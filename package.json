@@ -1,0 +1,45 @@
+{
+  "name": "@vistyy/pi-workgraph",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Agreement-gated, context-preserving workgraph orchestration for Pi.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "orchestration",
+    "worktree"
+  ],
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "PLAN.md",
+    "VERIFICATION.md"
+  ],
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "pnpm typecheck && pnpm test",
+    "smoke:real": "node --import tsx scripts/real-smoke.ts",
+    "smoke:coordinator": "node --import tsx scripts/coordinator-smoke.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/coordinator.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.0",
+    "typebox": "^1.0.0",
+    "typescript": "^5.9.0"
+  }
+}

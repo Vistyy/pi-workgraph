@@ -1,0 +1,138 @@
+import { spawn } from "node:child_process";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { runProcess } from "../src/git.js";
+
+const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const guideModel = process.env.PI_WORKGRAPH_GUIDE_MODEL || "openai-codex/gpt-5.6-sol";
+const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-coordinator-"));
+const root = join(parent, "fixture");
+const tools: string[] = [];
+const confirmations: Array<{ title: string; message: string }> = [];
+let statePath: string | undefined;
+let stderr = "";
+
+async function git(...args: string[]): Promise<string> {
+  const result = await runProcess("git", ["-C", root, ...args], { cwd: root, timeoutMs: 30_000 });
+  if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout);
+  return result.stdout.trim();
+}
+
+try {
+  await mkdir(join(root, "src"), { recursive: true });
+  await writeFile(join(root, "AGENTS.md"), `# Fixture instructions
+
+Use the requested Workgraph flow end to end.
+Keep changes minimal and use the Workgraph terminal report tools in child assignments.
+`);
+  await writeFile(join(root, "src", "value.txt"), "unset\n");
+  await writeFile(join(root, "verify.sh"), "#!/usr/bin/env bash\ntest \"$(cat src/value.txt)\" = AURORA\n", { mode: 0o755 });
+  await runProcess("git", ["init", "-b", "main", root], { cwd: parent, timeoutMs: 30_000 });
+  await git("config", "user.email", "workgraph@example.test");
+  await git("config", "user.name", "Workgraph Coordinator Smoke");
+  await git("add", ".");
+  await git("commit", "-m", "Create coordinator fixture");
+
+  const child = spawn(process.env.PI_WORKGRAPH_PI_BIN || "pi", [
+    "--mode", "rpc",
+    "--session-dir", join(parent, "sessions"),
+    "--model", guideModel,
+    "--thinking", "high",
+    "--no-extensions",
+    "--extension", packageRoot,
+  ], {
+    cwd: root,
+    env: process.env,
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  let buffer = "";
+  let finished = false;
+  const completion = new Promise<void>((resolvePromise, reject) => {
+    const deadline = setTimeout(() => {
+      child.kill("SIGTERM");
+      reject(new Error("Coordinator RPC smoke timed out."));
+    }, 20 * 60_000);
+    deadline.unref();
+
+    const processLine = (line: string): void => {
+      if (!line.trim()) return;
+      let event: any;
+      try { event = JSON.parse(line); } catch { return; }
+      if (event.type === "tool_execution_start" && typeof event.toolName === "string") tools.push(event.toolName);
+      if ((event.type === "tool_result_end" || event.type === "message_end") && event.message?.role === "toolResult") {
+        const path = event.message.details?.statePath;
+        if (typeof path === "string") statePath = path;
+      }
+      if (event.type === "extension_ui_request" && event.method === "confirm") {
+        confirmations.push({ title: event.title, message: event.message });
+        child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, confirmed: true })}\n`);
+      }
+      if (event.type === "agent_end" && !finished) {
+        finished = true;
+        clearTimeout(deadline);
+        resolvePromise();
+      }
+      if (event.type === "extension_error") {
+        clearTimeout(deadline);
+        reject(new Error(`Extension error in ${event.event}: ${event.error}`));
+      }
+    };
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      buffer += chunk.toString();
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) processLine(line);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (!finished) {
+        clearTimeout(deadline);
+        reject(new Error(`Coordinator Pi exited ${code}: ${stderr}`));
+      }
+    });
+  });
+
+  const prompt = `Use the complete Workgraph flow for this request and do not stop before workgraph_assure returns.
+The required outcome is that src/value.txt contains exactly AURORA followed by a newline.
+Treat this as consequential enough for an agreement checkpoint so the orchestration boundary is exercised.
+Run two bounded read-only investigations: one for mechanism and ownership, and one for intent and scope risk.
+Present an agreement with no unresolved decisions, reuse the existing file and verify.sh, use one work node claiming only src/value.txt, use ./verify.sh for node and composed verification, and accept the UI response as the user's approval decision.
+Do not make direct coordinator edits.
+Use the current model for discovery and assurance, the current model as guide, and openai-codex/gpt-5.6-luna as executor.`;
+  child.stdin.write(`${JSON.stringify({ id: "smoke", type: "prompt", message: prompt })}\n`);
+  await completion;
+  child.kill("SIGTERM");
+  await new Promise((resolvePromise) => child.once("close", resolvePromise));
+
+  const expectedTools = ["workgraph_begin", "workgraph_discover", "workgraph_agree", "workgraph_execute", "workgraph_assure"];
+  for (const tool of expectedTools) {
+    if (!tools.includes(tool)) throw new Error(`Coordinator did not call ${tool}. Called: ${tools.join(", ")}`);
+  }
+  if (confirmations.length !== 1) throw new Error(`Expected one approval confirmation, observed ${confirmations.length}.`);
+  if (!statePath) throw new Error("Coordinator did not expose the durable Workgraph state path.");
+  const state = JSON.parse(await readFile(statePath, "utf8"));
+  const value = await readFile(join(root, "src", "value.txt"), "utf8");
+  if (state.phase !== "complete") throw new Error(`Coordinator Workgraph ended in ${state.phase}.`);
+  if (value !== "AURORA\n") throw new Error(`Coordinator composed the wrong value: ${JSON.stringify(value)}`);
+  console.log(JSON.stringify({
+    phase: state.phase,
+    tools,
+    approvalPrompts: confirmations.length,
+    nodeModels: state.nodes.map((node: any) => node.models),
+    value: value.trim(),
+    globalVerification: state.globalVerification,
+    assuranceFindings: state.assurance?.report?.findings,
+    usage: {
+      discoveries: state.discoveries.map((item: any) => item.usage),
+      nodes: state.nodes.map((item: any) => item.usage),
+      assurance: state.assurance?.usage,
+    },
+  }));
+} finally {
+  await rm(parent, { recursive: true, force: true });
+}
