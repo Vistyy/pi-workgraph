@@ -5,8 +5,8 @@ import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import type {
   ChildOutcome,
-  ReportKind,
   ThinkingLevel,
+  WorkerMode,
   UsageSummary,
   WorkerReport,
 } from "./types.js";
@@ -20,7 +20,7 @@ export interface ChildRequest {
   targetCwd: string;
   sessionDir: string;
   objective: string;
-  mode: ReportKind;
+  mode: WorkerMode;
   guideModel: string;
   guideThinking: ThinkingLevel;
   executorModel?: string;
@@ -29,6 +29,8 @@ export interface ChildRequest {
   nodeId: string;
   baseCommit?: string;
   allowedPaths?: string[];
+  responsibility?: string;
+  implementationStart?: "guide" | "executor";
   timeoutMs?: number;
   stableEntryId?: string | null;
   workerExtensionPath?: string;
@@ -43,12 +45,15 @@ export async function runPiChild(request: ChildRequest): Promise<ChildOutcome> {
   const tools = request.mode === "implementation"
     ? "read,bash,grep,find,ls,edit,write,workgraph_todo,workgraph_report"
     : "read,bash,grep,find,ls,workgraph_report";
+  const startsInExecutor = request.mode === "implementation" && request.implementationStart === "executor";
+  const initialModel = startsInExecutor ? request.executorModel ?? request.guideModel : request.guideModel;
+  const initialThinking = startsInExecutor ? request.executorThinking ?? request.guideThinking : request.guideThinking;
   const args = [
     "--mode", "json",
     "--print",
     "--session", sessionFile,
-    "--model", request.guideModel,
-    "--thinking", request.guideThinking,
+    "--model", initialModel,
+    "--thinking", initialThinking,
     "--no-extensions",
     "--extension", workerExtension,
     "--no-prompt-templates",
@@ -64,6 +69,8 @@ export async function runPiChild(request: ChildRequest): Promise<ChildOutcome> {
     PI_WORKGRAPH_EXECUTOR_THINKING: request.executorThinking ?? request.guideThinking,
     PI_WORKGRAPH_BASE_COMMIT: request.baseCommit ?? "",
     PI_WORKGRAPH_ALLOWED_PATHS: JSON.stringify(request.allowedPaths ?? []),
+    PI_WORKGRAPH_RESPONSIBILITY: request.responsibility ?? "",
+    PI_WORKGRAPH_IMPLEMENTATION_START: request.implementationStart ?? "guide",
   };
 
   return spawnPi({

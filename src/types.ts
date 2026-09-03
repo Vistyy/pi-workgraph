@@ -1,11 +1,16 @@
-export const RUN_STATE_VERSION = 1 as const;
+export const RUN_STATE_VERSION = 2 as const;
+
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export type RunPhase =
   | "discovery"
   | "awaiting_agreement"
   | "approved"
   | "executing"
+  | "awaiting_verification"
   | "awaiting_assurance"
+  | "awaiting_judgment"
+  | "assurance_inconclusive"
   | "revision_required"
   | "needs_decision"
   | "complete"
@@ -20,7 +25,8 @@ export type NodeState =
   | "failed"
   | "superseded";
 
-export type ReportKind = "discovery" | "implementation" | "assurance";
+export type WorkerMode = "discovery" | "implementation" | "verification" | "assurance_review" | "assurance_synthesis";
+export type ReportKind = WorkerMode;
 export type ReportStatus = "completed" | "escalated" | "failed";
 export type FindingSeverity = "info" | "warning" | "error" | "blocker";
 export type EnvelopeImpact =
@@ -38,6 +44,7 @@ export interface EvidenceItem {
   label: string;
   observation: string;
   command?: string;
+  artifact?: string;
 }
 
 export interface Finding {
@@ -47,15 +54,69 @@ export interface Finding {
   envelopeImpact: EnvelopeImpact;
 }
 
-export interface WorkerReport {
-  kind: ReportKind;
+interface ReportBase<K extends ReportKind> {
+  kind: K;
   status: ReportStatus;
   summary: string;
   evidence: EvidenceItem[];
+}
+
+export interface DiscoveryReport extends ReportBase<"discovery"> {
+  findings: Finding[];
+}
+
+export interface ImplementationReport extends ReportBase<"implementation"> {
   findings: Finding[];
   commit?: string;
   changedFiles?: string[];
 }
+
+export interface VerificationReport extends ReportBase<"verification"> {
+  verdict: "verified" | "failed" | "inconclusive";
+  findings: Finding[];
+}
+
+export type AssuranceResponsibility = "behavior" | "structure" | "evidence";
+export type ComplexityEffect = "reduces" | "neutral" | "adds";
+export type FindingConfidence = "low" | "medium" | "high";
+
+export interface AssuranceFinding {
+  id: string;
+  category: string;
+  violatedInvariant: string;
+  evidence: string[];
+  reachableScenario: string;
+  consequence: string;
+  simplestResponse: string;
+  complexityEffect: ComplexityEffect;
+  confidence: FindingConfidence;
+  envelopeImpact: EnvelopeImpact;
+  ownerNodeId?: string;
+}
+
+export interface AssuranceReviewReport extends ReportBase<"assurance_review"> {
+  responsibility: AssuranceResponsibility;
+  recommendation: "approve" | "changes_required" | "inconclusive";
+  findings: AssuranceFinding[];
+}
+
+export interface FindingDisposition {
+  finding: AssuranceFinding;
+  disposition: "accept" | "optional" | "dismiss";
+  reason: string;
+}
+
+export interface AssuranceSynthesisReport extends ReportBase<"assurance_synthesis"> {
+  verdict: "approve" | "revision_required" | "needs_decision" | "inconclusive";
+  dispositions: FindingDisposition[];
+}
+
+export type WorkerReport =
+  | DiscoveryReport
+  | ImplementationReport
+  | VerificationReport
+  | AssuranceReviewReport
+  | AssuranceSynthesisReport;
 
 export interface UsageSummary {
   input: number;
@@ -76,20 +137,33 @@ export interface ChildOutcome {
   timedOut: boolean;
 }
 
+export type DiscoveryTopology = "partition" | "replicate" | "evidence";
+
 export interface InvestigationSpec {
   id: string;
   lens: string;
   objective: string;
 }
 
-export interface DiscoveryRecord extends InvestigationSpec {
+export interface DiscoveryAssignment extends InvestigationSpec {
   model: string;
-  state: "running" | "completed" | "failed";
+  thinking: ThinkingLevel;
+  unavailableReason?: string;
+  supersedes?: string[];
+}
+
+export interface DiscoveryRecord extends DiscoveryAssignment {
+  topology: DiscoveryTopology;
+  synthesisOf?: string[];
+  state: "running" | "completed" | "failed" | "timed_out" | "cancelled" | "unavailable" | "superseded";
+  supersededBy?: string;
   sessionFile?: string;
-  report?: WorkerReport;
+  report?: DiscoveryReport;
   error?: string;
   usage?: UsageSummary;
 }
+
+export type VerificationMethod = "commands" | "independent";
 
 export interface Agreement {
   outcome: string;
@@ -99,24 +173,35 @@ export interface Agreement {
   expectedScale: string;
   verificationBoundary: string;
   verificationCommands: string[];
+  verificationMethod: VerificationMethod;
+  verificationProcedure: string;
+  requiredEvidence: string[];
   unresolvedDecisions: string[];
   approvedAt: string;
 }
 
+export interface WorkerBrief {
+  goal: string;
+  context: string[];
+  acceptance: string[];
+  timeboxMinutes: number;
+  forbidden: string[];
+  report: string;
+}
+
 export interface WorkNodeSpec {
   id: string;
-  objective: string;
+  brief: WorkerBrief;
   claimedPaths: string[];
   dependencies: string[];
   verificationCommands: string[];
   supersedes: string[];
+  continuationOf?: string;
   guideModel: string;
   executorModel: string;
   guideThinking: ThinkingLevel;
   executorThinking: ThinkingLevel;
 }
-
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface CommandEvidence {
   command: string;
@@ -133,7 +218,7 @@ export interface WorkNode extends WorkNodeSpec {
   worktreePath?: string;
   sessionFile?: string;
   processExitCode?: number;
-  report?: WorkerReport;
+  report?: ImplementationReport;
   commit?: string;
   actualChangedFiles?: string[];
   verification?: CommandEvidence[];
@@ -156,13 +241,72 @@ export interface CompositionRecord {
   at: string;
 }
 
-export interface AssuranceRecord {
-  model: string;
-  state: "running" | "completed" | "failed";
+export interface ProductVerificationRecord {
+  revision: string;
+  method: VerificationMethod;
+  state: "running" | "completed" | "failed" | "inconclusive";
+  model?: string;
+  thinking?: ThinkingLevel;
   sessionFile?: string;
-  report?: WorkerReport;
+  report?: VerificationReport;
+  commands: CommandEvidence[];
   error?: string;
   usage?: UsageSummary;
+}
+
+export interface AssuranceReviewRecord {
+  responsibility: AssuranceResponsibility;
+  model: string;
+  thinking: ThinkingLevel;
+  state: "running" | "completed" | "failed" | "timed_out" | "unavailable";
+  sessionFile?: string;
+  report?: AssuranceReviewReport;
+  error?: string;
+  usage?: UsageSummary;
+}
+
+export interface AssuranceSynthesisRecord {
+  model: string;
+  thinking: ThinkingLevel;
+  state: "running" | "completed" | "failed" | "timed_out";
+  sessionFile?: string;
+  report?: AssuranceSynthesisReport;
+  error?: string;
+  usage?: UsageSummary;
+}
+
+export interface AssuranceJudgment {
+  judgments: Array<{
+    findingId: string;
+    disposition: "accept" | "dismiss";
+    reason: string;
+  }>;
+  acceptedFindings: AssuranceFinding[];
+  at: string;
+}
+
+export interface AssuranceRecord {
+  revision: string;
+  state: "running" | "completed" | "inconclusive";
+  reviews: AssuranceReviewRecord[];
+  synthesis?: AssuranceSynthesisRecord;
+  finalJudgment?: AssuranceJudgment;
+}
+
+export type PlaybookStepStatus = "pending" | "completed" | "skipped";
+
+export interface PlaybookStepRecord {
+  id: string;
+  status: PlaybookStepStatus;
+  reason?: string;
+  at?: string;
+}
+
+export interface PlaybookState {
+  id: string;
+  title: string;
+  completionPredicate: string;
+  steps: PlaybookStepRecord[];
 }
 
 export interface HumanDecision {
@@ -195,10 +339,12 @@ export interface WorkgraphRun {
   composedCommit: string;
   createdAt: string;
   updatedAt: string;
+  playbook: PlaybookState;
   agreement?: Agreement;
   discoveries: DiscoveryRecord[];
   nodes: WorkNode[];
   composition: CompositionRecord[];
+  productVerification?: ProductVerificationRecord;
   assurance?: AssuranceRecord;
   humanDecisions: HumanDecision[];
   transitions: Transition[];

@@ -3,42 +3,76 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { pathIsClaimed } from "../src/scheduler.js";
-import type { EnvelopeImpact, ReportKind, WorkerReport } from "../src/types.js";
+import type {
+  AssuranceResponsibility,
+  EnvelopeImpact,
+  ImplementationReport,
+  WorkerMode,
+  WorkerReport,
+} from "../src/types.js";
 
 const mode = readMode();
 const runId = process.env.PI_WORKGRAPH_RUN_ID || "unknown-run";
 const nodeId = process.env.PI_WORKGRAPH_NODE_ID || "unknown-node";
+const responsibility = process.env.PI_WORKGRAPH_RESPONSIBILITY || "";
 const executorModel = process.env.PI_WORKGRAPH_EXECUTOR_MODEL || "";
 const executorThinking = process.env.PI_WORKGRAPH_EXECUTOR_THINKING || "high";
 const baseCommit = process.env.PI_WORKGRAPH_BASE_COMMIT || "";
 const allowedPaths = readAllowedPaths();
+const startInExecutor = process.env.PI_WORKGRAPH_IMPLEMENTATION_START === "executor";
+
+const StatusSchema = StringEnum(["completed", "escalated", "failed"] as const);
+const EnvelopeImpactSchema = StringEnum([
+  "none",
+  "outcome",
+  "non_goal",
+  "owner",
+  "public_interface",
+  "dependency",
+  "security",
+  "scale",
+  "reuse",
+] as const);
 
 const EvidenceSchema = Type.Object({
   label: Type.String(),
   observation: Type.String(),
   command: Type.Optional(Type.String()),
+  artifact: Type.Optional(Type.String()),
 });
 
 const FindingSchema = Type.Object({
   severity: StringEnum(["info", "warning", "error", "blocker"] as const),
   title: Type.String(),
   detail: Type.String(),
-  envelopeImpact: StringEnum([
-    "none",
-    "outcome",
-    "non_goal",
-    "owner",
-    "public_interface",
-    "dependency",
-    "security",
-    "scale",
-    "reuse",
-  ] as const),
+  envelopeImpact: EnvelopeImpactSchema,
 });
 
-const ReportSchema = Type.Object({
-  kind: StringEnum(["discovery", "implementation", "assurance"] as const),
-  status: StringEnum(["completed", "escalated", "failed"] as const),
+const AssuranceFindingSchema = Type.Object({
+  id: Type.String(),
+  category: Type.String(),
+  violatedInvariant: Type.String(),
+  evidence: Type.Array(Type.String(), { minItems: 1, maxItems: 10 }),
+  reachableScenario: Type.String(),
+  consequence: Type.String(),
+  simplestResponse: Type.String(),
+  complexityEffect: StringEnum(["reduces", "neutral", "adds"] as const),
+  confidence: StringEnum(["low", "medium", "high"] as const),
+  envelopeImpact: EnvelopeImpactSchema,
+  ownerNodeId: Type.Optional(Type.String()),
+});
+
+const DiscoveryReportSchema = Type.Object({
+  kind: Type.Literal("discovery"),
+  status: StatusSchema,
+  summary: Type.String(),
+  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
+  findings: Type.Array(FindingSchema, { maxItems: 20 }),
+});
+
+const ImplementationReportSchema = Type.Object({
+  kind: Type.Literal("implementation"),
+  status: StatusSchema,
   summary: Type.String(),
   evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
   findings: Type.Array(FindingSchema, { maxItems: 20 }),
@@ -46,15 +80,57 @@ const ReportSchema = Type.Object({
   changedFiles: Type.Optional(Type.Array(Type.String())),
 });
 
+const VerificationReportSchema = Type.Object({
+  kind: Type.Literal("verification"),
+  status: StatusSchema,
+  summary: Type.String(),
+  evidence: Type.Array(EvidenceSchema, { maxItems: 30 }),
+  verdict: StringEnum(["verified", "failed", "inconclusive"] as const),
+  findings: Type.Array(FindingSchema, { maxItems: 20 }),
+});
+
+const AssuranceReviewReportSchema = Type.Object({
+  kind: Type.Literal("assurance_review"),
+  status: StatusSchema,
+  summary: Type.String(),
+  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
+  responsibility: StringEnum(["behavior", "structure", "evidence"] as const),
+  recommendation: StringEnum(["approve", "changes_required", "inconclusive"] as const),
+  findings: Type.Array(AssuranceFindingSchema, { maxItems: 20 }),
+});
+
+const AssuranceSynthesisReportSchema = Type.Object({
+  kind: Type.Literal("assurance_synthesis"),
+  status: StatusSchema,
+  summary: Type.String(),
+  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
+  verdict: StringEnum(["approve", "revision_required", "needs_decision", "inconclusive"] as const),
+  dispositions: Type.Array(Type.Object({
+    finding: AssuranceFindingSchema,
+    disposition: StringEnum(["accept", "optional", "dismiss"] as const),
+    reason: Type.String(),
+  }), { maxItems: 40 }),
+});
+
+const ReportSchema = mode === "discovery"
+  ? DiscoveryReportSchema
+  : mode === "implementation"
+    ? ImplementationReportSchema
+    : mode === "verification"
+      ? VerificationReportSchema
+      : mode === "assurance_review"
+        ? AssuranceReviewReportSchema
+        : AssuranceSynthesisReportSchema;
+
 const TodoSchema = Type.Object({
   items: Type.Array(Type.String({ minLength: 3 }), { minItems: 1, maxItems: 8 }),
 });
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
-  let phase: "guide" | "executor" = mode === "implementation" ? "guide" : "executor";
+  let phase: "guide" | "executor" = mode === "implementation" && !startInExecutor ? "guide" : "executor";
   let todos: string[] = [];
   let switchError: string | undefined;
-  let switchedAt: string | undefined;
+  let switchedAt: string | undefined = startInExecutor ? new Date().toISOString() : undefined;
 
   pi.registerTool({
     name: "workgraph_todo",
@@ -65,12 +141,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       if (mode !== "implementation") throw new Error("workgraph_todo is only available during implementation.");
       if (phase !== "guide") throw new Error("The Local Prewalk TODO list is already fixed for this assignment.");
       todos = [...params.items];
-      pi.appendEntry("pi-workgraph-worker-state", {
-        runId,
-        nodeId,
-        phase,
-        todos,
-      });
+      pi.appendEntry("pi-workgraph-worker-state", { runId, nodeId, phase, todos });
       return {
         content: [{ type: "text", text: `Recorded ${todos.length} Local Prewalk TODO item(s).` }],
         details: { items: todos },
@@ -85,8 +156,13 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     parameters: ReportSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (params.kind !== mode) throw new Error(`Report kind must be ${mode}.`);
-      if (mode === "implementation" && params.status === "completed") {
-        if (todos.length === 0) throw new Error("A completed implementation requires a Local Prewalk TODO list.");
+      if (mode === "assurance_review" && params.kind === mode) {
+        if (params.responsibility !== responsibility) throw new Error(`Assurance responsibility must be ${responsibility}.`);
+        const invalidId = params.findings.find((finding) => !finding.id.startsWith(`${responsibility}-`));
+        if (invalidId) throw new Error(`Assurance finding ids must start with ${responsibility}-: ${invalidId.id}`);
+      }
+      if (mode === "implementation" && params.kind === mode && params.status === "completed") {
+        if (!startInExecutor && todos.length === 0) throw new Error("A completed implementation requires a Local Prewalk TODO list.");
         if (phase !== "executor") throw new Error("A completed implementation can only be reported after the first-edit model transition.");
         if (switchError) throw new Error(`Executor model transition failed: ${switchError}`);
         if (!baseCommit) throw new Error("PI_WORKGRAPH_BASE_COMMIT is required for implementation reports.");
@@ -98,21 +174,15 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         const changedFiles = changedText ? changedText.split("\n").filter(Boolean).sort() : [];
         const outside = changedFiles.filter((path) => !pathIsClaimed(path, allowedPaths));
         if (outside.length > 0) throw new Error(`Changed files exceed this node's claimed paths: ${outside.join(", ")}`);
-        const report: WorkerReport = {
-          ...params,
-          kind: mode,
-          commit,
-          changedFiles,
-        };
-        return terminalReport(report, { todos, switchedAt });
+        const report: ImplementationReport = { ...params, commit, changedFiles };
+        return terminalReport(report, { todos, switchedAt, continued: startInExecutor });
       }
 
       if (mode !== "implementation") {
         const status = await git(pi, ctx.cwd, ["status", "--porcelain", "--untracked-files=all"], true);
-        if (status) throw new Error(`${mode} workers are read-only, but the repository is dirty:\n${status}`);
+        if (status) throw new Error(`${mode} workers are read-only for product files, but the repository is dirty:\n${status}`);
       }
-      const report: WorkerReport = { ...params, kind: mode };
-      return terminalReport(report, { todos, switchedAt, switchError });
+      return terminalReport(params as WorkerReport, { todos, switchedAt, switchError });
     },
   });
 
@@ -127,10 +197,13 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
 
     if (mode !== "implementation") {
       if (event.toolName === "edit" || event.toolName === "write") {
-        return { block: true, reason: `${mode} assignments are read-only.` };
+        return { block: true, reason: `${mode} assignments cannot edit product files.` };
       }
-      if (event.toolName === "bash" && !isReadOnlyCommand(String((event.input as { command?: unknown }).command ?? ""))) {
+      if (event.toolName === "bash" && mode !== "verification" && !isReadOnlyCommand(String((event.input as { command?: unknown }).command ?? ""))) {
         return { block: true, reason: `${mode} assignments permit only simple read-only shell commands.` };
+      }
+      if (event.toolName === "bash" && forbiddenGitControlCommand(String((event.input as { command?: unknown }).command ?? ""))) {
+        return { block: true, reason: "Workgraph reviewers cannot rewrite repository history or manage worktrees." };
       }
       return;
     }
@@ -170,24 +243,10 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       if (!selected) throw new Error(`Executor model has no usable credentials: ${executorModel}`);
       pi.setThinkingLevel(executorThinking as Parameters<typeof pi.setThinkingLevel>[0]);
       switchedAt = new Date().toISOString();
-      pi.appendEntry("pi-workgraph-worker-state", {
-        runId,
-        nodeId,
-        phase,
-        todos,
-        executorModel,
-        executorThinking,
-        switchedAt,
-      });
+      pi.appendEntry("pi-workgraph-worker-state", { runId, nodeId, phase, todos, executorModel, executorThinking, switchedAt });
     } catch (error) {
       switchError = error instanceof Error ? error.message : String(error);
-      pi.appendEntry("pi-workgraph-worker-state", {
-        runId,
-        nodeId,
-        phase,
-        todos,
-        switchError,
-      });
+      pi.appendEntry("pi-workgraph-worker-state", { runId, nodeId, phase, todos, switchError });
     }
   });
 
@@ -214,10 +273,10 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", () => ({
     message: {
-      customType: mode === "implementation" ? "pi-workgraph-guide" : `pi-workgraph-${mode}`,
+      customType: mode === "implementation" && phase === "guide" ? "pi-workgraph-guide" : `pi-workgraph-${mode}`,
       content: modeInstructions(),
       display: false,
-      details: { runId, nodeId, mode },
+      details: { runId, nodeId, mode, responsibility },
     },
   }));
 }
@@ -232,37 +291,32 @@ function terminalReport(report: WorkerReport, state: Record<string, unknown>) {
 
 function modeInstructions(): string {
   if (mode === "discovery") {
-    return `[WORKGRAPH DISCOVERY]
-Investigate only the assigned lens.
-Use read-only repository evidence and distinguish observations, inferences, and unknowns.
-Do not implement, edit files, or expand the question.
-Finish by calling workgraph_report with kind discovery, concise evidence, and any envelope-changing findings.`;
+    return `[WORKGRAPH DISCOVERY]\nInvestigate only the assigned responsibility.\nUse read-only repository evidence and distinguish observations, inferences, and unknowns.\nDo not implement, edit files, or expand the question.\nFinish with a concise discovery report and account for unknowns that could change the implementation envelope.`;
   }
-  if (mode === "assurance") {
-    return `[WORKGRAPH ASSURANCE]
-Review the composed result against the approved outcome and verification boundary.
-Stay read-only and prioritize realistic correctness, integration, security, and scope failures.
-Do not demand unrelated improvements.
-Finish by calling workgraph_report with kind assurance and typed findings.`;
+  if (mode === "verification") {
+    return `[WORKGRAPH PRODUCT VERIFICATION]\nObserve the composed revision through the procedure in the objective.\nDo not edit product files.\nUse the real product surface when commands alone cannot prove the behavior.\nRecord concrete artifacts such as screenshots, browser state, console or network output, traces, profiles, or stored values.\nReturn verified only when the evidence directly establishes the required scenarios.`;
   }
-  return `[WORKGRAPH LOCAL PREWALK - GUIDE PHASE]
-Stay within node ${nodeId} and claimed path prefixes: ${allowedPaths.join(", ")}.
-Inspect the inherited trajectory and current worktree before deciding how to proceed.
-Call workgraph_todo with no more than eight concrete local items.
-Then make the smallest useful first edit through edit or write.
-The runtime will switch models after that edit.
-If evidence requires changing the approved outcome, non-goal, owner, public interface, dependency, security guarantee, scale, or reuse decision, do not edit and report an escalation instead.
-Do not report completion during the guide phase.`;
+  if (mode === "assurance_review") {
+    return assuranceReviewInstructions(responsibility as AssuranceResponsibility);
+  }
+  if (mode === "assurance_synthesis") {
+    return `[WORKGRAPH ASSURANCE SYNTHESIS]\nReconcile the three responsibility reports without inventing findings.\nDismiss duplicate, impossible, immaterial, speculative, stylistic, or unsupported findings.\nClassify a supported but non-required improvement as optional.\nAccept only findings whose invariant, evidence, reachable scenario, consequence, and simplest response establish required correction work.\nPrefer deletion and simpler ownership over additive correction.\nAPPROVE with no findings is valid.\nClassify an accepted envelope-changing finding as needs_decision and an accepted internal correction as revision_required.`;
+  }
+  if (startInExecutor) return executorInstructions();
+  return `[WORKGRAPH LOCAL PREWALK - GUIDE PHASE]\nStay within node ${nodeId} and claimed path prefixes: ${allowedPaths.join(", ")}.\nInspect the inherited trajectory and current worktree before deciding how to proceed.\nCall workgraph_todo with no more than eight concrete local items.\nThen make the smallest useful first edit through edit or write.\nThe runtime will switch models after that edit.\nIf evidence requires changing the approved envelope, do not edit and report an escalation instead.\nDo not report completion during the guide phase.`;
+}
+
+function assuranceReviewInstructions(role: AssuranceResponsibility): string {
+  const focus = role === "behavior"
+    ? "Inspect realistic correctness, integration, failures, concurrency, recovery, security, and performance only where relevant."
+    : role === "structure"
+      ? "Inspect deletion opportunities, simplicity, types, ownership, boundaries, abstractions, reader load, and maintainability."
+      : "Inspect whether evidence proves distinct meaningful invariants without duplicate or implementation-detail test bloat.";
+  return `[WORKGRAPH ASSURANCE - ${role.toUpperCase()}]\n${focus}\nStay within this responsibility and remain read-only.\nDo not seek a quota of issues, and treat approval with zero findings as a valid result.\nReject impossible, immaterial, duplicate, speculative, stylistic, or unsupported concerns.\nPrefix every finding id with ${role}-.\nEvery proposed finding must name the violated invariant, concrete evidence, a reachable scenario, material consequence, simplest response, confidence, envelope impact, and complexity effect.`;
 }
 
 function executorInstructions(): string {
-  return `[WORKGRAPH EXECUTOR PHASE]
-Continue the same node trajectory after the guide's first edit.
-Complete only the recorded TODOs needed for node ${nodeId} within: ${allowedPaths.join(", ")}.
-Run the node verification commands from the objective.
-Create exactly one commit directly on the provided worker branch and leave the worktree clean.
-Then call workgraph_report with kind implementation, status completed, evidence, and findings.
-If a required change crosses the approved envelope, stop and report status escalated with the applicable envelopeImpact.`;
+  return `[WORKGRAPH EXECUTOR PHASE]\nContinue the same node trajectory${startInExecutor ? " from the retained implementer session" : " after the guide's first edit"}.\nComplete only the bounded brief for node ${nodeId} within: ${allowedPaths.join(", ")}.\nRun the node verification commands from the objective.\nCreate exactly one commit directly on the provided worker branch and leave the worktree clean.\nThen return a completed implementation report with evidence.\nIf a required change crosses the approved envelope, stop and report an escalation.`;
 }
 
 async function git(pi: ExtensionAPI, cwd: string, args: string[], allowEmpty = false): Promise<string> {
@@ -287,7 +341,7 @@ function isReadOnlyCommand(command: string): boolean {
 }
 
 function forbiddenGitControlCommand(command: string): boolean {
-  return /\bgit\s+(checkout|switch|reset|clean|rebase|merge|cherry-pick|worktree|branch\s+(-[dDmM]|--delete|--move))\b/.test(command);
+  return /\bgit\s+(add|apply|commit|checkout|switch|reset|restore|rm|mv|clean|rebase|merge|cherry-pick|worktree|branch\s+(-[dDmM]|--delete|--move))\b/.test(command);
 }
 
 function splitModel(selector: string): [string, string] {
@@ -296,9 +350,9 @@ function splitModel(selector: string): [string, string] {
   return [selector.slice(0, slash), selector.slice(slash + 1)];
 }
 
-function readMode(): ReportKind {
+function readMode(): WorkerMode {
   const value = process.env.PI_WORKGRAPH_MODE;
-  if (value === "discovery" || value === "implementation" || value === "assurance") return value;
+  if (value === "discovery" || value === "implementation" || value === "verification" || value === "assurance_review" || value === "assurance_synthesis") return value;
   throw new Error(`Invalid PI_WORKGRAPH_MODE: ${value ?? "(missing)"}`);
 }
 

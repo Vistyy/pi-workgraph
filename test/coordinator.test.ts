@@ -3,29 +3,38 @@ import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import coordinator from "../extensions/coordinator.js";
 
-test("a workgraph_begin tool batch gates sibling writes before tool execution", async () => {
+test("the coordinator registers one stable tool inventory without mutation interception", async () => {
   const handlers = new Map<string, Array<(event: any, ctx?: any) => any>>();
+  const tools: string[] = [];
+  let activeToolChanges = 0;
   const fakePi = {
-    registerTool() {},
+    registerTool(tool: { name: string }) { tools.push(tool.name); },
     on(name: string, handler: (event: any, ctx?: any) => any) {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
     },
+    setActiveTools() { activeToolChanges += 1; },
   } as unknown as ExtensionAPI;
   coordinator(fakePi);
 
-  const messageEnd = handlers.get("message_end")![0]!;
-  await messageEnd({
-    message: {
-      role: "assistant",
-      content: [
-        { type: "toolCall", id: "edit-first", name: "edit", arguments: { path: "src/a.ts" } },
-        { type: "toolCall", id: "begin-second", name: "workgraph_begin", arguments: {} },
-      ],
-    },
-  });
-  const toolCall = handlers.get("tool_call")![0]!;
-  const blocked = await toolCall({ toolName: "edit", input: { path: "src/a.ts" } });
-  assert.match(blocked.reason, /coordinator read-only/);
-  const destructiveFind = await toolCall({ toolName: "bash", input: { command: "find src -delete" } });
-  assert.match(destructiveFind.reason, /read-only coordinator shell/);
+  assert.deepEqual(tools, [
+    "workgraph_playbook",
+    "workgraph_models",
+    "workgraph_begin",
+    "workgraph_progress",
+    "workgraph_discover",
+    "workgraph_synthesize",
+    "workgraph_agree",
+    "workgraph_execute",
+    "workgraph_verify",
+    "workgraph_assure",
+    "workgraph_judge",
+    "workgraph_status",
+  ]);
+  assert.equal(handlers.has("tool_call"), false);
+  assert.equal(handlers.has("message_end"), false);
+  assert.equal(activeToolChanges, 0);
+
+  const policy = await handlers.get("before_agent_start")![0]!({}, {});
+  assert.match(policy.message.content, /All normal coordinator tools remain available/);
+  assert.match(policy.message.content, /substantial product implementation/);
 });

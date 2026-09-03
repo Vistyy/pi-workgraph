@@ -46,6 +46,13 @@ export function addNodes(run: WorkgraphRun, specs: WorkNodeSpec[]): WorkNode[] {
         throw new Error(`Work node ${spec.id} cannot depend on itself or a node it supersedes.`);
       }
     }
+    if (spec.continuationOf) {
+      const original = run.nodes.find((node) => node.id === spec.continuationOf);
+      if (!original) throw new Error(`Work node ${spec.id} cannot continue unknown node ${spec.continuationOf}.`);
+      if (original.state !== "composed" || !original.sessionFile) {
+        throw new Error(`Work node ${spec.id} can only continue a composed node with a retained session.`);
+      }
+    }
   }
 
   for (const node of run.nodes) {
@@ -54,6 +61,12 @@ export function addNodes(run: WorkgraphRun, specs: WorkNodeSpec[]): WorkNode[] {
   }
   const nodes = specs.map<WorkNode>((spec) => ({
     ...spec,
+    brief: {
+      ...spec.brief,
+      context: [...spec.brief.context],
+      acceptance: [...spec.brief.acceptance],
+      forbidden: [...spec.brief.forbidden],
+    },
     claimedPaths: spec.claimedPaths.map(normalizeClaim),
     dependencies: [...new Set(spec.dependencies.map((dependency) => replacements.get(dependency) ?? dependency))],
     verificationCommands: [...spec.verificationCommands],
@@ -126,7 +139,14 @@ function validateNodeSpec(spec: WorkNodeSpec): void {
   if (!/^[a-z][a-z0-9_-]{0,47}$/.test(spec.id)) {
     throw new Error(`Work node id must match [a-z][a-z0-9_-]{0,47}: ${spec.id}`);
   }
-  if (!spec.objective.trim()) throw new Error(`Work node ${spec.id} requires an objective.`);
+  if (!spec.brief.goal.trim()) throw new Error(`Work node ${spec.id} requires a goal.`);
+  if (spec.brief.acceptance.length === 0 || spec.brief.acceptance.some((item) => !item.trim())) {
+    throw new Error(`Work node ${spec.id} requires concrete acceptance conditions.`);
+  }
+  if (!Number.isSafeInteger(spec.brief.timeboxMinutes) || spec.brief.timeboxMinutes < 1) {
+    throw new Error(`Work node ${spec.id} requires a positive timeboxMinutes value.`);
+  }
+  if (!spec.brief.report.trim()) throw new Error(`Work node ${spec.id} requires a report contract.`);
   if (spec.claimedPaths.length === 0) throw new Error(`Work node ${spec.id} requires at least one claimed path.`);
   for (const claim of spec.claimedPaths) normalizeClaim(claim);
   if (!spec.guideModel.includes("/")) throw new Error(`Work node ${spec.id} guideModel must be provider/model.`);

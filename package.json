@@ -2,7 +2,7 @@
   "name": "@vistyy/pi-workgraph",
   "version": "0.1.0",
   "type": "module",
-  "description": "Agreement-gated, context-preserving workgraph orchestration for Pi.",
+  "description": "Playbook-guided, evidence-backed workgraph orchestration for Pi.",
   "license": "MIT",
   "keywords": [
     "pi-package",
@@ -13,6 +13,7 @@
   "files": [
     "extensions",
     "src",
+    "playbooks",
     "README.md",
     "PLAN.md",
     "VERIFICATION.md"

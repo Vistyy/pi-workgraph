@@ -97,19 +97,25 @@ Keep changes minimal and use the Workgraph terminal report tools in child assign
     });
   });
 
-  const prompt = `Use the complete Workgraph flow for this request and do not stop before workgraph_assure returns.
-The required outcome is that src/value.txt contains exactly AURORA followed by a newline.
+  const prompt = `Use the complete Workgraph Feature playbook for this request and do not stop before coordinator judgment returns complete.
+First load the feature playbook, then begin with the predicate that src/value.txt contains exactly AURORA followed by a newline and ./verify.sh succeeds at the composed revision.
 Treat this as consequential enough for an agreement checkpoint so the orchestration boundary is exercised.
-Run two bounded read-only investigations: one for mechanism and ownership, and one for intent and scope risk.
-Present an agreement with no unresolved decisions, reuse the existing file and verify.sh, use one work node claiming only src/value.txt, use ./verify.sh for node and composed verification, and accept the UI response as the user's approval decision.
-Do not make direct coordinator edits.
-Use the current model for discovery and assurance, the current model as guide, and openai-codex/gpt-5.6-luna as executor.`;
+Run one partitioned discovery call with two bounded read-only responsibilities: mechanism and ownership, then intent and scope risk.
+Use ${guideModel} with high thinking for both discovery responsibilities.
+Present an agreement with no unresolved decisions, reuse the existing file and verify.sh, use command verification, describe running ./verify.sh as the verification procedure, and require its successful output as evidence.
+Use one implementation node claiming only src/value.txt with a complete GOAL, SCOPE, CONTEXT, ACCEPTANCE, VERIFY, TIMEBOX, FORBIDDEN, and REPORT brief.
+Use ./verify.sh for node and composed verification.
+Use ${guideModel} as guide and openai-codex/gpt-5.6-luna as executor.
+Record every feature playbook step as completed before assurance.
+Run behavior, structure, and evidence assurance with ${guideModel}, then use openai-codex/gpt-5.6-luna for synthesis.
+Finally call workgraph_judge and account for every candidate finding, accepting only concrete material findings.
+Do not make direct coordinator product edits, and accept the UI response as the user's approval decision.`;
   child.stdin.write(`${JSON.stringify({ id: "smoke", type: "prompt", message: prompt })}\n`);
   await completion;
   child.kill("SIGTERM");
   await new Promise((resolvePromise) => child.once("close", resolvePromise));
 
-  const expectedTools = ["workgraph_begin", "workgraph_discover", "workgraph_agree", "workgraph_execute", "workgraph_assure"];
+  const expectedTools = ["workgraph_playbook", "workgraph_begin", "workgraph_discover", "workgraph_agree", "workgraph_execute", "workgraph_progress", "workgraph_assure", "workgraph_judge"];
   for (const tool of expectedTools) {
     if (!tools.includes(tool)) throw new Error(`Coordinator did not call ${tool}. Called: ${tools.join(", ")}`);
   }
@@ -126,11 +132,12 @@ Use the current model for discovery and assurance, the current model as guide, a
     nodeModels: state.nodes.map((node: any) => node.models),
     value: value.trim(),
     globalVerification: state.globalVerification,
-    assuranceFindings: state.assurance?.report?.findings,
+    assuranceFindings: state.assurance?.reviews?.flatMap((review: any) => review.report?.findings ?? []),
     usage: {
       discoveries: state.discoveries.map((item: any) => item.usage),
       nodes: state.nodes.map((item: any) => item.usage),
-      assurance: state.assurance?.usage,
+      assuranceReviews: state.assurance?.reviews?.map((review: any) => review.usage),
+      assuranceSynthesis: state.assurance?.synthesis?.usage,
     },
   }));
 } finally {

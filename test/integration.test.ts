@@ -3,11 +3,19 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { WorkgraphEngine, type ChildRunner } from "../src/engine.js";
+import { WorkgraphEngine, type AssuranceInput, type ChildRunner } from "../src/engine.js";
 import { GitRepository, runProcess } from "../src/git.js";
-import type { ChildOutcome, WorkerReport, WorkgraphRun } from "../src/types.js";
-
-const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+import type { ChildOutcome, WorkerReport } from "../src/types.js";
+import {
+  assuranceReview,
+  assuranceSynthesis,
+  commandAgreement,
+  discoveryReport,
+  implementationReport,
+  nodeSpec,
+  testPlaybook,
+  zeroUsage,
+} from "./helpers.js";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await runProcess("git", ["-C", cwd, ...args], { cwd, timeoutMs: 30_000 });
@@ -29,22 +37,11 @@ async function fixture(): Promise<{ parent: string; root: string; repository: Gi
   return { parent, root, repository: await GitRepository.open(root) };
 }
 
-function report(kind: WorkerReport["kind"], summary: string, fields: Partial<WorkerReport> = {}): WorkerReport {
-  return {
-    kind,
-    status: "completed",
-    summary,
-    evidence: [],
-    findings: [],
-    ...fields,
-  };
-}
-
-function outcome(sessionFile: string, reportValue: WorkerReport, models: string[] = []): ChildOutcome {
+function outcome(sessionFile: string, report: WorkerReport, models: string[] = []): ChildOutcome {
   return {
     exitCode: 0,
     sessionFile,
-    report: reportValue,
+    report,
     stderr: "",
     usage: zeroUsage,
     models,
@@ -52,17 +49,34 @@ function outcome(sessionFile: string, reportValue: WorkerReport, models: string[
   };
 }
 
-test("engine gates execution, composes parallel isolated commits deterministically, and assures the result", async () => {
+const assuranceAssignments: AssuranceInput = {
+  reviewers: [
+    { responsibility: "behavior", model: "provider/behavior", thinking: "high" },
+    { responsibility: "structure", model: "provider/structure", thinking: "high" },
+    { responsibility: "evidence", model: "provider/evidence", thinking: "high" },
+  ],
+  synthesis: { model: "provider/synthesis", thinking: "high" },
+};
+
+test("engine composes isolated commits, verifies the exact result, and runs responsibility assurance", async () => {
   const { parent, root, repository } = await fixture();
   const calls: string[] = [];
   const fakeChild: ChildRunner = async (request) => {
     calls.push(`${request.mode}:${request.nodeId}`);
     if (request.mode === "discovery") {
-      return outcome(join(parent, `${request.nodeId}.jsonl`), report("discovery", `Evidence for ${request.nodeId}`), [request.guideModel]);
+      return outcome(join(parent, `${request.nodeId}.jsonl`), discoveryReport(`Evidence for ${request.nodeId}`), [request.guideModel]);
     }
-    if (request.mode === "assurance") {
-      return outcome(join(parent, "assurance.jsonl"), report("assurance", "Composed behavior satisfies the envelope."), [request.guideModel]);
+    if (request.mode === "assurance_review") {
+      return outcome(
+        join(parent, `${request.nodeId}.jsonl`),
+        assuranceReview(request.responsibility as "behavior" | "structure" | "evidence"),
+        [request.guideModel],
+      );
     }
+    if (request.mode === "assurance_synthesis") {
+      return outcome(join(parent, "synthesis.jsonl"), assuranceSynthesis([]), [request.guideModel]);
+    }
+    if (request.mode !== "implementation") throw new Error(`Unexpected mode ${request.mode}`);
     const file = request.nodeId === "alpha" ? "src/a.txt" : "src/b.txt";
     await writeFile(join(request.targetCwd, file), `${request.nodeId}\n`);
     await git(request.targetCwd, "add", file);
@@ -70,7 +84,7 @@ test("engine gates execution, composes parallel isolated commits deterministical
     const commit = await git(request.targetCwd, "rev-parse", "HEAD");
     return outcome(
       join(parent, `${request.nodeId}.jsonl`),
-      report("implementation", `Implemented ${request.nodeId}`, { commit, changedFiles: [file] }),
+      implementationReport(`Implemented ${request.nodeId}`, commit, [file]),
       [request.guideModel, request.executorModel!],
     );
   };
@@ -85,56 +99,44 @@ test("engine gates execution, composes parallel isolated commits deterministical
       parentSessionFile: join(parent, "parent.jsonl"),
       baseCommit: info.head,
       runId: "integration-run",
+      playbook: testPlaybook,
     }, { repository, runChild: fakeChild });
 
     await assert.rejects(() => begun.engine.execute({ nodes: [] }), /expected approved/);
     let run = await begun.engine.discover({
-      investigations: [
-        { id: "how", lens: "mechanism", objective: "Find the files." },
-        { id: "why", lens: "intent", objective: "Confirm the outcome." },
+      topology: "partition",
+      assignments: [
+        { id: "how", lens: "mechanism", objective: "Find the files.", model: "provider/guide", thinking: "high" },
+        { id: "why", lens: "intent", objective: "Confirm the outcome.", model: "provider/guide", thinking: "high" },
       ],
-      model: "provider/guide",
-      thinking: "high",
     });
     assert.equal(run.phase, "awaiting_agreement");
 
+    const { approvedAt: _approvedAt, ...agreement } = commandAgreement;
     run = await begun.engine.recordAgreement({
+      ...agreement,
       outcome: "Both values are updated.",
       nonGoals: ["No third file."],
-      reuseDecision: "Use existing files.",
       structure: "Each node owns one file.",
       expectedScale: "Two one-line edits.",
       verificationBoundary: "Read both files after composition.",
       verificationCommands: ["test \"$(cat src/a.txt)\" = alpha", "test \"$(cat src/b.txt)\" = beta"],
-      unresolvedDecisions: [],
+      verificationProcedure: "Read both files from the composed root.",
+      requiredEvidence: ["Both composed-root value checks pass."],
     }, true, "checkpoint");
     assert.equal(run.phase, "approved");
 
     run = await begun.engine.execute({
       nodes: [
         {
-          id: "beta",
-          objective: "Set b.",
-          claimedPaths: ["src/b.txt"],
-          dependencies: [],
+          ...nodeSpec("beta", ["src/b.txt"]),
+          brief: { ...nodeSpec("beta", ["src/b.txt"]).brief, goal: "Set b." },
           verificationCommands: ["test \"$(cat src/b.txt)\" = beta"],
-          supersedes: [],
-          guideModel: "provider/guide",
-          executorModel: "provider/executor",
-          guideThinking: "high",
-          executorThinking: "high",
         },
         {
-          id: "alpha",
-          objective: "Set a.",
-          claimedPaths: ["src/a.txt"],
-          dependencies: [],
+          ...nodeSpec("alpha", ["src/a.txt"]),
+          brief: { ...nodeSpec("alpha", ["src/a.txt"]).brief, goal: "Set a." },
           verificationCommands: ["test \"$(cat src/a.txt)\" = alpha"],
-          supersedes: [],
-          guideModel: "provider/guide",
-          executorModel: "provider/executor",
-          guideThinking: "high",
-          executorThinking: "high",
         },
       ],
       maxConcurrency: 2,
@@ -144,11 +146,24 @@ test("engine gates execution, composes parallel isolated commits deterministical
     assert.equal(await readFile(join(root, "src", "a.txt"), "utf8"), "alpha\n");
     assert.equal(await readFile(join(root, "src", "b.txt"), "utf8"), "beta\n");
     assert.equal(run.globalVerification.every((item) => item.exitCode === 0), true);
+    assert.equal(run.productVerification?.revision, run.composedCommit);
     assert.deepEqual(run.nodes.map((node) => node.state), ["composed", "composed"]);
 
-    run = await begun.engine.assure({ model: "provider/guide", thinking: "high" });
+    for (const step of testPlaybook.steps) await begun.engine.recordProgress(step, "completed");
+    run = await begun.engine.assure(assuranceAssignments);
+    assert.equal(run.phase, "awaiting_judgment");
+    run = await begun.engine.judgeAssurance({ judgments: [] });
     assert.equal(run.phase, "complete");
-    assert.deepEqual(calls, ["discovery:how", "discovery:why", "implementation:alpha", "implementation:beta", "assurance:assurance"]);
+    assert.deepEqual(calls, [
+      "discovery:how",
+      "discovery:why",
+      "implementation:alpha",
+      "implementation:beta",
+      "assurance_review:assurance-behavior",
+      "assurance_review:assurance-structure",
+      "assurance_review:assurance-evidence",
+      "assurance_synthesis:assurance-synthesis",
+    ]);
 
     const recovered = await WorkgraphEngine.open(run.statePath, { repository, runChild: fakeChild }).load();
     assert.equal(recovered.revision, run.revision);
@@ -158,17 +173,51 @@ test("engine gates execution, composes parallel isolated commits deterministical
   }
 });
 
+test("scheduler rejects a committed file outside the worker's claimed paths", async () => {
+  const { parent, root, repository } = await fixture();
+  const child: ChildRunner = async (request) => {
+    await writeFile(join(request.targetCwd, "src", "b.txt"), "outside-claim\n");
+    await git(request.targetCwd, "add", "src/b.txt");
+    await git(request.targetCwd, "commit", "-m", "Change outside claim");
+    const commit = await git(request.targetCwd, "rev-parse", "HEAD");
+    return outcome(join(parent, "outside.jsonl"), implementationReport("Changed the wrong file.", commit, ["src/b.txt"]));
+  };
+  try {
+    const info = await GitRepository.inspect(root);
+    const begun = await WorkgraphEngine.begin({
+      request: "Change only a.",
+      projectRoot: root,
+      gitCommonDir: info.commonDir,
+      parentSessionId: "parent",
+      parentSessionFile: join(parent, "parent.jsonl"),
+      baseCommit: info.head,
+      playbook: testPlaybook,
+    }, { repository, runChild: child });
+    await begun.engine.store.update((run) => {
+      run.agreement = commandAgreement;
+      run.phase = "approved";
+    });
+    const run = await begun.engine.execute({ nodes: [nodeSpec("claimed", ["src/a.txt"])] });
+    assert.equal(run.phase, "revision_required");
+    assert.equal(run.nodes[0]!.state, "failed");
+    assert.match(run.nodes[0]!.error ?? "", /outside its claimed paths/);
+    assert.equal(await readFile(join(root, "src", "b.txt"), "utf8"), "old-b\n");
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("a routine worker failure can be replaced inside the existing approved envelope", async () => {
   const { parent, root, repository } = await fixture();
   const child: ChildRunner = async (request) => {
     if (request.nodeId === "failed") {
-      return outcome(join(parent, "failed.jsonl"), report("implementation", "Transient worker failure.", { status: "failed" }));
+      return outcome(join(parent, "failed.jsonl"), { ...implementationReport("Transient worker failure."), status: "failed" });
     }
     await writeFile(join(request.targetCwd, "src", "a.txt"), "recovered\n");
     await git(request.targetCwd, "add", "src/a.txt");
     await git(request.targetCwd, "commit", "-m", "Recover value");
     const commit = await git(request.targetCwd, "rev-parse", "HEAD");
-    return outcome(join(parent, "replacement.jsonl"), report("implementation", "Recovered.", { commit, changedFiles: ["src/a.txt"] }));
+    return outcome(join(parent, "replacement.jsonl"), implementationReport("Recovered.", commit, ["src/a.txt"]));
   };
   try {
     const info = await GitRepository.inspect(root);
@@ -179,53 +228,43 @@ test("a routine worker failure can be replaced inside the existing approved enve
       parentSessionId: "parent",
       parentSessionFile: join(parent, "parent.jsonl"),
       baseCommit: info.head,
+      playbook: testPlaybook,
     }, { repository, runChild: child });
     await begun.engine.store.update((run) => {
       run.agreement = {
+        ...commandAgreement,
         outcome: "src/a.txt contains recovered.",
-        nonGoals: [],
-        reuseDecision: "Reuse the file.",
-        structure: "One node owns src/a.txt.",
-        expectedScale: "One line.",
         verificationBoundary: "Check src/a.txt.",
         verificationCommands: ["test \"$(cat src/a.txt)\" = recovered"],
-        unresolvedDecisions: [],
-        approvedAt: new Date().toISOString(),
       };
       run.phase = "approved";
     });
-    let run = await begun.engine.execute({
-      nodes: [{
-        id: "failed",
-        objective: "Set src/a.txt.",
-        claimedPaths: ["src/a.txt"],
-        dependencies: [],
-        verificationCommands: [],
-        supersedes: [],
-        guideModel: "provider/guide",
-        executorModel: "provider/executor",
-        guideThinking: "high",
-        executorThinking: "high",
-      }],
-    });
+    let run = await begun.engine.execute({ nodes: [nodeSpec("failed", ["src/a.txt"])] });
     assert.equal(run.phase, "revision_required");
     run = await begun.engine.execute({
       nodes: [{
-        id: "replacement",
-        objective: "Replace the failed node and set src/a.txt.",
-        claimedPaths: ["src/a.txt"],
-        dependencies: [],
-        verificationCommands: ["test \"$(cat src/a.txt)\" = recovered"],
+        ...nodeSpec("replacement", ["src/a.txt"]),
         supersedes: ["failed"],
-        guideModel: "provider/guide",
-        executorModel: "provider/executor",
-        guideThinking: "high",
-        executorThinking: "high",
+        verificationCommands: ["test \"$(cat src/a.txt)\" = recovered"],
       }],
     });
     assert.equal(run.phase, "awaiting_assurance");
     assert.equal(run.nodes.find((node) => node.id === "failed")!.state, "superseded");
     assert.equal(run.nodes.find((node) => node.id === "replacement")!.state, "composed");
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("worktree creation reuses a clean crash-window placement for the same pending node", async () => {
+  const { parent, repository } = await fixture();
+  try {
+    const base = await repository.head();
+    const first = await repository.createWorktree("retry-run", "worker", base);
+    const second = await repository.createWorktree("retry-run", "worker", base);
+    assert.deepEqual(second, first);
+    assert.equal(await repository.head(second.path), base);
+    assert.equal(await repository.status(second.path), "");
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

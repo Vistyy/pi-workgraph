@@ -59,6 +59,43 @@ export class GitRepository {
     const path = join(worktreeRoot, nodeId);
     const branch = `pi-workgraph/${sanitizeRef(runId)}/${sanitizeRef(nodeId)}`;
     await mkdir(worktreeRoot, { recursive: true });
+
+    const pruned = await runProcess("git", ["-C", this.root, "worktree", "prune"], {
+      cwd: this.root,
+      timeoutMs: 30_000,
+    });
+    if (pruned.exitCode !== 0) throw new Error(`Could not prune stale worktree records: ${pruned.stderr || pruned.stdout}`);
+    const worktrees = parseWorktreeList(await gitText(this.root, ["worktree", "list", "--porcelain"], true));
+    const registered = worktrees.find((worktree) => worktree.branch === branch || resolve(worktree.path) === resolve(path));
+    if (registered) {
+      if (registered.branch !== branch || resolve(registered.path) !== resolve(path)) {
+        throw new Error(`Worktree identity collision for ${nodeId}: ${registered.path} on ${registered.branch ?? "detached HEAD"}.`);
+      }
+      const existingHead = await this.head(path);
+      const existingStatus = await this.status(path);
+      if (existingHead === baseCommit && !existingStatus) return { path, branch, baseCommit };
+      throw new Error(`Existing worktree ${path} contains uncertain state at ${existingHead}; inspect it before retrying.`);
+    }
+
+    const branchRef = `refs/heads/${branch}`;
+    const branchExists = await runProcess("git", ["-C", this.root, "rev-parse", "--verify", "--quiet", branchRef], {
+      cwd: this.root,
+      timeoutMs: 30_000,
+    });
+    if (branchExists.exitCode === 0) {
+      const existingHead = await gitText(this.root, ["rev-parse", branchRef]);
+      if (existingHead !== baseCommit) {
+        throw new Error(`Existing worker branch ${branch} contains uncertain state at ${existingHead}; inspect it before retrying.`);
+      }
+      const deleted = await runProcess("git", ["-C", this.root, "branch", "-D", branch], {
+        cwd: this.root,
+        timeoutMs: 30_000,
+      });
+      if (deleted.exitCode !== 0) throw new Error(`Could not remove stale worker branch ${branch}: ${deleted.stderr || deleted.stdout}`);
+    } else if (branchExists.exitCode !== 1) {
+      throw new Error(`Could not inspect worker branch ${branch}: ${branchExists.stderr || branchExists.stdout}`);
+    }
+
     await rm(path, { recursive: true, force: true });
     const result = await runProcess("git", ["-C", this.root, "worktree", "add", "-b", branch, path, baseCommit], {
       cwd: this.root,
@@ -246,6 +283,20 @@ async function gitText(cwd: string, args: string[], allowEmpty = false): Promise
   if (result.exitCode !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
   if (!allowEmpty && !result.stdout) throw new Error(`git ${args.join(" ")} returned no output.`);
   return result.stdout;
+}
+
+function parseWorktreeList(value: string): Array<{ path: string; branch?: string }> {
+  if (!value.trim()) return [];
+  return value.trim().split(/\n\n+/).map((block) => {
+    const lines = block.split("\n");
+    const pathLine = lines.find((line) => line.startsWith("worktree "));
+    if (!pathLine) throw new Error(`Invalid git worktree record: ${block}`);
+    const branchLine = lines.find((line) => line.startsWith("branch refs/heads/"));
+    return {
+      path: pathLine.slice("worktree ".length),
+      ...(branchLine ? { branch: branchLine.slice("branch refs/heads/".length) } : {}),
+    };
+  });
 }
 
 function sanitizeRef(value: string): string {

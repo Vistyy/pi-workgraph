@@ -14,6 +14,12 @@ export interface NewRunInput {
   parentSessionId: string;
   parentSessionFile: string;
   baseCommit: string;
+  playbook: {
+    id: string;
+    title: string;
+    completionPredicate: string;
+    steps: readonly string[];
+  };
   now?: Date;
   runId?: string;
 }
@@ -47,6 +53,12 @@ export class RunStateStore {
       composedCommit: input.baseCommit,
       createdAt: now,
       updatedAt: now,
+      playbook: {
+        id: input.playbook.id,
+        title: input.playbook.title,
+        completionPredicate: input.playbook.completionPredicate,
+        steps: input.playbook.steps.map((id) => ({ id, status: "pending" })),
+      },
       discoveries: [],
       nodes: [],
       composition: [],
