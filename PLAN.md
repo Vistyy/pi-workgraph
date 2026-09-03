@@ -1,153 +1,199 @@
-# Pi Workgraph Prototype Plan
+# Pi Workgraph Implementation Envelope
 
 ## Status
 
-The user approved this implementation envelope in the parent Pi session on 2026-09-02.
-This file is the durable checkpoint for the prototype and remains the authority if the parent session is compacted.
+The user approved this revised implementation envelope in the parent Pi session on 2026-09-03.
+This file is the durable authority for the current Workgraph implementation.
 
 ## Outcome
 
-Build a near-final Pi package that turns a materially ambiguous coding request into a visible agreement, then coordinates isolated implementation and assurance without making the user manage agents.
-The user should experience one coordinator conversation, one explicit approval checkpoint, and one concise final result.
-The implementation should prove the complete path on a disposable Git repository with real Pi sessions and configured models.
+Build a Pi package that lets one coordinator dynamically compose proven coding playbooks while Workgraph makes delegation, model selection, isolation, evidence, composition, and recovery reliable.
+The user should provide a goal and completion condition without managing agents or seeing routine worker events.
+The coordinator should surface only the initial agreement, genuine authority-changing decisions, material blockers, and the final evidenced result.
 
-## Stop boundary
+## Current structural boundary
 
-The prototype will support one local Git repository, one active workgraph per coordinator session, bounded parallelism, local Pi subprocesses, Git worktrees, exact-commit composition, and command-based verification.
-It will not provide remote workers, pull request automation, a dashboard, a general workflow language, nested agent teams, long-running daemon supervision, or a reusable project-management backlog.
-It will not automatically resolve semantic merge conflicts or silently broaden an approved implementation envelope.
-It will not modify the user's global Pi settings to install itself.
-
-## Reuse decision
-
-The package will reuse Pi extension tools, extension lifecycle events, `SessionManager.forkFrom`, model selection, session persistence, and normal CLI model authentication.
-It will reuse Git branches, worktrees, commits, diffs, and cherry-picks as the isolation and composition protocol.
-It will reuse the strongest applicable project verification commands supplied in the approved envelope.
-It will not depend on P-Stack or Herdr because their worker lifecycle and UI ownership introduce requirements that this prototype does not need.
-It will use plain TypeScript and Node.js rather than Effect unless implementation evidence reveals a lifecycle or concurrency problem that Effect directly removes.
-
-## Structural shape and ownership
+Workgraph retains a structured lifecycle around one implementation DAG:
 
 ```text
-Coordinator Pi session
-  -> agreement policy blocks product writes
-  -> discovery runner forks read-only sessions
-  -> approved implementation envelope
-  -> durable scheduler selects ready work nodes
-  -> worktree runner forks inherited sessions
-       -> guide model verifies local context
-       -> worker records bounded TODOs
-       -> worker lands first successful edit
-       -> same session switches to executor model
-       -> worker verifies and commits
-       -> worker returns a typed report
-  -> composition owner validates and cherry-picks exact commits
-  -> assurance runner inspects the composed result
-  -> coordinator reports evidence or requests a human decision
+playbook selection
+  -> bounded discovery
+  -> agreement
+  -> implementation DAG
+  -> composition and product verification
+  -> assurance review and synthesis
+  -> completion or bounded correction
 ```
 
-The coordinator owns semantic synthesis, the agreement checkpoint, and interpretation of escalations.
-The scheduler owns node identifiers, dependencies, states, exact commits, ready queues, and deterministic transition order.
-The worker runtime owns one branch objective, one worktree, one inherited Pi session, the local Prewalk transition, and one typed result.
-The composition module owns clean-worktree checks, claimed-path validation, exact cherry-picks, and conflict containment.
-The assurance module owns read-only review of the composed result and typed findings.
-The human decision queue owns all approval and authority-changing interactions and permits at most one unresolved prompt.
+Discovery, implementation, verification, and assurance will not become arbitrary mixed graph node kinds in this implementation.
+The question of whether unrelated branches continue while one branch awaits a human decision remains open until real use establishes a need.
+The implementation DAG continues to support parallel non-overlapping nodes and dependency-ordered waves.
 
-## Agreement policy
+## Coordinator contract
 
-Entering a workgraph disables the coordinator's direct `edit` and `write` tools and blocks known mutating shell commands.
-Discovery sessions are restricted to read-only tools.
-The approval checkpoint must contain the outcome, non-goals, reuse decision, structural ownership, expected scale, verification boundary, and unresolved decisions.
-Implementation cannot start until the user approves that checkpoint through Pi's UI.
-Approval creates an implementation envelope rather than a frozen step list.
-A worker may make local reversible decisions inside the envelope.
-A discovery that changes the outcome, non-goals, owner, public interface, dependency, security guarantee, scale, or reuse-versus-custom decision must stop affected work and return an escalation.
-The coordinator remains read-only after approval except for a demonstrably tiny integration correction inside the envelope.
-The prototype will not automate that exception.
+The coordinator owns playbook selection, semantic synthesis, agreement, worker briefs, correction routing, and final judgment.
+The coordinator keeps its normal Pi tools throughout the run.
+Workgraph must not add, remove, or mechanically block coordinator tools based on phase.
+The coordinator follows injected instructions to establish agreement before substantial implementation.
+The stable tool inventory preserves provider prompt-prefix caching and avoids encoding coordinator judgment as a tool restriction.
 
-## Public prototype interface
+## Playbooks and methods
 
-The package will expose a small set of coordinator tools rather than a workflow language.
+Workgraph owns its playbooks and does not depend on PStack at runtime.
+The initial playbook families are:
 
-- `workgraph_begin` records the request, verifies repository preconditions, starts the durable run, and activates the write gate.
-- `workgraph_discover` runs a bounded set of inherited-context read-only investigations in parallel and returns typed reports.
-- `workgraph_agree` records the complete implementation envelope and serializes the user approval interaction.
-- `workgraph_execute` adds or resumes a bounded dependency graph, runs ready workers, validates their results, and composes successful waves.
-- `workgraph_assure` runs read-only assurance against the composed result and returns typed findings.
-- `workgraph_status` reports durable run, node, worktree, session, and escalation state.
+- Understand with Investigation, Runtime forensics, and Trace forensics.
+- Decide with Prototype, Architecture, Arena, and Eval.
+- Change with Bug fix, Feature, Refactoring, Performance, and Visual parity.
+- Operate with Autonomous run, Pause safely, Session pickup, and Figure it out when no narrower playbook fits.
 
-The exact schemas may be combined if implementation proves that fewer tools reduce caller knowledge without weakening phase gates.
+The coordinator loads one matching playbook through a stable Workgraph tool.
+The selected playbook, completion predicate, ordered steps, completed steps, and explicit skip reasons are durable run state.
+The coordinator may compose partitioned exploration, replicated investigation, evidence-source investigation, synthesis, prototype, arena, swarm, and review methods as a playbook requires.
+The runtime must not force every method into every run.
 
-## Durable state
+## Discovery topology
 
-Each transition will be written atomically under the repository's Git common directory before its associated external operation is considered complete.
-The state will include the run identifier, parent session identifier, base and composed commits, phase, approved envelope, nodes, dependencies, attempts, worktree paths, child session files, process outcomes, reports, exact commits, composition records, assurance findings, and human decisions.
-A coordinator-session custom entry will point to the active run so state remains branch-aware and discoverable after resume.
-On recovery, the scheduler must inspect Git and session state before retrying an operation whose result may already have landed.
+Every discovery call declares why work is parallel:
 
-## Work node contract
+- Partition assigns different evidence slices and requires coverage of the requested slices.
+- Replicate sends the same consequential question to different model families and preserves convergence and disagreement.
+- Evidence assigns distinct evidence categories when historical or operational rationale affects the decision.
 
-A work node has a stable identifier, objective, claimed paths, dependency identifiers, verification commands, guide model, executor model, and state.
-The scheduler may run ready nodes concurrently only when their claimed paths do not overlap.
-A worker result must report completion or escalation, summary, changed files, verification evidence, commit, and findings.
-A worker cannot report completion with an uncommitted or dirty worktree.
-The scheduler validates the reported commit and actual changed paths rather than trusting the report.
+Partitioned exploration uses the configured explorer target unless the coordinator supplies a justified override.
+Replicated discovery selects a bounded subset of the configured heterogeneous panel.
+Every requested lane must settle as completed, failed, timed out, cancelled, or superseded.
+The coordinator must see dropouts instead of silently receiving a smaller panel.
+Substantial fan-out may receive a synthesis operation, while ordinary discovery is synthesized directly by the Sol coordinator.
 
-## Local Prewalk contract
+## Model policy
 
-The guide phase receives the inherited parent trajectory plus only the branch objective and execution envelope.
-It must inspect the local worktree, record a bounded TODO list, and make the first successful edit.
-The worker extension blocks an edit until the TODO list exists.
-After the first successful `edit` or `write`, the extension removes transient guide instructions and switches the same Pi session to the executor model.
-The executor continues from the same trajectory, completes the objective, verifies it, commits it, and emits the typed result.
-A model switch does not preserve the guide model's provider cache, so the benefit claimed for the executor is reduced exploration and preserved trajectory rather than cross-model cache reuse.
+Workgraph owns a durable role-to-model configuration independent of PStack.
+The initial defaults copy the user's current Pi PStack choices:
 
-## Composition and assurance
+- Partitioned exploration uses `opencode-go/muse-spark-1.3-contributor` with high thinking.
+- Replicated investigation draws from Muse Spark, `openai-codex/gpt-5.6-terra`, `opencode-go/glm-5.3-flash`, and `opencode-go/deepseek-v4-flash`, all with high thinking.
+- Local Prewalk uses `openai-codex/gpt-5.6-sol` as guide and `openai-codex/gpt-5.6-luna` as executor, both with high thinking.
+- Assurance responsibilities have independently configurable targets.
+- Assurance synthesis uses `openai-codex/gpt-5.6-luna` with high thinking.
 
-Each parallel wave starts from one recorded composition commit.
-After a wave settles, the scheduler validates each successful commit and cherry-picks commits in stable node-identifier order.
-A clean mechanical composition proceeds without user interaction.
-A cherry-pick conflict is aborted and recorded as an integration escalation without discarding worker branches or worktrees.
-Dependent nodes start only after their dependencies are composed.
-Assurance runs read-only after composition and returns typed findings.
-Required findings may become additional work nodes through another `workgraph_execute` call within the same approved envelope.
-A finding outside the envelope enters the human decision queue instead.
+Model selection is role-based and may be overridden per operation.
+The runtime validates availability before starting a configured panel and reports unavailable members as explicit dropouts.
+The coordinator should use two or three replicated discovery models ordinarily and reserve the full panel for consequential decisions.
+The initial assurance-role assignments are provisional and must remain configurable until role-specific evaluation provides better evidence.
+Cost is material when models provide comparable results, with Muse Spark treated as the lowest-cost default under the user's supplied pricing relationship.
 
-## Expected implementation scale
+## Worker brief
 
-The target is one Pi package with one coordinator extension, one worker extension, focused runtime modules, and tests.
-The target size is roughly 1,500 to 2,500 lines of TypeScript plus instructions and verification fixtures.
-The prototype should prefer direct code and explicit discriminated unions over adapters without a demonstrated variation.
+Every spawned worker receives one bounded brief with these fields:
+
+- Goal states the owned outcome.
+- Scope states claimed paths and forbidden scope.
+- Context points to required source, decisions, and upstream reports.
+- Acceptance contains observable completion conditions.
+- Verify names commands or the product-verification procedure.
+- Timebox states when to return partial evidence instead of wandering.
+- Forbidden states prohibited operations and changes.
+- Report defines the terminal result contract.
+
+A dependency is both an ordering edge and a context relay.
+The coordinator must pass required upstream evidence into downstream briefs rather than assuming workers can inspect sibling sessions.
+Workers cannot recursively delegate.
+
+## Local Prewalk
+
+An implementation worker starts in an inherited parent-session fork and an isolated Git worktree.
+The Sol guide inspects local context, records bounded TODOs, and makes the first successful edit.
+The same session then switches to the Luna executor, which completes, verifies, commits, and reports.
+The scheduler validates the actual commit, changed paths, and worktree state instead of trusting the report.
+
+## Product verification and evidence
+
+The agreement records the verification boundary and verification method before implementation.
+The coordinator decides whether commands directly observe the required result or whether independent product verification is necessary.
+The scheduler runs sufficient command-based verification directly when existing commands cross the real behavior boundary.
+For interactive, visual, judgment-laden, or otherwise unobserved behavior, Workgraph starts an independent verifier after composition.
+The verifier drives the composed product and produces evidence such as screenshots, interaction observations, console output, network records, traces, profiles, or stored values.
+The implementer may provide provisional evidence, but independent composed-result evidence has higher authority.
+
+Evidence is keyed to the exact composed commit.
+A later commit invalidates an earlier verdict until the affected boundary is verified again.
+One-time evidence does not automatically become durable test coverage.
+A test is retained only when it protects a distinct enduring invariant at acceptable maintenance cost.
+
+## Assurance
+
+Assurance runs after composed-result verification.
+It uses exactly one reviewer for each applicable responsibility rather than multiplying every responsibility across every model family.
+The default responsibilities are:
+
+- Behavior reviews realistic correctness, integration, failure behavior, concurrency, recovery, security, and performance where relevant.
+- Structure reviews deletion opportunities, smallest coherent scope, types, ownership, boundaries, abstractions, reader load, and maintainability.
+- Evidence reviews whether the observed artifacts and retained checks establish distinct consequential invariants without implementation-detail or duplicate-test burden.
+
+Reviewers decide whether the change should be accepted and may return no findings.
+They do not receive an issue quota or instructions to manufacture adversarial findings.
+A candidate finding must identify a violated invariant, concrete evidence, a reachable scenario, material consequence, the simplest response, confidence, and whether the response deletes or adds complexity.
+Impossible, immaterial, duplicate, speculative, or purely stylistic findings must not create correction work.
+The structural reviewer begins by asking what can be removed while preserving the agreed behavior.
+The evidence reviewer may recommend deleting redundant or implementation-coupled tests.
+
+Luna synthesizes the responsibility reports by deduplicating findings, checking support, and classifying them as accepted, optional, dismissed, or inconclusive.
+The Sol coordinator remains the final authority over which accepted findings become work.
+A local finding resumes the original implementation trajectory in a fresh worktree based on the current composed commit when practical.
+A cross-node finding becomes a bounded correction or integration node.
+An envelope-changing finding returns to the serialized human decision boundary.
+Corrections rerun affected product verification and assurance instead of looping until every reviewer is silent.
+
+## Context and result relay
+
+Child transcripts remain durable by path and are not copied wholesale into the coordinator context.
+Children return bounded typed reports with evidence pointers.
+A synthesis step reduces substantial fan-out before the coordinator consumes it.
+Every spawned child is accounted for, including dropouts.
+Progress records model, thinking level, state, turns, usage, and available context evidence without requiring a live dashboard.
+
+## Durable orchestration
+
+State remains atomic under the repository's Git common directory.
+The state includes the selected playbook, completion predicate, steps, model assignments, discovery topology and lane outcomes, agreement, worker briefs, implementation nodes, child sessions, commits, composition records, product-verification evidence, assurance reports, synthesis verdict, human decisions, and usage.
+Before retrying an uncertain operation, recovery inspects the session, worktree, branch, commit, and coordinator repository.
+Retries depend on observed failure mode and remain bounded.
+Unknown results are reconciled before replacement work begins.
+
+## Selective operating mechanisms
+
+Workgraph should adopt these mechanisms when the run earns their cost:
+
+- A pilot unit before broad repeated fan-out when one bad brief would multiply.
+- An append-only decision trail for long or unattended work.
+- Persisted standing instructions reconstructed on worker resume.
+- A completion inbox when genuine background execution replaces blocking batches.
+- Reflection over completed runs to propose playbook or runtime improvements, with human approval before durable instruction changes.
+
+These mechanisms must not become mandatory ceremony for ordinary work.
+
+## Deferred scope
+
+This implementation does not include pull request creation, PR babysitting, shipping, merging, or forge automation.
+It does not include Herdr integration, live worker panes, a worker dashboard, or daemon supervision.
+It accepts that child execution is not live-observable beyond coordinator progress updates, while durable sessions, reports, worktrees, commits, and usage remain inspectable afterward.
+It does not include PStack as a dependency, remote workers, nested delegation, a general workflow language, or hundred-agent program machinery.
 
 ## Verification boundary
 
-Unit checks will cover state transitions, dependency readiness, claimed-path overlap, agreement gating, worker-report parsing, and composition failure containment.
-An integration check will use a disposable Git fixture and deterministic fake worker processes to exercise begin, approval, parallel work, composition, assurance, and recovery state without model variability.
-A real-system check will use actual Pi subprocesses and configured guide and executor models on a disposable Git fixture.
-The real-system check must establish inherited session context, read-only discovery, TODO-before-edit enforcement, the post-edit model switch, isolated commits, exact composition, verification execution, typed assurance, and concise coordinator-visible evidence.
-Passing checks will establish only the observed local prototype path and will not establish crash safety for every process timing or unattended production operation.
-
-## Decision-driving hypothesis
-
-Pi's existing extension, session, model, and CLI primitives plus Git are sufficient to implement this workflow without a separate orchestration framework or Herdr dependency.
-The hypothesis is supported if the real-system fixture completes the entire path with durable inspectable state and no manual worker coordination.
-The hypothesis is refuted if inherited-context forks, in-session model switching after the first edit, or reliable exact-commit composition cannot be implemented through supported Pi and Git interfaces.
-The result is inconclusive if model availability or external service failure prevents the real-system boundary from running.
+Deterministic checks must establish playbook loading and progress, stable coordinator tools, topology expansion, heterogeneous model assignment, dropout accounting, brief construction, existing scheduler and Git invariants, verification routing, evidence invalidation, responsibility-specific assurance synthesis, finding rejection, and correction routing.
+Integration checks must use disposable Git repositories and real supported boundaries where model variability is not required.
+A bounded model-backed run must establish at least one heterogeneous discovery, Local Prewalk transition, composition, composed-result verification, three responsibility reports, Luna synthesis, and concise coordinator completion.
+Passing checks establish only the observed local Linux, Node.js 24, Pi 0.84.4, Git, and configured-model path.
 
 ## Implementation sequence
 
-1. Create package metadata, domain types, atomic state storage, and deterministic scheduler rules.
-2. Implement Git repository, worktree, commit-validation, and composition operations.
-3. Implement child session forking, subprocess event capture, typed result extraction, and bounded concurrency.
-4. Implement the worker extension with read-only discovery mode and the Local Prewalk transition.
-5. Implement coordinator tools, write gates, approval UI, persisted run linkage, and concise rendering.
-6. Add deterministic tests and a disposable end-to-end fixture.
-7. Run one bounded real-model end-to-end scenario, record evidence and cost, and correct defects within this envelope.
-8. Document operation, verified guarantees, and remaining limitations.
-
-## Unresolved local decisions
-
-The exact number and grouping of public tools may change if tests show a simpler interface with the same phase guarantees.
-The state schema may gain fields required for recovery evidence, but it must not become a general workflow definition.
-The initial real-model fixture will use `openai-codex/gpt-5.6-sol` as the guide and `openai-codex/gpt-5.6-luna` as the executor unless availability changes.
-These decisions are local and reversible inside the approved envelope.
+1. Add the playbook catalog, loader tool, durable playbook selection, and progress state.
+2. Remove coordinator tool gating while retaining a stable coordination policy.
+3. Add Workgraph model configuration and role resolution.
+4. Replace same-model generic discovery with topology-aware lane expansion and explicit dropouts.
+5. Deepen worker briefs and bounded result relay.
+6. Add verification plans, exact-revision evidence, and optional independent verifier execution.
+7. Replace single assurance with three responsibility reviewers and Luna synthesis.
+8. Add deterministic and real-system verification, then revise only from observed failures.
