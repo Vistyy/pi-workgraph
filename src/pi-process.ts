@@ -71,6 +71,18 @@ export function buildChildArguments(request: Pick<ChildRequest, "mode" | "guideM
   return ["--mode", "json", "--print", "--session", sessionFile, "--model", initialModel, "--thinking", initialThinking, "Continue the assigned Workgraph objective now."];
 }
 
+export async function forkConversationSession(request: { parentSessionFile: string; targetCwd: string; entryId?: string }): Promise<string> {
+  const parent = SessionManager.open(request.parentSessionFile);
+  const child = SessionManager.forkFrom(request.parentSessionFile, request.targetCwd);
+  if (request.entryId) {
+    if (!parent.getEntry(request.entryId)) throw new Error(`Unknown conversation entry: ${request.entryId}`);
+    child.branch(request.entryId);
+  }
+  const file = child.getSessionFile();
+  if (!file) throw new Error("Forked coordinator session did not produce a session file.");
+  return file;
+}
+
 export async function forkSession(request: Pick<ChildRequest, "parentSessionFile" | "targetCwd" | "sessionDir" | "objective" | "mode" | "runId" | "nodeId" | "stableEntryId">): Promise<string> {
   await mkdir(request.sessionDir, { recursive: true });
   const parent = SessionManager.open(request.parentSessionFile);

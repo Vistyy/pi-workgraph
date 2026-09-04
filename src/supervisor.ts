@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
-import { WorkgraphEngine, type ScheduleInput } from "./engine.js";
+import { validateSynthesis, WorkgraphEngine, type ScheduleInput } from "./engine.js";
 import type { WorktreePlacement } from "./git.js";
 import { herdrAgentName, type HerdrObservation, type VisibleWorkerRuntime } from "./herdr.js";
 import { forkSession, readTerminalText, readWorkgraphReport } from "./pi-process.js";
 import { claimsOverlap, readyWave, transitionNode } from "./scheduler.js";
-import type { ImplementationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun } from "./types.js";
+import type { AssuranceReviewReport, AssuranceSynthesisReport, DiscoveryReport, ImplementationReport, VerificationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun, WorkerMode } from "./types.js";
 
 export interface SupervisorWake {
   kick(): void;
@@ -140,8 +140,9 @@ export class WorkgraphSupervisor {
   private async consumeObservation(attempt: WorkAttempt, observation: HerdrObservation): Promise<void> {
     await this.recordObservation(attempt.id, observation);
     const report = readWorkgraphReport(observation.identity.sessionFile);
-    if (report?.kind === "implementation") {
-      await this.settleTypedAttempt(attempt.id, report);
+    if (report && report.kind === (attempt.mode ?? "implementation")) {
+      if (attempt.mode === "implementation" || !attempt.mode) await this.settleTypedAttempt(attempt.id, report as ImplementationReport);
+      else await this.settleObserverAttempt(attempt.id, report as DiscoveryReport | VerificationReport | AssuranceReviewReport | AssuranceSynthesisReport);
       return;
     }
     if (observation.status === "idle" || observation.status === "done") {
@@ -173,12 +174,78 @@ export class WorkgraphSupervisor {
       });
       return;
     }
-    const runningNodes = run.nodes.filter((node) => node.state === "running");
-    const capacity = Math.max(0, run.control.maxConcurrency - runningNodes.length);
+    const activeCount = run.attempts.filter((attempt) => isActiveAttempt(attempt)).length;
+    let capacity = Math.max(0, run.control.maxConcurrency - activeCount);
     if (capacity === 0) return;
+    const runningNodes = run.nodes.filter((node) => node.state === "running");
     const ready = readyWave(run, capacity).filter((candidate) => !runningNodes.some((running) => claimsOverlap(candidate.claimedPaths, running.claimedPaths)));
     for (const node of ready) {
       await this.claimAndLaunch(node.id);
+      capacity -= 1;
+      if (capacity === 0) return;
+    }
+    const latest = await this.engine.load();
+    const queued = latest.attempts.filter((attempt) => attempt.state === "queued").slice(0, capacity);
+    for (const attempt of queued) await this.launchQueuedAttempt(attempt);
+  }
+
+  private async launchQueuedAttempt(attempt: WorkAttempt): Promise<void> {
+    const run = await this.engine.load();
+    const current = run.attempts.find((candidate) => candidate.id === attempt.id);
+    if (!current || current.state !== "queued" || !current.mode || current.mode === "implementation") return;
+    let liveLaunchAttempted = false;
+    try {
+      const repository = await this.engine.repository();
+      const placement = await repository.createWorktree(run.runId, `observer-${current.nodeId}-${current.id.slice(0, 8)}`, run.composedCommit);
+      const sessionFile = await forkSession({
+        parentSessionFile: current.parentSessionFile ?? run.parentSessionFile,
+        targetCwd: placement.path,
+        sessionDir: join(dirname(run.statePath), "sessions", current.mode),
+        objective: current.objective ?? `Complete the ${current.mode} Workgraph objective.`,
+        mode: current.mode,
+        runId: run.runId,
+        nodeId: current.nodeId,
+        ...(current.stableEntryId !== undefined ? { stableEntryId: current.stableEntryId } : {}),
+      });
+      await this.engine.store.update((draft) => {
+        const retained = requiredAttempt(draft, current.id);
+        if (retained.state !== "queued") return;
+        retained.state = "starting";
+        retained.stage = "starting";
+        retained.worktreePath = placement.path;
+        retained.branch = placement.branch;
+        retained.baseCommit = placement.baseCommit;
+        retained.sessionFile = sessionFile;
+        retained.lastActivityAt = new Date().toISOString();
+        if (retained.mode === "discovery") {
+          const record = draft.discoveries.find((candidate) => candidate.attemptId === retained.id);
+          if (record) record.sessionFile = sessionFile;
+        } else if (retained.mode === "verification") {
+          if (draft.productVerification?.attemptId === retained.id) draft.productVerification.sessionFile = sessionFile;
+        } else if (retained.mode === "assurance_review") {
+          const review = draft.assurance?.reviews.find((candidate) => candidate.attemptId === retained.id);
+          if (review) review.sessionFile = sessionFile;
+        } else if (retained.mode === "assurance_synthesis") {
+          if (draft.assurance?.synthesis?.attemptId === retained.id) draft.assurance.synthesis.sessionFile = sessionFile;
+        }
+      });
+      liveLaunchAttempted = true;
+      const observation = await this.runtime.launch({
+        workspaceId: this.options.workspaceId!,
+        runId: run.runId,
+        nodeId: current.nodeId,
+        attemptId: current.id,
+        cwd: placement.path,
+        sessionFile,
+        prompt: "Continue the assigned Workgraph objective now.",
+        ...(current.model ? { model: current.model } : {}),
+        ...(current.thinking ? { thinking: current.thinking } : {}),
+        env: observerEnvironment(run, current, placement),
+        onIdentity: async (identity) => this.recordIdentity(current.id, identity),
+      });
+      await this.recordObservation(current.id, observation);
+    } catch (error) {
+      await this.recordLaunchFailure(current.id, error, liveLaunchAttempted);
     }
   }
 
@@ -201,7 +268,14 @@ export class WorkgraphSupervisor {
         runtimeMode: "herdr",
         createdAt: now,
         lastActivityAt: now,
+        mode: "implementation",
         baseCommit: draft.composedCommit,
+        parentSessionFile: draft.coordinator.sessionFile,
+        objective: implementationObjective(draft, node),
+        model: node.guideModel,
+        thinking: node.guideThinking,
+        executorModel: node.executorModel,
+        executorThinking: node.executorThinking,
         agentName: herdrAgentName(draft.runId, nodeId, attemptId),
       };
       transitionNode(node, "running");
@@ -260,6 +334,116 @@ export class WorkgraphSupervisor {
     } catch (error) {
       await this.recordLaunchFailure(attempt.id, error, liveLaunchAttempted);
     }
+  }
+
+  private async settleObserverAttempt(
+    attemptId: string,
+    report: DiscoveryReport | VerificationReport | AssuranceReviewReport | AssuranceSynthesisReport,
+  ): Promise<void> {
+    const run = await this.engine.load();
+    const attempt = run.attempts.find((candidate) => candidate.id === attemptId);
+    if (!attempt || !attempt.mode || attempt.mode === "implementation" || !attempt.worktreePath || !attempt.baseCommit) return;
+    try {
+      if (attempt.mode === "assurance_review" && report.kind === "assurance_review" && report.responsibility !== attempt.responsibility) throw new Error("Assurance report responsibility does not match the scheduled attempt.");
+      if (attempt.mode === "assurance_synthesis" && report.kind === "assurance_synthesis" && run.assurance) validateSynthesis(run.assurance.reviews, report.dispositions);
+      const repository = await this.engine.repository();
+      await repository.assertClean(attempt.worktreePath);
+      if (await repository.head(attempt.worktreePath) !== attempt.baseCommit) throw new Error("Observer worktree HEAD changed from the exact composed revision.");
+    } catch (error) {
+      await this.recordAttemptFailure(attemptId, error instanceof Error ? error.message : String(error));
+      return;
+    }
+    const now = new Date().toISOString();
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      if (!isActiveAttempt(current)) return;
+      current.state = "completed";
+      current.stage = "settled";
+      current.settledAt = now;
+      current.lastActivityAt = now;
+      if (current.mode === "discovery" && report.kind === "discovery") {
+        const record = draft.discoveries.find((candidate) => candidate.attemptId === attemptId);
+        if (record) {
+          record.resultKind = "typed";
+          record.report = report;
+          record.state = report.status === "completed" ? "completed" : report.status === "escalated" ? "review_required" : "failed";
+          if (record.state !== "completed") record.error = report.summary;
+          if (record.state === "completed") current.stage = "settled";
+        }
+      } else if (current.mode === "verification" && report.kind === "verification") {
+        const verification = draft.productVerification;
+        if (verification?.attemptId === attemptId) {
+          verification.resultKind = "typed";
+          verification.report = report;
+          const envelopeChange = report.status === "escalated" || report.findings.some((finding) => finding.envelopeImpact !== "none");
+          const failed = report.status === "failed" || report.verdict === "failed";
+          verification.state = report.verdict === "inconclusive" ? "inconclusive" : failed ? "failed" : "completed";
+          if (verification.state !== "completed") verification.error = report.summary;
+          if (envelopeChange) setPhase(draft, "needs_decision", "Product verification found an envelope-changing problem.");
+          else if (failed) setPhase(draft, "revision_required", "Product verification found a correction inside the approved envelope.");
+          else if (verification.state === "completed") setPhase(draft, "awaiting_assurance", "Independent product verification established exact-revision evidence.");
+        }
+      } else if (current.mode === "assurance_review" && report.kind === "assurance_review") {
+        const review = draft.assurance?.reviews.find((candidate) => candidate.attemptId === attemptId);
+        if (review) {
+          review.resultKind = "typed";
+          review.report = report;
+          review.state = report.status === "completed" ? "completed" : report.status === "escalated" ? "failed" : "failed";
+          if (review.state !== "completed") review.error = report.summary;
+        }
+      } else if (current.mode === "assurance_synthesis" && report.kind === "assurance_synthesis") {
+        const synthesis = draft.assurance?.synthesis;
+        if (synthesis?.attemptId === attemptId) {
+          synthesis.resultKind = "typed";
+          synthesis.report = report;
+          synthesis.state = report.status === "completed" && report.verdict !== "inconclusive" ? "completed" : "failed";
+          if (synthesis.state === "completed") {
+            if (draft.assurance) draft.assurance.state = "completed";
+            setPhase(draft, "awaiting_judgment", "Assurance synthesis is ready for coordinator judgment.");
+          } else synthesis.error = report.summary;
+        }
+      }
+      draft.control.updatedAt = now;
+    });
+    if (attempt.mode === "discovery") await this.maybeAdvanceDiscovery();
+    if (attempt.mode === "assurance_review") await this.maybeQueueAssuranceSynthesis();
+    if (attempt.mode === "assurance_review" && report.kind === "assurance_review" && report.status !== "completed") await this.markAssuranceInconclusive("A visible assurance reviewer returned a non-completed report.");
+    if (attempt.mode === "assurance_synthesis" && report.kind === "assurance_synthesis" && (report.status !== "completed" || report.verdict === "inconclusive")) await this.markAssuranceInconclusive("A visible assurance synthesizer returned a non-decision-ready report.");
+  }
+
+  private async maybeAdvanceDiscovery(): Promise<void> {
+    const run = await this.engine.load();
+    const active = run.discoveries.filter((record) => record.state !== "superseded");
+    if (active.length > 0 && active.every((record) => record.state === "completed" && record.report?.status === "completed")) {
+      await this.engine.store.update((draft) => setPhase(draft, "awaiting_agreement", "Asynchronous discovery completed with typed reports for every active lane."));
+    }
+  }
+
+  private async markAssuranceInconclusive(reason: string): Promise<void> {
+    await this.engine.store.update((draft) => {
+      if (draft.assurance) draft.assurance.state = "inconclusive";
+      setPhase(draft, "assurance_inconclusive", reason);
+      draft.control.attentionStatus = "decision_required";
+      draft.control.updatedAt = new Date().toISOString();
+    });
+  }
+
+  private async maybeQueueAssuranceSynthesis(): Promise<void> {
+    const run = await this.engine.load();
+    const assurance = run.assurance;
+    if (!assurance || assurance.state !== "running" || assurance.synthesis || assurance.reviews.some((review) => review.state !== "completed" || !review.report)) return;
+    await this.engine.store.update((draft) => {
+      const current = draft.assurance;
+      if (!current || current.synthesis || current.reviews.some((review) => review.state !== "completed" || !review.report)) return;
+      const model = assurance.synthesisModel;
+      if (!model) return;
+      const thinking = assurance.synthesisThinking ?? "high";
+      const attemptId = randomUUID();
+      current.synthesis = { model, thinking, state: "running", attemptId };
+      draft.attempts.push(observerAttempt(draft, { id: attemptId, nodeId: "assurance-synthesis", mode: "assurance_synthesis", model, thinking, objective: assuranceSynthesisObjective(draft), ...(assurance.stableEntryId !== undefined ? { stableEntryId: assurance.stableEntryId } : {}) }));
+      draft.control.executionStatus = "scheduled";
+      draft.control.updatedAt = new Date().toISOString();
+    });
   }
 
   private async settleTypedAttempt(attemptId: string, report: ImplementationReport): Promise<void> {
@@ -420,9 +604,11 @@ export class WorkgraphSupervisor {
         current.stage = "settled";
         current.settledAt = observation.observedAt;
         delete current.attention;
-        const node = requiredNode(draft, current.nodeId);
-        if (node.state === "running") transitionNode(node, "cancelled");
-        delete node.activeAttemptId;
+        const node = draft.nodes.find((candidate) => candidate.id === current.nodeId);
+        if (node) {
+          if (node.state === "running") transitionNode(node, "cancelled");
+          delete node.activeAttemptId;
+        }
         const otherAttention = draft.attempts.some((candidate) => candidate.id !== current.id && candidate.stage === "attention" && candidate.state !== "completed" && candidate.state !== "cancelled" && candidate.state !== "failed");
         if (!otherAttention && !draft.nodes.some((candidate) => candidate.state === "failed" || candidate.state === "escalated")) {
           draft.control.attentionStatus = "clear";
@@ -443,7 +629,7 @@ export class WorkgraphSupervisor {
 
   private async updateDrainState(run: WorkgraphRun): Promise<void> {
     const active = run.attempts.some((attempt) => attempt.state === "starting" || attempt.state === "running" || attempt.state === "settling" || attempt.state === "cancel_requested");
-    const pending = run.nodes.some((node) => node.state === "pending");
+    const pending = run.nodes.some((node) => node.state === "pending") || run.attempts.some((attempt) => attempt.state === "queued");
     let executionStatus = run.control.executionStatus;
     if (executionStatus === "draining" && !active) executionStatus = "paused";
     else if (!active && !pending) executionStatus = "idle";
@@ -497,14 +683,28 @@ export class WorkgraphSupervisor {
     await this.engine.store.update((draft) => {
       const current = requiredAttempt(draft, attemptId);
       if (current.state !== "running" && current.state !== "starting") return;
-      const node = requiredNode(draft, current.nodeId);
-      const attention = terminalText ? "Worker returned terminal prose without a typed implementation report." : "Herdr observed a settled-looking worker without a typed implementation report.";
+      const attention = terminalText ? "Worker returned terminal prose without a typed report." : "Herdr observed a settled-looking worker without a typed report.";
       if (current.stage === "attention" && current.attention === attention && draft.control.attentionStatus === "decision_required") return;
       current.stage = "attention";
       current.attention = attention;
       current.lastActivityAt = new Date().toISOString();
-      node.resultKind = terminalText ? "untyped" : "absent";
-      if (terminalText) node.terminalText = terminalText;
+      if ((current.mode ?? "implementation") === "implementation") {
+        const node = requiredNode(draft, current.nodeId);
+        node.resultKind = terminalText ? "untyped" : "absent";
+        if (terminalText) node.terminalText = terminalText;
+      } else if (current.mode === "discovery") {
+        const record = draft.discoveries.find((candidate) => candidate.attemptId === attemptId);
+        if (record) { record.resultKind = terminalText ? "untyped" : "absent"; if (terminalText) record.terminalText = terminalText; record.state = "review_required"; record.error = attention; }
+      } else if (current.mode === "verification") {
+        const verification = draft.productVerification;
+        if (verification?.attemptId === attemptId) { verification.resultKind = terminalText ? "untyped" : "absent"; if (terminalText) verification.terminalText = terminalText; verification.state = "inconclusive"; verification.error = attention; }
+      } else if (current.mode === "assurance_review") {
+        const review = draft.assurance?.reviews.find((candidate) => candidate.attemptId === attemptId);
+        if (review) { review.resultKind = terminalText ? "untyped" : "absent"; if (terminalText) review.terminalText = terminalText; review.state = "failed"; review.error = attention; }
+      } else if (current.mode === "assurance_synthesis") {
+        const synthesis = draft.assurance?.synthesis;
+        if (synthesis?.attemptId === attemptId) { synthesis.resultKind = terminalText ? "untyped" : "absent"; if (terminalText) synthesis.terminalText = terminalText; synthesis.state = "failed"; synthesis.error = attention; }
+      }
       draft.control.attentionStatus = "decision_required";
       draft.control.updatedAt = current.lastActivityAt;
     });
@@ -520,9 +720,11 @@ export class WorkgraphSupervisor {
       if (!current.worker && !uncertainLiveLaunch) {
         current.state = "failed";
         current.settledAt = current.lastActivityAt;
-        const node = requiredNode(draft, current.nodeId);
-        if (node.state === "running") transitionNode(node, "failed");
-        delete node.activeAttemptId;
+        const node = draft.nodes.find((candidate) => candidate.id === current.nodeId);
+        if (node) {
+          if (node.state === "running") transitionNode(node, "failed");
+          delete node.activeAttemptId;
+        } else markObserverFailure(draft, current, message);
       }
       draft.control.attentionStatus = current.worker || uncertainLiveLaunch ? "decision_required" : "failed";
       draft.control.updatedAt = current.lastActivityAt;
@@ -538,10 +740,28 @@ export class WorkgraphSupervisor {
       current.error = message;
       current.settledAt = new Date().toISOString();
       current.lastActivityAt = current.settledAt;
-      const node = requiredNode(draft, current.nodeId);
-      node.error = message;
-      if (node.state === "running" || node.state === "completed") transitionNode(node, "failed");
-      delete node.activeAttemptId;
+      const node = draft.nodes.find((candidate) => candidate.id === current.nodeId);
+      if (node) {
+        node.error = message;
+        if (node.state === "running" || node.state === "completed") transitionNode(node, "failed");
+        delete node.activeAttemptId;
+      } else if (current.mode === "discovery") {
+        const record = draft.discoveries.find((candidate) => candidate.attemptId === attemptId);
+        if (record) { record.state = "failed"; record.error = message; }
+      } else if (current.mode === "verification") {
+        const verification = draft.productVerification;
+        if (verification?.attemptId === attemptId) { verification.state = "inconclusive"; verification.error = message; }
+      } else if (current.mode === "assurance_review") {
+        const review = draft.assurance?.reviews.find((candidate) => candidate.attemptId === attemptId);
+        if (review) { review.state = "failed"; review.error = message; }
+      } else if (current.mode === "assurance_synthesis") {
+        const synthesis = draft.assurance?.synthesis;
+        if (synthesis?.attemptId === attemptId) { synthesis.state = "failed"; synthesis.error = message; }
+      }
+      if (current.mode === "assurance_review" || current.mode === "assurance_synthesis") {
+        if (draft.assurance) draft.assurance.state = "inconclusive";
+        setPhase(draft, "assurance_inconclusive", "A visible assurance worker failed before producing decision-ready evidence.");
+      }
       draft.control.attentionStatus = "failed";
       draft.control.updatedAt = current.settledAt;
     });
@@ -571,6 +791,81 @@ export class WorkgraphSupervisor {
       return this.engine.load();
     }
   }
+}
+
+function isActiveAttempt(attempt: WorkAttempt): boolean {
+  return attempt.state === "starting" || attempt.state === "running" || attempt.state === "settling" || attempt.state === "cancel_requested";
+}
+
+function observerAttempt(
+  run: WorkgraphRun,
+  input: { id: string; nodeId: string; mode: WorkerMode; model: string; thinking: NonNullable<WorkAttempt["thinking"]>; objective: string; stableEntryId?: string | null; responsibility?: WorkAttempt["responsibility"] },
+): WorkAttempt {
+  const now = new Date().toISOString();
+  return {
+    id: input.id,
+    nodeId: input.nodeId,
+    mode: input.mode,
+    planVersion: run.control.currentPlanVersion ?? 0,
+    state: "queued",
+    stage: "queued",
+    runtimeMode: "herdr",
+    createdAt: now,
+    lastActivityAt: now,
+    baseCommit: run.composedCommit,
+    parentSessionFile: run.parentSessionFile,
+    objective: input.objective,
+    model: input.model,
+    thinking: input.thinking,
+    ...(input.stableEntryId !== undefined ? { stableEntryId: input.stableEntryId } : {}),
+    ...(input.responsibility ? { responsibility: input.responsibility } : {}),
+    agentName: herdrAgentName(run.runId, input.nodeId, input.id),
+  };
+}
+
+function markObserverFailure(run: WorkgraphRun, attempt: WorkAttempt, message: string): void {
+  if (attempt.mode === "discovery") {
+    const record = run.discoveries.find((candidate) => candidate.attemptId === attempt.id);
+    if (record) { record.state = "failed"; record.error = message; }
+  } else if (attempt.mode === "verification") {
+    const verification = run.productVerification;
+    if (verification?.attemptId === attempt.id) { verification.state = "inconclusive"; verification.error = message; }
+  } else if (attempt.mode === "assurance_review") {
+    const review = run.assurance?.reviews.find((candidate) => candidate.attemptId === attempt.id);
+    if (review) { review.state = "failed"; review.error = message; }
+  } else if (attempt.mode === "assurance_synthesis") {
+    const synthesis = run.assurance?.synthesis;
+    if (synthesis?.attemptId === attempt.id) { synthesis.state = "failed"; synthesis.error = message; }
+  }
+}
+
+function observerEnvironment(run: WorkgraphRun, attempt: WorkAttempt, placement: WorktreePlacement): Record<string, string> {
+  return {
+    PI_WORKGRAPH_MODE: attempt.mode ?? "discovery",
+    PI_WORKGRAPH_RUN_ID: run.runId,
+    PI_WORKGRAPH_NODE_ID: attempt.nodeId,
+    PI_WORKGRAPH_BASE_COMMIT: placement.baseCommit,
+    ...(attempt.responsibility ? { PI_WORKGRAPH_RESPONSIBILITY: attempt.responsibility } : {}),
+  };
+}
+
+function assuranceSynthesisObjective(run: WorkgraphRun): string {
+  return [
+    `Original request: ${run.request}`,
+    `Exact composed revision: ${run.composedCommit}`,
+    "Approved implementation envelope:",
+    JSON.stringify(run.agreement, null, 2),
+    "Independent responsibility reports:",
+    JSON.stringify(run.assurance?.reviews.map((review) => ({ responsibility: review.responsibility, model: review.model, report: review.report })), null, 2),
+    "Account for every candidate by its exact id, preserve each candidate unchanged, and propose accept or dismiss with a concise reason.",
+    "Do not invent new findings.",
+  ].join("\n\n");
+}
+
+function setPhase(run: WorkgraphRun, to: WorkgraphRun["phase"], reason: string): void {
+  if (run.phase === to) return;
+  run.transitions.push({ sequence: run.transitions.length + 1, at: new Date().toISOString(), from: run.phase, to, reason });
+  run.phase = to;
 }
 
 function requiredAttempt(run: WorkgraphRun, id: string): WorkAttempt {

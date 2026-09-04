@@ -1,4 +1,4 @@
-export const RUN_STATE_VERSION = 5 as const;
+export const RUN_STATE_VERSION = 6 as const;
 
 export type RunLifecycle = "active" | "suspended" | "completed" | "abandoned" | "archived";
 export type PlanStatus = "absent" | "proposed" | "approved" | "superseded";
@@ -23,6 +23,7 @@ export interface RunCreator extends SessionIdentity {
 
 export interface CoordinatorBinding extends SessionIdentity {
   boundAt: string;
+  runtimeIdentity?: WorkerIdentity;
 }
 
 export interface CoordinatorHandoff {
@@ -230,6 +231,7 @@ export interface DiscoveryAssignment extends InvestigationSpec {
 
 export interface DiscoveryRecord extends DiscoveryAssignment {
   topology: DiscoveryTopology;
+  attemptId?: string;
   resultKind?: ChildResultKind;
   terminalText?: string;
   synthesisOf?: string[];
@@ -331,6 +333,7 @@ export interface CompositionRecord {
 
 export interface ProductVerificationRecord {
   revision: string;
+  attemptId?: string;
   resultKind?: ChildResultKind;
   terminalText?: string;
   method: VerificationMethod;
@@ -347,6 +350,7 @@ export interface ProductVerificationRecord {
 
 export interface AssuranceReviewRecord {
   responsibility: AssuranceResponsibility;
+  attemptId?: string;
   resultKind?: ChildResultKind;
   terminalText?: string;
   model: string;
@@ -360,6 +364,7 @@ export interface AssuranceReviewRecord {
 
 export interface AssuranceSynthesisRecord {
   model: string;
+  attemptId?: string;
   resultKind?: ChildResultKind;
   terminalText?: string;
   thinking: ThinkingLevel;
@@ -383,6 +388,9 @@ export interface AssuranceJudgment {
 export interface AssuranceRecord {
   revision: string;
   state: "running" | "completed" | "inconclusive";
+  synthesisModel?: string;
+  synthesisThinking?: ThinkingLevel;
+  stableEntryId?: string | null;
   reviews: AssuranceReviewRecord[];
   synthesis?: AssuranceSynthesisRecord;
   finalJudgment?: AssuranceJudgment;
@@ -427,6 +435,7 @@ export interface WorkerIdentity {
 export interface WorkAttempt {
   id: string;
   nodeId: string;
+  mode?: WorkerMode;
   planVersion: number;
   state: AttemptState;
   stage: WorkerStage;
@@ -441,6 +450,15 @@ export interface WorkAttempt {
   worktreePath?: string;
   branch?: string;
   baseCommit?: string;
+  parentSessionFile?: string;
+  stableEntryId?: string | null;
+  objective?: string;
+  model?: string;
+  thinking?: ThinkingLevel;
+  executorModel?: string;
+  executorThinking?: ThinkingLevel;
+  responsibility?: AssuranceResponsibility;
+  dependencies?: string[];
   sessionFile?: string;
   agentName?: string;
   worker?: WorkerIdentity;

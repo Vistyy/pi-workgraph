@@ -138,7 +138,7 @@ export class RunStateStore {
 
 function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): WorkgraphRun {
   const version = (parsed as { version?: number }).version;
-  if (version !== 3 && version !== 4 && version !== RUN_STATE_VERSION) {
+  if (version !== 3 && version !== 4 && version !== 5 && version !== RUN_STATE_VERSION) {
     throw new Error(`Unsupported workgraph state version ${String(version)}: ${parsed.runId}`);
   }
   if (version === RUN_STATE_VERSION) return parsed as WorkgraphRun;
@@ -179,7 +179,10 @@ function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): Workg
     lifecycleUpdatedAt: parsed.lifecycleUpdatedAt ?? updatedAt,
     control,
     plans,
-    attempts: [],
+    attempts: (parsed.attempts ?? []).map((attempt) => ({
+      ...attempt,
+      mode: attempt.mode ?? "implementation",
+    })),
   };
 }
 

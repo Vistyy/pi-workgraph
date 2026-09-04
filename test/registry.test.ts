@@ -92,7 +92,7 @@ test("version 3 migration preserves reports, sessions, decisions, nodes, evidenc
     };
     await writeFile(path, JSON.stringify(legacy));
     const run = await new RunStateStore(path).load();
-    assert.equal(run.version, 5);
+    assert.equal(run.version, 6);
     assert.equal(run.lifecycle, "active");
     assert.equal(run.creator.sessionId, "legacy-session");
     assert.equal(run.discoveries[0]?.report?.summary, "kept");
@@ -100,7 +100,7 @@ test("version 3 migration preserves reports, sessions, decisions, nodes, evidenc
     assert.equal(run.control.planStatus, "absent");
     assert.deepEqual(run.plans, []);
     assert.deepEqual(run.attempts, []);
-    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 5);
+    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 6);
   } finally { await rm(parent, { recursive: true, force: true }); }
 });
 

@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { GitRepository, type WorktreePlacement } from "./git.js";
-import { mapConcurrent, readTerminalText, readWorkgraphReport, runPiChild, type ChildRequest } from "./pi-process.js";
+import { herdrAgentName } from "./herdr.js";
+import { mapConcurrent, readTerminalText, readWorkgraphReport, type ChildRequest } from "./pi-process.js";
 import { addNodes, allNodesComposed, blockedPendingNodes, readyWave, transitionNode } from "./scheduler.js";
 import { RunStateStore, type NewRunInput } from "./state-store.js";
 import { WorkgraphRegistry, type Lease, type LeaseOwner } from "./registry.js";
@@ -25,6 +27,9 @@ import type {
   WorkNode,
   WorkNodeSpec,
   WorkgraphRun,
+  WorkAttempt,
+  WorkerMode,
+  WorkerIdentity,
 } from "./types.js";
 
 export type ChildRunner = (request: ChildRequest) => Promise<ChildOutcome>;
@@ -40,6 +45,28 @@ export interface DiscoveryInput {
   assignments: DiscoveryAssignment[];
   stableEntryId?: string | null;
   signal?: AbortSignal;
+}
+
+export interface AsyncDiscoveryInput {
+  topology: DiscoveryTopology;
+  assignments: DiscoveryAssignment[];
+  stableEntryId?: string | null;
+}
+
+export interface AsyncDiscoverySynthesisInput extends ModelAssignment {
+  id: string;
+  sourceIds: string[];
+  stableEntryId?: string | null;
+}
+
+export interface AsyncVerificationInput extends ModelAssignment {
+  stableEntryId?: string | null;
+}
+
+export interface AsyncAssuranceInput {
+  reviewers: Array<ModelAssignment & { responsibility: AssuranceResponsibility }>;
+  synthesis: ModelAssignment;
+  stableEntryId?: string | null;
 }
 
 export interface DiscoverySynthesisInput extends ModelAssignment {
@@ -102,7 +129,7 @@ export class WorkgraphEngine {
   private lease: Lease | undefined;
 
   constructor(readonly store: RunStateStore, dependencies: EngineDependencies = {}) {
-    this.runChild = dependencies.runChild ?? runPiChild;
+    this.runChild = dependencies.runChild ?? legacyChildUnavailable;
     this.registry = dependencies.registry ?? new WorkgraphRegistry();
     this.repositoryPromise = dependencies.repository
       ? Promise.resolve(dependencies.repository)
@@ -143,7 +170,7 @@ export class WorkgraphEngine {
     this.lease = this.registry.renew(this.lease);
   }
 
-  async adopt(sessionId: string, sessionFile: string, liveness: "alive" | "dead" | "unknown" = "unknown"): Promise<WorkgraphRun> {
+  async adopt(sessionId: string, sessionFile: string, liveness: "alive" | "dead" | "unknown" = "unknown", runtimeIdentity?: WorkerIdentity): Promise<WorkgraphRun> {
     if (!sessionId.trim() || !sessionFile.trim()) throw new Error("Adoption requires a Pi session identity.");
     const run = await this.load();
     if (run.lifecycle === "abandoned" || run.lifecycle === "archived") throw new Error(`Workgraph ${run.runId} is ${run.lifecycle}.`);
@@ -151,7 +178,7 @@ export class WorkgraphEngine {
     this.lease = this.registry.acquire(run.runId, owner, new Date(), liveness);
     const adopted = await this.store.update((draft) => {
       const previous = draft.coordinator;
-      draft.coordinator = { sessionId, sessionFile, boundAt: new Date().toISOString() };
+      draft.coordinator = { sessionId, sessionFile, boundAt: new Date().toISOString(), ...(runtimeIdentity ? { runtimeIdentity } : {}) };
       draft.handoffs.push({ kind: previous.sessionId === sessionId ? "resume" : "adopt", ...(previous.sessionId !== sessionId ? { fromSessionId: previous.sessionId } : {}), to: draft.coordinator, at: draft.coordinator.boundAt });
       if (draft.lifecycle === "suspended") {
         draft.lifecycle = "active";
@@ -210,6 +237,152 @@ export class WorkgraphEngine {
     return this.store.update((draft) => {
       draft.terminalOutcome = { kind, conclusion: conclusion.trim(), evidence: evidence.map((item) => ({ ...item, class: item.class ?? "direct" })), completedAt: new Date().toISOString() };
       setPhase(draft, "complete", `The ${kind} outcome is complete with typed evidence and no implementation claim.`);
+    });
+  }
+
+  async queueDiscovery(input: AsyncDiscoveryInput): Promise<WorkgraphRun> {
+    const run = await this.load();
+    requirePhase(run, ["discovery", "awaiting_agreement"]);
+    validateDiscoveryAssignments(run, input.assignments);
+    const now = new Date().toISOString();
+    return this.store.update((draft) => {
+      const replacements = new Map<string, string>();
+      for (const assignment of input.assignments) {
+        for (const replacedId of assignment.supersedes ?? []) replacements.set(replacedId, assignment.id);
+      }
+      for (const [replacedId, replacementId] of replacements) {
+        const replaced = draft.discoveries.find((record) => record.id === replacedId);
+        if (!replaced) throw new Error(`Unknown discovery lane ${replacedId}.`);
+        replaced.state = "superseded";
+        replaced.supersededBy = replacementId;
+      }
+      for (const assignment of input.assignments) {
+        const record: DiscoveryRecord = {
+          ...assignment,
+          topology: input.topology,
+          state: assignment.unavailableReason ? "unavailable" : "running",
+          ...(assignment.unavailableReason ? { error: assignment.unavailableReason } : {}),
+        };
+        draft.discoveries.push(record);
+        if (assignment.unavailableReason) continue;
+        const attemptId = randomUUID();
+        record.attemptId = attemptId;
+        draft.attempts.push(observerAttempt(draft, {
+          id: attemptId,
+          nodeId: assignment.id,
+          mode: "discovery",
+          model: assignment.model,
+          thinking: assignment.thinking,
+          objective: discoveryObjective(draft, input.topology, assignment),
+          stableEntryId: input.stableEntryId,
+          planVersion: draft.control.currentPlanVersion ?? 0,
+        }));
+      }
+      draft.control.executionStatus = "scheduled";
+      draft.control.updatedAt = now;
+    });
+  }
+
+  async queueDiscoverySynthesis(input: AsyncDiscoverySynthesisInput): Promise<WorkgraphRun> {
+    const run = await this.load();
+    requirePhase(run, ["awaiting_agreement"]);
+    validateModel(input.model, "Discovery synthesizer");
+    const sourceIds = [...new Set(input.sourceIds)];
+    if (sourceIds.length < 2 || sourceIds.length > 5) throw new Error("Discovery synthesis requires between two and five distinct source reports.");
+    const sources = sourceIds.map((id) => {
+      const source = run.discoveries.find((record) => record.id === id);
+      if (!source) throw new Error(`Unknown discovery synthesis source: ${id}`);
+      if (source.state === "running" || source.state === "superseded") throw new Error(`Discovery synthesis source ${id} is not settled.`);
+      return source;
+    });
+    if (!sources.some((source) => source.state === "completed" && source.report)) throw new Error("Discovery synthesis requires at least one completed source report.");
+    return this.store.update((draft) => {
+      if (draft.discoveries.some((record) => record.id === input.id)) throw new Error(`Duplicate investigation id: ${input.id}`);
+      const record: DiscoveryRecord = {
+        id: input.id,
+        lens: "Independent synthesis",
+        objective: `Reconcile discovery reports: ${sourceIds.join(", ")}`,
+        model: input.model,
+        thinking: input.thinking,
+        topology: sources[0]!.topology,
+        synthesisOf: sourceIds,
+        state: input.unavailableReason ? "unavailable" : "running",
+        ...(input.unavailableReason ? { error: input.unavailableReason } : {}),
+      };
+      draft.discoveries.push(record);
+      if (!input.unavailableReason) {
+        const attemptId = randomUUID();
+        record.attemptId = attemptId;
+        draft.attempts.push(observerAttempt(draft, {
+          id: attemptId,
+          nodeId: input.id,
+          mode: "discovery",
+          model: input.model,
+          thinking: input.thinking,
+          objective: discoverySynthesisObjective(draft, sources),
+          stableEntryId: input.stableEntryId,
+          planVersion: draft.control.currentPlanVersion ?? 0,
+        }));
+        draft.control.executionStatus = "scheduled";
+      }
+      draft.control.updatedAt = new Date().toISOString();
+    });
+  }
+
+  async queueVerification(input: AsyncVerificationInput): Promise<WorkgraphRun> {
+    const run = await this.load();
+    requirePhase(run, ["awaiting_verification"]);
+    if (!run.agreement || run.agreement.verificationMethod !== "independent") throw new Error("Independent product verification is not required by the approved envelope.");
+    const repositoryError = await this.composedRepositoryError(run);
+    if (repositoryError) return this.store.update((draft) => { if (draft.productVerification) draft.productVerification.error = repositoryError; setPhase(draft, "needs_decision", "Product verification found repository state outside Workgraph composition."); });
+    validateModel(input.model, "Product verifier");
+    return this.store.update((draft) => {
+      const verification: ProductVerificationRecord = { revision: draft.composedCommit, method: "independent", state: "running", model: input.model, thinking: input.thinking, commands: [...draft.globalVerification] };
+      const attemptId = randomUUID();
+      verification.attemptId = attemptId;
+      draft.productVerification = verification;
+      draft.attempts.push(observerAttempt(draft, {
+        id: attemptId,
+        nodeId: "product-verification",
+        mode: "verification",
+        model: input.model,
+        thinking: input.thinking,
+        objective: verificationObjective(draft),
+        stableEntryId: input.stableEntryId,
+        planVersion: draft.control.currentPlanVersion ?? 0,
+      }));
+      draft.control.executionStatus = "scheduled";
+      draft.control.verificationStatus = "running";
+      draft.control.updatedAt = new Date().toISOString();
+    });
+  }
+
+  async queueAssurance(input: AsyncAssuranceInput): Promise<WorkgraphRun> {
+    const run = await this.load();
+    requirePhase(run, ["awaiting_assurance", "assurance_inconclusive"]);
+    if (run.outcome.kind !== "product_change") throw new Error("Assurance is only available for product-change outcomes.");
+    if (!run.agreement) throw new Error("An approved implementation envelope is required.");
+    requireCurrentVerification(run);
+    const repositoryError = await this.composedRepositoryError(run);
+    if (repositoryError) return this.store.update((draft) => { draft.error = repositoryError; setPhase(draft, "needs_decision", "Assurance found repository state outside Workgraph composition."); });
+    validateAssuranceAssignments(input);
+    const previous = run.phase === "assurance_inconclusive" && run.assurance?.revision === run.composedCommit ? run.assurance : undefined;
+    return this.store.update((draft) => {
+      const assurance: AssuranceRecord = { revision: draft.composedCommit, state: "running", synthesisModel: input.synthesis.model, synthesisThinking: input.synthesis.thinking, ...(input.stableEntryId !== undefined ? { stableEntryId: input.stableEntryId } : {}), reviews: input.reviewers.map((reviewer) => {
+        const settled = previous?.reviews.find((candidate) => candidate.responsibility === reviewer.responsibility);
+        if (settled?.state === "completed" && settled.report?.status === "completed" && settled.report.recommendation !== "inconclusive") return settled;
+        const review: AssuranceReviewRecord = { responsibility: reviewer.responsibility, model: reviewer.model, thinking: reviewer.thinking, state: reviewer.unavailableReason ? "unavailable" : "running" };
+        if (reviewer.unavailableReason) review.error = reviewer.unavailableReason;
+        if (!reviewer.unavailableReason) {
+          const attemptId = randomUUID();
+          review.attemptId = attemptId;
+          draft.attempts.push(observerAttempt(draft, { id: attemptId, nodeId: `assurance-${reviewer.responsibility}`, mode: "assurance_review", responsibility: reviewer.responsibility, model: reviewer.model, thinking: reviewer.thinking, objective: assuranceReviewObjective(draft, reviewer.responsibility), stableEntryId: input.stableEntryId, planVersion: draft.control.currentPlanVersion ?? 0 }));
+        }
+        return review;
+      }) };
+      draft.assurance = assurance;
+      draft.control.executionStatus = "scheduled";
+      draft.control.updatedAt = new Date().toISOString();
     });
   }
 
@@ -1544,6 +1717,61 @@ export class WorkgraphEngine {
   }
 }
 
+function validateDiscoveryAssignments(run: WorkgraphRun, assignments: DiscoveryAssignment[]): void {
+  if (assignments.length < 1 || assignments.length > 5) throw new Error("Discovery requires between one and five bounded assignments.");
+  const ids = new Set(run.discoveries.map((record) => record.id));
+  const replacements = new Set<string>();
+  for (const assignment of assignments) {
+    if (!/^[a-z][a-z0-9_-]{0,47}$/.test(assignment.id) || ids.has(assignment.id)) throw new Error(`Invalid or duplicate investigation id: ${assignment.id}`);
+    ids.add(assignment.id);
+    if (!assignment.lens.trim() || !assignment.objective.trim()) throw new Error(`Investigation ${assignment.id} is incomplete.`);
+    validateModel(assignment.model, `Investigation ${assignment.id}`);
+    for (const replacedId of assignment.supersedes ?? []) {
+      const replaced = run.discoveries.find((record) => record.id === replacedId);
+      if (!replaced) throw new Error(`Investigation ${assignment.id} cannot supersede unknown lane ${replacedId}.`);
+      if (replaced.state === "completed" || replaced.state === "running" || replaced.state === "superseded") throw new Error(`Investigation ${assignment.id} cannot supersede lane ${replacedId} in ${replaced.state}.`);
+      if (replacements.has(replacedId)) throw new Error(`Discovery lane ${replacedId} has more than one replacement.`);
+      replacements.add(replacedId);
+    }
+  }
+}
+
+function observerAttempt(
+  run: WorkgraphRun,
+  input: {
+    id: string;
+    nodeId: string;
+    mode: WorkerMode;
+    planVersion: number;
+    model: string;
+    thinking: ThinkingLevel;
+    objective: string;
+    stableEntryId?: string | null | undefined;
+    responsibility?: AssuranceResponsibility;
+  },
+): WorkAttempt {
+  const now = new Date().toISOString();
+  return {
+    id: input.id,
+    nodeId: input.nodeId,
+    mode: input.mode,
+    planVersion: input.planVersion,
+    state: "queued",
+    stage: "queued",
+    runtimeMode: "herdr",
+    createdAt: now,
+    lastActivityAt: now,
+    baseCommit: run.composedCommit,
+    parentSessionFile: run.parentSessionFile,
+    ...(input.stableEntryId !== undefined ? { stableEntryId: input.stableEntryId } : {}),
+    objective: input.objective,
+    model: input.model,
+    thinking: input.thinking,
+    ...(input.responsibility ? { responsibility: input.responsibility } : {}),
+    agentName: herdrAgentName(run.runId, input.nodeId, input.id),
+  };
+}
+
 function validateEvidence(evidence: EvidenceItem[]): void {
   if (evidence.length === 0) throw new Error("Typed terminal completion requires evidence.");
   for (const item of evidence) {
@@ -1582,7 +1810,7 @@ function validateAssuranceAssignments(input: AssuranceInput): void {
   validateModel(input.synthesis.model, "Assurance synthesizer");
 }
 
-function validateSynthesis(
+export function validateSynthesis(
   reviews: AssuranceReviewRecord[],
   dispositions: Array<{ finding: AssuranceFinding; disposition: "accept" | "optional" | "dismiss"; reason: string }>,
 ): void {
@@ -1784,6 +2012,10 @@ function childFailure(outcome: ChildOutcome): string {
   if (outcome.terminalText) return `Child returned prose requiring coordinator review: ${outcome.terminalText}`;
   if (outcome.stderr) return outcome.stderr;
   return `Child exited ${outcome.exitCode} without a terminal result. Session: ${outcome.sessionFile}`;
+}
+
+function legacyChildUnavailable(): Promise<ChildOutcome> {
+  return Promise.reject(new Error("Legacy piped child execution is disabled; use the visible asynchronous Workgraph supervisor."));
 }
 
 function errorMessage(error: unknown): string {

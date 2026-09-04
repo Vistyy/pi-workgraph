@@ -16,11 +16,10 @@ import {
   type ModelRole,
   type ModelTarget,
 } from "../src/model-policy.js";
-import { stableParentEntry } from "../src/pi-process.js";
+import { forkConversationSession, stableParentEntry } from "../src/pi-process.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { persistSchedule, WorkgraphSupervisor } from "../src/supervisor.js";
-import { resolveChildCapabilities, WEB_TOOLS, WEB_PACKAGE, CODEX_PACKAGE } from "../src/capabilities.js";
 import type {
   AssuranceResponsibility,
   DiscoveryAssignment,
@@ -127,7 +126,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         engine.registry.indexRun(activeRun);
         const sessionFile = ctx.sessionManager.getSessionFile();
         if (sessionFile) {
-          activeRun = await engine.adopt(ctx.sessionManager.getSessionId(), sessionFile, "unknown");
+          const runtime = new HerdrCliRuntime();
+          if (runtime.available && !process.env.HERDR_PANE_ID) throw new Error("Herdr adoption requires the current pane identity.");
+          const runtimeIdentity = runtime.available
+            ? await runtime.observeCurrentCoordinator({ paneId: process.env.HERDR_PANE_ID!, sessionFile, cwd: activeRun.projectRoot })
+            : undefined;
+          activeRun = await engine.adopt(ctx.sessionManager.getSessionId(), sessionFile, "unknown", runtimeIdentity);
         }
         if (activeRun.lifecycle === "active") attachSupervisor(ctx);
         updateStatus(ctx, activeRun);
@@ -189,15 +193,29 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "workgraph_capabilities",
-    label: "Workgraph Capabilities",
-    description: "Inspect Workgraph's trusted child-capability configuration and resolved installed resources.",
-    promptSnippet: "Inspect trusted child capabilities without configuring executable paths",
-    parameters: Type.Object({ action: StringEnum(["get"] as const), model: Type.Optional(Type.String()) }),
+    name: "workgraph_fork",
+    label: "Workgraph Fork",
+    description: "Fork the selected conversation branch into a new requested working directory and start a plain normal-config Pi coordinator through Herdr.",
+    promptSnippet: "Fork this conversation branch into another repository",
+    parameters: Type.Object({
+      targetCwd: Type.String({ description: "Repository working directory for the new coordinator." }),
+      entryId: Type.Optional(Type.String({ description: "Conversation entry id whose branch should be preserved." })),
+    }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const model = params.model ?? "openai-codex/gpt-5.6-sol";
-      const capabilities = await resolveChildCapabilities("discovery", model);
-      return { content: [{ type: "text", text: JSON.stringify({ trusted: [WEB_PACKAGE, CODEX_PACKAGE], tools: WEB_TOOLS, model, capabilities }, null, 2) }], details: { capabilities } };
+      return exclusively(async () => {
+        const sessionFile = ctx.sessionManager.getSessionFile();
+        if (!sessionFile) throw new Error("Fork requires a persistent current Pi session.");
+        const repository = await GitRepository.inspect(params.targetCwd);
+        const childSession = await forkConversationSession({
+          parentSessionFile: sessionFile,
+          targetCwd: repository.root,
+          ...(params.entryId ? { entryId: params.entryId } : {}),
+        });
+        const runtime = new HerdrCliRuntime();
+        if (!runtime.available || !process.env.HERDR_WORKSPACE_ID) throw new Error("Herdr coordinator runtime is unavailable. No hidden fallback was started.");
+        const identity = await runtime.launchCoordinator({ workspaceId: process.env.HERDR_WORKSPACE_ID, cwd: repository.root, sessionFile: childSession });
+        return { content: [{ type: "text", text: `Forked conversation into ${repository.root} and started coordinator ${identity.agentName} through Herdr.` }], details: { sessionFile: childSession, identity, cwd: repository.root } };
+      });
     },
   });
 
@@ -274,7 +292,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const sessionFile = ctx.sessionManager.getSessionFile();
         if (!sessionFile) throw new Error("Adoption requires a persistent current Pi session.");
         const adoptedEngine = WorkgraphEngine.open(indexed.statePath, { registry });
-        const adopted = await adoptedEngine.adopt(ctx.sessionManager.getSessionId(), sessionFile, params.priorOwnerLiveness ?? "unknown");
+        const runtime = new HerdrCliRuntime();
+        if (runtime.available && !process.env.HERDR_PANE_ID) throw new Error("Herdr adoption requires the current pane identity.");
+        const runtimeIdentity = runtime.available
+          ? await runtime.observeCurrentCoordinator({ paneId: process.env.HERDR_PANE_ID!, sessionFile, cwd: repositoryInfo.root })
+          : undefined;
+        const adopted = await adoptedEngine.adopt(ctx.sessionManager.getSessionId(), sessionFile, params.priorOwnerLiveness ?? "unknown", runtimeIdentity);
         engine = adoptedEngine;
         remember(adopted);
         pi.appendEntry(POINTER_ENTRY, { runId: adopted.runId, statePath: adopted.statePath } satisfies RunPointer);
@@ -357,20 +380,20 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       panelSize: Type.Optional(Type.Integer({ minimum: 2, maximum: 4 })),
       models: Type.Optional(Type.Array(ModelTargetSchema, { minItems: 1, maxItems: 4 })),
     }),
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
         const assignments = await expandDiscovery(params, ctx, activeRun);
-        onUpdate?.({ content: [{ type: "text", text: `Running ${assignments.length} ${params.topology} discovery lane(s)...` }], details: { assignments } });
-        const run = remember(await requireEngine().discover({
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        const run = remember(await requireEngine().queueDiscovery({
           topology: params.topology,
           assignments,
           stableEntryId: stableParentEntry(ctx.sessionManager),
-          ...(signal ? { signal } : {}),
         }));
+        activeSupervisor.kick();
         const selectedIds = new Set(assignments.map((assignment) => assignment.id));
         const records = run.discoveries.filter((record) => selectedIds.has(record.id));
         return {
-          content: [{ type: "text", text: formatDiscoveries(run, records) }],
+          content: [{ type: "text", text: `Queued ${assignments.length} ${params.topology} discovery lane(s). Use workgraph_status or workgraph_reconcile to inspect retained reports.` }],
           details: {
             ...summaryDetails(run),
             topology: params.topology,
@@ -393,20 +416,20 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       model: Type.Optional(Type.String()),
       thinking: Type.Optional(ThinkingSchema),
     }),
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
         const target = withAvailability(await resolveTarget("discovery.synthesis", params.model, params.thinking), ctx, "discovery synthesizer");
-        onUpdate?.({ content: [{ type: "text", text: `Synthesizing ${params.sourceIds.length} discovery reports with ${target.model}...` }], details: { sourceIds: params.sourceIds, target } });
-        const run = remember(await requireEngine().synthesizeDiscovery({
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        const run = remember(await requireEngine().queueDiscoverySynthesis({
           id: params.id,
           sourceIds: params.sourceIds,
           ...target,
           stableEntryId: stableParentEntry(ctx.sessionManager),
-          ...(signal ? { signal } : {}),
         }));
+        activeSupervisor.kick();
         const record = run.discoveries.find((candidate) => candidate.id === params.id);
         return {
-          content: [{ type: "text", text: `Discovery synthesis ${params.id} [${record?.state ?? "missing"}]: ${record?.report?.summary ?? record?.error ?? "No report."}` }],
+          content: [{ type: "text", text: `Queued discovery synthesis ${params.id}. Use workgraph_status or workgraph_reconcile to inspect the retained report.` }],
           details: { ...summaryDetails(run), synthesis: record },
           ...(record?.usage ? { usage: nestedUsage([record.usage]) } : {}),
         };
@@ -496,18 +519,18 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       model: Type.Optional(Type.String()),
       thinking: Type.Optional(ThinkingSchema),
     }),
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
         const target = await resolveTarget("verification.product", params.model, params.thinking);
         requireAvailable(target.model, ctx, "product verifier");
-        onUpdate?.({ content: [{ type: "text", text: `Verifying composed product with ${target.model}...` }], details: { target } });
-        const run = remember(await requireEngine().verify({
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        const run = remember(await requireEngine().queueVerification({
           ...target,
           stableEntryId: stableParentEntry(ctx.sessionManager),
-          ...(signal ? { signal } : {}),
         }));
+        activeSupervisor.kick();
         return {
-          content: [{ type: "text", text: formatVerification(run) }],
+          content: [{ type: "text", text: `Queued independent verification at ${run.composedCommit}. Use workgraph_status or workgraph_reconcile to inspect the retained report.` }],
           details: { ...summaryDetails(run), verification: run.productVerification },
           ...(run.productVerification?.usage ? { usage: nestedUsage([run.productVerification.usage]) } : {}),
         };
@@ -526,23 +549,23 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       evidence: Type.Optional(ModelTargetSchema),
       synthesis: Type.Optional(ModelTargetSchema),
     }),
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
         const reviewers = await resolveReviewers(params, ctx);
         const synthesis = withAvailability(await resolveTarget("assurance.synthesis", params.synthesis?.model, params.synthesis?.thinking), ctx, "assurance synthesis");
-        onUpdate?.({ content: [{ type: "text", text: "Running behavior, structure, and evidence assurance, followed by synthesis..." }], details: { reviewers, synthesis } });
-        const run = remember(await requireEngine().assure({
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        const run = remember(await requireEngine().queueAssurance({
           reviewers,
           synthesis,
           stableEntryId: stableParentEntry(ctx.sessionManager),
-          ...(signal ? { signal } : {}),
         }));
+        activeSupervisor.kick();
         const usages = [
           ...(run.assurance?.reviews.flatMap((review) => review.usage ? [review.usage] : []) ?? []),
           ...(run.assurance?.synthesis?.usage ? [run.assurance.synthesis.usage] : []),
         ];
         return {
-          content: [{ type: "text", text: formatAssurance(run) }],
+          content: [{ type: "text", text: `Queued assurance reviewers for revision ${run.composedCommit}. Use workgraph_status or workgraph_reconcile to inspect retained reports.` }],
           details: { ...summaryDetails(run), assurance: run.assurance },
           ...(usages.length > 0 ? { usage: nestedUsage(usages) } : {}),
         };
@@ -814,7 +837,7 @@ function formatControlStatus(run: WorkgraphRun): string {
   const active = run.attempts.filter((attempt) => attempt.state === "starting" || attempt.state === "running" || attempt.state === "settling" || attempt.state === "cancel_requested");
   return [
     `Workgraph ${run.runId}: plan=${run.control.planStatus}${run.control.currentPlanVersion ? ` v${run.control.currentPlanVersion}` : ""}, execution=${run.control.executionStatus}, attention=${run.control.attentionStatus}, verification=${run.control.verificationStatus}.`,
-    ...active.map((attempt) => `- ${attempt.nodeId}/${attempt.id.slice(0, 8)}: ${attempt.state}, observed=${attempt.observedStatus ?? "not-observed"}, stage=${attempt.stage}, worker=${attempt.worker?.agentName ?? "unbound"}, pane=${attempt.worker?.paneId ?? "unbound"}, session=${attempt.worker?.sessionFile ?? attempt.sessionFile ?? "unbound"}, worktree=${attempt.worktreePath ?? "unbound"}, started=${attempt.startedAt ?? "not-started"}, activity=${attempt.lastActivityAt}, heartbeat=${attempt.heartbeatAt ?? "none"}${attempt.attention ? `, attention=${attempt.attention}` : ""}`),
+    ...active.map((attempt) => `- ${attempt.mode ?? "implementation"}/${attempt.responsibility ?? attempt.nodeId}/${attempt.id.slice(0, 8)}: ${attempt.state}, model=${attempt.model ?? "node-policy"}, thinking=${attempt.thinking ?? "node-policy"}, observed=${attempt.observedStatus ?? "not-observed"}, stage=${attempt.stage}, worker=${attempt.worker?.agentName ?? "unbound"}, pane=${attempt.worker?.paneId ?? "unbound"}, session=${attempt.worker?.sessionFile ?? attempt.sessionFile ?? "unbound"}, worktree=${attempt.worktreePath ?? "unbound"}, started=${attempt.startedAt ?? "not-started"}, activity=${attempt.lastActivityAt}, heartbeat=${attempt.heartbeatAt ?? "none"}${attempt.attention ? `, attention=${attempt.attention}` : ""}`),
   ].join("\n");
 }
 
@@ -841,7 +864,7 @@ function formatStatus(run: WorkgraphRun): string {
     `Product evidence: ${run.productVerification?.state ?? "none"} at ${run.productVerification?.revision ?? "none"}`,
     `Nodes: ${counts}`,
     `Attempts: ${run.attempts.length}`,
-    ...run.attempts.map((attempt) => `- ${attempt.nodeId}/${attempt.id.slice(0, 8)} [${attempt.state}; observed=${attempt.observedStatus ?? "not-observed"}; stage=${attempt.stage}]: worker=${attempt.worker?.agentName ?? "unbound"}, workspace=${attempt.worker?.workspaceId ?? "unbound"}, tab=${attempt.worker?.tabId ?? "unbound"}, pane=${attempt.worker?.paneId ?? "unbound"}, terminal=${attempt.worker?.terminalId ?? "unbound"}, session=${attempt.worker?.sessionFile ?? attempt.sessionFile ?? "unbound"}, worktree=${attempt.worktreePath ?? "unbound"}, started=${attempt.startedAt ?? "not-started"}, activity=${attempt.lastActivityAt}, heartbeat=${attempt.heartbeatAt ?? "none"}${attempt.attention ? `, attention=${attempt.attention}` : ""}`),
+    ...run.attempts.map((attempt) => `- ${attempt.mode ?? "implementation"}/${attempt.responsibility ?? attempt.nodeId}/${attempt.id.slice(0, 8)} [${attempt.state}; model=${attempt.model ?? "node-policy"}; thinking=${attempt.thinking ?? "node-policy"}; observed=${attempt.observedStatus ?? "not-observed"}; stage=${attempt.stage}]: worker=${attempt.worker?.agentName ?? "unbound"}, workspace=${attempt.worker?.workspaceId ?? "unbound"}, tab=${attempt.worker?.tabId ?? "unbound"}, pane=${attempt.worker?.paneId ?? "unbound"}, terminal=${attempt.worker?.terminalId ?? "unbound"}, session=${attempt.worker?.sessionFile ?? attempt.sessionFile ?? "unbound"}, worktree=${attempt.worktreePath ?? "unbound"}, started=${attempt.startedAt ?? "not-started"}, activity=${attempt.lastActivityAt}, heartbeat=${attempt.heartbeatAt ?? "none"}${attempt.attention ? `, attention=${attempt.attention}` : ""}`),
     `State: ${run.statePath}`,
   ].join("\n");
 }

@@ -32,6 +32,18 @@ export interface WorkerRecoveryRequest {
   cwd: string;
 }
 
+export interface CoordinatorLaunchRequest {
+  workspaceId: string;
+  cwd: string;
+  sessionFile: string;
+}
+
+export interface CoordinatorObservationRequest {
+  paneId: string;
+  sessionFile: string;
+  cwd: string;
+}
+
 export interface VisibleWorkerRuntime {
   readonly available: boolean;
   launch(request: WorkerLaunchRequest): Promise<HerdrObservation>;
@@ -54,6 +66,42 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     env: NodeJS.ProcessEnv = process.env,
   ) {
     this.available = env.HERDR_ENV === "1" && typeof env.HERDR_WORKSPACE_ID === "string";
+  }
+
+  async launchCoordinator(request: CoordinatorLaunchRequest): Promise<WorkerIdentity> {
+    if (!this.available) throw new Error("Herdr coordinator runtime is unavailable.");
+    const tabResponse = await this.call(["tab", "create", "--workspace", request.workspaceId, "--cwd", request.cwd, "--label", "Workgraph coordinator", "--no-focus"]);
+    const tab = object(object(tabResponse, "result"), "root_pane");
+    const paneId = string(tab, "pane_id");
+    const agentName = `wg-coordinator-${createHash("sha256").update(`${request.sessionFile}\0${request.cwd}`).digest("hex").slice(0, 16)}`;
+    const started = parseAgent(object(object(await this.call(["agent", "start", agentName, "--kind", "pi", "--pane", paneId, "--", "--session", request.sessionFile], 45_000), "result"), "agent"));
+    const identity: WorkerIdentity = {
+      workspaceId: started.workspaceId,
+      tabId: started.tabId,
+      paneId: started.paneId,
+      terminalId: started.terminalId,
+      agentName,
+      sessionFile: request.sessionFile,
+      cwd: request.cwd,
+    };
+    assertIdentity(identity, started);
+    return identity;
+  }
+
+  async observeCurrentCoordinator(request: CoordinatorObservationRequest): Promise<WorkerIdentity> {
+    if (!this.available) throw new Error("Herdr coordinator runtime is unavailable.");
+    const current = parseAgent(object(object(await this.call(["agent", "get", request.paneId]), "result"), "agent"));
+    if (current.sessionFile !== request.sessionFile) throw new Error("Current Herdr pane does not own the requested Pi session.");
+    if (current.cwd !== request.cwd) throw new Error("Current Herdr pane cwd does not match the repository.");
+    return {
+      workspaceId: current.workspaceId,
+      tabId: current.tabId,
+      paneId: current.paneId,
+      terminalId: current.terminalId,
+      agentName: current.name,
+      sessionFile: current.sessionFile,
+      cwd: current.cwd,
+    };
   }
 
   async launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
