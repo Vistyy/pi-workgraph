@@ -105,6 +105,18 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       ...(process.env.HERDR_WORKSPACE_ID ? { workspaceId: process.env.HERDR_WORKSPACE_ID } : {}),
       stableEntryId: stableParentEntry(ctx.sessionManager),
       onRun: (run) => { activeRun = run; updateStatus(ctx, run); },
+      onCoordinatorWake: (wake, run) => {
+        const sessionFile = ctx.sessionManager.getSessionFile();
+        if (ctx.sessionManager.getSessionId() !== run.coordinator.sessionId || !sessionFile || sessionFile !== run.coordinator.sessionFile) {
+          throw new Error("Coordinator wake refused because the current Pi session does not match the durable coordinator binding.");
+        }
+        pi.sendMessage({
+          customType: "pi-workgraph-coordinator-wake",
+          content: `[WORKGRAPH COORDINATOR WAKE]\nWorkgraph ${run.runId} reached ${wake.kind} boundary ${wake.boundaryRevision} at ${run.composedCommit}. Inspect durable status and continue within the approved plan. This extension message is not human approval and cannot authorize an envelope change or final judgment.`,
+          display: true,
+          details: { runId: run.runId, wake },
+        }, { deliverAs: "followUp", triggerTurn: true });
+      },
       onError: (error) => ctx.ui.notify(`Workgraph supervisor: ${error.message}`, "warning"),
     });
     supervisor.start();

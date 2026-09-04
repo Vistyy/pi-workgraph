@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import { GitRepository, runProcess } from "../src/git.js";
 import { HerdrCliRuntime, herdrAgentName, type HerdrAgentStatus, type HerdrObservation, type VisibleWorkerRuntime, type WorkerLaunchRequest, type WorkerRecoveryRequest } from "../src/herdr.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { transitionNode } from "../src/scheduler.js";
+import { UnsupportedWorkgraphStateVersionError } from "../src/state-store.js";
 import { persistSchedule, WorkgraphSupervisor } from "../src/supervisor.js";
 import type { WorkerIdentity } from "../src/types.js";
 import { commandAgreement, nodeSpec, testOutcome } from "./helpers.js";
@@ -51,6 +53,8 @@ class FakeRuntime implements VisibleWorkerRuntime {
   observations: WorkerIdentity[] = [];
   recoveries: WorkerRecoveryRequest[] = [];
   interrupts: WorkerIdentity[] = [];
+  cleanups: Array<{ identity: WorkerIdentity; deletedWorktree: boolean }> = [];
+  onCleanup?: (identity: WorkerIdentity, deletedWorktree: boolean) => void;
   recovered?: WorkerIdentity;
   observeStatus: HerdrAgentStatus = "working";
   interruptStatus: HerdrAgentStatus = "idle";
@@ -73,6 +77,18 @@ class FakeRuntime implements VisibleWorkerRuntime {
   async interrupt(identity: WorkerIdentity): Promise<HerdrObservation> {
     this.interrupts.push(structuredClone(identity));
     return observation(identity, this.interruptStatus);
+  }
+
+  async cleanup(identity: WorkerIdentity) {
+    this.cleanups.push({ identity: structuredClone(identity), deletedWorktree: false });
+    this.onCleanup?.(identity, false);
+    return { state: "completed" as const, identity, observedAt: new Date().toISOString(), detail: "closed" };
+  }
+
+  async cleanupDeletedWorktree(identity: WorkerIdentity) {
+    this.cleanups.push({ identity: structuredClone(identity), deletedWorktree: true });
+    this.onCleanup?.(identity, true);
+    return { state: "completed" as const, identity, observedAt: new Date().toISOString(), detail: "closed deleted cwd" };
   }
 }
 
@@ -263,6 +279,125 @@ test("stale composition reconciliation is exact and idempotent", async () => {
   }
 });
 
+test("the background supervisor contains a forward-version failure while explicit reconciliation reports it", async () => {
+  const value = await fixture();
+  const errors: Error[] = [];
+  const supervisor = new WorkgraphSupervisor(value.engine, new FakeRuntime(), { pollIntervalMs: 5, onError: (error) => { errors.push(error); throw new Error("notification failed"); } });
+  try {
+    await writeFile(value.engine.store.path, JSON.stringify({ version: 999, runId: "future" }));
+    supervisor.start();
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    await supervisor.shutdown();
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]?.message ?? "", /Unsupported workgraph state version 999/);
+    await assert.rejects(() => supervisor.reconcileNow(), (error: unknown) => error instanceof UnsupportedWorkgraphStateVersionError && error.code === "unsupported_state_version" && error.stateVersion === 999);
+  } finally {
+    value.registry.close();
+    await rm(value.parent, { recursive: true, force: true });
+  }
+});
+
+test("a semantic boundary wakes the coordinator once and retains the delivered identity", async () => {
+  const value = await fixture();
+  const runtime = new FakeRuntime();
+  const wakeups: string[] = [];
+  try {
+    await value.engine.schedule({ nodes: [nodeSpec("settled", ["value.txt"])], maxConcurrency: 1 });
+    await value.engine.store.update((run) => {
+      const node = run.nodes[0]!;
+      transitionNode(node, "running");
+      transitionNode(node, "completed");
+      transitionNode(node, "composed");
+      node.commit = run.composedCommit;
+      run.control.executionStatus = "idle";
+      run.control.attentionStatus = "clear";
+      run.phase = "executing";
+    });
+    const supervisor = new WorkgraphSupervisor(value.engine, runtime, {
+      onCoordinatorWake(wake) { wakeups.push(wake.id); },
+    });
+    let run = await supervisor.reconcileNow();
+    run = await supervisor.reconcileNow();
+    assert.equal(wakeups.length, 1);
+    assert.match(wakeups[0] ?? "", /^settle:/);
+    assert.equal(run.coordinatorWakeups?.length, 1);
+    assert.equal(run.coordinatorWakeups?.[0]?.state, "delivered");
+    assert.equal(run.coordinatorWakeups?.[0]?.composedCommit, run.composedCommit);
+
+    await value.engine.store.update((draft) => {
+      draft.phase = "awaiting_verification";
+      draft.productVerification = { revision: draft.composedCommit, method: "independent", state: "inconclusive", attemptId: "failed-verifier", commands: [], error: "Verifier failed before reporting." };
+      draft.attempts.push({ id: "failed-verifier", nodeId: "product-verification", mode: "verification", planVersion: 1, state: "failed", stage: "settled", runtimeMode: "herdr", createdAt: new Date(0).toISOString(), lastActivityAt: new Date(0).toISOString(), error: "Verifier failed before reporting." });
+      draft.control.attentionStatus = "failed";
+      draft.control.verificationStatus = "inconclusive";
+    });
+    run = await supervisor.reconcileNow();
+    assert.equal(wakeups.length, 2);
+    assert.match(wakeups[1] ?? "", /^attention:/);
+    assert.equal(run.coordinatorWakeups?.[1]?.state, "delivered");
+  } finally {
+    value.registry.close();
+    await rm(value.parent, { recursive: true, force: true });
+  }
+});
+
+test("cleanup closes Herdr before Git and recovers the attributable deleted-worktree window", async () => {
+  const value = await fixture();
+  const runtime = new FakeRuntime();
+  try {
+    await value.engine.schedule({ nodes: [nodeSpec("cleanup-order", ["value.txt"])], maxConcurrency: 1 });
+    const run = await value.engine.load();
+    const placement = await value.repository.createWorktree(run.runId, "cleanup-order", run.composedCommit);
+    const identity: WorkerIdentity = {
+      workspaceId: "workspace-1", tabId: "workspace-1:tab-cleanup", paneId: "workspace-1:pane-cleanup", terminalId: "terminal-cleanup",
+      agentName: "wg-cleanup-order", sessionFile: join(value.parent, "cleanup.jsonl"), cwd: placement.path,
+    };
+    await value.engine.store.update((draft) => {
+      const node = draft.nodes[0]!;
+      transitionNode(node, "running");
+      transitionNode(node, "completed");
+      transitionNode(node, "composed");
+      node.commit = draft.composedCommit;
+      node.baseCommit = placement.baseCommit;
+      node.branch = placement.branch;
+      node.worktreePath = placement.path;
+      draft.attempts.push({ id: "cleanup-attempt", nodeId: node.id, mode: "implementation", planVersion: 1, state: "completed", stage: "settled", runtimeMode: "herdr", createdAt: new Date(0).toISOString(), lastActivityAt: new Date(0).toISOString(), settledAt: new Date(0).toISOString(), baseCommit: placement.baseCommit, branch: placement.branch, worktreePath: placement.path, worker: identity });
+      draft.control.executionStatus = "idle";
+    });
+    runtime.onCleanup = (worker, deleted) => {
+      assert.equal(deleted, false);
+      assert.equal(worker.cwd, placement.path);
+      assert.equal(existsSync(placement.path), true);
+    };
+    let cleaned = await new WorkgraphSupervisor(value.engine, runtime).cleanupNow();
+    assert.equal(existsSync(placement.path), false);
+    assert.deepEqual(runtime.cleanups.map((item) => item.deletedWorktree), [false]);
+    assert.equal(cleaned.cleanup?.every((record) => record.state === "completed"), true);
+
+    await value.engine.store.update((draft) => {
+      const herdr = draft.cleanup?.find((record) => record.kind === "herdr_worker");
+      if (!herdr) throw new Error("missing Herdr cleanup record");
+      herdr.state = "blocked";
+      delete herdr.completedAt;
+      herdr.error = "Herdr worker cwd changed.";
+      const gitRecord = draft.cleanup?.find((record) => record.kind === "git_worktree");
+      if (!gitRecord) throw new Error("missing Git cleanup record");
+      gitRecord.state = "completed";
+    });
+    runtime.cleanups.length = 0;
+    runtime.onCleanup = (_worker, deleted) => {
+      assert.equal(deleted, true);
+      assert.equal(existsSync(placement.path), false);
+    };
+    cleaned = await new WorkgraphSupervisor(value.engine, runtime).cleanupNow();
+    assert.deepEqual(runtime.cleanups.map((item) => item.deletedWorktree), [true]);
+    assert.equal(cleaned.cleanup?.every((record) => record.state === "completed"), true);
+  } finally {
+    value.registry.close();
+    await rm(value.parent, { recursive: true, force: true });
+  }
+});
+
 test("an internal replan remains available after legacy revision_required attention", async () => {
   const value = await fixture();
   try {
@@ -339,6 +474,47 @@ test("Herdr identity validation rejects missing and mismatched native session or
   }
 });
 
+test("current-session coordinator observation accepts an unnamed detected Pi pane without weakening worker identity", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-coordinator-"));
+  const command = join(parent, "fake-herdr-coordinator.mjs");
+  const cwd = join(parent, "repo");
+  const sessionFile = join(parent, "coordinator.jsonl");
+  const agent = { workspace_id: "workspace-1", tab_id: "workspace-1:tab-1", pane_id: "workspace-1:pane-1", terminal_id: "terminal-1", agent_status: "working", cwd, agent_session: { value: sessionFile } };
+  await writeFile(command, `#!/usr/bin/env node\nconsole.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));\n`);
+  await chmod(command, 0o755);
+  try {
+    const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "workspace-1" });
+    const coordinator = await runtime.observeCurrentCoordinator({ paneId: agent.pane_id, sessionFile, cwd });
+    assert.equal(coordinator.agentName, undefined);
+    assert.equal(coordinator.sessionFile, sessionFile);
+    await assert.rejects(() => runtime.observe({ ...coordinator, agentName: "required-worker-name" }), /omitted string name/);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("deleted-worktree cleanup accepts only the attributable cwd suffix and verifies tab absence", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-deleted-cleanup-"));
+  const command = join(parent, "fake-herdr-cleanup.mjs");
+  const closed = join(parent, "closed");
+  const cwd = join(parent, "worktree");
+  const sessionFile = join(parent, "worker.jsonl");
+  const identity: WorkerIdentity = { workspaceId: "workspace-1", tabId: "workspace-1:tab-1", paneId: "workspace-1:pane-1", terminalId: "terminal-1", agentName: "wg-cleanup", sessionFile, cwd };
+  const agent = { workspace_id: identity.workspaceId, tab_id: identity.tabId, pane_id: identity.paneId, terminal_id: identity.terminalId, agent_status: "idle", name: identity.agentName, cwd: `${cwd} (deleted)`, agent_session: { value: sessionFile } };
+  await writeFile(command, `#!/usr/bin/env node\nimport { existsSync, writeFileSync } from "node:fs";\nconst args=process.argv.slice(2);\nconst closed=${JSON.stringify(closed)};\nif(args[0]==="agent"&&args[1]==="get"){if(existsSync(closed)){console.error(JSON.stringify({error:{code:"pane_not_found",message:"gone"}}));process.exit(1)}console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}))}\nelse if(args[0]==="tab"&&args[1]==="close"){writeFileSync(closed,"");console.log(JSON.stringify({result:{type:"ok"}}))}\nelse if(args[0]==="tab"&&args[1]==="get"&&existsSync(closed)){console.error(JSON.stringify({error:{code:"tab_not_found",message:"gone"}}));process.exit(1)}\nelse console.log(JSON.stringify({result:{tab:{tab_id:${JSON.stringify(identity.tabId)}}}}));\n`);
+  await chmod(command, 0o755);
+  try {
+    const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: identity.workspaceId });
+    await assert.rejects(() => runtime.cleanup(identity), /worker cwd changed/);
+    const result = await runtime.cleanupDeletedWorktree(identity);
+    assert.equal(result.state, "completed");
+    assert.match(result.detail, /Closed and verified exact Herdr tab/);
+    assert.equal(existsSync(closed), true);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("the Herdr adapter launches without waiting and validates exact identity before interrupt", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-"));
   const log = join(parent, "commands.jsonl");
@@ -380,11 +556,14 @@ test("the Herdr adapter launches without waiting and validates exact identity be
     assert.deepEqual(recovered?.identity, observation.identity);
     assert.equal(recovered?.status, "working");
     await runtime.interrupt(observation.identity);
+    const pendingCleanup = await runtime.cleanup(observation.identity);
+    assert.equal(pendingCleanup.state, "pending");
     const calls = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
     const prompt = calls.find((args) => args[0] === "agent" && args[1] === "prompt")!;
     assert.equal(prompt.includes("--wait"), false);
     assert.deepEqual(calls.find((args) => args[0] === "agent" && args[1] === "send-keys")?.slice(-1), ["esc"]);
-    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "get").length, 2);
+    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "get").length, 3);
+    assert.equal(calls.some((args) => args[0] === "tab" && args[1] === "close"), false);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

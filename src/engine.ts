@@ -19,6 +19,7 @@ import type {
   ChildOutcome,
   ChildResultKind,
   ChildResultReview,
+  CoordinatorRuntimeIdentity,
   DiscoveryAssignment,
   DiscoveryRecord,
   DiscoveryTopology,
@@ -33,7 +34,6 @@ import type {
   WorkgraphRun,
   WorkAttempt,
   WorkerMode,
-  WorkerIdentity,
   WorkerReport,
   ImplementationReport,
 } from "./types.js";
@@ -184,7 +184,7 @@ export class WorkgraphEngine {
     this.lease = this.registry.renew(this.lease);
   }
 
-  async adopt(sessionId: string, sessionFile: string, liveness: "alive" | "dead" | "unknown" = "unknown", runtimeIdentity?: WorkerIdentity): Promise<WorkgraphRun> {
+  async adopt(sessionId: string, sessionFile: string, liveness: "alive" | "dead" | "unknown" = "unknown", runtimeIdentity?: CoordinatorRuntimeIdentity): Promise<WorkgraphRun> {
     if (!sessionId.trim() || !sessionFile.trim()) throw new Error("Adoption requires a Pi session identity.");
     const run = await this.load();
     if (run.lifecycle === "abandoned" || run.lifecycle === "archived") throw new Error(`Workgraph ${run.runId} is ${run.lifecycle}.`);

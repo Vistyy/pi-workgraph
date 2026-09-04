@@ -11,6 +11,15 @@ import {
   type PlanRecord,
 } from "./types.js";
 
+export class UnsupportedWorkgraphStateVersionError extends Error {
+  readonly code = "unsupported_state_version";
+
+  constructor(readonly stateVersion: number | undefined, readonly runId: string) {
+    super(`Unsupported workgraph state version ${String(stateVersion)}: ${runId}`);
+    this.name = "UnsupportedWorkgraphStateVersionError";
+  }
+}
+
 export interface NewRunInput {
   request: string;
   projectRoot: string;
@@ -75,6 +84,7 @@ export class RunStateStore {
       attempts: [],
       resultReviews: [],
       cleanup: [],
+      coordinatorWakeups: [],
       milestones: (input.milestones ?? []).map((milestone) => ({
         id: milestone.id,
         description: milestone.description,
@@ -95,7 +105,7 @@ export class RunStateStore {
     const parsed = JSON.parse(await readFile(this.path, "utf8")) as Partial<WorkgraphRun> & { version?: number };
     if (typeof parsed.runId !== "string") throw new Error(`Unsupported or invalid workgraph state: ${this.path}`);
     const migrated = migrateRun(parsed);
-    if (migrated.version !== parsed.version) await this.write(migrated);
+    if (migrated !== parsed) await this.write(migrated);
     return migrated;
   }
 
@@ -141,15 +151,38 @@ export class RunStateStore {
 function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): WorkgraphRun {
   const version = (parsed as { version?: number }).version;
   if (version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== RUN_STATE_VERSION) {
-    throw new Error(`Unsupported workgraph state version ${String(version)}: ${parsed.runId}`);
+    throw new UnsupportedWorkgraphStateVersionError(version, parsed.runId!);
   }
-  if (version === RUN_STATE_VERSION && parsed.resultReviews && parsed.cleanup) return parsed as WorkgraphRun;
+  if (version === RUN_STATE_VERSION && parsed.resultReviews && parsed.cleanup && parsed.coordinatorWakeups) return parsed as WorkgraphRun;
   const createdAt = parsed.createdAt ?? new Date(0).toISOString();
   const updatedAt = parsed.updatedAt ?? createdAt;
   const legacy = parsed as Partial<WorkgraphRun> & { parentSessionId?: string; parentSessionFile?: string };
   const sessionId = legacy.parentSessionId ?? "unknown-session";
   const sessionFile = legacy.parentSessionFile ?? "";
-  const lifecycle: RunLifecycle = version === 4 && parsed.lifecycle ? parsed.lifecycle : parsed.phase === "complete" ? "completed" : "active";
+  const lifecycle: RunLifecycle = parsed.lifecycle ?? (parsed.phase === "complete" ? "completed" : "active");
+  const plans = parsed.plans ? [...parsed.plans] : legacyPlans(parsed, createdAt, updatedAt);
+  const control = parsed.control ? { ...parsed.control } : migratedControl(parsed, plans, lifecycle, updatedAt);
+  return {
+    ...(parsed as WorkgraphRun),
+    version: RUN_STATE_VERSION,
+    creator: parsed.creator ?? { sessionId, sessionFile, createdAt },
+    coordinator: parsed.coordinator ?? { sessionId, sessionFile, boundAt: createdAt },
+    handoffs: parsed.handoffs ?? [],
+    lifecycle,
+    lifecycleUpdatedAt: parsed.lifecycleUpdatedAt ?? updatedAt,
+    control,
+    plans,
+    attempts: (parsed.attempts ?? []).map((attempt) => ({
+      ...attempt,
+      mode: attempt.mode ?? "implementation",
+    })),
+    resultReviews: parsed.resultReviews ?? [],
+    cleanup: parsed.cleanup ?? [],
+    coordinatorWakeups: parsed.coordinatorWakeups ?? [],
+  };
+}
+
+function legacyPlans(parsed: Partial<WorkgraphRun>, createdAt: string, updatedAt: string): PlanRecord[] {
   const approvedAt = parsed.agreement?.approvedAt;
   const plans: PlanRecord[] = parsed.agreement ? [{
     version: 1,
@@ -170,24 +203,7 @@ function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): Workg
       proposedAt: updatedAt,
     });
   }
-  const control = migratedControl(parsed, plans, lifecycle, updatedAt);
-  return {
-    ...(parsed as WorkgraphRun),
-    version: RUN_STATE_VERSION,
-    creator: parsed.creator ?? { sessionId, sessionFile, createdAt },
-    coordinator: parsed.coordinator ?? { sessionId, sessionFile, boundAt: createdAt },
-    handoffs: parsed.handoffs ?? [],
-    lifecycle,
-    lifecycleUpdatedAt: parsed.lifecycleUpdatedAt ?? updatedAt,
-    control,
-    plans,
-    attempts: (parsed.attempts ?? []).map((attempt) => ({
-      ...attempt,
-      mode: attempt.mode ?? "implementation",
-    })),
-    resultReviews: parsed.resultReviews ?? [],
-    cleanup: parsed.cleanup ?? [],
-  };
+  return plans;
 }
 
 function agreementDraft(agreement: NonNullable<Partial<WorkgraphRun>["agreement"]>): PlanRecord["agreement"] {

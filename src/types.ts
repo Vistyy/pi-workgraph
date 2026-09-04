@@ -23,7 +23,7 @@ export interface RunCreator extends SessionIdentity {
 
 export interface CoordinatorBinding extends SessionIdentity {
   boundAt: string;
-  runtimeIdentity?: WorkerIdentity;
+  runtimeIdentity?: CoordinatorRuntimeIdentity;
 }
 
 export interface CoordinatorHandoff {
@@ -436,14 +436,33 @@ export interface PlanRecord {
   decisionText?: string;
 }
 
-export interface WorkerIdentity {
+export interface CoordinatorRuntimeIdentity {
   workspaceId: string;
   tabId: string;
   paneId: string;
   terminalId: string;
-  agentName: string;
+  agentName?: string;
   sessionFile: string;
   cwd: string;
+}
+
+export interface WorkerIdentity extends CoordinatorRuntimeIdentity {
+  agentName: string;
+}
+
+export type CoordinatorBoundaryKind = "agreement" | "settle" | "verification" | "assurance" | "judgment" | "attention";
+
+export interface CoordinatorWakeRecord {
+  id: string;
+  boundaryRevision: string;
+  kind: CoordinatorBoundaryKind;
+  phase: RunPhase;
+  composedCommit: string;
+  planVersion?: number;
+  state: "claimed" | "delivered" | "failed";
+  requestedAt: string;
+  deliveredAt?: string;
+  error?: string;
 }
 
 export type CleanupState = "pending" | "completed" | "blocked";
@@ -548,6 +567,7 @@ export interface WorkgraphRun {
   attempts: WorkAttempt[];
   resultReviews?: ChildResultReview[];
   cleanup?: ResourceCleanupRecord[];
+  coordinatorWakeups?: CoordinatorWakeRecord[];
   milestones: MilestoneRecord[];
   terminalOutcome?: TerminalOutcome;
   agreement?: Agreement;

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import type { ThinkingLevel, WorkerIdentity, WorkerObservationStatus, WorkerStage } from "./types.js";
+import type { CoordinatorRuntimeIdentity, ThinkingLevel, WorkerIdentity, WorkerObservationStatus, WorkerStage } from "./types.js";
 
 export type HerdrAgentStatus = WorkerObservationStatus;
 
@@ -45,7 +45,7 @@ export interface CoordinatorObservationRequest {
 }
 
 export interface WorkerCleanupResult {
-  state: "completed" | "blocked";
+  state: "pending" | "completed" | "blocked";
   identity: WorkerIdentity;
   observedAt: string;
   detail: string;
@@ -58,6 +58,7 @@ export interface VisibleWorkerRuntime {
   observe(identity: WorkerIdentity): Promise<HerdrObservation>;
   interrupt(identity: WorkerIdentity): Promise<HerdrObservation>;
   cleanup?(identity: WorkerIdentity): Promise<WorkerCleanupResult>;
+  cleanupDeletedWorktree?(identity: WorkerIdentity): Promise<WorkerCleanupResult>;
 }
 
 interface CommandResult {
@@ -96,20 +97,12 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     return identity;
   }
 
-  async observeCurrentCoordinator(request: CoordinatorObservationRequest): Promise<WorkerIdentity> {
+  async observeCurrentCoordinator(request: CoordinatorObservationRequest): Promise<CoordinatorRuntimeIdentity> {
     if (!this.available) throw new Error("Herdr coordinator runtime is unavailable.");
-    const current = parseAgent(object(object(await this.call(["agent", "get", request.paneId]), "result"), "agent"));
+    const current = parseCoordinator(object(object(await this.call(["agent", "get", request.paneId]), "result"), "agent"));
     if (current.sessionFile !== request.sessionFile) throw new Error("Current Herdr pane does not own the requested Pi session.");
     if (current.cwd !== request.cwd) throw new Error("Current Herdr pane cwd does not match the repository.");
-    return {
-      workspaceId: current.workspaceId,
-      tabId: current.tabId,
-      paneId: current.paneId,
-      terminalId: current.terminalId,
-      agentName: current.name,
-      sessionFile: current.sessionFile,
-      cwd: current.cwd,
-    };
+    return current;
   }
 
   async launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
@@ -203,24 +196,57 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
   }
 
   async cleanup(identity: WorkerIdentity): Promise<WorkerCleanupResult> {
-    const observation = await this.observe(identity);
-    if (observation.status === "working" || observation.status === "blocked" || observation.status === "unknown") {
+    return this.cleanupExact(identity, false);
+  }
+
+  async cleanupDeletedWorktree(identity: WorkerIdentity): Promise<WorkerCleanupResult> {
+    return this.cleanupExact(identity, true);
+  }
+
+  private async cleanupExact(identity: WorkerIdentity, allowDeletedWorktree: boolean): Promise<WorkerCleanupResult> {
+    const observation = await this.observeForCleanup(identity, allowDeletedWorktree);
+    if (!observation) {
+      return { state: "completed", identity, observedAt: new Date().toISOString(), detail: `Exact Herdr tab ${identity.tabId} was already absent.` };
+    }
+    if (observation.status === "working") {
+      return { state: "pending", identity, observedAt: observation.observedAt, detail: "Worker is still working; exact cleanup remains pending." };
+    }
+    if (observation.status === "blocked" || observation.status === "unknown") {
       return { state: "blocked", identity, observedAt: observation.observedAt, detail: `Worker is ${observation.status}; cleanup requires a verified idle or done worker.` };
     }
     await this.call(["tab", "close", identity.tabId]);
-    return { state: "completed", identity, observedAt: new Date().toISOString(), detail: `Closed exact Herdr tab ${identity.tabId}.` };
+    if (!(await this.tabAbsent(identity.tabId))) throw new Error(`Herdr tab ${identity.tabId} still exists after cleanup.`);
+    return { state: "completed", identity, observedAt: new Date().toISOString(), detail: `Closed and verified exact Herdr tab ${identity.tabId}.` };
+  }
+
+  private async observeForCleanup(identity: WorkerIdentity, allowDeletedWorktree: boolean): Promise<HerdrObservation | undefined> {
+    const result = await spawnCommand(this.command, ["agent", "get", identity.paneId], 30_000);
+    if (result.code !== 0) {
+      if ((isNotFound(result, "agent_not_found") || isNotFound(result, "pane_not_found")) && await this.tabAbsent(identity.tabId)) return undefined;
+      throw herdrError(["agent", "get", identity.paneId], result);
+    }
+    const parsed = parseSuccess(result, ["agent", "get", identity.paneId]);
+    const current = parseAgent(object(object(parsed, "result"), "agent"));
+    assertIdentity(identity, current, allowDeletedWorktree);
+    return {
+      identity,
+      status: current.status,
+      stage: current.status === "blocked" ? "attention" : current.status === "working" ? "executing" : "reporting",
+      observedAt: new Date().toISOString(),
+    };
+  }
+
+  private async tabAbsent(tabId: string): Promise<boolean> {
+    const result = await spawnCommand(this.command, ["tab", "get", tabId], 30_000);
+    if (result.code === 0) return false;
+    if (isNotFound(result, "tab_not_found")) return true;
+    throw herdrError(["tab", "get", tabId], result);
   }
 
   private async call(args: string[], timeoutMs = 30_000): Promise<Record<string, unknown>> {
     const result = await spawnCommand(this.command, args, timeoutMs);
     if (result.code !== 0) throw herdrError(args, result);
-    let parsed: unknown;
-    try { parsed = JSON.parse(result.stdout); }
-    catch { throw new Error(`Herdr returned invalid JSON for ${args.slice(0, 2).join(" ")}.`); }
-    if (!parsed || typeof parsed !== "object" || !("result" in parsed)) {
-      throw new Error(`Herdr returned an invalid success response for ${args.slice(0, 2).join(" ")}.`);
-    }
-    return parsed as Record<string, unknown>;
+    return parseSuccess(result, args);
   }
 }
 
@@ -233,6 +259,20 @@ interface ParsedAgent {
   status: HerdrAgentStatus;
   sessionFile: string;
   cwd: string;
+}
+
+function parseCoordinator(value: Record<string, unknown>): CoordinatorRuntimeIdentity {
+  const session = object(value, "agent_session");
+  const agentName = optionalString(value, "name");
+  return {
+    workspaceId: string(value, "workspace_id"),
+    tabId: string(value, "tab_id"),
+    paneId: string(value, "pane_id"),
+    terminalId: string(value, "terminal_id"),
+    ...(agentName ? { agentName } : {}),
+    sessionFile: string(session, "value"),
+    cwd: string(value, "cwd"),
+  };
 }
 
 function parseAgent(value: Record<string, unknown>): ParsedAgent {
@@ -252,7 +292,7 @@ function parseAgent(value: Record<string, unknown>): ParsedAgent {
   return result;
 }
 
-function assertIdentity(expected: WorkerIdentity, actual: ParsedAgent): void {
+function assertIdentity(expected: WorkerIdentity, actual: ParsedAgent, allowDeletedWorktree = false): void {
   if (
     expected.workspaceId !== actual.workspaceId
     || expected.tabId !== actual.tabId
@@ -263,7 +303,8 @@ function assertIdentity(expected: WorkerIdentity, actual: ParsedAgent): void {
     throw new Error("Herdr worker identity changed.");
   }
   if (actual.sessionFile !== expected.sessionFile) throw new Error("Herdr native Pi session changed.");
-  if (actual.cwd !== expected.cwd) throw new Error("Herdr worker cwd changed.");
+  const attributableDeletedCwd = allowDeletedWorktree && actual.cwd === `${expected.cwd} (deleted)`;
+  if (actual.cwd !== expected.cwd && !attributableDeletedCwd) throw new Error("Herdr worker cwd changed.");
 }
 
 function envArgs(env: Record<string, string>): string[] {
@@ -303,12 +344,35 @@ function isAgentStatus(value: string): value is HerdrAgentStatus {
   return value === "idle" || value === "working" || value === "blocked" || value === "done" || value === "unknown";
 }
 
+function parseSuccess(result: CommandResult, args: string[]): Record<string, unknown> {
+  let parsed: unknown;
+  try { parsed = JSON.parse(result.stdout); }
+  catch { throw new Error(`Herdr returned invalid JSON for ${args.slice(0, 2).join(" ")}.`); }
+  if (!parsed || typeof parsed !== "object" || !("result" in parsed)) {
+    throw new Error(`Herdr returned an invalid success response for ${args.slice(0, 2).join(" ")}.`);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function isNotFound(result: CommandResult, expectedCode: "agent_not_found" | "pane_not_found" | "tab_not_found"): boolean {
+  for (const candidate of [result.stderr, result.stdout]) {
+    try {
+      const parsed = JSON.parse(candidate) as { error?: { code?: string } };
+      if (parsed.error?.code === expectedCode) return true;
+    } catch {}
+  }
+  return false;
+}
+
 function herdrError(args: string[], result: CommandResult): Error {
   let message = result.stderr || result.stdout || `Herdr exited ${result.code}.`;
-  try {
-    const parsed = JSON.parse(result.stderr) as { error?: { code?: string; message?: string } };
-    message = [parsed.error?.code, parsed.error?.message].filter(Boolean).join(": ") || message;
-  } catch {}
+  for (const candidate of [result.stderr, result.stdout]) {
+    try {
+      const parsed = JSON.parse(candidate) as { error?: { code?: string; message?: string } };
+      message = [parsed.error?.code, parsed.error?.message].filter(Boolean).join(": ") || message;
+      if (parsed.error) break;
+    } catch {}
+  }
   return new Error(`herdr ${args.slice(0, 2).join(" ")} failed: ${message}`);
 }
 

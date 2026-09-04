@@ -7,7 +7,7 @@ import { WorkgraphEngine } from "../src/engine.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { RunStateStore } from "../src/state-store.js";
 import { GitRepository, runProcess } from "../src/git.js";
-import { testOutcome } from "./helpers.js";
+import { commandAgreement, testOutcome } from "./helpers.js";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await runProcess("git", ["-C", cwd, ...args], { cwd, timeoutMs: 30_000 });
@@ -64,8 +64,10 @@ test("engine adoption changes coordinator identity without forking and lifecycle
   const fixture = await makeFixture();
   try {
     fixture.begun.engine.releaseLease();
-    const adopted = await fixture.begun.engine.adopt("session-b", join(fixture.parent, "b.jsonl"));
+    const runtimeIdentity = { workspaceId: "workspace-1", tabId: "workspace-1:tab-1", paneId: "workspace-1:pane-1", terminalId: "terminal-1", sessionFile: join(fixture.parent, "b.jsonl"), cwd: fixture.root };
+    const adopted = await fixture.begun.engine.adopt("session-b", runtimeIdentity.sessionFile, "unknown", runtimeIdentity);
     assert.equal(adopted.coordinator.sessionId, "session-b");
+    assert.deepEqual(adopted.coordinator.runtimeIdentity, runtimeIdentity);
     assert.equal(adopted.handoffs.at(-1)?.kind, "adopt");
     assert.equal(adopted.handoffs.at(-1)?.fromSessionId, "session-a");
     const suspended = await fixture.begun.engine.setLifecycle("suspended", "User paused the run.");
@@ -101,6 +103,35 @@ test("version 3 migration preserves reports, sessions, decisions, nodes, evidenc
     assert.deepEqual(run.plans, []);
     assert.deepEqual(run.attempts, []);
     assert.equal(JSON.parse(await readFile(path, "utf8")).version, 6);
+  } finally { await rm(parent, { recursive: true, force: true }); }
+});
+
+test("version 5 migration preserves versioned plan history and active plan identity", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-plan-migration-"));
+  try {
+    const path = join(parent, "state.json");
+    const { approvedAt: _approvedAt, ...agreement } = commandAgreement;
+    const plans = [
+      { version: 1, status: "superseded", changeKind: "initial", agreement: { ...agreement, outcome: "First authority." }, summary: "First plan.", proposedAt: "2026-01-01T00:00:00.000Z", decisionText: "approved first", approvedAt: "2026-01-01T00:01:00.000Z" },
+      { version: 2, status: "approved", changeKind: "authority", agreement: { ...agreement, outcome: "Current authority." }, summary: "Current plan.", proposedAt: "2026-01-02T00:00:00.000Z", decisionText: "approved current", approvedAt: "2026-01-02T00:01:00.000Z" },
+    ] as const;
+    const legacy = {
+      version: 5, revision: 12, runId: "planned", request: "planned", projectRoot: parent, gitCommonDir: join(parent, ".git"), statePath: path,
+      parentSessionId: "coordinator", parentSessionFile: join(parent, "coordinator.jsonl"), phase: "executing", lifecycle: "active",
+      baseCommit: "base", composedCommit: "commit", createdAt: new Date(0).toISOString(), updatedAt: new Date(1).toISOString(), outcome: testOutcome.outcome,
+      agreement: { ...plans[1].agreement, approvedAt: plans[1].approvedAt }, plans, control: { planStatus: "approved", currentPlanVersion: 2, executionStatus: "idle", attentionStatus: "clear", verificationStatus: "absent", maxConcurrency: 1, updatedAt: new Date(1).toISOString() },
+      milestones: [], discoveries: [], nodes: [], attempts: [], resultReviews: [], cleanup: [], composition: [], humanDecisions: [
+        { kind: "agreement", prompt: plans[0].decisionText, accepted: true, at: plans[0].approvedAt },
+        { kind: "envelope_change", prompt: plans[1].decisionText, accepted: true, at: plans[1].approvedAt },
+      ], globalVerification: [], transitions: [], handoffs: [],
+    };
+    await writeFile(path, JSON.stringify(legacy));
+    const run = await new RunStateStore(path).load();
+    assert.equal(run.version, 6);
+    assert.deepEqual(run.plans, plans);
+    assert.equal(run.control.currentPlanVersion, 2);
+    assert.equal(run.control.planStatus, "approved");
+    assert.deepEqual(run.humanDecisions, legacy.humanDecisions);
   } finally { await rm(parent, { recursive: true, force: true }); }
 });
 

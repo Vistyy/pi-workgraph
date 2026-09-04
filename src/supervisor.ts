@@ -1,11 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { validateSynthesis, WorkgraphEngine, type ScheduleInput } from "./engine.js";
 import type { WorktreePlacement } from "./git.js";
 import { herdrAgentName, type HerdrObservation, type VisibleWorkerRuntime } from "./herdr.js";
 import { forkSession, readTerminalText, readWorkgraphReport } from "./pi-process.js";
-import { claimsOverlap, readyWave, transitionNode } from "./scheduler.js";
-import type { AssuranceReviewReport, AssuranceSynthesisReport, DiscoveryReport, ImplementationReport, VerificationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun, WorkerMode, ResourceCleanupRecord } from "./types.js";
+import { allNodesComposed, claimsOverlap, readyWave, transitionNode } from "./scheduler.js";
+import { UnsupportedWorkgraphStateVersionError } from "./state-store.js";
+import type { AssuranceReviewReport, AssuranceSynthesisReport, CleanupState, CoordinatorBoundaryKind, CoordinatorWakeRecord, DiscoveryReport, ImplementationReport, VerificationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun, WorkerMode, ResourceCleanupRecord } from "./types.js";
 
 export interface SupervisorWake {
   kick(): void;
@@ -22,12 +23,14 @@ export interface SupervisorOptions {
   pollIntervalMs?: number;
   stableEntryId?: string | null;
   onRun?: (run: WorkgraphRun) => void;
+  onCoordinatorWake?: (wake: CoordinatorWakeRecord, run: WorkgraphRun) => void | Promise<void>;
   onError?: (error: Error) => void;
 }
 
 export class WorkgraphSupervisor {
   private timer: NodeJS.Timeout | undefined;
-  private active: Promise<WorkgraphRun> | undefined;
+  private active: Promise<void> | undefined;
+  private operationTail: Promise<void> = Promise.resolve();
   private controller = new AbortController();
   private stopped = false;
 
@@ -61,29 +64,34 @@ export class WorkgraphSupervisor {
 
   kick(): void {
     if (this.stopped || this.active) return;
-    this.active = this.reconcileAndAdvance()
-      .then((run) => {
-        this.options.onRun?.(run);
-        return run;
-      })
+    this.active = this.exclusively(() => this.reconcileCycle())
+      .then((run) => { this.options.onRun?.(run); })
       .catch(async (error: unknown) => {
         const normalized = error instanceof Error ? error : new Error(String(error));
-        this.options.onError?.(normalized);
-        return this.recordSupervisorError(normalized);
+        this.reportError(normalized);
+        if (isForwardStateError(normalized)) this.stop();
+        try { await this.recordSupervisorError(normalized); } catch {}
       })
       .finally(() => { this.active = undefined; });
   }
 
   async reconcileNow(): Promise<WorkgraphRun> {
-    if (this.active) return this.active;
-    this.active = this.reconcileAndAdvance().finally(() => { this.active = undefined; });
-    return this.active;
+    return this.exclusively(() => this.reconcileCycle());
   }
 
   async cleanupNow(): Promise<WorkgraphRun> {
-    if (this.active) return this.active;
-    this.active = this.reconcileCleanupOnly().finally(() => { this.active = undefined; });
-    return this.active;
+    return this.exclusively(() => this.reconcileCleanupOnly());
+  }
+
+  private exclusively<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.operationTail.then(operation, operation);
+    this.operationTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async reconcileCycle(): Promise<WorkgraphRun> {
+    const run = await this.reconcileAndAdvance();
+    return this.notifyCoordinatorBoundary(run);
   }
 
   private async reconcileCleanupOnly(): Promise<WorkgraphRun> {
@@ -667,25 +675,37 @@ export class WorkgraphSupervisor {
   }
 
   private async processCleanup(run: WorkgraphRun): Promise<void> {
-    for (const record of run.cleanup ?? []) {
-      if (record.state === "completed") continue;
+    const ordered = [...(run.cleanup ?? [])].sort((left, right) => {
+      if (left.attemptId !== right.attemptId) return left.requestedAt.localeCompare(right.requestedAt);
+      return cleanupPriority(left) - cleanupPriority(right);
+    });
+    for (const original of ordered) {
+      const latest = await this.engine.load();
+      const record = (latest.cleanup ?? []).find((candidate) => candidate.id === original.id);
+      if (!record || record.state === "completed") continue;
       try {
-        if (record.kind === "git_worktree") {
-          const result = await (await this.engine.repository()).cleanupWorktree({ path: record.path, branch: record.branch, baseCommit: record.expectedHead }, record.expectedHead);
+        if (record.kind === "herdr_worker") {
+          const gitRecord = (latest.cleanup ?? []).find((candidate) => candidate.attemptId === record.attemptId && candidate.kind === "git_worktree");
+          const cleanup = gitRecord?.state === "completed" ? this.runtime.cleanupDeletedWorktree : this.runtime.cleanup;
+          if (!cleanup) {
+            await this.recordCleanup(record.id, "blocked", "Herdr runtime does not provide exact worker cleanup.");
+            continue;
+          }
+          const result = await cleanup.call(this.runtime, record.identity);
           await this.recordCleanup(record.id, result.state, result.detail);
-        } else if (this.runtime.cleanup) {
-          const result = await this.runtime.cleanup(record.identity);
-          await this.recordCleanup(record.id, result.state, result.detail);
-        } else {
-          await this.recordCleanup(record.id, "blocked", "Herdr runtime does not provide exact worker cleanup.");
+          continue;
         }
+        const herdrRecord = (latest.cleanup ?? []).find((candidate) => candidate.attemptId === record.attemptId && candidate.kind === "herdr_worker");
+        if (herdrRecord && herdrRecord.state !== "completed") continue;
+        const result = await (await this.engine.repository()).cleanupWorktree({ path: record.path, branch: record.branch, baseCommit: record.expectedHead }, record.expectedHead);
+        await this.recordCleanup(record.id, result.state, result.detail);
       } catch (error) {
         await this.recordCleanup(record.id, "blocked", errorMessage(error));
       }
     }
   }
 
-  private async recordCleanup(id: string, state: "completed" | "blocked", detail: string): Promise<void> {
+  private async recordCleanup(id: string, state: CleanupState, detail: string): Promise<void> {
     await this.engine.store.update((draft) => {
       const record = (draft.cleanup ?? []).find((candidate) => candidate.id === id);
       if (!record) return;
@@ -693,9 +713,18 @@ export class WorkgraphSupervisor {
       record.inspectedAt = new Date().toISOString();
       record.detail = detail;
       if (state === "blocked") record.error = detail;
-      else { delete record.error; record.completedAt = record.inspectedAt; }
+      else if (state === "completed") { delete record.error; record.completedAt = record.inspectedAt; }
+      else { delete record.error; delete record.completedAt; }
       draft.control.updatedAt = record.inspectedAt;
       if (state === "blocked") draft.control.attentionStatus = "decision_required";
+      else if (state === "completed" && (
+        draft.control.attentionStatus === "decision_required"
+        && !(draft.cleanup ?? []).some((candidate) => candidate.state === "blocked")
+        && !draft.nodes.some((node) => node.state === "failed" || node.state === "escalated")
+        && draft.phase !== "needs_decision"
+        && draft.phase !== "revision_required"
+        && draft.phase !== "assurance_inconclusive"
+      )) draft.control.attentionStatus = "clear";
     });
   }
 
@@ -852,17 +881,101 @@ export class WorkgraphSupervisor {
     });
   }
 
-  private async recordSupervisorError(error: Error): Promise<WorkgraphRun> {
+  private async notifyCoordinatorBoundary(run: WorkgraphRun): Promise<WorkgraphRun> {
+    const boundary = coordinatorBoundary(run);
+    if (!boundary || !this.options.onCoordinatorWake) return run;
+    let claimed: CoordinatorWakeRecord | undefined;
+    const retained = await this.engine.store.update((draft) => {
+      const wakeups = draft.coordinatorWakeups ??= [];
+      if (wakeups.some((candidate) => candidate.id === boundary.id)) return;
+      claimed = {
+        ...boundary,
+        phase: draft.phase,
+        composedCommit: draft.composedCommit,
+        ...(draft.control.currentPlanVersion !== undefined ? { planVersion: draft.control.currentPlanVersion } : {}),
+        state: "claimed",
+        requestedAt: new Date().toISOString(),
+      };
+      wakeups.push(claimed);
+    });
+    if (!claimed) return retained;
     try {
-      return await this.engine.store.update((draft) => {
-        draft.control.attentionStatus = "failed";
-        draft.control.updatedAt = new Date().toISOString();
-        draft.error = `Supervisor: ${error.message}`;
+      await this.options.onCoordinatorWake(claimed, retained);
+      return this.engine.store.update((draft) => {
+        const wake = (draft.coordinatorWakeups ?? []).find((candidate) => candidate.id === claimed!.id);
+        if (!wake || wake.state !== "claimed") return;
+        wake.state = "delivered";
+        wake.deliveredAt = new Date().toISOString();
       });
-    } catch {
-      return this.engine.load();
+    } catch (error) {
+      const message = errorMessage(error);
+      this.reportError(new Error(`Coordinator wake ${claimed.id} failed: ${message}`));
+      return this.engine.store.update((draft) => {
+        const wake = (draft.coordinatorWakeups ?? []).find((candidate) => candidate.id === claimed!.id);
+        if (!wake || wake.state !== "claimed") return;
+        wake.state = "failed";
+        wake.error = message;
+        draft.control.attentionStatus = "decision_required";
+        draft.control.updatedAt = new Date().toISOString();
+      });
     }
   }
+
+  private reportError(error: Error): void {
+    try { this.options.onError?.(error); } catch {}
+  }
+
+  private async recordSupervisorError(error: Error): Promise<WorkgraphRun> {
+    return this.engine.store.update((draft) => {
+      draft.control.attentionStatus = "failed";
+      draft.control.updatedAt = new Date().toISOString();
+      draft.error = `Supervisor: ${error.message}`;
+    });
+  }
+}
+
+function cleanupPriority(record: ResourceCleanupRecord): number {
+  return record.kind === "herdr_worker" ? 0 : 1;
+}
+
+function coordinatorBoundary(run: WorkgraphRun): Pick<CoordinatorWakeRecord, "id" | "boundaryRevision" | "kind"> | undefined {
+  if (run.lifecycle !== "active") return undefined;
+  const activeAttempt = run.attempts.some((attempt) => isActiveAttempt(attempt));
+  let kind: CoordinatorBoundaryKind | undefined;
+  if (run.phase === "awaiting_agreement" && !run.agreementProposal) kind = "agreement";
+  else if (run.phase === "awaiting_verification" && !run.productVerification?.attemptId) kind = "verification";
+  else if (run.phase === "awaiting_assurance" && run.assurance?.state !== "running") kind = "assurance";
+  else if (run.phase === "awaiting_judgment") kind = "judgment";
+  else if (
+    run.phase === "revision_required"
+    || run.phase === "needs_decision"
+    || run.phase === "assurance_inconclusive"
+    || run.phase === "failed"
+    || run.nodes.some((node) => node.state === "failed" || node.state === "escalated")
+    || (!activeAttempt && (run.productVerification?.state === "failed" || run.productVerification?.state === "inconclusive"))
+    || run.attempts.some((attempt) => attempt.stage === "attention")
+    || (run.cleanup ?? []).some((record) => record.state === "blocked")
+  ) kind = "attention";
+  else if (!activeAttempt && run.control.executionStatus === "idle" && run.control.verificationStatus === "absent" && run.phase === "executing" && allNodesComposed(run)) kind = "settle";
+  if (!kind) return undefined;
+  const semanticState = JSON.stringify({
+    kind,
+    phase: run.phase,
+    composedCommit: run.composedCommit,
+    planVersion: run.control.currentPlanVersion,
+    attention: run.control.attentionStatus,
+    verification: run.productVerification ? { revision: run.productVerification.revision, state: run.productVerification.state } : undefined,
+    assurance: run.assurance ? { revision: run.assurance.revision, state: run.assurance.state } : undefined,
+    nodes: run.nodes.map((node) => [node.id, node.state]),
+    attempts: run.attempts.filter((attempt) => attempt.stage === "attention").map((attempt) => [attempt.id, attempt.state, attempt.attention, attempt.error]),
+    cleanup: (run.cleanup ?? []).filter((record) => record.state === "blocked").map((record) => [record.id, record.error]),
+  });
+  const boundaryRevision = createHash("sha256").update(semanticState).digest("hex").slice(0, 20);
+  return { id: `${kind}:${boundaryRevision}`, boundaryRevision, kind };
+}
+
+function isForwardStateError(error: Error): boolean {
+  return error instanceof UnsupportedWorkgraphStateVersionError;
 }
 
 function errorMessage(error: unknown): string {
