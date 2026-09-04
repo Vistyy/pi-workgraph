@@ -7,6 +7,8 @@ import {
   type WorkgraphRun,
   type OutcomeKind,
   type RunLifecycle,
+  type WorkgraphControl,
+  type PlanRecord,
 } from "./types.js";
 
 export interface NewRunInput {
@@ -61,6 +63,16 @@ export class RunStateStore {
       createdAt: now,
       updatedAt: now,
       outcome: { ...input.outcome },
+      control: {
+        planStatus: "absent",
+        executionStatus: "idle",
+        attentionStatus: "clear",
+        verificationStatus: "absent",
+        maxConcurrency: 2,
+        updatedAt: now,
+      },
+      plans: [],
+      attempts: [],
       milestones: (input.milestones ?? []).map((milestone) => ({
         id: milestone.id,
         description: milestone.description,
@@ -126,23 +138,67 @@ export class RunStateStore {
 
 function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): WorkgraphRun {
   const version = (parsed as { version?: number }).version;
-  if (version !== 3 && version !== RUN_STATE_VERSION) {
+  if (version !== 3 && version !== 4 && version !== RUN_STATE_VERSION) {
     throw new Error(`Unsupported workgraph state version ${String(version)}: ${parsed.runId}`);
   }
   if (version === RUN_STATE_VERSION) return parsed as WorkgraphRun;
   const createdAt = parsed.createdAt ?? new Date(0).toISOString();
+  const updatedAt = parsed.updatedAt ?? createdAt;
   const legacy = parsed as Partial<WorkgraphRun> & { parentSessionId?: string; parentSessionFile?: string };
   const sessionId = legacy.parentSessionId ?? "unknown-session";
   const sessionFile = legacy.parentSessionFile ?? "";
-  const lifecycle: RunLifecycle = parsed.phase === "complete" ? "completed" : "active";
+  const lifecycle: RunLifecycle = version === 4 && parsed.lifecycle ? parsed.lifecycle : parsed.phase === "complete" ? "completed" : "active";
+  const approvedAt = parsed.agreement?.approvedAt;
+  const plans: PlanRecord[] = parsed.agreement ? [{
+    version: 1,
+    status: "approved",
+    changeKind: "initial",
+    agreement: agreementDraft(parsed.agreement),
+    summary: parsed.agreementProposalText ?? parsed.agreement.outcome,
+    proposedAt: approvedAt ?? createdAt,
+    ...(approvedAt ? { approvedAt } : {}),
+  }] : [];
+  if (parsed.agreementProposal) {
+    plans.push({
+      version: plans.length + 1,
+      status: "proposed",
+      changeKind: parsed.agreement ? "authority" : "initial",
+      agreement: { ...parsed.agreementProposal },
+      summary: parsed.agreementProposalText ?? parsed.agreementProposal.outcome,
+      proposedAt: updatedAt,
+    });
+  }
+  const control = migratedControl(parsed, plans, lifecycle, updatedAt);
   return {
     ...(parsed as WorkgraphRun),
     version: RUN_STATE_VERSION,
-    creator: { sessionId, sessionFile, createdAt },
-    coordinator: { sessionId, sessionFile, boundAt: createdAt },
-    handoffs: [],
+    creator: parsed.creator ?? { sessionId, sessionFile, createdAt },
+    coordinator: parsed.coordinator ?? { sessionId, sessionFile, boundAt: createdAt },
+    handoffs: parsed.handoffs ?? [],
     lifecycle,
-    lifecycleUpdatedAt: parsed.updatedAt ?? createdAt,
+    lifecycleUpdatedAt: parsed.lifecycleUpdatedAt ?? updatedAt,
+    control,
+    plans,
+    attempts: [],
+  };
+}
+
+function agreementDraft(agreement: NonNullable<Partial<WorkgraphRun>["agreement"]>): PlanRecord["agreement"] {
+  const { approvedAt: _approvedAt, ...draft } = agreement;
+  return draft;
+}
+
+function migratedControl(parsed: Partial<WorkgraphRun>, plans: PlanRecord[], lifecycle: RunLifecycle, updatedAt: string): WorkgraphControl {
+  const phase = parsed.phase;
+  const verification = parsed.productVerification?.state;
+  return {
+    planStatus: plans.at(-1)?.status ?? "absent",
+    ...(plans.length > 0 ? { currentPlanVersion: plans.at(-1)!.version } : {}),
+    executionStatus: lifecycle === "suspended" ? "paused" : phase === "executing" ? "running" : "idle",
+    attentionStatus: phase === "needs_decision" ? "decision_required" : phase === "revision_required" || phase === "failed" ? "failed" : "clear",
+    verificationStatus: verification === "running" ? "running" : verification === "completed" ? "passed" : verification === "failed" ? "failed" : verification === "inconclusive" ? "inconclusive" : "absent",
+    maxConcurrency: 2,
+    updatedAt,
   };
 }
 

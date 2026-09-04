@@ -4,7 +4,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 test("assignment resources are role-aware without tool-call policing", async () => {
   const previous = process.env.PI_WORKGRAPH_MODE;
+  const previousStart = process.env.PI_WORKGRAPH_IMPLEMENTATION_START;
   process.env.PI_WORKGRAPH_MODE = "implementation";
+  process.env.PI_WORKGRAPH_IMPLEMENTATION_START = "guide";
   process.env.PI_WORKGRAPH_RUN_ID = "run";
   process.env.PI_WORKGRAPH_NODE_ID = "alpha";
   process.env.PI_WORKGRAPH_EXECUTOR_MODEL = "provider/executor";
@@ -40,5 +42,7 @@ test("assignment resources are role-aware without tool-call policing", async () 
     delete process.env.PI_WORKGRAPH_EXECUTOR_MODEL;
     delete process.env.PI_WORKGRAPH_EXECUTOR_THINKING;
     delete process.env.PI_WORKGRAPH_BASE_COMMIT;
+    if (previousStart === undefined) delete process.env.PI_WORKGRAPH_IMPLEMENTATION_START;
+    else process.env.PI_WORKGRAPH_IMPLEMENTATION_START = previousStart;
   }
 });

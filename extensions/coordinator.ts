@@ -17,7 +17,9 @@ import {
   type ModelTarget,
 } from "../src/model-policy.js";
 import { stableParentEntry } from "../src/pi-process.js";
+import { HerdrCliRuntime } from "../src/herdr.js";
 import { WorkgraphRegistry } from "../src/registry.js";
+import { persistSchedule, WorkgraphSupervisor } from "../src/supervisor.js";
 import { resolveChildCapabilities, WEB_TOOLS, WEB_PACKAGE, CODEX_PACKAGE } from "../src/capabilities.js";
 import type {
   AssuranceResponsibility,
@@ -62,6 +64,7 @@ const NodeSchema = Type.Object({
   brief: BriefSchema,
   claimedPaths: Type.Array(Type.String(), { minItems: 1 }),
   dependencies: Type.Array(Type.String()),
+  priority: Type.Optional(Type.Integer({ minimum: -1000, maximum: 1000 })),
   verificationCommands: Type.Array(Type.String()),
   supersedes: Type.Optional(Type.Array(Type.String())),
   continuationOf: Type.Optional(Type.String()),
@@ -75,6 +78,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   if (process.env.PI_WORKGRAPH_MODE) return;
   let engine: WorkgraphEngine | undefined;
   let activeRun: WorkgraphRun | undefined;
+  let supervisor: WorkgraphSupervisor | undefined;
   let exclusiveTail: Promise<unknown> = Promise.resolve();
 
   const exclusively = <T>(operation: () => Promise<T>): Promise<T> => {
@@ -93,7 +97,22 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     return engine;
   };
 
+  const attachSupervisor = (ctx: ExtensionContext): WorkgraphSupervisor => {
+    const currentEngine = requireEngine();
+    supervisor?.stop();
+    supervisor = new WorkgraphSupervisor(currentEngine, new HerdrCliRuntime(), {
+      ...(process.env.HERDR_WORKSPACE_ID ? { workspaceId: process.env.HERDR_WORKSPACE_ID } : {}),
+      stableEntryId: stableParentEntry(ctx.sessionManager),
+      onRun: (run) => { activeRun = run; updateStatus(ctx, run); },
+      onError: (error) => ctx.ui.notify(`Workgraph supervisor: ${error.message}`, "warning"),
+    });
+    supervisor.start();
+    return supervisor;
+  };
+
   const restore = async (ctx: ExtensionContext): Promise<void> => {
+    await supervisor?.shutdown();
+    supervisor = undefined;
     engine = undefined;
     activeRun = undefined;
     const branch = ctx.sessionManager.getBranch();
@@ -110,13 +129,8 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         if (sessionFile) {
           activeRun = await engine.adopt(ctx.sessionManager.getSessionId(), sessionFile, "unknown");
         }
-        const interrupted = activeRun.phase === "executing"
-          || (activeRun.phase === "awaiting_verification" && activeRun.productVerification?.state === "running")
-          || ((activeRun.phase === "awaiting_assurance" || activeRun.phase === "assurance_inconclusive") && activeRun.assurance?.state === "running");
-        if (interrupted) {
-          activeRun = await engine.reconcile();
-          ctx.ui.notify(`Reconciled interrupted Workgraph ${activeRun.runId} to ${activeRun.phase}.`, activeRun.phase === "needs_decision" || activeRun.phase === "assurance_inconclusive" ? "warning" : "info");
-        }
+        if (activeRun.lifecycle === "active") attachSupervisor(ctx);
+        updateStatus(ctx, activeRun);
       } catch (error) {
         ctx.ui.notify(`Could not restore Workgraph ${pointer.runId ?? ""}: ${errorMessage(error)}`, "warning");
       }
@@ -126,18 +140,20 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => restore(ctx));
   pi.on("session_tree", async (_event, ctx) => restore(ctx));
+  pi.on("session_shutdown", async () => { await supervisor?.shutdown(); supervisor = undefined; });
 
   pi.on("before_agent_start", async (event) => {
     let run = activeRun;
     if (engine && run?.agreementProposal) {
       const decision = conversationalDecision(event.prompt);
-      if (decision !== undefined) {
-        run = remember(await engine.recordAgreement(run.agreementProposal, decision, event.prompt));
+      const proposed = run.plans.at(-1);
+      if (decision !== undefined && proposed?.status === "proposed") {
+        run = remember(await engine.recordPlanDecision(proposed.version, decision, event.prompt));
       }
     }
-    const inProgress = run !== undefined && run.phase !== "complete" && run.phase !== "failed";
+    const inProgress = run !== undefined && (run.lifecycle === "active" || run.lifecycle === "suspended");
     const state = inProgress && run
-      ? `Active Workgraph ${run.runId} is in phase ${run.phase} for a ${run.outcome.kind} outcome. All normal coordinator tools remain available. Keep substantial product implementation behind the approved agreement and use Workgraph boundaries for delegated writes, composition, evidence, and assurance.`
+      ? `Workgraph ${run.runId} is ${run.lifecycle} with plan ${run.control.planStatus}, execution ${run.control.executionStatus}, attention ${run.control.attentionStatus}, and verification ${run.control.verificationStatus} for a ${run.outcome.kind} outcome. All normal coordinator tools remain available. Keep substantial product implementation behind the approved plan and use Workgraph boundaries for delegated writes, composition, evidence, and assurance.`
       : "All normal coordinator tools remain available. For materially ambiguous or structurally consequential work, begin a durable Workgraph before substantial product implementation. Clear, local, reversible work may proceed directly.";
     const proposal = run?.agreementProposal
       ? " A Workgraph implementation plan is awaiting an exact approval or rejection in a later user message."
@@ -204,8 +220,8 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
-        if (activeRun && !["complete", "failed"].includes(activeRun.phase)) {
-          throw new Error(`Workgraph ${activeRun.runId} is still ${activeRun.phase}.`);
+        if (activeRun && (activeRun.lifecycle === "active" || activeRun.lifecycle === "suspended")) {
+          throw new Error(`Workgraph ${activeRun.runId} lifecycle is still ${activeRun.lifecycle}.`);
         }
         const sessionFile = ctx.sessionManager.getSessionFile();
         if (!sessionFile) throw new Error("Workgraph orchestration requires a persistent parent Pi session.");
@@ -228,6 +244,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         engine = begun.engine;
         remember(begun.run);
         pi.appendEntry(POINTER_ENTRY, { runId: begun.run.runId, statePath: begun.run.statePath } satisfies RunPointer);
+        attachSupervisor(ctx);
         return {
           content: [{ type: "text", text: `Started Workgraph ${begun.run.runId} for ${begun.run.outcome.kind}. All coordinator tools remain stable. Reason: ${params.reason}` }],
           details: summaryDetails(begun.run),
@@ -241,9 +258,14 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     label: "Workgraph Adopt",
     description: "Adopt an existing eligible Workgraph into this current Pi session without creating or forking a session.",
     promptSnippet: "Adopt an existing Workgraph into the current Pi conversation",
-    parameters: Type.Object({ runId: Type.String() }),
+    parameters: Type.Object({
+      runId: Type.String(),
+      priorOwnerLiveness: Type.Optional(StringEnum(["alive", "dead", "unknown"] as const)),
+    }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
+        await supervisor?.shutdown();
+        supervisor = undefined;
         const registry = new WorkgraphRegistry();
         const indexed = registry.findRun(params.runId);
         if (!indexed) throw new Error(`Unknown Workgraph ${params.runId}.`);
@@ -252,10 +274,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const sessionFile = ctx.sessionManager.getSessionFile();
         if (!sessionFile) throw new Error("Adoption requires a persistent current Pi session.");
         const adoptedEngine = WorkgraphEngine.open(indexed.statePath, { registry });
-        const adopted = await adoptedEngine.adopt(ctx.sessionManager.getSessionId(), sessionFile, "unknown");
+        const adopted = await adoptedEngine.adopt(ctx.sessionManager.getSessionId(), sessionFile, params.priorOwnerLiveness ?? "unknown");
         engine = adoptedEngine;
         remember(adopted);
         pi.appendEntry(POINTER_ENTRY, { runId: adopted.runId, statePath: adopted.statePath } satisfies RunPointer);
+        attachSupervisor(ctx);
         return { content: [{ type: "text", text: `Adopted Workgraph ${adopted.runId} into the current Pi session without forking.` }], details: { ...summaryDetails(adopted), lifecycle: adopted.lifecycle, coordinator: adopted.coordinator } };
       });
     },
@@ -267,9 +290,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     description: "Explicitly suspend, resume, complete, abandon, or archive a Workgraph. Inactivity never abandons a run.",
     promptSnippet: "Change a Workgraph lifecycle state explicitly",
     parameters: Type.Object({ lifecycle: StringEnum(["active", "suspended", "completed", "abandoned", "archived"] as const), reason: Type.String() }),
-    async execute(_id, params) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
         const run = remember(await requireEngine().setLifecycle(params.lifecycle, params.reason));
+        if (run.lifecycle === "active") attachSupervisor(ctx);
+        else { supervisor?.stop(); supervisor = undefined; }
+        updateStatus(ctx, run);
         return { content: [{ type: "text", text: `Workgraph ${run.runId} lifecycle: ${run.lifecycle}.` }], details: { ...summaryDetails(run), lifecycle: run.lifecycle, lifecycleReason: run.lifecycleReason } };
       });
     },
@@ -389,11 +415,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
-    name: "workgraph_agree",
-    label: "Workgraph Agreement",
-    description: "Present a complete implementation plan for conversational approval in the next user message.",
-    promptSnippet: "Request approval for a complete Workgraph implementation envelope",
+    name: "workgraph_plan",
+    label: "Workgraph Plan",
+    description: "Create a versioned Workgraph plan. Initial and authority-changing plans await a normal conversational decision; internal DAG repairs apply without another approval.",
+    promptSnippet: "Propose or revise a versioned Workgraph plan without trapping other control operations",
     parameters: Type.Object({
+      changeKind: StringEnum(["initial", "internal", "authority"] as const),
       outcome: Type.String(),
       nonGoals: Type.Array(Type.String()),
       reuseDecision: Type.String(),
@@ -408,26 +435,30 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     }),
     async execute(_id, params) {
       return exclusively(async () => {
-        const checkpoint = formatAgreementSummary(params);
-        const run = remember(await requireEngine().proposeAgreement(params, checkpoint));
+        const { changeKind, ...agreement } = params;
+        const checkpoint = formatAgreementSummary(agreement);
+        const run = remember(await requireEngine().proposePlan(agreement, checkpoint, changeKind));
+        const plan = run.plans.at(-1)!;
         return {
-          content: [{ type: "text", text: `${checkpoint}\n\nReply with your approval or requested changes. Workgraph will record the next user decision.` }],
-          details: { ...summaryDetails(run), proposal: params },
+          content: [{ type: "text", text: plan.status === "proposed"
+            ? `${checkpoint}\n\nPlan v${plan.version} changes authority. Reply with your approval or requested changes; Workgraph will record the next exact user decision.`
+            : `Applied internal plan v${plan.version}. ${checkpoint}` }],
+          details: { ...summaryDetails(run), plan },
         };
       });
     },
   });
 
   pi.registerTool({
-    name: "workgraph_execute",
-    label: "Workgraph Execute",
-    description: "Add bounded nodes to the approved implementation DAG or resume pending nodes, then run isolated Local Prewalk workers, verify commits, and compose exact changes.",
-    promptSnippet: "Execute approved Workgraph nodes from complete bounded worker briefs",
+    name: "workgraph_schedule",
+    label: "Workgraph Schedule",
+    description: "Persist bounded nodes against the current approved plan and return immediately. The independent visible-worker supervisor advances them afterward.",
+    promptSnippet: "Schedule approved Workgraph nodes without waiting for worker settlement",
     parameters: Type.Object({
       nodes: Type.Array(NodeSchema, { minItems: 0, maxItems: 8 }),
-      maxConcurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
+      maxConcurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
     }),
-    async execute(_id, params, signal, onUpdate, ctx) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
         const policy = await loadModelPolicy();
         const guideDefault = roleTargets(policy, "implementation.guide")[0]!;
@@ -444,24 +475,13 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           requireAvailable(node.guideModel, ctx, `${node.id} guide`);
           requireAvailable(node.executorModel, ctx, `${node.id} executor`);
         }
-        const nodeIds = nodes.map((node) => node.id);
-        onUpdate?.({ content: [{ type: "text", text: nodeIds.length > 0 ? `Executing ${nodeIds.length} approved work node(s)...` : "Resuming reconciled pending work nodes..." }], details: { nodeIds } });
-        const run = remember(await requireEngine().execute({
-          nodes,
-          maxConcurrency: params.maxConcurrency ?? 2,
-          stableEntryId: stableParentEntry(ctx.sessionManager),
-          ...(signal ? { signal } : {}),
-        }));
-        const selected = nodeIds.length > 0 ? run.nodes.filter((node) => nodeIds.includes(node.id)) : run.nodes;
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        activeSupervisor.options.stableEntryId = stableParentEntry(ctx.sessionManager);
+        const run = remember(await persistSchedule(requireEngine(), { nodes, maxConcurrency: params.maxConcurrency ?? 2 }, activeSupervisor));
+        updateStatus(ctx, run);
         return {
-          content: [{ type: "text", text: formatExecution(run, selected) }],
-          details: {
-            ...summaryDetails(run),
-            nodes: selected,
-            globalVerification: run.globalVerification,
-            productVerification: run.productVerification,
-          },
-          usage: nestedUsage(selected.flatMap((node) => node.usage ? [node.usage] : [])),
+          content: [{ type: "text", text: `Scheduled ${nodes.length || run.nodes.filter((node) => node.state === "pending").length} Workgraph node(s) at plan v${run.control.currentPlanVersion}. This call did not wait for worker startup or settlement.` }],
+          details: { ...summaryDetails(run), control: run.control, nodeIds: nodes.map((node) => node.id) },
         };
       });
     },
@@ -549,6 +569,68 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           content: [{ type: "text", text: formatJudgment(run) }],
           details: { ...summaryDetails(run), judgment: run.assurance?.finalJudgment },
         };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_control",
+    label: "Workgraph Control",
+    description: "Pause, resume, cancel, or reprioritize durable Workgraph execution without waiting for visible workers to settle.",
+    promptSnippet: "Control scheduled Workgraph execution independently of worker completion",
+    parameters: Type.Object({
+      action: StringEnum(["pause", "resume", "cancel", "reprioritize"] as const),
+      mode: Type.Optional(StringEnum(["drain", "immediate"] as const)),
+      reason: Type.String(),
+      nodeIds: Type.Optional(Type.Array(Type.String())),
+      priorities: Type.Optional(Type.Array(Type.Object({ nodeId: Type.String(), priority: Type.Integer({ minimum: -1000, maximum: 1000 }) }))),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return exclusively(async () => {
+        const control = params.action === "pause"
+          ? { action: "pause" as const, mode: params.mode ?? "drain", reason: params.reason }
+          : params.action === "resume"
+            ? { action: "resume" as const, reason: params.reason }
+            : params.action === "cancel"
+              ? { action: "cancel" as const, reason: params.reason, ...(params.nodeIds ? { nodeIds: params.nodeIds } : {}) }
+              : { action: "reprioritize" as const, reason: params.reason, priorities: params.priorities ?? [] };
+        const run = remember(await requireEngine().controlExecution(control));
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        activeSupervisor.kick();
+        updateStatus(ctx, run);
+        return { content: [{ type: "text", text: `Recorded ${params.action}; execution is ${run.control.executionStatus}. Worker interruption, when requested, is reconciled by exact Herdr identity in the background.` }], details: { ...summaryDetails(run), control: run.control, attempts: run.attempts } };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_reconcile",
+    label: "Workgraph Reconcile",
+    description: "Perform one bounded idempotent pass over durable attempts, live Herdr identities, typed reports, validation, and composition. It never waits for a worker to finish.",
+    promptSnippet: "Reconcile visible Workgraph worker observations without owning their wait loop",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      return exclusively(async () => {
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        const run = remember(await activeSupervisor.reconcileNow());
+        updateStatus(ctx, run);
+        return { content: [{ type: "text", text: formatControlStatus(run) }], details: { ...summaryDetails(run), control: run.control, attempts: run.attempts, nodes: run.nodes } };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_settle",
+    label: "Workgraph Settle",
+    description: "Settle a quiescent execution result and run the approved exact-revision verification boundary. It does not wait for active workers.",
+    promptSnippet: "Settle quiescent Workgraph execution into verification or actionable attention",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      return exclusively(async () => {
+        if (supervisor) remember(await supervisor.reconcileNow());
+        const run = remember(await requireEngine().settle());
+        updateStatus(ctx, run);
+        return { content: [{ type: "text", text: formatControlStatus(run) }], details: { ...summaryDetails(run), control: run.control, productVerification: run.productVerification } };
       });
     },
   });
@@ -728,6 +810,14 @@ function formatMilestoneProgress(run: WorkgraphRun): string {
   ].join("\n");
 }
 
+function formatControlStatus(run: WorkgraphRun): string {
+  const active = run.attempts.filter((attempt) => attempt.state === "starting" || attempt.state === "running" || attempt.state === "settling" || attempt.state === "cancel_requested");
+  return [
+    `Workgraph ${run.runId}: plan=${run.control.planStatus}${run.control.currentPlanVersion ? ` v${run.control.currentPlanVersion}` : ""}, execution=${run.control.executionStatus}, attention=${run.control.attentionStatus}, verification=${run.control.verificationStatus}.`,
+    ...active.map((attempt) => `- ${attempt.nodeId}/${attempt.id.slice(0, 8)}: ${attempt.state}, observed=${attempt.observedStatus ?? "not-observed"}, stage=${attempt.stage}, worker=${attempt.worker?.agentName ?? "unbound"}, pane=${attempt.worker?.paneId ?? "unbound"}, session=${attempt.worker?.sessionFile ?? attempt.sessionFile ?? "unbound"}, worktree=${attempt.worktreePath ?? "unbound"}, started=${attempt.startedAt ?? "not-started"}, activity=${attempt.lastActivityAt}, heartbeat=${attempt.heartbeatAt ?? "none"}${attempt.attention ? `, attention=${attempt.attention}` : ""}`),
+  ].join("\n");
+}
+
 function formatStatus(run: WorkgraphRun): string {
   const nodeCounts = new Map<string, number>();
   for (const node of run.nodes) nodeCounts.set(node.state, (nodeCounts.get(node.state) ?? 0) + 1);
@@ -739,7 +829,8 @@ function formatStatus(run: WorkgraphRun): string {
     `Coordinator: ${run.coordinator.sessionId} (${run.coordinator.sessionFile})`,
     `Creator: ${run.creator.sessionId} (${run.creator.sessionFile})`,
     `Handoffs: ${run.handoffs.length}`,
-    `Phase: ${run.phase}`,
+    `Control: plan=${run.control.planStatus}${run.control.currentPlanVersion ? ` v${run.control.currentPlanVersion}` : ""}, execution=${run.control.executionStatus}, attention=${run.control.attentionStatus}, verification=${run.control.verificationStatus}`,
+    `Legacy phase: ${run.phase}`,
     `Outcome: ${run.outcome.kind}`,
     `Statement: ${run.outcome.statement}`,
     `Predicate: ${run.outcome.completionPredicate}`,
@@ -749,6 +840,8 @@ function formatStatus(run: WorkgraphRun): string {
     `Composed: ${run.composedCommit}`,
     `Product evidence: ${run.productVerification?.state ?? "none"} at ${run.productVerification?.revision ?? "none"}`,
     `Nodes: ${counts}`,
+    `Attempts: ${run.attempts.length}`,
+    ...run.attempts.map((attempt) => `- ${attempt.nodeId}/${attempt.id.slice(0, 8)} [${attempt.state}; observed=${attempt.observedStatus ?? "not-observed"}; stage=${attempt.stage}]: worker=${attempt.worker?.agentName ?? "unbound"}, workspace=${attempt.worker?.workspaceId ?? "unbound"}, tab=${attempt.worker?.tabId ?? "unbound"}, pane=${attempt.worker?.paneId ?? "unbound"}, terminal=${attempt.worker?.terminalId ?? "unbound"}, session=${attempt.worker?.sessionFile ?? attempt.sessionFile ?? "unbound"}, worktree=${attempt.worktreePath ?? "unbound"}, started=${attempt.startedAt ?? "not-started"}, activity=${attempt.lastActivityAt}, heartbeat=${attempt.heartbeatAt ?? "none"}${attempt.attention ? `, attention=${attempt.attention}` : ""}`),
     `State: ${run.statePath}`,
   ].join("\n");
 }
@@ -760,12 +853,19 @@ function formatModelPolicy(roles: Record<ModelRole, ModelTarget[]>): string {
   ]).join("\n");
 }
 
+function updateStatus(ctx: ExtensionContext, run: WorkgraphRun): void {
+  ctx.ui.setStatus("workgraph", `WG ${run.control.executionStatus}/${run.control.attentionStatus} - ${run.attempts.filter((attempt) => attempt.state === "running" || attempt.state === "starting").length} active`);
+}
+
 function summaryDetails(run: WorkgraphRun) {
   return {
     runId: run.runId,
     lifecycle: run.lifecycle,
     coordinator: run.coordinator,
     phase: run.phase,
+    control: run.control,
+    currentPlan: run.plans.at(-1),
+    attempts: run.attempts,
     statePath: run.statePath,
     outcome: run.outcome,
     milestones: run.milestones,

@@ -1,0 +1,630 @@
+import { randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
+import { WorkgraphEngine, type ScheduleInput } from "./engine.js";
+import type { WorktreePlacement } from "./git.js";
+import { herdrAgentName, type HerdrObservation, type VisibleWorkerRuntime } from "./herdr.js";
+import { forkSession, readTerminalText, readWorkgraphReport } from "./pi-process.js";
+import { claimsOverlap, readyWave, transitionNode } from "./scheduler.js";
+import type { ImplementationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun } from "./types.js";
+
+export interface SupervisorWake {
+  kick(): void;
+}
+
+export async function persistSchedule(engine: WorkgraphEngine, input: ScheduleInput, supervisor: SupervisorWake): Promise<WorkgraphRun> {
+  const run = await engine.schedule(input);
+  supervisor.kick();
+  return run;
+}
+
+export interface SupervisorOptions {
+  workspaceId?: string;
+  pollIntervalMs?: number;
+  stableEntryId?: string | null;
+  onRun?: (run: WorkgraphRun) => void;
+  onError?: (error: Error) => void;
+}
+
+export class WorkgraphSupervisor {
+  private timer: NodeJS.Timeout | undefined;
+  private active: Promise<WorkgraphRun> | undefined;
+  private controller = new AbortController();
+  private stopped = false;
+
+  constructor(
+    readonly engine: WorkgraphEngine,
+    readonly runtime: VisibleWorkerRuntime,
+    readonly options: SupervisorOptions = {},
+  ) {}
+
+  start(): void {
+    this.stopped = false;
+    if (this.controller.signal.aborted) this.controller = new AbortController();
+    if (!this.timer) {
+      this.timer = setInterval(() => this.kick(), this.options.pollIntervalMs ?? 2_000);
+      this.timer.unref();
+    }
+    this.kick();
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.controller.abort("Supervisor stopped without interrupting visible workers.");
+    if (this.timer) clearInterval(this.timer);
+    this.timer = undefined;
+  }
+
+  async shutdown(): Promise<void> {
+    this.stop();
+    await this.active;
+  }
+
+  kick(): void {
+    if (this.stopped || this.active) return;
+    this.active = this.reconcileAndAdvance()
+      .then((run) => {
+        this.options.onRun?.(run);
+        return run;
+      })
+      .catch(async (error: unknown) => {
+        const normalized = error instanceof Error ? error : new Error(String(error));
+        this.options.onError?.(normalized);
+        return this.recordSupervisorError(normalized);
+      })
+      .finally(() => { this.active = undefined; });
+  }
+
+  async reconcileNow(): Promise<WorkgraphRun> {
+    if (this.active) return this.active;
+    this.active = this.reconcileAndAdvance().finally(() => { this.active = undefined; });
+    return this.active;
+  }
+
+  private async reconcileAndAdvance(): Promise<WorkgraphRun> {
+    this.engine.heartbeatLease();
+    let run = await this.engine.load();
+    if (run.lifecycle !== "active") return run;
+
+    await this.reconcileAttempts(run);
+    run = await this.engine.load();
+    await this.composeCompleted(run);
+    run = await this.engine.load();
+    await this.updateDrainState(run);
+    run = await this.engine.load();
+
+    if (run.control.executionStatus === "scheduled" || run.control.executionStatus === "running") {
+      await this.startReadyAttempts(run);
+    }
+    return this.engine.load();
+  }
+
+  private async reconcileAttempts(run: WorkgraphRun): Promise<void> {
+    const active = run.attempts.filter((attempt) => attempt.state === "starting" || attempt.state === "running" || attempt.state === "settling" || attempt.state === "cancel_requested");
+    for (const attempt of active) {
+      if (attempt.state === "cancel_requested") {
+        await this.cancelAttempt(attempt);
+        continue;
+      }
+      if (!attempt.worker) {
+        let recovered: HerdrObservation | undefined;
+        if (this.runtime.recover && attempt.agentName && attempt.sessionFile && attempt.worktreePath) {
+          try {
+            recovered = await this.runtime.recover({
+              workspaceId: this.options.workspaceId ?? "",
+              agentName: attempt.agentName,
+              sessionFile: attempt.sessionFile,
+              cwd: attempt.worktreePath,
+            });
+          } catch (error) {
+            await this.recordObservationFailure(attempt.id, error);
+            continue;
+          }
+        }
+        if (recovered) {
+          await this.recordIdentity(attempt.id, recovered.identity);
+          await this.consumeObservation(attempt, recovered);
+          continue;
+        }
+        await this.recordMissingIdentity(attempt.id);
+        continue;
+      }
+      try {
+        const observation = await this.runtime.observe(attempt.worker);
+        await this.consumeObservation(attempt, observation);
+      } catch (error) {
+        await this.recordObservationFailure(attempt.id, error);
+      }
+    }
+  }
+
+  private async consumeObservation(attempt: WorkAttempt, observation: HerdrObservation): Promise<void> {
+    await this.recordObservation(attempt.id, observation);
+    const report = readWorkgraphReport(observation.identity.sessionFile);
+    if (report?.kind === "implementation") {
+      await this.settleTypedAttempt(attempt.id, report);
+      return;
+    }
+    if (observation.status === "idle" || observation.status === "done") {
+      await this.settleUntypedAttempt(attempt.id, readTerminalText(observation.identity.sessionFile));
+    }
+  }
+
+  private async recordMissingIdentity(attemptId: string): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = draft.attempts.find((candidate) => candidate.id === attemptId);
+      if (!current || current.worker || (current.state !== "starting" && current.state !== "running" && current.state !== "settling")) return;
+      const attention = "Worker launch identity is incomplete; retained resources require reconciliation before retry.";
+      if (current.stage === "attention" && current.attention === attention && draft.control.attentionStatus === "decision_required") return;
+      current.stage = "attention";
+      current.attention = attention;
+      current.lastActivityAt = new Date().toISOString();
+      draft.control.attentionStatus = "decision_required";
+      draft.control.updatedAt = current.lastActivityAt;
+    });
+  }
+
+  private async startReadyAttempts(run: WorkgraphRun): Promise<void> {
+    if (!this.runtime.available || !this.options.workspaceId) {
+      await this.engine.store.update((draft) => {
+        draft.control.executionStatus = "paused";
+        draft.control.attentionStatus = "blocked";
+        draft.control.pauseReason = "Visible Herdr execution is unavailable. No headless fallback was started.";
+        draft.control.updatedAt = new Date().toISOString();
+      });
+      return;
+    }
+    const runningNodes = run.nodes.filter((node) => node.state === "running");
+    const capacity = Math.max(0, run.control.maxConcurrency - runningNodes.length);
+    if (capacity === 0) return;
+    const ready = readyWave(run, capacity).filter((candidate) => !runningNodes.some((running) => claimsOverlap(candidate.claimedPaths, running.claimedPaths)));
+    for (const node of ready) {
+      await this.claimAndLaunch(node.id);
+    }
+  }
+
+  private async claimAndLaunch(nodeId: string): Promise<void> {
+    const attemptId = randomUUID();
+    let claimed: { run: WorkgraphRun; node: WorkNode; attempt: WorkAttempt } | undefined;
+    await this.engine.store.update((draft) => {
+      if (draft.lifecycle !== "active" || (draft.control.executionStatus !== "scheduled" && draft.control.executionStatus !== "running")) return;
+      const node = draft.nodes.find((candidate) => candidate.id === nodeId);
+      if (!node || node.state !== "pending") return;
+      const eligible = readyWave(draft, draft.control.maxConcurrency).some((candidate) => candidate.id === nodeId);
+      if (!eligible) return;
+      const now = new Date().toISOString();
+      const attempt: WorkAttempt = {
+        id: attemptId,
+        nodeId,
+        planVersion: node.planVersion ?? draft.control.currentPlanVersion ?? 0,
+        state: "starting",
+        stage: "allocating",
+        runtimeMode: "herdr",
+        createdAt: now,
+        lastActivityAt: now,
+        baseCommit: draft.composedCommit,
+        agentName: herdrAgentName(draft.runId, nodeId, attemptId),
+      };
+      transitionNode(node, "running");
+      node.activeAttemptId = attemptId;
+      draft.attempts.push(attempt);
+      draft.control.executionStatus = "running";
+      draft.control.updatedAt = now;
+      claimed = { run: structuredClone(draft), node: structuredClone(node), attempt: structuredClone(attempt) };
+    });
+    if (!claimed) return;
+
+    const { run, node, attempt } = claimed;
+    let liveLaunchAttempted = false;
+    try {
+      const repository = await this.engine.repository();
+      const placement = await repository.createWorktree(run.runId, node.id, attempt.baseCommit!);
+      const sessionFile = await forkSession({
+        parentSessionFile: run.coordinator.sessionFile,
+        targetCwd: placement.path,
+        sessionDir: join(dirname(run.statePath), "sessions", "implementation"),
+        objective: implementationObjective(run, node),
+        mode: "implementation",
+        runId: run.runId,
+        nodeId: node.id,
+        ...(this.options.stableEntryId !== undefined ? { stableEntryId: this.options.stableEntryId } : {}),
+      });
+      await this.engine.store.update((draft) => {
+        const current = requiredAttempt(draft, attempt.id);
+        current.worktreePath = placement.path;
+        current.branch = placement.branch;
+        current.baseCommit = placement.baseCommit;
+        current.sessionFile = sessionFile;
+        current.stage = "starting";
+        current.lastActivityAt = new Date().toISOString();
+        const currentNode = requiredNode(draft, node.id);
+        currentNode.worktreePath = placement.path;
+        currentNode.branch = placement.branch;
+        currentNode.baseCommit = placement.baseCommit;
+        currentNode.sessionFile = sessionFile;
+      });
+      liveLaunchAttempted = true;
+      const observation = await this.runtime.launch({
+        workspaceId: this.options.workspaceId!,
+        runId: run.runId,
+        nodeId: node.id,
+        attemptId: attempt.id,
+        cwd: placement.path,
+        sessionFile,
+        prompt: "Continue the assigned Workgraph objective now.",
+        ...(node.guideModel ? { model: node.guideModel } : {}),
+        ...(node.guideThinking ? { thinking: node.guideThinking } : {}),
+        env: workerEnvironment(run, node, placement),
+        onIdentity: async (identity) => this.recordIdentity(attempt.id, identity),
+      });
+      await this.recordObservation(attempt.id, observation);
+    } catch (error) {
+      await this.recordLaunchFailure(attempt.id, error, liveLaunchAttempted);
+    }
+  }
+
+  private async settleTypedAttempt(attemptId: string, report: ImplementationReport): Promise<void> {
+    const run = await this.engine.load();
+    const attempt = run.attempts.find((candidate) => candidate.id === attemptId);
+    if (!attempt || (attempt.state !== "running" && attempt.state !== "starting" && attempt.state !== "settling")) return;
+    const node = requiredNode(run, attempt.nodeId);
+    if (report.status !== "completed") {
+      await this.engine.store.update((draft) => {
+        const current = requiredAttempt(draft, attemptId);
+        const currentNode = requiredNode(draft, current.nodeId);
+        current.state = "failed";
+        current.stage = "settled";
+        current.settledAt = new Date().toISOString();
+        current.lastActivityAt = current.settledAt;
+        current.error = report.summary;
+        currentNode.report = report;
+        currentNode.resultKind = "typed";
+        transitionNode(currentNode, report.status === "escalated" ? "escalated" : "failed");
+        delete currentNode.activeAttemptId;
+        draft.control.attentionStatus = report.status === "escalated" ? "decision_required" : "failed";
+        draft.control.updatedAt = current.settledAt;
+      });
+      return;
+    }
+    if (!attempt.worktreePath || !attempt.branch || !attempt.baseCommit) {
+      await this.recordAttemptFailure(attemptId, "Completed report has no exact worktree placement.");
+      return;
+    }
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      current.state = "settling";
+      current.stage = "verifying";
+      current.lastActivityAt = new Date().toISOString();
+    });
+    try {
+      const repository = await this.engine.repository();
+      const placement: WorktreePlacement = { path: attempt.worktreePath, branch: attempt.branch, baseCommit: attempt.baseCommit };
+      const validated = await repository.validateWorkerCommit(placement, report.commit);
+      const verification = await repository.runCommands(node.verificationCommands, attempt.worktreePath);
+      if (verification.some((evidence) => evidence.exitCode !== 0)) throw new Error(`Node verification failed: ${verification.find((item) => item.exitCode !== 0)?.command}`);
+      await this.engine.store.update((draft) => {
+        const current = requiredAttempt(draft, attemptId);
+        const currentNode = requiredNode(draft, current.nodeId);
+        if (current.state === "completed") return;
+        current.state = "settling";
+        current.stage = "composing";
+        current.lastActivityAt = new Date().toISOString();
+        currentNode.report = report;
+        currentNode.resultKind = "typed";
+        currentNode.commit = validated.commit;
+        currentNode.actualChangedFiles = validated.changedFiles;
+        currentNode.verification = verification;
+        transitionNode(currentNode, "completed");
+      });
+    } catch (error) {
+      await this.recordAttemptFailure(attemptId, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async composeCompleted(run: WorkgraphRun): Promise<void> {
+    const candidates = run.nodes.filter((node) => node.state === "completed" && node.commit && node.baseCommit && node.activeAttemptId).sort((left, right) => left.id.localeCompare(right.id));
+    const node = candidates[0];
+    if (!node?.commit || !node.activeAttemptId) return;
+    const repository = await this.engine.repository();
+    try {
+      const recovered = await repository.recoverComposedCandidate(
+        run.composedCommit,
+        candidates.map((candidate) => ({ nodeId: candidate.id, baseCommit: candidate.baseCommit!, commit: candidate.commit! })),
+      );
+      if (recovered) {
+        const recoveredNode = requiredNode(run, recovered.nodeId);
+        if (!recoveredNode.activeAttemptId) throw new Error(`Recovered node ${recovered.nodeId} has no active attempt.`);
+        await this.recordComposition(recovered.nodeId, recoveredNode.activeAttemptId, recovered.sourceCommit, run.composedCommit, recovered.head);
+        return;
+      }
+      const composedCommit = await repository.compose(node.commit, run.composedCommit);
+      await this.recordComposition(node.id, node.activeAttemptId, node.commit, run.composedCommit, composedCommit);
+    } catch (error) {
+      const after = await this.engine.load();
+      if (after.composedCommit !== run.composedCommit || after.nodes.find((candidate) => candidate.id === node.id)?.state === "composed") return;
+      try {
+        const recovered = await repository.recoverComposedCandidate(
+          run.composedCommit,
+          candidates.map((candidate) => ({ nodeId: candidate.id, baseCommit: candidate.baseCommit!, commit: candidate.commit! })),
+        );
+        if (recovered) {
+          const recoveredNode = requiredNode(run, recovered.nodeId);
+          if (!recoveredNode.activeAttemptId) throw new Error(`Recovered node ${recovered.nodeId} has no active attempt.`);
+          await this.recordComposition(recovered.nodeId, recoveredNode.activeAttemptId, recovered.sourceCommit, run.composedCommit, recovered.head);
+          return;
+        }
+      } catch {}
+      await this.recordAttemptFailure(node.activeAttemptId, error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async recordComposition(nodeId: string, attemptId: string, sourceCommit: string, beforeCommit: string, afterCommit: string): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const currentNode = requiredNode(draft, nodeId);
+      if (currentNode.state === "composed") return;
+      if (currentNode.state !== "completed" || currentNode.commit !== sourceCommit || draft.composedCommit !== beforeCommit) {
+        throw new Error(`Composition facts changed while composing ${nodeId}.`);
+      }
+      const current = requiredAttempt(draft, attemptId);
+      transitionNode(currentNode, "composed");
+      currentNode.composedAt = new Date().toISOString();
+      delete currentNode.activeAttemptId;
+      current.state = "completed";
+      current.stage = "settled";
+      current.settledAt = currentNode.composedAt;
+      current.lastActivityAt = current.settledAt;
+      draft.composedCommit = afterCommit;
+      draft.composition.push({ nodeId, sourceCommit, beforeCommit, afterCommit, status: "composed", at: current.settledAt });
+      draft.control.updatedAt = current.settledAt;
+    });
+  }
+
+  private async cancelAttempt(attempt: WorkAttempt): Promise<void> {
+    if (!attempt.worker) {
+      await this.recordAttemptFailure(attempt.id, "Cancellation requires an exact retained Herdr worker identity.");
+      return;
+    }
+    let sendInterrupt = !attempt.interruptRequestedAt;
+    if (sendInterrupt) {
+      await this.engine.store.update((draft) => {
+        const current = requiredAttempt(draft, attempt.id);
+        if (current.state !== "cancel_requested" || current.interruptRequestedAt) {
+          sendInterrupt = false;
+          return;
+        }
+        current.interruptRequestedAt = new Date().toISOString();
+        current.lastActivityAt = current.interruptRequestedAt;
+        current.attention = "Interrupt requested; awaiting a verified non-working Herdr observation.";
+        draft.control.updatedAt = current.interruptRequestedAt;
+      });
+    }
+    try {
+      const observation = sendInterrupt
+        ? await this.runtime.interrupt(attempt.worker)
+        : await this.runtime.observe(attempt.worker);
+      await this.recordCancellationObservation(attempt.id, observation);
+    } catch (error) {
+      await this.recordObservationFailure(attempt.id, error);
+    }
+  }
+
+  private async recordCancellationObservation(attemptId: string, observation: HerdrObservation): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      if (current.state !== "cancel_requested") return;
+      assertSameWorker(current.worker, observation.identity);
+      current.observedStatus = observation.status;
+      current.lastActivityAt = observation.observedAt;
+      current.heartbeatAt = observation.observedAt;
+      if (observation.status === "idle" || observation.status === "done") {
+        current.state = "cancelled";
+        current.stage = "settled";
+        current.settledAt = observation.observedAt;
+        delete current.attention;
+        const node = requiredNode(draft, current.nodeId);
+        if (node.state === "running") transitionNode(node, "cancelled");
+        delete node.activeAttemptId;
+        const otherAttention = draft.attempts.some((candidate) => candidate.id !== current.id && candidate.stage === "attention" && candidate.state !== "completed" && candidate.state !== "cancelled" && candidate.state !== "failed");
+        if (!otherAttention && !draft.nodes.some((candidate) => candidate.state === "failed" || candidate.state === "escalated")) {
+          draft.control.attentionStatus = "clear";
+        }
+        draft.control.updatedAt = observation.observedAt;
+        return;
+      }
+      current.stage = "attention";
+      current.attention = observation.status === "working"
+        ? "Interrupt was requested once; the worker still reports working."
+        : observation.status === "blocked"
+          ? "Interrupt was requested once; the worker reports blocked and requires attention."
+          : "Interrupt was requested once; the worker status is unknown and requires reconciliation.";
+      draft.control.attentionStatus = observation.status === "unknown" ? "decision_required" : "blocked";
+      draft.control.updatedAt = observation.observedAt;
+    });
+  }
+
+  private async updateDrainState(run: WorkgraphRun): Promise<void> {
+    const active = run.attempts.some((attempt) => attempt.state === "starting" || attempt.state === "running" || attempt.state === "settling" || attempt.state === "cancel_requested");
+    const pending = run.nodes.some((node) => node.state === "pending");
+    let executionStatus = run.control.executionStatus;
+    if (executionStatus === "draining" && !active) executionStatus = "paused";
+    else if (!active && !pending) executionStatus = "idle";
+    else if (active && executionStatus === "scheduled") executionStatus = "running";
+    const attentionStatus = run.nodes.some((node) => node.state === "escalated")
+      ? "decision_required"
+      : run.nodes.some((node) => node.state === "failed")
+        ? "failed"
+        : run.control.attentionStatus;
+    if (executionStatus === run.control.executionStatus && attentionStatus === run.control.attentionStatus) return;
+    await this.engine.store.update((draft) => {
+      draft.control.executionStatus = executionStatus;
+      draft.control.attentionStatus = attentionStatus;
+      draft.control.updatedAt = new Date().toISOString();
+    });
+  }
+
+  private async recordIdentity(attemptId: string, identity: WorkerIdentity): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      if (current.worker) assertSameWorker(current.worker, identity);
+      current.worker = { ...identity };
+      current.agentName = identity.agentName;
+      current.sessionFile = identity.sessionFile;
+      current.state = "running";
+      current.stage = "executing";
+      current.startedAt ??= new Date().toISOString();
+      current.lastActivityAt = current.startedAt;
+      current.heartbeatAt = current.startedAt;
+    });
+  }
+
+  private async recordObservation(attemptId: string, observation: HerdrObservation): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      assertSameWorker(current.worker, observation.identity);
+      current.worker = { ...observation.identity };
+      if (current.state === "starting") current.state = "running";
+      current.stage = observation.stage;
+      current.lastActivityAt = observation.observedAt;
+      current.heartbeatAt = observation.observedAt;
+      current.observedStatus = observation.status;
+      if (observation.status === "blocked") {
+        current.attention = "Herdr reports that the worker is blocked.";
+        draft.control.attentionStatus = "blocked";
+      }
+    });
+  }
+
+  private async settleUntypedAttempt(attemptId: string, terminalText?: string): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      if (current.state !== "running" && current.state !== "starting") return;
+      const node = requiredNode(draft, current.nodeId);
+      const attention = terminalText ? "Worker returned terminal prose without a typed implementation report." : "Herdr observed a settled-looking worker without a typed implementation report.";
+      if (current.stage === "attention" && current.attention === attention && draft.control.attentionStatus === "decision_required") return;
+      current.stage = "attention";
+      current.attention = attention;
+      current.lastActivityAt = new Date().toISOString();
+      node.resultKind = terminalText ? "untyped" : "absent";
+      if (terminalText) node.terminalText = terminalText;
+      draft.control.attentionStatus = "decision_required";
+      draft.control.updatedAt = current.lastActivityAt;
+    });
+  }
+
+  private async recordLaunchFailure(attemptId: string, error: unknown, uncertainLiveLaunch: boolean): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      current.lastActivityAt = new Date().toISOString();
+      current.error = message;
+      current.stage = "attention";
+      if (!current.worker && !uncertainLiveLaunch) {
+        current.state = "failed";
+        current.settledAt = current.lastActivityAt;
+        const node = requiredNode(draft, current.nodeId);
+        if (node.state === "running") transitionNode(node, "failed");
+        delete node.activeAttemptId;
+      }
+      draft.control.attentionStatus = current.worker || uncertainLiveLaunch ? "decision_required" : "failed";
+      draft.control.updatedAt = current.lastActivityAt;
+    });
+  }
+
+  private async recordAttemptFailure(attemptId: string, message: string): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      if (current.state === "completed") return;
+      current.state = "failed";
+      current.stage = "settled";
+      current.error = message;
+      current.settledAt = new Date().toISOString();
+      current.lastActivityAt = current.settledAt;
+      const node = requiredNode(draft, current.nodeId);
+      node.error = message;
+      if (node.state === "running" || node.state === "completed") transitionNode(node, "failed");
+      delete node.activeAttemptId;
+      draft.control.attentionStatus = "failed";
+      draft.control.updatedAt = current.settledAt;
+    });
+  }
+
+  private async recordObservationFailure(attemptId: string, error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    await this.engine.store.update((draft) => {
+      const current = draft.attempts.find((candidate) => candidate.id === attemptId);
+      if (!current || current.state === "completed" || current.state === "cancelled") return;
+      current.stage = "attention";
+      current.attention = `Worker observation failed: ${message}`;
+      current.lastActivityAt = new Date().toISOString();
+      draft.control.attentionStatus = "decision_required";
+      draft.control.updatedAt = current.lastActivityAt;
+    });
+  }
+
+  private async recordSupervisorError(error: Error): Promise<WorkgraphRun> {
+    try {
+      return await this.engine.store.update((draft) => {
+        draft.control.attentionStatus = "failed";
+        draft.control.updatedAt = new Date().toISOString();
+        draft.error = `Supervisor: ${error.message}`;
+      });
+    } catch {
+      return this.engine.load();
+    }
+  }
+}
+
+function requiredAttempt(run: WorkgraphRun, id: string): WorkAttempt {
+  const attempt = run.attempts.find((candidate) => candidate.id === id);
+  if (!attempt) throw new Error(`Unknown work attempt ${id}.`);
+  return attempt;
+}
+
+function requiredNode(run: WorkgraphRun, id: string): WorkNode {
+  const node = run.nodes.find((candidate) => candidate.id === id);
+  if (!node) throw new Error(`Unknown work node ${id}.`);
+  return node;
+}
+
+function assertSameWorker(expected: WorkerIdentity | undefined, actual: WorkerIdentity): void {
+  if (!expected) throw new Error("Work attempt has no retained worker identity.");
+  if (
+    expected.workspaceId !== actual.workspaceId
+    || expected.tabId !== actual.tabId
+    || expected.paneId !== actual.paneId
+    || expected.terminalId !== actual.terminalId
+    || expected.agentName !== actual.agentName
+    || expected.sessionFile !== actual.sessionFile
+    || expected.cwd !== actual.cwd
+  ) throw new Error("Live worker does not match the retained Workgraph identity.");
+}
+
+function workerEnvironment(run: WorkgraphRun, node: WorkNode, placement: WorktreePlacement): Record<string, string> {
+  return {
+    PI_WORKGRAPH_MODE: "implementation",
+    PI_WORKGRAPH_RUN_ID: run.runId,
+    PI_WORKGRAPH_NODE_ID: node.id,
+    PI_WORKGRAPH_BASE_COMMIT: placement.baseCommit,
+    PI_WORKGRAPH_IMPLEMENTATION_START: "guide",
+    PI_WORKGRAPH_EXECUTOR_MODEL: node.executorModel,
+    PI_WORKGRAPH_EXECUTOR_THINKING: node.executorThinking,
+  };
+}
+
+function implementationObjective(run: WorkgraphRun, node: WorkNode): string {
+  return [
+    `Implement only Workgraph node ${node.id}.`,
+    `Run: ${run.runId}`,
+    `Plan version: ${node.planVersion ?? run.control.currentPlanVersion ?? "unknown"}`,
+    `Base commit: ${run.composedCommit}`,
+    `Goal: ${node.brief.goal}`,
+    "Context:",
+    ...node.brief.context.map((item) => `- ${item}`),
+    "Acceptance:",
+    ...node.brief.acceptance.map((item) => `- ${item}`),
+    "Forbidden:",
+    ...node.brief.forbidden.map((item) => `- ${item}`),
+    `Timebox: ${node.brief.timeboxMinutes} minutes.`,
+    `Report contract: ${node.brief.report}`,
+    "Run the node verification commands, create exactly one direct commit, leave the worktree clean, and return workgraph_report.",
+  ].join("\n");
+}

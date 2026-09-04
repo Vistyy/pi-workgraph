@@ -49,13 +49,16 @@ test("registry grants one lease, renews it, and requires authoritative stale-own
     assert.throws(() => registry.acquire("run", { sessionId: "b", sessionFile: join(parent, "b.jsonl") }, new Date(1)), /leased by session a/);
     const renewed = registry.renew(first, new Date(10));
     assert.equal(renewed.owner.sessionId, "a");
-    assert.throws(() => registry.acquire("run", { sessionId: "b", sessionFile: join(parent, "b.jsonl") }, new Date(LEASE_END)), /liveness is unknown/);
-    const takeover = registry.acquire("run", { sessionId: "b", sessionFile: join(parent, "b.jsonl") }, new Date(LEASE_END), "dead");
+    const resumed = registry.acquire("run", { sessionId: "a", sessionFile: run.coordinator.sessionFile }, new Date(LEASE_END));
+    assert.equal(resumed.token, first.token);
+    assert.throws(() => registry.acquire("run", { sessionId: "b", sessionFile: join(parent, "b.jsonl") }, new Date(SECOND_LEASE_END)), /liveness is unknown/);
+    const takeover = registry.acquire("run", { sessionId: "b", sessionFile: join(parent, "b.jsonl") }, new Date(SECOND_LEASE_END), "dead");
     assert.equal(takeover.owner.sessionId, "b");
   } finally { registry.close(); await rm(parent, { recursive: true, force: true }); }
 });
 
 const LEASE_END = 31_000;
+const SECOND_LEASE_END = 62_000;
 
 test("engine adoption changes coordinator identity without forking and lifecycle transitions are explicit", async () => {
   const fixture = await makeFixture();
@@ -89,12 +92,15 @@ test("version 3 migration preserves reports, sessions, decisions, nodes, evidenc
     };
     await writeFile(path, JSON.stringify(legacy));
     const run = await new RunStateStore(path).load();
-    assert.equal(run.version, 4);
+    assert.equal(run.version, 5);
     assert.equal(run.lifecycle, "active");
     assert.equal(run.creator.sessionId, "legacy-session");
     assert.equal(run.discoveries[0]?.report?.summary, "kept");
     assert.equal(run.humanDecisions[0]?.prompt, "kept");
-    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 4);
+    assert.equal(run.control.planStatus, "absent");
+    assert.deepEqual(run.plans, []);
+    assert.deepEqual(run.attempts, []);
+    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 5);
   } finally { await rm(parent, { recursive: true, force: true }); }
 });
 

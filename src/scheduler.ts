@@ -2,12 +2,13 @@ import { posix } from "node:path";
 import type { NodeState, WorkNode, WorkNodeSpec, WorkgraphRun } from "./types.js";
 
 const NODE_TRANSITIONS: Record<NodeState, readonly NodeState[]> = {
-  pending: ["running", "failed"],
-  running: ["completed", "escalated", "failed"],
+  pending: ["running", "failed", "cancelled"],
+  running: ["completed", "escalated", "failed", "cancelled"],
   completed: ["composed", "failed"],
   composed: [],
   escalated: ["superseded"],
   failed: ["superseded"],
+  cancelled: ["superseded"],
   superseded: [],
 };
 
@@ -91,7 +92,7 @@ export function readyWave(run: WorkgraphRun, maxConcurrency: number): WorkNode[]
   const candidates = run.nodes
     .filter((node) => node.state === "pending")
     .filter((node) => node.dependencies.every((dependency) => byId.get(dependency)?.state === "composed"))
-    .sort((left, right) => left.id.localeCompare(right.id));
+    .sort((left, right) => (right.priority ?? 0) - (left.priority ?? 0) || left.id.localeCompare(right.id));
 
   const selected: WorkNode[] = [];
   for (const candidate of candidates) {
@@ -135,6 +136,9 @@ function validateNodeSpec(spec: WorkNodeSpec): void {
     throw new Error(`Work node id must match [a-z][a-z0-9_-]{0,47}: ${spec.id}`);
   }
   if (!spec.brief.goal.trim()) throw new Error(`Work node ${spec.id} requires a goal.`);
+  if (spec.priority !== undefined && (!Number.isSafeInteger(spec.priority) || spec.priority < -1000 || spec.priority > 1000)) {
+    throw new Error(`Work node ${spec.id} priority must be an integer from -1000 through 1000.`);
+  }
   if (spec.brief.acceptance.length === 0 || spec.brief.acceptance.some((item) => !item.trim())) {
     throw new Error(`Work node ${spec.id} requires concrete acceptance conditions.`);
   }

@@ -1,6 +1,15 @@
-export const RUN_STATE_VERSION = 4 as const;
+export const RUN_STATE_VERSION = 5 as const;
 
 export type RunLifecycle = "active" | "suspended" | "completed" | "abandoned" | "archived";
+export type PlanStatus = "absent" | "proposed" | "approved" | "superseded";
+export type PlanChangeKind = "initial" | "internal" | "authority";
+export type ExecutionStatus = "idle" | "scheduled" | "running" | "draining" | "paused";
+export type AttentionStatus = "clear" | "blocked" | "failed" | "decision_required";
+export type VerificationControlStatus = "absent" | "running" | "passed" | "failed" | "inconclusive";
+export type WorkerRuntimeMode = "herdr" | "headless_degraded";
+export type WorkerObservationStatus = "idle" | "working" | "blocked" | "done" | "unknown";
+export type AttemptState = "queued" | "starting" | "running" | "settling" | "completed" | "failed" | "cancel_requested" | "cancelled";
+export type WorkerStage = "queued" | "allocating" | "starting" | "executing" | "attention" | "reporting" | "verifying" | "composing" | "settled";
 export type CoordinatorHandoffKind = "begin" | "adopt" | "resume" | "recovery";
 
 export interface SessionIdentity {
@@ -46,6 +55,7 @@ export type NodeState =
   | "composed"
   | "escalated"
   | "failed"
+  | "cancelled"
   | "superseded";
 
 export type WorkerMode = "discovery" | "implementation" | "verification" | "assurance_review" | "assurance_synthesis";
@@ -266,6 +276,7 @@ export interface WorkNodeSpec {
   brief: WorkerBrief;
   claimedPaths: string[];
   dependencies: string[];
+  priority?: number;
   verificationCommands: string[];
   supersedes: string[];
   continuationOf?: string;
@@ -285,6 +296,8 @@ export interface CommandEvidence {
 
 export interface WorkNode extends WorkNodeSpec {
   state: NodeState;
+  planVersion?: number;
+  activeAttemptId?: string;
   resultKind?: ChildResultKind;
   terminalText?: string;
   baseCommit?: string;
@@ -390,6 +403,63 @@ export interface Transition {
   reason: string;
 }
 
+export interface PlanRecord {
+  version: number;
+  status: Exclude<PlanStatus, "absent">;
+  changeKind: PlanChangeKind;
+  agreement: AgreementDraft;
+  summary: string;
+  proposedAt: string;
+  approvedAt?: string;
+  decisionText?: string;
+}
+
+export interface WorkerIdentity {
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+  terminalId: string;
+  agentName: string;
+  sessionFile: string;
+  cwd: string;
+}
+
+export interface WorkAttempt {
+  id: string;
+  nodeId: string;
+  planVersion: number;
+  state: AttemptState;
+  stage: WorkerStage;
+  runtimeMode: WorkerRuntimeMode;
+  createdAt: string;
+  startedAt?: string;
+  settledAt?: string;
+  lastActivityAt: string;
+  heartbeatAt?: string;
+  interruptRequestedAt?: string;
+  observedStatus?: WorkerObservationStatus;
+  worktreePath?: string;
+  branch?: string;
+  baseCommit?: string;
+  sessionFile?: string;
+  agentName?: string;
+  worker?: WorkerIdentity;
+  attention?: string;
+  error?: string;
+}
+
+export interface WorkgraphControl {
+  planStatus: PlanStatus;
+  currentPlanVersion?: number;
+  executionStatus: ExecutionStatus;
+  attentionStatus: AttentionStatus;
+  verificationStatus: VerificationControlStatus;
+  maxConcurrency: number;
+  pauseMode?: "drain" | "immediate";
+  pauseReason?: string;
+  updatedAt: string;
+}
+
 export interface WorkgraphRun {
   version: typeof RUN_STATE_VERSION;
   revision: number;
@@ -412,6 +482,9 @@ export interface WorkgraphRun {
   createdAt: string;
   updatedAt: string;
   outcome: OutcomeContract;
+  control: WorkgraphControl;
+  plans: PlanRecord[];
+  attempts: WorkAttempt[];
   milestones: MilestoneRecord[];
   terminalOutcome?: TerminalOutcome;
   agreement?: Agreement;

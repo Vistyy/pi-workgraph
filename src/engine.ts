@@ -18,6 +18,7 @@ import type {
   DiscoveryTopology,
   HumanDecision,
   ProductVerificationRecord,
+  PlanChangeKind,
   RunPhase,
   ThinkingLevel,
   VerificationReport,
@@ -56,6 +57,17 @@ export interface ExecuteInput {
   stableEntryId?: string | null;
   signal?: AbortSignal;
 }
+
+export interface ScheduleInput {
+  nodes: WorkNodeSpec[];
+  maxConcurrency?: number;
+}
+
+export type ControlInput =
+  | { action: "pause"; mode?: "drain" | "immediate"; reason: string }
+  | { action: "resume"; reason: string }
+  | { action: "cancel"; reason: string; nodeIds?: string[] }
+  | { action: "reprioritize"; priorities: Array<{ nodeId: string; priority: number }>; reason: string };
 
 export interface ModelAssignment {
   model: string;
@@ -120,6 +132,15 @@ export class WorkgraphEngine {
 
   load(): Promise<WorkgraphRun> {
     return this.store.load();
+  }
+
+  repository(): Promise<GitRepository> {
+    return this.repositoryPromise;
+  }
+
+  heartbeatLease(): void {
+    if (!this.lease) throw new Error("This coordinator does not hold a Workgraph lease.");
+    this.lease = this.registry.renew(this.lease);
   }
 
   async adopt(sessionId: string, sessionFile: string, liveness: "alive" | "dead" | "unknown" = "unknown"): Promise<WorkgraphRun> {
@@ -401,6 +422,220 @@ export class WorkgraphEngine {
       setPhase(draft, "approved", decision.kind === "agreement"
         ? "The user approved the implementation envelope."
         : "The user approved the revised implementation envelope.");
+    });
+  }
+
+  async proposePlan(input: AgreementInput, summary: string, changeKind: PlanChangeKind): Promise<WorkgraphRun> {
+    const run = await this.load();
+    if (run.outcome.kind !== "product_change") throw new Error("Planning is only available for product-change outcomes.");
+    requireActiveLifecycle(run);
+    validateAgreement(input);
+    if (input.unresolvedDecisions.length > 0) throw new Error("Resolve material decisions before proposing a plan.");
+    if (!summary.trim()) throw new Error("A plan summary is required.");
+    const current = currentApprovedPlan(run);
+    if (changeKind === "internal" && !current) throw new Error("An internal plan change requires an approved plan.");
+    if (changeKind === "authority" && !current) throw new Error("An authority-changing plan requires a previously approved plan.");
+    if (changeKind === "initial" && current) throw new Error("A run with an approved plan must use an internal or authority-changing revision.");
+    return this.store.update((draft) => {
+      const now = new Date().toISOString();
+      const version = (draft.plans.at(-1)?.version ?? 0) + 1;
+      for (const plan of draft.plans) {
+        if (plan.status === "proposed") plan.status = "superseded";
+      }
+      const approved = changeKind === "internal";
+      if (approved) {
+        for (const plan of draft.plans) if (plan.status === "approved") plan.status = "superseded";
+      }
+      draft.plans.push({
+        version,
+        status: approved ? "approved" : "proposed",
+        changeKind,
+        agreement: { ...input },
+        summary: summary.trim(),
+        proposedAt: now,
+        ...(approved ? { approvedAt: now, decisionText: "Internal plan change did not alter authority." } : {}),
+      });
+      draft.control.planStatus = approved ? "approved" : "proposed";
+      draft.control.currentPlanVersion = version;
+      draft.control.attentionStatus = approved ? "clear" : "decision_required";
+      if (!approved && (draft.control.executionStatus === "scheduled" || draft.control.executionStatus === "running")) {
+        draft.control.executionStatus = "draining";
+      }
+      draft.control.updatedAt = now;
+      if (approved) {
+        draft.agreement = { ...input, approvedAt: now };
+        delete draft.agreementProposal;
+        delete draft.agreementProposalText;
+      } else {
+        draft.agreementProposal = { ...input };
+        draft.agreementProposalText = summary.trim();
+      }
+    });
+  }
+
+  async recordPlanDecision(version: number, accepted: boolean, prompt: string): Promise<WorkgraphRun> {
+    if (!Number.isSafeInteger(version) || version < 1) throw new Error("A valid plan version is required.");
+    if (!prompt.trim()) throw new Error("A plan decision must preserve the user's exact reply.");
+    return this.store.update((draft) => {
+      requireActiveLifecycle(draft);
+      const plan = draft.plans.find((candidate) => candidate.version === version);
+      if (!plan || plan.status !== "proposed") throw new Error(`Plan v${version} is not awaiting approval.`);
+      const latest = draft.plans.at(-1);
+      if (latest?.version !== version) throw new Error(`Plan v${version} is not the latest plan.`);
+      const now = new Date().toISOString();
+      draft.humanDecisions.push({ kind: draft.agreement ? "envelope_change" : "agreement", prompt: prompt.trim(), accepted, at: now });
+      plan.decisionText = prompt.trim();
+      if (!accepted) {
+        plan.status = "superseded";
+        const previous = [...draft.plans].reverse().find((candidate) => candidate.status === "approved");
+        draft.control.planStatus = previous ? "approved" : "absent";
+        if (previous) draft.control.currentPlanVersion = previous.version;
+        else delete draft.control.currentPlanVersion;
+        draft.control.attentionStatus = "clear";
+        if (draft.control.executionStatus === "draining") {
+          draft.control.executionStatus = draft.nodes.some((node) => node.state === "running") ? "running" : draft.nodes.some((node) => node.state === "pending") ? "scheduled" : "idle";
+        }
+        delete draft.agreementProposal;
+        delete draft.agreementProposalText;
+        draft.control.updatedAt = now;
+        return;
+      }
+      for (const candidate of draft.plans) {
+        if (candidate.version !== version && candidate.status === "approved") candidate.status = "superseded";
+      }
+      plan.status = "approved";
+      plan.approvedAt = now;
+      draft.control.planStatus = "approved";
+      draft.control.currentPlanVersion = version;
+      draft.control.attentionStatus = "clear";
+      draft.control.executionStatus = draft.nodes.some((node) => node.state === "running") ? "running" : draft.nodes.some((node) => node.state === "pending") ? "scheduled" : "idle";
+      draft.control.updatedAt = now;
+      draft.agreement = { ...plan.agreement, approvedAt: now };
+      delete draft.agreementProposal;
+      delete draft.agreementProposalText;
+      delete draft.productVerification;
+      delete draft.assurance;
+    });
+  }
+
+  async schedule(input: ScheduleInput): Promise<WorkgraphRun> {
+    const run = await this.load();
+    if (run.outcome.kind !== "product_change") throw new Error("Scheduling is only available for product-change outcomes.");
+    requireActiveLifecycle(run);
+    const plan = currentApprovedPlan(run);
+    if (!plan || run.control.planStatus !== "approved" || run.control.currentPlanVersion !== plan.version) {
+      throw new Error("Scheduling requires the current approved plan.");
+    }
+    if (run.control.executionStatus === "paused" || run.control.executionStatus === "draining") {
+      throw new Error(`Scheduling is unavailable while execution is ${run.control.executionStatus}.`);
+    }
+    const repositoryError = await this.composedRepositoryError(run);
+    if (repositoryError) throw new Error(repositoryError);
+    const maxConcurrency = input.maxConcurrency ?? run.control.maxConcurrency;
+    if (!Number.isSafeInteger(maxConcurrency) || maxConcurrency < 1 || maxConcurrency > 8) {
+      throw new Error("maxConcurrency must be an integer from 1 through 8.");
+    }
+    return this.store.update((draft) => {
+      if (input.nodes.length > 0) {
+        const before = new Set(draft.nodes.map((node) => node.id));
+        addNodes(draft, input.nodes);
+        for (const node of draft.nodes) {
+          if (!before.has(node.id)) node.planVersion = plan.version;
+        }
+      } else if (!draft.nodes.some((node) => node.state === "pending")) {
+        throw new Error("No new or pending work nodes are available to schedule.");
+      }
+      for (const node of draft.nodes) {
+        if (node.state === "pending" && node.planVersion === undefined) node.planVersion = plan.version;
+      }
+      const now = new Date().toISOString();
+      draft.control.executionStatus = "scheduled";
+      draft.control.attentionStatus = "clear";
+      draft.control.maxConcurrency = maxConcurrency;
+      draft.control.verificationStatus = "absent";
+      draft.control.updatedAt = now;
+      delete draft.productVerification;
+      delete draft.assurance;
+      draft.globalVerification = [];
+      setPhase(draft, "executing", input.nodes.length > 0 ? `Scheduled ${input.nodes.length} asynchronous work node(s).` : "Resumed asynchronous pending work.");
+    });
+  }
+
+  async controlExecution(input: ControlInput): Promise<WorkgraphRun> {
+    if (!input.reason.trim()) throw new Error("A control action requires a reason.");
+    return this.store.update((draft) => {
+      requireActiveLifecycle(draft);
+      const now = new Date().toISOString();
+      if (input.action === "pause") {
+        const mode = input.mode ?? "drain";
+        draft.control.executionStatus = mode === "drain" && draft.nodes.some((node) => node.state === "running") ? "draining" : "paused";
+        draft.control.pauseMode = mode;
+        draft.control.pauseReason = input.reason.trim();
+        if (mode === "immediate") {
+          for (const attempt of draft.attempts) {
+            if (attempt.state === "running" || attempt.state === "starting") attempt.state = "cancel_requested";
+          }
+        }
+      } else if (input.action === "resume") {
+        if (draft.control.planStatus !== "approved") throw new Error("Execution cannot resume without a current approved plan.");
+        draft.control.executionStatus = draft.nodes.some((node) => node.state === "running") ? "running" : draft.nodes.some((node) => node.state === "pending") ? "scheduled" : "idle";
+        delete draft.control.pauseMode;
+        delete draft.control.pauseReason;
+      } else if (input.action === "cancel") {
+        const targets = input.nodeIds?.length ? new Set(input.nodeIds) : undefined;
+        for (const node of draft.nodes) {
+          if (targets && !targets.has(node.id)) continue;
+          if (node.state === "pending") transitionNode(node, "cancelled");
+          if (node.state === "running" && node.activeAttemptId) {
+            const attempt = draft.attempts.find((candidate) => candidate.id === node.activeAttemptId);
+            if (attempt && (attempt.state === "running" || attempt.state === "starting")) attempt.state = "cancel_requested";
+          }
+        }
+        if (targets) {
+          for (const nodeId of targets) if (!draft.nodes.some((node) => node.id === nodeId)) throw new Error(`Unknown work node ${nodeId}.`);
+        }
+      } else {
+        for (const change of input.priorities) {
+          if (!Number.isSafeInteger(change.priority) || change.priority < -1000 || change.priority > 1000) throw new Error(`Invalid priority for ${change.nodeId}.`);
+          const node = draft.nodes.find((candidate) => candidate.id === change.nodeId);
+          if (!node) throw new Error(`Unknown work node ${change.nodeId}.`);
+          if (node.state !== "pending") throw new Error(`Only pending work can be reprioritized: ${change.nodeId} is ${node.state}.`);
+          node.priority = change.priority;
+        }
+      }
+      draft.control.updatedAt = now;
+    });
+  }
+
+  async settle(): Promise<WorkgraphRun> {
+    const run = await this.load();
+    requireActiveLifecycle(run);
+    const unsettled = run.attempts.some((attempt) => attempt.state === "starting" || attempt.state === "running" || attempt.state === "settling" || attempt.state === "cancel_requested");
+    if (unsettled) throw new Error("Workgraph has active attempts; inspect status or pause before settlement.");
+    if (!allNodesComposed(run)) {
+      const attention = run.nodes.some((node) => node.state === "escalated") ? "decision_required" : run.nodes.some((node) => node.state === "failed") ? "failed" : "blocked";
+      return this.store.update((draft) => {
+        draft.control.executionStatus = "idle";
+        draft.control.attentionStatus = attention;
+        draft.control.updatedAt = new Date().toISOString();
+      });
+    }
+    if (run.productVerification?.revision === run.composedCommit && run.control.verificationStatus !== "absent") return run;
+    await this.finalizeComposition(run);
+    return this.store.update((draft) => {
+      const verification = draft.productVerification;
+      draft.control.executionStatus = "idle";
+      draft.control.verificationStatus = verification?.state === "completed"
+        ? "passed"
+        : verification?.state === "failed"
+          ? "failed"
+          : verification?.state === "inconclusive"
+            ? "inconclusive"
+            : verification?.state === "running"
+              ? "running"
+              : "absent";
+      draft.control.attentionStatus = verification?.state === "failed" ? "failed" : verification?.state === "inconclusive" ? "decision_required" : "clear";
+      draft.control.updatedAt = new Date().toISOString();
     });
   }
 
@@ -1384,6 +1619,14 @@ function requireCurrentVerification(run: WorkgraphRun): void {
 
 function requirePhase(run: WorkgraphRun, phases: RunPhase[]): void {
   if (!phases.includes(run.phase)) throw new Error(`Workgraph ${run.runId} is ${run.phase}; expected ${phases.join(" or ")}.`);
+}
+
+function requireActiveLifecycle(run: WorkgraphRun): void {
+  if (run.lifecycle !== "active") throw new Error(`Workgraph ${run.runId} lifecycle is ${run.lifecycle}; expected active.`);
+}
+
+function currentApprovedPlan(run: WorkgraphRun) {
+  return [...run.plans].reverse().find((plan) => plan.status === "approved");
 }
 
 function requireNode(run: WorkgraphRun, id: string): WorkNode {

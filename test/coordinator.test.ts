@@ -20,7 +20,11 @@ test("the coordinator registers one stable tool inventory without mutation inter
     coordinator(fakePi);
 
     assert.ok(tools.includes("workgraph_begin"));
-    assert.ok(tools.includes("workgraph_agree"));
+    assert.ok(tools.includes("workgraph_plan"));
+    assert.ok(tools.includes("workgraph_schedule"));
+    assert.ok(tools.includes("workgraph_control"));
+    assert.ok(tools.includes("workgraph_reconcile"));
+    assert.ok(tools.includes("workgraph_settle"));
     assert.equal(handlers.has("tool_call"), false);
     assert.equal(handlers.has("message_end"), false);
     assert.equal(activeToolChanges, 0);

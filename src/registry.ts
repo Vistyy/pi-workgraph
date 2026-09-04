@@ -132,7 +132,7 @@ export class WorkgraphRegistry {
       if (current && current.expires_at > acquiredAt && current.owner_session_id !== owner.sessionId) {
         throw new Error(`Workgraph ${runId} is leased by session ${current.owner_session_id}.`);
       }
-      if (current && current.expires_at > acquiredAt && current.owner_session_id === owner.sessionId) {
+      if (current && current.owner_session_id === owner.sessionId) {
         const renewed: Lease = { runId, token: current.token, owner, acquiredAt: current.acquired_at, heartbeatAt: acquiredAt, expiresAt };
         this.db.prepare("UPDATE leases SET owner_session_file=?, heartbeat_at=?, expires_at=? WHERE run_id=? AND token=?").run(owner.sessionFile, acquiredAt, expiresAt, runId, current.token);
         this.db.exec("COMMIT");
