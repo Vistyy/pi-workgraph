@@ -23,6 +23,7 @@ import { WorkgraphRegistry } from "../src/registry.js";
 import { persistSchedule, WorkgraphSupervisor } from "../src/supervisor.js";
 import type {
   AssuranceResponsibility,
+  CoordinatorWakeRecord,
   EvidenceItem,
   DiscoveryAssignment,
   DiscoveryTopology,
@@ -36,6 +37,17 @@ const POINTER_ENTRY = "pi-workgraph-active";
 const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const);
 const ModelRoleSchema = StringEnum([...MODEL_ROLES]);
 const AssuranceResponsibilitySchema = StringEnum(["behavior", "structure", "evidence"] as const);
+
+export function deliverCoordinatorWake(pi: ExtensionAPI, ctx: ExtensionContext, wake: CoordinatorWakeRecord, run: WorkgraphRun): void {
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  if (ctx.sessionManager.getSessionId() !== run.coordinator.sessionId || !sessionFile || sessionFile !== run.coordinator.sessionFile) {
+    throw new Error("Coordinator wake refused because the current Pi session does not match the durable coordinator binding.");
+  }
+  pi.sendUserMessage(
+    `[WORKGRAPH AUTOMATIC EXTENSION CONTINUATION]\nWorkgraph ${run.runId} reached ${wake.kind} boundary ${wake.boundaryRevision} at ${run.composedCommit}. Inspect durable status and continue within the approved plan. This message was generated automatically by the Workgraph extension. It is not a human message, human approval, envelope change, assurance judgment, or completion decision, and it cannot authorize any of them.`,
+    { deliverAs: "followUp" },
+  );
+}
 
 const ModelTargetSchema = Type.Object({
   model: Type.String({ description: "Model selector as provider/model." }),
@@ -105,18 +117,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       ...(process.env.HERDR_WORKSPACE_ID ? { workspaceId: process.env.HERDR_WORKSPACE_ID } : {}),
       stableEntryId: stableParentEntry(ctx.sessionManager),
       onRun: (run) => { activeRun = run; updateStatus(ctx, run); },
-      onCoordinatorWake: (wake, run) => {
-        const sessionFile = ctx.sessionManager.getSessionFile();
-        if (ctx.sessionManager.getSessionId() !== run.coordinator.sessionId || !sessionFile || sessionFile !== run.coordinator.sessionFile) {
-          throw new Error("Coordinator wake refused because the current Pi session does not match the durable coordinator binding.");
-        }
-        pi.sendMessage({
-          customType: "pi-workgraph-coordinator-wake",
-          content: `[WORKGRAPH COORDINATOR WAKE]\nWorkgraph ${run.runId} reached ${wake.kind} boundary ${wake.boundaryRevision} at ${run.composedCommit}. Inspect durable status and continue within the approved plan. This extension message is not human approval and cannot authorize an envelope change or final judgment.`,
-          display: true,
-          details: { runId: run.runId, wake },
-        }, { deliverAs: "followUp", triggerTurn: true });
-      },
+      onCoordinatorWake: (wake, run) => deliverCoordinatorWake(pi, ctx, wake, run),
       onError: (error) => ctx.ui.notify(`Workgraph supervisor: ${error.message}`, "warning"),
     });
     supervisor.start();
