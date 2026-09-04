@@ -5,7 +5,7 @@ import type { WorktreePlacement } from "./git.js";
 import { herdrAgentName, type HerdrObservation, type VisibleWorkerRuntime } from "./herdr.js";
 import { forkSession, readTerminalText, readWorkgraphReport } from "./pi-process.js";
 import { claimsOverlap, readyWave, transitionNode } from "./scheduler.js";
-import type { AssuranceReviewReport, AssuranceSynthesisReport, DiscoveryReport, ImplementationReport, VerificationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun, WorkerMode } from "./types.js";
+import type { AssuranceReviewReport, AssuranceSynthesisReport, DiscoveryReport, ImplementationReport, VerificationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun, WorkerMode, ResourceCleanupRecord } from "./types.js";
 
 export interface SupervisorWake {
   kick(): void;
@@ -83,12 +83,17 @@ export class WorkgraphSupervisor {
   private async reconcileAndAdvance(): Promise<WorkgraphRun> {
     this.engine.heartbeatLease();
     let run = await this.engine.load();
-    if (run.lifecycle !== "active") return run;
+    if (run.lifecycle === "suspended" || run.lifecycle === "archived") return run;
 
     await this.reconcileAttempts(run);
     run = await this.engine.load();
     await this.composeCompleted(run);
     run = await this.engine.load();
+    await this.ensureCleanupIntents(run);
+    run = await this.engine.load();
+    await this.processCleanup(run);
+    run = await this.engine.load();
+    if (run.lifecycle !== "active") return run;
     await this.updateDrainState(run);
     run = await this.engine.load();
 
@@ -627,6 +632,59 @@ export class WorkgraphSupervisor {
     });
   }
 
+  private async ensureCleanupIntents(run: WorkgraphRun): Promise<void> {
+    const settled = run.attempts.filter((attempt) => !isActiveAttempt(attempt) && attempt.worktreePath && attempt.branch && attempt.baseCommit);
+    if (settled.length === 0) return;
+    await this.engine.store.update((draft) => {
+      const cleanup = draft.cleanup ??= [];
+      for (const attempt of settled) {
+        const current = draft.attempts.find((candidate) => candidate.id === attempt.id);
+        if (!current?.worktreePath || !current.branch || !current.baseCommit) continue;
+        const node = draft.nodes.find((candidate) => candidate.id === current.nodeId);
+        const expectedHead = node?.commit ?? current.baseCommit;
+        if (!cleanup.some((record) => record.attemptId === current.id && record.kind === "git_worktree")) {
+          cleanup.push({ id: `${current.id}:git`, attemptId: current.id, kind: "git_worktree", state: "pending", requestedAt: new Date().toISOString(), path: current.worktreePath, branch: current.branch, expectedHead });
+        }
+        if (current.worker && !cleanup.some((record) => record.attemptId === current.id && record.kind === "herdr_worker")) {
+          cleanup.push({ id: `${current.id}:herdr`, attemptId: current.id, kind: "herdr_worker", state: "pending", requestedAt: new Date().toISOString(), identity: { ...current.worker } });
+        }
+      }
+    });
+  }
+
+  private async processCleanup(run: WorkgraphRun): Promise<void> {
+    for (const record of run.cleanup ?? []) {
+      if (record.state === "completed") continue;
+      try {
+        if (record.kind === "git_worktree") {
+          const result = await (await this.engine.repository()).cleanupWorktree({ path: record.path, branch: record.branch, baseCommit: record.expectedHead }, record.expectedHead);
+          await this.recordCleanup(record.id, result.state, result.detail);
+        } else if (this.runtime.cleanup) {
+          const result = await this.runtime.cleanup(record.identity);
+          await this.recordCleanup(record.id, result.state, result.detail);
+        } else {
+          await this.recordCleanup(record.id, "blocked", "Herdr runtime does not provide exact worker cleanup.");
+        }
+      } catch (error) {
+        await this.recordCleanup(record.id, "blocked", errorMessage(error));
+      }
+    }
+  }
+
+  private async recordCleanup(id: string, state: "completed" | "blocked", detail: string): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const record = (draft.cleanup ?? []).find((candidate) => candidate.id === id);
+      if (!record) return;
+      record.state = state;
+      record.inspectedAt = new Date().toISOString();
+      record.detail = detail;
+      if (state === "blocked") record.error = detail;
+      else { delete record.error; record.completedAt = record.inspectedAt; }
+      draft.control.updatedAt = record.inspectedAt;
+      if (state === "blocked") draft.control.attentionStatus = "decision_required";
+    });
+  }
+
   private async updateDrainState(run: WorkgraphRun): Promise<void> {
     const active = run.attempts.some((attempt) => attempt.state === "starting" || attempt.state === "running" || attempt.state === "settling" || attempt.state === "cancel_requested");
     const pending = run.nodes.some((node) => node.state === "pending") || run.attempts.some((attempt) => attempt.state === "queued");
@@ -791,6 +849,10 @@ export class WorkgraphSupervisor {
       return this.engine.load();
     }
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isActiveAttempt(attempt: WorkAttempt): boolean {

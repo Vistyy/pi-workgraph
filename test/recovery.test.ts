@@ -136,6 +136,22 @@ async function seedNode(
   });
 }
 
+test("exact worktree cleanup inspects identity, HEAD, and cleanliness before deletion", async () => {
+  const fixture = await setup();
+  try {
+    const placement = await fixture.repository.createWorktree(fixture.runId, "cleanup", fixture.base);
+    const result = await fixture.repository.cleanupWorktree(placement, fixture.base);
+    assert.equal(result.state, "completed");
+    await assert.rejects(() => fixture.repository.head(placement.path));
+
+    const dirty = await fixture.repository.createWorktree(fixture.runId, "dirty-cleanup", fixture.base);
+    await writeFile(join(dirty.path, "value.txt"), "dirty\n");
+    await assert.rejects(() => fixture.repository.cleanupWorktree(dirty, fixture.base), /dirty worktree/);
+    await writeFile(join(dirty.path, "value.txt"), "old\n");
+    await fixture.repository.cleanupWorktree(dirty, fixture.base);
+  } finally { await rm(fixture.parent, { recursive: true, force: true }); }
+});
+
 test("recovery consumes a terminal child report, validates it, and finishes composition", async () => {
   const fixture = await setup();
   try {

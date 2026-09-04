@@ -23,6 +23,14 @@ export interface ValidatedCommit {
   changedFiles: string[];
 }
 
+export interface WorktreeCleanupResult {
+  state: "completed" | "blocked";
+  path: string;
+  branch: string;
+  expectedHead: string;
+  detail: string;
+}
+
 export class GitRepository {
   constructor(readonly root: string, readonly commonDir: string) {}
 
@@ -178,17 +186,37 @@ export class GitRepository {
     return this.head();
   }
 
+  async cleanupWorktree(placement: WorktreePlacement, expectedHead: string): Promise<WorktreeCleanupResult> {
+    const records = parseWorktreeList(await gitText(this.root, ["worktree", "list", "--porcelain"], true));
+    const registered = records.find((worktree) => resolve(worktree.path) === resolve(placement.path));
+    const branchAtAnotherPath = records.find((worktree) => worktree.branch === placement.branch && resolve(worktree.path) !== resolve(placement.path));
+    if (branchAtAnotherPath) throw new Error(`Refusing cleanup: branch ${placement.branch} is registered at ${branchAtAnotherPath.path}, not ${placement.path}.`);
+    const branchRef = `refs/heads/${placement.branch}`;
+    const branchExists = await runProcess("git", ["-C", this.root, "rev-parse", "--verify", "--quiet", branchRef], { cwd: this.root, timeoutMs: 30_000 });
+    if (registered) {
+      if (registered.branch !== placement.branch) throw new Error(`Refusing cleanup: ${placement.path} is registered on ${registered.branch ?? "detached HEAD"}, not ${placement.branch}.`);
+      const head = await this.head(placement.path);
+      const status = await this.status(placement.path);
+      if (head !== expectedHead) throw new Error(`Refusing cleanup: ${placement.path} HEAD is ${head}, expected ${expectedHead}.`);
+      if (status) throw new Error(`Refusing cleanup of dirty worktree ${placement.path}: ${status}`);
+      const result = await runProcess("git", ["-C", this.root, "worktree", "remove", placement.path], { cwd: this.root, timeoutMs: 60_000 });
+      if (result.exitCode !== 0) throw new Error(`Could not remove worktree ${placement.path}: ${result.stderr || result.stdout}`);
+    }
+    if (branchExists.exitCode === 0) {
+      const branchHead = await gitText(this.root, ["rev-parse", branchRef]);
+      if (branchHead !== expectedHead) throw new Error(`Refusing cleanup: branch ${placement.branch} points to ${branchHead}, expected ${expectedHead}.`);
+      const branchResult = await runProcess("git", ["-C", this.root, "branch", "-D", placement.branch], { cwd: this.root, timeoutMs: 30_000 });
+      if (branchResult.exitCode !== 0) throw new Error(`Could not remove worker branch ${placement.branch}: ${branchResult.stderr || branchResult.stdout}`);
+    } else if (branchExists.exitCode !== 1) {
+      throw new Error(`Could not inspect worker branch ${placement.branch}: ${branchExists.stderr || branchExists.stdout}`);
+    }
+    const remaining = parseWorktreeList(await gitText(this.root, ["worktree", "list", "--porcelain"], true)).find((worktree) => resolve(worktree.path) === resolve(placement.path) || worktree.branch === placement.branch);
+    if (remaining) throw new Error(`Cleanup postcondition failed for ${placement.path}.`);
+    return { state: "completed", path: placement.path, branch: placement.branch, expectedHead, detail: "Exact clean worktree and branch were removed, or were already absent." };
+  }
+
   async removeWorktree(placement: WorktreePlacement): Promise<void> {
-    const result = await runProcess("git", ["-C", this.root, "worktree", "remove", placement.path], {
-      cwd: this.root,
-      timeoutMs: 60_000,
-    });
-    if (result.exitCode !== 0) throw new Error(`Could not remove worktree ${placement.path}: ${result.stderr || result.stdout}`);
-    const branchResult = await runProcess("git", ["-C", this.root, "branch", "-D", placement.branch], {
-      cwd: this.root,
-      timeoutMs: 30_000,
-    });
-    if (branchResult.exitCode !== 0) throw new Error(`Could not remove worker branch ${placement.branch}: ${branchResult.stderr || branchResult.stdout}`);
+    await this.cleanupWorktree(placement, await this.head(placement.path));
   }
 
   async runCommands(commands: string[], cwd = this.root): Promise<CommandEvidence[]> {

@@ -14,7 +14,11 @@ import type {
   AssuranceRecord,
   AssuranceResponsibility,
   AssuranceReviewRecord,
+  AssuranceReviewReport,
+  AssuranceSynthesisReport,
   ChildOutcome,
+  ChildResultKind,
+  ChildResultReview,
   DiscoveryAssignment,
   DiscoveryRecord,
   DiscoveryTopology,
@@ -30,6 +34,8 @@ import type {
   WorkAttempt,
   WorkerMode,
   WorkerIdentity,
+  WorkerReport,
+  ImplementationReport,
 } from "./types.js";
 
 export type ChildRunner = (request: ChildRequest) => Promise<ChildOutcome>;
@@ -114,6 +120,14 @@ export interface AssuranceInput {
   signal?: AbortSignal;
 }
 
+export interface ChildResultReviewInput {
+  attemptId: string;
+  disposition: "accept" | "retry" | "reject";
+  summary: string;
+  evidence: EvidenceItem[];
+  report?: WorkgraphRun["discoveries"][number]["report"] | ImplementationReport | VerificationReport | AssuranceReviewReport | AssuranceSynthesisReport;
+}
+
 export interface AssuranceJudgmentInput {
   judgments: Array<{
     findingId: string;
@@ -196,6 +210,9 @@ export class WorkgraphEngine {
     const run = await this.load();
     if (run.lifecycle === lifecycle) return run;
     const updated = await this.store.update((draft) => {
+      if ((lifecycle === "completed" || lifecycle === "abandoned") && draft.attempts.some((attempt) => ["starting", "running", "settling", "cancel_requested"].includes(attempt.state))) {
+        throw new Error(`Cannot settle lifecycle while a worker attempt is active.`);
+      }
       const allowed: Record<WorkgraphRun["lifecycle"], readonly WorkgraphRun["lifecycle"][]> = {
         active: ["suspended", "completed", "abandoned"], suspended: ["active", "completed", "abandoned"], completed: ["archived"], abandoned: ["archived"], archived: [],
       };
@@ -203,8 +220,14 @@ export class WorkgraphEngine {
       draft.lifecycle = lifecycle;
       draft.lifecycleReason = reason.trim();
       draft.lifecycleUpdatedAt = new Date().toISOString();
+      if (lifecycle === "completed" || lifecycle === "abandoned") addCleanupIntents(draft);
     });
-    this.registry.transitionLifecycle(updated.runId, lifecycle, reason);
+    try {
+      this.registry.transitionLifecycle(updated.runId, lifecycle, reason);
+    } catch {
+      // The durable JSON run is semantic authority; repair the SQLite projection after a stale index race.
+      this.registry.indexRun(updated);
+    }
     this.registry.indexRun(updated);
     return updated;
   }
@@ -557,6 +580,7 @@ export class WorkgraphEngine {
     const run = await this.load();
     if (run.outcome.kind !== "product_change") throw new Error("Agreement is only required for product-change outcomes.");
     requirePhase(run, ["awaiting_agreement", "needs_decision"]);
+    if (!discoveryAgreementReady(run)) throw new Error("Agreement is blocked until every active discovery lane has a completed typed report or an explicit coordinator disposition.");
     validateAgreement(input);
     if (input.unresolvedDecisions.length > 0) throw new Error("Resolve material decisions before proposing the implementation envelope.");
     if (!summary.trim()) throw new Error("An agreement summary is required.");
@@ -570,6 +594,7 @@ export class WorkgraphEngine {
     const run = await this.load();
     if (run.outcome.kind !== "product_change") throw new Error("Agreement is only required for product-change outcomes.");
     requirePhase(run, ["awaiting_agreement", "needs_decision"]);
+    if (accepted && !discoveryAgreementReady(run)) throw new Error("Agreement approval is blocked until every active discovery lane has a completed typed report or an explicit coordinator disposition.");
     validateAgreement(input);
     if (accepted && input.unresolvedDecisions.length > 0) {
       throw new Error("Resolve material decisions before approving the implementation envelope.");
@@ -602,6 +627,7 @@ export class WorkgraphEngine {
     const run = await this.load();
     if (run.outcome.kind !== "product_change") throw new Error("Planning is only available for product-change outcomes.");
     requireActiveLifecycle(run);
+    if (!discoveryAgreementReady(run)) throw new Error("Planning is blocked until every active discovery lane has a completed typed report or an explicit coordinator disposition.");
     validateAgreement(input);
     if (input.unresolvedDecisions.length > 0) throw new Error("Resolve material decisions before proposing a plan.");
     if (!summary.trim()) throw new Error("A plan summary is required.");
@@ -644,6 +670,52 @@ export class WorkgraphEngine {
         draft.agreementProposalText = summary.trim();
       }
     });
+  }
+
+  async reviewChildResult(input: ChildResultReviewInput): Promise<WorkgraphRun> {
+    if (!input.summary.trim()) throw new Error("A child-result review requires a summary.");
+    validateEvidence(input.evidence);
+    const run = await this.load();
+    requireActiveLifecycle(run);
+    const attempt = run.attempts.find((candidate) => candidate.id === input.attemptId);
+    if (!attempt || !attempt.mode) throw new Error(`Unknown child attempt ${input.attemptId}.`);
+    const original = childResultRecord(run, attempt);
+    if (!original || (original.resultKind !== "untyped" && original.resultKind !== "absent")) throw new Error("Only an untyped or absent child result can be reviewed.");
+    if (input.disposition === "accept") {
+      if (!input.report || input.report.kind !== attempt.mode || input.report.status !== "completed") throw new Error("Accepting an untyped child result requires a completed typed report matching the attempt mode.");
+    }
+    const report = input.report;
+    const reviewed = await this.store.update((draft) => {
+      const current = requiredAttempt(draft, input.attemptId);
+      const retained = childResultRecord(draft, current);
+      if (!retained || (retained.resultKind !== "untyped" && retained.resultKind !== "absent")) throw new Error("Child result changed before review was recorded.");
+      const review: ChildResultReview = {
+        id: randomUUID(),
+        attemptId: input.attemptId,
+        mode: current.mode!,
+        disposition: input.disposition,
+        originalResultKind: retained.resultKind,
+        ...(retained.terminalText ? { originalTerminalText: retained.terminalText } : {}),
+        summary: input.summary.trim(),
+        evidence: input.evidence.map((item) => ({ ...item, class: item.class ?? "direct" })),
+        ...(report ? { report } : {}),
+        reviewedAt: new Date().toISOString(),
+      };
+      (draft.resultReviews ??= []).push(review);
+      if (input.disposition === "accept" && report) promoteReviewedResult(draft, current, report as WorkerReport);
+      else {
+        current.state = "completed";
+        current.stage = "settled";
+        current.settledAt = review.reviewedAt;
+        markRejectedResult(draft, current, `${input.disposition}: ${input.summary.trim()}`);
+      }
+      draft.control.attentionStatus = input.disposition === "accept" ? "clear" : "decision_required";
+      draft.control.updatedAt = review.reviewedAt;
+    });
+    if (input.disposition === "accept" && attempt.mode === "discovery" && discoveryAgreementReady(reviewed) && reviewed.phase === "discovery") {
+      return this.store.update((draft) => setPhase(draft, "awaiting_agreement", "Coordinator accepted typed evidence for every active discovery lane."));
+    }
+    return reviewed;
   }
 
   async recordPlanDecision(version: number, accepted: boolean, prompt: string): Promise<WorkgraphRun> {
@@ -1855,6 +1927,87 @@ function requireActiveLifecycle(run: WorkgraphRun): void {
 
 function currentApprovedPlan(run: WorkgraphRun) {
   return [...run.plans].reverse().find((plan) => plan.status === "approved");
+}
+
+function discoveryAgreementReady(run: WorkgraphRun): boolean {
+  const active = run.discoveries.filter((record) => record.state !== "superseded");
+  return active.length === 0 || active.every((record) => record.state === "completed" && record.report?.kind === "discovery" && record.report.status === "completed");
+}
+
+type ResultCarrier = { resultKind?: ChildResultKind; terminalText?: string; report?: WorkerReport; state?: string; error?: string };
+
+function childResultRecord(run: WorkgraphRun, attempt: WorkAttempt): ResultCarrier | undefined {
+  if (attempt.mode === "implementation") return run.nodes.find((node) => node.activeAttemptId === attempt.id || node.id === attempt.nodeId);
+  if (attempt.mode === "discovery") return run.discoveries.find((record) => record.attemptId === attempt.id);
+  if (attempt.mode === "verification") return run.productVerification?.attemptId === attempt.id ? run.productVerification : undefined;
+  if (attempt.mode === "assurance_review") return run.assurance?.reviews.find((record) => record.attemptId === attempt.id);
+  if (attempt.mode === "assurance_synthesis") return run.assurance?.synthesis?.attemptId === attempt.id ? run.assurance.synthesis : undefined;
+  return undefined;
+}
+
+function promoteReviewedResult(run: WorkgraphRun, attempt: WorkAttempt, report: WorkerReport): void {
+  const now = new Date().toISOString();
+  attempt.resultKind = "typed";
+  attempt.state = "completed";
+  attempt.stage = "settled";
+  attempt.settledAt = now;
+  attempt.lastActivityAt = now;
+  if (attempt.mode === "discovery" && report.kind === "discovery") {
+    const record = run.discoveries.find((candidate) => candidate.attemptId === attempt.id);
+    if (record) { record.resultKind = "typed"; record.report = report; record.state = "completed"; delete record.error; }
+  } else if (attempt.mode === "verification" && report.kind === "verification") {
+    const verification = run.productVerification;
+    if (verification?.attemptId === attempt.id) { verification.resultKind = "typed"; verification.report = report; verification.state = "completed"; delete verification.error; }
+  } else if (attempt.mode === "assurance_review" && report.kind === "assurance_review") {
+    const review = run.assurance?.reviews.find((candidate) => candidate.attemptId === attempt.id);
+    if (review) { review.resultKind = "typed"; review.report = report; review.state = "completed"; delete review.error; }
+  } else if (attempt.mode === "assurance_synthesis" && report.kind === "assurance_synthesis") {
+    const synthesis = run.assurance?.synthesis;
+    if (synthesis?.attemptId === attempt.id) { synthesis.resultKind = "typed"; synthesis.report = report; synthesis.state = "completed"; delete synthesis.error; }
+  } else if (attempt.mode === "implementation" && report.kind === "implementation") {
+    const node = run.nodes.find((candidate) => candidate.id === attempt.nodeId);
+    if (node) {
+      node.resultKind = "typed";
+      node.report = report;
+      node.error = "Coordinator accepted typed evidence, but implementation commit validation is still required.";
+      if (node.state === "running") transitionNode(node, "escalated");
+      delete node.activeAttemptId;
+    }
+  }
+}
+
+function addCleanupIntents(run: WorkgraphRun): void {
+  const cleanup = run.cleanup ??= [];
+  for (const attempt of run.attempts) {
+    if (!attempt.worktreePath || !attempt.branch || !attempt.baseCommit) continue;
+    const node = run.nodes.find((candidate) => candidate.id === attempt.nodeId);
+    const expectedHead = node?.commit ?? attempt.baseCommit;
+    if (!cleanup.some((record) => record.attemptId === attempt.id && record.kind === "git_worktree")) {
+      cleanup.push({ id: `${attempt.id}:git`, attemptId: attempt.id, kind: "git_worktree", state: "pending", requestedAt: new Date().toISOString(), path: attempt.worktreePath, branch: attempt.branch, expectedHead });
+    }
+    if (attempt.worker && !cleanup.some((record) => record.attemptId === attempt.id && record.kind === "herdr_worker")) {
+      cleanup.push({ id: `${attempt.id}:herdr`, attemptId: attempt.id, kind: "herdr_worker", state: "pending", requestedAt: new Date().toISOString(), identity: { ...attempt.worker } });
+    }
+  }
+}
+
+function markRejectedResult(run: WorkgraphRun, attempt: WorkAttempt, reason: string): void {
+  attempt.attention = `Coordinator disposition requires follow-up: ${reason}`;
+  const carrier = childResultRecord(run, attempt);
+  if (carrier) carrier.error = reason;
+  if (attempt.mode === "implementation") {
+    const node = run.nodes.find((candidate) => candidate.id === attempt.nodeId);
+    if (node) { if (node.state === "running") transitionNode(node, "escalated"); delete node.activeAttemptId; node.error = reason; }
+  } else if (attempt.mode === "discovery") {
+    const record = run.discoveries.find((candidate) => candidate.attemptId === attempt.id);
+    if (record) record.state = "failed";
+  }
+}
+
+function requiredAttempt(run: WorkgraphRun, id: string): WorkAttempt {
+  const attempt = run.attempts.find((candidate) => candidate.id === id);
+  if (!attempt) throw new Error(`Unknown work attempt ${id}.`);
+  return attempt;
 }
 
 function requireNode(run: WorkgraphRun, id: string): WorkNode {

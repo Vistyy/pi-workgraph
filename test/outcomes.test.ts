@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WorkgraphEngine } from "../src/engine.js";
-import { commandAgreement, testOutcome } from "./helpers.js";
+import { commandAgreement, discoveryReport, testOutcome } from "./helpers.js";
 import { GitRepository } from "../src/git.js";
 import type { EvidenceItem } from "../src/types.js";
 
@@ -48,6 +48,29 @@ test("non-change completion rejects unresolved conflicts and product execution",
     await assert.rejects(() => begun.engine.execute({ nodes: [] }), /only available for product-change/);
     const resumed = await WorkgraphEngine.open(begun.run.statePath).load();
     assert.equal(resumed.milestones[0]?.status, "pending");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("agreement waits for every discovery lane and only explicit typed review unblocks it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-workgraph-review-"));
+  try {
+    const begun = await WorkgraphEngine.begin({ request: "request", projectRoot: root, gitCommonDir: join(root, ".git"), parentSessionId: "parent", parentSessionFile: join(root, "parent.jsonl"), baseCommit: "base", outcome: testOutcome.outcome });
+    await begun.engine.store.transition("awaiting_agreement", "Discovery was started.");
+    const sessionFile = join(root, "retained.jsonl");
+    await begun.engine.store.update((run) => {
+      run.discoveries.push({ id: "lane", lens: "lane", objective: "Inspect evidence.", model: "provider/model", thinking: "high", topology: "evidence", attemptId: "attempt", resultKind: "untyped", terminalText: "The child left prose.", state: "review_required", sessionFile });
+      run.attempts.push({ id: "attempt", nodeId: "lane", mode: "discovery", planVersion: 0, state: "completed", stage: "settled", runtimeMode: "herdr", createdAt: new Date(0).toISOString(), settledAt: new Date(0).toISOString(), lastActivityAt: new Date(0).toISOString(), sessionFile });
+    });
+    const { approvedAt: _approvedAt, ...draft } = commandAgreement;
+    for (const state of ["running", "failed", "review_required", "timed_out", "cancelled", "unavailable"] as const) {
+      await begun.engine.store.update((run) => { run.discoveries[0]!.state = state; });
+      await assert.rejects(() => begun.engine.proposeAgreement(draft, "Plan summary"), /discovery/i);
+    }
+    const reviewed = await begun.engine.reviewChildResult({ attemptId: "attempt", disposition: "accept", summary: "Coordinator verified the retained evidence.", evidence: [{ label: "retained", observation: "The session remains available.", class: "direct" }], report: discoveryReport("Reviewed evidence.") });
+    assert.equal(reviewed.discoveries[0]?.state, "completed");
+    assert.equal(reviewed.discoveries[0]?.terminalText, "The child left prose.");
+    assert.equal(reviewed.resultReviews?.[0]?.originalTerminalText, "The child left prose.");
+    assert.equal((await begun.engine.proposeAgreement(draft, "Plan summary")).phase, "awaiting_agreement");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

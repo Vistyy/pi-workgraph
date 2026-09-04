@@ -44,12 +44,20 @@ export interface CoordinatorObservationRequest {
   cwd: string;
 }
 
+export interface WorkerCleanupResult {
+  state: "completed" | "blocked";
+  identity: WorkerIdentity;
+  observedAt: string;
+  detail: string;
+}
+
 export interface VisibleWorkerRuntime {
   readonly available: boolean;
   launch(request: WorkerLaunchRequest): Promise<HerdrObservation>;
   recover?(request: WorkerRecoveryRequest): Promise<HerdrObservation | undefined>;
   observe(identity: WorkerIdentity): Promise<HerdrObservation>;
   interrupt(identity: WorkerIdentity): Promise<HerdrObservation>;
+  cleanup?(identity: WorkerIdentity): Promise<WorkerCleanupResult>;
 }
 
 interface CommandResult {
@@ -192,6 +200,15 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     await this.observe(identity);
     await this.call(["agent", "send-keys", identity.agentName, "esc"]);
     return this.observe(identity);
+  }
+
+  async cleanup(identity: WorkerIdentity): Promise<WorkerCleanupResult> {
+    const observation = await this.observe(identity);
+    if (observation.status === "working" || observation.status === "blocked" || observation.status === "unknown") {
+      return { state: "blocked", identity, observedAt: observation.observedAt, detail: `Worker is ${observation.status}; cleanup requires a verified idle or done worker.` };
+    }
+    await this.call(["tab", "close", identity.tabId]);
+    return { state: "completed", identity, observedAt: new Date().toISOString(), detail: `Closed exact Herdr tab ${identity.tabId}.` };
   }
 
   private async call(args: string[], timeoutMs = 30_000): Promise<Record<string, unknown>> {

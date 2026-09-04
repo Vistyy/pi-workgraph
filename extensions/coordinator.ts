@@ -4,6 +4,7 @@ import { Type } from "typebox";
 import {
   WorkgraphEngine,
   type AgreementInput,
+  type ChildResultReviewInput,
   type ModelAssignment,
 } from "../src/engine.js";
 import { GitRepository } from "../src/git.js";
@@ -22,6 +23,7 @@ import { WorkgraphRegistry } from "../src/registry.js";
 import { persistSchedule, WorkgraphSupervisor } from "../src/supervisor.js";
 import type {
   AssuranceResponsibility,
+  EvidenceItem,
   DiscoveryAssignment,
   DiscoveryTopology,
   RunPointer,
@@ -315,9 +317,14 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     parameters: Type.Object({ lifecycle: StringEnum(["active", "suspended", "completed", "abandoned", "archived"] as const), reason: Type.String() }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
-        const run = remember(await requireEngine().setLifecycle(params.lifecycle, params.reason));
+        if (params.lifecycle === "completed" || params.lifecycle === "abandoned") await supervisor?.reconcileNow();
+        let run = remember(await requireEngine().setLifecycle(params.lifecycle, params.reason));
         if (run.lifecycle === "active") attachSupervisor(ctx);
-        else { supervisor?.stop(); supervisor = undefined; }
+        else if (run.lifecycle === "completed" || run.lifecycle === "abandoned") {
+          if (supervisor) run = remember(await supervisor.reconcileNow());
+          supervisor?.stop();
+          supervisor = undefined;
+        } else { supervisor?.stop(); supervisor = undefined; }
         updateStatus(ctx, run);
         return { content: [{ type: "text", text: `Workgraph ${run.runId} lifecycle: ${run.lifecycle}.` }], details: { ...summaryDetails(run), lifecycle: run.lifecycle, lifecycleReason: run.lifecycleReason } };
       });
@@ -433,6 +440,30 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           details: { ...summaryDetails(run), synthesis: record },
           ...(record?.usage ? { usage: nestedUsage([record.usage]) } : {}),
         };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_review",
+    label: "Workgraph Review Child Result",
+    description: "Explicitly disposition an untyped or absent child result while retaining the original session and prose. Acceptance requires a matching completed typed report.",
+    promptSnippet: "Review retained untyped Workgraph evidence without silently promoting it",
+    parameters: Type.Object({
+      attemptId: Type.String(),
+      disposition: StringEnum(["accept", "retry", "reject"] as const),
+      summary: Type.String(),
+      evidence: Type.Array(Type.Object({
+        label: Type.String(), observation: Type.String(), class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
+        command: Type.Optional(Type.String()), artifact: Type.Optional(Type.String()),
+      }), { minItems: 1, maxItems: 30 }),
+      report: Type.Optional(Type.Any()),
+    }),
+    async execute(_id, params) {
+      return exclusively(async () => {
+        const input: ChildResultReviewInput = { ...params, report: params.report as ChildResultReviewInput["report"] };
+        const run = remember(await requireEngine().reviewChildResult(input));
+        return { content: [{ type: "text", text: `Recorded ${params.disposition} disposition for child attempt ${params.attemptId}.` }], details: { ...summaryDetails(run), review: run.resultReviews?.at(-1) } };
       });
     },
   });
@@ -859,6 +890,8 @@ function formatStatus(run: WorkgraphRun): string {
     `Predicate: ${run.outcome.completionPredicate}`,
     `Milestones: ${run.milestones.map((milestone) => `${milestone.id}=${milestone.status}`).join(", ") || "none"}`,
     `Discovery lanes: ${run.discoveries.length}, dropouts=${dropouts}`,
+    `Result reviews: ${run.resultReviews?.length ?? 0}`,
+    `Cleanup: ${(run.cleanup ?? []).map((record) => `${record.kind}=${record.state}`).join(", ") || "none"}`,
     `Base: ${run.baseCommit}`,
     `Composed: ${run.composedCommit}`,
     `Product evidence: ${run.productVerification?.state ?? "none"} at ${run.productVerification?.revision ?? "none"}`,
@@ -889,6 +922,8 @@ function summaryDetails(run: WorkgraphRun) {
     control: run.control,
     currentPlan: run.plans.at(-1),
     attempts: run.attempts,
+    resultReviews: run.resultReviews ?? [],
+    cleanup: run.cleanup ?? [],
     statePath: run.statePath,
     outcome: run.outcome,
     milestones: run.milestones,

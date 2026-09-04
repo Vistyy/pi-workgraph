@@ -200,6 +200,20 @@ export interface ChildCapabilityRecord {
 }
 
 export type ChildResultKind = "typed" | "untyped" | "absent";
+export type ResultReviewDisposition = "accept" | "retry" | "reject";
+
+export interface ChildResultReview {
+  id: string;
+  attemptId: string;
+  mode: WorkerMode;
+  disposition: ResultReviewDisposition;
+  originalResultKind: Exclude<ChildResultKind, "typed">;
+  originalTerminalText?: string;
+  summary: string;
+  evidence: EvidenceItem[];
+  report?: WorkerReport;
+  reviewedAt: string;
+}
 
 export interface ChildOutcome {
   exitCode: number;
@@ -432,6 +446,33 @@ export interface WorkerIdentity {
   cwd: string;
 }
 
+export type CleanupState = "pending" | "completed" | "blocked";
+
+interface CleanupRecordBase {
+  id: string;
+  attemptId: string;
+  state: CleanupState;
+  requestedAt: string;
+  inspectedAt?: string;
+  completedAt?: string;
+  detail?: string;
+  error?: string;
+}
+
+export interface GitWorktreeCleanupRecord extends CleanupRecordBase {
+  kind: "git_worktree";
+  path: string;
+  branch: string;
+  expectedHead: string;
+}
+
+export interface HerdrWorkerCleanupRecord extends CleanupRecordBase {
+  kind: "herdr_worker";
+  identity: WorkerIdentity;
+}
+
+export type ResourceCleanupRecord = GitWorktreeCleanupRecord | HerdrWorkerCleanupRecord;
+
 export interface WorkAttempt {
   id: string;
   nodeId: string;
@@ -462,6 +503,8 @@ export interface WorkAttempt {
   sessionFile?: string;
   agentName?: string;
   worker?: WorkerIdentity;
+  resultKind?: ChildResultKind;
+  workerHistory?: WorkerIdentity[];
   attention?: string;
   error?: string;
 }
@@ -503,6 +546,8 @@ export interface WorkgraphRun {
   control: WorkgraphControl;
   plans: PlanRecord[];
   attempts: WorkAttempt[];
+  resultReviews?: ChildResultReview[];
+  cleanup?: ResourceCleanupRecord[];
   milestones: MilestoneRecord[];
   terminalOutcome?: TerminalOutcome;
   agreement?: Agreement;

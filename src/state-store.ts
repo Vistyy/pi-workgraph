@@ -73,6 +73,8 @@ export class RunStateStore {
       },
       plans: [],
       attempts: [],
+      resultReviews: [],
+      cleanup: [],
       milestones: (input.milestones ?? []).map((milestone) => ({
         id: milestone.id,
         description: milestone.description,
@@ -138,10 +140,10 @@ export class RunStateStore {
 
 function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): WorkgraphRun {
   const version = (parsed as { version?: number }).version;
-  if (version !== 3 && version !== 4 && version !== 5 && version !== RUN_STATE_VERSION) {
+  if (version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== RUN_STATE_VERSION) {
     throw new Error(`Unsupported workgraph state version ${String(version)}: ${parsed.runId}`);
   }
-  if (version === RUN_STATE_VERSION) return parsed as WorkgraphRun;
+  if (version === RUN_STATE_VERSION && parsed.resultReviews && parsed.cleanup) return parsed as WorkgraphRun;
   const createdAt = parsed.createdAt ?? new Date(0).toISOString();
   const updatedAt = parsed.updatedAt ?? createdAt;
   const legacy = parsed as Partial<WorkgraphRun> & { parentSessionId?: string; parentSessionFile?: string };
@@ -183,6 +185,8 @@ function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): Workg
       ...attempt,
       mode: attempt.mode ?? "implementation",
     })),
+    resultReviews: parsed.resultReviews ?? [],
+    cleanup: parsed.cleanup ?? [],
   };
 }
 
