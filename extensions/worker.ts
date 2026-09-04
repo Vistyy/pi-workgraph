@@ -1,13 +1,7 @@
-import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type {
-  AssuranceResponsibility,
-  EnvelopeImpact,
-  ImplementationReport,
-  WorkerMode,
-  WorkerReport,
-} from "../src/types.js";
+import { reportSchemaForMode } from "../src/report-schema.js";
+import type { AssuranceResponsibility, EnvelopeImpact, ImplementationReport, WorkerMode, WorkerReport } from "../src/types.js";
 
 const configuredMode = readMode();
 const mode = configuredMode ?? "discovery";
@@ -19,107 +13,7 @@ const executorThinking = process.env.PI_WORKGRAPH_EXECUTOR_THINKING || "high";
 const baseCommit = process.env.PI_WORKGRAPH_BASE_COMMIT || "";
 const startInExecutor = process.env.PI_WORKGRAPH_IMPLEMENTATION_START === "executor";
 
-const StatusSchema = StringEnum(["completed", "escalated", "failed"] as const);
-const EnvelopeImpactSchema = StringEnum([
-  "none",
-  "outcome",
-  "non_goal",
-  "owner",
-  "public_interface",
-  "dependency",
-  "security",
-  "scale",
-  "reuse",
-] as const);
-
-const EvidenceSchema = Type.Object({
-  label: Type.String(),
-  observation: Type.String(),
-  class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
-  command: Type.Optional(Type.String()),
-  artifact: Type.Optional(Type.String()),
-});
-
-const FindingSchema = Type.Object({
-  severity: StringEnum(["info", "warning", "error", "blocker"] as const),
-  title: Type.String(),
-  detail: Type.String(),
-  envelopeImpact: EnvelopeImpactSchema,
-});
-
-const AssuranceFindingSchema = Type.Object({
-  id: Type.String(),
-  category: Type.String(),
-  violatedInvariant: Type.String(),
-  evidence: Type.Array(Type.String(), { minItems: 1, maxItems: 10 }),
-  reachableScenario: Type.String(),
-  consequence: Type.String(),
-  simplestResponse: Type.String(),
-  complexityEffect: StringEnum(["reduces", "neutral", "adds"] as const),
-  confidence: StringEnum(["low", "medium", "high"] as const),
-  envelopeImpact: EnvelopeImpactSchema,
-  ownerNodeId: Type.Optional(Type.String()),
-});
-
-const DiscoveryReportSchema = Type.Object({
-  kind: Type.Literal("discovery"),
-  status: StatusSchema,
-  summary: Type.String(),
-  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
-  findings: Type.Array(FindingSchema, { maxItems: 20 }),
-});
-
-const ImplementationReportSchema = Type.Object({
-  kind: Type.Literal("implementation"),
-  status: StatusSchema,
-  summary: Type.String(),
-  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
-  findings: Type.Array(FindingSchema, { maxItems: 20 }),
-  commit: Type.Optional(Type.String()),
-  changedFiles: Type.Optional(Type.Array(Type.String())),
-});
-
-const VerificationReportSchema = Type.Object({
-  kind: Type.Literal("verification"),
-  status: StatusSchema,
-  summary: Type.String(),
-  evidence: Type.Array(EvidenceSchema, { maxItems: 30 }),
-  verdict: StringEnum(["verified", "failed", "inconclusive"] as const),
-  findings: Type.Array(FindingSchema, { maxItems: 20 }),
-});
-
-const AssuranceReviewReportSchema = Type.Object({
-  kind: Type.Literal("assurance_review"),
-  status: StatusSchema,
-  summary: Type.String(),
-  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
-  responsibility: StringEnum(["behavior", "structure", "evidence"] as const),
-  recommendation: StringEnum(["approve", "changes_required", "inconclusive"] as const),
-  findings: Type.Array(AssuranceFindingSchema, { maxItems: 20 }),
-});
-
-const AssuranceSynthesisReportSchema = Type.Object({
-  kind: Type.Literal("assurance_synthesis"),
-  status: StatusSchema,
-  summary: Type.String(),
-  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
-  verdict: StringEnum(["approve", "revision_required", "needs_decision", "inconclusive"] as const),
-  dispositions: Type.Array(Type.Object({
-    finding: AssuranceFindingSchema,
-    disposition: StringEnum(["accept", "optional", "dismiss"] as const),
-    reason: Type.String(),
-  }), { maxItems: 40 }),
-});
-
-const ReportSchema = mode === "discovery"
-  ? DiscoveryReportSchema
-  : mode === "implementation"
-    ? ImplementationReportSchema
-    : mode === "verification"
-      ? VerificationReportSchema
-      : mode === "assurance_review"
-        ? AssuranceReviewReportSchema
-        : AssuranceSynthesisReportSchema;
+const ReportSchema = reportSchemaForMode(mode);
 
 const TodoSchema = Type.Object({
   items: Type.Array(Type.String({ minLength: 3 }), { minItems: 1, maxItems: 8 }),

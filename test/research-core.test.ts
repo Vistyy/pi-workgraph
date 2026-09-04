@@ -152,7 +152,7 @@ test("malformed persisted worker reports are classified as invalid evidence", as
     const session = SessionManager.create(root, join(root, "session"));
     session.appendMessage({ role: "user", content: "Invalid report.", timestamp: Date.now() });
     session.appendMessage({ role: "assistant", content: [{ type: "text", text: "Reporting." }], api: "test", provider: "test", model: "test", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "toolUse", timestamp: Date.now() });
-    session.appendMessage({ role: "toolResult", toolCallId: "report", toolName: "workgraph_report", content: [{ type: "text", text: "invalid" }], details: { report: { kind: "discovery", status: "completed" } }, isError: false, timestamp: Date.now() });
+    session.appendMessage({ role: "toolResult", toolCallId: "report", toolName: "workgraph_report", content: [{ type: "text", text: "invalid" }], details: { report: { kind: "discovery", status: "completed", summary: "Malformed nested evidence.", evidence: [null], findings: [] } }, isError: false, timestamp: Date.now() });
     const result = readWorkgraphReportResult(session.getSessionFile()!);
     assert.equal(result.report, undefined);
     assert.equal(result.invalid, true, JSON.stringify(result));

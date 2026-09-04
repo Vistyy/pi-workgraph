@@ -2,11 +2,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { validateSynthesis, WorkgraphEngine, type ScheduleInput } from "./engine.js";
 import type { WorktreePlacement } from "./git.js";
-import { herdrAgentName, type HerdrObservation, type VisibleWorkerRuntime } from "./herdr.js";
-import { forkSession, hasNativeAgentSettled, readTerminalText, readWorkgraphReportResult } from "./pi-process.js";
+import { herdrAgentName, WorkerLaunchReadinessError, type HerdrObservation, type VisibleWorkerRuntime } from "./herdr.js";
+import { forkSession, hasNativeAgentSettled, hasNativeAgentStarted, readTerminalText, readWorkgraphReportResult } from "./pi-process.js";
 import { allNodesComposed, claimsOverlap, readyWave, transitionNode } from "./scheduler.js";
 import { UnsupportedWorkgraphStateVersionError } from "./state-store.js";
-import type { AssuranceReviewReport, AssuranceSynthesisReport, CleanupState, CoordinatorBoundaryKind, CoordinatorWakeRecord, DiscoveryReport, ImplementationReport, VerificationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun, WorkerMode, ResourceCleanupRecord } from "./types.js";
+import type { AssuranceReviewReport, AssuranceSynthesisReport, CleanupState, CoordinatorBoundaryKind, CoordinatorWakeRecord, DiscoveryReport, ImplementationReport, VerificationReport, WorkAttempt, WorkerIdentity, WorkerResourceIdentity, WorkNode, WorkgraphRun, WorkerMode, ResourceCleanupRecord } from "./types.js";
 
 export interface SupervisorWake {
   kick(): void;
@@ -142,6 +142,7 @@ export class WorkgraphSupervisor {
               agentName: attempt.agentName,
               sessionFile: attempt.sessionFile,
               cwd: attempt.worktreePath,
+              ...(attempt.resource ? { resource: attempt.resource } : {}),
             });
           } catch (error) {
             await this.recordObservationFailure(attempt.id, error);
@@ -250,6 +251,7 @@ export class WorkgraphSupervisor {
         retained.branch = placement.branch;
         retained.baseCommit = placement.baseCommit;
         retained.sessionFile = sessionFile;
+        retained.submission = { id: retained.id, prompt: workerLaunchPrompt(), state: "pending" };
         retained.lastActivityAt = new Date().toISOString();
         if (retained.mode === "discovery") {
           const record = draft.discoveries.find((candidate) => candidate.attemptId === retained.id);
@@ -275,7 +277,9 @@ export class WorkgraphSupervisor {
         ...(current.model ? { model: current.model } : {}),
         ...(current.thinking ? { thinking: current.thinking } : {}),
         env: observerEnvironment(run, current, placement),
+        onResource: async (resource) => this.recordResource(current.id, resource),
         onIdentity: async (identity) => this.recordIdentity(current.id, identity),
+        onSubmitted: async () => this.recordSubmission(current.id, "submitted"),
       });
       await this.recordObservation(current.id, observation);
     } catch (error) {
@@ -342,6 +346,7 @@ export class WorkgraphSupervisor {
         current.branch = placement.branch;
         current.baseCommit = placement.baseCommit;
         current.sessionFile = sessionFile;
+        current.submission = { id: current.id, prompt: workerLaunchPrompt(), state: "pending" };
         current.stage = "starting";
         current.lastActivityAt = new Date().toISOString();
         const currentNode = requiredNode(draft, node.id);
@@ -362,7 +367,9 @@ export class WorkgraphSupervisor {
         ...(node.guideModel ? { model: node.guideModel } : {}),
         ...(node.guideThinking ? { thinking: node.guideThinking } : {}),
         env: workerEnvironment(run, node, placement),
+        onResource: async (resource) => this.recordResource(attempt.id, resource),
         onIdentity: async (identity) => this.recordIdentity(attempt.id, identity),
+        onSubmitted: async () => this.recordSubmission(attempt.id, "submitted"),
       });
       await this.recordObservation(attempt.id, observation);
     } catch (error) {
@@ -756,13 +763,48 @@ export class WorkgraphSupervisor {
     });
   }
 
+  private async recordResource(attemptId: string, resource: WorkerResourceIdentity): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      if (current.worker) assertSameWorker(current.worker, { ...resource, sessionFile: current.worker.sessionFile });
+      current.resource = { ...resource };
+      current.agentName = resource.agentName;
+      current.stage = "starting";
+      current.lastActivityAt = new Date().toISOString();
+      current.attention = "Herdr resource created; waiting for matching native Pi session identity before submitting the assignment.";
+    });
+  }
+
+  private async recordSubmission(attemptId: string, state: "submitted" | "uncertain", detail?: string): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      if (!current.submission) return;
+      current.submission.state = state;
+      if (state === "submitted") current.submission.submittedAt = new Date().toISOString();
+      if (detail) current.submission.detail = detail;
+      current.lastActivityAt = new Date().toISOString();
+    });
+  }
+
   private async recordIdentity(attemptId: string, identity: WorkerIdentity): Promise<void> {
     await this.engine.store.update((draft) => {
       const current = requiredAttempt(draft, attemptId);
       if (current.worker) assertSameWorker(current.worker, identity);
       current.worker = { ...identity };
+      current.resource = {
+        workspaceId: identity.workspaceId,
+        tabId: identity.tabId,
+        paneId: identity.paneId,
+        terminalId: identity.terminalId,
+        agentName: identity.agentName,
+        cwd: identity.cwd,
+      };
       current.agentName = identity.agentName;
       current.sessionFile = identity.sessionFile;
+      if (current.submission) {
+        current.submission.state = "native_ready";
+        current.submission.nativeReadyAt = new Date().toISOString();
+      }
       current.state = "running";
       current.stage = "executing";
       current.startedAt ??= new Date().toISOString();
@@ -781,6 +823,10 @@ export class WorkgraphSupervisor {
       current.lastActivityAt = observation.observedAt;
       current.heartbeatAt = observation.observedAt;
       current.observedStatus = observation.status;
+      if (current.submission?.state === "submitted" && hasNativeAgentStarted(observation.identity.sessionFile, draft.runId, current.nodeId)) {
+        current.submission.state = "agent_started";
+        current.submission.agentStartedAt = observation.observedAt;
+      }
       if (observation.status === "blocked") {
         current.attention = "Herdr reports that the worker is blocked.";
         draft.control.attentionStatus = "blocked";
@@ -857,6 +903,16 @@ export class WorkgraphSupervisor {
       const current = requiredAttempt(draft, attemptId);
       current.lastActivityAt = new Date().toISOString();
       current.error = message;
+      current.attention = message;
+      if (current.submission && current.submission.state !== "agent_started") {
+        current.submission.state = "uncertain";
+        current.submission.detail = message;
+      }
+      const resource = error instanceof WorkerLaunchReadinessError ? error.resource : undefined;
+      if (resource) {
+        current.resource = { ...resource };
+        current.agentName = resource.agentName;
+      }
       current.stage = "attention";
       if (!current.worker && !uncertainLiveLaunch) {
         current.state = "failed";
@@ -913,6 +969,15 @@ export class WorkgraphSupervisor {
     await this.engine.store.update((draft) => {
       const current = draft.attempts.find((candidate) => candidate.id === attemptId);
       if (!current || current.state === "completed" || current.state === "cancelled") return;
+      if (current.submission && current.submission.state !== "agent_started") {
+        current.submission.state = "uncertain";
+        current.submission.detail = message;
+      }
+      const resource = error instanceof WorkerLaunchReadinessError ? error.resource : undefined;
+      if (resource) {
+        current.resource = { ...resource };
+        current.agentName = resource.agentName;
+      }
       current.stage = "attention";
       current.attention = `Worker observation failed: ${message}`;
       current.lastActivityAt = new Date().toISOString();
@@ -1096,6 +1161,7 @@ function markObserverFailure(run: WorkgraphRun, attempt: WorkAttempt, message: s
 
 function observerEnvironment(run: WorkgraphRun, attempt: WorkAttempt, placement: WorktreePlacement): Record<string, string> {
   return {
+    ...inheritedPiEnvironment(),
     PI_WORKGRAPH_MODE: attempt.mode ?? "discovery",
     PI_WORKGRAPH_RUN_ID: run.runId,
     PI_WORKGRAPH_NODE_ID: attempt.nodeId,
@@ -1150,6 +1216,7 @@ function assertSameWorker(expected: WorkerIdentity | undefined, actual: WorkerId
 
 function workerEnvironment(run: WorkgraphRun, node: WorkNode, placement: WorktreePlacement): Record<string, string> {
   return {
+    ...inheritedPiEnvironment(),
     PI_WORKGRAPH_MODE: "implementation",
     PI_WORKGRAPH_RUN_ID: run.runId,
     PI_WORKGRAPH_NODE_ID: node.id,
@@ -1158,6 +1225,15 @@ function workerEnvironment(run: WorkgraphRun, node: WorkNode, placement: Worktre
     PI_WORKGRAPH_EXECUTOR_MODEL: node.executorModel,
     PI_WORKGRAPH_EXECUTOR_THINKING: node.executorThinking,
   };
+}
+
+function workerLaunchPrompt(): string {
+  return "Continue the assigned Workgraph objective now.";
+}
+
+function inheritedPiEnvironment(): Record<string, string> {
+  const agentDir = process.env.PI_CODING_AGENT_DIR;
+  return agentDir ? { PI_CODING_AGENT_DIR: agentDir } : {};
 }
 
 function implementationObjective(run: WorkgraphRun, node: WorkNode): string {

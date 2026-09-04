@@ -8,7 +8,7 @@ export const CODEX_PACKAGE = "pi-openai-remote-compaction" as const;
 export interface ChildCapability { id: "web_access" | "codex_remote_compaction"; packageSource: string; resourceIdentity: string; resourcePath?: string; version?: string; tools: string[]; available: boolean; diagnostic?: string; }
 type PackageJson = { name?: string; version?: string; pi?: { extensions?: string[] } };
 
-export async function resolveChildCapabilities(mode: string, model: string, root = process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent")): Promise<ChildCapability[]> {
+export async function resolveChildCapabilities(mode: string, model: string, root = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent")): Promise<ChildCapability[]> {
   const result: ChildCapability[] = [];
   if (mode === "discovery") result.push(await resolvePackage("web_access", "pi-web-access", WEB_PACKAGE, [...WEB_TOOLS], root));
   if (model.startsWith("openai-codex/")) result.push(await resolvePackage("codex_remote_compaction", "pi-openai-remote-compaction", CODEX_PACKAGE, [], root));

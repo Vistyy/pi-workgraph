@@ -603,8 +603,91 @@ test("the Herdr adapter launches without waiting and validates exact identity be
     const prompt = calls.find((args) => args[0] === "agent" && args[1] === "prompt")!;
     assert.equal(prompt.includes("--wait"), false);
     assert.deepEqual(calls.find((args) => args[0] === "agent" && args[1] === "send-keys")?.slice(-1), ["esc"]);
-    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "get").length, 3);
+    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "get").length, 4);
     assert.equal(calls.some((args) => args[0] === "tab" && args[1] === "close"), false);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("the Herdr launch waits for native session identity before submitting work", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-readiness-"));
+  const log = join(parent, "commands.jsonl");
+  const command = join(parent, "fake-herdr-readiness.mjs");
+  const cwd = join(parent, "worktree");
+  const sessionFile = join(parent, "worker.jsonl");
+  const agentName = herdrAgentName("run", "node", "attempt");
+  const resource = {
+    workspace_id: "workspace-1",
+    tab_id: "workspace-1:tab-1",
+    pane_id: "workspace-1:pane-1",
+    terminal_id: "terminal-1",
+    agent_status: "idle",
+    name: agentName,
+    cwd,
+  };
+  const native = { ...resource, agent_session: { value: sessionFile } };
+  await writeFile(command, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+if (args[0] === "tab") console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-1"}}}));
+else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:${JSON.stringify(resource)}}}));
+else if (args[0] === "agent" && args[1] === "get") console.log(JSON.stringify({result:{agent:${JSON.stringify(native)}}}));
+else console.log(JSON.stringify({result:{accepted:true}}));
+`);
+  await chmod(command, 0o755);
+  try {
+    const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "workspace-1" });
+    let retainedResource;
+    let retainedIdentity;
+    const observation = await runtime.launch({
+      workspaceId: "workspace-1",
+      runId: "run",
+      nodeId: "node",
+      attemptId: "attempt",
+      cwd,
+      sessionFile,
+      prompt: "Submit only after readiness.",
+      env: {},
+      onResource(resourceValue) { retainedResource = resourceValue; },
+      onIdentity(identity) { retainedIdentity = identity; },
+    });
+    assert.deepEqual(retainedResource, { workspaceId: "workspace-1", tabId: "workspace-1:tab-1", paneId: "workspace-1:pane-1", terminalId: "terminal-1", agentName, cwd });
+    assert.deepEqual(retainedIdentity, observation.identity);
+    const calls = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    const promptIndex = calls.findIndex((args) => args[0] === "agent" && args[1] === "prompt");
+    const getIndex = calls.findIndex((args) => args[0] === "agent" && args[1] === "get");
+    assert.ok(getIndex >= 0 && getIndex < promptIndex);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("the Herdr launch retains a blocked resource without submitting an assignment", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-blocked-"));
+  const log = join(parent, "commands.jsonl");
+  const command = join(parent, "fake-herdr-blocked.mjs");
+  const cwd = join(parent, "worktree");
+  const sessionFile = join(parent, "worker.jsonl");
+  const agentName = herdrAgentName("run", "node", "attempt");
+  const agent = { workspace_id: "workspace-1", tab_id: "workspace-1:tab-1", pane_id: "workspace-1:pane-1", terminal_id: "terminal-1", agent_status: "blocked", name: agentName, cwd };
+  await writeFile(command, `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+if (args[0] === "tab") console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-1"}}}));
+else if (args[0] === "agent" && (args[1] === "start" || args[1] === "get")) console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));
+else console.log(JSON.stringify({result:{accepted:true}}));
+`);
+  await chmod(command, 0o755);
+  try {
+    const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "workspace-1" });
+    let retainedResource;
+    await assert.rejects(() => runtime.launch({ workspaceId: "workspace-1", runId: "run", nodeId: "node", attemptId: "attempt", cwd, sessionFile, prompt: "Do not submit.", env: {}, onResource(resource) { retainedResource = resource; } }), /operator action is required/);
+    assert.deepEqual(retainedResource, { workspaceId: "workspace-1", tabId: "workspace-1:tab-1", paneId: "workspace-1:pane-1", terminalId: "terminal-1", agentName, cwd });
+    const calls = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as string[]);
+    assert.equal(calls.some((args) => args[0] === "agent" && args[1] === "prompt"), false);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

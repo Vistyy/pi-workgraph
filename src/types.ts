@@ -451,6 +451,27 @@ export interface WorkerIdentity extends CoordinatorRuntimeIdentity {
   agentName: string;
 }
 
+export interface WorkerResourceIdentity {
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+  terminalId: string;
+  agentName: string;
+  cwd: string;
+}
+
+export type WorkerSubmissionState = "pending" | "native_ready" | "uncertain" | "submitted" | "agent_started";
+
+export interface WorkerSubmissionRecord {
+  id: string;
+  prompt: string;
+  state: WorkerSubmissionState;
+  nativeReadyAt?: string;
+  submittedAt?: string;
+  agentStartedAt?: string;
+  detail?: string;
+}
+
 export type CoordinatorBoundaryKind = "result" | "agreement" | "settle" | "verification" | "assurance" | "judgment" | "attention";
 
 export interface CoordinatorWakeRecord {
@@ -529,6 +550,8 @@ export interface WorkAttempt {
   sessionFile?: string;
   agentName?: string;
   worker?: WorkerIdentity;
+  resource?: WorkerResourceIdentity;
+  submission?: WorkerSubmissionRecord;
   resultKind?: ChildResultKind;
   workerHistory?: WorkerIdentity[];
   attention?: string;

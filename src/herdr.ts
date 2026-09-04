@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import type { CoordinatorRuntimeIdentity, ThinkingLevel, WorkerIdentity, WorkerObservationStatus, WorkerStage } from "./types.js";
-import { hasNativeAgentSettled } from "./pi-process.js";
+import type { CoordinatorRuntimeIdentity, ThinkingLevel, WorkerIdentity, WorkerObservationStatus, WorkerResourceIdentity, WorkerStage } from "./types.js";
 
 export type HerdrAgentStatus = WorkerObservationStatus;
 
@@ -24,7 +23,9 @@ export interface WorkerLaunchRequest {
   model?: string;
   thinking?: ThinkingLevel;
   env: Record<string, string>;
+  onResource?: (resource: WorkerResourceIdentity) => void | Promise<void>;
   onIdentity?: (identity: WorkerIdentity) => void | Promise<void>;
+  onSubmitted?: () => void | Promise<void>;
 }
 
 export interface WorkerRecoveryRequest {
@@ -32,6 +33,14 @@ export interface WorkerRecoveryRequest {
   agentName: string;
   sessionFile: string;
   cwd: string;
+  resource?: WorkerResourceIdentity;
+}
+
+export class WorkerLaunchReadinessError extends Error {
+  constructor(readonly resource: WorkerResourceIdentity, message: string) {
+    super(message);
+    this.name = "WorkerLaunchReadinessError";
+  }
 }
 
 export interface CoordinatorLaunchRequest {
@@ -131,18 +140,13 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     if (request.model) args.push("--model", request.model);
     if (request.thinking) args.push("--thinking", request.thinking);
     const started = parseAgent(object(object(await this.call(args, 45_000), "result"), "agent"));
-    const identity: WorkerIdentity = {
-      workspaceId: started.workspaceId,
-      tabId: started.tabId,
-      paneId: started.paneId,
-      terminalId: started.terminalId,
-      agentName: workerName,
-      sessionFile: request.sessionFile,
-      cwd: request.cwd,
-    };
-    assertIdentity(identity, started);
+    const resource = resourceOf(started);
+    assertResource({ ...resource, agentName: workerName }, started);
+    await request.onResource?.(resource);
+    const identity = await this.awaitNativeIdentity(resource, request.sessionFile);
     await request.onIdentity?.(identity);
     await this.call(["agent", "prompt", workerName, request.prompt], 15_000);
+    await request.onSubmitted?.();
     return { identity, status: "working", stage: "executing", observedAt: new Date().toISOString() };
   }
 
@@ -156,28 +160,52 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       const value = candidate as Record<string, unknown>;
       const session = value.agent_session;
       const sessionFile = session && typeof session === "object" ? optionalString(session as Record<string, unknown>, "value") : undefined;
-      return value.workspace_id === request.workspaceId && value.name === request.agentName && value.cwd === request.cwd && sessionFile === request.sessionFile;
+      const resource = request.resource;
+      const resourceMatches = resource
+        ? value.workspace_id === resource.workspaceId
+          && value.tab_id === resource.tabId
+          && value.pane_id === resource.paneId
+          && value.terminal_id === resource.terminalId
+          && value.name === resource.agentName
+          && value.cwd === resource.cwd
+        : value.workspace_id === request.workspaceId && value.name === request.agentName && value.cwd === request.cwd;
+      return resourceMatches && (resource ? !sessionFile || sessionFile === request.sessionFile : sessionFile === request.sessionFile);
     });
     if (matches.length === 0) return undefined;
     if (matches.length !== 1) throw new Error(`Herdr recovery found ${matches.length} workers for ${request.agentName}.`);
     const current = parseAgent(matches[0]!);
-    const identity: WorkerIdentity = {
-      workspaceId: current.workspaceId,
-      tabId: current.tabId,
-      paneId: current.paneId,
-      terminalId: current.terminalId,
-      agentName: request.agentName,
-      sessionFile: request.sessionFile,
-      cwd: request.cwd,
-    };
+    const resource = request.resource ?? resourceOf(current);
+    assertResource(resource, current);
+    if (!current.sessionFile) throw new WorkerLaunchReadinessError(resource, "Recovered Herdr resource still has no native Pi session identity; operator action is required before assignment submission.");
+    const identity = identityOf(resource, current);
     assertIdentity(identity, current);
     return {
       identity,
       status: current.status,
       stage: current.status === "blocked" ? "attention" : current.status === "working" ? "executing" : "reporting",
       observedAt: new Date().toISOString(),
-      nativeSettled: hasNativeAgentSettled(request.sessionFile),
     };
+  }
+
+  private async awaitNativeIdentity(resource: WorkerResourceIdentity, expectedSessionFile: string, timeoutMs = 15_000): Promise<WorkerIdentity> {
+    const deadline = Date.now() + timeoutMs;
+    let last = "Native Pi session identity is not available yet.";
+    while (Date.now() < deadline) {
+      const response = await this.call(["agent", "get", resource.paneId]);
+      const current = parseAgent(object(object(response, "result"), "agent"));
+      assertResource(resource, current);
+      if (current.sessionFile) {
+        const identity = identityOf(resource, current);
+        assertIdentity({ ...identity, sessionFile: expectedSessionFile }, current);
+        return identity;
+      }
+      if (current.status === "blocked") {
+        throw new WorkerLaunchReadinessError(resource, "Worker is blocked at a Pi trust or approval prompt; operator action is required before assignment submission.");
+      }
+      last = `Worker is ${current.status}, but Herdr has not exposed its native Pi session identity.`;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    throw new WorkerLaunchReadinessError(resource, `${last} Launch readiness timed out after ${timeoutMs}ms. No assignment prompt was submitted.`);
   }
 
   async observe(identity: WorkerIdentity): Promise<HerdrObservation> {
@@ -189,7 +217,6 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       status: current.status,
       stage: current.status === "blocked" ? "attention" : current.status === "working" ? "executing" : "reporting",
       observedAt: new Date().toISOString(),
-      nativeSettled: hasNativeAgentSettled(identity.sessionFile),
     };
   }
 
@@ -261,7 +288,7 @@ interface ParsedAgent {
   terminalId: string;
   name: string;
   status: HerdrAgentStatus;
-  sessionFile: string;
+  sessionFile?: string;
   cwd: string;
 }
 
@@ -282,8 +309,11 @@ function parseCoordinator(value: Record<string, unknown>): CoordinatorRuntimeIde
 function parseAgent(value: Record<string, unknown>): ParsedAgent {
   const status = string(value, "agent_status");
   if (!isAgentStatus(status)) throw new Error(`Invalid Herdr agent status: ${status}`);
-  const session = object(value, "agent_session");
-  const result: ParsedAgent = {
+  const session = value.agent_session;
+  const sessionFile = session && typeof session === "object" && !Array.isArray(session)
+    ? optionalString(session as Record<string, unknown>, "value")
+    : undefined;
+  return {
     workspaceId: string(value, "workspace_id"),
     tabId: string(value, "tab_id"),
     paneId: string(value, "pane_id"),
@@ -291,12 +321,22 @@ function parseAgent(value: Record<string, unknown>): ParsedAgent {
     name: string(value, "name"),
     status,
     cwd: string(value, "cwd"),
-    sessionFile: string(session, "value"),
+    ...(sessionFile ? { sessionFile } : {}),
   };
-  return result;
 }
 
-function assertIdentity(expected: WorkerIdentity, actual: ParsedAgent, allowDeletedWorktree = false): void {
+function resourceOf(actual: ParsedAgent): WorkerResourceIdentity {
+  return {
+    workspaceId: actual.workspaceId,
+    tabId: actual.tabId,
+    paneId: actual.paneId,
+    terminalId: actual.terminalId,
+    agentName: actual.name,
+    cwd: actual.cwd,
+  };
+}
+
+function assertResource(expected: WorkerResourceIdentity, actual: ParsedAgent, allowDeletedWorktree = false): void {
   if (
     expected.workspaceId !== actual.workspaceId
     || expected.tabId !== actual.tabId
@@ -304,13 +344,22 @@ function assertIdentity(expected: WorkerIdentity, actual: ParsedAgent, allowDele
     || expected.terminalId !== actual.terminalId
     || expected.agentName !== actual.name
   ) {
-    throw new Error("Herdr worker identity changed.");
+    throw new Error("Herdr worker resource identity changed.");
   }
-  if (actual.sessionFile !== expected.sessionFile) throw new Error("Herdr native Pi session changed.");
   const attributableDeletedCwd = allowDeletedWorktree && actual.cwd === `${expected.cwd} (deleted)`;
   if (actual.cwd !== expected.cwd && !attributableDeletedCwd) throw new Error("Herdr worker cwd changed.");
 }
 
+function assertIdentity(expected: WorkerIdentity, actual: ParsedAgent, allowDeletedWorktree = false): void {
+  assertResource(expected, actual, allowDeletedWorktree);
+  if (!actual.sessionFile) throw new Error("Herdr response omitted agent_session; native Pi session identity is not available.");
+  if (actual.sessionFile !== expected.sessionFile) throw new Error("Herdr native Pi session changed.");
+}
+
+function identityOf(expected: WorkerResourceIdentity, actual: ParsedAgent): WorkerIdentity {
+  if (!actual.sessionFile) throw new Error("Herdr response omitted agent_session; native Pi session identity is not available.");
+  return { ...expected, sessionFile: actual.sessionFile };
+}
 function envArgs(env: Record<string, string>): string[] {
   return Object.entries(env)
     .sort(([left], [right]) => left.localeCompare(right))

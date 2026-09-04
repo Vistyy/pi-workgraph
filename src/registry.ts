@@ -218,7 +218,7 @@ function toRegistryRun(row: Record<string, unknown>): RegistryRun {
   };
 }
 
-export function defaultRegistryPath(agentDir = process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent")): string {
+export function defaultRegistryPath(agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent")): string {
   return join(agentDir, "workgraph", "registry.sqlite");
 }
 

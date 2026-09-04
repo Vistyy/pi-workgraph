@@ -173,12 +173,12 @@ Keep changes minimal and use the Workgraph terminal report tools in child assign
   workspaceId = String(created.result.workspace.workspace_id ?? created.result.workspace.id);
   if (!workspaceId || priorIds.has(workspaceId) || workspaceId === process.env.HERDR_WORKSPACE_ID) throw new Error("Herdr did not create a distinct disposable coordinator-smoke workspace.");
 
-  const sourceAgentDir = process.env.PI_AGENT_DIR || join(homedir(), ".pi", "agent");
+  const sourceAgentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
   await linkIfPresent(join(sourceAgentDir, "auth.json"), join(agentDir, "auth.json"));
   await linkIfPresent(join(sourceAgentDir, "models.json"), join(agentDir, "models.json"));
   const childEnv: NodeJS.ProcessEnv = {
     ...process.env,
-    PI_AGENT_DIR: agentDir,
+    PI_CODING_AGENT_DIR: agentDir,
     HERDR_ENV: "1",
     HERDR_WORKSPACE_ID: workspaceId,
     PI_WORKGRAPH_GUIDE_MODEL: guideModel,

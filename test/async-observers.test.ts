@@ -85,6 +85,9 @@ test("discovery, verification, and assurance are durable visible-attempt queues"
 
 test("the visible supervisor settles a discovery report from an isolated exact-revision worktree", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-visible-discovery-"));
+  const agentDir = join(parent, "agent-config");
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
   const root = join(parent, "repo");
   await runProcess("mkdir", ["-p", root], { cwd: parent, timeoutMs: 5_000 });
   await git(root, "init", "-b", "main");
@@ -100,6 +103,7 @@ test("the visible supervisor settles a discovery report from an isolated exact-r
   class Runtime implements VisibleWorkerRuntime {
     readonly available = true;
     async launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
+      assert.equal(request.env.PI_CODING_AGENT_DIR, agentDir);
       const identity: WorkerIdentity = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1", terminalId: "term1", agentName: herdrAgentName(request.runId, request.nodeId, request.attemptId), sessionFile: request.sessionFile, cwd: request.cwd };
       const session = SessionManager.open(request.sessionFile);
       session.appendMessage({ role: "toolResult", toolCallId: "report", toolName: "workgraph_report", content: [{ type: "text", text: "done" }], details: { report: discoveryReport("Observed exact revision.") }, isError: false, timestamp: Date.now() });
@@ -124,6 +128,8 @@ test("the visible supervisor settles a discovery report from an isolated exact-r
     assert.equal(await repository.status(), "");
   } finally {
     begun.engine.registry.close();
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
     await rm(parent, { recursive: true, force: true });
   }
 });

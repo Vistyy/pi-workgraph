@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { isWorkerReport } from "./report-schema.js";
 import type { ChildCapability } from "./capabilities.js";
 import type {
   ChildOutcome,
@@ -301,14 +302,22 @@ export function readWorkgraphReport(sessionFile: string): WorkerReport | undefin
   return readWorkgraphReportResult(sessionFile).report;
 }
 
-export function hasNativeAgentSettled(sessionFile: string): boolean {
+export function hasNativeAgentStarted(sessionFile: string, runId?: string, nodeId?: string): boolean {
+  return hasNativeMarker(sessionFile, "pi-workgraph-agent-running", runId, nodeId);
+}
+
+export function hasNativeAgentSettled(sessionFile: string, runId?: string, nodeId?: string): boolean {
+  return hasNativeMarker(sessionFile, "pi-workgraph-agent-settled", runId, nodeId);
+}
+
+function hasNativeMarker(sessionFile: string, customType: string, runId?: string, nodeId?: string): boolean {
   try {
     const entries = SessionManager.open(sessionFile).getEntries();
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
       if (entry?.type !== "custom") continue;
-      if (entry.customType === "pi-workgraph-agent-settled") return true;
-      if (entry.customType === "pi-workgraph-agent-running") return false;
+      if (entry.customType === customType && markerMatches(entry.data, runId, nodeId)) return true;
+      if (entry.customType === "pi-workgraph-agent-running" && customType === "pi-workgraph-agent-settled") return false;
     }
   } catch {
     return false;
@@ -316,72 +325,11 @@ export function hasNativeAgentSettled(sessionFile: string): boolean {
   return false;
 }
 
-function hasReportBase(value: unknown): boolean {
-  if (!isRecord(value) || typeof value.kind !== "string" || typeof value.status !== "string" || typeof value.summary !== "string") return false;
-  if (!(["discovery", "implementation", "verification", "assurance_review", "assurance_synthesis"] as string[]).includes(value.kind)) return false;
-  if (!(["completed", "escalated", "failed"] as string[]).includes(value.status)) return false;
-  if (!Array.isArray(value.evidence)) return false;
-  if (value.kind === "verification" && !(["verified", "failed", "inconclusive"] as string[]).includes(String(value.verdict))) return false;
-  if (value.kind === "assurance_review" && typeof value.responsibility !== "string") return false;
-  if (value.kind === "assurance_synthesis" && typeof value.verdict !== "string") return false;
-  return true;
+function markerMatches(value: unknown, runId?: string, nodeId?: string): boolean {
+  if (runId === undefined && nodeId === undefined) return true;
+  if (!isRecord(value)) return false;
+  return value.runId === runId && value.nodeId === nodeId;
 }
-
-function isWorkerReport(value: unknown): value is WorkerReport {
-  if (!hasReportBase(value) || !isRecord(value) || !isReportKind(value.kind) || !isReportStatus(value.status)) return false;
-  if (!isEvidenceList(value.evidence)) return false;
-  if (value.kind === "discovery") return isFindingList(value["findings"]);
-  if (value.kind === "implementation") return isFindingList(value["findings"]) && isOptionalString(value.commit) && isStringListOrUndefined(value.changedFiles);
-  if (value.kind === "verification") return isFindingList(value["findings"]) && isVerificationVerdict(value.verdict);
-  if (value.kind === "assurance_review") return isAssuranceResponsibility(value.responsibility) && isAssuranceRecommendation(value.recommendation) && isAssuranceFindingList(value["findings"]);
-  return isAssuranceVerdict(value.verdict) && isDispositionList(value.dispositions);
-}
-
-function isEvidenceList(value: unknown): value is WorkerReport["evidence"] {
-  return Array.isArray(value) && value.length <= 30 && value.every((item) => {
-    if (!isRecord(item) || !nonEmptyString(item.label) || !nonEmptyString(item.observation)) return false;
-    return isOptionalEnum(item.class, ["direct", "inference", "conflict", "unknown"])
-      && isOptionalString(item.command) && isOptionalString(item.artifact);
-  });
-}
-
-function isFindingList(value: unknown): boolean {
-  return Array.isArray(value) && value.length <= 20 && value.every((item) => isRecord(item)
-    && isEnum(item.severity, ["info", "warning", "error", "blocker"])
-    && nonEmptyString(item.title) && nonEmptyString(item.detail)
-    && isEnum(item.envelopeImpact, ["none", "outcome", "non_goal", "owner", "public_interface", "dependency", "security", "scale", "reuse"]));
-}
-
-function isAssuranceFindingList(value: unknown): boolean {
-  return Array.isArray(value) && value.length <= 20 && value.every((item) => isRecord(item)
-    && nonEmptyString(item.id) && nonEmptyString(item.category) && nonEmptyString(item.violatedInvariant)
-    && isStringList(item.evidence, 1, 10) && nonEmptyString(item.reachableScenario)
-    && nonEmptyString(item.consequence) && nonEmptyString(item.simplestResponse)
-    && isEnum(item.complexityEffect, ["reduces", "neutral", "adds"])
-    && isEnum(item.confidence, ["low", "medium", "high"])
-    && isEnum(item.envelopeImpact, ["none", "outcome", "non_goal", "owner", "public_interface", "dependency", "security", "scale", "reuse"])
-    && isOptionalString(item.ownerNodeId));
-}
-
-function isDispositionList(value: unknown): boolean {
-  return Array.isArray(value) && value.length <= 40 && value.every((item) => isRecord(item)
-    && isAssuranceFindingList([item.finding])
-    && isEnum(item.disposition, ["accept", "optional", "dismiss"])
-    && nonEmptyString(item.reason));
-}
-
-function isReportKind(value: unknown): value is WorkerReport["kind"] { return isEnum(value, ["discovery", "implementation", "verification", "assurance_review", "assurance_synthesis"]); }
-function isReportStatus(value: unknown): value is WorkerReport["status"] { return isEnum(value, ["completed", "escalated", "failed"]); }
-function isVerificationVerdict(value: unknown): boolean { return isEnum(value, ["verified", "failed", "inconclusive"]); }
-function isAssuranceResponsibility(value: unknown): boolean { return isEnum(value, ["behavior", "structure", "evidence"]); }
-function isAssuranceRecommendation(value: unknown): boolean { return isEnum(value, ["approve", "changes_required", "inconclusive"]); }
-function isAssuranceVerdict(value: unknown): boolean { return isEnum(value, ["approve", "revision_required", "needs_decision", "inconclusive"]); }
-function isStringList(value: unknown, min: number, max: number): value is string[] { return Array.isArray(value) && value.length >= min && value.length <= max && value.every((item) => typeof item === "string" && item.trim() !== ""); }
-function isStringListOrUndefined(value: unknown): boolean { return value === undefined || isStringList(value, 0, 30); }
-function isOptionalString(value: unknown): boolean { return value === undefined || typeof value === "string"; }
-function isOptionalEnum<T extends string>(value: unknown, values: readonly T[]): boolean { return value === undefined || isEnum(value, values); }
-function isEnum<T extends string>(value: unknown, values: readonly T[]): value is T { return typeof value === "string" && values.includes(value as T); }
-function nonEmptyString(value: unknown): value is string { return typeof value === "string" && value.trim() !== ""; }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
