@@ -6,6 +6,7 @@ import {
   type RunPhase,
   type WorkgraphRun,
   type OutcomeKind,
+  type RunLifecycle,
 } from "./types.js";
 
 export interface NewRunInput {
@@ -47,6 +48,11 @@ export class RunStateStore {
       projectRoot: input.projectRoot,
       gitCommonDir: input.gitCommonDir,
       statePath,
+      creator: { sessionId: input.parentSessionId, sessionFile: input.parentSessionFile, createdAt: now },
+      coordinator: { sessionId: input.parentSessionId, sessionFile: input.parentSessionFile, boundAt: now },
+      handoffs: [],
+      lifecycle: "active",
+      lifecycleUpdatedAt: now,
       parentSessionId: input.parentSessionId,
       parentSessionFile: input.parentSessionFile,
       phase: "discovery",
@@ -72,11 +78,11 @@ export class RunStateStore {
   }
 
   async load(): Promise<WorkgraphRun> {
-    const parsed = JSON.parse(await readFile(this.path, "utf8")) as Partial<WorkgraphRun>;
-    if (parsed.version !== RUN_STATE_VERSION || typeof parsed.runId !== "string") {
-      throw new Error(`Unsupported or invalid workgraph state: ${this.path}`);
-    }
-    return parsed as WorkgraphRun;
+    const parsed = JSON.parse(await readFile(this.path, "utf8")) as Partial<WorkgraphRun> & { version?: number };
+    if (typeof parsed.runId !== "string") throw new Error(`Unsupported or invalid workgraph state: ${this.path}`);
+    const migrated = migrateRun(parsed);
+    if (migrated.version !== parsed.version) await this.write(migrated);
+    return migrated;
   }
 
   async update(mutator: (draft: WorkgraphRun) => void | Promise<void>): Promise<WorkgraphRun> {
@@ -116,6 +122,28 @@ export class RunStateStore {
     });
     await rename(temporaryPath, this.path);
   }
+}
+
+function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): WorkgraphRun {
+  const version = (parsed as { version?: number }).version;
+  if (version !== 3 && version !== RUN_STATE_VERSION) {
+    throw new Error(`Unsupported workgraph state version ${String(version)}: ${parsed.runId}`);
+  }
+  if (version === RUN_STATE_VERSION) return parsed as WorkgraphRun;
+  const createdAt = parsed.createdAt ?? new Date(0).toISOString();
+  const legacy = parsed as Partial<WorkgraphRun> & { parentSessionId?: string; parentSessionFile?: string };
+  const sessionId = legacy.parentSessionId ?? "unknown-session";
+  const sessionFile = legacy.parentSessionFile ?? "";
+  const lifecycle: RunLifecycle = parsed.phase === "complete" ? "completed" : "active";
+  return {
+    ...(parsed as WorkgraphRun),
+    version: RUN_STATE_VERSION,
+    creator: { sessionId, sessionFile, createdAt },
+    coordinator: { sessionId, sessionFile, boundAt: createdAt },
+    handoffs: [],
+    lifecycle,
+    lifecycleUpdatedAt: parsed.updatedAt ?? createdAt,
+  };
 }
 
 function makeRunId(now = new Date()): string {

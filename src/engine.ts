@@ -3,6 +3,7 @@ import { GitRepository, type WorktreePlacement } from "./git.js";
 import { mapConcurrent, readTerminalText, readWorkgraphReport, runPiChild, type ChildRequest } from "./pi-process.js";
 import { addNodes, allNodesComposed, blockedPendingNodes, readyWave, transitionNode } from "./scheduler.js";
 import { RunStateStore, type NewRunInput } from "./state-store.js";
+import { WorkgraphRegistry, type Lease, type LeaseOwner } from "./registry.js";
 import type {
   Agreement,
   AssuranceFinding,
@@ -30,6 +31,7 @@ export type ChildRunner = (request: ChildRequest) => Promise<ChildOutcome>;
 export interface EngineDependencies {
   runChild?: ChildRunner;
   repository?: GitRepository;
+  registry?: WorkgraphRegistry;
 }
 
 export interface DiscoveryInput {
@@ -84,9 +86,12 @@ export interface AssuranceJudgmentInput {
 export class WorkgraphEngine {
   private readonly runChild: ChildRunner;
   private repositoryPromise: Promise<GitRepository>;
+  readonly registry: WorkgraphRegistry;
+  private lease: Lease | undefined;
 
   constructor(readonly store: RunStateStore, dependencies: EngineDependencies = {}) {
     this.runChild = dependencies.runChild ?? runPiChild;
+    this.registry = dependencies.registry ?? new WorkgraphRegistry();
     this.repositoryPromise = dependencies.repository
       ? Promise.resolve(dependencies.repository)
       : this.store.load().then((run) => new GitRepository(run.projectRoot, run.gitCommonDir));
@@ -103,7 +108,10 @@ export class WorkgraphEngine {
       ids.add(milestone.id);
     }
     const created = await RunStateStore.create(input);
-    return { engine: new WorkgraphEngine(created.store, dependencies), run: created.run };
+    const engine = new WorkgraphEngine(created.store, dependencies);
+    engine.registry.indexRun(created.run);
+    engine.lease = engine.registry.acquire(created.run.runId, { sessionId: input.parentSessionId, sessionFile: input.parentSessionFile });
+    return { engine, run: created.run };
   }
 
   static open(statePath: string, dependencies: EngineDependencies = {}): WorkgraphEngine {
@@ -112,6 +120,50 @@ export class WorkgraphEngine {
 
   load(): Promise<WorkgraphRun> {
     return this.store.load();
+  }
+
+  async adopt(sessionId: string, sessionFile: string, liveness: "alive" | "dead" | "unknown" = "unknown"): Promise<WorkgraphRun> {
+    if (!sessionId.trim() || !sessionFile.trim()) throw new Error("Adoption requires a Pi session identity.");
+    const run = await this.load();
+    if (run.lifecycle === "abandoned" || run.lifecycle === "archived") throw new Error(`Workgraph ${run.runId} is ${run.lifecycle}.`);
+    const owner: LeaseOwner = { sessionId, sessionFile };
+    this.lease = this.registry.acquire(run.runId, owner, new Date(), liveness);
+    const adopted = await this.store.update((draft) => {
+      const previous = draft.coordinator;
+      draft.coordinator = { sessionId, sessionFile, boundAt: new Date().toISOString() };
+      draft.handoffs.push({ kind: previous.sessionId === sessionId ? "resume" : "adopt", ...(previous.sessionId !== sessionId ? { fromSessionId: previous.sessionId } : {}), to: draft.coordinator, at: draft.coordinator.boundAt });
+      if (draft.lifecycle === "suspended") {
+        draft.lifecycle = "active";
+        draft.lifecycleReason = "Adopted by a live coordinator.";
+        draft.lifecycleUpdatedAt = draft.coordinator.boundAt;
+      }
+    });
+    this.registry.indexRun(adopted);
+    this.registry.bind(adopted.runId, owner);
+    return adopted;
+  }
+
+  async setLifecycle(lifecycle: WorkgraphRun["lifecycle"], reason: string): Promise<WorkgraphRun> {
+    if (!reason.trim()) throw new Error("A lifecycle transition requires a reason.");
+    const run = await this.load();
+    if (run.lifecycle === lifecycle) return run;
+    const updated = await this.store.update((draft) => {
+      const allowed: Record<WorkgraphRun["lifecycle"], readonly WorkgraphRun["lifecycle"][]> = {
+        active: ["suspended", "completed", "abandoned"], suspended: ["active", "completed", "abandoned"], completed: ["archived"], abandoned: ["archived"], archived: [],
+      };
+      if (!allowed[draft.lifecycle].includes(lifecycle)) throw new Error(`Invalid lifecycle transition ${draft.lifecycle} -> ${lifecycle}.`);
+      draft.lifecycle = lifecycle;
+      draft.lifecycleReason = reason.trim();
+      draft.lifecycleUpdatedAt = new Date().toISOString();
+    });
+    this.registry.transitionLifecycle(updated.runId, lifecycle, reason);
+    this.registry.indexRun(updated);
+    return updated;
+  }
+
+  releaseLease(): void {
+    if (this.lease) this.registry.release(this.lease);
+    this.lease = undefined;
   }
 
   async recordMilestone(milestoneId: string, status: "completed" | "skipped", reason?: string): Promise<WorkgraphRun> {

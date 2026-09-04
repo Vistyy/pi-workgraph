@@ -1,4 +1,27 @@
-export const RUN_STATE_VERSION = 3 as const;
+export const RUN_STATE_VERSION = 4 as const;
+
+export type RunLifecycle = "active" | "suspended" | "completed" | "abandoned" | "archived";
+export type CoordinatorHandoffKind = "begin" | "adopt" | "resume" | "recovery";
+
+export interface SessionIdentity {
+  sessionId: string;
+  sessionFile: string;
+}
+
+export interface RunCreator extends SessionIdentity {
+  createdAt: string;
+}
+
+export interface CoordinatorBinding extends SessionIdentity {
+  boundAt: string;
+}
+
+export interface CoordinatorHandoff {
+  kind: CoordinatorHandoffKind;
+  fromSessionId?: string;
+  to: CoordinatorBinding;
+  at: string;
+}
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -377,6 +400,12 @@ export interface WorkgraphRun {
   statePath: string;
   parentSessionId: string;
   parentSessionFile: string;
+  creator: RunCreator;
+  coordinator: CoordinatorBinding;
+  handoffs: CoordinatorHandoff[];
+  lifecycle: RunLifecycle;
+  lifecycleUpdatedAt: string;
+  lifecycleReason?: string;
   phase: RunPhase;
   baseCommit: string;
   composedCommit: string;

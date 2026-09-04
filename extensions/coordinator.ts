@@ -17,6 +17,7 @@ import {
   type ModelTarget,
 } from "../src/model-policy.js";
 import { stableParentEntry } from "../src/pi-process.js";
+import { WorkgraphRegistry } from "../src/registry.js";
 import { resolveChildCapabilities, WEB_TOOLS, WEB_PACKAGE, CODEX_PACKAGE } from "../src/capabilities.js";
 import type {
   AssuranceResponsibility,
@@ -104,6 +105,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       try {
         engine = WorkgraphEngine.open(pointer.statePath);
         activeRun = await engine.load();
+        engine.registry.indexRun(activeRun);
+        const sessionFile = ctx.sessionManager.getSessionFile();
+        if (sessionFile) {
+          activeRun = await engine.adopt(ctx.sessionManager.getSessionId(), sessionFile, "unknown");
+        }
         const interrupted = activeRun.phase === "executing"
           || (activeRun.phase === "awaiting_verification" && activeRun.productVerification?.state === "running")
           || ((activeRun.phase === "awaiting_assurance" || activeRun.phase === "assurance_inconclusive") && activeRun.assurance?.state === "running");
@@ -226,6 +232,45 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           content: [{ type: "text", text: `Started Workgraph ${begun.run.runId} for ${begun.run.outcome.kind}. All coordinator tools remain stable. Reason: ${params.reason}` }],
           details: summaryDetails(begun.run),
         };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_adopt",
+    label: "Workgraph Adopt",
+    description: "Adopt an existing eligible Workgraph into this current Pi session without creating or forking a session.",
+    promptSnippet: "Adopt an existing Workgraph into the current Pi conversation",
+    parameters: Type.Object({ runId: Type.String() }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return exclusively(async () => {
+        const registry = new WorkgraphRegistry();
+        const indexed = registry.findRun(params.runId);
+        if (!indexed) throw new Error(`Unknown Workgraph ${params.runId}.`);
+        const repositoryInfo = await GitRepository.inspect(ctx.cwd);
+        if (repositoryInfo.root !== indexed.projectRoot) throw new Error(`Workgraph ${params.runId} belongs to ${indexed.projectRoot}, not ${repositoryInfo.root}.`);
+        const sessionFile = ctx.sessionManager.getSessionFile();
+        if (!sessionFile) throw new Error("Adoption requires a persistent current Pi session.");
+        const adoptedEngine = WorkgraphEngine.open(indexed.statePath, { registry });
+        const adopted = await adoptedEngine.adopt(ctx.sessionManager.getSessionId(), sessionFile, "unknown");
+        engine = adoptedEngine;
+        remember(adopted);
+        pi.appendEntry(POINTER_ENTRY, { runId: adopted.runId, statePath: adopted.statePath } satisfies RunPointer);
+        return { content: [{ type: "text", text: `Adopted Workgraph ${adopted.runId} into the current Pi session without forking.` }], details: { ...summaryDetails(adopted), lifecycle: adopted.lifecycle, coordinator: adopted.coordinator } };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_lifecycle",
+    label: "Workgraph Lifecycle",
+    description: "Explicitly suspend, resume, complete, abandon, or archive a Workgraph. Inactivity never abandons a run.",
+    promptSnippet: "Change a Workgraph lifecycle state explicitly",
+    parameters: Type.Object({ lifecycle: StringEnum(["active", "suspended", "completed", "abandoned", "archived"] as const), reason: Type.String() }),
+    async execute(_id, params) {
+      return exclusively(async () => {
+        const run = remember(await requireEngine().setLifecycle(params.lifecycle, params.reason));
+        return { content: [{ type: "text", text: `Workgraph ${run.runId} lifecycle: ${run.lifecycle}.` }], details: { ...summaryDetails(run), lifecycle: run.lifecycle, lifecycleReason: run.lifecycleReason } };
       });
     },
   });
@@ -690,6 +735,10 @@ function formatStatus(run: WorkgraphRun): string {
   const dropouts = run.discoveries.filter((record) => record.state !== "completed").length;
   return [
     `Workgraph ${run.runId}`,
+    `Lifecycle: ${run.lifecycle}${run.lifecycleReason ? ` - ${run.lifecycleReason}` : ""}`,
+    `Coordinator: ${run.coordinator.sessionId} (${run.coordinator.sessionFile})`,
+    `Creator: ${run.creator.sessionId} (${run.creator.sessionFile})`,
+    `Handoffs: ${run.handoffs.length}`,
     `Phase: ${run.phase}`,
     `Outcome: ${run.outcome.kind}`,
     `Statement: ${run.outcome.statement}`,
@@ -714,6 +763,8 @@ function formatModelPolicy(roles: Record<ModelRole, ModelTarget[]>): string {
 function summaryDetails(run: WorkgraphRun) {
   return {
     runId: run.runId,
+    lifecycle: run.lifecycle,
+    coordinator: run.coordinator,
     phase: run.phase,
     statePath: run.statePath,
     outcome: run.outcome,
