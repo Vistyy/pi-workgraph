@@ -14,12 +14,10 @@ Product-change outcomes retain agreement, isolated bounded implementation nodes,
 
 ## Child boundary
 
-Children run with `--no-extensions` and explicitly receive only the Workgraph worker extension and resolved trusted capability extensions.
-Third-party capabilities use stable Pi package identity.
-Evidence discovery may activate `npm:pi-web-access@0.14.0` with only the four approved web tools.
-Codex children may resolve the installed remote-compaction resource by stable package identity.
-Repository-local configuration cannot inject executable child extensions.
-Capability selection and diagnostics are durable for recovery and diagnosis.
+Children use ordinary Pi configuration and resource discovery, retaining the configured tools, extensions, skills, and prompt templates.
+The Workgraph package is role-aware: coordinator tools load in coordinator sessions, while assignment sessions load reporting support without removing unrelated resources.
+Child session identity, terminal result, usage, and model provenance are durable for recovery and diagnosis.
+Git worktrees isolate product effects, and authoritative Git postconditions validate implementation commits before composition.
 
 ## Guidance
 
@@ -38,5 +36,5 @@ Creation and maintenance of project verification skills remain repository-changi
 ## Verification
 
 The retained gates are `pnpm check`, `pnpm pack --dry-run`, `pnpm smoke:real`, and `pnpm smoke:coordinator`.
-Deterministic coverage protects outcome contracts, milestone persistence, child accounting, trusted resource isolation, exact composition, recovery, evidence routing, assurance, and final judgment.
+Deterministic coverage protects outcome contracts, milestone persistence, child accounting, ordinary resource loading, exact composition, recovery, evidence routing, assurance, and final judgment.
 Model-backed smokes exercise both direct engine and coordinator package boundaries when credentials are available.

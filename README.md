@@ -32,12 +32,11 @@ The package exposes sixteen optional composable procedure skills and Workgraph-o
 Verification guidance prefers repository-native harnesses, then a project-local verification skill, then the appropriate browser or CLI/TUI control skill.
 Unavailable control surfaces produce inconclusive verification.
 
-## Child capabilities
+## Child runtime
 
-Workers run with `--no-extensions` and receive only the Workgraph worker extension plus explicitly resolved trusted capabilities.
-Evidence discovery can use `npm:pi-web-access@0.14.0` with only `web_search`, `source_check`, `fetch_content`, and `get_search_content` enabled.
-Codex workers can use the installed remote-compaction capability by stable package identity.
-Each child records requested and resolved capability identity, version, tools, availability, and diagnostics in durable run state.
+Assignment sessions use ordinary Pi resource discovery and retain the normal configured tools, extensions, skills, and prompt templates.
+Workgraph roles are identified through the assignment environment so coordinator tools do not appear in worker sessions.
+Each child records its session, terminal result, usage, and model provenance in durable run state.
 
 Repository-local configuration cannot inject executable child extensions, and third-party identities are never represented by installed `node_modules` paths.
 

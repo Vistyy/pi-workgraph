@@ -1,9 +1,7 @@
 import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { capabilityArgs, capabilityTools, resolveChildCapabilities, type ChildCapability } from "./capabilities.js";
+import type { ChildCapability } from "./capabilities.js";
 import type {
   ChildOutcome,
   ThinkingLevel,
@@ -13,8 +11,6 @@ import type {
   ChildCapabilityRecord,
 } from "./types.js";
 
-const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const defaultWorkerExtension = resolve(packageRoot, "extensions", "worker.ts");
 const STDERR_LIMIT = 50 * 1024;
 
 export interface ChildRequest {
@@ -30,7 +26,6 @@ export interface ChildRequest {
   runId: string;
   nodeId: string;
   baseCommit?: string;
-  allowedPaths?: string[];
   responsibility?: string;
   implementationStart?: "guide" | "executor";
   timeoutMs?: number;
@@ -43,7 +38,7 @@ export interface ChildRequest {
 export async function runPiChild(request: ChildRequest): Promise<ChildOutcome> {
   const sessionFile = await forkSession(request);
   await request.onSessionCreated?.(sessionFile);
-  const capabilities = request.capabilities ?? await resolveChildCapabilities(request.mode, request.guideModel);
+  const capabilities = request.capabilities ?? [];
   const args = buildChildArguments(request, sessionFile, capabilities);
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -53,10 +48,8 @@ export async function runPiChild(request: ChildRequest): Promise<ChildOutcome> {
     PI_WORKGRAPH_EXECUTOR_MODEL: request.executorModel ?? request.guideModel,
     PI_WORKGRAPH_EXECUTOR_THINKING: request.executorThinking ?? request.guideThinking,
     PI_WORKGRAPH_BASE_COMMIT: request.baseCommit ?? "",
-    PI_WORKGRAPH_ALLOWED_PATHS: JSON.stringify(request.allowedPaths ?? []),
     PI_WORKGRAPH_RESPONSIBILITY: request.responsibility ?? "",
     PI_WORKGRAPH_IMPLEMENTATION_START: request.implementationStart ?? "guide",
-    PI_WORKGRAPH_CAPABILITIES: JSON.stringify(capabilities),
   };
 
   return spawnPi({
@@ -71,15 +64,11 @@ export async function runPiChild(request: ChildRequest): Promise<ChildOutcome> {
   });
 }
 
-export function buildChildArguments(request: Pick<ChildRequest, "mode" | "guideModel" | "guideThinking" | "executorModel" | "executorThinking" | "implementationStart">, sessionFile: string, capabilities: ChildCapability[]): string[] {
+export function buildChildArguments(request: Pick<ChildRequest, "mode" | "guideModel" | "guideThinking" | "executorModel" | "executorThinking" | "implementationStart">, sessionFile: string, _capabilities: ChildCapability[]): string[] {
   const startsInExecutor = request.mode === "implementation" && request.implementationStart === "executor";
   const initialModel = startsInExecutor ? request.executorModel ?? request.guideModel : request.guideModel;
   const initialThinking = startsInExecutor ? request.executorThinking ?? request.guideThinking : request.guideThinking;
-  const tools = request.mode === "implementation"
-    ? ["read","bash","grep","find","ls","edit","write","workgraph_todo","workgraph_report"]
-    : ["read","bash","grep","find","ls","workgraph_report"];
-  if (request.mode === "discovery") tools.push(...capabilityTools(capabilities));
-  return ["--mode", "json", "--print", "--session", sessionFile, "--model", initialModel, "--thinking", initialThinking, "--no-extensions", "--extension", defaultWorkerExtension, ...capabilityArgs(capabilities), "--no-prompt-templates", "--tools", tools.join(","), "Continue the assigned Workgraph objective now."];
+  return ["--mode", "json", "--print", "--session", sessionFile, "--model", initialModel, "--thinking", initialThinking, "Continue the assigned Workgraph objective now."];
 }
 
 export async function forkSession(request: Pick<ChildRequest, "parentSessionFile" | "targetCwd" | "sessionDir" | "objective" | "mode" | "runId" | "nodeId" | "stableEntryId">): Promise<string> {
@@ -153,6 +142,7 @@ async function spawnPi(options: SpawnPiOptions): Promise<ChildOutcome> {
     const usage: UsageSummary = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
     const models: string[] = [];
     let report: WorkerReport | undefined;
+    let terminalText = "";
     let stderr = "";
     let lineBuffer = "";
     let timedOut = false;
@@ -174,6 +164,7 @@ async function spawnPi(options: SpawnPiOptions): Promise<ChildOutcome> {
       }
       const message = event.message as Record<string, unknown> | undefined;
       if (event.type === "message_end" && message?.role === "assistant") {
+        terminalText = assistantText(message);
         usage.turns += 1;
         const messageUsage = message.usage as Record<string, unknown> | undefined;
         const cost = messageUsage?.cost as Record<string, unknown> | undefined;
@@ -233,7 +224,9 @@ async function spawnPi(options: SpawnPiOptions): Promise<ChildOutcome> {
       resolvePromise({
         exitCode: code ?? 1,
         sessionFile: options.sessionFile,
+        resultKind: report ? "typed" : terminalText ? "untyped" : "absent",
         ...(report ? { report } : {}),
+        ...(terminalText ? { terminalText } : {}),
         stderr: stderr.trim(),
         usage,
         models,
@@ -244,6 +237,15 @@ async function spawnPi(options: SpawnPiOptions): Promise<ChildOutcome> {
   });
 }
 
+function assistantText(message: Record<string, unknown>): string {
+  const content = Array.isArray(message.content) ? message.content : [];
+  return content
+    .filter((part): part is { type: string; text: string } => !!part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string")
+    .map((part) => part.text)
+    .join("\n")
+    .trim();
+}
+
 export function readWorkgraphReport(sessionFile: string): WorkerReport | undefined {
   try {
     const messages = SessionManager.open(sessionFile).buildSessionContext().messages;
@@ -252,6 +254,21 @@ export function readWorkgraphReport(sessionFile: string): WorkerReport | undefin
       if (message?.role !== "toolResult" || message.toolName !== "workgraph_report") continue;
       const details = message.details as { report?: WorkerReport } | undefined;
       if (details?.report) return details.report;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+export function readTerminalText(sessionFile: string): string | undefined {
+  try {
+    const messages = SessionManager.open(sessionFile).buildSessionContext().messages;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.role !== "assistant") continue;
+      const text = assistantText(message as unknown as Record<string, unknown>);
+      if (text) return text;
     }
   } catch {
     return undefined;

@@ -71,6 +71,7 @@ const NodeSchema = Type.Object({
 });
 
 export default function workgraphCoordinator(pi: ExtensionAPI): void {
+  if (process.env.PI_WORKGRAPH_MODE) return;
   let engine: WorkgraphEngine | undefined;
   let activeRun: WorkgraphRun | undefined;
   let exclusiveTail: Promise<unknown> = Promise.resolve();
@@ -120,16 +121,25 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => restore(ctx));
   pi.on("session_tree", async (_event, ctx) => restore(ctx));
 
-  pi.on("before_agent_start", () => {
-    const run = activeRun;
-    const inProgress = run && run.phase !== "complete" && run.phase !== "failed";
-    const state = inProgress
+  pi.on("before_agent_start", async (event) => {
+    let run = activeRun;
+    if (engine && run?.agreementProposal) {
+      const decision = conversationalDecision(event.prompt);
+      if (decision !== undefined) {
+        run = remember(await engine.recordAgreement(run.agreementProposal, decision, event.prompt));
+      }
+    }
+    const inProgress = run !== undefined && run.phase !== "complete" && run.phase !== "failed";
+    const state = inProgress && run
       ? `Active Workgraph ${run.runId} is in phase ${run.phase} for a ${run.outcome.kind} outcome. All normal coordinator tools remain available. Keep substantial product implementation behind the approved agreement and use Workgraph boundaries for delegated writes, composition, evidence, and assurance.`
       : "All normal coordinator tools remain available. For materially ambiguous or structurally consequential work, begin a durable Workgraph before substantial product implementation. Clear, local, reversible work may proceed directly.";
+    const proposal = run?.agreementProposal
+      ? " A Workgraph implementation plan is awaiting an exact approval or rejection in a later user message."
+      : "";
     return {
       message: {
         customType: "pi-workgraph-policy",
-        content: `[WORKGRAPH COORDINATION POLICY]\n${state}\nThe coordinator owns semantic synthesis and final judgment. Keep outcome and milestone progress durable, account for every child, and expose only the agreement, authority-changing decisions, material blockers, and final evidenced result to the user.`,
+        content: `[WORKGRAPH COORDINATION POLICY]\n${state}${proposal}\nThe coordinator owns semantic synthesis and final judgment. Keep outcome and milestone progress durable, account for every child, and expose only the agreement, authority-changing decisions, material blockers, and final evidenced result to the user.`,
         display: false,
       },
     };
@@ -336,7 +346,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "workgraph_agree",
     label: "Workgraph Agreement",
-    description: "Present a complete initial or revised implementation and verification envelope as a serialized human approval checkpoint.",
+    description: "Present a complete implementation plan for conversational approval in the next user message.",
     promptSnippet: "Request approval for a complete Workgraph implementation envelope",
     parameters: Type.Object({
       outcome: Type.String(),
@@ -351,21 +361,13 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       requiredEvidence: Type.Array(Type.String()),
       unresolvedDecisions: Type.Array(Type.String()),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params) {
       return exclusively(async () => {
-        if (!ctx.hasUI) throw new Error("Workgraph approval requires Pi TUI or RPC UI confirmation.");
-        const checkpoint = formatAgreement(params);
-        if (params.unresolvedDecisions.length > 0) {
-          return {
-            content: [{ type: "text", text: `${checkpoint}\n\nResolve the listed decisions before requesting approval.` }],
-            details: { approved: false, unresolved: true },
-          };
-        }
-        const accepted = await ctx.ui.confirm("Approve implementation envelope?", checkpoint);
-        const run = remember(await requireEngine().recordAgreement(params, accepted, checkpoint));
+        const checkpoint = formatAgreementSummary(params);
+        const run = remember(await requireEngine().proposeAgreement(params, checkpoint));
         return {
-          content: [{ type: "text", text: accepted ? "Implementation envelope approved. Schedule bounded work nodes next." : "Implementation envelope was not approved. Revise it without substantial product implementation." }],
-          details: { ...summaryDetails(run), approved: accepted },
+          content: [{ type: "text", text: `${checkpoint}\n\nReply with your approval or requested changes. Workgraph will record the next user decision.` }],
+          details: { ...summaryDetails(run), proposal: params },
         };
       });
     },
@@ -605,21 +607,21 @@ function requireAvailable(model: string, ctx: ExtensionContext, owner: string): 
   if (target.unavailableReason) throw new Error(target.unavailableReason);
 }
 
-function formatAgreement(agreement: AgreementInput): string {
-  const list = (items: string[]): string => items.length > 0 ? items.map((item) => `- ${item}`).join("\n") : "- None";
+function formatAgreementSummary(agreement: AgreementInput): string {
   return [
-    `Outcome\n${agreement.outcome}`,
-    `Non-goals\n${list(agreement.nonGoals)}`,
-    `Reuse decision\n${agreement.reuseDecision}`,
-    `Structural ownership\n${agreement.structure}`,
-    `Expected scale\n${agreement.expectedScale}`,
-    `Verification boundary\n${agreement.verificationBoundary}`,
-    `Verification method\n${agreement.verificationMethod}`,
-    `Verification procedure\n${agreement.verificationProcedure}`,
-    `Verification commands\n${list(agreement.verificationCommands)}`,
-    `Required evidence\n${list(agreement.requiredEvidence)}`,
-    `Unresolved decisions\n${list(agreement.unresolvedDecisions)}`,
-  ].join("\n\n");
+    `Plan: ${agreement.outcome}`,
+    `Scope: ${agreement.structure}`,
+    `Verification: ${agreement.verificationMethod} at ${agreement.verificationBoundary}`,
+    `Checks: ${agreement.verificationCommands.join(", ")}`,
+    agreement.nonGoals.length > 0 ? `Non-goals: ${agreement.nonGoals.join("; ")}` : "Non-goals: none",
+  ].join("\n");
+}
+
+function conversationalDecision(prompt: string): boolean | undefined {
+  const normalized = prompt.trim().toLowerCase().replace(/[.!?]+$/g, "");
+  if (/^(approve|approved|yes|y|lgtm)$/.test(normalized)) return true;
+  if (/^(reject|rejected|decline|declined|no|n)$/.test(normalized)) return false;
+  return undefined;
 }
 
 function formatDiscoveries(run: WorkgraphRun, records: WorkgraphRun["discoveries"]): string {

@@ -165,10 +165,14 @@ export interface ChildCapabilityRecord {
   diagnostic?: string;
 }
 
+export type ChildResultKind = "typed" | "untyped" | "absent";
+
 export interface ChildOutcome {
   exitCode: number;
   sessionFile: string;
+  resultKind?: ChildResultKind;
   report?: WorkerReport;
+  terminalText?: string;
   stderr: string;
   usage: UsageSummary;
   models: string[];
@@ -193,8 +197,10 @@ export interface DiscoveryAssignment extends InvestigationSpec {
 
 export interface DiscoveryRecord extends DiscoveryAssignment {
   topology: DiscoveryTopology;
+  resultKind?: ChildResultKind;
+  terminalText?: string;
   synthesisOf?: string[];
-  state: "running" | "completed" | "failed" | "timed_out" | "cancelled" | "unavailable" | "superseded";
+  state: "running" | "completed" | "failed" | "review_required" | "timed_out" | "cancelled" | "unavailable" | "superseded";
   supersededBy?: string;
   sessionFile?: string;
   report?: DiscoveryReport;
@@ -205,7 +211,7 @@ export interface DiscoveryRecord extends DiscoveryAssignment {
 
 export type VerificationMethod = "commands" | "independent";
 
-export interface Agreement {
+export interface AgreementDraft {
   outcome: string;
   nonGoals: string[];
   reuseDecision: string;
@@ -217,6 +223,9 @@ export interface Agreement {
   verificationProcedure: string;
   requiredEvidence: string[];
   unresolvedDecisions: string[];
+}
+
+export interface Agreement extends AgreementDraft {
   approvedAt: string;
 }
 
@@ -253,6 +262,8 @@ export interface CommandEvidence {
 
 export interface WorkNode extends WorkNodeSpec {
   state: NodeState;
+  resultKind?: ChildResultKind;
+  terminalText?: string;
   baseCommit?: string;
   branch?: string;
   worktreePath?: string;
@@ -284,6 +295,8 @@ export interface CompositionRecord {
 
 export interface ProductVerificationRecord {
   revision: string;
+  resultKind?: ChildResultKind;
+  terminalText?: string;
   method: VerificationMethod;
   state: "running" | "completed" | "failed" | "inconclusive";
   model?: string;
@@ -298,6 +311,8 @@ export interface ProductVerificationRecord {
 
 export interface AssuranceReviewRecord {
   responsibility: AssuranceResponsibility;
+  resultKind?: ChildResultKind;
+  terminalText?: string;
   model: string;
   thinking: ThinkingLevel;
   state: "running" | "completed" | "failed" | "timed_out" | "unavailable";
@@ -309,6 +324,8 @@ export interface AssuranceReviewRecord {
 
 export interface AssuranceSynthesisRecord {
   model: string;
+  resultKind?: ChildResultKind;
+  terminalText?: string;
   thinking: ThinkingLevel;
   state: "running" | "completed" | "failed" | "timed_out";
   sessionFile?: string;
@@ -369,6 +386,8 @@ export interface WorkgraphRun {
   milestones: MilestoneRecord[];
   terminalOutcome?: TerminalOutcome;
   agreement?: Agreement;
+  agreementProposal?: AgreementDraft;
+  agreementProposalText?: string;
   discoveries: DiscoveryRecord[];
   nodes: WorkNode[];
   composition: CompositionRecord[];

@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { CommandEvidence } from "./types.js";
-import { pathIsClaimed } from "./scheduler.js";
 
 const OUTPUT_LIMIT = 50 * 1024;
 
@@ -109,7 +108,6 @@ export class GitRepository {
 
   async validateWorkerCommit(
     placement: WorktreePlacement,
-    claimedPaths: string[],
     reportedCommit?: string,
   ): Promise<ValidatedCommit> {
     await this.assertClean(placement.path);
@@ -131,10 +129,6 @@ export class GitRepository {
     );
     const changedFiles = changedText ? changedText.split("\n").filter(Boolean).sort() : [];
     if (changedFiles.length === 0) throw new Error("Worker commit does not change any files.");
-    const outside = changedFiles.filter((path) => !pathIsClaimed(path, claimedPaths));
-    if (outside.length > 0) {
-      throw new Error(`Worker changed files outside its claimed paths: ${outside.join(", ")}`);
-    }
     return { commit, changedFiles };
   }
 

@@ -10,7 +10,6 @@ const guideModel = process.env.PI_WORKGRAPH_GUIDE_MODEL || "openai-codex/gpt-5.6
 const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-coordinator-"));
 const root = join(parent, "fixture");
 const tools: string[] = [];
-const confirmations: Array<{ title: string; message: string }> = [];
 let statePath: string | undefined;
 let stderr = "";
 
@@ -40,8 +39,6 @@ Keep changes minimal and use the Workgraph terminal report tools in child assign
     "--session-dir", join(parent, "sessions"),
     "--model", guideModel,
     "--thinking", "high",
-    "--no-extensions",
-    "--extension", packageRoot,
   ], {
     cwd: root,
     env: process.env,
@@ -67,9 +64,8 @@ Keep changes minimal and use the Workgraph terminal report tools in child assign
         const path = event.message.details?.statePath;
         if (typeof path === "string") statePath = path;
       }
-      if (event.type === "extension_ui_request" && event.method === "confirm") {
-        confirmations.push({ title: event.title, message: event.message });
-        child.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, confirmed: true })}\n`);
+      if ((event.type === "tool_result_end" || event.type === "message_end") && event.message?.role === "toolResult" && event.message.toolName === "workgraph_agree") {
+        child.stdin.write(`${JSON.stringify({ id: "approval", type: "prompt", message: "approved" })}\n`);
       }
       if (event.type === "agent_end" && !finished) {
         finished = true;
@@ -99,7 +95,7 @@ Keep changes minimal and use the Workgraph terminal report tools in child assign
 
   const prompt = `Use Workgraph for this request and do not stop before coordinator judgment returns complete.
 Begin with a product_change outcome and the predicate that src/value.txt contains exactly AURORA followed by a newline and ./verify.sh succeeds at the composed revision.
-Treat this as consequential enough for an agreement checkpoint so the orchestration boundary is exercised.
+Treat this as consequential enough for a conversational agreement checkpoint so the orchestration boundary is exercised.
 Run one partitioned discovery call with two bounded read-only responsibilities: mechanism and ownership, then intent and scope risk.
 Use ${guideModel} with high thinking for both discovery responsibilities.
 Present an agreement with no unresolved decisions, reuse the existing file and verify.sh, use command verification, describe running ./verify.sh as the verification procedure, and require its successful output as evidence.
@@ -109,7 +105,7 @@ Use ${guideModel} as guide and openai-codex/gpt-5.6-luna as executor.
 Record task-specific milestones as completed before assurance.
 Run behavior, structure, and evidence assurance with ${guideModel}, then use openai-codex/gpt-5.6-luna for synthesis.
 Finally call workgraph_judge and account for every candidate finding, accepting only concrete material findings.
-Do not make direct coordinator product edits, and accept the UI response as the user's approval decision.`;
+Do not make direct coordinator product edits, and wait for the subsequent exact user message \'approved\' as the approval decision.`;
   child.stdin.write(`${JSON.stringify({ id: "smoke", type: "prompt", message: prompt })}\n`);
   await completion;
   child.kill("SIGTERM");
@@ -119,7 +115,6 @@ Do not make direct coordinator product edits, and accept the UI response as the 
   for (const tool of expectedTools) {
     if (!tools.includes(tool)) throw new Error(`Coordinator did not call ${tool}. Called: ${tools.join(", ")}`);
   }
-  if (confirmations.length !== 1) throw new Error(`Expected one approval confirmation, observed ${confirmations.length}. Tools: ${tools.join(", ")}. Prompts: ${JSON.stringify(confirmations)}`);
   if (!statePath) throw new Error("Coordinator did not expose the durable Workgraph state path.");
   const state = JSON.parse(await readFile(statePath, "utf8"));
   const value = await readFile(join(root, "src", "value.txt"), "utf8");
@@ -128,7 +123,6 @@ Do not make direct coordinator product edits, and accept the UI response as the 
   console.log(JSON.stringify({
     phase: state.phase,
     tools,
-    approvalPrompts: confirmations.length,
     nodeModels: state.nodes.map((node: any) => node.models),
     value: value.trim(),
     globalVerification: state.globalVerification,

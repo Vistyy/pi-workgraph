@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WorkgraphEngine } from "../src/engine.js";
+import { commandAgreement, testOutcome } from "./helpers.js";
 import { GitRepository } from "../src/git.js";
 import type { EvidenceItem } from "../src/types.js";
 
@@ -23,6 +24,22 @@ test("non-change outcomes finish with typed evidence and no implementation state
   }
 });
 
+test("conversational agreement persists the exact subsequent user decision", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-workgraph-agreement-"));
+  try {
+    const begun = await WorkgraphEngine.begin({ request: "request", projectRoot: root, gitCommonDir: join(root, ".git"), parentSessionId: "parent", parentSessionFile: join(root, "parent.jsonl"), baseCommit: "base", outcome: testOutcome.outcome });
+    const { approvedAt: _approvedAt, ...draft } = commandAgreement;
+    await begun.engine.store.transition("awaiting_agreement", "Discovery is ready for the agreement proposal.");
+    const proposed = await begun.engine.proposeAgreement(draft, "Plan summary");
+    assert.equal(proposed.phase, "awaiting_agreement");
+    assert.deepEqual(proposed.agreementProposal, draft);
+    const approved = await begun.engine.recordAgreement(draft, true, "approved");
+    assert.equal(approved.phase, "approved");
+    assert.equal(approved.humanDecisions[0]?.prompt, "approved");
+    assert.equal(approved.agreementProposal, undefined);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("non-change completion rejects unresolved conflicts and product execution", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-workgraph-outcome-"));
   try {
@@ -34,7 +51,7 @@ test("non-change completion rejects unresolved conflicts and product execution",
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("trusted capabilities resolve installed metadata and activate exactly the approved web tools", async () => {
+test("normal child launches do not inject a restricted resource selection", async () => {
   const { resolveChildCapabilities, WEB_TOOLS } = await import("../src/capabilities.js");
   const root = await mkdtemp(join(tmpdir(), "pi-workgraph-capability-"));
   try {
@@ -49,9 +66,9 @@ test("trusted capabilities resolve installed metadata and activate exactly the a
     assert.deepEqual(web.tools, [...WEB_TOOLS]);
     const { buildChildArguments } = await import("../src/pi-process.js");
     const args = buildChildArguments({ mode: "discovery", guideModel: "provider/model", guideThinking: "high" }, "/tmp/session.jsonl", capabilities);
-    assert.ok(args.includes("--no-extensions"));
-    assert.ok(args.includes(join(root, "node_modules", "pi-web-access", "index.ts")));
-    assert.equal(args[args.indexOf("--tools") + 1], ["read", "bash", "grep", "find", "ls", "workgraph_report", ...WEB_TOOLS].join(","));
+    assert.equal(args.includes("--no-extensions"), false);
+    assert.equal(args.includes("--tools"), false);
+    assert.equal(args.includes(join(root, "node_modules", "pi-web-access", "index.ts")), false);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

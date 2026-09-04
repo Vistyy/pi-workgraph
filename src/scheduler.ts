@@ -122,11 +122,6 @@ export function claimsOverlap(left: string[], right: string[]): boolean {
   return left.some((leftClaim) => right.some((rightClaim) => claimContains(leftClaim, rightClaim) || claimContains(rightClaim, leftClaim)));
 }
 
-export function pathIsClaimed(path: string, claims: string[]): boolean {
-  const normalizedPath = normalizeClaim(path);
-  return claims.some((claim) => claimContains(claim, normalizedPath));
-}
-
 export function allNodesComposed(run: WorkgraphRun): boolean {
   return run.nodes.length > 0 && run.nodes.every((node) => node.state === "composed" || node.state === "superseded");
 }

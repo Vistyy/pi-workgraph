@@ -28,6 +28,3 @@ async function resolvePackage(id: ChildCapability["id"], name: string, source: s
   const versionOk = id === "web_access" ? pkg.version === "0.14.0" : true;
   return { ...base, ...(pkg.version ? { version: pkg.version } : {}), resourceIdentity: `${pkg.name ?? name}:${resource}`, resourcePath: join(path.slice(0, -"package.json".length), resource), available: versionOk, ...(versionOk ? {} : { diagnostic: `Expected pi-web-access 0.14.0, found ${pkg.version ?? "unknown"}.` }) };
 }
-
-export function capabilityArgs(capabilities: ChildCapability[]): string[] { return capabilities.filter((capability) => capability.available && capability.resourcePath).flatMap((capability) => ["--extension", capability.resourcePath!]); }
-export function capabilityTools(capabilities: ChildCapability[]): string[] { return capabilities.filter((capability) => capability.id === "web_access" && capability.available).flatMap((capability) => capability.tools); }

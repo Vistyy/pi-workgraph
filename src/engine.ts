@@ -1,6 +1,6 @@
 import { dirname, join } from "node:path";
 import { GitRepository, type WorktreePlacement } from "./git.js";
-import { mapConcurrent, readWorkgraphReport, runPiChild, type ChildRequest } from "./pi-process.js";
+import { mapConcurrent, readTerminalText, readWorkgraphReport, runPiChild, type ChildRequest } from "./pi-process.js";
 import { addNodes, allNodesComposed, blockedPendingNodes, readyWave, transitionNode } from "./scheduler.js";
 import { RunStateStore, type NewRunInput } from "./state-store.js";
 import type {
@@ -208,6 +208,8 @@ export class WorkgraphEngine {
       await this.updateDiscovery(assignment.id, (record) => {
         record.sessionFile = outcome.sessionFile;
         record.usage = outcome.usage;
+        if (outcome.resultKind) record.resultKind = outcome.resultKind;
+        if (outcome.terminalText) record.terminalText = outcome.terminalText;
         if (outcome.capabilities) record.capabilities = outcome.capabilities;
         if (outcome.exitCode === 0 && outcome.report?.kind === "discovery" && outcome.report.status === "completed") {
           record.state = "completed";
@@ -219,14 +221,21 @@ export class WorkgraphEngine {
           ? "timed_out"
           : input.signal?.aborted
             ? "cancelled"
-            : unavailableModelFailure(outcome)
-              ? "unavailable"
-              : "failed";
+            : outcome.resultKind === "untyped"
+              ? "review_required"
+              : unavailableModelFailure(outcome)
+                ? "unavailable"
+                : "failed";
         record.error = childFailure(outcome);
       });
     });
 
-    return this.changePhase("awaiting_agreement", `${input.topology} discovery settled with every requested lane accounted for.`);
+    const settled = await this.load();
+    const activeLanes = settled.discoveries.filter((record) => record.state !== "superseded");
+    const ready = activeLanes.length > 0 && activeLanes.every((record) => record.state === "completed" && record.report?.kind === "discovery" && record.report.status === "completed");
+    return this.changePhase(ready ? "awaiting_agreement" : "discovery", ready
+      ? `${input.topology} discovery completed with typed reports for every active lane.`
+      : `${input.topology} discovery remains open because every active lane requires a completed typed report or explicit disposition.`);
   }
 
   async synthesizeDiscovery(input: DiscoverySynthesisInput): Promise<WorkgraphRun> {
@@ -284,6 +293,8 @@ export class WorkgraphEngine {
     return this.updateDiscovery(input.id, (draft) => {
       draft.sessionFile = outcome.sessionFile;
       draft.usage = outcome.usage;
+      if (outcome.resultKind) draft.resultKind = outcome.resultKind;
+      if (outcome.terminalText) draft.terminalText = outcome.terminalText;
       if (outcome.capabilities) draft.capabilities = outcome.capabilities;
       if (outcome.exitCode === 0 && outcome.report?.kind === "discovery" && outcome.report.status === "completed") {
         draft.state = "completed";
@@ -293,6 +304,19 @@ export class WorkgraphEngine {
         draft.state = outcome.timedOut ? "timed_out" : unavailableModelFailure(outcome) ? "unavailable" : "failed";
         draft.error = childFailure(outcome);
       }
+    });
+  }
+
+  async proposeAgreement(input: AgreementInput, summary: string): Promise<WorkgraphRun> {
+    const run = await this.load();
+    if (run.outcome.kind !== "product_change") throw new Error("Agreement is only required for product-change outcomes.");
+    requirePhase(run, ["awaiting_agreement", "needs_decision"]);
+    validateAgreement(input);
+    if (input.unresolvedDecisions.length > 0) throw new Error("Resolve material decisions before proposing the implementation envelope.");
+    if (!summary.trim()) throw new Error("An agreement summary is required.");
+    return this.store.update((draft) => {
+      draft.agreementProposal = { ...input };
+      draft.agreementProposalText = summary.trim();
     });
   }
 
@@ -312,8 +336,14 @@ export class WorkgraphEngine {
         at: new Date().toISOString(),
       };
       draft.humanDecisions.push(decision);
-      if (!accepted) return;
+      if (!accepted) {
+        delete draft.agreementProposal;
+        delete draft.agreementProposalText;
+        return;
+      }
       draft.agreement = { ...input, approvedAt: decision.at };
+      delete draft.agreementProposal;
+      delete draft.agreementProposalText;
       delete draft.productVerification;
       delete draft.assurance;
       setPhase(draft, "approved", decision.kind === "agreement"
@@ -499,10 +529,19 @@ export class WorkgraphEngine {
     run = await this.load();
     for (const node of run.nodes.filter((candidate) => candidate.state === "running")) {
       const report = node.sessionFile ? readWorkgraphReport(node.sessionFile) : undefined;
+      const terminalText = !report && node.sessionFile ? readTerminalText(node.sessionFile) : undefined;
       if (!report || report.kind !== "implementation" || !node.worktreePath || !node.branch || !node.baseCommit) {
         await this.updateNode(node.id, (draft) => {
+          if (terminalText) {
+            draft.resultKind = "untyped";
+            draft.terminalText = terminalText;
+          } else {
+            draft.resultKind = "absent";
+          }
           transitionNode(draft, "escalated");
-          draft.error = "Recovery found no complete typed implementation result. Inspect the retained worktree and child session before replacing this node.";
+          draft.error = terminalText
+            ? "Recovery retained final worker prose without a typed implementation result; inspect it before replacement."
+            : "Recovery found no terminal implementation result. Inspect the retained worktree and child session before replacing this node.";
           draft.settledAt = new Date().toISOString();
         });
         continue;
@@ -526,7 +565,7 @@ export class WorkgraphEngine {
       }
       try {
         const placement = { path: node.worktreePath, branch: node.branch, baseCommit: node.baseCommit };
-        const validated = await repository.validateWorkerCommit(placement, node.claimedPaths, report.commit);
+        const validated = await repository.validateWorkerCommit(placement, report.commit);
         const verification = await repository.runCommands(node.verificationCommands, node.worktreePath);
         const failed = verification.find((item) => item.exitCode !== 0);
         if (failed) throw new Error(`Node verification failed during recovery: ${failed.command}`);
@@ -653,6 +692,8 @@ export class WorkgraphEngine {
       return this.store.update((draft) => {
         draft.productVerification = {
           ...verification,
+          ...(outcome.resultKind ? { resultKind: outcome.resultKind } : {}),
+          ...(outcome.terminalText ? { terminalText: outcome.terminalText } : {}),
           state: "inconclusive",
           sessionFile: outcome.sessionFile,
           usage: outcome.usage,
@@ -665,6 +706,8 @@ export class WorkgraphEngine {
       return this.store.update((draft) => {
         draft.productVerification = {
           ...verification,
+          ...(outcome.resultKind ? { resultKind: outcome.resultKind } : {}),
+          ...(outcome.terminalText ? { terminalText: outcome.terminalText } : {}),
           state: "inconclusive",
           sessionFile: outcome.sessionFile,
           usage: outcome.usage,
@@ -678,6 +721,8 @@ export class WorkgraphEngine {
     return this.store.update((draft) => {
       draft.productVerification = {
         ...verification,
+        ...(outcome.resultKind ? { resultKind: outcome.resultKind } : {}),
+        ...(outcome.terminalText ? { terminalText: outcome.terminalText } : {}),
         state: inconclusive ? "inconclusive" : failed ? "failed" : "completed",
         sessionFile: outcome.sessionFile,
         usage: outcome.usage,
@@ -755,6 +800,8 @@ export class WorkgraphEngine {
       }
       await this.updateAssuranceReview(reviewer.responsibility, (record) => {
         record.sessionFile = outcome.sessionFile;
+        if (outcome.resultKind) record.resultKind = outcome.resultKind;
+        if (outcome.terminalText) record.terminalText = outcome.terminalText;
         record.usage = outcome.usage;
         if (outcome.exitCode === 0 && outcome.report?.kind === "assurance_review" && outcome.report.responsibility === reviewer.responsibility && outcome.report.status === "completed") {
           record.state = "completed";
@@ -840,6 +887,8 @@ export class WorkgraphEngine {
         draft.assurance.state = "inconclusive";
         draft.assurance.synthesis = {
           ...synthesis,
+          ...(outcome.resultKind ? { resultKind: outcome.resultKind } : {}),
+          ...(outcome.terminalText ? { terminalText: outcome.terminalText } : {}),
           state: outcome.timedOut ? "timed_out" : report.status === "completed" ? "completed" : "failed",
           sessionFile: outcome.sessionFile,
           usage: outcome.usage,
@@ -855,6 +904,8 @@ export class WorkgraphEngine {
       draft.assurance.state = "completed";
       draft.assurance.synthesis = {
         ...synthesis,
+        ...(outcome.resultKind ? { resultKind: outcome.resultKind } : {}),
+        ...(outcome.terminalText ? { terminalText: outcome.terminalText } : {}),
         state: "completed",
         sessionFile: outcome.sessionFile,
         usage: outcome.usage,
@@ -1088,7 +1139,6 @@ export class WorkgraphEngine {
         runId: run.runId,
         nodeId: node.id,
         baseCommit: placement.baseCommit,
-        allowedPaths: node.claimedPaths,
         onSessionCreated: async (sessionFile) => {
           await this.updateNode(node.id, (draft) => { draft.sessionFile = sessionFile; });
         },
@@ -1107,6 +1157,8 @@ export class WorkgraphEngine {
     await this.updateNode(node.id, (draft) => {
       draft.sessionFile = outcome.sessionFile;
       draft.processExitCode = outcome.exitCode;
+      if (outcome.resultKind) draft.resultKind = outcome.resultKind;
+      if (outcome.terminalText) draft.terminalText = outcome.terminalText;
       draft.usage = outcome.usage;
       draft.models = outcome.models;
       if (outcome.capabilities) draft.capabilities = outcome.capabilities;
@@ -1139,7 +1191,7 @@ export class WorkgraphEngine {
 
     try {
       const repository = await this.repositoryPromise;
-      const validated = await repository.validateWorkerCommit(placement, node.claimedPaths, outcome.report.commit);
+      const validated = await repository.validateWorkerCommit(placement, outcome.report.commit);
       const verification = await repository.runCommands(node.verificationCommands, placement.path);
       const failedCommand = verification.find((item) => item.exitCode !== 0);
       if (failedCommand) throw new Error(`Node verification failed: ${failedCommand.command}`);
@@ -1434,8 +1486,9 @@ function unavailableModelFailure(outcome: ChildOutcome): boolean {
 function childFailure(outcome: ChildOutcome): string {
   if (outcome.timedOut) return `Child timed out. Session: ${outcome.sessionFile}`;
   if (outcome.report?.summary) return outcome.report.summary;
+  if (outcome.terminalText) return `Child returned prose requiring coordinator review: ${outcome.terminalText}`;
   if (outcome.stderr) return outcome.stderr;
-  return `Child exited ${outcome.exitCode} without a typed report. Session: ${outcome.sessionFile}`;
+  return `Child exited ${outcome.exitCode} without a terminal result. Session: ${outcome.sessionFile}`;
 }
 
 function errorMessage(error: unknown): string {

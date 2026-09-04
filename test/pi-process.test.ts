@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { forkSession, runPiChild, stableParentEntry } from "../src/pi-process.js";
+import { buildChildArguments, forkSession, runPiChild, stableParentEntry } from "../src/pi-process.js";
 
 test("forkSession branches before an unresolved parent tool call and carries the objective", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-workgraph-session-"));
@@ -50,6 +50,38 @@ test("forkSession branches before an unresolved parent tool call and carries the
     assert.ok(objective && objective.role === "custom");
     assert.match(typeof objective.content === "string" ? objective.content : "", /Change only src\/a\.ts/);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("normal child arguments retain the process defaults and explicit assignment model", () => {
+  const args = buildChildArguments({ mode: "discovery", guideModel: "provider/model", guideThinking: "high" }, "/tmp/session.jsonl", []);
+  assert.deepEqual(args, ["--mode", "json", "--print", "--session", "/tmp/session.jsonl", "--model", "provider/model", "--thinking", "high", "Continue the assigned Workgraph objective now."]);
+  assert.equal(args.some((arg) => arg.includes("extensions") || arg.includes("tools") || arg.includes("prompt")), false);
+});
+
+test("a prose-only child result is retained as untyped terminal evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-workgraph-prose-child-"));
+  const previous = process.env.PI_WORKGRAPH_PI_BIN;
+  try {
+    const fakePi = join(root, "fake-pi.sh");
+    await writeFile(fakePi, [
+      "#!/bin/sh",
+      "printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Useful final prose\"}]}}'",
+    ].join("\n"), { mode: 0o755 });
+    process.env.PI_WORKGRAPH_PI_BIN = fakePi;
+    const parent = SessionManager.create(root, join(root, "parent"));
+    parent.appendMessage({ role: "user", content: "Evidence objective", timestamp: Date.now() });
+    parent.appendMessage({ role: "assistant", content: [{ type: "text", text: "Ready." }], api: "openai-responses", provider: "provider", model: "model", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: Date.now() });
+    const parentFile = parent.getSessionFile();
+    assert.ok(parentFile);
+    const outcome = await runPiChild({ parentSessionFile: parentFile, targetCwd: root, sessionDir: join(root, "children"), objective: "Inspect evidence.", mode: "discovery", guideModel: "provider/model", guideThinking: "high", runId: "run", nodeId: "child" });
+    assert.equal(outcome.resultKind, "untyped");
+    assert.equal(outcome.terminalText, "Useful final prose");
+    assert.equal(outcome.report, undefined);
+  } finally {
+    if (previous === undefined) delete process.env.PI_WORKGRAPH_PI_BIN;
+    else process.env.PI_WORKGRAPH_PI_BIN = previous;
     await rm(root, { recursive: true, force: true });
   }
 });

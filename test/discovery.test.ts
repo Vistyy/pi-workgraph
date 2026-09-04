@@ -8,11 +8,11 @@ import { commandAgreement, testOutcome, zeroUsage } from "./helpers.js";
 
 const failedDiscovery: ChildRunner = async (request) => ({
   exitCode: 0,
-  sessionFile: join(request.sessionDir, "failed.jsonl"),
+  sessionFile: join(request.sessionDir, `${request.nodeId}.jsonl`),
   report: {
     kind: "discovery",
-    status: "failed",
-    summary: "Evidence unavailable.",
+    status: request.nodeId === "history-retry" ? "completed" : "failed",
+    summary: request.nodeId === "history-retry" ? "Evidence established." : "Evidence unavailable.",
     evidence: [],
     findings: [],
   },
@@ -60,6 +60,7 @@ test("discovery accounts for a failed lane without silently shrinking the reques
     });
     assert.equal(retried.discoveries.find((record) => record.id === "history")?.state, "superseded");
     assert.equal(retried.discoveries.find((record) => record.id === "history")?.supersededBy, "history-retry");
+    assert.equal(retried.discoveries.find((record) => record.id === "history-retry")?.state, "completed");
 
     const { approvedAt: _approvedAt, ...agreement } = commandAgreement;
     const approved = await begun.engine.recordAgreement(agreement, true, "checkpoint");

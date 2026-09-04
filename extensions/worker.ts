@@ -1,8 +1,6 @@
-import { relative, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { pathIsClaimed } from "../src/scheduler.js";
 import type {
   AssuranceResponsibility,
   EnvelopeImpact,
@@ -11,14 +9,14 @@ import type {
   WorkerReport,
 } from "../src/types.js";
 
-const mode = readMode();
+const configuredMode = readMode();
+const mode = configuredMode ?? "discovery";
 const runId = process.env.PI_WORKGRAPH_RUN_ID || "unknown-run";
 const nodeId = process.env.PI_WORKGRAPH_NODE_ID || "unknown-node";
 const responsibility = process.env.PI_WORKGRAPH_RESPONSIBILITY || "";
 const executorModel = process.env.PI_WORKGRAPH_EXECUTOR_MODEL || "";
 const executorThinking = process.env.PI_WORKGRAPH_EXECUTOR_THINKING || "high";
 const baseCommit = process.env.PI_WORKGRAPH_BASE_COMMIT || "";
-const allowedPaths = readAllowedPaths();
 const startInExecutor = process.env.PI_WORKGRAPH_IMPLEMENTATION_START === "executor";
 
 const StatusSchema = StringEnum(["completed", "escalated", "failed"] as const);
@@ -128,6 +126,7 @@ const TodoSchema = Type.Object({
 });
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
+  if (!configuredMode) return;
   let phase: "guide" | "executor" = mode === "implementation" && !startInExecutor ? "guide" : "executor";
   let todos: string[] = [];
   let switchError: string | undefined;
@@ -173,8 +172,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         if (commit === baseCommit) throw new Error("A completed implementation requires one new commit.");
         const changedText = await git(pi, ctx.cwd, ["diff", "--name-only", "--no-renames", baseCommit, commit], true);
         const changedFiles = changedText ? changedText.split("\n").filter(Boolean).sort() : [];
-        const outside = changedFiles.filter((path) => !pathIsClaimed(path, allowedPaths));
-        if (outside.length > 0) throw new Error(`Changed files exceed this node's claimed paths: ${outside.join(", ")}`);
         const report: ImplementationReport = { ...params, commit, changedFiles };
         return terminalReport(report, { todos, switchedAt, continued: startInExecutor });
       }
@@ -185,51 +182,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       }
       return terminalReport(params as WorkerReport, { todos, switchedAt, switchError });
     },
-  });
-
-  pi.on("tool_call", async (event, ctx) => {
-    if (event.toolName === "workgraph_report") {
-      const status = (event.input as { status?: string }).status;
-      if (mode === "implementation" && status === "completed" && phase !== "executor") {
-        return { block: true, reason: "Complete the first-edit model transition before reporting completion." };
-      }
-      return;
-    }
-
-    if (mode !== "implementation") {
-      if (event.toolName === "edit" || event.toolName === "write") {
-        return { block: true, reason: `${mode} assignments cannot edit product files.` };
-      }
-      if (event.toolName === "bash" && mode !== "verification" && !isReadOnlyCommand(String((event.input as { command?: unknown }).command ?? ""))) {
-        return { block: true, reason: `${mode} assignments permit only simple read-only shell commands.` };
-      }
-      if (event.toolName === "bash" && forbiddenGitControlCommand(String((event.input as { command?: unknown }).command ?? ""))) {
-        return { block: true, reason: "Workgraph reviewers cannot rewrite repository history or manage worktrees." };
-      }
-      return;
-    }
-
-    if (event.toolName === "edit" || event.toolName === "write") {
-      if (phase === "guide" && todos.length === 0) {
-        return { block: true, reason: "Record a bounded TODO list with workgraph_todo before the first edit." };
-      }
-      const rawPath = (event.input as { path?: unknown }).path;
-      if (typeof rawPath !== "string") return { block: true, reason: "A file mutation requires a path." };
-      const path = repositoryRelativePath(ctx.cwd, rawPath);
-      if (!path || !pathIsClaimed(path, allowedPaths)) {
-        return { block: true, reason: `Path ${rawPath} is outside this node's claimed paths: ${allowedPaths.join(", ")}` };
-      }
-    }
-
-    if (event.toolName === "bash") {
-      const command = String((event.input as { command?: unknown }).command ?? "");
-      if (phase === "guide" && !isReadOnlyCommand(command)) {
-        return { block: true, reason: "The guide phase is read-only except for the first edit through edit or write." };
-      }
-      if (forbiddenGitControlCommand(command)) {
-        return { block: true, reason: "Worker branches cannot rewrite history, change branches, or manage worktrees." };
-      }
-    }
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
@@ -304,7 +256,7 @@ function modeInstructions(): string {
     return `[WORKGRAPH ASSURANCE SYNTHESIS]\nReconcile the three responsibility reports without inventing findings.\nDismiss duplicate, impossible, immaterial, speculative, stylistic, or unsupported findings.\nClassify a supported but non-required improvement as optional.\nAccept only findings whose invariant, evidence, reachable scenario, consequence, and simplest response establish required correction work.\nPrefer deletion and simpler ownership over additive correction.\nAPPROVE with no findings is valid.\nClassify an accepted envelope-changing finding as needs_decision and an accepted internal correction as revision_required.`;
   }
   if (startInExecutor) return executorInstructions();
-  return `[WORKGRAPH LOCAL PREWALK - GUIDE PHASE]\nStay within node ${nodeId} and claimed path prefixes: ${allowedPaths.join(", ")}.\nInspect the inherited trajectory and current worktree before deciding how to proceed.\nCall workgraph_todo with no more than eight concrete local items.\nThen make the smallest useful first edit through edit or write.\nThe runtime will switch models after that edit.\nIf evidence requires changing the approved envelope, do not edit and report an escalation instead.\nDo not report completion during the guide phase.`;
+  return `[WORKGRAPH LOCAL PREWALK - GUIDE PHASE]\nInspect the inherited trajectory and current worktree before deciding how to proceed.\nCall workgraph_todo with no more than eight concrete local items.\nThen make the smallest useful first edit through edit or write.\nThe runtime will switch models after that edit.\nIf evidence requires changing the approved envelope, do not edit and report an escalation instead.\nDo not report completion during the guide phase.`;
 }
 
 function assuranceReviewInstructions(role: AssuranceResponsibility): string {
@@ -317,7 +269,7 @@ function assuranceReviewInstructions(role: AssuranceResponsibility): string {
 }
 
 function executorInstructions(): string {
-  return `[WORKGRAPH EXECUTOR PHASE]\nContinue the same node trajectory${startInExecutor ? " from the retained implementer session" : " after the guide's first edit"}.\nComplete only the bounded brief for node ${nodeId} within: ${allowedPaths.join(", ")}.\nRun the node verification commands from the objective.\nCreate exactly one commit directly on the provided worker branch and leave the worktree clean.\nThen return a completed implementation report with evidence.\nIf a required change crosses the approved envelope, stop and report an escalation.`;
+  return `[WORKGRAPH EXECUTOR PHASE]\nContinue the same node trajectory${startInExecutor ? " from the retained implementer session" : " after the guide's first edit"}.\nComplete only the bounded brief for node ${nodeId}.\nRun the node verification commands from the objective.\nCreate exactly one commit directly on the provided worker branch and leave the worktree clean.\nThen return a completed implementation report with evidence.\nIf a required change crosses the approved envelope, stop and report an escalation.`;
 }
 
 async function git(pi: ExtensionAPI, cwd: string, args: string[], allowEmpty = false): Promise<string> {
@@ -328,43 +280,17 @@ async function git(pi: ExtensionAPI, cwd: string, args: string[], allowEmpty = f
   return output;
 }
 
-function repositoryRelativePath(cwd: string, rawPath: string): string | undefined {
-  const absolute = resolve(cwd, rawPath.replace(/^@/, ""));
-  const path = relative(cwd, absolute).replaceAll("\\", "/");
-  if (!path || path === ".." || path.startsWith("../")) return undefined;
-  return path;
-}
-
-function isReadOnlyCommand(command: string): boolean {
-  const trimmed = command.trim();
-  if (!trimmed || /[;&|><`\n]/.test(trimmed) || /\$\(/.test(trimmed) || /(?:^|\s)(?:--output(?:=|\s)|-o(?:\s|$))/.test(trimmed)) return false;
-  return /^(pwd|ls|grep|cat|head|tail|wc|stat|file|du|git\s+(status|diff|show|log|rev-parse|ls-files|branch\s+--show-current))\b/.test(trimmed);
-}
-
-function forbiddenGitControlCommand(command: string): boolean {
-  return /\bgit\s+(apply|checkout|switch|reset|restore|rm|mv|clean|rebase|merge|cherry-pick|worktree|branch\s+(-[dDmM]|--delete|--move))\b/.test(command);
-}
-
 function splitModel(selector: string): [string, string] {
   const slash = selector.indexOf("/");
   if (slash <= 0 || slash === selector.length - 1) throw new Error(`Model selector must be provider/model: ${selector}`);
   return [selector.slice(0, slash), selector.slice(slash + 1)];
 }
 
-function readMode(): WorkerMode {
+function readMode(): WorkerMode | undefined {
   const value = process.env.PI_WORKGRAPH_MODE;
+  if (!value) return undefined;
   if (value === "discovery" || value === "implementation" || value === "verification" || value === "assurance_review" || value === "assurance_synthesis") return value;
-  throw new Error(`Invalid PI_WORKGRAPH_MODE: ${value ?? "(missing)"}`);
-}
-
-function readAllowedPaths(): string[] {
-  try {
-    const parsed = JSON.parse(process.env.PI_WORKGRAPH_ALLOWED_PATHS || "[]") as unknown;
-    if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== "string")) throw new Error();
-    return parsed;
-  } catch {
-    throw new Error("PI_WORKGRAPH_ALLOWED_PATHS must be a JSON string array.");
-  }
+  throw new Error(`Invalid PI_WORKGRAPH_MODE: ${value}`);
 }
 
 export function isEnvelopeChangingFinding(impact: EnvelopeImpact): boolean {

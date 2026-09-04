@@ -174,7 +174,7 @@ test("engine composes isolated commits, verifies the exact result, and runs resp
   }
 });
 
-test("scheduler rejects a committed file outside the worker's claimed paths", async () => {
+test("scheduler claims coordinate waves without rejecting committed files", async () => {
   const { parent, root, repository } = await fixture();
   const child: ChildRunner = async (request) => {
     await writeFile(join(request.targetCwd, "src", "b.txt"), "outside-claim\n");
@@ -200,10 +200,9 @@ test("scheduler rejects a committed file outside the worker's claimed paths", as
       run.phase = "approved";
     });
     const run = await begun.engine.execute({ nodes: [nodeSpec("claimed", ["src/a.txt"])] });
-    assert.equal(run.phase, "revision_required");
-    assert.equal(run.nodes[0]!.state, "failed");
-    assert.match(run.nodes[0]!.error ?? "", /outside its claimed paths/);
-    assert.equal(await readFile(join(root, "src", "b.txt"), "utf8"), "old-b\n");
+    assert.equal(run.phase, "awaiting_assurance");
+    assert.equal(run.nodes[0]!.state, "composed");
+    assert.equal(await readFile(join(root, "src", "b.txt"), "utf8"), "outside-claim\n");
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
