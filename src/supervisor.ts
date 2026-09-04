@@ -80,6 +80,20 @@ export class WorkgraphSupervisor {
     return this.active;
   }
 
+  async cleanupNow(): Promise<WorkgraphRun> {
+    if (this.active) return this.active;
+    this.active = this.reconcileCleanupOnly().finally(() => { this.active = undefined; });
+    return this.active;
+  }
+
+  private async reconcileCleanupOnly(): Promise<WorkgraphRun> {
+    let run = await this.engine.load();
+    await this.ensureCleanupIntents(run);
+    run = await this.engine.load();
+    await this.processCleanup(run);
+    return this.engine.load();
+  }
+
   private async reconcileAndAdvance(): Promise<WorkgraphRun> {
     this.engine.heartbeatLease();
     let run = await this.engine.load();

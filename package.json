@@ -4,6 +4,9 @@
   "type": "module",
   "description": "Outcome-driven, evidence-backed workgraph orchestration for Pi.",
   "license": "MIT",
+  "bin": {
+    "pi-workgraph": "./bin/pi-workgraph.mjs"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -11,6 +14,7 @@
     "worktree"
   ],
   "files": [
+    "bin",
     "extensions",
     "src",
     "skills",
@@ -22,6 +26,7 @@
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "check": "pnpm typecheck && pnpm test",
+    "smoke:herdr": "node --import tsx scripts/herdr-smoke.ts",
     "smoke:real": "node --import tsx scripts/real-smoke.ts",
     "smoke:coordinator": "node --import tsx scripts/coordinator-smoke.ts"
   },
@@ -34,6 +39,9 @@
       "./skills"
     ]
   },
+  "dependencies": {
+    "tsx": "^4.23.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
@@ -43,7 +51,6 @@
     "@earendil-works/pi-ai": "0.84.4",
     "@earendil-works/pi-coding-agent": "0.84.4",
     "@types/node": "^24.0.0",
-    "tsx": "^4.23.0",
     "typebox": "^1.0.0",
     "typescript": "^5.9.0"
   }

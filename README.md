@@ -1,12 +1,12 @@
 # Pi Workgraph
 
-Pi Workgraph is an outcome-driven local orchestrator for consequential repository work.
+Pi Workgraph is a durable local orchestrator for consequential repository work.
 
-It keeps one coordinator conversation while bounded discovery, isolated product changes, exact-revision verification, and assurance run in inherited Pi session forks.
+It keeps one coordinator conversation while discovery, isolated implementation, exact-revision verification, assurance, and lifecycle recovery are recorded in the repository's Workgraph state.
 
-## Use
+## Use the Pi package
 
-Install dependencies and run the deterministic gate.
+Install dependencies and run the deterministic checks.
 
 ```bash
 pnpm install
@@ -19,35 +19,68 @@ Run Pi from the repository you want to change and load this package.
 pi -e /absolute/path/to/pi-workgraph
 ```
 
-Begin a run with an explicit outcome kind, outcome statement, and completion predicate.
-The supported kinds are `answer`, `decision`, `product_change`, and `operation`.
-A run may declare zero or more concrete task milestones.
+Start a run with `workgraph_begin` when the request has material ambiguity or structural consequence.
 
-Answer, decision, and operation runs finish through typed evidence and a coordinator conclusion without claiming implementation.
-Product-change runs require agreement before writes, isolated bounded nodes, deterministic exact-commit composition, exact-revision verification, assurance, and final judgment.
+The run records an outcome kind, outcome statement, completion predicate, optional milestones, plans, attempts, evidence, and final judgment.
+
+The coordinator remains a normal Pi session with its configured tools, extensions, skills, and prompt templates.
+
+Worker sessions are ordinary Pi sessions launched in visible Herdr panes with an isolated Git worktree.
+
+A worker reports one typed terminal result, and the supervisor records its Herdr identity, session, model provenance, timing, heartbeat, and resource cleanup state.
+
+Product-change execution requires a conversational agreement and an approved versioned plan before delegated writes.
+
+There is no modal approval dialog and no hidden worker fallback.
+
+## Command fallback
+
+The `pi-workgraph` executable exposes the same durable registry, state, Git, session, and Herdr services when a Pi tool call is not convenient.
+
+```bash
+pi-workgraph status --run-id RUN_ID
+pi-workgraph adopt --run-id RUN_ID --session-id SESSION_ID --session-file SESSION_FILE
+pi-workgraph fork --parent-session-file SESSION_FILE --target-cwd PATH --workspace WORKSPACE_ID
+pi-workgraph suspend --run-id RUN_ID --reason "Pause for review"
+pi-workgraph resume --run-id RUN_ID --reason "Review complete"
+pi-workgraph abandon --run-id RUN_ID --reason "Stop this run"
+pi-workgraph archive --run-id RUN_ID --reason "Archive settled state"
+pi-workgraph recovery --run-id RUN_ID
+pi-workgraph cleanup --run-id RUN_ID
+```
+
+Use `--registry PATH` with an isolated registry and `--state PATH` when operating on a state file directly.
+
+Command results are JSON on stdout, and command failures are JSON on stderr with a non-zero exit code.
+
+Adoption uses the supplied current session identity and never forks a replacement session.
+
+Forking requires a visible Herdr workspace and starts a normal Pi coordinator with the selected conversation branch and target working directory.
 
 ## Skills
 
-The package exposes sixteen optional composable procedure skills and Workgraph-owned verification skills through Pi's native `pi.skills` package manifest.
-Verification guidance prefers repository-native harnesses, then a project-local verification skill, then the appropriate browser or CLI/TUI control skill.
-Unavailable control surfaces produce inconclusive verification.
+The package exposes composable Workgraph procedure skills and Workgraph-owned verification guidance through Pi's native package manifest.
 
-## Child runtime
+Procedure skills provide guidance only and do not own runtime state or lifecycle transitions.
 
-Assignment sessions use ordinary Pi resource discovery and retain the normal configured tools, extensions, skills, and prompt templates.
-Workgraph roles are identified through the assignment environment so coordinator tools do not appear in worker sessions.
-Each child records its session, terminal result, usage, and model provenance in durable run state.
+Verification guidance prefers repository-native checks, then a project-local verification skill, then the appropriate live CLI, TUI, browser, or trace surface.
 
-Repository-local configuration cannot inject executable child extensions, and third-party identities are never represented by installed `node_modules` paths.
+Unavailable required control surfaces produce inconclusive verification.
 
 ## Verification
 
 ```bash
 pnpm check
 pnpm pack --dry-run
+pnpm smoke:herdr
 pnpm smoke:real
 pnpm smoke:coordinator
 ```
 
-The deterministic checks use disposable repositories and fake child outcomes where model variability would obscure engine behavior.
-The smoke commands exercise the direct engine and coordinator package boundaries when configured models are authenticated.
+`smoke:herdr` creates a disposable Git repository, an isolated Workgraph registry, and a new Herdr workspace.
+
+It exercises command fallback, visible coordinator identity, shell resources, worktree isolation, recovery, interruption, lifecycle, and identity-checked cleanup.
+
+It closes only the workspace, tabs, and workers created by that invocation.
+
+The other smoke commands exercise direct engine and coordinator package boundaries when configured models are authenticated.

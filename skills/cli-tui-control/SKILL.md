@@ -5,7 +5,7 @@ description: Verify CLI and TUI behavior through the Herdr control surface when 
 
 # CLI and TUI control
 
-Use Herdr only when it is installed and reachable through the approved child capability.
+Use Herdr when it is installed and the current agent is running inside a Herdr-managed pane.
 Launch or attach through the project's supported procedure, drive the user-facing scenario, and retain command output, screen observations, and stored evidence.
 Do not edit product files during verification.
-Return inconclusive with the unavailable capability and required next action when Herdr is unavailable.
+Return inconclusive with the unavailable Herdr capability and required next action when Herdr is unavailable.
