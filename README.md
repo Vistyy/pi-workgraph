@@ -77,10 +77,20 @@ pnpm smoke:real
 pnpm smoke:coordinator
 ```
 
-`smoke:herdr` creates a disposable Git repository, an isolated Workgraph registry, and a new Herdr workspace.
+Run all three smoke commands from a Herdr-managed pane.
 
-It exercises command fallback, visible coordinator identity, shell resources, worktree isolation, recovery, interruption, lifecycle, and identity-checked cleanup.
+`smoke:herdr` exercises command fallback, unnamed current-session coordinator rebind, visible session identity, worktree isolation, recovery, interruption, lifecycle, and exact cleanup ordering with a live worker.
 
-It closes only the workspace, tabs, and workers created by that invocation.
+`smoke:real` exercises the asynchronous engine and supervisor path with replicated discovery, two concurrent visible implementations, exact composition, command verification, assurance, final judgment, durable coordinator wakes, and recorded Herdr-before-Git cleanup.
 
-The other smoke commands exercise direct engine and coordinator package boundaries when configured models are authenticated.
+Implementation workers may record a bounded Local Prewalk TODO list before their first edit, and completed reports record whether that telemetry was supplied without making it a completion prerequisite.
+
+`smoke:coordinator` starts an isolated Pi RPC coordinator with the candidate extension explicitly loaded.
+
+The harness sends only the initial request and the exact `approved` reply, while durable coordinator wakes resume settlement, independent verification, assurance, and judgment without manual nudges.
+
+The model-backed smokes require authenticated configured models.
+
+Each smoke creates a disposable Git repository, isolated registry, and new Herdr workspace, then removes only the exact resources created by that invocation.
+
+The real smoke fails promptly with retained node and attempt diagnostics when the supervisor becomes idle with unresolved implementation work.

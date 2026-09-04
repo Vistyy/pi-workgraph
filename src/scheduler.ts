@@ -31,8 +31,8 @@ export function addNodes(run: WorkgraphRun, specs: WorkNodeSpec[]): WorkNode[] {
       if (replacements.has(supersededId)) throw new Error(`Work node ${supersededId} has more than one replacement.`);
       const superseded = run.nodes.find((node) => node.id === supersededId);
       if (!superseded) throw new Error(`Work node ${spec.id} cannot supersede unknown node ${supersededId}.`);
-      if (superseded.state !== "failed" && superseded.state !== "escalated") {
-        throw new Error(`Work node ${spec.id} can only supersede a failed or escalated node, not ${supersededId} in ${superseded.state}.`);
+      if (superseded.state !== "failed" && superseded.state !== "escalated" && superseded.state !== "cancelled") {
+        throw new Error(`Work node ${spec.id} can only supersede a failed, escalated, or cancelled node, not ${supersededId} in ${superseded.state}.`);
       }
       replacements.set(supersededId, spec.id);
     }

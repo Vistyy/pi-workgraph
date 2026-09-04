@@ -28,6 +28,12 @@ Scheduling persists the execution intent and returns before visible workers sett
 
 A background supervisor launches visible Herdr workers, reconciles their observations, settles typed reports, and records uncertain results for review.
 
+Implementation workers can retain bounded Local Prewalk TODO telemetry without making that optional telemetry a prerequisite for a valid committed report.
+
+Semantic coordinator boundaries are retained as durable deduplicated wake records, and the active coordinator receives an automatic follow-up when asynchronous work reaches a decision boundary.
+
+Completed attempts retain separate Herdr and Git cleanup records, with exact Herdr closure verified before clean worktree and branch removal.
+
 Pause defaults to draining active work, while immediate cancellation sends one Escape to the exact recorded worker and waits for a verified settled state.
 
 Lifecycle transitions are explicit, and inactivity never abandons a run.
@@ -52,6 +58,12 @@ The retained gates are `pnpm check`, `pnpm pack --dry-run`, `pnpm smoke:herdr`, 
 
 The deterministic suite protects outcome contracts, milestone persistence, child accounting, ordinary resource loading, exact composition, recovery, evidence routing, assurance, lifecycle, and final judgment.
 
-The bounded Herdr smoke uses disposable resources and exact identity checks for the live runtime boundary.
+The bounded Herdr smoke uses disposable resources to exercise unnamed current-session rebind and verify exact Herdr-before-Git cleanup with a live worker.
 
-The model-backed smokes exercise direct engine and coordinator package boundaries when credentials are available.
+The real smoke drives asynchronous replicated discovery, concurrent visible implementation, command verification, assurance, final judgment, coordinator wakes, and cleanup through the engine and supervisor boundary.
+
+The coordinator smoke drives the current extension in an isolated Pi RPC process with one initial request and one approval reply, then requires automatic wake continuation through independent verification and final judgment.
+
+The model-backed smokes require authenticated configured models and a Herdr-managed environment.
+
+The real smoke reports unresolved failed or escalated implementation work promptly when execution is idle instead of waiting for its general timeout.

@@ -93,27 +93,35 @@ try {
   if ((adopted.result as { forked?: boolean } | undefined)?.forked !== false || adopted.run?.coordinator.sessionFile !== parentSessionFile) throw new Error("CLI adoption forked or changed the current session path.");
   assertDuplicateLease(registry, begun.run.runId, parentSessionFile);
   observations.push("status, unchanged-session adoption, and duplicate lease refusal passed");
+  begun.engine.releaseLease();
 
   const runtime = new HerdrCliRuntime();
-  const childSession = await (async () => {
-    const child = SessionManager.forkFrom(parentSessionFile, root, join(parent, "forked-sessions"));
-    const file = child.getSessionFile();
-    if (!file) throw new Error("Forked coordinator session did not produce a file.");
-    return file;
-  })();
+  const childManager = SessionManager.forkFrom(parentSessionFile, root, join(parent, "forked-sessions"));
+  const childSession = childManager.getSessionFile();
+  if (!childSession) throw new Error("Forked coordinator session did not produce a file.");
   coordinator = await runtime.launchCoordinator({ workspaceId, cwd: root, sessionFile: childSession });
   createdTabs.push(coordinator.tabId);
+  await herdr("agent", "rename", coordinator.paneId, "--clear");
+  const rebound = await runCli([
+    "adopt", "--run-id", begun.run.runId, "--registry", registryPath, "--cwd", root,
+    "--session-id", childManager.getSessionId(), "--session-file", childSession, "--liveness", "dead",
+  ], { ...process.env, HERDR_ENV: "1", HERDR_WORKSPACE_ID: workspaceId, HERDR_PANE_ID: coordinator.paneId });
+  if ((rebound.result as { forked?: boolean } | undefined)?.forked !== false) throw new Error("Recovered current-session adoption forked the coordinator.");
+  if (rebound.run?.coordinator.runtimeIdentity?.paneId !== coordinator.paneId || rebound.run.coordinator.runtimeIdentity.agentName !== undefined) throw new Error("Recovered unnamed coordinator pane was not retained exactly.");
+  await herdr("agent", "rename", coordinator.paneId, coordinator.agentName);
   const coordinatorObservation = await runtime.observe(coordinator);
   if (coordinatorObservation.identity.sessionFile !== childSession || coordinatorObservation.identity.cwd !== root) throw new Error("Coordinator identity did not retain normal Pi session and cwd.");
-  observations.push(`normal coordinator argv/config retained session ${childSession}`);
+  observations.push(`unnamed current-session rebind and normal coordinator identity passed for ${childSession}`);
 
-  const tab = await herdr("tab", "create", "--workspace", workspaceId, "--cwd", root, "--label", "Workgraph smoke shell", "--no-focus");
+  const base = await repository.head();
+  const placement = await repository.createWorktree(begun.run.runId, "isolation", base);
+  const tab = await herdr("tab", "create", "--workspace", workspaceId, "--cwd", placement.path, "--label", "Workgraph smoke shell", "--no-focus");
   const tabId = String(tab.result.tab.tab_id ?? tab.result.tab.id);
   const paneId = String(tab.result.root_pane.pane_id);
   createdTabs.push(tabId);
   await herdr("pane", "run", paneId, "printf 'workgraph-smoke-shell\\n'");
   await herdr("pane", "wait-output", paneId, "--match", "workgraph-smoke-shell", "--timeout", "10000");
-  const workerSessionManager = SessionManager.forkFrom(parentSessionFile, root, join(parent, "worker-sessions"));
+  const workerSessionManager = SessionManager.forkFrom(parentSessionFile, placement.path, join(parent, "worker-sessions"));
   const workerSessionFile = workerSessionManager.getSessionFile();
   if (!workerSessionFile) throw new Error("Worker session fork did not produce a file.");
   const workerName = `wg-smoke-${workspaceId.toLowerCase()}`;
@@ -129,8 +137,8 @@ try {
     cwd: String(agent.cwd),
   };
   const workerObservation = await runtime.observe(worker);
-  if (workerObservation.identity.sessionFile !== workerSessionFile || workerObservation.identity.cwd !== root) throw new Error("Worker did not retain its normal Pi session and cwd.");
-  observations.push("normal Herdr shell resources and Pi worker session passed");
+  if (workerObservation.identity.sessionFile !== workerSessionFile || workerObservation.identity.cwd !== placement.path) throw new Error("Worker did not retain its normal Pi session and isolated cwd.");
+  observations.push("normal Herdr shell resources and isolated Pi worker session passed");
 
   const proseSession = SessionManager.create(root, join(parent, "prose-sessions"));
   proseSession.appendMessage({ role: "user", content: "Retain this terminal result.", timestamp: Date.now() });
@@ -139,11 +147,35 @@ try {
   if (!proseFile || readTerminalText(proseFile) !== "Useful final prose retained by recovery.") throw new Error("Prose-only terminal evidence was not retained.");
   observations.push("prose-only terminal evidence retention passed");
 
-  const base = await repository.head();
-  const placement = await repository.createWorktree(begun.run.runId, "isolation", base);
   if (placement.path === root || (await repository.head()) !== base) throw new Error("Worktree isolation changed the disposable coordinator checkout.");
-  await repository.cleanupWorktree(placement, base);
-  observations.push("worktree isolation and exact cleanup passed");
+  await begun.engine.store.update((run) => {
+    run.attempts.push({
+      id: "live-cleanup-attempt",
+      nodeId: "live-cleanup",
+      mode: "implementation",
+      planVersion: 0,
+      state: "completed",
+      stage: "settled",
+      runtimeMode: "herdr",
+      createdAt: new Date().toISOString(),
+      settledAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      baseCommit: placement.baseCommit,
+      branch: placement.branch,
+      worktreePath: placement.path,
+      sessionFile: workerSessionFile,
+      agentName: worker!.agentName,
+      worker: { ...worker! },
+    });
+  });
+  const cleanupRun = await new WorkgraphSupervisor(begun.engine, runtime, { workspaceId }).cleanupNow();
+  const workerCleanup = cleanupRun.cleanup?.filter((record) => record.attemptId === "live-cleanup-attempt") ?? [];
+  const herdrCleanup = workerCleanup.find((record) => record.kind === "herdr_worker");
+  const gitCleanup = workerCleanup.find((record) => record.kind === "git_worktree");
+  if (herdrCleanup?.state !== "completed" || gitCleanup?.state !== "completed") throw new Error(`Ordered cleanup did not complete: ${JSON.stringify(workerCleanup)}`);
+  if (!herdrCleanup.completedAt || !gitCleanup.completedAt || herdrCleanup.completedAt > gitCleanup.completedAt) throw new Error("Git cleanup completed before exact Herdr cleanup.");
+  worker = undefined;
+  observations.push("exact Herdr closure preceded clean worktree removal and retained both records");
 
   await begun.engine.store.update((run) => { run.phase = "discovery"; });
   await expectRejected(begun.engine.execute({ nodes: [], maxConcurrency: 1 }), "expected approved");
@@ -155,9 +187,6 @@ try {
   const interrupted = await runtime.interrupt(coordinator);
   if (interrupted.identity.agentName !== coordinator.agentName) throw new Error("Interruption changed the exact coordinator identity.");
   await expectRejected(runtime.cleanup(identityWithPane(coordinator, `${coordinator.paneId}-mismatch`)), "agent");
-  const cleanedWorker = await runtime.cleanup(worker);
-  if (cleanedWorker.state !== "completed") throw new Error("Exact worker cleanup did not complete.");
-  worker = undefined;
   const cleanedCoordinator = await runtime.cleanup(coordinator);
   if (cleanedCoordinator.state !== "completed") throw new Error("Exact coordinator cleanup did not complete.");
   coordinator = undefined;

@@ -139,7 +139,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     parameters: TodoSchema,
     async execute(_toolCallId, params) {
       if (mode !== "implementation") throw new Error("workgraph_todo is only available during implementation.");
-      if (phase !== "guide") throw new Error("The Local Prewalk TODO list is already fixed for this assignment.");
+      if (phase !== "guide") throw new Error("A Local Prewalk TODO list can only be recorded before the first edit.");
       todos = [...params.items];
       pi.appendEntry("pi-workgraph-worker-state", { runId, nodeId, phase, todos });
       return {
@@ -162,7 +162,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         if (invalidId) throw new Error(`Assurance finding ids must start with ${responsibility}-: ${invalidId.id}`);
       }
       if (mode === "implementation" && params.kind === mode && params.status === "completed") {
-        if (!startInExecutor && todos.length === 0) throw new Error("A completed implementation requires a Local Prewalk TODO list.");
         if (phase !== "executor") throw new Error("A completed implementation can only be reported after the first-edit model transition.");
         if (switchError) throw new Error(`Executor model transition failed: ${switchError}`);
         if (!baseCommit) throw new Error("PI_WORKGRAPH_BASE_COMMIT is required for implementation reports.");
@@ -173,7 +172,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         const changedText = await git(pi, ctx.cwd, ["diff", "--name-only", "--no-renames", baseCommit, commit], true);
         const changedFiles = changedText ? changedText.split("\n").filter(Boolean).sort() : [];
         const report: ImplementationReport = { ...params, commit, changedFiles };
-        return terminalReport(report, { todos, switchedAt, continued: startInExecutor });
+        return terminalReport(report, { todos, todoRecorded: todos.length > 0, switchedAt, continued: startInExecutor });
       }
 
       if (mode !== "implementation") {
@@ -242,13 +241,15 @@ function terminalReport(report: WorkerReport, state: Record<string, unknown>) {
   };
 }
 
+export function verificationWorkerInstructions(): string {
+  return `[WORKGRAPH PRODUCT VERIFICATION - ASSIGNED VERIFIER]\nThis session is already the independent product-verification worker assigned by Workgraph for the objective.\nDirectly execute the supplied verification procedure and report what you observe.\nDo not create, adopt, plan, schedule, verify, assure, judge, or otherwise coordinate another Workgraph, and do not delegate this assignment.\nDo not edit product files.\nUse the real product surface when commands alone cannot prove the behavior.\nRecord concrete artifacts such as screenshots, browser state, console or network output, traces, profiles, or stored values.\nDo not favor a verified verdict: return failed, inconclusive, or escalated when the observations warrant it.\nReturn inconclusive when the required browser, CLI, or TUI control surface is unavailable.\nReturn verified only when the evidence directly establishes the required scenarios.`;
+}
+
 function modeInstructions(): string {
   if (mode === "discovery") {
     return `[WORKGRAPH DISCOVERY]\nInvestigate only the assigned responsibility.\nUse read-only repository evidence and classify each item as direct, inference, conflict, or unknown.\nFor blast-radius-sensitive changes, identify and prove the external safety fact at the actual dependent boundary.\nDo not implement, edit files, or expand the question.\nFinish with a concise discovery report and account for unknowns that could change the implementation envelope.`;
   }
-  if (mode === "verification") {
-    return `[WORKGRAPH PRODUCT VERIFICATION]\nObserve the composed revision through the procedure in the objective.\nDo not edit product files.\nUse the real product surface when commands alone cannot prove the behavior.\nRecord concrete artifacts such as screenshots, browser state, console or network output, traces, profiles, or stored values.\nReturn inconclusive when the required browser, CLI, or TUI control surface is unavailable.\nReturn verified only when the evidence directly establishes the required scenarios.`;
-  }
+  if (mode === "verification") return verificationWorkerInstructions();
   if (mode === "assurance_review") {
     return assuranceReviewInstructions(responsibility as AssuranceResponsibility);
   }
@@ -256,7 +257,7 @@ function modeInstructions(): string {
     return `[WORKGRAPH ASSURANCE SYNTHESIS]\nReconcile the three responsibility reports without inventing findings.\nDismiss duplicate, impossible, immaterial, speculative, stylistic, or unsupported findings.\nClassify a supported but non-required improvement as optional.\nAccept only findings whose invariant, evidence, reachable scenario, consequence, and simplest response establish required correction work.\nPrefer deletion and simpler ownership over additive correction.\nAPPROVE with no findings is valid.\nClassify an accepted envelope-changing finding as needs_decision and an accepted internal correction as revision_required.`;
   }
   if (startInExecutor) return executorInstructions();
-  return `[WORKGRAPH LOCAL PREWALK - GUIDE PHASE]\nInspect the inherited trajectory and current worktree before deciding how to proceed.\nCall workgraph_todo with no more than eight concrete local items.\nThen make the smallest useful first edit through edit or write.\nThe runtime will switch models after that edit.\nIf evidence requires changing the approved envelope, do not edit and report an escalation instead.\nDo not report completion during the guide phase.`;
+  return `[WORKGRAPH LOCAL PREWALK - GUIDE PHASE]\nInspect the inherited trajectory and current worktree before deciding how to proceed.\nBefore the first edit, call workgraph_todo with no more than eight concrete local items.\nIf omitted, the report will honestly record that no Local Prewalk TODO list was supplied instead of blocking an otherwise valid implementation.\nThen make the smallest useful first edit through edit or write.\nThe runtime will switch models after that edit.\nIf evidence requires changing the approved envelope, do not edit and report an escalation instead.\nDo not report completion during the guide phase.`;
 }
 
 function assuranceReviewInstructions(role: AssuranceResponsibility): string {
