@@ -96,7 +96,7 @@ export class WorkgraphEngine {
     if (!input.request.trim()) throw new Error("A Workgraph request is required.");
     if (!input.outcome.statement.trim()) throw new Error("An explicit outcome statement is required.");
     if (!input.outcome.completionPredicate.trim()) throw new Error("A checkable completion predicate is required.");
-    if (input.outcome.kind === "product_change" && input.milestones?.some((milestone) => !milestone.description.trim())) throw new Error("Milestone descriptions are required.");
+    if (input.milestones?.some((milestone) => !milestone.description.trim())) throw new Error("Milestone descriptions are required.");
     const ids = new Set<string>();
     for (const milestone of input.milestones ?? []) {
       if (!/^[a-z][a-z0-9_-]{0,47}$/.test(milestone.id) || ids.has(milestone.id)) throw new Error(`Invalid or duplicate milestone id: ${milestone.id}`);

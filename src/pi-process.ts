@@ -3,7 +3,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { capabilityArgs, capabilityTools, resolveChildCapabilities } from "./capabilities.js";
+import { capabilityArgs, capabilityTools, resolveChildCapabilities, type ChildCapability } from "./capabilities.js";
 import type {
   ChildOutcome,
   ThinkingLevel,
@@ -71,7 +71,7 @@ export async function runPiChild(request: ChildRequest): Promise<ChildOutcome> {
   });
 }
 
-export function buildChildArguments(request: Pick<ChildRequest, "mode" | "guideModel" | "guideThinking" | "executorModel" | "executorThinking" | "implementationStart">, sessionFile: string, capabilities: ChildCapabilityRecord[]): string[] {
+export function buildChildArguments(request: Pick<ChildRequest, "mode" | "guideModel" | "guideThinking" | "executorModel" | "executorThinking" | "implementationStart">, sessionFile: string, capabilities: ChildCapability[]): string[] {
   const startsInExecutor = request.mode === "implementation" && request.implementationStart === "executor";
   const initialModel = startsInExecutor ? request.executorModel ?? request.guideModel : request.guideModel;
   const initialThinking = startsInExecutor ? request.executorThinking ?? request.guideThinking : request.guideThinking;
@@ -238,6 +238,7 @@ async function spawnPi(options: SpawnPiOptions): Promise<ChildOutcome> {
         usage,
         models,
         timedOut,
+        ...(options.capabilities ? { capabilities: options.capabilities } : {}),
       });
     });
   });

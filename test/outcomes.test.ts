@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -34,13 +34,34 @@ test("non-change completion rejects unresolved conflicts and product execution",
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("trusted capabilities retain stable package identity and exact web tools", async () => {
+test("trusted capabilities resolve installed metadata and activate exactly the approved web tools", async () => {
   const { resolveChildCapabilities, WEB_TOOLS } = await import("../src/capabilities.js");
+  const root = await mkdtemp(join(tmpdir(), "pi-workgraph-capability-"));
+  try {
+    await mkdir(join(root, "node_modules", "pi-web-access"), { recursive: true });
+    await writeFile(join(root, "node_modules", "pi-web-access", "package.json"), JSON.stringify({ name: "pi-web-access", version: "0.14.0", pi: { extensions: ["./index.ts"] } }));
+    const capabilities = await resolveChildCapabilities("discovery", "provider/model", root);
+    const web = capabilities.find((capability) => capability.id === "web_access");
+    assert.ok(web);
+    assert.equal(web.packageSource, "npm:pi-web-access@0.14.0");
+    assert.equal(web.resourceIdentity, "pi-web-access:./index.ts");
+    assert.equal(web.available, true);
+    assert.deepEqual(web.tools, [...WEB_TOOLS]);
+    const { buildChildArguments } = await import("../src/pi-process.js");
+    const args = buildChildArguments({ mode: "discovery", guideModel: "provider/model", guideThinking: "high" }, "/tmp/session.jsonl", capabilities);
+    assert.ok(args.includes("--no-extensions"));
+    assert.ok(args.includes(join(root, "node_modules", "pi-web-access", "index.ts")));
+    assert.equal(args[args.indexOf("--tools") + 1], ["read", "bash", "grep", "find", "ls", "workgraph_report", ...WEB_TOOLS].join(","));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("trusted capability and milestone diagnostics remain explicit", async () => {
+  const { resolveChildCapabilities } = await import("../src/capabilities.js");
   const capabilities = await resolveChildCapabilities("discovery", "openai-codex/gpt-test", "/definitely-missing");
-  const web = capabilities.find((capability) => capability.id === "web_access");
-  assert.ok(web);
-  assert.equal(web.packageSource, "npm:pi-web-access@0.14.0");
-  assert.deepEqual(web.tools, [...WEB_TOOLS]);
-  assert.equal(web.available, false);
-  assert.match(web.diagnostic ?? "", /unavailable/);
+  assert.equal(capabilities.find((capability) => capability.id === "web_access")?.available, false);
+  assert.match(capabilities.find((capability) => capability.id === "web_access")?.diagnostic ?? "", /unavailable/);
+  const root = await mkdtemp(join(tmpdir(), "pi-workgraph-milestone-"));
+  try {
+    await assert.rejects(() => WorkgraphEngine.begin({ request: "request", projectRoot: root, gitCommonDir: join(root, ".git"), parentSessionId: "parent", parentSessionFile: join(root, "parent.jsonl"), baseCommit: "base", outcome: { kind: "answer", statement: "answer", completionPredicate: "evidence" }, milestones: [{ id: "bad", description: "  " }] }), /Milestone descriptions/);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
