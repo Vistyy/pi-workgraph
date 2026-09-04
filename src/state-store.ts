@@ -85,6 +85,7 @@ export class RunStateStore {
       resultReviews: [],
       cleanup: [],
       coordinatorWakeups: [],
+      unsupportedControls: [],
       milestones: (input.milestones ?? []).map((milestone) => ({
         id: milestone.id,
         description: milestone.description,

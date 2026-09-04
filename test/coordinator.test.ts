@@ -75,6 +75,7 @@ test("the coordinator registers one stable tool inventory without mutation inter
 
     assert.ok(tools.includes("workgraph_research"));
     assert.ok(tools.includes("workgraph_acknowledge"));
+    assert.ok(tools.includes("workgraph_steer"));
     assert.ok(tools.includes("workgraph_begin"));
     assert.ok(tools.includes("workgraph_plan"));
     assert.ok(tools.includes("workgraph_schedule"));

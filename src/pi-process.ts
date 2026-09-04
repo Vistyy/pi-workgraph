@@ -86,10 +86,11 @@ export async function forkConversationSession(request: { parentSessionFile: stri
 export async function forkSession(request: Pick<ChildRequest, "parentSessionFile" | "targetCwd" | "sessionDir" | "objective" | "mode" | "runId" | "nodeId" | "stableEntryId">): Promise<string> {
   await mkdir(request.sessionDir, { recursive: true });
   const parent = SessionManager.open(request.parentSessionFile);
-  const child = SessionManager.forkFrom(request.parentSessionFile, request.targetCwd, request.sessionDir);
   const stableEntryId = request.stableEntryId === undefined ? stableParentEntry(parent) : request.stableEntryId;
+  const child = stableEntryId === null
+    ? SessionManager.create(request.targetCwd, request.sessionDir)
+    : SessionManager.forkFrom(request.parentSessionFile, request.targetCwd, request.sessionDir);
   if (stableEntryId) child.branch(stableEntryId);
-  else child.resetLeaf();
   child.appendCustomMessageEntry(
     "pi-workgraph-objective",
     [
@@ -102,6 +103,18 @@ export async function forkSession(request: Pick<ChildRequest, "parentSessionFile
     false,
     { runId: request.runId, nodeId: request.nodeId, mode: request.mode },
   );
+  if (stableEntryId === null) {
+    child.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "Workgraph assignment loaded." }],
+      api: "openai-responses",
+      provider: "workgraph",
+      model: "workgraph",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: "stop",
+      timestamp: Date.now(),
+    });
+  }
   const file = child.getSessionFile();
   if (!file) throw new Error("Forked child session did not produce a session file.");
   return file;
@@ -263,6 +276,8 @@ function assistantText(message: Record<string, unknown>): string {
 export interface WorkgraphReportRead {
   report?: WorkerReport;
   invalid: boolean;
+  unreadable: boolean;
+  error?: string;
 }
 
 export function readWorkgraphReportResult(sessionFile: string): WorkgraphReportRead {
@@ -271,30 +286,102 @@ export function readWorkgraphReportResult(sessionFile: string): WorkgraphReportR
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (message?.role !== "toolResult" || message.toolName !== "workgraph_report") continue;
+      if (message.isError) return { invalid: true, unreadable: false, error: "The Workgraph report tool returned an error." };
       const details = isRecord(message.details) ? message.details : undefined;
-      if (isWorkerReport(details?.report)) return { report: details.report, invalid: false };
-      return { invalid: true };
+      if (isWorkerReport(details?.report)) return { report: details.report, invalid: false, unreadable: false };
+      return { invalid: true, unreadable: false, error: "The latest Workgraph report has an invalid shape." };
     }
-  } catch {
-    return { invalid: false };
+  } catch (error) {
+    return { invalid: false, unreadable: true, error: errorMessage(error) };
   }
-  return { invalid: false };
+  return { invalid: false, unreadable: false };
 }
 
 export function readWorkgraphReport(sessionFile: string): WorkerReport | undefined {
   return readWorkgraphReportResult(sessionFile).report;
 }
 
-function isWorkerReport(value: unknown): value is WorkerReport {
+export function hasNativeAgentSettled(sessionFile: string): boolean {
+  try {
+    const entries = SessionManager.open(sessionFile).getEntries();
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (entry?.type !== "custom") continue;
+      if (entry.customType === "pi-workgraph-agent-settled") return true;
+      if (entry.customType === "pi-workgraph-agent-running") return false;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function hasReportBase(value: unknown): boolean {
   if (!isRecord(value) || typeof value.kind !== "string" || typeof value.status !== "string" || typeof value.summary !== "string") return false;
   if (!(["discovery", "implementation", "verification", "assurance_review", "assurance_synthesis"] as string[]).includes(value.kind)) return false;
   if (!(["completed", "escalated", "failed"] as string[]).includes(value.status)) return false;
-  if (!Array.isArray(value.evidence) || !Array.isArray(value.findings)) return false;
+  if (!Array.isArray(value.evidence)) return false;
   if (value.kind === "verification" && !(["verified", "failed", "inconclusive"] as string[]).includes(String(value.verdict))) return false;
   if (value.kind === "assurance_review" && typeof value.responsibility !== "string") return false;
   if (value.kind === "assurance_synthesis" && typeof value.verdict !== "string") return false;
   return true;
 }
+
+function isWorkerReport(value: unknown): value is WorkerReport {
+  if (!hasReportBase(value) || !isRecord(value) || !isReportKind(value.kind) || !isReportStatus(value.status)) return false;
+  if (!isEvidenceList(value.evidence)) return false;
+  if (value.kind === "discovery") return isFindingList(value["findings"]);
+  if (value.kind === "implementation") return isFindingList(value["findings"]) && isOptionalString(value.commit) && isStringListOrUndefined(value.changedFiles);
+  if (value.kind === "verification") return isFindingList(value["findings"]) && isVerificationVerdict(value.verdict);
+  if (value.kind === "assurance_review") return isAssuranceResponsibility(value.responsibility) && isAssuranceRecommendation(value.recommendation) && isAssuranceFindingList(value["findings"]);
+  return isAssuranceVerdict(value.verdict) && isDispositionList(value.dispositions);
+}
+
+function isEvidenceList(value: unknown): value is WorkerReport["evidence"] {
+  return Array.isArray(value) && value.length <= 30 && value.every((item) => {
+    if (!isRecord(item) || !nonEmptyString(item.label) || !nonEmptyString(item.observation)) return false;
+    return isOptionalEnum(item.class, ["direct", "inference", "conflict", "unknown"])
+      && isOptionalString(item.command) && isOptionalString(item.artifact);
+  });
+}
+
+function isFindingList(value: unknown): boolean {
+  return Array.isArray(value) && value.length <= 20 && value.every((item) => isRecord(item)
+    && isEnum(item.severity, ["info", "warning", "error", "blocker"])
+    && nonEmptyString(item.title) && nonEmptyString(item.detail)
+    && isEnum(item.envelopeImpact, ["none", "outcome", "non_goal", "owner", "public_interface", "dependency", "security", "scale", "reuse"]));
+}
+
+function isAssuranceFindingList(value: unknown): boolean {
+  return Array.isArray(value) && value.length <= 20 && value.every((item) => isRecord(item)
+    && nonEmptyString(item.id) && nonEmptyString(item.category) && nonEmptyString(item.violatedInvariant)
+    && isStringList(item.evidence, 1, 10) && nonEmptyString(item.reachableScenario)
+    && nonEmptyString(item.consequence) && nonEmptyString(item.simplestResponse)
+    && isEnum(item.complexityEffect, ["reduces", "neutral", "adds"])
+    && isEnum(item.confidence, ["low", "medium", "high"])
+    && isEnum(item.envelopeImpact, ["none", "outcome", "non_goal", "owner", "public_interface", "dependency", "security", "scale", "reuse"])
+    && isOptionalString(item.ownerNodeId));
+}
+
+function isDispositionList(value: unknown): boolean {
+  return Array.isArray(value) && value.length <= 40 && value.every((item) => isRecord(item)
+    && isAssuranceFindingList([item.finding])
+    && isEnum(item.disposition, ["accept", "optional", "dismiss"])
+    && nonEmptyString(item.reason));
+}
+
+function isReportKind(value: unknown): value is WorkerReport["kind"] { return isEnum(value, ["discovery", "implementation", "verification", "assurance_review", "assurance_synthesis"]); }
+function isReportStatus(value: unknown): value is WorkerReport["status"] { return isEnum(value, ["completed", "escalated", "failed"]); }
+function isVerificationVerdict(value: unknown): boolean { return isEnum(value, ["verified", "failed", "inconclusive"]); }
+function isAssuranceResponsibility(value: unknown): boolean { return isEnum(value, ["behavior", "structure", "evidence"]); }
+function isAssuranceRecommendation(value: unknown): boolean { return isEnum(value, ["approve", "changes_required", "inconclusive"]); }
+function isAssuranceVerdict(value: unknown): boolean { return isEnum(value, ["approve", "revision_required", "needs_decision", "inconclusive"]); }
+function isStringList(value: unknown, min: number, max: number): value is string[] { return Array.isArray(value) && value.length >= min && value.length <= max && value.every((item) => typeof item === "string" && item.trim() !== ""); }
+function isStringListOrUndefined(value: unknown): boolean { return value === undefined || isStringList(value, 0, 30); }
+function isOptionalString(value: unknown): boolean { return value === undefined || typeof value === "string"; }
+function isOptionalEnum<T extends string>(value: unknown, values: readonly T[]): boolean { return value === undefined || isEnum(value, values); }
+function isEnum<T extends string>(value: unknown, values: readonly T[]): value is T { return typeof value === "string" && values.includes(value as T); }
+function nonEmptyString(value: unknown): value is string { return typeof value === "string" && value.trim() !== ""; }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -313,6 +400,10 @@ export function readTerminalText(sessionFile: string): string | undefined {
     return undefined;
   }
   return undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function numberValue(value: unknown): number {

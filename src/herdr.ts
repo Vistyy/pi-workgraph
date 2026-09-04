@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { CoordinatorRuntimeIdentity, ThinkingLevel, WorkerIdentity, WorkerObservationStatus, WorkerStage } from "./types.js";
+import { hasNativeAgentSettled } from "./pi-process.js";
 
 export type HerdrAgentStatus = WorkerObservationStatus;
 
@@ -9,6 +10,7 @@ export interface HerdrObservation {
   status: HerdrAgentStatus;
   stage: WorkerStage;
   observedAt: string;
+  nativeSettled?: boolean;
 }
 
 export interface WorkerLaunchRequest {
@@ -174,6 +176,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       status: current.status,
       stage: current.status === "blocked" ? "attention" : current.status === "working" ? "executing" : "reporting",
       observedAt: new Date().toISOString(),
+      nativeSettled: hasNativeAgentSettled(request.sessionFile),
     };
   }
 
@@ -186,6 +189,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       status: current.status,
       stage: current.status === "blocked" ? "attention" : current.status === "working" ? "executing" : "reporting",
       observedAt: new Date().toISOString(),
+      nativeSettled: hasNativeAgentSettled(identity.sessionFile),
     };
   }
 

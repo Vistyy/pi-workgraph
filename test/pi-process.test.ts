@@ -42,10 +42,12 @@ test("forkSession branches before an unresolved parent tool call and carries the
       objective: "Change only src/a.ts.",
       mode: "implementation",
       runId: "run-1",
+      stableEntryId: null,
       nodeId: "alpha",
     });
     const childContext = SessionManager.open(childFile).buildSessionContext().messages;
-    assert.equal(childContext.some((message) => message.role === "assistant"), false);
+    assert.equal(childContext.some((message) => message.role === "assistant" && message.content.some((part) => part.type === "text" && part.text === "Workgraph assignment loaded.")), true);
+    assert.equal(childContext.some((message) => message.role === "user" && message.content === "Original request"), false);
     const objective = childContext.find((message) => message.role === "custom");
     assert.ok(objective && objective.role === "custom");
     assert.match(typeof objective.content === "string" ? objective.content : "", /Change only src\/a\.ts/);

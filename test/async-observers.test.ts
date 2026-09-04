@@ -101,12 +101,14 @@ test("the visible supervisor settles a discovery report from an isolated exact-r
     readonly available = true;
     async launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
       const identity: WorkerIdentity = { workspaceId: "w1", tabId: "w1:t1", paneId: "w1:p1", terminalId: "term1", agentName: herdrAgentName(request.runId, request.nodeId, request.attemptId), sessionFile: request.sessionFile, cwd: request.cwd };
-      SessionManager.open(request.sessionFile).appendMessage({ role: "toolResult", toolCallId: "report", toolName: "workgraph_report", content: [{ type: "text", text: "done" }], details: { report: discoveryReport("Observed exact revision.") }, isError: false, timestamp: Date.now() });
+      const session = SessionManager.open(request.sessionFile);
+      session.appendMessage({ role: "toolResult", toolCallId: "report", toolName: "workgraph_report", content: [{ type: "text", text: "done" }], details: { report: discoveryReport("Observed exact revision.") }, isError: false, timestamp: Date.now() });
+      session.appendCustomEntry("pi-workgraph-agent-settled", { runId: request.runId, nodeId: request.nodeId });
       await request.onIdentity?.(identity);
       return { identity, status: "working", stage: "executing", observedAt: new Date().toISOString() };
     }
-    async observe(identity: WorkerIdentity): Promise<HerdrObservation> { return { identity, status: "idle", stage: "reporting", observedAt: new Date().toISOString() }; }
-    async interrupt(identity: WorkerIdentity): Promise<HerdrObservation> { return { identity, status: "idle", stage: "reporting", observedAt: new Date().toISOString() }; }
+    async observe(identity: WorkerIdentity): Promise<HerdrObservation> { return { identity, status: "idle", stage: "reporting", nativeSettled: true, observedAt: new Date().toISOString() }; }
+    async interrupt(identity: WorkerIdentity): Promise<HerdrObservation> { return { identity, status: "idle", stage: "reporting", nativeSettled: true, observedAt: new Date().toISOString() }; }
     async recover(_request: WorkerRecoveryRequest): Promise<HerdrObservation | undefined> { return undefined; }
   }
   try {

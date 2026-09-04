@@ -202,6 +202,14 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     }
   });
 
+  pi.on("agent_start", async () => {
+    pi.appendEntry("pi-workgraph-agent-running", { runId, nodeId, startedAt: new Date().toISOString() });
+  });
+
+  pi.on("agent_settled", async () => {
+    pi.appendEntry("pi-workgraph-agent-settled", { runId, nodeId, settledAt: new Date().toISOString() });
+  });
+
   pi.on("context", (event) => {
     const withoutGuide = event.messages.filter((message) => {
       const custom = message as { role?: string; customType?: string };

@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { validateSynthesis, WorkgraphEngine, type ScheduleInput } from "./engine.js";
 import type { WorktreePlacement } from "./git.js";
 import { herdrAgentName, type HerdrObservation, type VisibleWorkerRuntime } from "./herdr.js";
-import { forkSession, readTerminalText, readWorkgraphReportResult } from "./pi-process.js";
+import { forkSession, hasNativeAgentSettled, readTerminalText, readWorkgraphReportResult } from "./pi-process.js";
 import { allNodesComposed, claimsOverlap, readyWave, transitionNode } from "./scheduler.js";
 import { UnsupportedWorkgraphStateVersionError } from "./state-store.js";
 import type { AssuranceReviewReport, AssuranceSynthesisReport, CleanupState, CoordinatorBoundaryKind, CoordinatorWakeRecord, DiscoveryReport, ImplementationReport, VerificationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun, WorkerMode, ResourceCleanupRecord } from "./types.js";
@@ -33,7 +33,7 @@ export class WorkgraphSupervisor {
   private operationTail: Promise<void> = Promise.resolve();
   private controller = new AbortController();
   private stopped = false;
-  private retryFailedWakeup = true;
+  private readonly deliveryOwner = randomUUID();
 
   constructor(
     readonly engine: WorkgraphEngine,
@@ -169,14 +169,18 @@ export class WorkgraphSupervisor {
     await this.recordObservation(attempt.id, observation);
     const reportResult = readWorkgraphReportResult(observation.identity.sessionFile);
     const report = reportResult.report;
-    if (report && report.kind === (attempt.mode ?? "implementation") && (observation.status === "idle" || observation.status === "done")) {
+    const nativeSettled = observation.nativeSettled === true || hasNativeAgentSettled(observation.identity.sessionFile);
+    if (report && report.kind === (attempt.mode ?? "implementation") && nativeSettled) {
       if (attempt.mode === "implementation" || !attempt.mode) await this.settleTypedAttempt(attempt.id, report as ImplementationReport);
       else await this.settleObserverAttempt(attempt.id, report as DiscoveryReport | VerificationReport | AssuranceReviewReport | AssuranceSynthesisReport);
       return;
     }
-    if (observation.status === "idle" || observation.status === "done") {
-      if (reportResult.invalid) await this.settleInvalidAttempt(attempt.id);
+    if (nativeSettled) {
+      if (reportResult.invalid) await this.settleInvalidAttempt(attempt.id, reportResult.error);
+      else if (reportResult.unreadable) await this.settleInvalidAttempt(attempt.id, reportResult.error);
       else await this.settleUntypedAttempt(attempt.id, readTerminalText(observation.identity.sessionFile));
+    } else if (observation.status === "idle" || observation.status === "done") {
+      await this.recordUncertainSettlement(attempt.id, observation.status);
     }
   }
 
@@ -630,7 +634,7 @@ export class WorkgraphSupervisor {
       current.observedStatus = observation.status;
       current.lastActivityAt = observation.observedAt;
       current.heartbeatAt = observation.observedAt;
-      if (observation.status === "idle" || observation.status === "done") {
+      if ((observation.status === "idle" || observation.status === "done") && observation.nativeSettled === true) {
         current.state = "cancelled";
         current.stage = "settled";
         current.settledAt = observation.observedAt;
@@ -784,11 +788,23 @@ export class WorkgraphSupervisor {
     });
   }
 
-  private async settleInvalidAttempt(attemptId: string): Promise<void> {
+  private async recordUncertainSettlement(attemptId: string, status: string): Promise<void> {
     await this.engine.store.update((draft) => {
       const current = requiredAttempt(draft, attemptId);
       if (current.state !== "running" && current.state !== "starting") return;
-      const attention = "Worker returned an invalid Workgraph report; retained output requires explicit review.";
+      current.stage = "attention";
+      current.attention = `Herdr reports ${status}, but Pi has not recorded agent_settled; retaining the worker for reconciliation.`;
+      current.lastActivityAt = new Date().toISOString();
+      draft.control.attentionStatus = "decision_required";
+      draft.control.updatedAt = current.lastActivityAt;
+    });
+  }
+
+  private async settleInvalidAttempt(attemptId: string, detail?: string): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      if (current.state !== "running" && current.state !== "starting") return;
+      const attention = detail ? `Worker report could not be trusted: ${detail}` : "Worker returned an invalid Workgraph report; retained output requires explicit review.";
       current.state = "completed";
       current.stage = "attention";
       current.attention = attention;
@@ -906,14 +922,14 @@ export class WorkgraphSupervisor {
   }
 
   private async notifyCoordinatorBoundary(run: WorkgraphRun): Promise<WorkgraphRun> {
-    const boundary = coordinatorBoundary(run);
+    const boundary = coordinatorBoundary(run, this.deliveryOwner);
     if (!boundary || !this.options.onCoordinatorWake) return run;
     let claimed: CoordinatorWakeRecord | undefined;
     const retained = await this.engine.store.update((draft) => {
       const wakeups = draft.coordinatorWakeups ??= [];
       const previous = wakeups.find((candidate) => candidate.id === boundary.id);
-      if (previous && (previous.state === "claimed" || previous.state === "delivered")) return;
-      if (previous && previous.state === "failed" && !this.retryFailedWakeup) return;
+      if (previous?.state === "delivered") return;
+      if (previous && (previous.state === "claimed" || previous.state === "failed") && previous.deliveryOwner === this.deliveryOwner) return;
       const now = new Date().toISOString();
       claimed = previous ?? {
         ...boundary,
@@ -922,10 +938,12 @@ export class WorkgraphSupervisor {
         ...(draft.control.currentPlanVersion !== undefined ? { planVersion: draft.control.currentPlanVersion } : {}),
         state: "claimed",
         requestedAt: now,
+        deliveryOwner: this.deliveryOwner,
       };
       if (previous) {
         previous.state = "claimed";
         previous.requestedAt = now;
+        previous.deliveryOwner = this.deliveryOwner;
         previous.deliveryAttempts = (previous.deliveryAttempts ?? 0) + 1;
         delete previous.error;
         claimed = previous;
@@ -933,7 +951,6 @@ export class WorkgraphSupervisor {
         claimed.deliveryAttempts = 1;
         wakeups.push(claimed);
       }
-      this.retryFailedWakeup = false;
     });
     if (!claimed) return retained;
     try {
@@ -952,7 +969,6 @@ export class WorkgraphSupervisor {
         if (!wake || wake.state !== "claimed") return;
         wake.state = "failed";
         wake.error = message;
-        draft.control.attentionStatus = "decision_required";
         draft.control.updatedAt = new Date().toISOString();
       });
     }
@@ -975,14 +991,14 @@ function cleanupPriority(record: ResourceCleanupRecord): number {
   return record.kind === "herdr_worker" ? 0 : 1;
 }
 
-function coordinatorBoundary(run: WorkgraphRun): Pick<CoordinatorWakeRecord, "id" | "boundaryRevision" | "kind" | "resultId" | "resultKind"> | undefined {
+function coordinatorBoundary(run: WorkgraphRun, deliveryOwner: string): Pick<CoordinatorWakeRecord, "id" | "boundaryRevision" | "kind" | "resultId" | "resultKind"> | undefined {
   if (run.lifecycle !== "active") return undefined;
   if (run.outcome.kind !== "product_change") {
     const wakeups = run.coordinatorWakeups ?? [];
-    const researchResult = [...run.discoveries].reverse().find((record) => {
+    const researchResult = run.discoveries.find((record) => {
       if (!record.resultId || !record.resultKind) return false;
       const prior = wakeups.find((wake) => wake.resultId === record.resultId);
-      return !prior || prior.state === "failed";
+      return !prior || (prior.state !== "delivered" && prior.deliveryOwner !== deliveryOwner);
     });
     if (researchResult?.resultId && researchResult.resultKind) {
       const boundaryRevision = createHash("sha256").update(JSON.stringify({ resultId: researchResult.resultId, resultKind: researchResult.resultKind, state: researchResult.state, report: researchResult.report, terminalText: researchResult.terminalText, error: researchResult.error })).digest("hex").slice(0, 20);

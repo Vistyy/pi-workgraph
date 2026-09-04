@@ -465,6 +465,7 @@ export interface CoordinatorWakeRecord {
   state: "claimed" | "delivered" | "failed";
   requestedAt: string;
   deliveryAttempts?: number;
+  deliveryOwner?: string;
   deliveredAt?: string;
   acknowledgedAt?: string;
   acknowledgment?: string;
@@ -534,6 +535,15 @@ export interface WorkAttempt {
   error?: string;
 }
 
+export interface UnsupportedControlRecord {
+  id: string;
+  action: "steer";
+  attemptId: string;
+  instruction: string;
+  reason: string;
+  at: string;
+}
+
 export interface WorkgraphControl {
   planStatus: PlanStatus;
   currentPlanVersion?: number;
@@ -574,6 +584,7 @@ export interface WorkgraphRun {
   resultReviews?: ChildResultReview[];
   cleanup?: ResourceCleanupRecord[];
   coordinatorWakeups?: CoordinatorWakeRecord[];
+  unsupportedControls?: UnsupportedControlRecord[];
   milestones: MilestoneRecord[];
   terminalOutcome?: TerminalOutcome;
   agreement?: Agreement;

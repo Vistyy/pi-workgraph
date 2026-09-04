@@ -826,11 +826,19 @@ export class WorkgraphEngine {
         }
       } else if (input.action === "resume") {
         if (draft.nodes.length > 0 && draft.control.planStatus !== "approved") throw new Error("Execution cannot resume without a current approved plan.");
-        draft.control.executionStatus = draft.nodes.some((node) => node.state === "running") ? "running" : draft.nodes.some((node) => node.state === "pending") ? "scheduled" : "idle";
+        draft.control.executionStatus = draft.nodes.some((node) => node.state === "running") || draft.attempts.some((attempt) => ["starting", "running", "settling", "cancel_requested"].includes(attempt.state))
+          ? "running"
+          : draft.nodes.some((node) => node.state === "pending") || draft.attempts.some((attempt) => attempt.state === "queued")
+            ? "scheduled"
+            : "idle";
         delete draft.control.pauseMode;
         delete draft.control.pauseReason;
       } else if (input.action === "cancel") {
         const targets = input.nodeIds?.length ? new Set(input.nodeIds) : undefined;
+        if (targets) {
+          const known = new Set([...draft.nodes.map((node) => node.id), ...draft.discoveries.map((record) => record.id)]);
+          for (const target of targets) if (!known.has(target)) throw new Error(`Unknown work item ${target}.`);
+        }
         for (const node of draft.nodes) {
           if (targets && !targets.has(node.id)) continue;
           if (node.state === "pending") transitionNode(node, "cancelled");
@@ -841,10 +849,13 @@ export class WorkgraphEngine {
         }
         for (const attempt of draft.attempts) {
           if (attempt.mode === "implementation" || (targets && !targets.has(attempt.nodeId))) continue;
-          if (attempt.state === "running" || attempt.state === "starting") attempt.state = "cancel_requested";
-        }
-        if (targets) {
-          for (const nodeId of targets) if (!draft.nodes.some((node) => node.id === nodeId)) throw new Error(`Unknown work node ${nodeId}.`);
+          if (attempt.state === "queued") {
+            attempt.state = "cancelled";
+            if (attempt.mode === "discovery") {
+              const record = draft.discoveries.find((candidate) => candidate.id === attempt.nodeId);
+              if (record) { record.state = "cancelled"; record.error = input.reason.trim(); }
+            }
+          } else if (attempt.state === "running" || attempt.state === "starting") attempt.state = "cancel_requested";
         }
       } else {
         for (const change of input.priorities) {
@@ -867,6 +878,16 @@ export class WorkgraphEngine {
       if (wake.state !== "delivered") throw new Error(`Coordinator wake ${id} is not delivered.`);
       wake.acknowledgedAt = new Date().toISOString();
       wake.acknowledgment = acknowledgment.trim();
+    });
+  }
+
+  async recordUnsupportedControl(attemptId: string, instruction: string, reason: string): Promise<WorkgraphRun> {
+    if (!attemptId.trim() || !instruction.trim() || !reason.trim()) throw new Error("An unsupported control record requires an attempt, instruction, and reason.");
+    return this.store.update((draft) => {
+      const attempt = draft.attempts.find((candidate) => candidate.id === attemptId);
+      if (!attempt) throw new Error(`Unknown work attempt ${attemptId}.`);
+      const records = draft.unsupportedControls ??= [];
+      records.push({ id: randomUUID(), action: "steer", attemptId, instruction: instruction.trim(), reason: reason.trim(), at: new Date().toISOString() });
     });
   }
 

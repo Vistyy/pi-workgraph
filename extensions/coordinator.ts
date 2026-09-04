@@ -111,7 +111,15 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   };
 
   const ensureResearchEngine = async (ctx: ExtensionContext, request: string): Promise<WorkgraphEngine> => {
-    if (engine) return engine;
+    if (engine) {
+      const current = await engine.load();
+      if (current.lifecycle === "active") return engine;
+      if (current.lifecycle === "suspended") throw new Error("The current Workgraph is suspended. Resume it explicitly before delegating research.");
+      await supervisor?.shutdown();
+      supervisor = undefined;
+      engine.registry.close();
+      engine = undefined;
+    }
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (!sessionFile) throw new Error("Research requires a persistent parent Pi session.");
     const repositoryInfo = await GitRepository.inspect(ctx.cwd);
@@ -283,7 +291,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const current = await currentEngine.load();
         const target = withAvailability(await resolveTarget("discovery.partition", params.model, params.thinking), ctx, "research worker");
         const id = `research-${current.discoveries.length + 1}`;
-        const objective = [params.question.trim(), ...(params.context ?? []).map((item) => `Context: ${item}`), ...(params.expectedEvidence ?? []).map((item) => `Expected evidence: ${item}`)].join("\\n");
+        const objective = [params.question.trim(), ...(params.context ?? []).map((item) => `Context: ${item}`), ...(params.expectedEvidence ?? []).map((item) => `Expected evidence: ${item}`)].join("\n");
         const activeSupervisor = supervisor ?? attachSupervisor(ctx);
         const queued = remember(await currentEngine.queueDiscovery({
           topology: "evidence",
@@ -292,7 +300,9 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         }));
         activeSupervisor.kick();
         return {
-          content: [{ type: "text", text: `Started research ${id} in Workgraph ${queued.runId}; the visible worker is running asynchronously.` }],
+          content: [{ type: "text", text: queued.discoveries.find((candidate) => candidate.id === id)?.state === "unavailable"
+            ? `Research ${id} was recorded as unavailable; no worker was started.`
+            : `Queued research ${id} in Workgraph ${queued.runId}; a visible worker will start asynchronously.` }],
           details: { ...summaryDetails(queued), research: queued.discoveries.find((candidate) => candidate.id === id) },
         };
       });
@@ -701,6 +711,20 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           content: [{ type: "text", text: formatJudgment(run) }],
           details: { ...summaryDetails(run), judgment: run.assurance?.finalJudgment },
         };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_steer",
+    label: "Workgraph Steer",
+    description: "Record that direct worker steering is unsupported at the current Herdr boundary; no instruction is falsely reported as applied.",
+    promptSnippet: "Record unsupported worker steering without claiming it was delivered",
+    parameters: Type.Object({ attemptId: Type.String(), instruction: Type.String() }),
+    async execute(_id, params) {
+      return exclusively(async () => {
+        const run = remember(await requireEngine().recordUnsupportedControl(params.attemptId, params.instruction, "The current Herdr worker adapter exposes observation and interruption, but no supported text-steering operation."));
+        return { content: [{ type: "text", text: `Steering is unsupported for attempt ${params.attemptId}; the request was retained without being sent.` }], details: { ...summaryDetails(run), unsupportedControl: run.unsupportedControls?.at(-1) } };
       });
     },
   });

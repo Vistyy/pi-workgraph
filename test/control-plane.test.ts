@@ -97,6 +97,7 @@ function observation(identity: WorkerIdentity, status: HerdrAgentStatus): HerdrO
     identity: structuredClone(identity),
     status,
     stage: status === "working" ? "executing" : status === "blocked" || status === "unknown" ? "attention" : "reporting",
+    nativeSettled: status === "idle" || status === "done",
     observedAt: new Date().toISOString(),
   };
 }
@@ -335,6 +336,46 @@ test("a semantic boundary wakes the coordinator once and retains the delivered i
     assert.equal(wakeups.length, 2);
     assert.match(wakeups[1] ?? "", /^attention:/);
     assert.equal(run.coordinatorWakeups?.[1]?.state, "delivered");
+  } finally {
+    value.registry.close();
+    await rm(value.parent, { recursive: true, force: true });
+  }
+});
+
+test("a failed or interrupted wake recovers under a new supervisor without repeating an acknowledged wake", async () => {
+  const value = await fixture();
+  const runtime = new FakeRuntime();
+  try {
+    await value.engine.schedule({ nodes: [nodeSpec("recover-wake", ["value.txt"])] });
+    await value.engine.store.update((run) => {
+      const node = run.nodes[0]!;
+      transitionNode(node, "running");
+      transitionNode(node, "completed");
+      transitionNode(node, "composed");
+      node.commit = run.composedCommit;
+      run.control.executionStatus = "idle";
+      run.phase = "executing";
+    });
+    let firstCalls = 0;
+    const first = new WorkgraphSupervisor(value.engine, runtime, {
+      onCoordinatorWake() { firstCalls += 1; throw new Error("coordinator disconnected after claim"); },
+    });
+    let run = await first.reconcileNow();
+    assert.equal(firstCalls, 1);
+    assert.equal(run.coordinatorWakeups?.[0]?.state, "failed");
+    const claimedId = run.coordinatorWakeups?.[0]?.id;
+    assert.ok(claimedId);
+
+    let secondCalls = 0;
+    const second = new WorkgraphSupervisor(value.engine, runtime, {
+      onCoordinatorWake(wake) { secondCalls += 1; assert.equal(wake.id, claimedId); },
+    });
+    run = await second.reconcileNow();
+    assert.equal(secondCalls, 1);
+    assert.equal(run.coordinatorWakeups?.[0]?.state, "delivered");
+    run = await value.engine.acknowledgeCoordinatorWake(claimedId, "The recovered wake was reviewed.");
+    await second.reconcileNow();
+    assert.equal(secondCalls, 1);
   } finally {
     value.registry.close();
     await rm(value.parent, { recursive: true, force: true });
