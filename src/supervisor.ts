@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { validateSynthesis, WorkgraphEngine, type ScheduleInput } from "./engine.js";
 import type { WorktreePlacement } from "./git.js";
 import { herdrAgentName, type HerdrObservation, type VisibleWorkerRuntime } from "./herdr.js";
-import { forkSession, readTerminalText, readWorkgraphReport } from "./pi-process.js";
+import { forkSession, readTerminalText, readWorkgraphReportResult } from "./pi-process.js";
 import { allNodesComposed, claimsOverlap, readyWave, transitionNode } from "./scheduler.js";
 import { UnsupportedWorkgraphStateVersionError } from "./state-store.js";
 import type { AssuranceReviewReport, AssuranceSynthesisReport, CleanupState, CoordinatorBoundaryKind, CoordinatorWakeRecord, DiscoveryReport, ImplementationReport, VerificationReport, WorkAttempt, WorkerIdentity, WorkNode, WorkgraphRun, WorkerMode, ResourceCleanupRecord } from "./types.js";
@@ -33,6 +33,7 @@ export class WorkgraphSupervisor {
   private operationTail: Promise<void> = Promise.resolve();
   private controller = new AbortController();
   private stopped = false;
+  private retryFailedWakeup = true;
 
   constructor(
     readonly engine: WorkgraphEngine,
@@ -166,14 +167,16 @@ export class WorkgraphSupervisor {
 
   private async consumeObservation(attempt: WorkAttempt, observation: HerdrObservation): Promise<void> {
     await this.recordObservation(attempt.id, observation);
-    const report = readWorkgraphReport(observation.identity.sessionFile);
-    if (report && report.kind === (attempt.mode ?? "implementation")) {
+    const reportResult = readWorkgraphReportResult(observation.identity.sessionFile);
+    const report = reportResult.report;
+    if (report && report.kind === (attempt.mode ?? "implementation") && (observation.status === "idle" || observation.status === "done")) {
       if (attempt.mode === "implementation" || !attempt.mode) await this.settleTypedAttempt(attempt.id, report as ImplementationReport);
       else await this.settleObserverAttempt(attempt.id, report as DiscoveryReport | VerificationReport | AssuranceReviewReport | AssuranceSynthesisReport);
       return;
     }
     if (observation.status === "idle" || observation.status === "done") {
-      await this.settleUntypedAttempt(attempt.id, readTerminalText(observation.identity.sessionFile));
+      if (reportResult.invalid) await this.settleInvalidAttempt(attempt.id);
+      else await this.settleUntypedAttempt(attempt.id, readTerminalText(observation.identity.sessionFile));
     }
   }
 
@@ -391,6 +394,7 @@ export class WorkgraphSupervisor {
       if (current.mode === "discovery" && report.kind === "discovery") {
         const record = draft.discoveries.find((candidate) => candidate.attemptId === attemptId);
         if (record) {
+          record.resultId ??= `${draft.runId}:discovery:${record.id}:${attemptId}`;
           record.resultKind = "typed";
           record.report = report;
           record.state = report.status === "completed" ? "completed" : report.status === "escalated" ? "review_required" : "failed";
@@ -441,7 +445,7 @@ export class WorkgraphSupervisor {
   private async maybeAdvanceDiscovery(): Promise<void> {
     const run = await this.engine.load();
     const active = run.discoveries.filter((record) => record.state !== "superseded");
-    if (active.length > 0 && active.every((record) => record.state === "completed" && record.report?.status === "completed")) {
+    if (run.outcome.kind === "product_change" && active.length > 0 && active.every((record) => record.state === "completed" && record.report?.status === "completed")) {
       await this.engine.store.update((draft) => setPhase(draft, "awaiting_agreement", "Asynchronous discovery completed with typed reports for every active lane."));
     }
   }
@@ -780,22 +784,42 @@ export class WorkgraphSupervisor {
     });
   }
 
+  private async settleInvalidAttempt(attemptId: string): Promise<void> {
+    await this.engine.store.update((draft) => {
+      const current = requiredAttempt(draft, attemptId);
+      if (current.state !== "running" && current.state !== "starting") return;
+      const attention = "Worker returned an invalid Workgraph report; retained output requires explicit review.";
+      current.state = "completed";
+      current.stage = "attention";
+      current.attention = attention;
+      current.resultKind = "invalid";
+      current.settledAt = new Date().toISOString();
+      current.lastActivityAt = current.settledAt;
+      const record = draft.discoveries.find((candidate) => candidate.attemptId === attemptId);
+      if (record) { record.resultId ??= `${draft.runId}:discovery:${record.id}:${attemptId}`; record.resultKind = "invalid"; record.state = "review_required"; record.error = attention; }
+      draft.control.attentionStatus = "decision_required";
+      draft.control.updatedAt = current.lastActivityAt;
+    });
+  }
+
   private async settleUntypedAttempt(attemptId: string, terminalText?: string): Promise<void> {
     await this.engine.store.update((draft) => {
       const current = requiredAttempt(draft, attemptId);
       if (current.state !== "running" && current.state !== "starting") return;
       const attention = terminalText ? "Worker returned terminal prose without a typed report." : "Herdr observed a settled-looking worker without a typed report.";
       if (current.stage === "attention" && current.attention === attention && draft.control.attentionStatus === "decision_required") return;
+      current.state = "completed";
       current.stage = "attention";
       current.attention = attention;
-      current.lastActivityAt = new Date().toISOString();
+      current.settledAt = new Date().toISOString();
+      current.lastActivityAt = current.settledAt;
       if ((current.mode ?? "implementation") === "implementation") {
         const node = requiredNode(draft, current.nodeId);
         node.resultKind = terminalText ? "untyped" : "absent";
         if (terminalText) node.terminalText = terminalText;
       } else if (current.mode === "discovery") {
         const record = draft.discoveries.find((candidate) => candidate.attemptId === attemptId);
-        if (record) { record.resultKind = terminalText ? "untyped" : "absent"; if (terminalText) record.terminalText = terminalText; record.state = "review_required"; record.error = attention; }
+        if (record) { record.resultId ??= `${draft.runId}:discovery:${record.id}:${attemptId}`; record.resultKind = terminalText ? "untyped" : "absent"; if (terminalText) record.terminalText = terminalText; record.state = "review_required"; record.error = attention; }
       } else if (current.mode === "verification") {
         const verification = draft.productVerification;
         if (verification?.attemptId === attemptId) { verification.resultKind = terminalText ? "untyped" : "absent"; if (terminalText) verification.terminalText = terminalText; verification.state = "inconclusive"; verification.error = attention; }
@@ -887,16 +911,29 @@ export class WorkgraphSupervisor {
     let claimed: CoordinatorWakeRecord | undefined;
     const retained = await this.engine.store.update((draft) => {
       const wakeups = draft.coordinatorWakeups ??= [];
-      if (wakeups.some((candidate) => candidate.id === boundary.id)) return;
-      claimed = {
+      const previous = wakeups.find((candidate) => candidate.id === boundary.id);
+      if (previous && (previous.state === "claimed" || previous.state === "delivered")) return;
+      if (previous && previous.state === "failed" && !this.retryFailedWakeup) return;
+      const now = new Date().toISOString();
+      claimed = previous ?? {
         ...boundary,
         phase: draft.phase,
         composedCommit: draft.composedCommit,
         ...(draft.control.currentPlanVersion !== undefined ? { planVersion: draft.control.currentPlanVersion } : {}),
         state: "claimed",
-        requestedAt: new Date().toISOString(),
+        requestedAt: now,
       };
-      wakeups.push(claimed);
+      if (previous) {
+        previous.state = "claimed";
+        previous.requestedAt = now;
+        previous.deliveryAttempts = (previous.deliveryAttempts ?? 0) + 1;
+        delete previous.error;
+        claimed = previous;
+      } else {
+        claimed.deliveryAttempts = 1;
+        wakeups.push(claimed);
+      }
+      this.retryFailedWakeup = false;
     });
     if (!claimed) return retained;
     try {
@@ -938,8 +975,20 @@ function cleanupPriority(record: ResourceCleanupRecord): number {
   return record.kind === "herdr_worker" ? 0 : 1;
 }
 
-function coordinatorBoundary(run: WorkgraphRun): Pick<CoordinatorWakeRecord, "id" | "boundaryRevision" | "kind"> | undefined {
+function coordinatorBoundary(run: WorkgraphRun): Pick<CoordinatorWakeRecord, "id" | "boundaryRevision" | "kind" | "resultId" | "resultKind"> | undefined {
   if (run.lifecycle !== "active") return undefined;
+  if (run.outcome.kind !== "product_change") {
+    const wakeups = run.coordinatorWakeups ?? [];
+    const researchResult = [...run.discoveries].reverse().find((record) => {
+      if (!record.resultId || !record.resultKind) return false;
+      const prior = wakeups.find((wake) => wake.resultId === record.resultId);
+      return !prior || prior.state === "failed";
+    });
+    if (researchResult?.resultId && researchResult.resultKind) {
+      const boundaryRevision = createHash("sha256").update(JSON.stringify({ resultId: researchResult.resultId, resultKind: researchResult.resultKind, state: researchResult.state, report: researchResult.report, terminalText: researchResult.terminalText, error: researchResult.error })).digest("hex").slice(0, 20);
+      return { id: `result:${researchResult.resultId}:${boundaryRevision}`, boundaryRevision, kind: "result", resultId: researchResult.resultId, resultKind: researchResult.resultKind };
+    }
+  }
   const activeAttempt = run.attempts.some((attempt) => isActiveAttempt(attempt));
   let kind: CoordinatorBoundaryKind | undefined;
   if (run.phase === "awaiting_agreement" && !run.agreementProposal) kind = "agreement";
@@ -960,6 +1009,7 @@ function coordinatorBoundary(run: WorkgraphRun): Pick<CoordinatorWakeRecord, "id
   if (!kind) return undefined;
   const semanticState = JSON.stringify({
     kind,
+    discoveries: run.discoveries.map((record) => ({ id: record.id, resultId: record.resultId, state: record.state, resultKind: record.resultKind })),
     phase: run.phase,
     composedCommit: run.composedCommit,
     planVersion: run.control.currentPlanVersion,

@@ -72,7 +72,9 @@ test("engine adoption changes coordinator identity without forking and lifecycle
     assert.equal(adopted.handoffs.at(-1)?.fromSessionId, "session-a");
     const suspended = await fixture.begun.engine.setLifecycle("suspended", "User paused the run.");
     assert.equal(suspended.lifecycle, "suspended");
-    const resumed = await fixture.begun.engine.adopt("session-b", join(fixture.parent, "b.jsonl"));
+    const attached = await fixture.begun.engine.adopt("session-b", join(fixture.parent, "b.jsonl"));
+    assert.equal(attached.lifecycle, "suspended");
+    const resumed = await fixture.begun.engine.setLifecycle("active", "User resumed the run.");
     assert.equal(resumed.lifecycle, "active");
     await assert.rejects(() => fixture.begun.engine.setLifecycle("archived", "Not settled."), /Invalid lifecycle transition/);
     const completed = await fixture.begun.engine.setLifecycle("completed", "Work settled.");

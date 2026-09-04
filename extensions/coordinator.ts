@@ -106,7 +106,33 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   };
 
   const requireEngine = (): WorkgraphEngine => {
-    if (!engine) throw new Error("No active Workgraph. Call workgraph_begin first.");
+    if (!engine) throw new Error("No active Workgraph. Delegate research first or call workgraph_begin.");
+    return engine;
+  };
+
+  const ensureResearchEngine = async (ctx: ExtensionContext, request: string): Promise<WorkgraphEngine> => {
+    if (engine) return engine;
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (!sessionFile) throw new Error("Research requires a persistent parent Pi session.");
+    const repositoryInfo = await GitRepository.inspect(ctx.cwd);
+    if (repositoryInfo.status) throw new Error(`Start research from a clean Git worktree:\n${repositoryInfo.status}`);
+    const begun = await WorkgraphEngine.begin({
+      request,
+      projectRoot: repositoryInfo.root,
+      gitCommonDir: repositoryInfo.commonDir,
+      parentSessionId: ctx.sessionManager.getSessionId(),
+      parentSessionFile: sessionFile,
+      baseCommit: repositoryInfo.head,
+      outcome: {
+        kind: "answer",
+        statement: `Answer the research question: ${request}`,
+        completionPredicate: "The coordinator has received and judged the retained research result.",
+      },
+    });
+    engine = begun.engine;
+    remember(begun.run);
+    pi.appendEntry(POINTER_ENTRY, { runId: begun.run.runId, statePath: begun.run.statePath } satisfies RunPointer);
+    attachSupervisor(ctx);
     return engine;
   };
 
@@ -230,6 +256,45 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         if (!runtime.available || !process.env.HERDR_WORKSPACE_ID) throw new Error("Herdr coordinator runtime is unavailable. No hidden fallback was started.");
         const identity = await runtime.launchCoordinator({ workspaceId: process.env.HERDR_WORKSPACE_ID, cwd: repository.root, sessionFile: childSession });
         return { content: [{ type: "text", text: `Forked conversation into ${repository.root} and started coordinator ${identity.agentName} through Herdr.` }], details: { sessionFile: childSession, identity, cwd: repository.root } };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_research",
+    label: "Workgraph Research",
+    description: "Delegate one bounded research question to a fresh visible worker. The first delegation creates a durable answer workstream; research can be repeated without a mandatory plan.",
+    promptSnippet: "Delegate a bounded research question without requiring a prior plan",
+    promptGuidelines: [
+      "Use workgraph_research for investigation, design inquiry, or a bounded evidence probe.",
+      "A research result informs coordinator judgment; it does not authorize product mutation.",
+    ],
+    parameters: Type.Object({
+      question: Type.String({ description: "The bounded question the worker must answer." }),
+      context: Type.Optional(Type.Array(Type.String())),
+      expectedEvidence: Type.Optional(Type.Array(Type.String())),
+      model: Type.Optional(Type.String()),
+      thinking: Type.Optional(ThinkingSchema),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return exclusively(async () => {
+        if (!params.question.trim()) throw new Error("Research requires a bounded question.");
+        const currentEngine = await ensureResearchEngine(ctx, params.question.trim());
+        const current = await currentEngine.load();
+        const target = withAvailability(await resolveTarget("discovery.partition", params.model, params.thinking), ctx, "research worker");
+        const id = `research-${current.discoveries.length + 1}`;
+        const objective = [params.question.trim(), ...(params.context ?? []).map((item) => `Context: ${item}`), ...(params.expectedEvidence ?? []).map((item) => `Expected evidence: ${item}`)].join("\\n");
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        const queued = remember(await currentEngine.queueDiscovery({
+          topology: "evidence",
+          assignments: [{ id, lens: "Coordinator-requested research", objective, ...target }],
+          stableEntryId: null,
+        }));
+        activeSupervisor.kick();
+        return {
+          content: [{ type: "text", text: `Started research ${id} in Workgraph ${queued.runId}; the visible worker is running asynchronously.` }],
+          details: { ...summaryDetails(queued), research: queued.discoveries.find((candidate) => candidate.id === id) },
+        };
       });
     },
   });
@@ -407,7 +472,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const run = remember(await requireEngine().queueDiscovery({
           topology: params.topology,
           assignments,
-          stableEntryId: stableParentEntry(ctx.sessionManager),
+          stableEntryId: null,
         }));
         activeSupervisor.kick();
         const selectedIds = new Set(assignments.map((assignment) => assignment.id));
@@ -698,6 +763,20 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const run = remember(await requireEngine().settle());
         updateStatus(ctx, run);
         return { content: [{ type: "text", text: formatControlStatus(run) }], details: { ...summaryDetails(run), control: run.control, productVerification: run.productVerification } };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_acknowledge",
+    label: "Workgraph Acknowledge",
+    description: "Record the coordinator's durable acknowledgment and disposition of a delivered Workgraph result or attention wake.",
+    promptSnippet: "Acknowledge and disposition a delivered Workgraph result",
+    parameters: Type.Object({ id: Type.String(), acknowledgment: Type.String() }),
+    async execute(_id, params) {
+      return exclusively(async () => {
+        const run = remember(await requireEngine().acknowledgeCoordinatorWake(params.id, params.acknowledgment));
+        return { content: [{ type: "text", text: `Acknowledged Workgraph wake ${params.id}.` }], details: { ...summaryDetails(run), wake: run.coordinatorWakeups?.find((wake) => wake.id === params.id) } };
       });
     },
   });

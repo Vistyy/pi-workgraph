@@ -199,7 +199,7 @@ export interface ChildCapabilityRecord {
   diagnostic?: string;
 }
 
-export type ChildResultKind = "typed" | "untyped" | "absent";
+export type ChildResultKind = "typed" | "untyped" | "invalid" | "absent";
 export type ResultReviewDisposition = "accept" | "retry" | "reject";
 
 export interface ChildResultReview {
@@ -246,6 +246,7 @@ export interface DiscoveryAssignment extends InvestigationSpec {
 export interface DiscoveryRecord extends DiscoveryAssignment {
   topology: DiscoveryTopology;
   attemptId?: string;
+  resultId?: string;
   resultKind?: ChildResultKind;
   terminalText?: string;
   synthesisOf?: string[];
@@ -450,7 +451,7 @@ export interface WorkerIdentity extends CoordinatorRuntimeIdentity {
   agentName: string;
 }
 
-export type CoordinatorBoundaryKind = "agreement" | "settle" | "verification" | "assurance" | "judgment" | "attention";
+export type CoordinatorBoundaryKind = "result" | "agreement" | "settle" | "verification" | "assurance" | "judgment" | "attention";
 
 export interface CoordinatorWakeRecord {
   id: string;
@@ -459,9 +460,14 @@ export interface CoordinatorWakeRecord {
   phase: RunPhase;
   composedCommit: string;
   planVersion?: number;
+  resultId?: string;
+  resultKind?: ChildResultKind;
   state: "claimed" | "delivered" | "failed";
   requestedAt: string;
+  deliveryAttempts?: number;
   deliveredAt?: string;
+  acknowledgedAt?: string;
+  acknowledgment?: string;
   error?: string;
 }
 

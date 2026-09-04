@@ -195,8 +195,7 @@ export class WorkgraphEngine {
       draft.coordinator = { sessionId, sessionFile, boundAt: new Date().toISOString(), ...(runtimeIdentity ? { runtimeIdentity } : {}) };
       draft.handoffs.push({ kind: previous.sessionId === sessionId ? "resume" : "adopt", ...(previous.sessionId !== sessionId ? { fromSessionId: previous.sessionId } : {}), to: draft.coordinator, at: draft.coordinator.boundAt });
       if (draft.lifecycle === "suspended") {
-        draft.lifecycle = "active";
-        draft.lifecycleReason = "Adopted by a live coordinator.";
+        draft.lifecycleReason = "Attached by a coordinator while remaining suspended.";
         draft.lifecycleUpdatedAt = draft.coordinator.boundAt;
       }
     });
@@ -265,7 +264,8 @@ export class WorkgraphEngine {
 
   async queueDiscovery(input: AsyncDiscoveryInput): Promise<WorkgraphRun> {
     const run = await this.load();
-    requirePhase(run, ["discovery", "awaiting_agreement"]);
+    requireActiveLifecycle(run);
+    if (run.phase !== "discovery" && run.phase !== "awaiting_agreement") throw new Error(`Research is unavailable during ${run.phase}.`);
     validateDiscoveryAssignments(run, input.assignments);
     const now = new Date().toISOString();
     return this.store.update((draft) => {
@@ -283,6 +283,8 @@ export class WorkgraphEngine {
         const record: DiscoveryRecord = {
           ...assignment,
           topology: input.topology,
+          resultId: `${draft.runId}:discovery:${assignment.id}:${randomUUID()}`,
+          ...(assignment.unavailableReason ? { resultKind: "absent" as const } : {}),
           state: assignment.unavailableReason ? "unavailable" : "running",
           ...(assignment.unavailableReason ? { error: assignment.unavailableReason } : {}),
         };
@@ -680,7 +682,7 @@ export class WorkgraphEngine {
     const attempt = run.attempts.find((candidate) => candidate.id === input.attemptId);
     if (!attempt || !attempt.mode) throw new Error(`Unknown child attempt ${input.attemptId}.`);
     const original = childResultRecord(run, attempt);
-    if (!original || (original.resultKind !== "untyped" && original.resultKind !== "absent")) throw new Error("Only an untyped or absent child result can be reviewed.");
+    if (!original || (original.resultKind !== "untyped" && original.resultKind !== "invalid" && original.resultKind !== "absent")) throw new Error("Only an untyped, invalid, or absent child result can be reviewed.");
     if (input.disposition === "accept") {
       if (!input.report || input.report.kind !== attempt.mode || input.report.status !== "completed") throw new Error("Accepting an untyped child result requires a completed typed report matching the attempt mode.");
     }
@@ -688,7 +690,7 @@ export class WorkgraphEngine {
     const reviewed = await this.store.update((draft) => {
       const current = requiredAttempt(draft, input.attemptId);
       const retained = childResultRecord(draft, current);
-      if (!retained || (retained.resultKind !== "untyped" && retained.resultKind !== "absent")) throw new Error("Child result changed before review was recorded.");
+      if (!retained || (retained.resultKind !== "untyped" && retained.resultKind !== "invalid" && retained.resultKind !== "absent")) throw new Error("Child result changed before review was recorded.");
       const review: ChildResultReview = {
         id: randomUUID(),
         attemptId: input.attemptId,
@@ -811,9 +813,10 @@ export class WorkgraphEngine {
     return this.store.update((draft) => {
       requireActiveLifecycle(draft);
       const now = new Date().toISOString();
+      const activeAttempts = draft.attempts.some((attempt) => ["starting", "running", "settling", "cancel_requested"].includes(attempt.state));
       if (input.action === "pause") {
         const mode = input.mode ?? "drain";
-        draft.control.executionStatus = mode === "drain" && draft.nodes.some((node) => node.state === "running") ? "draining" : "paused";
+        draft.control.executionStatus = mode === "drain" && activeAttempts ? "draining" : "paused";
         draft.control.pauseMode = mode;
         draft.control.pauseReason = input.reason.trim();
         if (mode === "immediate") {
@@ -822,7 +825,7 @@ export class WorkgraphEngine {
           }
         }
       } else if (input.action === "resume") {
-        if (draft.control.planStatus !== "approved") throw new Error("Execution cannot resume without a current approved plan.");
+        if (draft.nodes.length > 0 && draft.control.planStatus !== "approved") throw new Error("Execution cannot resume without a current approved plan.");
         draft.control.executionStatus = draft.nodes.some((node) => node.state === "running") ? "running" : draft.nodes.some((node) => node.state === "pending") ? "scheduled" : "idle";
         delete draft.control.pauseMode;
         delete draft.control.pauseReason;
@@ -835,6 +838,10 @@ export class WorkgraphEngine {
             const attempt = draft.attempts.find((candidate) => candidate.id === node.activeAttemptId);
             if (attempt && (attempt.state === "running" || attempt.state === "starting")) attempt.state = "cancel_requested";
           }
+        }
+        for (const attempt of draft.attempts) {
+          if (attempt.mode === "implementation" || (targets && !targets.has(attempt.nodeId))) continue;
+          if (attempt.state === "running" || attempt.state === "starting") attempt.state = "cancel_requested";
         }
         if (targets) {
           for (const nodeId of targets) if (!draft.nodes.some((node) => node.id === nodeId)) throw new Error(`Unknown work node ${nodeId}.`);
@@ -849,6 +856,17 @@ export class WorkgraphEngine {
         }
       }
       draft.control.updatedAt = now;
+    });
+  }
+
+  async acknowledgeCoordinatorWake(id: string, acknowledgment: string): Promise<WorkgraphRun> {
+    if (!id.trim() || !acknowledgment.trim()) throw new Error("A coordinator wake acknowledgment requires an id and explanation.");
+    return this.store.update((draft) => {
+      const wake = (draft.coordinatorWakeups ?? []).find((candidate) => candidate.id === id);
+      if (!wake) throw new Error(`Unknown coordinator wake ${id}.`);
+      if (wake.state !== "delivered") throw new Error(`Coordinator wake ${id} is not delivered.`);
+      wake.acknowledgedAt = new Date().toISOString();
+      wake.acknowledgment = acknowledgment.trim();
     });
   }
 

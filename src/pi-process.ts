@@ -191,12 +191,13 @@ async function spawnPi(options: SpawnPiOptions): Promise<ChildOutcome> {
         if (selector && models.at(-1) !== selector) models.push(selector);
       }
       if ((event.type === "tool_result_end" || event.type === "message_end") && message?.role === "toolResult" && message.toolName === "workgraph_report") {
-        const details = message.details as { report?: WorkerReport } | undefined;
-        if (details?.report) report = details.report;
+        const details = isRecord(message.details) ? message.details : undefined;
+        if (isWorkerReport(details?.report)) report = details.report;
       }
       if (event.type === "tool_execution_end" && event.toolName === "workgraph_report") {
-        const result = event.result as { details?: { report?: WorkerReport } } | undefined;
-        if (result?.details?.report) report = result.details.report;
+        const result = isRecord(event.result) ? event.result : undefined;
+        const details = isRecord(result?.details) ? result.details : undefined;
+        if (isWorkerReport(details?.report)) report = details.report;
       }
     };
 
@@ -232,11 +233,12 @@ async function spawnPi(options: SpawnPiOptions): Promise<ChildOutcome> {
       clearTimeout(timeout);
       options.signal?.removeEventListener("abort", onAbort);
       if (lineBuffer.trim()) processLine(lineBuffer);
-      report ??= readWorkgraphReport(options.sessionFile);
+      const storedReport = readWorkgraphReportResult(options.sessionFile);
+      report ??= storedReport.report;
       resolvePromise({
         exitCode: code ?? 1,
         sessionFile: options.sessionFile,
-        resultKind: report ? "typed" : terminalText ? "untyped" : "absent",
+        resultKind: report ? "typed" : storedReport.invalid ? "invalid" : terminalText ? "untyped" : "absent",
         ...(report ? { report } : {}),
         ...(terminalText ? { terminalText } : {}),
         stderr: stderr.trim(),
@@ -258,19 +260,44 @@ function assistantText(message: Record<string, unknown>): string {
     .trim();
 }
 
-export function readWorkgraphReport(sessionFile: string): WorkerReport | undefined {
+export interface WorkgraphReportRead {
+  report?: WorkerReport;
+  invalid: boolean;
+}
+
+export function readWorkgraphReportResult(sessionFile: string): WorkgraphReportRead {
   try {
     const messages = SessionManager.open(sessionFile).buildSessionContext().messages;
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (message?.role !== "toolResult" || message.toolName !== "workgraph_report") continue;
-      const details = message.details as { report?: WorkerReport } | undefined;
-      if (details?.report) return details.report;
+      const details = isRecord(message.details) ? message.details : undefined;
+      if (isWorkerReport(details?.report)) return { report: details.report, invalid: false };
+      return { invalid: true };
     }
   } catch {
-    return undefined;
+    return { invalid: false };
   }
-  return undefined;
+  return { invalid: false };
+}
+
+export function readWorkgraphReport(sessionFile: string): WorkerReport | undefined {
+  return readWorkgraphReportResult(sessionFile).report;
+}
+
+function isWorkerReport(value: unknown): value is WorkerReport {
+  if (!isRecord(value) || typeof value.kind !== "string" || typeof value.status !== "string" || typeof value.summary !== "string") return false;
+  if (!(["discovery", "implementation", "verification", "assurance_review", "assurance_synthesis"] as string[]).includes(value.kind)) return false;
+  if (!(["completed", "escalated", "failed"] as string[]).includes(value.status)) return false;
+  if (!Array.isArray(value.evidence) || !Array.isArray(value.findings)) return false;
+  if (value.kind === "verification" && !(["verified", "failed", "inconclusive"] as string[]).includes(String(value.verdict))) return false;
+  if (value.kind === "assurance_review" && typeof value.responsibility !== "string") return false;
+  if (value.kind === "assurance_synthesis" && typeof value.verdict !== "string") return false;
+  return true;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 export function readTerminalText(sessionFile: string): string | undefined {
