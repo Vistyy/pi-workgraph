@@ -1,10 +1,15 @@
+---
+name: workgraph-investigation
+description: Optional composable guidance for investigation tasks when it matches the current outcome.
+---
+
 # Investigation
 
 ## Purpose
 
-Use this playbook to answer a read-only question, test a premise, or recommend between alternatives.
+Use this skill to answer a read-only question, test a premise, or recommend between alternatives.
 The deliverable is a cited explanation or decision, not a repository change.
-If the investigation establishes that code must change, finish this playbook and route the new outcome through Bug fix, Feature, Refactoring, or Performance.
+If the investigation establishes that code must change, finish this skill and route the new outcome through Bug fix, Feature, Refactoring, or Performance.
 
 ## Completion predicate
 
@@ -57,4 +62,4 @@ Mark any unsupported premise as unknown rather than presenting it as fact.
 A missing source is not automatically a human decision.
 Try a different evidence surface or narrow the claim first.
 Ask the user only when an answer depends on product intent, preference, or authority that repository and runtime evidence cannot establish.
-Do not create implementation nodes under this playbook.
+Do not create implementation nodes under this skill.

@@ -3,12 +3,14 @@ import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { capabilityArgs, capabilityTools, resolveChildCapabilities } from "./capabilities.js";
 import type {
   ChildOutcome,
   ThinkingLevel,
   WorkerMode,
   UsageSummary,
   WorkerReport,
+  ChildCapabilityRecord,
 } from "./types.js";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -33,33 +35,16 @@ export interface ChildRequest {
   implementationStart?: "guide" | "executor";
   timeoutMs?: number;
   stableEntryId?: string | null;
-  workerExtensionPath?: string;
   onSessionCreated?: (sessionFile: string) => void | Promise<void>;
   signal?: AbortSignal;
+  capabilities?: ChildCapabilityRecord[];
 }
 
 export async function runPiChild(request: ChildRequest): Promise<ChildOutcome> {
   const sessionFile = await forkSession(request);
   await request.onSessionCreated?.(sessionFile);
-  const workerExtension = request.workerExtensionPath ?? defaultWorkerExtension;
-  const tools = request.mode === "implementation"
-    ? "read,bash,grep,find,ls,edit,write,workgraph_todo,workgraph_report"
-    : "read,bash,grep,find,ls,workgraph_report";
-  const startsInExecutor = request.mode === "implementation" && request.implementationStart === "executor";
-  const initialModel = startsInExecutor ? request.executorModel ?? request.guideModel : request.guideModel;
-  const initialThinking = startsInExecutor ? request.executorThinking ?? request.guideThinking : request.guideThinking;
-  const args = [
-    "--mode", "json",
-    "--print",
-    "--session", sessionFile,
-    "--model", initialModel,
-    "--thinking", initialThinking,
-    "--no-extensions",
-    "--extension", workerExtension,
-    "--no-prompt-templates",
-    "--tools", tools,
-    "Continue the assigned Workgraph objective now.",
-  ];
+  const capabilities = request.capabilities ?? await resolveChildCapabilities(request.mode, request.guideModel);
+  const args = buildChildArguments(request, sessionFile, capabilities);
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     PI_WORKGRAPH_MODE: request.mode,
@@ -71,6 +56,7 @@ export async function runPiChild(request: ChildRequest): Promise<ChildOutcome> {
     PI_WORKGRAPH_ALLOWED_PATHS: JSON.stringify(request.allowedPaths ?? []),
     PI_WORKGRAPH_RESPONSIBILITY: request.responsibility ?? "",
     PI_WORKGRAPH_IMPLEMENTATION_START: request.implementationStart ?? "guide",
+    PI_WORKGRAPH_CAPABILITIES: JSON.stringify(capabilities),
   };
 
   return spawnPi({
@@ -81,7 +67,19 @@ export async function runPiChild(request: ChildRequest): Promise<ChildOutcome> {
     sessionFile,
     timeoutMs: request.timeoutMs ?? 20 * 60_000,
     ...(request.signal ? { signal: request.signal } : {}),
+    capabilities,
   });
+}
+
+export function buildChildArguments(request: Pick<ChildRequest, "mode" | "guideModel" | "guideThinking" | "executorModel" | "executorThinking" | "implementationStart">, sessionFile: string, capabilities: ChildCapabilityRecord[]): string[] {
+  const startsInExecutor = request.mode === "implementation" && request.implementationStart === "executor";
+  const initialModel = startsInExecutor ? request.executorModel ?? request.guideModel : request.guideModel;
+  const initialThinking = startsInExecutor ? request.executorThinking ?? request.guideThinking : request.guideThinking;
+  const tools = request.mode === "implementation"
+    ? ["read","bash","grep","find","ls","edit","write","workgraph_todo","workgraph_report"]
+    : ["read","bash","grep","find","ls","workgraph_report"];
+  if (request.mode === "discovery") tools.push(...capabilityTools(capabilities));
+  return ["--mode", "json", "--print", "--session", sessionFile, "--model", initialModel, "--thinking", initialThinking, "--no-extensions", "--extension", defaultWorkerExtension, ...capabilityArgs(capabilities), "--no-prompt-templates", "--tools", tools.join(","), "Continue the assigned Workgraph objective now."];
 }
 
 export async function forkSession(request: Pick<ChildRequest, "parentSessionFile" | "targetCwd" | "sessionDir" | "objective" | "mode" | "runId" | "nodeId" | "stableEntryId">): Promise<string> {
@@ -147,6 +145,7 @@ interface SpawnPiOptions {
   sessionFile: string;
   timeoutMs: number;
   signal?: AbortSignal;
+  capabilities?: ChildCapabilityRecord[];
 }
 
 async function spawnPi(options: SpawnPiOptions): Promise<ChildOutcome> {

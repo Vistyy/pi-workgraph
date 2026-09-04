@@ -1,8 +1,13 @@
+---
+name: workgraph-bug-fix
+description: Optional composable guidance for bug-fix tasks when it matches the current outcome.
+---
+
 # Bug fix
 
 ## Purpose
 
-Use this playbook to correct observable behavior that violates an established expectation.
+Use this skill to correct observable behavior that violates an established expectation.
 Every shipped line must trace to evidence about the root mechanism or to a necessary verification boundary.
 Do not add protective changes that merely might help.
 

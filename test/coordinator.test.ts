@@ -17,10 +17,11 @@ test("the coordinator registers one stable tool inventory without mutation inter
   coordinator(fakePi);
 
   assert.deepEqual(tools, [
-    "workgraph_playbook",
     "workgraph_models",
+    "workgraph_capabilities",
     "workgraph_begin",
     "workgraph_progress",
+    "workgraph_complete",
     "workgraph_discover",
     "workgraph_synthesize",
     "workgraph_agree",
@@ -37,4 +38,5 @@ test("the coordinator registers one stable tool inventory without mutation inter
   const policy = await handlers.get("before_agent_start")![0]!({}, {});
   assert.match(policy.message.content, /All normal coordinator tools remain available/);
   assert.match(policy.message.content, /substantial product implementation/);
+  assert.match(policy.message.content, /outcome/);
 });

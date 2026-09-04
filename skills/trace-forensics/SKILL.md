@@ -1,9 +1,14 @@
+---
+name: workgraph-trace-forensics
+description: Optional composable guidance for trace-forensics tasks when it matches the current outcome.
+---
+
 # Trace forensics
 
 ## Purpose
 
-Use this playbook when a fixed trace, profile, snapshot, dump, or diagnostic capture is already available.
-Unlike Runtime forensics, this playbook treats the artifact as an immutable dataset and does not depend on reproducing the live symptom.
+Use this skill when a fixed trace, profile, snapshot, dump, or diagnostic capture is already available.
+Unlike Runtime forensics, this skill treats the artifact as an immutable dataset and does not depend on reproducing the live symptom.
 The deliverable is the strongest diagnosis the artifact can support.
 
 ## Completion predicate

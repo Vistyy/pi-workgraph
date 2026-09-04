@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { addNodes, allNodesComposed, claimsOverlap, readyWave, transitionNode } from "../src/scheduler.js";
 import { RUN_STATE_VERSION, type WorkgraphRun } from "../src/types.js";
-import { nodeSpec, testPlaybook } from "./helpers.js";
+import { nodeSpec, testOutcome } from "./helpers.js";
 
 function runFixture(): WorkgraphRun {
   return {
@@ -20,12 +20,8 @@ function runFixture(): WorkgraphRun {
     composedCommit: "base",
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString(),
-    playbook: {
-      id: testPlaybook.id,
-      title: testPlaybook.title,
-      completionPredicate: testPlaybook.completionPredicate,
-      steps: testPlaybook.steps.map((id) => ({ id, status: "pending" })),
-    },
+    outcome: testOutcome.outcome,
+    milestones: testOutcome.milestones.map((milestone) => ({ ...milestone, status: "pending" as const })),
     discoveries: [],
     nodes: [],
     composition: [],

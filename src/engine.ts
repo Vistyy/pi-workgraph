@@ -6,6 +6,8 @@ import { RunStateStore, type NewRunInput } from "./state-store.js";
 import type {
   Agreement,
   AssuranceFinding,
+  EvidenceItem,
+  OutcomeKind,
   AssuranceRecord,
   AssuranceResponsibility,
   AssuranceReviewRecord,
@@ -92,8 +94,14 @@ export class WorkgraphEngine {
 
   static async begin(input: NewRunInput, dependencies: EngineDependencies = {}): Promise<{ engine: WorkgraphEngine; run: WorkgraphRun }> {
     if (!input.request.trim()) throw new Error("A Workgraph request is required.");
-    if (!input.playbook.completionPredicate.trim()) throw new Error("A checkable completion predicate is required.");
-    if (input.playbook.steps.length === 0) throw new Error("The selected playbook has no steps.");
+    if (!input.outcome.statement.trim()) throw new Error("An explicit outcome statement is required.");
+    if (!input.outcome.completionPredicate.trim()) throw new Error("A checkable completion predicate is required.");
+    if (input.outcome.kind === "product_change" && input.milestones?.some((milestone) => !milestone.description.trim())) throw new Error("Milestone descriptions are required.");
+    const ids = new Set<string>();
+    for (const milestone of input.milestones ?? []) {
+      if (!/^[a-z][a-z0-9_-]{0,47}$/.test(milestone.id) || ids.has(milestone.id)) throw new Error(`Invalid or duplicate milestone id: ${milestone.id}`);
+      ids.add(milestone.id);
+    }
     const created = await RunStateStore.create(input);
     return { engine: new WorkgraphEngine(created.store, dependencies), run: created.run };
   }
@@ -106,16 +114,29 @@ export class WorkgraphEngine {
     return this.store.load();
   }
 
-  async recordProgress(stepId: string, status: "completed" | "skipped", reason?: string): Promise<WorkgraphRun> {
-    if (!stepId.trim()) throw new Error("A playbook step id is required.");
-    if (status === "skipped" && !reason?.trim()) throw new Error("A skipped playbook step requires a reason.");
+  async recordMilestone(milestoneId: string, status: "completed" | "skipped", reason?: string): Promise<WorkgraphRun> {
+    if (!milestoneId.trim()) throw new Error("A milestone id is required.");
+    if (status === "skipped" && !reason?.trim()) throw new Error("A skipped milestone requires a reason.");
     return this.store.update((run) => {
-      const step = run.playbook.steps.find((candidate) => candidate.id === stepId);
-      if (!step) throw new Error(`Unknown step ${stepId} for playbook ${run.playbook.id}.`);
-      step.status = status;
-      if (reason?.trim()) step.reason = reason.trim();
-      else delete step.reason;
-      step.at = new Date().toISOString();
+      const milestone = run.milestones.find((candidate) => candidate.id === milestoneId);
+      if (!milestone) throw new Error(`Unknown milestone ${milestoneId}.`);
+      milestone.status = status;
+      if (reason?.trim()) milestone.reason = reason.trim();
+      else delete milestone.reason;
+      milestone.at = new Date().toISOString();
+    });
+  }
+
+  async completeNonChange(kind: Exclude<OutcomeKind, "product_change">, conclusion: string, evidence: EvidenceItem[]): Promise<WorkgraphRun> {
+    const run = await this.load();
+    requirePhase(run, ["discovery", "awaiting_agreement", "approved"]);
+    if (run.outcome.kind !== kind) throw new Error(`This run is for ${run.outcome.kind}, not ${kind}.`);
+    if (!conclusion.trim()) throw new Error("A terminal conclusion is required.");
+    validateEvidence(evidence);
+    if (evidence.some((item) => item.class === "unknown" || item.class === "conflict")) throw new Error("Non-change completion requires conflicts and unknowns to be resolved or explicitly addressed.");
+    return this.store.update((draft) => {
+      draft.terminalOutcome = { kind, conclusion: conclusion.trim(), evidence: evidence.map((item) => ({ ...item, class: item.class ?? "direct" })), completedAt: new Date().toISOString() };
+      setPhase(draft, "complete", `The ${kind} outcome is complete with typed evidence and no implementation claim.`);
     });
   }
 
@@ -187,6 +208,7 @@ export class WorkgraphEngine {
       await this.updateDiscovery(assignment.id, (record) => {
         record.sessionFile = outcome.sessionFile;
         record.usage = outcome.usage;
+        if (outcome.capabilities) record.capabilities = outcome.capabilities;
         if (outcome.exitCode === 0 && outcome.report?.kind === "discovery" && outcome.report.status === "completed") {
           record.state = "completed";
           record.report = outcome.report;
@@ -262,6 +284,7 @@ export class WorkgraphEngine {
     return this.updateDiscovery(input.id, (draft) => {
       draft.sessionFile = outcome.sessionFile;
       draft.usage = outcome.usage;
+      if (outcome.capabilities) draft.capabilities = outcome.capabilities;
       if (outcome.exitCode === 0 && outcome.report?.kind === "discovery" && outcome.report.status === "completed") {
         draft.state = "completed";
         draft.report = outcome.report;
@@ -275,6 +298,7 @@ export class WorkgraphEngine {
 
   async recordAgreement(input: AgreementInput, accepted: boolean, prompt: string): Promise<WorkgraphRun> {
     const run = await this.load();
+    if (run.outcome.kind !== "product_change") throw new Error("Agreement is only required for product-change outcomes.");
     requirePhase(run, ["awaiting_agreement", "needs_decision"]);
     validateAgreement(input);
     if (accepted && input.unresolvedDecisions.length > 0) {
@@ -300,6 +324,7 @@ export class WorkgraphEngine {
 
   async execute(input: ExecuteInput): Promise<WorkgraphRun> {
     let run = await this.load();
+    if (run.outcome.kind !== "product_change") throw new Error("Implementation execution is only available for product-change outcomes.");
     requirePhase(run, ["approved", "awaiting_verification", "awaiting_assurance", "assurance_inconclusive", "revision_required"]);
     if (!run.agreement) throw new Error("An approved implementation envelope is required.");
     const repositoryError = await this.composedRepositoryError(run);
@@ -668,12 +693,9 @@ export class WorkgraphEngine {
   async assure(input: AssuranceInput): Promise<WorkgraphRun> {
     const run = await this.load();
     requirePhase(run, ["awaiting_assurance", "assurance_inconclusive"]);
+    if (run.outcome.kind !== "product_change") throw new Error("Assurance is only available for product-change outcomes.");
     if (!run.agreement) throw new Error("An approved implementation envelope is required.");
     requireCurrentVerification(run);
-    const pendingSteps = run.playbook.steps.filter((step) => step.status === "pending").map((step) => step.id);
-    if (pendingSteps.length > 0) {
-      throw new Error(`Settle every playbook step before assurance: ${pendingSteps.join(", ")}.`);
-    }
     const repositoryError = await this.composedRepositoryError(run);
     if (repositoryError) {
       return this.store.update((draft) => {
@@ -1087,6 +1109,7 @@ export class WorkgraphEngine {
       draft.processExitCode = outcome.exitCode;
       draft.usage = outcome.usage;
       draft.models = outcome.models;
+      if (outcome.capabilities) draft.capabilities = outcome.capabilities;
       if (outcome.report?.kind === "implementation") draft.report = outcome.report;
     });
     if (outcome.exitCode !== 0 || outcome.report?.kind !== "implementation") {
@@ -1182,6 +1205,13 @@ export class WorkgraphEngine {
   }
 }
 
+function validateEvidence(evidence: EvidenceItem[]): void {
+  if (evidence.length === 0) throw new Error("Typed terminal completion requires evidence.");
+  for (const item of evidence) {
+    if (!item.label.trim() || !item.observation.trim()) throw new Error("Evidence labels and observations are required.");
+  }
+}
+
 function validateAgreement(input: AgreementInput): void {
   const required = [
     ["outcome", input.outcome],
@@ -1273,7 +1303,7 @@ function setPhase(run: WorkgraphRun, to: RunPhase, reason: string): void {
 function discoveryObjective(run: WorkgraphRun, topology: DiscoveryTopology, assignment: DiscoveryAssignment): string {
   return [
     `Original request: ${run.request}`,
-    `Selected playbook: ${run.playbook.id}`,
+    `Outcome: ${run.outcome.kind}`,
     `Discovery topology: ${topology}`,
     `Assigned responsibility: ${assignment.lens}`,
     `Bounded question: ${assignment.objective}`,
@@ -1285,6 +1315,7 @@ function discoveryObjective(run: WorkgraphRun, topology: DiscoveryTopology, assi
 function discoverySynthesisObjective(run: WorkgraphRun, sources: DiscoveryRecord[]): string {
   return [
     `Original request: ${run.request}`,
+    `Outcome: ${run.outcome.kind}`,
     "Discovery reports to reconcile:",
     JSON.stringify(sources.map((source) => ({
       id: source.id,
@@ -1307,6 +1338,7 @@ function implementationObjective(run: WorkgraphRun, node: WorkNode): string {
   });
   return [
     `Original request: ${run.request}`,
+    `Outcome: ${run.outcome.kind}`,
     "Approved implementation envelope:",
     JSON.stringify(run.agreement, null, 2),
     "Bounded worker brief:",

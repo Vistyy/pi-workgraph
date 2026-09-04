@@ -1,10 +1,15 @@
+---
+name: workgraph-autonomous-run
+description: Optional composable guidance for autonomous-run tasks when it matches the current outcome.
+---
+
 # Autonomous run
 
 ## Purpose
 
-Use this playbook when the user wants one bounded task driven to completion without routine human turns.
+Use this skill when the user wants one bounded task driven to completion without routine human turns.
 Autonomy means the coordinator owns reversible technical decisions and verification, not that it may cross product authority or irreversible boundaries.
-Do not use this playbook to hide an unclear outcome or an unbounded program of work.
+Do not use this skill to hide an unclear outcome or an unbounded program of work.
 
 ## Completion predicate
 
@@ -15,7 +20,7 @@ A plateau, timeout, or partial improvement is not completion.
 
 Translate the requested result into a falsifiable predicate before the first state-changing unit.
 Quantify the expected scope and name an escape condition for a genuine dead end.
-Select the narrowest applicable change or investigation playbook as the inner procedure.
+Select the narrowest applicable change or investigation skill as the inner procedure.
 Record which decisions are reversible technical choices and which require human authority.
 Present the normal implementation agreement before substantial product writes.
 Do not weaken the predicate later merely to end the run.
@@ -40,7 +45,7 @@ Do not use a worker's completion report as product proof.
 
 ## Step 4: `record`
 
-Keep Workgraph state, playbook progress, node reports, model assignments, usage, commits, and evidence paths durable.
+Keep Workgraph state, skill progress, node reports, model assignments, usage, commits, and evidence paths durable.
 For a long or unattended run, maintain a compact append-only decision trail with one row per material unit or pivot.
 Record rejected hypotheses and discarded changes when they explain why the final path was selected.
 Use pointers rather than transcript dumps.

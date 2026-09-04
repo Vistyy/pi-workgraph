@@ -1,8 +1,13 @@
+---
+name: workgraph-runtime-forensics
+description: Optional composable guidance for runtime-forensics tasks when it matches the current outcome.
+---
+
 # Runtime forensics
 
 ## Purpose
 
-Use this playbook to diagnose a symptom in a live process, such as a leak, spin, intermittent failure, stale state, or visual glitch.
+Use this skill to diagnose a symptom in a live process, such as a leak, spin, intermittent failure, stale state, or visual glitch.
 The live system is the primary evidence surface.
 Reading source can generate hypotheses, but source alone cannot establish the runtime cause.
 The deliverable is a diagnosis and evidence package, not a fix.

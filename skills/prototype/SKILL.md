@@ -1,10 +1,15 @@
+---
+name: workgraph-prototype
+description: Optional composable guidance for prototype tasks when it matches the current outcome.
+---
+
 # Prototype
 
 ## Purpose
 
-Use this playbook to settle a consequential design, interaction, layout, timing, or integration question by observing a cheap throwaway artifact.
+Use this skill to settle a consequential design, interaction, layout, timing, or integration question by observing a cheap throwaway artifact.
 The prototype is a decision instrument, not an early production implementation.
-Do not use this playbook when the desired behavior and implementation shape are already established; route directly to Feature.
+Do not use this skill when the desired behavior and implementation shape are already established; route directly to Feature.
 
 ## Completion predicate
 
@@ -14,7 +19,7 @@ The run is complete when the deciding question has been observed on the matching
 
 State the single decision the prototype must resolve.
 Name the observation that would discriminate between credible outcomes.
-If there is no unresolved empirical decision, skip the prototype and route to the applicable change playbook.
+If there is no unresolved empirical decision, skip the prototype and route to the applicable change skill.
 Use a short evidence discovery lane to gather prior art or API constraints only when those inputs could eliminate an option before building.
 Record expected prototype lifetime and cleanup location.
 

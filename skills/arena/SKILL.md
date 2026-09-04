@@ -1,8 +1,13 @@
+---
+name: workgraph-arena
+description: Optional composable guidance for arena tasks when it matches the current outcome.
+---
+
 # Arena
 
 ## Purpose
 
-Use this playbook when several independent attempts at the same non-trivial artifact could reveal a materially better shape.
+Use this skill when several independent attempts at the same non-trivial artifact could reveal a materially better shape.
 Within the current Workgraph lifecycle, Arena is primarily a decision method for designs, plans, analyses, prompts, or other report-sized artifacts before implementation.
 Do not schedule overlapping production implementations as ordinary DAG nodes, because composition would incorrectly treat every candidate as additive work.
 
@@ -51,7 +56,7 @@ Select one candidate as the coherent base.
 Incorporate only ideas from losing candidates that fit the base's ownership and mental model.
 Record each accepted idea, rejected idea, and convergence signal.
 Do not paste together incompatible interfaces or split authority among candidates.
-Verify the synthesized artifact against the original rubric and route it to the applicable playbook.
+Verify the synthesized artifact against the original rubric and route it to the applicable skill.
 
 ## Failure and recovery
 

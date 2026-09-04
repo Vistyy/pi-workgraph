@@ -1,8 +1,13 @@
+---
+name: workgraph-performance
+description: Optional composable guidance for performance tasks when it matches the current outcome.
+---
+
 # Performance
 
 ## Purpose
 
-Use this playbook for a measured latency, throughput, CPU, memory, I/O, startup, or responsiveness problem.
+Use this skill for a measured latency, throughput, CPU, memory, I/O, startup, or responsiveness problem.
 The measurement story controls the work.
 Do not optimize from source inspection alone or keep changes whose effect is indistinguishable from noise.
 

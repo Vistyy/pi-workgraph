@@ -1,10 +1,15 @@
+---
+name: workgraph-figure-it-out
+description: Optional composable guidance for figure-it-out tasks when it matches the current outcome.
+---
+
 # Figure it out
 
 ## Purpose
 
-Use this fallback only for consequential work that does not fit a narrower playbook or whose scale makes a focused playbook insufficient.
+Use this fallback only for consequential work that does not fit a narrower skill or whose scale makes a focused skill insufficient.
 The coordinator must design an auditable workflow before implementing.
-Do not reinvent Bug fix, Feature, Refactoring, Performance, Visual parity, Eval, or another existing playbook for a routine unit.
+Do not reinvent Bug fix, Feature, Refactoring, Performance, Visual parity, Eval, or another existing skill for a routine unit.
 
 ## Completion predicate
 
@@ -23,7 +28,7 @@ Do not encode "done well" as a predicate without observable conditions.
 
 Design the workflow as ordered phases and record it before implementation.
 Put the riskiest unknown, verification harness, and shared foundations before broad feature work.
-Compose narrower playbooks and methods rather than reproducing their instructions.
+Compose narrower skills and methods rather than reproducing their instructions.
 Use Architecture for consequential ownership, Prototype for empirical forks, Arena for independent candidate comparison, and discovery topologies for bounded evidence.
 Declare which scopes fan out, their path isolation, dependencies, pilot needs, model roles, and dropout tolerance.
 Define product verification, assurance responsibilities, pause points, and the escape condition.
@@ -45,7 +50,7 @@ Maintain a compact append-only decision trail for each material phase, experimen
 Link exact commits, artifacts, reports, and sessions instead of embedding their contents.
 Record the hypothesis, observation, decision, and effect on the predicate.
 Preserve rejected directions when they explain why the accepted design is safer or simpler.
-Update playbook step state and explicit skip reasons as the workflow changes.
+Update skill milestone state and explicit skip reasons as the workflow changes.
 Keep the trail only as detailed as needed for audit and cold-start resumption.
 
 ## Step 5: `verify`

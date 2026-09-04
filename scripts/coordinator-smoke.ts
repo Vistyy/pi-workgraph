@@ -97,8 +97,8 @@ Keep changes minimal and use the Workgraph terminal report tools in child assign
     });
   });
 
-  const prompt = `Use the complete Workgraph Feature playbook for this request and do not stop before coordinator judgment returns complete.
-First load the feature playbook, then begin with the predicate that src/value.txt contains exactly AURORA followed by a newline and ./verify.sh succeeds at the composed revision.
+  const prompt = `Use Workgraph for this request and do not stop before coordinator judgment returns complete.
+Begin with a product_change outcome and the predicate that src/value.txt contains exactly AURORA followed by a newline and ./verify.sh succeeds at the composed revision.
 Treat this as consequential enough for an agreement checkpoint so the orchestration boundary is exercised.
 Run one partitioned discovery call with two bounded read-only responsibilities: mechanism and ownership, then intent and scope risk.
 Use ${guideModel} with high thinking for both discovery responsibilities.
@@ -106,7 +106,7 @@ Present an agreement with no unresolved decisions, reuse the existing file and v
 Use one implementation node claiming only src/value.txt with a complete GOAL, SCOPE, CONTEXT, ACCEPTANCE, VERIFY, TIMEBOX, FORBIDDEN, and REPORT brief.
 Use ./verify.sh for node and composed verification.
 Use ${guideModel} as guide and openai-codex/gpt-5.6-luna as executor.
-Record every feature playbook step as completed before assurance.
+Record task-specific milestones as completed before assurance.
 Run behavior, structure, and evidence assurance with ${guideModel}, then use openai-codex/gpt-5.6-luna for synthesis.
 Finally call workgraph_judge and account for every candidate finding, accepting only concrete material findings.
 Do not make direct coordinator product edits, and accept the UI response as the user's approval decision.`;
@@ -115,11 +115,11 @@ Do not make direct coordinator product edits, and accept the UI response as the 
   child.kill("SIGTERM");
   await new Promise((resolvePromise) => child.once("close", resolvePromise));
 
-  const expectedTools = ["workgraph_playbook", "workgraph_begin", "workgraph_discover", "workgraph_agree", "workgraph_execute", "workgraph_progress", "workgraph_assure", "workgraph_judge"];
+  const expectedTools = ["workgraph_begin", "workgraph_discover", "workgraph_agree", "workgraph_execute", "workgraph_progress", "workgraph_assure", "workgraph_judge"];
   for (const tool of expectedTools) {
     if (!tools.includes(tool)) throw new Error(`Coordinator did not call ${tool}. Called: ${tools.join(", ")}`);
   }
-  if (confirmations.length !== 1) throw new Error(`Expected one approval confirmation, observed ${confirmations.length}.`);
+  if (confirmations.length !== 1) throw new Error(`Expected one approval confirmation, observed ${confirmations.length}. Tools: ${tools.join(", ")}. Prompts: ${JSON.stringify(confirmations)}`);
   if (!statePath) throw new Error("Coordinator did not expose the durable Workgraph state path.");
   const state = JSON.parse(await readFile(statePath, "utf8"));
   const value = await readFile(join(root, "src", "value.txt"), "utf8");

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { WorkgraphEngine, type ChildRunner } from "../src/engine.js";
 import { GitRepository, runProcess } from "../src/git.js";
-import { implementationReport, nodeSpec, testPlaybook, verificationReport, zeroUsage } from "./helpers.js";
+import { implementationReport, nodeSpec, testOutcome, verificationReport, zeroUsage } from "./helpers.js";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await runProcess("git", ["-C", cwd, ...args], { cwd, timeoutMs: 30_000 });
@@ -63,7 +63,8 @@ test("independent product evidence is revision-keyed and a correction continues 
       parentSessionId: "parent",
       parentSessionFile: join(parent, "parent.jsonl"),
       baseCommit: await repository.head(),
-      playbook: testPlaybook,
+      outcome: testOutcome.outcome,
+      milestones: testOutcome.milestones,
     }, { repository, runChild: child });
     await begun.engine.store.update((run) => {
       run.agreement = {
@@ -109,7 +110,7 @@ test("independent product evidence is revision-keyed and a correction continues 
     assert.equal(implementationRequests[1]!.implementationStart, "executor");
 
     run = await begun.engine.verify({ model: "provider/verifier", thinking: "high" });
-    for (const step of testPlaybook.steps) await begun.engine.recordProgress(step, "completed");
+    for (const step of testOutcome.milestones.map((milestone) => milestone.id)) await begun.engine.recordMilestone(step, "completed");
     await writeFile(join(root, "outside.txt"), "unattributed\n");
     await git(root, "add", "outside.txt");
     await git(root, "commit", "-m", "Unattributed coordinator change");

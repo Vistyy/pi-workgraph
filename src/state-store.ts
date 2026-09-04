@@ -5,6 +5,7 @@ import {
   RUN_STATE_VERSION,
   type RunPhase,
   type WorkgraphRun,
+  type OutcomeKind,
 } from "./types.js";
 
 export interface NewRunInput {
@@ -14,12 +15,12 @@ export interface NewRunInput {
   parentSessionId: string;
   parentSessionFile: string;
   baseCommit: string;
-  playbook: {
-    id: string;
-    title: string;
+  outcome: {
+    kind: OutcomeKind;
+    statement: string;
     completionPredicate: string;
-    steps: readonly string[];
   };
+  milestones?: readonly { id: string; description: string }[];
   now?: Date;
   runId?: string;
 }
@@ -53,12 +54,12 @@ export class RunStateStore {
       composedCommit: input.baseCommit,
       createdAt: now,
       updatedAt: now,
-      playbook: {
-        id: input.playbook.id,
-        title: input.playbook.title,
-        completionPredicate: input.playbook.completionPredicate,
-        steps: input.playbook.steps.map((id) => ({ id, status: "pending" })),
-      },
+      outcome: { ...input.outcome },
+      milestones: (input.milestones ?? []).map((milestone) => ({
+        id: milestone.id,
+        description: milestone.description,
+        status: "pending" as const,
+      })),
       discoveries: [],
       nodes: [],
       composition: [],

@@ -37,6 +37,7 @@ const EnvelopeImpactSchema = StringEnum([
 const EvidenceSchema = Type.Object({
   label: Type.String(),
   observation: Type.String(),
+  class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
   command: Type.Optional(Type.String()),
   artifact: Type.Optional(Type.String()),
 });
@@ -291,10 +292,10 @@ function terminalReport(report: WorkerReport, state: Record<string, unknown>) {
 
 function modeInstructions(): string {
   if (mode === "discovery") {
-    return `[WORKGRAPH DISCOVERY]\nInvestigate only the assigned responsibility.\nUse read-only repository evidence and distinguish observations, inferences, and unknowns.\nDo not implement, edit files, or expand the question.\nFinish with a concise discovery report and account for unknowns that could change the implementation envelope.`;
+    return `[WORKGRAPH DISCOVERY]\nInvestigate only the assigned responsibility.\nUse read-only repository evidence and classify each item as direct, inference, conflict, or unknown.\nFor blast-radius-sensitive changes, identify and prove the external safety fact at the actual dependent boundary.\nDo not implement, edit files, or expand the question.\nFinish with a concise discovery report and account for unknowns that could change the implementation envelope.`;
   }
   if (mode === "verification") {
-    return `[WORKGRAPH PRODUCT VERIFICATION]\nObserve the composed revision through the procedure in the objective.\nDo not edit product files.\nUse the real product surface when commands alone cannot prove the behavior.\nRecord concrete artifacts such as screenshots, browser state, console or network output, traces, profiles, or stored values.\nReturn verified only when the evidence directly establishes the required scenarios.`;
+    return `[WORKGRAPH PRODUCT VERIFICATION]\nObserve the composed revision through the procedure in the objective.\nDo not edit product files.\nUse the real product surface when commands alone cannot prove the behavior.\nRecord concrete artifacts such as screenshots, browser state, console or network output, traces, profiles, or stored values.\nReturn inconclusive when the required browser, CLI, or TUI control surface is unavailable.\nReturn verified only when the evidence directly establishes the required scenarios.`;
   }
   if (mode === "assurance_review") {
     return assuranceReviewInstructions(responsibility as AssuranceResponsibility);
@@ -341,7 +342,7 @@ function isReadOnlyCommand(command: string): boolean {
 }
 
 function forbiddenGitControlCommand(command: string): boolean {
-  return /\bgit\s+(add|apply|commit|checkout|switch|reset|restore|rm|mv|clean|rebase|merge|cherry-pick|worktree|branch\s+(-[dDmM]|--delete|--move))\b/.test(command);
+  return /\bgit\s+(apply|checkout|switch|reset|restore|rm|mv|clean|rebase|merge|cherry-pick|worktree|branch\s+(-[dDmM]|--delete|--move))\b/.test(command);
 }
 
 function splitModel(selector: string): [string, string] {

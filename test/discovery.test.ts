@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WorkgraphEngine, type ChildRunner } from "../src/engine.js";
-import { commandAgreement, testPlaybook, zeroUsage } from "./helpers.js";
+import { commandAgreement, testOutcome, zeroUsage } from "./helpers.js";
 
 const failedDiscovery: ChildRunner = async (request) => ({
   exitCode: 0,
@@ -32,7 +32,8 @@ test("discovery accounts for a failed lane without silently shrinking the reques
       parentSessionId: "parent",
       parentSessionFile: join(root, "parent.jsonl"),
       baseCommit: "base",
-      playbook: testPlaybook,
+      outcome: testOutcome.outcome,
+      milestones: testOutcome.milestones,
     }, { runChild: failedDiscovery });
     const discovered = await begun.engine.discover({
       topology: "evidence",
@@ -93,7 +94,8 @@ test("substantial discovery fan-out can be reduced by an accounted synthesis chi
       parentSessionId: "parent",
       parentSessionFile: join(root, "parent.jsonl"),
       baseCommit: "base",
-      playbook: testPlaybook,
+      outcome: testOutcome.outcome,
+      milestones: testOutcome.milestones,
     }, { runChild: child });
     await begun.engine.discover({
       topology: "replicate",
@@ -132,7 +134,8 @@ test("preflight-unavailable discovery members become durable dropouts without sp
       parentSessionId: "parent",
       parentSessionFile: join(root, "parent.jsonl"),
       baseCommit: "base",
-      playbook: testPlaybook,
+      outcome: testOutcome.outcome,
+      milestones: testOutcome.milestones,
     }, { runChild: child });
     const run = await begun.engine.discover({
       topology: "replicate",

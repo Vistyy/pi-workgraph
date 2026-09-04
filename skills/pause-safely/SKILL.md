@@ -1,8 +1,13 @@
+---
+name: workgraph-pause-safely
+description: Optional composable guidance for pause-safely tasks when it matches the current outcome.
+---
+
 # Pause safely
 
 ## Purpose
 
-Use this playbook only when the user requests a pause, a restart is necessary, or context must be handed off before the current run completes.
+Use this skill only when the user requests a pause, a restart is necessary, or context must be handed off before the current run completes.
 A safe pause leaves enough durable evidence for a cold-start coordinator to resume without guessing or duplicating work.
 Do not interpret "keep going" or unattended execution as a pause request.
 
@@ -24,7 +29,7 @@ Start no new discovery lane, implementation node, verification process, or assur
 Cancel children only when cancellation is safer than waiting and record their terminal classification.
 Do not cross a new irreversible boundary merely to package the pause.
 This implementation does not create or push pull requests as part of pausing.
-Mark unfinished playbook steps as pending rather than skipping them.
+Mark unfinished skill milestones as pending rather than skipping them.
 
 ## Step 3: `persist`
 
@@ -37,7 +42,7 @@ Do not delete artifacts needed to interpret current verification or failure stat
 ## Step 4: `record`
 
 Write a compact resume note outside volatile conversational context.
-Include the requested outcome, completion predicate, selected playbook, current phase, approved envelope, completed and pending steps, node and commit status, evidence revision, open findings, and first next operation.
+Include the requested outcome, completion predicate, selected guidance, current phase, approved envelope, completed and pending milestones, node and commit status, evidence revision, open findings, and first next operation.
 Point to the durable state and session paths instead of copying reports.
 State what is verified, not verified, and inconclusive.
 Record standing restrictions that a resumed worker must reconstruct.

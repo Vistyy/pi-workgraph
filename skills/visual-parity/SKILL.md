@@ -1,8 +1,13 @@
+---
+name: workgraph-visual-parity
+description: Optional composable guidance for visual-parity tasks when it matches the current outcome.
+---
+
 # Visual parity
 
 ## Purpose
 
-Use this playbook when one rendered interface must match an existing baseline across specified states and viewports.
+Use this skill when one rendered interface must match an existing baseline across specified states and viewports.
 The untouched baseline is the specification.
 Visual equivalence is established by image evidence and interaction observation, not source similarity or unaided memory.
 

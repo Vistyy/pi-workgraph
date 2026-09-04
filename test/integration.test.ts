@@ -13,7 +13,7 @@ import {
   discoveryReport,
   implementationReport,
   nodeSpec,
-  testPlaybook,
+  testOutcome,
   zeroUsage,
 } from "./helpers.js";
 
@@ -99,7 +99,8 @@ test("engine composes isolated commits, verifies the exact result, and runs resp
       parentSessionFile: join(parent, "parent.jsonl"),
       baseCommit: info.head,
       runId: "integration-run",
-      playbook: testPlaybook,
+      outcome: testOutcome.outcome,
+      milestones: testOutcome.milestones,
     }, { repository, runChild: fakeChild });
 
     await assert.rejects(() => begun.engine.execute({ nodes: [] }), /expected approved/);
@@ -149,7 +150,7 @@ test("engine composes isolated commits, verifies the exact result, and runs resp
     assert.equal(run.productVerification?.revision, run.composedCommit);
     assert.deepEqual(run.nodes.map((node) => node.state), ["composed", "composed"]);
 
-    for (const step of testPlaybook.steps) await begun.engine.recordProgress(step, "completed");
+    for (const step of testOutcome.milestones.map((milestone) => milestone.id)) await begun.engine.recordMilestone(step, "completed");
     run = await begun.engine.assure(assuranceAssignments);
     assert.equal(run.phase, "awaiting_judgment");
     run = await begun.engine.judgeAssurance({ judgments: [] });
@@ -191,7 +192,8 @@ test("scheduler rejects a committed file outside the worker's claimed paths", as
       parentSessionId: "parent",
       parentSessionFile: join(parent, "parent.jsonl"),
       baseCommit: info.head,
-      playbook: testPlaybook,
+      outcome: testOutcome.outcome,
+      milestones: testOutcome.milestones,
     }, { repository, runChild: child });
     await begun.engine.store.update((run) => {
       run.agreement = commandAgreement;
@@ -228,7 +230,8 @@ test("a routine worker failure can be replaced inside the existing approved enve
       parentSessionId: "parent",
       parentSessionFile: join(parent, "parent.jsonl"),
       baseCommit: info.head,
-      playbook: testPlaybook,
+      outcome: testOutcome.outcome,
+      milestones: testOutcome.milestones,
     }, { repository, runChild: child });
     await begun.engine.store.update((run) => {
       run.agreement = {

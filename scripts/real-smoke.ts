@@ -6,7 +6,6 @@ import type { AssistantMessage, UserMessage } from "@earendil-works/pi-ai";
 import { WorkgraphEngine } from "../src/engine.js";
 import { GitRepository, runProcess } from "../src/git.js";
 import { loadModelPolicy, roleTargets } from "../src/model-policy.js";
-import { getPlaybook } from "../src/playbooks.js";
 
 const guideModel = process.env.PI_WORKGRAPH_GUIDE_MODEL || "openai-codex/gpt-5.6-sol";
 const executorModel = process.env.PI_WORKGRAPH_EXECUTOR_MODEL || "openai-codex/gpt-5.6-luna";
@@ -67,7 +66,6 @@ Use workgraph_report as the terminal action.
   if (!parentSessionFile) throw new Error("Could not create the parent smoke session.");
 
   const repositoryInfo = await GitRepository.inspect(root);
-  const featurePlaybook = getPlaybook("feature");
   const modelPolicy = await loadModelPolicy();
   const discoveryPanel = roleTargets(modelPolicy, "discovery.replicate");
   const begun = await WorkgraphEngine.begin({
@@ -78,12 +76,8 @@ Use workgraph_report as the terminal action.
     parentSessionFile,
     baseCommit: repositoryInfo.head,
     runId: `real-${Date.now().toString(36)}`,
-    playbook: {
-      id: featurePlaybook.id,
-      title: featurePlaybook.title,
-      completionPredicate: "src/a.txt is ORBIT, src/b.txt is MOON, and the composed result passes both fixture checks.",
-      steps: featurePlaybook.steps,
-    },
+    outcome: { kind: "product_change", statement: "The exact fixture values are composed.", completionPredicate: "src/a.txt is ORBIT, src/b.txt is MOON, and the composed result passes both fixture checks." },
+    milestones: ["discover", "implement", "verify", "assure"].map((id) => ({ id, description: `Complete ${id}.` })),
   });
 
   console.log(JSON.stringify({ event: "begun", runId: begun.run.runId, root }));
@@ -193,7 +187,7 @@ Use workgraph_report as the terminal action.
   }
   if (run.phase !== "awaiting_assurance") throw new Error(`Real execution stopped in ${run.phase}.`);
 
-  for (const step of featurePlaybook.steps) await begun.engine.recordProgress(step, "completed");
+  for (const milestone of begun.run.milestones) await begun.engine.recordMilestone(milestone.id, "completed");
   run = await begun.engine.assure({
     reviewers: [
       { responsibility: "behavior", ...roleTargets(modelPolicy, "assurance.behavior")[0]! },

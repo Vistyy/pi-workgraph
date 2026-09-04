@@ -14,7 +14,7 @@ import {
   assuranceSynthesis,
   commandAgreement,
   nodeSpec,
-  testPlaybook,
+  testOutcome,
   verificationReport,
   zeroUsage,
 } from "./helpers.js";
@@ -44,7 +44,8 @@ async function setup() {
     parentSessionId: "parent",
     parentSessionFile: join(parent, "parent.jsonl"),
     baseCommit: base,
-    playbook: testPlaybook,
+    outcome: testOutcome.outcome,
+      milestones: testOutcome.milestones,
   }, { repository });
   return { parent, root, repository, base, engine: begun.engine, runId: begun.run.runId };
 }
@@ -191,7 +192,7 @@ test("assurance recovery preserves completed reviews and retries only synthesis"
     await fixture.engine.store.update((run) => {
       run.agreement = commandAgreement;
       run.productVerification = { revision: run.composedCommit, method: "commands", state: "completed", commands: [] };
-      for (const step of run.playbook.steps) step.status = "completed";
+      for (const step of run.milestones) step.status = "completed";
       run.assurance = {
         revision: run.composedCommit,
         state: "running",

@@ -1,10 +1,15 @@
+---
+name: workgraph-eval
+description: Optional composable guidance for eval tasks when it matches the current outcome.
+---
+
 # Eval
 
 ## Purpose
 
-Use this playbook to measure how a prompt, instruction, model assignment, or orchestration variant changes agent behavior before adopting it.
+Use this skill to measure how a prompt, instruction, model assignment, or orchestration variant changes agent behavior before adopting it.
 The main threat is observer effect, because a candidate that knows the rubric or comparison purpose may behave differently.
-Do not use this playbook to compare ordinary product implementations when direct product verification can decide the outcome.
+Do not use this skill to compare ordinary product implementations when direct product verification can decide the outcome.
 
 ## Completion predicate
 

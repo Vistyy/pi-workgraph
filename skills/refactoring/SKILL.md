@@ -1,8 +1,13 @@
+---
+name: workgraph-refactoring
+description: Optional composable guidance for refactoring tasks when it matches the current outcome.
+---
+
 # Refactoring
 
 ## Purpose
 
-Use this playbook when structure changes while supported behavior must remain stable.
+Use this skill when structure changes while supported behavior must remain stable.
 A refactor may remove or reorganize code, but it must not silently introduce a feature or bug fix.
 If investigation reveals a behavior change is necessary, split it into a separately agreed run.
 

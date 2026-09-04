@@ -21,7 +21,7 @@ test("the default policy keeps heterogeneous replication and independently assig
   assert.notEqual(roleTargets(DEFAULT_MODEL_POLICY, "assurance.behavior")[0]!.model, roleTargets(DEFAULT_MODEL_POLICY, "assurance.structure")[0]!.model);
 });
 
-test("a role override persists independently of PStack configuration", async () => {
+test("a role override persists independently of external configuration configuration", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-workgraph-models-"));
   const path = join(root, "models.json");
   try {

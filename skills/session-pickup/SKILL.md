@@ -1,14 +1,19 @@
+---
+name: workgraph-session-pickup
+description: Optional composable guidance for session-pickup tasks when it matches the current outcome.
+---
+
 # Session pickup
 
 ## Purpose
 
-Use this playbook to continue a prior Workgraph, session, branch, worktree, or explicit resume note.
+Use this skill to continue a prior Workgraph, session, branch, worktree, or explicit resume note.
 Pickup is inheritance, so the prior run's durable evidence should prevent unnecessary re-investigation.
 Do not trust a prior summary where repository or state evidence contradicts it.
 
 ## Completion predicate
 
-The pickup is complete when operational state is reconciled, completed and pending work are distinguished, the exact resume point is named, the remaining task is routed to the applicable playbook, and inherited claims are checked at their authoritative boundary.
+The pickup is complete when operational state is reconciled, completed and pending work are distinguished, the exact resume point is named, the remaining task is routed to the applicable skill, and inherited claims are checked at their authoritative boundary.
 
 ## Step 1: `read`
 
@@ -37,8 +42,8 @@ Name the first unsettled operation and the reason it remains necessary.
 
 ## Step 4: `route`
 
-Continue through the already selected playbook when its outcome and predicate remain valid.
-Route to a narrower playbook when the inherited run intentionally ended at a diagnosis or design decision.
+Continue through the already selected guidance when its outcome and predicate remain valid.
+Route to a narrower skill when the inherited run intentionally ended at a diagnosis or design decision.
 Use a revised agreement when new evidence changes outcome, non-goal, owner, public interface, dependency, security guarantee, scale, or reuse decision.
 Use bounded replacement or correction nodes for failures inside the existing envelope.
 Preserve original implementer trajectory for local correction when practical.
@@ -50,7 +55,7 @@ Verify inherited claims at the boundary that gives them authority.
 Use exact commits for composition, actual repository status for cleanliness, typed terminal reports for worker completion, and product artifacts for behavior.
 A prior worker statement that checks passed is not equivalent to retained command or product evidence.
 Run only the checks affected by changed or stale inputs during pickup, then continue normal lifecycle verification.
-Update durable playbook progress and the resume note if another interruption is likely.
+Update durable skill progress and the resume note if another interruption is likely.
 
 ## Failure and recovery
 
@@ -60,4 +65,4 @@ If neither state nor repository can establish what happened, stop before mutatio
 
 ## Output
 
-Report what was inherited, what was reconciled, what was not redone, the exact resume point, the routed playbook, stale evidence, and the next operation.
+Report what was inherited, what was reconciled, what was not redone, the exact resume point, the routed skill, stale evidence, and the next operation.

@@ -1,4 +1,4 @@
-export const RUN_STATE_VERSION = 2 as const;
+export const RUN_STATE_VERSION = 3 as const;
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
@@ -40,11 +40,39 @@ export type EnvelopeImpact =
   | "scale"
   | "reuse";
 
+export type OutcomeKind = "answer" | "decision" | "product_change" | "operation";
+export type EvidenceClass = "direct" | "inference" | "conflict" | "unknown";
+
 export interface EvidenceItem {
   label: string;
   observation: string;
+  class?: EvidenceClass;
   command?: string;
   artifact?: string;
+}
+
+export interface OutcomeContract {
+  kind: OutcomeKind;
+  statement: string;
+  completionPredicate: string;
+}
+
+export type MilestoneStatus = "pending" | "completed" | "skipped";
+
+export interface MilestoneRecord {
+  id: string;
+  description: string;
+  status: MilestoneStatus;
+  reason?: string;
+  at?: string;
+}
+
+export interface TerminalOutcome {
+  kind: Exclude<OutcomeKind, "product_change">;
+  conclusion: string;
+  evidence: EvidenceItem[];
+  implementationClaim?: never;
+  completedAt: string;
 }
 
 export interface Finding {
@@ -127,6 +155,16 @@ export interface UsageSummary {
   turns: number;
 }
 
+export interface ChildCapabilityRecord {
+  id: "web_access" | "codex_remote_compaction";
+  packageSource: string;
+  resourceIdentity: string;
+  version?: string;
+  tools: string[];
+  available: boolean;
+  diagnostic?: string;
+}
+
 export interface ChildOutcome {
   exitCode: number;
   sessionFile: string;
@@ -135,6 +173,7 @@ export interface ChildOutcome {
   usage: UsageSummary;
   models: string[];
   timedOut: boolean;
+  capabilities?: ChildCapabilityRecord[];
 }
 
 export type DiscoveryTopology = "partition" | "replicate" | "evidence";
@@ -161,6 +200,7 @@ export interface DiscoveryRecord extends DiscoveryAssignment {
   report?: DiscoveryReport;
   error?: string;
   usage?: UsageSummary;
+  capabilities?: ChildCapabilityRecord[];
 }
 
 export type VerificationMethod = "commands" | "independent";
@@ -225,6 +265,7 @@ export interface WorkNode extends WorkNodeSpec {
   error?: string;
   usage?: UsageSummary;
   models?: string[];
+  capabilities?: ChildCapabilityRecord[];
   startedAt?: string;
   settledAt?: string;
   composedAt?: string;
@@ -252,6 +293,7 @@ export interface ProductVerificationRecord {
   commands: CommandEvidence[];
   error?: string;
   usage?: UsageSummary;
+  capabilities?: ChildCapabilityRecord[];
 }
 
 export interface AssuranceReviewRecord {
@@ -293,22 +335,6 @@ export interface AssuranceRecord {
   finalJudgment?: AssuranceJudgment;
 }
 
-export type PlaybookStepStatus = "pending" | "completed" | "skipped";
-
-export interface PlaybookStepRecord {
-  id: string;
-  status: PlaybookStepStatus;
-  reason?: string;
-  at?: string;
-}
-
-export interface PlaybookState {
-  id: string;
-  title: string;
-  completionPredicate: string;
-  steps: PlaybookStepRecord[];
-}
-
 export interface HumanDecision {
   kind: "agreement" | "envelope_change";
   prompt: string;
@@ -339,7 +365,9 @@ export interface WorkgraphRun {
   composedCommit: string;
   createdAt: string;
   updatedAt: string;
-  playbook: PlaybookState;
+  outcome: OutcomeContract;
+  milestones: MilestoneRecord[];
+  terminalOutcome?: TerminalOutcome;
   agreement?: Agreement;
   discoveries: DiscoveryRecord[];
   nodes: WorkNode[];

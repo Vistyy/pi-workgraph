@@ -1,8 +1,13 @@
+---
+name: workgraph-architecture
+description: Optional composable guidance for architecture tasks when it matches the current outcome.
+---
+
 # Architecture
 
 ## Purpose
 
-Use this playbook when ownership, public interfaces, state models, failure semantics, or expensive-to-reverse module boundaries must be decided before implementation.
+Use this skill when ownership, public interfaces, state models, failure semantics, or expensive-to-reverse module boundaries must be decided before implementation.
 Do not use it merely because more than one file changes.
 The output is one coherent design package that implementation can follow and verification can test.
 

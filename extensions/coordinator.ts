@@ -17,7 +17,7 @@ import {
   type ModelTarget,
 } from "../src/model-policy.js";
 import { stableParentEntry } from "../src/pi-process.js";
-import { getPlaybook, listPlaybooks, loadPlaybook, PLAYBOOKS } from "../src/playbooks.js";
+import { resolveChildCapabilities, WEB_TOOLS, WEB_PACKAGE, CODEX_PACKAGE } from "../src/capabilities.js";
 import type {
   AssuranceResponsibility,
   DiscoveryAssignment,
@@ -30,7 +30,6 @@ import type {
 
 const POINTER_ENTRY = "pi-workgraph-active";
 const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const);
-const PlaybookIdSchema = StringEnum(PLAYBOOKS.map((playbook) => playbook.id) as [typeof PLAYBOOKS[number]["id"], ...typeof PLAYBOOKS[number]["id"][]]);
 const ModelRoleSchema = StringEnum([...MODEL_ROLES]);
 const AssuranceResponsibilitySchema = StringEnum(["behavior", "structure", "evidence"] as const);
 
@@ -125,51 +124,21 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     const run = activeRun;
     const inProgress = run && run.phase !== "complete" && run.phase !== "failed";
     const state = inProgress
-      ? `Active Workgraph ${run.runId} is in phase ${run.phase} with playbook ${run.playbook.id}. All normal coordinator tools remain available. Keep substantial product implementation behind the approved agreement and use Workgraph boundaries for delegated writes, composition, evidence, and assurance.`
-      : "All normal coordinator tools remain available. For materially ambiguous or structurally consequential work, load a Workgraph playbook and begin a durable run before substantial product implementation. Clear, local, reversible work may proceed directly.";
+      ? `Active Workgraph ${run.runId} is in phase ${run.phase} for a ${run.outcome.kind} outcome. All normal coordinator tools remain available. Keep substantial product implementation behind the approved agreement and use Workgraph boundaries for delegated writes, composition, evidence, and assurance.`
+      : "All normal coordinator tools remain available. For materially ambiguous or structurally consequential work, begin a durable Workgraph before substantial product implementation. Clear, local, reversible work may proceed directly.";
     return {
       message: {
         customType: "pi-workgraph-policy",
-        content: `[WORKGRAPH COORDINATION POLICY]\n${state}\nThe coordinator owns semantic synthesis and final judgment. Keep playbook progress durable, account for every child, and expose only the agreement, authority-changing decisions, material blockers, and final evidenced result to the user.`,
+        content: `[WORKGRAPH COORDINATION POLICY]\n${state}\nThe coordinator owns semantic synthesis and final judgment. Keep outcome and milestone progress durable, account for every child, and expose only the agreement, authority-changing decisions, material blockers, and final evidenced result to the user.`,
         display: false,
       },
     };
   });
 
   pi.registerTool({
-    name: "workgraph_playbook",
-    label: "Workgraph Playbook",
-    description: "List Workgraph playbooks or load the complete instructions for one playbook through a stable tool.",
-    promptSnippet: "List or load a Workgraph playbook before beginning consequential orchestration",
-    parameters: Type.Object({
-      action: StringEnum(["list", "get"] as const),
-      id: Type.Optional(PlaybookIdSchema),
-    }),
-    async execute(_id, params) {
-      if (params.action === "list") {
-        const playbooks = listPlaybooks();
-        return {
-          content: [{ type: "text", text: playbooks.map((item) => `${item.id} [${item.family}]: ${item.summary}`).join("\n") }],
-          details: { action: "list", playbooks, playbook: null } as Record<string, unknown>,
-        };
-      }
-      if (!params.id) throw new Error("Playbook id is required for action get.");
-      const loaded = await loadPlaybook(params.id);
-      return {
-        content: [{ type: "text", text: loaded.content }],
-        details: {
-          action: "get",
-          playbooks: [],
-          playbook: { ...loaded.definition, path: `playbooks/${loaded.definition.id}.md` },
-        } as Record<string, unknown>,
-      };
-    },
-  });
-
-  pi.registerTool({
     name: "workgraph_models",
     label: "Workgraph Models",
-    description: "Read or update Workgraph's durable role-to-model policy without depending on PStack configuration.",
+    description: "Read or update Workgraph's durable role-to-model policy without depending on external configuration.",
     promptSnippet: "Inspect or configure Workgraph model roles",
     parameters: Type.Object({
       action: StringEnum(["get", "set"] as const),
@@ -188,19 +157,34 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "workgraph_capabilities",
+    label: "Workgraph Capabilities",
+    description: "Inspect Workgraph's trusted child-capability configuration and resolved installed resources.",
+    promptSnippet: "Inspect trusted child capabilities without configuring executable paths",
+    parameters: Type.Object({ action: StringEnum(["get"] as const), model: Type.Optional(Type.String()) }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const model = params.model ?? "openai-codex/gpt-5.6-sol";
+      const capabilities = await resolveChildCapabilities("discovery", model);
+      return { content: [{ type: "text", text: JSON.stringify({ trusted: [WEB_PACKAGE, CODEX_PACKAGE], tools: WEB_TOOLS, model, capabilities }, null, 2) }], details: { capabilities } };
+    },
+  });
+
+  pi.registerTool({
     name: "workgraph_begin",
     label: "Workgraph Begin",
-    description: "Begin durable playbook-guided orchestration for a materially ambiguous or structurally consequential repository task.",
-    promptSnippet: "Begin a durable Workgraph with a selected playbook and checkable completion predicate",
+    description: "Begin a durable outcome-driven Workgraph for a materially ambiguous or structurally consequential repository task.",
+    promptSnippet: "Begin a durable Workgraph with an explicit outcome and completion predicate",
     promptGuidelines: [
-      "Load the selected playbook first, then begin Workgraph before substantial product implementation for consequential requests.",
+      "Choose the outcome kind and begin Workgraph before substantial product implementation for consequential requests.",
       "Normal coordinator tools remain available; this boundary records orchestration state and does not install a tool gate.",
     ],
     parameters: Type.Object({
       request: Type.String({ description: "The user's requested outcome in their terms." }),
-      reason: Type.String({ description: "Why the selected playbook and lifecycle are proportionate." }),
-      playbook: PlaybookIdSchema,
+      reason: Type.String({ description: "Why the Workgraph lifecycle is proportionate." }),
+      outcomeKind: StringEnum(["answer", "decision", "product_change", "operation"] as const),
+      outcomeStatement: Type.String({ description: "The explicit answer, decision, change, or operation outcome." }),
       completionPredicate: Type.String({ description: "A falsifiable condition for completion." }),
+      milestones: Type.Optional(Type.Array(Type.Object({ id: Type.String(), description: Type.String() }), { maxItems: 12 })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
@@ -211,7 +195,6 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         if (!sessionFile) throw new Error("Workgraph orchestration requires a persistent parent Pi session.");
         const repositoryInfo = await GitRepository.inspect(ctx.cwd);
         if (repositoryInfo.status) throw new Error(`Start from a clean Git worktree:\n${repositoryInfo.status}`);
-        const playbook = getPlaybook(params.playbook);
         const begun = await WorkgraphEngine.begin({
           request: params.request.trim(),
           projectRoot: repositoryInfo.root,
@@ -219,18 +202,18 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           parentSessionId: ctx.sessionManager.getSessionId(),
           parentSessionFile: sessionFile,
           baseCommit: repositoryInfo.head,
-          playbook: {
-            id: playbook.id,
-            title: playbook.title,
+          outcome: {
+            kind: params.outcomeKind,
+            statement: params.outcomeStatement.trim(),
             completionPredicate: params.completionPredicate.trim(),
-            steps: playbook.steps,
           },
+          ...(params.milestones ? { milestones: params.milestones } : {}),
         });
         engine = begun.engine;
         remember(begun.run);
         pi.appendEntry(POINTER_ENTRY, { runId: begun.run.runId, statePath: begun.run.statePath } satisfies RunPointer);
         return {
-          content: [{ type: "text", text: `Started Workgraph ${begun.run.runId} with ${playbook.title}. All coordinator tools remain stable. Reason: ${params.reason}` }],
+          content: [{ type: "text", text: `Started Workgraph ${begun.run.runId} for ${begun.run.outcome.kind}. All coordinator tools remain stable. Reason: ${params.reason}` }],
           details: summaryDetails(begun.run),
         };
       });
@@ -239,21 +222,43 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "workgraph_progress",
-    label: "Workgraph Progress",
-    description: "Mark a selected playbook step completed or explicitly skipped in durable run state.",
-    promptSnippet: "Record completed or explicitly skipped Workgraph playbook steps",
+    label: "Workgraph Milestone",
+    description: "Mark a run-declared task milestone completed or explicitly skipped.",
+    promptSnippet: "Record durable task-specific milestone progress",
     parameters: Type.Object({
-      step: Type.String(),
+      milestone: Type.String(),
       status: StringEnum(["completed", "skipped"] as const),
       reason: Type.Optional(Type.String()),
     }),
     async execute(_id, params) {
       return exclusively(async () => {
-        const run = remember(await requireEngine().recordProgress(params.step, params.status, params.reason));
+        const run = remember(await requireEngine().recordMilestone(params.milestone, params.status, params.reason));
         return {
-          content: [{ type: "text", text: formatPlaybookProgress(run) }],
-          details: { ...summaryDetails(run), playbook: run.playbook },
+          content: [{ type: "text", text: formatMilestoneProgress(run) }],
+          details: { ...summaryDetails(run), milestones: run.milestones },
         };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_complete",
+    label: "Workgraph Complete",
+    description: "Complete an answer, decision, or operation outcome with typed evidence and no implementation claim.",
+    promptSnippet: "Finish a non-change Workgraph outcome with direct evidence",
+    parameters: Type.Object({
+      conclusion: Type.String(),
+      evidence: Type.Array(Type.Object({
+        label: Type.String(), observation: Type.String(), class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
+        command: Type.Optional(Type.String()), artifact: Type.Optional(Type.String()),
+      }), { minItems: 1, maxItems: 30 }),
+    }),
+    async execute(_id, params) {
+      return exclusively(async () => {
+        const current = await requireEngine().load();
+        if (current.outcome.kind === "product_change") throw new Error("Product-change outcomes must use agreement, execution, verification, assurance, and judgment.");
+        const run = remember(await requireEngine().completeNonChange(current.outcome.kind, params.conclusion, params.evidence));
+        return { content: [{ type: "text", text: `Outcome ${run.outcome.kind} completed: ${run.terminalOutcome?.conclusion}` }], details: { ...summaryDetails(run), terminalOutcome: run.terminalOutcome } };
       });
     },
   });
@@ -504,7 +509,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "workgraph_status",
     label: "Workgraph Status",
-    description: "Read durable playbook progress, lane accounting, nodes, child sessions, exact commits, verification evidence, assurance, and pending decisions.",
+    description: "Read durable outcome, milestone, lane, child, exact-commit, verification, assurance, and pending-decision state.",
     promptSnippet: "Inspect durable Workgraph status and evidence",
     parameters: Type.Object({}),
     async execute() {
@@ -622,7 +627,7 @@ function formatDiscoveries(run: WorkgraphRun, records: WorkgraphRun["discoveries
   for (const record of records) {
     lines.push(`- ${record.id} [${record.model}; ${record.state}]: ${record.report?.summary ?? record.error ?? "No report."}`);
   }
-  lines.push("The Sol coordinator should reconcile convergence, disagreement, and dropouts before choosing the next playbook step.");
+  lines.push("The Sol coordinator should reconcile convergence, disagreement, dropouts, and unknowns before choosing the next operation.");
   return lines.join("\n");
 }
 
@@ -633,7 +638,7 @@ function formatExecution(run: WorkgraphRun, nodes: WorkgraphRun["nodes"]): strin
     lines.push(`- ${node.id}: ${node.state}${commit}${node.error ? ` - ${node.error}` : ""}`);
   }
   if (run.phase === "awaiting_verification") lines.push("Run workgraph_verify next.");
-  if (run.phase === "awaiting_assurance") lines.push("Settle playbook steps, then run workgraph_assure.");
+  if (run.phase === "awaiting_assurance") lines.push("Run workgraph_assure.");
   if (run.phase === "needs_decision") lines.push("Affected work stopped. Present only the authority-changing decision to the user.");
   if (run.phase === "revision_required") lines.push("Add bounded corrective nodes if accepted findings remain inside the approved envelope.");
   return lines.join("\n");
@@ -669,10 +674,10 @@ function formatJudgment(run: WorkgraphRun): string {
   return lines.join("\n");
 }
 
-function formatPlaybookProgress(run: WorkgraphRun): string {
+function formatMilestoneProgress(run: WorkgraphRun): string {
   return [
-    `${run.playbook.title} progress:`,
-    ...run.playbook.steps.map((step) => `- ${step.id}: ${step.status}${step.reason ? ` - ${step.reason}` : ""}`),
+    `${run.outcome.kind} milestones:`,
+    ...(run.milestones.length ? run.milestones.map((milestone) => `- ${milestone.id}: ${milestone.status}${milestone.reason ? ` - ${milestone.reason}` : ""}`) : ["- None declared"]),
   ].join("\n");
 }
 
@@ -684,9 +689,10 @@ function formatStatus(run: WorkgraphRun): string {
   return [
     `Workgraph ${run.runId}`,
     `Phase: ${run.phase}`,
-    `Playbook: ${run.playbook.id}`,
-    `Predicate: ${run.playbook.completionPredicate}`,
-    `Steps: ${run.playbook.steps.map((step) => `${step.id}=${step.status}`).join(", ")}`,
+    `Outcome: ${run.outcome.kind}`,
+    `Statement: ${run.outcome.statement}`,
+    `Predicate: ${run.outcome.completionPredicate}`,
+    `Milestones: ${run.milestones.map((milestone) => `${milestone.id}=${milestone.status}`).join(", ") || "none"}`,
     `Discovery lanes: ${run.discoveries.length}, dropouts=${dropouts}`,
     `Base: ${run.baseCommit}`,
     `Composed: ${run.composedCommit}`,
@@ -708,7 +714,8 @@ function summaryDetails(run: WorkgraphRun) {
     runId: run.runId,
     phase: run.phase,
     statePath: run.statePath,
-    playbook: run.playbook,
+    outcome: run.outcome,
+    milestones: run.milestones,
     baseCommit: run.baseCommit,
     composedCommit: run.composedCommit,
   };

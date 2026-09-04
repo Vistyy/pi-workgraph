@@ -1,8 +1,13 @@
+---
+name: workgraph-feature
+description: Optional composable guidance for feature tasks when it matches the current outcome.
+---
+
 # Feature
 
 ## Purpose
 
-Use this playbook for new product behavior or an intentional change to existing behavior.
+Use this skill for new product behavior or an intentional change to existing behavior.
 The coordinator owns design, decomposition, evidence, and final judgment while bounded workers own implementation scopes.
 Do not let a solution-shaped request substitute for establishing the desired outcome and ownership.
 

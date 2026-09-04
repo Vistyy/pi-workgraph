@@ -11,7 +11,7 @@ import {
   assuranceReview,
   assuranceSynthesis,
   commandAgreement,
-  testPlaybook,
+  testOutcome,
   zeroUsage,
 } from "./helpers.js";
 
@@ -69,13 +69,14 @@ async function runAssurance(
     parentSessionId: "parent",
     parentSessionFile: join(root, "parent.jsonl"),
     baseCommit: "base",
-    playbook: testPlaybook,
+    outcome: testOutcome.outcome,
+      milestones: testOutcome.milestones,
   }, { runChild: child, repository });
   await begun.engine.store.update((run) => {
     run.agreement = commandAgreement;
     run.productVerification = { revision: "base", method: "commands", state: "completed", commands: [] };
     run.phase = "awaiting_assurance";
-    for (const step of run.playbook.steps) step.status = "completed";
+    for (const step of run.milestones) step.status = "completed";
   });
   try {
     const assured = await begun.engine.assure(assignments);
