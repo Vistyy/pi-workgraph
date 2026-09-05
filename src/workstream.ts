@@ -1496,9 +1496,9 @@ export class WorkstreamStore {
   }
 
   /**
-   * Record that the configured result callback accepted the notification enqueue.
-   * Pi does not report when a queued follow-up is presented or inspected, so this
-   * retained delivery state must not be interpreted as either of those events.
+   * Record accepted notification enqueue or direct result-tool presentation.
+   * Pi provides no queued-follow-up presentation receipt; this shared delivery
+   * state alone proves neither queued presentation nor coordinator inspection.
    */
   async markDelivered(resultId: string, now?: Date): Promise<WorkstreamState> {
     return this.update(
