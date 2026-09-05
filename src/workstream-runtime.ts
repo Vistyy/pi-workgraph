@@ -857,8 +857,12 @@ export class WorkstreamRuntime {
           attempt.id,
           composition.commit,
         );
+        if (composition.retainedRef && composition.retainedRef !== retainedRef)
+          throw new Error(
+            `Retained ref provenance changed from ${composition.retainedRef} to ${retainedRef}.`,
+          );
         if (input.action === "retry") {
-          await this.store.retryComposition(attempt.id);
+          await this.store.retryComposition(attempt.id, undefined, retainedRef);
           await this.advance(attempt.id);
         } else {
           const integratedRevision = await this.repository.resolveRevision(
@@ -888,16 +892,17 @@ export class WorkstreamRuntime {
           await this.cleanup(attempt.id);
         }
       } else if (cleanup?.state === "blocked") {
-        if (!attempt.worker)
-          throw new Error(
-            "Cleanup recovery cannot inspect the missing worker identity.",
-          );
-        const observation = await this.workers.observe(attempt.worker);
-        if (!["idle", "done"].includes(observation.status))
-          throw new Error(
-            `Recovery inspected worker ${observation.status}; leave resources intact.`,
-          );
-        await this.repository.assertClean(placementOf(attempt).path);
+        if (!cleanup.workerClosed) {
+          if (!attempt.worker)
+            throw new Error(
+              "Cleanup recovery cannot inspect the missing worker identity.",
+            );
+          const observation = await this.workers.observe(attempt.worker);
+          if (!["idle", "done"].includes(observation.status))
+            throw new Error(
+              `Recovery inspected worker ${observation.status}; leave resources intact.`,
+            );
+        }
         await this.store.retryCleanup(attempt.id);
         await this.cleanup(attempt.id);
       } else {

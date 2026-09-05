@@ -1050,7 +1050,11 @@ export class WorkstreamStore {
     );
   }
 
-  async retryComposition(id: string, now?: Date): Promise<WorkstreamState> {
+  async retryComposition(
+    id: string,
+    now?: Date,
+    retainedRef?: string,
+  ): Promise<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -1061,6 +1065,9 @@ export class WorkstreamStore {
           state: "pending",
           commit: composition.commit,
           expectedHead: composition.expectedHead,
+          ...((retainedRef ?? composition.retainedRef)
+            ? { retainedRef: retainedRef ?? composition.retainedRef }
+            : {}),
         };
       },
       now,
