@@ -15,7 +15,7 @@ import {
 } from "../src/herdr.js";
 import type { WorkerIdentity, WorkerResourceIdentity } from "../src/types.js";
 
-test("task-first Herdr names are bounded, readable, role-specific, and distinguish attempts", () => {
+test("worker tabs use concise task text while native names remain unique and role-specific", () => {
   const request = {
     runId: "RUN/with spaces and symbols",
     nodeId: "attempt-one",
@@ -30,18 +30,21 @@ test("task-first Herdr names are bounded, readable, role-specific, and distingui
   const label = herdrWorkerTabLabel(request);
   assert.match(first, /^meaningful-agen[a-z]*-implement-[a-f0-9]{6}$/);
   assert.match(first, /^[a-z][a-z0-9_-]{0,31}$/);
-  assert.match(label, /^Meaningful agent names - implement - [a-f0-9]{6}$/);
-  assert.ok(label.length <= 48);
+  assert.equal(label, "Meaningful agent");
+  assert.ok(label.length <= 18);
+  assert.doesNotMatch(label, /implement|[a-f0-9]{6}/i);
+  assert.equal(
+    herdrWorkerTabLabel({ ...request, attemptId: "attempt-two" }),
+    label,
+  );
   assert.notEqual(first, second);
   const fallback = herdrWorkerTabLabel({
     ...request,
     assignmentId: "assignment-123456789abcdef0",
     objective: "Implement parser support",
   });
-  assert.match(
-    fallback,
-    /^Implement parser support - implement - [a-f0-9]{6}$/,
-  );
+  assert.equal(fallback, "Implement parser");
+  assert.ok(fallback.length <= 18);
   assert.equal(
     herdrAgentName("run", "node", "attempt"),
     legacyHerdrAgentName("run", "node", "attempt"),
@@ -50,6 +53,14 @@ test("task-first Herdr names are bounded, readable, role-specific, and distingui
     legacyObjectiveHerdrWorkerName(request),
     herdrWorkerName(request),
   );
+
+  const semanticId = herdrWorkerTabLabel({
+    ...request,
+    assignmentId: "tool-design",
+    objective: "Implement the tool design",
+  });
+  assert.equal(semanticId, "Tool design");
+  assert.ok(semanticId.length <= 18);
 });
 
 test("coordinator fork names use repository context without exposing paths", () => {

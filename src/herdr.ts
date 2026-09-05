@@ -697,6 +697,7 @@ function errorMessage(error: unknown): string {
 
 const HERDR_AGENT_NAME_LIMIT = 32;
 const IDENTITY_SUFFIX_LENGTH = 6;
+const WORKER_TAB_LABEL_LIMIT = 18;
 const TAB_SUBJECT_LIMIT = 24;
 const GENERIC_ASSIGNMENT_IDS = new Set([
   "assignment",
@@ -742,12 +743,7 @@ export function legacyObjectiveHerdrWorkerName(
 }
 
 export function herdrWorkerTabLabel(request: WorkerNamingContext): string {
-  const role = request.role ?? "research";
-  const suffix = identitySuffix(
-    workerIdentity(request),
-    IDENTITY_SUFFIX_LENGTH,
-  );
-  return `${bound(workerSubject(request), TAB_SUBJECT_LIMIT)} - ${role} - ${suffix}`;
+  return boundAtWord(workerSubject(request), WORKER_TAB_LABEL_LIMIT);
 }
 
 export function herdrCoordinatorNames(request: CoordinatorLaunchRequest): {
@@ -833,6 +829,13 @@ function identitySuffix(value: string, length: number): string {
 
 function bound(value: string, limit: number): string {
   return value.slice(0, limit).replace(/[ -]+$/g, "");
+}
+
+function boundAtWord(value: string, limit: number): string {
+  const bounded = bound(value, limit);
+  if (value.length <= limit) return bounded;
+  const boundary = bounded.lastIndexOf(" ");
+  return boundary > 0 ? bounded.slice(0, boundary) : bounded;
 }
 
 function readableLabel(value: string): string {

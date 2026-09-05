@@ -17,7 +17,9 @@ Start from the project directory and ask the coordinator to delegate the needed 
 Composition still requires a clean destination at the maintained-application boundary.
 First delegation creates a workstream automatically; `workgraph_begin` is optional.
 Workers run in visible Herdr tabs with ordinary Pi package/configuration loading and fresh context.
-Worker tab labels and native agent names begin with bounded sanitized assignment text, identify the capability role, and include a short attempt suffix so repeated attempts are distinguishable.
+Worker tab labels show only bounded task text - at most 18 display characters, with readable word-boundary shortening when possible.
+Native agent names retain bounded sanitized assignment text, the capability role, and a short identity suffix so repeated attempts remain distinguishable.
+Use concise, semantic 1-2 word assignment IDs when practical; tab labels are display text only, while native names and stored resource IDs provide identity and recovery.
 Forked coordinator workspaces use the target repository basename and a short identity suffix rather than exposing the full path or inventing a user purpose.
 Workspace, tab, pane, terminal, session, and stored resource IDs remain authoritative for ownership, observation, and cleanup; display labels are never cleanup targets.
 Retained states launched before task-first names remain recoverable through their stored exact resource identity, with the legacy name accepted only when that resource identity was not retained.
