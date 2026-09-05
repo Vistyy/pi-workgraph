@@ -63,14 +63,14 @@ if (args[0] === "tab" && args[1] === "create") {
   save();
   console.log(JSON.stringify({result:{agent:{workspace_id:"recovery-workspace",tab_id:"recovery-workspace:tab-1",pane_id:"recovery-workspace:pane-1",terminal_id:"terminal-1",agent_status:state.status,name:state.name,cwd:state.cwd,agent_session:{value:state.sessionFile}}}}));
 } else if (args[0] === "agent" && args[1] === "get") {
-  if (state.closed) fail("pane_not_found");
+  if (state.closed || state.paneGone) fail(state.errorCode || "pane_not_found");
   console.log(JSON.stringify({result:{agent:{workspace_id:"recovery-workspace",tab_id:"recovery-workspace:tab-1",pane_id:"recovery-workspace:pane-1",terminal_id:"terminal-1",agent_status:state.status,name:state.name,cwd:state.mismatchedCwd || state.cwd,agent_session:{value:state.sessionFile}}}}));
 } else if (args[0] === "tab" && args[1] === "close") {
   state.closed = true;
   save();
   console.log(JSON.stringify({result:{type:"ok"}}));
 } else if (args[0] === "tab" && args[1] === "get") {
-  if (state.closed) fail("tab_not_found");
+  if (state.closed || state.tabGone) fail("tab_not_found");
   console.log(JSON.stringify({result:{tab:{tab_id:"recovery-workspace:tab-1"}}}));
 } else if (args[0] === "api" && args[1] === "snapshot") {
   const agents = state.closed ? [] : [{workspace_id:"recovery-workspace",tab_id:"recovery-workspace:tab-1",pane_id:"recovery-workspace:pane-1",terminal_id:"terminal-1",agent_status:state.status,name:state.name,cwd:state.cwd,agent_session:{value:state.sessionFile}}];
@@ -294,6 +294,55 @@ async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
   return { f, attempt };
 }
 
+test("registered recover reconciles absent worker closure before blocked cleanup bookkeeping", async () => {
+  const f = await recoveryFixture();
+  await f.runtime.queue({
+    id: "cleanup-absent",
+    capability: "research",
+    artifactIntent: "evidence_only",
+    objective: "Read value",
+    intentVersion: 0,
+    expectedEvidence: ["Exact bytes"],
+  });
+  await f.runtime.reconcile();
+  const attempt = (await f.store.load()).attempts[0]!;
+  const obstruction = join(attempt.worktreePath!, "transient.tmp");
+  await writeFile(obstruction, "known fixture obstruction\n");
+  await f.settle({
+    kind: "research",
+    status: "completed",
+    summary: "Read exact bytes",
+    evidence: [{ label: "value", observation: "value.txt contains before\\n" }],
+    findings: [],
+  });
+  await f.store.beginCleanup({
+    id: attempt.id,
+    expectedHead: await f.repository.head(attempt.worktreePath!),
+    discard: false,
+  });
+  await f.store.blockCleanup(attempt.id, "Known fixture obstruction");
+  await f.setTransport({ closed: true });
+  await f.attachPublic();
+  try {
+    await rm(obstruction);
+    const state = resultState(
+      (
+        await f.pi.call("workgraph_control", {
+          action: "recover",
+          attemptId: attempt.id,
+          reason:
+            "Exact native worker tab is absent; obstruction was inspected",
+        })
+      ).details,
+    );
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(existsSync(attempt.worktreePath!), false);
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("registered recover resumes Git cleanup after durable native worker closure", async () => {
   const { f, attempt } = await prepareBlockedCleanup(false);
   try {
@@ -390,6 +439,86 @@ test("registered recover safely retries a transient Git composition failure and 
       await f.repository.head(),
       composition.revision,
       "later reconciliation must not reapply",
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("registered recovery reconciles a proven-absent worker before blocked composition bookkeeping", async () => {
+  const { f, attempt, workerCommit } = await prepareBlockedComposition(
+    false,
+    true,
+  );
+  try {
+    await f.setTransport({ closed: true });
+    const beforeHead = await f.repository.head();
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "before\n");
+    const state = resultState(
+      (
+        await f.pi.call("workgraph_control", {
+          action: "recover",
+          attemptId: attempt.id,
+          reason: "Exact native worker tab is already absent",
+        })
+      ).details,
+    );
+    const composition = state.attempts[0]?.composition;
+    assert.equal(composition?.state, "composed", JSON.stringify(state));
+    assert.notEqual(composition.revision, beforeHead);
+    assert.equal(
+      await git(f.root, "rev-parse", composition!.retainedRef!),
+      workerCommit,
+    );
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "worker\n");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    const recoveredHead = await f.repository.head();
+    await f.pi.call("workgraph_status", {});
+    assert.equal(await f.repository.head(), recoveredHead, "must not reapply");
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("registered absent-worker retain_not_applied preserves integrated HEAD and retained proposal", async () => {
+  const { f, attempt, workerCommit, integratedRevision } =
+    await prepareBlockedComposition(true);
+  try {
+    assert.ok(integratedRevision);
+    await f.setTransport({ closed: true });
+    const state = resultState(
+      (
+        await f.pi.call("workgraph_control", {
+          action: "retain_not_applied",
+          attemptId: attempt.id,
+          integratedRevision,
+          reason:
+            "Integrated change remains authoritative after worker closure",
+        })
+      ).details,
+    );
+    assert.equal(state.attempts[0]?.composition?.state, "retained_not_applied");
+    assert.equal(
+      await git(
+        f.root,
+        "rev-parse",
+        state.attempts[0]!.composition!.retainedRef!,
+      ),
+      workerCommit,
+    );
+    assert.equal(await f.repository.head(), integratedRevision);
+    assert.equal(
+      await readFile(join(f.root, "value.txt"), "utf8"),
+      "integrated\n",
+    );
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    await f.pi.call("workgraph_status", {});
+    assert.equal(
+      await f.repository.head(),
+      integratedRevision,
+      "must not reapply",
     );
   } finally {
     await f.dispose();
@@ -503,7 +632,40 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
       }),
       /worker cwd changed/,
     );
-    await f.setTransport({ mismatchedCwd: undefined });
+    await f.setTransport({
+      mismatchedCwd: undefined,
+      paneGone: true,
+      tabGone: false,
+      errorCode: undefined,
+    });
+    await assert.rejects(
+      f.pi.call("workgraph_control", {
+        action: "retain_not_applied",
+        attemptId: attempt.id,
+        integratedRevision,
+        reason: "A missing pane with a present tab is ambiguous",
+      }),
+      /pane_not_found/,
+    );
+    await f.setTransport({
+      paneGone: true,
+      tabGone: true,
+      errorCode: "transport_failure",
+    });
+    await assert.rejects(
+      f.pi.call("workgraph_control", {
+        action: "retain_not_applied",
+        attemptId: attempt.id,
+        integratedRevision,
+        reason: "An ambiguous transport failure is not absence proof",
+      }),
+      /transport_failure/,
+    );
+    await f.setTransport({
+      paneGone: false,
+      tabGone: false,
+      errorCode: undefined,
+    });
     await writeFile(join(attempt.worktreePath!, "unattributed.txt"), "dirty\n");
     await assert.rejects(
       f.pi.call("workgraph_control", {

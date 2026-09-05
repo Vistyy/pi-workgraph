@@ -164,6 +164,7 @@ export interface DelegatedEffectObservation {
   valid: boolean;
   detail: string;
   delegationExercised: true;
+  implementationOrigin: "direct" | "delegated";
   experiment: "verified" | "not-run";
 }
 
@@ -177,6 +178,61 @@ export function observeDelegatedOutcome(
     problems.push(`workstream lifecycle is ${state.lifecycle.state}`);
   if (state.attempts.length === 0)
     problems.push("no delegated attempts are attributable");
+  const assignmentsById = new Map(
+    state.assignments.map((assignment) => [assignment.id, assignment]),
+  );
+  if (assignmentsById.size !== state.assignments.length)
+    problems.push("delegated assignments are not uniquely attributable");
+  for (const assignment of state.assignments) {
+    if (
+      !state.attempts.some((attempt) => attempt.assignmentId === assignment.id)
+    )
+      problems.push(`delegated assignment ${assignment.id} has no attempt`);
+  }
+  const resultOwners = new Set<string>();
+  for (const attempt of state.attempts) {
+    const assignment = assignmentsById.get(attempt.assignmentId);
+    if (!assignment) {
+      problems.push(`attempt ${attempt.id} has no delegated assignment`);
+      continue;
+    }
+    if (!attempt.worker)
+      problems.push(`attempt ${attempt.id} has no worker identity`);
+    else if (
+      !attempt.sessionFile ||
+      attempt.worker.sessionFile !== attempt.sessionFile
+    )
+      problems.push(`attempt ${attempt.id} worker session is not attributable`);
+    else if (
+      attempt.worktreePath &&
+      attempt.worker.cwd !== attempt.worktreePath
+    )
+      problems.push(`attempt ${attempt.id} worker cwd is not attributable`);
+    if (!attempt.resultId)
+      problems.push(`attempt ${attempt.id} has no retained result`);
+    else {
+      if (resultOwners.has(attempt.resultId))
+        problems.push(`result ${attempt.resultId} has multiple attempt owners`);
+      resultOwners.add(attempt.resultId);
+      const result = state.results.find((item) => item.id === attempt.resultId);
+      if (!result)
+        problems.push(`attempt ${attempt.id} retained result is missing`);
+      else if (result.assignmentId !== assignment.id)
+        problems.push(`attempt ${attempt.id} result assignment is mismatched`);
+      else if (result.assignmentIntentVersion !== assignment.intentVersion)
+        problems.push(`attempt ${attempt.id} result intent is mismatched`);
+    }
+  }
+  for (const result of state.results) {
+    if (
+      !state.attempts.some(
+        (attempt) =>
+          attempt.resultId === result.id &&
+          attempt.assignmentId === result.assignmentId,
+      )
+    )
+      problems.push(`result ${result.id} has no attributable attempt`);
+  }
   if (state.attempts.some((attempt) => attempt.state !== "settled"))
     problems.push("one or more delegated attempts are not settled");
   if (
@@ -206,15 +262,20 @@ export function observeDelegatedOutcome(
         assignment.capability === "implement",
     ),
   );
+  const implementationOrigin: "direct" | "delegated" =
+    implementationAttempts.length > 0 ? "delegated" : "direct";
   if (
-    implementationAttempts.length === 0 ||
+    implementationOrigin === "delegated" &&
     implementationAttempts.some(
       (attempt) => attempt.composition?.state !== "composed",
     )
   )
-    problems.push(
-      "no attributable composed maintained implementation is present",
-    );
+    problems.push("attributable maintained implementation is not composed");
+  if (
+    implementationOrigin === "direct" &&
+    state.attempts.some((attempt) => attempt.composition)
+  )
+    problems.push("a non-implementation delegation has a composition");
 
   const experimentAssignments = state.assignments.filter(
     (assignment) => assignment.artifactIntent === "disposable_experiment",
@@ -256,6 +317,7 @@ export function observeDelegatedOutcome(
         ? "Delegated outcomes, composition, cleanup, and authorized bytes are attributable and valid."
         : problems.join("; "),
     delegationExercised: true,
+    implementationOrigin,
     experiment,
   };
 }

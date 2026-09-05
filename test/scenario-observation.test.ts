@@ -114,6 +114,7 @@ test("delegated native outcome requires attributable composition, cleanup, and r
       createdAt: now,
       updatedAt: now,
       sessionFile: "/tmp/experiment.jsonl",
+      resultId: "result-experiment",
       worker: {
         workspaceId: "workspace",
         tabId: "tab",
@@ -137,6 +138,7 @@ test("delegated native outcome requires attributable composition, cleanup, and r
       createdAt: now,
       updatedAt: now,
       sessionFile: "/tmp/implementation.jsonl",
+      resultId: "result-implementation",
       worker: {
         workspaceId: "workspace",
         tabId: "tab",
@@ -209,6 +211,98 @@ test("delegated native outcome requires attributable composition, cleanup, and r
   assert.equal(result.valid, true);
   assert.equal(result.delegationExercised, true);
   assert.equal(result.experiment, "verified");
+});
+
+test("natural observer accepts read-only delegation followed by a direct edit and rejects unaccounted effects", async () => {
+  const { state } = await baseState();
+  const now = new Date().toISOString();
+  state.lifecycle = { state: "completed", changedAt: now, reason: "done" };
+  state.assignments.push({
+    id: "research",
+    objective: "Read the current value",
+    intentVersion: 0,
+    createdAt: now,
+    capability: "research",
+    artifactIntent: "evidence_only",
+    expectedEvidence: ["value bytes"],
+  });
+  state.attempts.push({
+    id: "attempt-research",
+    assignmentId: "research",
+    state: "settled",
+    createdAt: now,
+    updatedAt: now,
+    sessionFile: "/tmp/research.jsonl",
+    resultId: "result-research",
+    worker: {
+      workspaceId: "workspace",
+      tabId: "tab",
+      paneId: "pane",
+      terminalId: "terminal",
+      agentName: "research-worker",
+      cwd: "/tmp/natural-test",
+      sessionFile: "/tmp/research.jsonl",
+    },
+    cleanup: {
+      state: "completed",
+      expectedHead: "base",
+      workerClosed: true,
+      discard: false,
+    },
+  });
+  state.results.push({
+    id: "result-research",
+    assignmentId: "research",
+    assignmentIntentVersion: 0,
+    validity: "typed",
+    observedAt: now,
+    report: {
+      kind: "research",
+      status: "completed",
+      summary: "Read value",
+      evidence: [],
+      findings: [],
+    },
+    artifacts: [],
+  });
+  const before = new Map([["value.txt", "YmVmb3JlCg=="]]);
+  const after = new Map([["value.txt", "YWZ0ZXIK"]]);
+  const mixed = observeDelegatedOutcome(
+    state,
+    observeDirectEffect(before, after, "YWZ0ZXIK"),
+  );
+  assert.equal(mixed.valid, true, mixed.detail);
+  assert.equal(mixed.delegationExercised, true);
+  assert.equal(mixed.implementationOrigin, "direct");
+
+  const unauthorized = observeDelegatedOutcome(
+    state,
+    observeDirectEffect(
+      before,
+      new Map([...after, ["probe.txt", "c2NyYXRjaA=="]]),
+      "YWZ0ZXIK",
+    ),
+  );
+  assert.equal(unauthorized.valid, false);
+  assert.match(unauthorized.detail, /authorized/);
+
+  state.attempts[0]!.state = "running";
+  assert.equal(
+    observeDelegatedOutcome(
+      state,
+      observeDirectEffect(before, after, "YWZ0ZXIK"),
+    ).valid,
+    false,
+  );
+  state.attempts[0]!.state = "settled";
+  delete state.attempts[0]!.worker;
+  assert.match(
+    observeDelegatedOutcome(
+      state,
+      observeDirectEffect(before, after, "YWZ0ZXIK"),
+    ).detail,
+    /no worker identity/,
+  );
 });
 
 test("native observer requires request progression and reports early blocker or incomplete turns promptly", () => {

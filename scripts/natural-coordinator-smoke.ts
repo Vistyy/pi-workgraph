@@ -207,7 +207,14 @@ try {
         );
       await verifyDelegatedSettlements(f.workspaceId, latest);
       await verifyRetainedExperiments(latest);
-      return { strategy: "delegated" as const, turn, directEffect, delegated };
+      return {
+        strategy:
+          delegated.implementationOrigin === "direct" ? "mixed" : "delegated",
+        implementationOrigin: delegated.implementationOrigin,
+        turn,
+        directEffect,
+        delegated,
+      };
     },
     Number(process.env.PI_WORKGRAPH_SMOKE_TIMEOUT_MS || 1_800_000),
     "native coordinator request settlement and truthful direct/delegated outcome",
@@ -229,15 +236,17 @@ try {
 
   const observations = {
     strategy: outcome.strategy,
-    delegationExercised: outcome.strategy === "delegated",
+    delegationExercised: outcome.strategy !== "direct",
+    implementationOrigin:
+      outcome.strategy === "direct" ? "direct" : outcome.implementationOrigin,
     ...(outcome.strategy === "direct"
       ? {
           evidenceLimit:
             "No delegation was exercised; native direct outcome only.",
         }
       : {
-          experiment: outcome.delegated.experiment,
-          delegatedOutcome: outcome.delegated.detail,
+          experiment: outcome.delegated!.experiment,
+          delegatedOutcome: outcome.delegated!.detail,
         }),
     nativeSettlement: outcome.turn.detail,
     changedPaths: directEffect.changedPaths,

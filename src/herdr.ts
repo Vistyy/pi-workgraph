@@ -16,6 +16,15 @@ export interface HerdrObservation {
   observedAt: string;
 }
 
+export interface HerdrAbsentObservation {
+  identity: WorkerIdentity;
+  status: "absent";
+  observedAt: string;
+  detail: string;
+}
+
+export type HerdrInspection = HerdrObservation | HerdrAbsentObservation;
+
 export interface WorkerLaunchRequest {
   workspaceId: string;
   runId: string;
@@ -79,6 +88,7 @@ export interface VisibleWorkerRuntime {
   recover?(
     request: WorkerRecoveryRequest,
   ): Promise<HerdrObservation | undefined>;
+  inspect(identity: WorkerIdentity): Promise<HerdrInspection>;
   observe(identity: WorkerIdentity): Promise<HerdrObservation>;
   interrupt(identity: WorkerIdentity): Promise<HerdrObservation>;
   steer?(identity: WorkerIdentity, instruction: string): Promise<void>;
@@ -353,15 +363,40 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     );
   }
 
-  async observe(identity: WorkerIdentity): Promise<HerdrObservation> {
-    const response = await this.call(["agent", "get", identity.paneId]);
-    const current = parseAgent(object(object(response, "result"), "agent"));
+  async inspect(identity: WorkerIdentity): Promise<HerdrInspection> {
+    const result = await spawnCommand(
+      this.command,
+      ["agent", "get", identity.paneId],
+      30_000,
+    );
+    if (result.code !== 0) {
+      if (
+        (isNotFound(result, "agent_not_found") ||
+          isNotFound(result, "pane_not_found")) &&
+        (await this.tabAbsent(identity.tabId))
+      )
+        return {
+          identity,
+          status: "absent",
+          observedAt: new Date().toISOString(),
+          detail: `Exact Herdr tab ${identity.tabId} is absent.`,
+        };
+      throw herdrError(["agent", "get", identity.paneId], result);
+    }
+    const parsed = parseSuccess(result, ["agent", "get", identity.paneId]);
+    const current = parseAgent(object(object(parsed, "result"), "agent"));
     assertIdentity(identity, current);
     return {
       identity,
       status: current.status,
       observedAt: new Date().toISOString(),
     };
+  }
+
+  async observe(identity: WorkerIdentity): Promise<HerdrObservation> {
+    const inspection = await this.inspect(identity);
+    if (inspection.status === "absent") throw new Error(inspection.detail);
+    return inspection;
   }
 
   async interrupt(identity: WorkerIdentity): Promise<HerdrObservation> {
@@ -385,13 +420,13 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
   }
 
   async cleanup(identity: WorkerIdentity): Promise<WorkerCleanupResult> {
-    const observation = await this.observeForCleanup(identity);
-    if (!observation) {
+    const observation = await this.inspect(identity);
+    if (observation.status === "absent") {
       return {
         state: "completed",
         identity,
-        observedAt: new Date().toISOString(),
-        detail: `Exact Herdr tab ${identity.tabId} was already absent.`,
+        observedAt: observation.observedAt,
+        detail: observation.detail,
       };
     }
     if (observation.status === "working") {
@@ -420,33 +455,6 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       identity,
       observedAt: new Date().toISOString(),
       detail: `Closed and verified exact Herdr tab ${identity.tabId}.`,
-    };
-  }
-
-  private async observeForCleanup(
-    identity: WorkerIdentity,
-  ): Promise<HerdrObservation | undefined> {
-    const result = await spawnCommand(
-      this.command,
-      ["agent", "get", identity.paneId],
-      30_000,
-    );
-    if (result.code !== 0) {
-      if (
-        (isNotFound(result, "agent_not_found") ||
-          isNotFound(result, "pane_not_found")) &&
-        (await this.tabAbsent(identity.tabId))
-      )
-        return undefined;
-      throw herdrError(["agent", "get", identity.paneId], result);
-    }
-    const parsed = parseSuccess(result, ["agent", "get", identity.paneId]);
-    const current = parseAgent(object(object(parsed, "result"), "agent"));
-    assertIdentity(identity, current);
-    return {
-      identity,
-      status: current.status,
-      observedAt: new Date().toISOString(),
     };
   }
 

@@ -831,6 +831,7 @@ export class WorkstreamRuntime {
       if (!input.reason.trim()) throw new Error("Recovery reason is required.");
       let state = await this.store.load();
       const attempt = findAttempt(state, input.attemptId);
+      const assignment = findAssignment(state, attempt.assignmentId);
       const composition = attempt.composition;
       const cleanup = attempt.cleanup;
       if (input.action === "retain_not_applied" && !input.integratedRevision)
@@ -842,16 +843,20 @@ export class WorkstreamRuntime {
           throw new Error(
             "Recovery cannot inspect the missing worker identity.",
           );
-        const observation = await this.workers.observe(attempt.worker);
-        if (!["idle", "done"].includes(observation.status))
+        const inspection = await this.workers.inspect(attempt.worker);
+        if (
+          inspection.status !== "absent" &&
+          !["idle", "done"].includes(inspection.status)
+        )
           throw new Error(
-            `Recovery inspected worker ${observation.status}; leave resources intact.`,
+            `Recovery inspected worker ${inspection.status}; leave resources intact.`,
           );
         await this.repository.assertClean();
         await this.repository.validateWorkerCommit(
           placementOf(attempt),
           composition.commit,
         );
+        this.assertOwnership();
         const retainedRef = await this.repository.retainCommit(
           state.id,
           attempt.id,
@@ -863,7 +868,19 @@ export class WorkstreamRuntime {
           );
         if (input.action === "retry") {
           await this.store.retryComposition(attempt.id, undefined, retainedRef);
-          await this.advance(attempt.id);
+          state = await this.store.load();
+          const retried = findAttempt(state, attempt.id);
+          await this.compose(state, retried, assignment);
+          state = await this.store.load();
+          const composed = findAttempt(state, attempt.id);
+          if (!composed.cleanup && composed.worktreePath) {
+            await this.store.beginCleanup({
+              id: attempt.id,
+              expectedHead: await this.repository.head(composed.worktreePath),
+              discard: false,
+            });
+          }
+          await this.cleanup(attempt.id);
         } else {
           const integratedRevision = await this.repository.resolveRevision(
             input.integratedRevision!,
@@ -897,10 +914,13 @@ export class WorkstreamRuntime {
             throw new Error(
               "Cleanup recovery cannot inspect the missing worker identity.",
             );
-          const observation = await this.workers.observe(attempt.worker);
-          if (!["idle", "done"].includes(observation.status))
+          const inspection = await this.workers.inspect(attempt.worker);
+          if (
+            inspection.status !== "absent" &&
+            !["idle", "done"].includes(inspection.status)
+          )
             throw new Error(
-              `Recovery inspected worker ${observation.status}; leave resources intact.`,
+              `Recovery inspected worker ${inspection.status}; leave resources intact.`,
             );
         }
         await this.store.retryCleanup(attempt.id);

@@ -13,6 +13,7 @@ import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { GitRepository, runProcess } from "../src/git.js";
 import {
+  type HerdrInspection,
   type HerdrObservation,
   herdrAgentName,
   type VisibleWorkerRuntime,
@@ -63,6 +64,7 @@ class Worker implements VisibleWorkerRuntime {
   failAfterSubmission = false;
   onWork: (request: WorkerLaunchRequest) => Promise<unknown> = async () =>
     researchReport;
+  onInspect: () => void = () => {};
 
   async produce(request: WorkerLaunchRequest): Promise<void> {
     this.promptCount++;
@@ -134,6 +136,10 @@ class Worker implements VisibleWorkerRuntime {
       status: "working",
       observedAt: new Date().toISOString(),
     };
+  }
+  async inspect(identity: WorkerIdentity): Promise<HerdrInspection> {
+    this.onInspect();
+    return this.observe(identity);
   }
   async observe(identity: WorkerIdentity): Promise<HerdrObservation> {
     return {
@@ -660,6 +666,78 @@ test("wrong-mode and stale maintained results remain retained without compositio
       ),
       /workers and owned resources/,
     );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("recovery fences retained-ref writes after asynchronous worker inspection", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const authority = await f.authority(active);
+    f.workers.onWork = async (request) => {
+      await writeFile(join(request.cwd, "value.txt"), "recovered\n");
+      await git(request.cwd, "add", ".");
+      await git(request.cwd, "commit", "-m", "worker proposal");
+      return {
+        kind: "implementation",
+        status: "completed",
+        summary: "Worker proposal",
+        evidence: [],
+        findings: [],
+        commit: await git(request.cwd, "rev-parse", "HEAD"),
+      };
+    };
+    await active.queue({
+      id: "fenced-recovery",
+      capability: "implement",
+      artifactIntent: "maintained_change",
+      objective: "Change value",
+      intentVersion: 1,
+      authority,
+      acceptance: ["value changes"],
+    });
+    await active.reconcile();
+    await writeFile(join(f.root, "unrelated.txt"), "temporary\n");
+    const state = await active.reconcile();
+    const attempt = state.attempts[0]!;
+    assert.equal(attempt.composition?.state, "blocked");
+    await rm(join(f.root, "unrelated.txt"));
+    const beforeHead = await f.repository.head();
+    await active.stop();
+    const recovered = f.runtime();
+    f.workers.onInspect = () => {
+      f.registry.db
+        .prepare("DELETE FROM leases WHERE run_id=?")
+        .run("ws-fixture");
+    };
+    await assert.rejects(
+      recovered.recoverAttempt({
+        attemptId: attempt.id,
+        action: "retry",
+        reason: "Fence must hold through inspection",
+      }),
+      /no lease|live lease|owner/i,
+    );
+    const retained = await runProcess(
+      "git",
+      [
+        "-C",
+        f.root,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        `refs/workgraph-retained/ws-fixture/${attempt.id}`,
+      ],
+      { cwd: f.root, timeoutMs: 30_000 },
+    );
+    assert.equal(
+      retained.exitCode,
+      1,
+      "ownership loss must precede retained-ref creation",
+    );
+    assert.equal(await f.repository.head(), beforeHead);
   } finally {
     await f.dispose();
   }
