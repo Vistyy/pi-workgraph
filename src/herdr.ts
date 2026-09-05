@@ -145,9 +145,9 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       .slice(0, 16);
     const agentName = `wg-coordinator-${key}`;
     const label = `Workgraph coordinator ${key}`;
-    let created: Record<string, unknown>;
+    let resource: CoordinatorLaunchResource;
     try {
-      created = object(
+      const created = object(
         await this.call([
           "workspace",
           "create",
@@ -160,23 +160,21 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
         ]),
         "result",
       );
+      resource = {
+        workspaceId: string(object(created, "workspace"), "workspace_id"),
+        tabId: string(object(created, "tab"), "tab_id"),
+        paneId: string(object(created, "root_pane"), "pane_id"),
+        agentName,
+        sessionFile: request.sessionFile,
+        cwd: request.cwd,
+      };
     } catch (error) {
       throw new CoordinatorLaunchError(
         undefined,
         `Coordinator workspace creation is uncertain for session ${request.sessionFile} at ${request.cwd} with exact label ${JSON.stringify(label)}: ${errorMessage(error)} Inspect that label before retrying; no tab fallback or cleanup was attempted.`,
       );
     }
-    const workspaceId = string(object(created, "workspace"), "workspace_id");
-    const tabId = string(object(created, "tab"), "tab_id");
-    const paneId = string(object(created, "root_pane"), "pane_id");
-    const resource: CoordinatorLaunchResource = {
-      workspaceId,
-      tabId,
-      paneId,
-      agentName,
-      sessionFile: request.sessionFile,
-      cwd: request.cwd,
-    };
+    const { workspaceId, tabId, paneId } = resource;
     let retainedResource = resource;
     try {
       const started = parseAgent(
