@@ -341,7 +341,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
     [
       "missing",
       { path: "/definitely/missing/workstream.json" },
-      /ENOENT.*Inspect the retained pointer and state.*no state was changed/,
+      /ENOENT.*Inspect the retained pointer and state.*reconcile explicitly/,
     ],
     [
       "unsupported",

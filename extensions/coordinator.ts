@@ -297,7 +297,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         remember(await current().store.load(), ctx);
       } catch (error) {
         ctx.ui.notify(
-          `Workstream reattachment skipped for ${data.path}: ${error instanceof Error ? error.message : String(error)}. Inspect the retained pointer and state, then reconcile explicitly; no state was changed.`,
+          `Workstream reattachment skipped for ${data.path}: ${error instanceof Error ? error.message : String(error)}. Inspect the retained pointer and state, then reconcile explicitly.`,
           "warning",
         );
       }
