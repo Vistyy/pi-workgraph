@@ -369,7 +369,11 @@ test("registered recover safely retries a transient Git composition failure and 
     const composition = state.attempts[0]?.composition;
     assert.equal(composition?.state, "composed", JSON.stringify(state));
     assert.ok(composition?.revision);
-    assert.notEqual(composition.revision, workerCommit);
+    assert.equal(
+      await git(f.root, "rev-parse", `${composition.revision}^{tree}`),
+      await git(f.root, "rev-parse", `${workerCommit}^{tree}`),
+      "recovery must compose the exact worker tree, whether Git reuses the commit id or not",
+    );
     assert.equal(
       composition?.retainedRef,
       `refs/workgraph-retained/${state.id}/${attempt.id}`,
