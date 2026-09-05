@@ -175,6 +175,66 @@ test("failed registered adoption preserves the attached runtime lease; same-targ
   }
 });
 
+test("mutation responses stay action-focused while retaining handles, models, and exact read paths", async () => {
+  const f = await fixture();
+  try {
+    const first = await f.call("workgraph_research", {
+      id: "focused-research",
+      question: "Inspect the focused fixture",
+      expectedEvidence: ["bytes"],
+      model: "fixture/research",
+      modelReason: "The regression checks selected model provenance.",
+      thinking: "low",
+    });
+    const firstText =
+      first.content[0] && "text" in first.content[0]
+        ? first.content[0].text
+        : "";
+    const firstDetails = record(first.details);
+    const firstView = record(firstDetails.view);
+    const firstAffected = record(firstView.affected);
+    const firstAssignment = record(firstAffected.assignment);
+    const firstAttempt = record(firstAffected.attempt);
+    const firstModels = record(firstAttempt.models);
+    const firstGuide = record(firstModels.guide);
+    assert.equal(record(firstView.action).name, "workgraph_research");
+    assert.equal(firstAssignment.id, "focused-research");
+    assert.equal(firstGuide.model, "fixture/research");
+    assert.match(firstText, /focused-research/);
+    assert.doesNotMatch(firstText, /"assignments":\s*\[/);
+
+    const initial = resultState(first.details);
+    const owner = {
+      sessionId: f.session.getSessionId(),
+      sessionFile: f.session.getSessionFile()!,
+    };
+    const store = WorkstreamStore.open(initial.statePath, owner);
+    for (let index = 0; index < 12; index++) {
+      await store.assign({
+        id: `unrelated-${index}`,
+        capability: "research",
+        artifactIntent: "evidence_only",
+        objective: `Unrelated history ${index}`,
+        intentVersion: 0,
+        expectedEvidence: ["bytes"],
+      });
+    }
+    const later = await f.call("workgraph_begin", {
+      purpose: "Focused fixture",
+    });
+    const laterText =
+      later.content[0] && "text" in later.content[0]
+        ? later.content[0].text
+        : "";
+    assert.ok(laterText.length < firstText.length + 2_000);
+    const laterView = record(record(later.details).view);
+    assert.equal(record(laterView.counts).assignments, 13);
+    assert.equal(record(laterView.attention).count, 0);
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("registered status stays compact and focused result retrieval projects bounded sections", async () => {
   const f = await fixture();
   try {
@@ -226,6 +286,21 @@ test("registered status stays compact and focused result retrieval projects boun
     assert.doesNotMatch(statusText, /observation-0/);
     assert.equal(statusText.includes(longObjective), false);
     assert.ok(statusText.length < 8_000);
+    const defaultResult = await f.call("workgraph_result", {
+      resultId: "large-result-1",
+    });
+    const defaultView = record(record(defaultResult.details).result);
+    assert.equal(defaultView.evidence, undefined);
+    assert.equal(defaultView.findings, undefined);
+    assert.equal(defaultView.evidenceCount, 6);
+    assert.equal(defaultView.findingsCount, 4);
+    assert.deepEqual(defaultView.accounting, []);
+    assert.match(
+      defaultResult.content[0] && "text" in defaultResult.content[0]
+        ? defaultResult.content[0].text
+        : "",
+      /section evidence or findings/,
+    );
     const evidence = await f.call("workgraph_result", {
       resultId: "large-result-1",
       section: "evidence",

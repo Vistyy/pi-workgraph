@@ -33,7 +33,8 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 | `workgraph_implement` | Delegate one bounded maintained slice with acceptance requirements and human-backed intent. Independent slices may share an exact base revision. |
 | `workgraph_review` | Independently inspect a retained result, artifact, exact revision, or comparison of retained results for a specified concern. |
 | `workgraph_intent` | Record changed scope against an actual retained human input receipt. |
-| `workgraph_status` | Inspect a compact view of assignments, selected models and reasons, findings, evidence, uncertainty, delivery, and resource recovery. |
+| `workgraph_status` | Inspect the detailed bounded view of assignments, selected models and reasons, findings, evidence, uncertainty, delivery, and resource recovery. |
+| `workgraph_result` | Retrieve one retained result; defaults to a summary with evidence/findings counts and recovery handles, while `section: evidence` or `findings` returns complete individual items. |
 | `workgraph_acknowledge` | Optionally record that evidence was actually read after a transport interruption. It is not required for ordinary result use. |
 | `workgraph_disposition` | Optionally record explicit coordinator judgment of retained evidence. Presentation and validity do not imply acceptance. |
 | `workgraph_control` | Suspend/resume work or cancel/steer a specific live attempt. |
@@ -44,7 +45,9 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 
 The coordinator interprets what a human request authorizes and chooses which independent contributions are meaningful.
 Research, experiments, implementation slices, comparison, review, and integration are optional capabilities rather than a prescribed route.
-Routine coordinator responses show concise purpose, assignment and result outcomes, lifecycle, actionable attention, model selection reasons, and bounded effective-model transitions with counts.
+Routine mutation responses show the action outcome, workstream lifecycle, aggregate counts, affected assignment/attempt/result handles, and selected model provenance without replaying unrelated history.
+Detailed `workgraph_status` remains the bounded inspection path for assignments, results, delivery, judgment, accounting, and recovery history.
+`workgraph_result` defaults to a summary only; use its `evidence` or `findings` sections to retrieve complete individual items, with count and continuation metadata preserved.
 Focused result retrieval retains substantive findings, evidence, uncertainty, and recovery attention.
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic approval oracle.
 Extension notifications and worker reports do not grant authority.

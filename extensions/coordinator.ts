@@ -6,6 +6,12 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import {
+  actionView,
+  compactStatus,
+  focusedResult,
+  resultNotification,
+} from "../src/coordinator-view.js";
 import { GitRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import {
@@ -23,7 +29,6 @@ import { EvidenceSchema } from "../src/report-schema.js";
 import {
   type ResultDisposition,
   type SessionIdentity,
-  type WorkAttempt,
   type WorkstreamState,
   WorkstreamStore,
 } from "../src/workstream.js";
@@ -34,11 +39,6 @@ import {
 
 const POINTER = "pi-workgraph-workstream";
 const INPUT = "pi-workgraph-human-input";
-
-function compactText(value: string, max = 240): string {
-  const text = value.replace(/\s+/g, " ").trim();
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
-}
 
 const InputReceipt = Type.Object({
   id: Type.String(),
@@ -117,11 +117,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             customType: POINTER,
             content: resultNotification(latest, resultId),
             display: true,
-            details: {
-              resultId,
-              statePath: latest.statePath,
-              view: coordinatorView(latest),
-            },
+            details: { resultId, statePath: latest.statePath },
           },
           { triggerTurn: true, deliverAs: "followUp" },
         );
@@ -402,9 +398,10 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     parameters: Type.Object({ purpose: Type.String() }),
     async execute(_id, params, _signal, _update, ctx) {
       return serial(async () =>
-        result(
+        mutationResult(
           "Workstream ready.",
           remember(await (await ensure(ctx, params.purpose)).store.load(), ctx),
+          { action: "workgraph_begin", outcome: "ready" },
         ),
       );
     },
@@ -463,9 +460,14 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
               }
             : { ...common, artifactIntent: "evidence_only" as const };
         const state = await active.queue(assignment, queueOptions(params));
-        return result(
+        return mutationResult(
           `Queued ${params.id}; submission and execution are observed asynchronously.`,
           remember(state, ctx),
+          {
+            action: "workgraph_research",
+            assignmentId: params.id,
+            outcome: "queued",
+          },
         );
       });
     },
@@ -482,12 +484,13 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     }),
     async execute(_id, params, _signal, _update, ctx) {
       return serial(async () =>
-        result(
+        mutationResult(
           "Recorded intent revision.",
           remember(
             await current().perform(() => current().store.reviseIntent(params)),
             ctx,
           ),
+          { action: "workgraph_intent", outcome: "recorded" },
         ),
       );
     },
@@ -530,9 +533,14 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             ...(params.executor ? { executor: params.executor } : {}),
           },
         );
-        return result(
+        return mutationResult(
           `Queued maintained change ${params.id}.`,
           remember(state, ctx),
+          {
+            action: "workgraph_implement",
+            assignmentId: params.id,
+            outcome: "queued",
+          },
         );
       });
     },
@@ -570,7 +578,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const active = await ensure(ctx, params.objective);
         const intent = (await active.store.load()).intents.at(-1);
         if (!intent) throw new Error("Missing intent.");
-        return result(
+        return mutationResult(
           `Queued review ${params.id}.`,
           remember(
             await active.queue(
@@ -587,6 +595,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             ),
             ctx,
           ),
+          {
+            action: "workgraph_review",
+            assignmentId: params.id,
+            outcome: "queued",
+          },
         );
       });
     },
@@ -595,7 +608,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_result",
     label: "Workgraph Result",
     description:
-      "Retrieve one retained result without dumping the whole workstream. Use all, summary, evidence, findings, or attention as the focused view.",
+      "Retrieve one retained result without dumping the whole workstream. Defaults to summary with evidence/findings counts and recovery handles; use section evidence or findings for complete individual text, or all/attention for focused inspection.",
     parameters: Type.Object({
       resultId: Type.String(),
       section: Type.Optional(
@@ -625,7 +638,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const selected = focusedResult(
           latest,
           params.resultId,
-          params.section ?? "all",
+          params.section ?? "summary",
           params.offset ?? 0,
           params.limit ?? 20,
         );
@@ -669,11 +682,16 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     }),
     async execute(_id, params) {
       return serial(async () =>
-        result(
+        mutationResult(
           "Acknowledged result.",
           await current().perform(() =>
             current().store.acknowledge(params.resultId, params.acknowledgment),
           ),
+          {
+            action: "workgraph_acknowledge",
+            resultId: params.resultId,
+            outcome: "acknowledged",
+          },
         ),
       );
     },
@@ -690,7 +708,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     }),
     async execute(_id, params) {
       return serial(async () =>
-        result(
+        mutationResult(
           "Recorded disposition.",
           await current().perform(() =>
             current().store.disposition({
@@ -698,6 +716,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
               status: params.status as ResultDisposition["status"],
             }),
           ),
+          {
+            action: "workgraph_disposition",
+            resultId: params.resultId,
+            outcome: "recorded",
+          },
         ),
       );
     },
@@ -752,14 +775,28 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
               reason: params.reason,
             }),
           );
-        return result(
+        const message =
           params.action === "steer"
             ? "Steering submitted; application is not yet established."
             : params.action === "recover" ||
                 params.action === "retain_not_applied"
               ? "Recovery inspected the exact boundary and recorded its outcome."
-              : "Control request recorded.",
+              : "Control request recorded.";
+        return mutationResult(
+          message,
           remember(await active.store.load(), ctx),
+          {
+            action: `workgraph_control:${params.action}`,
+            ...(params.attemptId ? { attemptId: params.attemptId } : {}),
+            message,
+            outcome:
+              params.action === "steer"
+                ? "submitted"
+                : params.action === "recover" ||
+                    params.action === "retain_not_applied"
+                  ? "inspected"
+                  : "recorded",
+          },
         );
       });
     },
@@ -788,9 +825,10 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const active = await attach(ctx, target, liveness);
         pi.appendEntry(POINTER, { path: target.path });
         await importInputs(active);
-        return result(
+        return mutationResult(
           "Adopted without changing lifecycle.",
           remember(await active.store.load(), ctx),
+          { action: "workgraph_adopt", outcome: "adopted" },
         );
       });
     },
@@ -863,397 +901,19 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const state = await active.perform(() => active.store.complete(params));
         await active.stop();
         runtime = undefined;
-        return result("Completed workstream.", remember(state, ctx));
+        return mutationResult("Completed workstream.", remember(state, ctx), {
+          action: "workgraph_complete",
+          outcome: "completed",
+        });
       });
     },
   });
 }
 
-function coordinatorView(state: WorkstreamState) {
-  return compactStatus(state);
-}
-
-function compactStatus(state: WorkstreamState, offset = 0, limit = 20) {
-  const page = <T>(items: T[]) => ({
-    items: items.slice(offset, offset + limit),
-    total: items.length,
-    offset,
-    limit,
-    remaining: Math.max(0, items.length - offset - limit),
-    ...(offset + limit < items.length ? { nextOffset: offset + limit } : {}),
-  });
-  const effectiveModelView = (
-    entries: NonNullable<WorkAttempt["effectiveModels"]> = [],
-  ) => {
-    const distinct = new Map<
-      string,
-      { model: string; thinking?: string; sources: Set<string> }
-    >();
-    const transitions: Array<{
-      model: string;
-      thinking?: string;
-      source?: string;
-    }> = [];
-    let previous: string | undefined;
-    for (const entry of entries) {
-      const key = `${entry.model}|${entry.thinking ?? ""}`;
-      if (!distinct.has(key))
-        distinct.set(key, {
-          model: entry.model,
-          ...(entry.thinking ? { thinking: entry.thinking } : {}),
-          sources: new Set(),
-        });
-      distinct.get(key)?.sources.add(entry.source ?? "unknown");
-      if (key !== previous) {
-        transitions.push({
-          model: entry.model,
-          ...(entry.thinking ? { thinking: entry.thinking } : {}),
-          ...(entry.source ? { source: entry.source } : {}),
-        });
-        previous = key;
-      }
-    }
-    return {
-      observations: entries.length,
-      distinctCount: distinct.size,
-      omittedDistinct: Math.max(0, distinct.size - 8),
-      distinct: [...distinct.values()]
-        .slice(0, 8)
-        .map(({ sources, ...entry }) => ({
-          ...entry,
-          sources: [...sources],
-        })),
-      transitions: transitions.slice(0, 8),
-      truncatedTransitions: Math.max(0, transitions.length - 8),
-    };
-  };
-  const selectionView = (models: WorkAttempt["models"]) =>
-    models
-      ? {
-          guide: models.guide,
-          ...(models.executor ? { executor: models.executor } : {}),
-          source: models.source,
-          ...(models.overrideReason
-            ? { overrideReason: compactText(models.overrideReason) }
-            : {}),
-          ...(models.selection
-            ? {
-                selection: {
-                  requested: models.selection.requested,
-                  diversity: models.selection.diversity,
-                  selected: models.selection.selected.slice(0, 8),
-                  selectedCount: models.selection.selected.length,
-                  ...(models.selection.selected.length > 8
-                    ? { omittedSelected: models.selection.selected.length - 8 }
-                    : {}),
-                  unfulfilled: models.selection.unfulfilled.slice(0, 8),
-                  unfulfilledCount: models.selection.unfulfilled.length,
-                  ...(models.selection.unfulfilled.length > 8
-                    ? {
-                        omittedUnfulfilled:
-                          models.selection.unfulfilled.length - 8,
-                      }
-                    : {}),
-                  source: models.selection.source,
-                  reason: compactText(models.selection.reason),
-                },
-              }
-            : {}),
-        }
-      : undefined;
-  const attemptView = (attempt: WorkAttempt) => {
-    const result = state.results.find((item) => item.id === attempt.resultId);
-    const report = result?.validity === "typed" ? result.report : undefined;
-    return {
-      id: attempt.id,
-      state: attempt.state,
-      submission: attempt.submission,
-      placement: attempt.placement?.kind,
-      resultId: attempt.resultId,
-      outcome:
-        report?.kind === "implementation" && report.status === "completed"
-          ? report.outcome
-          : report?.status,
-      models: selectionView(attempt.models),
-      effectiveModels: effectiveModelView(attempt.effectiveModels),
-      composition: attempt.composition?.state,
-      compositionReason: attempt.composition?.reason,
-      retainedRef: attempt.composition?.retainedRef,
-      cleanup: attempt.cleanup?.state,
-      attention: attempt.error ? compactText(attempt.error, 320) : undefined,
-    };
-  };
-  const attention = state.attempts.flatMap((attempt) =>
-    attempt.error
-      ? [{ attemptId: attempt.id, detail: compactText(attempt.error, 320) }]
-      : attempt.composition?.state === "blocked" ||
-          attempt.cleanup?.state === "blocked"
-        ? [
-            {
-              attemptId: attempt.id,
-              detail: compactText(
-                attempt.composition?.error ??
-                  attempt.cleanup?.error ??
-                  "Blocked attempt requires recovery.",
-                320,
-              ),
-            },
-          ]
-        : [],
-  );
-  const accounting = state.completion?.accounting ?? [];
-  return {
-    id: state.id,
-    purpose: compactText(state.purpose),
-    lifecycle: {
-      ...state.lifecycle,
-      reason: compactText(state.lifecycle.reason),
-    },
-    counts: {
-      assignments: state.assignments.length,
-      attempts: state.attempts.length,
-      results: state.results.length,
-      deliveries: state.deliveries.length,
-      attention: attention.length,
-      accounting: accounting.length,
-    },
-    assignments: page(
-      state.assignments.map((assignment) => {
-        const attempts = state.attempts.filter(
-          (attempt) => attempt.assignmentId === assignment.id,
-        );
-        return {
-          id: assignment.id,
-          capability: assignment.capability,
-          objective: compactText(assignment.objective),
-          attempts: {
-            count: attempts.length,
-            active: attempts.filter((attempt) =>
-              ["starting", "running", "cancel_requested"].includes(
-                attempt.state,
-              ),
-            ).length,
-            items: attempts.slice(-3).map(attemptView),
-            ...(attempts.length > 3
-              ? { omittedHistory: attempts.length - 3 }
-              : {}),
-          },
-        };
-      }),
-    ),
-    results: page(
-      state.results.map((item) => ({
-        id: item.id,
-        assignmentId: item.assignmentId,
-        validity: item.validity,
-        ...(item.validity === "typed"
-          ? {
-              kind: item.report.kind,
-              status: item.report.status,
-              ...(item.report.kind === "implementation" &&
-              item.report.status === "completed"
-                ? {
-                    outcome: item.report.outcome,
-                    ...(item.report.outcome === "no_change"
-                      ? {
-                          revision: item.report.revision,
-                          reason: compactText(item.report.reason),
-                        }
-                      : {}),
-                  }
-                : {}),
-            }
-          : {}),
-        summary: compactText(
-          item.validity === "typed"
-            ? item.report.summary
-            : item.validity === "untyped"
-              ? item.text
-              : item.detail,
-        ),
-        undeliveredEvidence: accounting
-          .filter(
-            (entry) =>
-              entry.kind === "undelivered_result" && entry.resultId === item.id,
-          )
-          .map((entry) => ({
-            ...entry,
-            reason: compactText(entry.reason, 320),
-          })),
-        retainedNotApplied: state.attempts
-          .filter(
-            (attempt) =>
-              attempt.resultId === item.id &&
-              attempt.composition?.state === "retained_not_applied",
-          )
-          .map((attempt) => ({
-            attemptId: attempt.id,
-            reason: attempt.composition?.reason
-              ? compactText(attempt.composition.reason, 320)
-              : undefined,
-            retainedRef: attempt.composition?.retainedRef,
-            integratedRevision: attempt.composition?.integratedRevision,
-          })),
-        handles: {
-          summary: "summary",
-          evidence: "evidence",
-          findings: "findings",
-          attention: "attention",
-        },
-      })),
-    ),
-    delivery: page(
-      state.deliveries.map((delivery) => ({
-        resultId: delivery.resultId,
-        state: delivery.state,
-        error: delivery.error ? compactText(delivery.error, 320) : undefined,
-        failureCount: delivery.failureHistory?.length ?? 0,
-      })),
-    ),
-    attention: page(attention),
-    accounting: page(
-      accounting.map((entry) => ({
-        ...entry,
-        reason: compactText(entry.reason, 320),
-      })),
-    ),
-    judgment: page(
-      state.dispositions.map(({ resultId, status, reason }) => ({
-        resultId,
-        status,
-        reason: compactText(reason, 320),
-      })),
-    ),
-    completion: state.completion
-      ? {
-          completedAt: state.completion.completedAt,
-          accountingCount: state.completion.accounting.length,
-        }
-      : undefined,
-  };
-}
-
-function focusedResult(
-  state: WorkstreamState,
-  resultId: string,
-  section: "all" | "summary" | "evidence" | "findings" | "attention",
-  offset: number,
-  limit: number,
-): Record<string, unknown> {
-  const item = state.results.find((candidate) => candidate.id === resultId);
-  if (!item) throw new Error(`Unknown result ${resultId}.`);
-  const base = {
-    id: item.id,
-    assignmentId: item.assignmentId,
-    validity: item.validity,
-    accounting: state.completion?.accounting.filter(
-      (entry) =>
-        (entry.kind === "unresolved_result" ||
-          entry.kind === "undelivered_result") &&
-        entry.resultId === item.id,
-    ),
-  };
-  if (item.validity !== "typed")
-    return {
-      ...base,
-      ...(item.validity === "untyped"
-        ? { text: item.text }
-        : { detail: item.detail }),
-    };
-  const report = item.report;
-  const page = (values: unknown[]) => ({
-    items: values.slice(offset, offset + limit),
-    total: values.length,
-    offset,
-    limit,
-    remaining: Math.max(0, values.length - offset - limit),
-    ...(offset + limit < values.length ? { nextOffset: offset + limit } : {}),
-    continuation: "Call workgraph_result with the same section and nextOffset.",
-  });
-  if (section === "summary")
-    return {
-      ...base,
-      kind: report.kind,
-      status: report.status,
-      summary: report.summary,
-      uncertainty: report.uncertainty ?? [],
-      evidenceCount: report.evidence.length,
-      findingsCount: report.findings.length,
-      ...(report.kind === "implementation" && report.status === "completed"
-        ? {
-            outcome: report.outcome,
-            ...(report.outcome === "no_change"
-              ? { revision: report.revision, reason: report.reason }
-              : { commit: report.commit }),
-          }
-        : {}),
-    };
-  if (section === "evidence")
-    return { ...base, evidence: page(report.evidence) };
-  if (section === "findings")
-    return { ...base, findings: page(report.findings) };
-  if (section === "attention")
-    return {
-      ...base,
-      delivery: state.deliveries.find(
-        (delivery) => delivery.resultId === resultId,
-      ),
-      judgments: state.dispositions.filter(
-        (disposition) => disposition.resultId === resultId,
-      ),
-      accounting: state.completion?.accounting.filter(
-        (entry) =>
-          (entry.kind === "unresolved_result" ||
-            entry.kind === "undelivered_result") &&
-          entry.resultId === resultId,
-      ),
-      retainedNotApplied: state.attempts
-        .filter(
-          (attempt) =>
-            attempt.resultId === resultId &&
-            attempt.composition?.state === "retained_not_applied",
-        )
-        .map((attempt) => ({
-          attemptId: attempt.id,
-          reason: attempt.composition?.reason,
-          retainedRef: attempt.composition?.retainedRef,
-          integratedRevision: attempt.composition?.integratedRevision,
-        })),
-    };
-  return {
-    ...base,
-    kind: report.kind,
-    status: report.status,
-    summary: report.summary,
-    uncertainty: report.uncertainty ?? [],
-    evidence: page(report.evidence),
-    findings: page(report.findings),
-    ...(report.kind === "implementation" && report.status === "completed"
-      ? {
-          outcome: report.outcome,
-          ...(report.outcome === "no_change"
-            ? { revision: report.revision, reason: report.reason }
-            : { commit: report.commit }),
-        }
-      : {}),
-    artifacts: item.artifacts,
-  };
-}
-
-function resultNotification(state: WorkstreamState, resultId: string): string {
-  return [
-    `Workgraph retained result ${resultId} is available for ${state.id}.`,
-    "This is a retained-result availability notice, not new outstanding work.",
-    "It may be presented after the result was already inspected or the workstream was completed; do not reprocess or reopen work solely because of this notice.",
-    JSON.stringify(focusedResult(state, resultId, "summary", 0, 20), null, 2),
-    "Use workgraph_result with this resultId and section evidence or findings for bounded detail; continuation offsets are returned when needed.",
-  ].join("\n");
-}
-
 function result(
   text: string,
   state: WorkstreamState,
-  view = coordinatorView(state),
+  view: unknown = compactStatus(state),
 ) {
   return {
     content: [
@@ -1264,6 +924,14 @@ function result(
     ],
     details: { workstream: state, view, statePath: state.statePath },
   };
+}
+
+function mutationResult(
+  text: string,
+  state: WorkstreamState,
+  options: Parameters<typeof actionView>[1],
+) {
+  return result(text, state, actionView(state, { ...options, message: text }));
 }
 
 function queueOptions(params: {
