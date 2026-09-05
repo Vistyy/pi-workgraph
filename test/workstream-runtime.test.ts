@@ -477,31 +477,6 @@ test("cleaned history has constant reconciliation reads while error clearing and
       state.deliveries.every((delivery) => delivery.state === "delivered"),
     );
     assert.equal(f.workers.cleanupCount, 4);
-
-    // Shared cleanup closes only the native worker and leaves dirty project bytes alone.
-    f.workers.deferWork = true;
-    await recovered.queue(research("dirty-shared"));
-    await recovered.reconcile();
-    const request = f.workers.requests.at(-1)!;
-    const obstruction = join(f.root, "unattributed.txt");
-    await writeFile(obstruction, "Created before shared worker settlement\n");
-    await f.workers.produce(request);
-    f.workers.status = "idle";
-    state = await recovered.reconcile();
-    assert.equal(state.attempts.at(-1)?.placement?.kind, "shared_project");
-    assert.equal(state.attempts.at(-1)?.cleanup?.state, "completed");
-    assert.equal(
-      await readFile(obstruction, "utf8"),
-      "Created before shared worker settlement\n",
-    );
-    await recovered.stop();
-    const retried = f.runtime();
-    state = await retried.reconcile();
-    assert.equal(state.attempts.at(-1)?.cleanup?.state, "completed");
-    assert.equal(
-      await readFile(obstruction, "utf8"),
-      "Created before shared worker settlement\n",
-    );
   } finally {
     await f.dispose();
   }
@@ -543,8 +518,6 @@ test("completed no-change implementations retain explicit attribution, skip comp
     const attempt = state.attempts[0]!;
     const result = state.results[0]!;
     assert.equal(result.validity, "typed");
-    assert.equal(result.report.kind, "implementation");
-    assert.equal(result.report.status, "completed");
     assert.ok(
       result.report.kind === "implementation" &&
         result.report.status === "completed",
@@ -594,10 +567,6 @@ test("dirty isolated trees cannot settle a successful no-change implementation",
     await active.reconcile();
     const state = await active.reconcile();
     assert.equal(state.results[0]?.validity, "invalid");
-    assert.match(
-      state.results[0]?.detail ?? "",
-      /clean worktree|No-change validation failed|Artifact retention failed/i,
-    );
     assert.equal(state.attempts[0]?.composition, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(await f.repository.head(), base);

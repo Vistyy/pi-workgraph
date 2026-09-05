@@ -1,34 +1,27 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { WorkstreamState } from "../src/workstream.js";
 
-export const CAPABILITY_SCENARIO_ASSIGNMENT_IDS = [
-  "baseline-research",
-  "uppercase-experiment",
-  "update-value",
-  "concurrent-readme",
-  "exact-revision-review",
-] as const;
+export const CAPABILITY_SCENARIO_IDS = {
+  baselineResearch: "baseline-research",
+  uppercaseExperiment: "uppercase-experiment",
+  updateValue: "update-value",
+  concurrentReadme: "concurrent-readme",
+  exactRevisionReview: "exact-revision-review",
+} as const;
 
 /** The deterministic scenario's protocol is deliberately explicit and inspectable. */
 export function capabilityScenarioPrompt(privateToken: string): string {
   return `Use Workgraph capability tools to complete this single bounded workstream without another approval ceremony.
 Coordinator-only context: ${privateToken}. Never include that token in worker assignments.
-First delegate read-only research id baseline-research to gather cheap evidence about the README marker and exact current value.txt bytes, then use the returned findings to decide what bounded work is justified. End your turn when only workers are running and resume on actual results.
-Next delegate disposable experiment id uppercase-experiment, explicitly authorized to read value.txt and write only probe.txt containing its uppercase bytes. Stop after one observation, retain probe.txt, never compose scratch code.
-Then delegate maintained implementation id update-value, explicitly authorized to change only value.txt to exactly after followed by one newline, with acceptance node verify.mjs and exact bytes/scope. Use policy guide/executor defaults.
-Immediately after queueing implementation, before waiting for its result, queue read-only research id concurrent-readme to read the README marker, demonstrating interleaving.
-After maintained composition, delegate independent review id exact-revision-review of that exact retained revision, concerned with scope, exact bytes, absence of probe.txt and node verify.mjs.
+First delegate read-only research id ${CAPABILITY_SCENARIO_IDS.baselineResearch} to gather cheap evidence about the README marker and exact current value.txt bytes, then use the returned findings to decide what bounded work is justified. End your turn when only workers are running and resume on actual results.
+Next delegate disposable experiment id ${CAPABILITY_SCENARIO_IDS.uppercaseExperiment}, explicitly authorized to read value.txt and write only probe.txt containing its uppercase bytes. Stop after one observation, retain probe.txt, never compose scratch code.
+Then delegate maintained implementation id ${CAPABILITY_SCENARIO_IDS.updateValue}, explicitly authorized to change only value.txt to exactly after followed by one newline, with acceptance node verify.mjs and exact bytes/scope. Use policy guide/executor defaults.
+Immediately after queueing implementation, before waiting for its result, queue read-only research id ${CAPABILITY_SCENARIO_IDS.concurrentReadme} to read the README marker, demonstrating interleaving.
+After maintained composition, delegate independent review id ${CAPABILITY_SCENARIO_IDS.exactRevisionReview} of that exact retained revision, concerned with scope, exact bytes, absence of probe.txt and node verify.mjs.
 You may run read-only verification yourself but do not edit the fixture directly. Do not delegate extra workers or change model policy.
 Handle result notifications automatically and inspect execution, findings, evidence, uncertainty, and cleanup. After queueing useful independent work, end your turn to receive notifications; do not poll status, run waits for workers, or wait inside shell commands. Status inspection for an actual result or attention is appropriate.
 Independently verify retained probe.txt is BEFORE followed by a newline, maintained value.txt is after followed by a newline, only value.txt changed, node verify.mjs passes, and all owned attempts/resources settled and cleaned.
 Complete with concrete evidence and honest limitations only after those conditions hold. Report a blocker instead of claiming success if a required boundary is unavailable.`;
-}
-
-/** Extract the assignment ids actually named in the emitted prompt. */
-export function capabilityPromptAssignmentIds(prompt: string): string[] {
-  return [...prompt.matchAll(/\bid\s+([a-z][a-z0-9-]*)\b/g)].map(
-    (match) => match[1]!,
-  );
 }
 
 export type CoordinatorTurnObservation =
@@ -343,7 +336,7 @@ export function notificationDrivenProgress(
         (block) =>
           block.type === "toolCall" &&
           block.name === "workgraph_research" &&
-          block.arguments.id === "uppercase-experiment",
+          block.arguments.id === CAPABILITY_SCENARIO_IDS.uppercaseExperiment,
       ),
   );
   const baselineIndex = notificationIndex(baselineResultId);

@@ -5,6 +5,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { hasNativeAgentSettled } from "../src/pi-process.js";
 import { type WorkstreamState, WorkstreamStore } from "../src/workstream.js";
 import {
+  CAPABILITY_SCENARIO_IDS,
   capabilityScenarioPrompt,
   notificationDrivenProgress,
 } from "./coordinator-observation.js";
@@ -68,11 +69,12 @@ try {
       )
         throw new Error(`Unexpected lifecycle ${latest.lifecycle.state}`);
       const baseline = latest.results.find(
-        (result) => result.assignmentId === "baseline-research",
+        (result) =>
+          result.assignmentId === CAPABILITY_SCENARIO_IDS.baselineResearch,
       );
       if (!baseline && latest.lifecycle.state === "completed")
         throw new Error(
-          `Completed state is missing required protocol assignment baseline-research; observed assignments: ${latest.assignments.map((assignment) => assignment.id).join(", ")}.`,
+          `Completed state is missing required protocol assignment ${CAPABILITY_SCENARIO_IDS.baselineResearch}; observed assignments: ${latest.assignments.map((assignment) => assignment.id).join(", ")}.`,
         );
       const progressed =
         baseline &&
@@ -96,13 +98,7 @@ try {
   );
   assert.deepEqual(
     state.assignments.map((assignment) => assignment.id).sort(),
-    [
-      "baseline-research",
-      "concurrent-readme",
-      "exact-revision-review",
-      "update-value",
-      "uppercase-experiment",
-    ].sort(),
+    Object.values(CAPABILITY_SCENARIO_IDS).sort(),
   );
   assert.equal(state.attempts.length, 5);
   assert.equal(state.results.length, 5);
@@ -143,7 +139,8 @@ try {
     );
   }
   const experiment = state.results.find(
-    (result) => result.assignmentId === "uppercase-experiment",
+    (result) =>
+      result.assignmentId === CAPABILITY_SCENARIO_IDS.uppercaseExperiment,
   );
   const artifact = experiment?.artifacts.find(
     (item) => item.id === "probe.txt" && item.retention === "retained",
@@ -159,13 +156,14 @@ try {
     "value.txt",
   );
   const implementation = state.attempts.find(
-    (attempt) => attempt.assignmentId === "update-value",
+    (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
   );
   const review = state.attempts.find(
-    (attempt) => attempt.assignmentId === "exact-revision-review",
+    (attempt) =>
+      attempt.assignmentId === CAPABILITY_SCENARIO_IDS.exactRevisionReview,
   );
   const concurrent = state.assignments.find(
-    (assignment) => assignment.id === "concurrent-readme",
+    (assignment) => assignment.id === CAPABILITY_SCENARIO_IDS.concurrentReadme,
   );
   assert.ok(implementation && review && concurrent);
   assert.equal(review.baseRevision, implementation.composition?.revision);
@@ -174,7 +172,7 @@ try {
     await command(f.root, "git", ["rev-parse", "HEAD"]),
   );
   const implementationResult = state.results.find(
-    (result) => result.assignmentId === "update-value",
+    (result) => result.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
   );
   assert.ok(
     implementationResult &&

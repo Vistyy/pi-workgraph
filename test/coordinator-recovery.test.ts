@@ -306,6 +306,48 @@ async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
   return { f, attempt };
 }
 
+type RecoveryFixture = Awaited<ReturnType<typeof recoveryFixture>>;
+type CompositionFixture = Awaited<ReturnType<typeof prepareBlockedComposition>>;
+
+async function retainNotApplied(
+  f: RecoveryFixture,
+  attempt: CompositionFixture["attempt"],
+  workerCommit: string,
+  integratedRevision: string,
+  reason: string,
+) {
+  const state = resultState(
+    (
+      await f.pi.call("workgraph_control", {
+        action: "retain_not_applied",
+        attemptId: attempt.id,
+        integratedRevision,
+        reason,
+      })
+    ).details,
+  );
+  const composition = state.attempts[0]?.composition;
+  assert.equal(composition?.state, "retained_not_applied");
+  assert.equal(
+    await git(f.root, "rev-parse", composition!.retainedRef!),
+    workerCommit,
+  );
+  assert.equal(await f.repository.head(), integratedRevision);
+  assert.equal(
+    await readFile(join(f.root, "value.txt"), "utf8"),
+    "integrated\n",
+  );
+  assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+  assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+  await f.pi.call("workgraph_status", {});
+  assert.equal(
+    await f.repository.head(),
+    integratedRevision,
+    "must not reapply",
+  );
+  return state;
+}
+
 test("registered shared recovery closes an absent worker without touching dirty project files", async () => {
   const f = await recoveryFixture();
   try {
@@ -501,38 +543,12 @@ test("registered absent-worker retain_not_applied preserves integrated HEAD and 
   try {
     assert.ok(integratedRevision);
     await f.setTransport({ closed: true });
-    const state = resultState(
-      (
-        await f.pi.call("workgraph_control", {
-          action: "retain_not_applied",
-          attemptId: attempt.id,
-          integratedRevision,
-          reason:
-            "Integrated change remains authoritative after worker closure",
-        })
-      ).details,
-    );
-    assert.equal(state.attempts[0]?.composition?.state, "retained_not_applied");
-    assert.equal(
-      await git(
-        f.root,
-        "rev-parse",
-        state.attempts[0]!.composition!.retainedRef!,
-      ),
+    await retainNotApplied(
+      f,
+      attempt,
       workerCommit,
-    );
-    assert.equal(await f.repository.head(), integratedRevision);
-    assert.equal(
-      await readFile(join(f.root, "value.txt"), "utf8"),
-      "integrated\n",
-    );
-    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-    await f.pi.call("workgraph_status", {});
-    assert.equal(
-      await f.repository.head(),
-      integratedRevision,
-      "must not reapply",
+      integratedRevision!,
+      "Integrated change remains authoritative after worker closure",
     );
   } finally {
     await f.dispose();
@@ -544,34 +560,19 @@ test("registered retain_not_applied preserves integrated bytes and exact unresol
     await prepareBlockedComposition(true);
   try {
     assert.ok(integratedRevision);
-    const state = resultState(
-      (
-        await f.pi.call("workgraph_control", {
-          action: "retain_not_applied",
-          attemptId: attempt.id,
-          integratedRevision,
-          reason:
-            "Integrated commit is authoritative; worker proposal remains retained",
-        })
-      ).details,
+    const state = await retainNotApplied(
+      f,
+      attempt,
+      workerCommit,
+      integratedRevision!,
+      "Integrated commit is authoritative; worker proposal remains retained",
     );
     const composition = state.attempts[0]?.composition;
-    assert.equal(composition?.state, "retained_not_applied");
     assert.equal(
       composition?.reason,
       "Integrated commit is authoritative; worker proposal remains retained",
     );
     assert.equal(composition?.integratedRevision, integratedRevision);
-    assert.equal(
-      await git(f.root, "rev-parse", composition!.retainedRef!),
-      workerCommit,
-    );
-    assert.equal(await f.repository.head(), integratedRevision);
-    assert.equal(
-      await readFile(join(f.root, "value.txt"), "utf8"),
-      "integrated\n",
-    );
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     const againResponse = await f.pi.call("workgraph_status", {});
     const again = resultState(againResponse.details);
     assert.equal(again.attempts[0]?.composition?.state, "retained_not_applied");

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { notificationDrivenProgress } from "../scripts/coordinator-observation.js";
+import {
+  CAPABILITY_SCENARIO_IDS,
+  notificationDrivenProgress,
+} from "../scripts/coordinator-observation.js";
 import { usage } from "./helpers.js";
 
 function assistant(session: SessionManager, experiment = false) {
@@ -13,7 +16,7 @@ function assistant(session: SessionManager, experiment = false) {
             type: "toolCall",
             id: "experiment",
             name: "workgraph_research",
-            arguments: { id: "uppercase-experiment" },
+            arguments: { id: CAPABILITY_SCENARIO_IDS.uppercaseExperiment },
           },
         ]
       : [{ type: "text", text: "Handle retained evidence" }],

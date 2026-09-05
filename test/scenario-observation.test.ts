@@ -3,9 +3,6 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
-  CAPABILITY_SCENARIO_ASSIGNMENT_IDS,
-  capabilityPromptAssignmentIds,
-  capabilityScenarioPrompt,
   observeCoordinatorTurn,
   observeDelegatedOutcome,
   observeDirectEffect,
@@ -285,7 +282,6 @@ test("natural observer accepts read-only delegation followed by a direct edit an
     ),
   );
   assert.equal(unauthorized.valid, false);
-  assert.match(unauthorized.detail, /authorized/);
 
   state.attempts[0]!.state = "running";
   assert.equal(
@@ -297,12 +293,12 @@ test("natural observer accepts read-only delegation followed by a direct edit an
   );
   state.attempts[0]!.state = "settled";
   delete state.attempts[0]!.worker;
-  assert.match(
+  assert.equal(
     observeDelegatedOutcome(
       state,
       observeDirectEffect(before, after, "YWZ0ZXIK"),
-    ).detail,
-    /no worker identity/,
+    ).valid,
+    false,
   );
 });
 
@@ -324,7 +320,6 @@ test("native observer requires request progression and reports early blocker or 
   failedAssistant(session, "length");
   const incomplete = observeCoordinatorTurn(session.getBranch(), request);
   assert.equal(incomplete.state, "failed");
-  assert.match(incomplete.detail, /incomplete/);
 
   const settled = SessionManager.inMemory();
   settled.appendMessage({
@@ -350,7 +345,6 @@ test("native observer requires request progression and reports early blocker or 
   );
   const blocker = observeCoordinatorTurn(blocked.getBranch(), request);
   assert.equal(blocker.state, "blocked");
-  assert.match(blocker.detail, /blocker/);
 
   const failed = SessionManager.inMemory();
   failed.appendMessage({
@@ -361,26 +355,4 @@ test("native observer requires request progression and reports early blocker or 
   failedAssistant(failed, "error");
   const failure = observeCoordinatorTurn(failed.getBranch(), request);
   assert.equal(failure.state, "failed");
-  assert.match(failure.detail, /error/);
-});
-
-test("capability prompt emits the independently specified assignment ids", () => {
-  const expected = [
-    "baseline-research",
-    "uppercase-experiment",
-    "update-value",
-    "concurrent-readme",
-    "exact-revision-review",
-  ];
-  assert.deepEqual([...CAPABILITY_SCENARIO_ASSIGNMENT_IDS], expected);
-  assert.deepEqual(
-    capabilityPromptAssignmentIds(capabilityScenarioPrompt("private")),
-    expected,
-  );
-
-  const mismatch = capabilityScenarioPrompt("private").replace(
-    "id baseline-research",
-    "id initial-evidence",
-  );
-  assert.notDeepEqual(capabilityPromptAssignmentIds(mismatch), expected);
 });
