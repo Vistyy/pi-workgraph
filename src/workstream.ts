@@ -7,7 +7,7 @@ import { Value } from "typebox/value";
 import { ModelTargetSchema } from "./model-policy.js";
 import { EvidenceSchema, WorkerReportSchema } from "./report-schema.js";
 
-export const WORKSTREAM_STATE_VERSION = 3 as const;
+export const WORKSTREAM_STATE_VERSION = 4 as const;
 const WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
 
 const NonEmptyStringSchema = Type.String({ minLength: 1 });
@@ -243,6 +243,23 @@ const ResourceSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+const AttemptPlacementSchema = Type.Union([
+  Type.Object(
+    {
+      kind: Type.Literal("shared_project"),
+      path: NonEmptyStringSchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("isolated_worktree"),
+      path: NonEmptyStringSchema,
+      branch: NonEmptyStringSchema,
+    },
+    { additionalProperties: false },
+  ),
+]);
 const AttemptSchema = Type.Object(
   {
     id: NonEmptyStringSchema,
@@ -315,7 +332,7 @@ const AttemptSchema = Type.Object(
       Type.Object(
         {
           state: StringEnum(["pending", "blocked", "completed"] as const),
-          expectedHead: NonEmptyStringSchema,
+          expectedHead: Type.Optional(NonEmptyStringSchema),
           workerClosed: Type.Boolean(),
           discard: Type.Boolean(),
           error: Type.Optional(NonEmptyStringSchema),
@@ -324,7 +341,10 @@ const AttemptSchema = Type.Object(
       ),
     ),
     sessionFile: Type.Optional(NonEmptyStringSchema),
+    placement: Type.Optional(AttemptPlacementSchema),
+    /** @deprecated Derived only for isolated placement compatibility views. */
     worktreePath: Type.Optional(NonEmptyStringSchema),
+    /** @deprecated Derived only for isolated placement compatibility views. */
     branch: Type.Optional(NonEmptyStringSchema),
     baseRevision: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
     worker: Type.Optional(
@@ -865,18 +885,23 @@ export class WorkstreamStore {
 
   async startAttempt(input: {
     id: string;
-    worktreePath: string;
-    branch: string;
-    baseRevision: string;
+    placement?: Static<typeof AttemptPlacementSchema>;
+    worktreePath?: string;
+    branch?: string;
+    baseRevision?: string;
     now?: Date;
   }): Promise<WorkstreamState> {
+    const placement = input.placement ?? {
+      kind: "isolated_worktree" as const,
+      path: requireTextValue(input.worktreePath, "worktree"),
+      branch: requireTextValue(input.branch, "branch"),
+    };
     return this.changeAttempt(
       input.id,
       (attempt) => {
         if (attempt.state === "starting") {
           if (
-            attempt.worktreePath === input.worktreePath &&
-            attempt.branch === input.branch &&
+            sameValue(attempt.placement, placement) &&
             attempt.baseRevision === input.baseRevision
           )
             return;
@@ -887,9 +912,16 @@ export class WorkstreamStore {
         if (attempt.state !== "queued")
           throw new Error(`Attempt ${input.id} is not awaiting launch.`);
         attempt.state = "starting";
-        attempt.worktreePath = input.worktreePath;
-        attempt.branch = input.branch;
-        attempt.baseRevision = input.baseRevision;
+        attempt.placement = structuredClone(placement);
+        if (placement.kind === "isolated_worktree") {
+          attempt.worktreePath = placement.path;
+          attempt.branch = placement.branch;
+        } else {
+          delete attempt.worktreePath;
+          delete attempt.branch;
+        }
+        if (input.baseRevision) attempt.baseRevision = input.baseRevision;
+        else delete attempt.baseRevision;
         attempt.submission = "not_sent";
       },
       input.now,
@@ -1208,7 +1240,7 @@ export class WorkstreamStore {
 
   async beginCleanup(input: {
     id: string;
-    expectedHead: string;
+    expectedHead?: string;
     discard: boolean;
     now?: Date;
   }): Promise<WorkstreamState> {
@@ -1224,11 +1256,18 @@ export class WorkstreamStore {
             return;
           throw new Error(`Cleanup for ${input.id} is already recorded.`);
         }
-        if (!attempt.worktreePath)
-          throw new Error("Cleanup requires a worktree.");
+        if (!attempt.placement)
+          throw new Error("Cleanup requires an attempt placement.");
+        if (
+          attempt.placement.kind === "isolated_worktree" &&
+          !input.expectedHead
+        )
+          throw new Error("Isolated worktree cleanup requires its exact HEAD.");
+        if (attempt.placement.kind === "shared_project" && input.discard)
+          throw new Error("Shared project cleanup cannot discard files.");
         attempt.cleanup = {
           state: "pending",
-          expectedHead: input.expectedHead,
+          ...(input.expectedHead ? { expectedHead: input.expectedHead } : {}),
           workerClosed: false,
           discard: input.discard,
         };
@@ -1525,7 +1564,7 @@ export class WorkstreamStore {
             ["queued", "starting", "running", "cancel_requested"].includes(
               attempt.state,
             ) ||
-            (attempt.worktreePath && attempt.cleanup?.state !== "completed"),
+            (attempt.placement && attempt.cleanup?.state !== "completed"),
         )
       ) {
         throw new Error(
@@ -1754,6 +1793,31 @@ function validateState(value: unknown): asserts value is WorkstreamState {
     "attempt",
   );
   for (const attempt of state.attempts) {
+    if (attempt.placement) {
+      if (
+        attempt.placement.kind === "shared_project" &&
+        resolve(attempt.placement.path) !== resolve(state.projectRoot)
+      )
+        throw new InvalidWorkstreamStateError(
+          `Attempt ${attempt.id} shared placement must be the project root.`,
+        );
+      if (attempt.placement.kind === "isolated_worktree") {
+        if (!attempt.baseRevision)
+          throw new InvalidWorkstreamStateError(
+            `Attempt ${attempt.id} isolated placement has no base revision.`,
+          );
+        if (
+          attempt.worktreePath !== attempt.placement.path ||
+          attempt.branch !== attempt.placement.branch
+        )
+          throw new InvalidWorkstreamStateError(
+            `Attempt ${attempt.id} isolated placement compatibility fields disagree.`,
+          );
+      } else if (attempt.worktreePath || attempt.branch)
+        throw new InvalidWorkstreamStateError(
+          `Attempt ${attempt.id} shared placement has isolated compatibility fields.`,
+        );
+    }
     if (!assignmentIds.has(attempt.assignmentId))
       throw new InvalidWorkstreamStateError(
         `Attempt ${attempt.id} references unknown assignment.`,
@@ -2109,6 +2173,10 @@ function validateSession(value: SessionIdentity): void {
 
 function requireText(value: string, label: string): void {
   if (!value.trim()) throw new Error(`${label} is required.`);
+}
+function requireTextValue(value: string | undefined, label: string): string {
+  if (!value?.trim()) throw new Error(`${label} is required.`);
+  return value;
 }
 
 function requireTexts(values: string[], label: string): void {

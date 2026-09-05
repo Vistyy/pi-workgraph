@@ -261,83 +261,96 @@ async function prepareBlockedComposition(
 
 async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
   const f = await recoveryFixture();
+  const authority = await f.authorize();
   await f.runtime.queue({
     id: "cleanup",
-    capability: "research",
-    artifactIntent: "evidence_only",
-    objective: "Read value",
-    intentVersion: 0,
-    expectedEvidence: ["Exact bytes"],
+    capability: "implement",
+    artifactIntent: "maintained_change",
+    authority,
+    acceptance: ["The bounded cleanup fixture is retained"],
+    objective: "Retain a cleanup fixture",
+    intentVersion: authority.intentVersion,
   });
   await f.runtime.reconcile();
   let state = await f.store.load();
   const attempt = state.attempts[0]!;
-  const obstruction = join(attempt.worktreePath!, "transient.tmp");
-  await writeFile(obstruction, "known fixture obstruction\n");
+  const obstruction = join(attempt.placement!.path, "transient.tmp");
   await f.settle({
-    kind: "research",
-    status: "completed",
-    summary: "Read exact bytes",
+    kind: "implementation",
+    status: "failed",
+    summary: "Retained cleanup fixture",
     evidence: [{ label: "value", observation: "value.txt contains before\\n" }],
     findings: [],
   });
+  await writeFile(obstruction, "known fixture obstruction\n");
   state = await f.runtime.reconcile();
+  await f.store.beginCleanup({
+    id: attempt.id,
+    expectedHead: await f.repository.head(attempt.placement!.path),
+    discard: false,
+  });
+  await f.store.markWorkerClosed(attempt.id);
+  await f.store.blockCleanup(attempt.id, "Known fixture obstruction");
+  state = await f.store.load();
   assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
   assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
   assert.equal(existsSync(obstruction), true);
   await rm(obstruction);
   if (removeBeforeRecovery) {
-    await git(f.root, "worktree", "remove", attempt.worktreePath!);
-    await git(f.root, "branch", "-D", attempt.branch!);
+    assert.equal(attempt.placement?.kind, "isolated_worktree");
+    await git(f.root, "worktree", "remove", attempt.placement.path);
+    await git(f.root, "branch", "-D", attempt.placement.branch);
   }
   await f.attachPublic();
   return { f, attempt };
 }
 
-test("registered recover reconciles absent worker closure before blocked cleanup bookkeeping", async () => {
+test("registered shared recovery closes an absent worker without touching dirty project files", async () => {
   const f = await recoveryFixture();
-  await f.runtime.queue({
-    id: "cleanup-absent",
-    capability: "research",
-    artifactIntent: "evidence_only",
-    objective: "Read value",
-    intentVersion: 0,
-    expectedEvidence: ["Exact bytes"],
-  });
-  await f.runtime.reconcile();
-  const attempt = (await f.store.load()).attempts[0]!;
-  const obstruction = join(attempt.worktreePath!, "transient.tmp");
-  await writeFile(obstruction, "known fixture obstruction\n");
-  await f.settle({
-    kind: "research",
-    status: "completed",
-    summary: "Read exact bytes",
-    evidence: [{ label: "value", observation: "value.txt contains before\\n" }],
-    findings: [],
-  });
-  await f.store.beginCleanup({
-    id: attempt.id,
-    expectedHead: await f.repository.head(attempt.worktreePath!),
-    discard: false,
-  });
-  await f.store.blockCleanup(attempt.id, "Known fixture obstruction");
-  await f.setTransport({ closed: true });
-  await f.attachPublic();
   try {
-    await rm(obstruction);
+    await f.runtime.queue({
+      id: "cleanup-absent",
+      capability: "research",
+      artifactIntent: "evidence_only",
+      objective: "Read value",
+      intentVersion: 0,
+      expectedEvidence: ["Exact bytes"],
+    });
+    await f.runtime.reconcile();
+    const attempt = (await f.store.load()).attempts[0]!;
+    assert.equal(attempt.placement?.kind, "shared_project");
+    const dirty = join(f.root, "local-edit.txt");
+    await writeFile(dirty, "must remain untouched\\n");
+    await f.settle({
+      kind: "research",
+      status: "completed",
+      summary: "Read exact bytes",
+      evidence: [
+        { label: "value", observation: "value.txt contains before\\n" },
+      ],
+      findings: [],
+    });
+    await f.store.beginCleanup({ id: attempt.id, discard: false });
+    await f.store.blockCleanup(
+      attempt.id,
+      "Worker closure bookkeeping interrupted",
+    );
+    await f.setTransport({ closed: true });
+    await f.attachPublic();
     const state = resultState(
       (
         await f.pi.call("workgraph_control", {
           action: "recover",
           attemptId: attempt.id,
           reason:
-            "Exact native worker tab is absent; obstruction was inspected",
+            "Exact native worker tab is absent; shared project bytes remain owned by the user",
         })
       ).details,
     );
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-    assert.equal(existsSync(attempt.worktreePath!), false);
+    assert.equal(await readFile(dirty, "utf8"), "must remain untouched\\n");
+    assert.equal(await f.repository.status(), "?? local-edit.txt");
   } finally {
     await f.dispose();
   }

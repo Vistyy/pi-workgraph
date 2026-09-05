@@ -106,9 +106,9 @@ async function verifyDelegatedSettlements(
       throw new Error(
         `Delegated attempt ${attempt.id} is not attributable to the owned workspace.`,
       );
-    if (!attempt.worktreePath || worker.cwd !== attempt.worktreePath)
+    if (!attempt.placement || worker.cwd !== attempt.placement.path)
       throw new Error(
-        `Delegated attempt ${attempt.id} has an unexpected worker worktree identity.`,
+        `Delegated attempt ${attempt.id} has an unexpected worker placement identity.`,
       );
   }
 }

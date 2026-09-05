@@ -294,7 +294,7 @@ test("multi-attempt queueing resolves one shared validated base and exact-review
     });
     assert.deepEqual(
       queued.attempts.map((attempt) => attempt.baseRevision),
-      [initial, initial],
+      [undefined, undefined],
     );
     await writeFile(join(f.root, "moved.txt"), "moved\n");
     await git(f.root, "add", ".");
@@ -374,6 +374,50 @@ test("new runtime drives fresh research through native evidence, durable retryab
   }
 });
 
+test("shared research sees dirty tracked and untracked files and leaves them untouched after closure and retry", async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.root, "value.txt"), "local tracked edit\\n");
+    const local = join(f.root, "local-untracked.txt");
+    await writeFile(local, "local untracked edit\\n");
+    f.workers.onWork = async (request) => {
+      assert.equal(request.cwd, f.root);
+      assert.equal(
+        await readFile(join(request.cwd, "value.txt"), "utf8"),
+        "local tracked edit\\n",
+      );
+      assert.equal(
+        await readFile(join(request.cwd, "local-untracked.txt"), "utf8"),
+        "local untracked edit\\n",
+      );
+      return researchReport;
+    };
+    const active = f.runtime();
+    await active.queue(research("dirty-shared"));
+    await active.reconcile();
+    let state = await active.reconcile();
+    assert.equal(state.attempts[0]?.placement?.kind, "shared_project");
+    assert.equal(state.attempts[0]?.placement?.path, f.root);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(
+      await readFile(join(f.root, "value.txt"), "utf8"),
+      "local tracked edit\\n",
+    );
+    assert.equal(await readFile(local, "utf8"), "local untracked edit\\n");
+    await active.stop();
+    const retry = f.runtime();
+    state = await retry.reconcile();
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(
+      await readFile(join(f.root, "value.txt"), "utf8"),
+      "local tracked edit\\n",
+    );
+    assert.equal(await readFile(local, "utf8"), "local untracked edit\\n");
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("cleaned history has constant reconciliation reads while error clearing and pending delivery remain independent", async (t) => {
   const f = await fixture();
   try {
@@ -434,28 +478,30 @@ test("cleaned history has constant reconciliation reads while error clearing and
     );
     assert.equal(f.workers.cleanupCount, 4);
 
-    // A blocked (not completed) cleanup must still be inspected and recoverable.
-    await recovered.queue(research("blocked-cleanup"));
+    // Shared cleanup closes only the native worker and leaves dirty project bytes alone.
+    f.workers.deferWork = true;
+    await recovered.queue(research("dirty-shared"));
     await recovered.reconcile();
     const request = f.workers.requests.at(-1)!;
-    const obstruction = join(request.cwd, "unattributed.txt");
-    await writeFile(
-      obstruction,
-      "Created by this fixture after worker settlement\n",
-    );
+    const obstruction = join(f.root, "unattributed.txt");
+    await writeFile(obstruction, "Created before shared worker settlement\n");
+    await f.workers.produce(request);
+    f.workers.status = "idle";
     state = await recovered.reconcile();
-    const blocked = state.attempts.at(-1)!;
-    assert.equal(blocked.cleanup?.state, "blocked");
-    before = reads.mock.callCount();
-    await recovered.reconcile();
-    assert.ok(reads.mock.callCount() - before > emptyReads);
-    await rm(obstruction);
-    // Rearm only after inspecting/removing the exact fixture-owned obstruction.
-    assert.ok(blocked.cleanup);
-    await recovered.perform(() => f.store.retryCleanup(blocked.id));
-    state = await recovered.reconcile();
+    assert.equal(state.attempts.at(-1)?.placement?.kind, "shared_project");
     assert.equal(state.attempts.at(-1)?.cleanup?.state, "completed");
-    assert.equal(state.attempts.at(-1)?.error, undefined);
+    assert.equal(
+      await readFile(obstruction, "utf8"),
+      "Created before shared worker settlement\n",
+    );
+    await recovered.stop();
+    const retried = f.runtime();
+    state = await retried.reconcile();
+    assert.equal(state.attempts.at(-1)?.cleanup?.state, "completed");
+    assert.equal(
+      await readFile(obstruction, "utf8"),
+      "Created before shared worker settlement\n",
+    );
   } finally {
     await f.dispose();
   }
@@ -490,8 +536,16 @@ test("maintained changes use guide/executor policy and review checks the request
         };
       }
       assert.equal(
+        await git(
+          request.cwd,
+          "show",
+          `${request.env.PI_WORKGRAPH_BASE_COMMIT}:value.txt`,
+        ),
+        "maintained",
+      );
+      assert.equal(
         await readFile(join(request.cwd, "value.txt"), "utf8"),
-        "maintained\n",
+        "later\n",
       );
       return {
         kind: "review",
@@ -534,6 +588,7 @@ test("maintained changes use guide/executor policy and review checks the request
     await active.reconcile();
     state = await active.reconcile();
     assert.equal(state.attempts[1]?.baseRevision, revision);
+    assert.equal(state.attempts[1]?.placement?.kind, "shared_project");
     assert.equal(state.results[1]?.validity, "typed");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "later\n");
   } finally {
@@ -827,7 +882,8 @@ test("worker continuation uses an isolated new workspace and current generation,
     await active.reconcile();
     state = await active.reconcile();
     assert.equal(state.results[1]?.validity, "untyped");
-    assert.notEqual(state.attempts[1]?.worktreePath, previous.worktreePath);
+    assert.equal(state.attempts[1]?.placement?.kind, "shared_project");
+    assert.equal(state.attempts[1]?.placement?.path, f.root);
     assert.notEqual(state.attempts[1]?.sessionFile, previous.sessionFile);
     assert.equal(state.attempts[1]?.models?.guide.model, "provider/other");
     assert.equal(state.attempts[1]?.models?.source, "override");

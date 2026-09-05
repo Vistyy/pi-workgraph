@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -207,7 +207,7 @@ test("continued implementation requires this attempt's native start and later ex
   }
 });
 
-test("read-only review rejects a committed revision change as well as dirty files", async () => {
+test("read-only review observes dirty live files without changing them", async () => {
   const f = await fixture("review");
   const report = {
     kind: "review",
@@ -219,12 +219,13 @@ test("read-only review rejects a committed revision change as well as dirty file
   try {
     assert.equal((await f.call("workgraph_report", report)).terminate, true);
     await writeFile(join(f.root, "value.txt"), "changed\n");
-    await assert.rejects(f.call("workgraph_report", report), /read-only/);
-    await git(f.root, "commit", "-am", "Unauthorized change");
-    await assert.rejects(
-      f.call("workgraph_report", report),
-      /assigned revision/,
+    assert.equal((await f.call("workgraph_report", report)).terminate, true);
+    assert.equal(
+      await readFile(join(f.root, "value.txt"), "utf8"),
+      "changed\n",
     );
+    await git(f.root, "commit", "-am", "Observed local change");
+    assert.equal((await f.call("workgraph_report", report)).terminate, true);
   } finally {
     await f.dispose();
   }

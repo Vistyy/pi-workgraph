@@ -164,23 +164,10 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
           continued,
         });
       }
-      if (mode !== "implementation" && !experiment) {
-        const status = await git(
-          pi,
-          ctx.cwd,
-          ["status", "--porcelain", "--untracked-files=all"],
-          true,
-        );
-        if (status)
-          throw new Error(
-            `${mode} workers are read-only, but the repository is dirty:\n${status}`,
-          );
-        if (
-          baseCommit &&
-          (await git(pi, ctx.cwd, ["rev-parse", "HEAD"])) !== baseCommit
-        )
-          throw new Error("Read-only worker changed the assigned revision.");
-      }
+      // Read-only is an instruction and authority boundary, not a filesystem sandbox.
+      // Shared research and review deliberately observe the live project cwd, including
+      // tracked and untracked local changes. Do not claim an immutable base unless the
+      // report records exact Git evidence for the requested revision.
       return terminalReport(params, { todos, switchedAt, switchError });
     },
   });
@@ -354,15 +341,15 @@ function terminalReport(report: WorkerReport, state: Record<string, unknown>) {
   };
 }
 const researchInstructions =
-  "[WORKGRAPH RESEARCH]\nAnswer only the assigned question using read-only evidence. Supply the requested observations and retain material unknowns. Do not edit product files or delegate another worker. Finish with workgraph_report.";
+  "[WORKGRAPH RESEARCH]\nAnswer only the assigned question using read-only evidence from the live project cwd. Tracked and untracked local changes may be present; do not require cleanliness, copy files, or modify them. Supply the requested observations and retain material unknowns. Do not delegate another worker. Finish with workgraph_report.";
 const experimentInstructions =
   "[WORKGRAPH EXPERIMENT]\nAnswer the question within the explicitly permitted effects and stop condition in this disposable worktree. Retain the named artifacts and report direct observations, failures and limits. Do not compose, publish, or delegate another worker. Finish with workgraph_report.";
 const reviewInstructions =
-  "[WORKGRAPH REVIEW]\nReview only the identified subject and concern, at the named revision when supplied. Execute the assigned verification procedure when requested and authorized. Do not edit product files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
+  "[WORKGRAPH REVIEW]\nReview only the identified subject and concern. For an exact revision subject, inspect that exact commit with Git (for example git show, git diff, and git ls-tree) and cite the revision in evidence; do not silently treat live working files as that commit. Do not claim tests against current working files validate another revision. Execute verification only when it genuinely targets the requested subject. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
 const guideInstructions =
-  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current worktree. Record at most eight concrete local TODO items with workgraph_todo before the first edit. Missing TODO telemetry does not block an otherwise valid implementation. Make the first useful edit; the runtime then switches models. If required work crosses the authorized scope, report escalation without editing. Do not report completion during the guide phase.";
+  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current isolated worktree. Record at most eight concrete local TODO items with workgraph_todo before the first edit. Missing TODO telemetry does not block an otherwise valid implementation. Make the first useful edit; the runtime then switches models. If required work crosses the authorized scope, report escalation without editing. Do not report completion during the guide phase.";
 function executorInstructions(): string {
-  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory. Complete the bounded assignment, run its verification, create exactly one direct commit on the supplied base, and leave the worktree clean. Return workgraph_report with evidence. Escalate required work beyond the authorized scope.";
+  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory in the isolated worktree. Complete the bounded assignment, run its verification, create exactly one direct commit on the supplied base, and leave the worktree clean. Return workgraph_report with evidence. Escalate required work beyond the authorized scope.";
 }
 async function git(
   pi: ExtensionAPI,

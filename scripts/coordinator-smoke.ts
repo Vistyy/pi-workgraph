@@ -121,6 +121,22 @@ try {
     assert.equal(attempt.cleanup?.workerClosed, true);
     assert.ok(attempt.worker && attempt.sessionFile);
     assert.equal(attempt.worker.workspaceId, f.workspaceId);
+    const assignment = state.assignments.find(
+      (item) => item.id === attempt.assignmentId,
+    );
+    assert.ok(assignment);
+    assert.ok(attempt.placement);
+    const isolated =
+      assignment.capability === "implement" ||
+      assignment.artifactIntent === "disposable_experiment";
+    assert.equal(
+      attempt.placement.kind,
+      isolated ? "isolated_worktree" : "shared_project",
+    );
+    assert.equal(
+      attempt.worker.cwd,
+      isolated ? attempt.placement.path : f.root,
+    );
     assert.ok(hasNativeAgentSettled(attempt.sessionFile, state.id, attempt.id));
     assert.ok(
       !(await readFile(attempt.sessionFile, "utf8")).includes(privateToken),

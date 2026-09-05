@@ -164,10 +164,6 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       runtime = undefined;
     }
     const repository = await GitRepository.inspect(ctx.cwd);
-    if (repository.status)
-      throw new Error(
-        `Delegate from a clean committed repository snapshot:\n${repository.status}`,
-      );
     const created = await WorkstreamStore.create({
       id: `ws-${randomUUID()}`,
       purpose,
@@ -921,6 +917,7 @@ function compactStatus(state: WorkstreamState, offset = 0, limit = 20) {
             models: attempt.models,
             effectiveModels: attempt.effectiveModels,
             submission: attempt.submission,
+            placement: attempt.placement,
             resultId: attempt.resultId,
             composition: attempt.composition?.state,
             compositionReason: attempt.composition?.reason,

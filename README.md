@@ -13,11 +13,13 @@ pnpm install
 pi -e /absolute/path/to/pi-workgraph
 ```
 
-Start from a clean committed repository and ask the coordinator to delegate the needed work.
+Start from the project directory and ask the coordinator to delegate the needed work.
+Composition still requires a clean destination at the maintained-application boundary.
 First delegation creates a workstream automatically; `workgraph_begin` is optional.
-Workers run in visible Herdr tabs and isolated Git worktrees, with ordinary Pi package/configuration loading and fresh context.
-There is no hidden print-process fallback or automatic trust approval.
-Worktrees are not operating-system sandboxes.
+Workers run in visible Herdr tabs with ordinary Pi package/configuration loading and fresh context.
+Read-only research and review use the existing coordinator project directory, so they observe live tracked and untracked changes without a clean-tree prerequisite or copying.
+Implementation and disposable experiments use owned isolated Git worktrees; those worktrees are not operating-system sandboxes.
+Read-only is an instruction and authority boundary, not a filesystem sandbox, and shared files may change while research runs.
 
 ## Conversation tools
 
@@ -91,7 +93,9 @@ pi-workgraph fork --parent-session-file SESSION_PATH --target-cwd REPOSITORY --w
 
 CLI results are JSON; failures exit nonzero.
 Historical state is inspected as uninterpreted JSON, without automatic migration or mutation.
-The active runtime uses workstream format version 3; earlier versions are not silently adopted.
+The active runtime uses workstream format version 4; earlier versions are not silently adopted.
+Default shared research evidence describes live working files rather than an immutable committed snapshot.
+An explicit base revision is exact Git evidence; an exact-revision review must inspect that commit with Git rather than treating current working files as the revision.
 
 ## Development and live verification
 
@@ -109,7 +113,8 @@ This natural procedure is evidence of caller usability, while the deterministic 
 The assertion check uses the already-installed TypeScript parser to reject type laundering through `unknown` and assertions to `never`, while permitting legitimate unknown inputs, ordinary narrowing, and `as const`.
 Non-null assertions are not blanket-banned; their correctness depends on the enforced boundary.
 
-Run live scenarios only from a Herdr-managed pane, against a clean committed candidate.
+Run live scenarios only from a Herdr-managed pane, against a clean committed candidate when the scenario itself requires composition.
+Shared research is separately expected to start with local tracked or untracked changes and leave those bytes untouched after native worker closure and retry.
 `smoke:herdr` starts idle Pi sessions without submitting model prompts and checks native identity, unnamed coordinator lookup, cleanup refusal for mismatched identity, and Herdr closure before Git removal.
 `smoke:coordinator` submits one authorized request through a normal visible Pi coordinator and observes automatic handling of research, experiment retention/non-composition, implementation with guide/executor messages, concurrent research, exact-revision review, and resource cleanup.
 It requires authenticated configured models and does not supply later approval or progress nudges.

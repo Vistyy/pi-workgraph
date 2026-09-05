@@ -203,10 +203,7 @@ export function observeDelegatedOutcome(
       attempt.worker.sessionFile !== attempt.sessionFile
     )
       problems.push(`attempt ${attempt.id} worker session is not attributable`);
-    else if (
-      attempt.worktreePath &&
-      attempt.worker.cwd !== attempt.worktreePath
-    )
+    else if (attempt.placement && attempt.worker.cwd !== attempt.placement.path)
       problems.push(`attempt ${attempt.id} worker cwd is not attributable`);
     if (!attempt.resultId)
       problems.push(`attempt ${attempt.id} has no retained result`);

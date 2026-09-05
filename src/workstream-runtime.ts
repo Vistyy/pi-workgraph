@@ -210,7 +210,7 @@ export class WorkstreamRuntime {
           ...(options.continuationOf
             ? { continuationOf: options.continuationOf }
             : {}),
-          baseRevision,
+          ...(baseRevision ? { baseRevision } : {}),
         });
       }
       const role = input.capability === "review" ? "review" : "research";
@@ -242,7 +242,7 @@ export class WorkstreamRuntime {
           ...(index === 0 && options.continuationOf
             ? { continuationOf: options.continuationOf }
             : {}),
-          baseRevision,
+          ...(baseRevision ? { baseRevision } : {}),
         })),
       );
     });
@@ -251,7 +251,7 @@ export class WorkstreamRuntime {
   private async resolveQueueBase(
     input: Parameters<WorkstreamStore["assign"]>[0],
     options: QueueOptions,
-  ): Promise<string> {
+  ): Promise<string | undefined> {
     const subjectRevision =
       input.capability === "review" && input.subject.kind === "revision"
         ? input.subject.revision
@@ -262,9 +262,14 @@ export class WorkstreamRuntime {
       subjectRevision !== options.baseRevision
     )
       throw new Error("Review base revision conflicts with its exact subject.");
+    const requiresIsolatedBase =
+      input.capability === "implement" ||
+      input.artifactIntent === "disposable_experiment";
     const requested =
-      options.baseRevision ?? subjectRevision ?? (await this.repository.head());
-    return this.repository.resolveRevision(requested);
+      options.baseRevision ??
+      subjectRevision ??
+      (requiresIsolatedBase ? await this.repository.head() : undefined);
+    return requested ? this.repository.resolveRevision(requested) : undefined;
   }
 
   async reconcile(): Promise<WorkstreamState> {
@@ -356,7 +361,7 @@ export class WorkstreamRuntime {
         const recovered = await recover.call(this.workers, {
           workspaceId: this.launch.workspaceId,
           agentName: herdrAgentName(state.id, attempt.id, attempt.id),
-          cwd: required(attempt.worktreePath, "worktree"),
+          cwd: placementPath(state, attempt),
           sessionFile: attempt.sessionFile,
           ...(attempt.resource ? { resource: attempt.resource } : {}),
         });
@@ -436,11 +441,17 @@ export class WorkstreamRuntime {
       }
       state = await this.store.load();
       attempt = findAttempt(state, id);
-      if (!attempt.cleanup && attempt.worktreePath) {
-        const expectedHead = await this.repository.head(attempt.worktreePath);
+      if (!attempt.cleanup && attempt.placement) {
+        const isolated = attempt.placement.kind === "isolated_worktree";
         await this.store.beginCleanup({
           id,
-          expectedHead,
+          ...(isolated
+            ? {
+                expectedHead: await this.repository.head(
+                  attempt.placement.path,
+                ),
+              }
+            : {}),
           discard: assignment.artifactIntent === "disposable_experiment",
         });
       }
@@ -453,28 +464,34 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     assignment: WorkAssignment,
   ): Promise<void> {
-    const baseRevision =
-      attempt.baseRevision ??
-      (assignment.capability === "review" &&
-      assignment.subject.kind === "revision"
-        ? assignment.subject.revision
-        : await this.repository.head());
-    const placement = await this.repository.createWorktree(
-      state.id,
-      attempt.id,
-      baseRevision,
-    );
+    const isolated =
+      assignment.capability === "implement" ||
+      assignment.artifactIntent === "disposable_experiment";
+    const baseRevision = attempt.baseRevision;
+    const isolatedPlacement = isolated
+      ? await this.repository.createWorktree(
+          state.id,
+          attempt.id,
+          required(baseRevision, "base revision"),
+        )
+      : undefined;
+    const workerCwd = isolatedPlacement?.path ?? this.repository.root;
     await this.store.startAttempt({
       id: attempt.id,
-      worktreePath: placement.path,
-      branch: placement.branch,
-      baseRevision,
+      placement: isolatedPlacement
+        ? {
+            kind: "isolated_worktree",
+            path: isolatedPlacement.path,
+            branch: isolatedPlacement.branch,
+          }
+        : { kind: "shared_project", path: workerCwd },
+      ...(baseRevision ? { baseRevision } : {}),
     });
     const previous = attempt.continuationOf
       ? findAttempt(state, attempt.continuationOf)
       : undefined;
     const sessionFile = await createWorkerSession({
-      targetCwd: placement.path,
+      targetCwd: workerCwd,
       sessionDir: join(dirname(state.statePath), "sessions"),
       objective: objectiveFor(state, assignment, baseRevision),
       mode: modeFor(assignment),
@@ -497,7 +514,7 @@ export class WorkstreamRuntime {
       runId: state.id,
       nodeId: attempt.id,
       attemptId: attempt.id,
-      cwd: placement.path,
+      cwd: workerCwd,
       sessionFile,
       prompt: "Continue the assigned Workgraph objective now.",
       model: models.guide.model,
@@ -506,7 +523,7 @@ export class WorkstreamRuntime {
         PI_WORKGRAPH_MODE: modeFor(assignment),
         PI_WORKGRAPH_RUN_ID: state.id,
         PI_WORKGRAPH_NODE_ID: attempt.id,
-        PI_WORKGRAPH_BASE_COMMIT: baseRevision,
+        ...(baseRevision ? { PI_WORKGRAPH_BASE_COMMIT: baseRevision } : {}),
         ...(process.env.PI_CODING_AGENT_DIR
           ? { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR }
           : {}),
@@ -579,9 +596,13 @@ export class WorkstreamRuntime {
           await this.store
             .beginCleanup({
               id: attempt.id,
-              expectedHead: await this.repository.head(
-                required(attempt.worktreePath, "worktree"),
-              ),
+              ...(attempt.placement?.kind === "isolated_worktree"
+                ? {
+                    expectedHead: await this.repository.head(
+                      attempt.placement.path,
+                    ),
+                  }
+                : {}),
               discard: false,
             })
             .then(() =>
@@ -731,7 +752,12 @@ export class WorkstreamRuntime {
     successful: boolean,
   ): Promise<RetainedArtifact[]> {
     const root = await realpath(
-      required(attempt.worktreePath, "experiment worktree"),
+      required(
+        attempt.placement?.kind === "isolated_worktree"
+          ? attempt.placement.path
+          : undefined,
+        "experiment worktree",
+      ),
     );
     const destination = join(dirname(state.statePath), "artifacts", resultId);
     const artifacts: RetainedArtifact[] = [];
@@ -806,15 +832,23 @@ export class WorkstreamRuntime {
         await this.store.markWorkerClosed(id);
       }
       this.assertOwnership();
-      if (cleanup.discard)
-        await this.repository.discardExperiment(
-          placementOf(attempt),
+      if (attempt.placement?.kind === "isolated_worktree") {
+        const expectedHead = required(
           cleanup.expectedHead,
+          "expected worktree HEAD",
         );
-      await this.repository.cleanupWorktree(
-        placementOf(attempt),
-        cleanup.expectedHead,
-      );
+        if (cleanup.discard)
+          await this.repository.discardExperiment(
+            placementOf(attempt),
+            expectedHead,
+          );
+        await this.repository.cleanupWorktree(
+          placementOf(attempt),
+          expectedHead,
+        );
+      } else if (cleanup.discard) {
+        throw new Error("Shared project cleanup cannot discard files.");
+      }
       await this.store.finishCleanup(id);
     } catch (error) {
       await this.store.blockCleanup(id, asError(error).message);
@@ -873,10 +907,12 @@ export class WorkstreamRuntime {
           await this.compose(state, retried, assignment);
           state = await this.store.load();
           const composed = findAttempt(state, attempt.id);
-          if (!composed.cleanup && composed.worktreePath) {
+          if (!composed.cleanup && composed.placement) {
             await this.store.beginCleanup({
               id: attempt.id,
-              expectedHead: await this.repository.head(composed.worktreePath),
+              expectedHead: await this.repository.head(
+                placementOf(composed).path,
+              ),
               discard: false,
             });
           }
@@ -967,11 +1003,19 @@ export class WorkstreamRuntime {
 }
 
 function placementOf(attempt: WorkAttempt): WorktreePlacement {
+  const placement = required(attempt.placement, "attempt placement");
+  if (placement.kind !== "isolated_worktree")
+    throw new Error(
+      "Git worktree ownership is unavailable for shared placement.",
+    );
   return {
-    path: required(attempt.worktreePath, "worktree"),
-    branch: required(attempt.branch, "branch"),
+    path: placement.path,
+    branch: placement.branch,
     baseCommit: required(attempt.baseRevision, "base"),
   };
+}
+function placementPath(state: WorkstreamState, attempt: WorkAttempt): string {
+  return attempt.placement?.path ?? state.projectRoot;
 }
 function findAttempt(state: WorkstreamState, id: string): WorkAttempt {
   return required(
@@ -1011,7 +1055,7 @@ function modeFor(assignment: WorkAssignment) {
 function objectiveFor(
   state: WorkstreamState,
   assignment: WorkAssignment,
-  baseRevision: string,
+  baseRevision?: string,
 ): string {
   const intent = state.intents.find(
     (item) => item.version === assignment.intentVersion,
@@ -1020,7 +1064,11 @@ function objectiveFor(
     `Assignment: ${assignment.objective}`,
     `Intent version: ${assignment.intentVersion}`,
     `Constraints: ${intent?.constraints.join("; ") ?? ""}`,
-    `Base revision: ${baseRevision}`,
+    ...(baseRevision
+      ? [
+          `${assignment.capability === "implement" || assignment.artifactIntent === "disposable_experiment" ? "Isolated base revision" : "Requested Git revision evidence"}: ${baseRevision}`,
+        ]
+      : []),
   ];
   if (assignment.capability === "research")
     common.push(`Expected evidence: ${assignment.expectedEvidence.join("; ")}`);
@@ -1028,7 +1076,7 @@ function objectiveFor(
     common.push(
       `Permitted effects: ${assignment.permittedEffects.join("; ")}`,
       `Stop condition: ${assignment.stopCondition}`,
-      `Retain worktree-relative artifacts: ${assignment.artifactPolicy.retain.join(", ") || "none"}.`,
+      `Retain isolated-worktree-relative artifacts: ${assignment.artifactPolicy.retain.join(", ") || "none"}.`,
       "Experimental changes are not maintained product changes and must not be committed for composition.",
     );
   if (assignment.capability === "implement")
