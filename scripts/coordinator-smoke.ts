@@ -77,6 +77,10 @@ Complete with concrete evidence and honest limitations only after those conditio
       const baseline = latest.results.find(
         (result) => result.assignmentId === "baseline-research",
       );
+      if (!baseline && latest.lifecycle.state === "completed")
+        throw new Error(
+          `Completed state is missing required protocol assignment baseline-research; observed assignments: ${latest.assignments.map((assignment) => assignment.id).join(", ")}.`,
+        );
       const progressed =
         baseline &&
         notificationDrivenProgress(
@@ -117,7 +121,7 @@ Complete with concrete evidence and honest limitations only after those conditio
   );
   assert.equal(state.deliveries.length, 5);
   assert.ok(state.deliveries.every((delivery) => delivery.state !== "pending"));
-  assert.deepEqual(state.completion?.unresolvedAssignmentIds, []);
+  assert.deepEqual(state.completion?.accounting, []);
   for (const attempt of state.attempts) {
     assert.equal(attempt.state, "settled");
     assert.equal(attempt.cleanup?.state, "completed");

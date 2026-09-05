@@ -46,8 +46,9 @@ test("accepted historical research closes its original scope after intent change
         { label: "Baseline", observation: "Evidence predates the new intent" },
       ],
       limitations: [],
+      accounting: [],
     });
-    assert.deepEqual(state.completion?.unresolvedAssignmentIds, []);
+    assert.deepEqual(state.completion?.accounting, []);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -110,10 +111,11 @@ test("accepting a failed report or uncomposed stale implementation as evidence d
           { label: "Result", observation: "The assignment is not fulfilled" },
         ],
         limitations: [],
+        accounting: [],
       };
       await assert.rejects(
         store.complete(completion),
-        /unresolved assignments/,
+        /Completion accounting|unresolved assignments/,
       );
       const state = await store.complete({
         ...completion,
@@ -122,8 +124,33 @@ test("accepting a failed report or uncomposed stale implementation as evidence d
             ? "The read failed"
             : "The stale change was never composed",
         ],
+        accounting: [
+          {
+            kind: "unresolved_assignment",
+            assignmentId: "work",
+            reason: "The assignment is unresolved.",
+          },
+          ...(capability === "research"
+            ? [
+                {
+                  kind: "unresolved_result" as const,
+                  resultId: "result",
+                  reason: "The result is failed or stale.",
+                },
+              ]
+            : []),
+        ],
       });
-      assert.deepEqual(state.completion?.unresolvedAssignmentIds, ["work"]);
+      assert.deepEqual(
+        state.completion?.accounting.map((item) =>
+          item.kind === "unresolved_assignment"
+            ? item.assignmentId
+            : item.kind === "unresolved_result"
+              ? item.resultId
+              : "",
+        ),
+        capability === "research" ? ["work", "result"] : ["work"],
+      );
     } finally {
       await rm(parent, { recursive: true, force: true });
     }
@@ -390,9 +417,30 @@ test("workstream keeps worker validity, disposition, limitations, and stale resu
         },
       ],
       limitations: ["The revised constraint has no accepted result yet."],
+      accounting: [
+        {
+          kind: "unresolved_assignment",
+          assignmentId: "research",
+          reason: "The revised assignment is unresolved.",
+        },
+        {
+          kind: "unresolved_result",
+          resultId: "stale-result",
+          reason: "The stale result is not usable.",
+        },
+      ],
     });
     assert.equal(state.lifecycle.state, "completed");
-    assert.deepEqual(state.completion?.unresolvedAssignmentIds, ["research"]);
+    assert.deepEqual(
+      state.completion?.accounting.map((item) =>
+        item.kind === "unresolved_assignment"
+          ? item.assignmentId
+          : item.kind === "unresolved_result"
+            ? item.resultId
+            : "",
+      ),
+      ["research", "stale-result"],
+    );
     assert.equal(state.completion?.evidence[0]?.class, "unknown");
   } finally {
     await rm(parent, { recursive: true, force: true });
@@ -497,8 +545,9 @@ test("every independent attempt remains accounted for regardless of result arriv
             { label: "comparison", observation: "Both attempts retained" },
           ],
           limitations: ["The failed attempt remains unresolved."],
+          accounting: [],
         }),
-        /unresolved attempts|unresolved results/,
+        /Completion accounting|unresolved attempts|unresolved results/,
       );
       const failed = state.attempts.find((attempt) =>
         attempt.id.endsWith(order.indexOf("failed").toString()),
@@ -512,13 +561,36 @@ test("every independent attempt remains accounted for regardless of result arriv
           { label: "comparison", observation: "Both attempts retained" },
         ],
         limitations: ["The failed attempt remains unresolved."],
-        unresolvedAttemptIds: [failed.id],
-        unresolvedResultIds: [failedResult.id],
+        accounting: [
+          {
+            kind: "unresolved_assignment",
+            assignmentId: "comparison",
+            reason: "One attempt failed.",
+          },
+          {
+            kind: "unresolved_attempt",
+            attemptId: failed.id,
+            reason: "The attempt failed.",
+          },
+          {
+            kind: "unresolved_result",
+            resultId: failedResult.id,
+            reason: "The result failed.",
+          },
+        ],
       });
-      assert.deepEqual(completed.completion?.unresolvedAttemptIds, [failed.id]);
-      assert.deepEqual(completed.completion?.unresolvedResultIds, [
-        failedResult.id,
-      ]);
+      assert.deepEqual(
+        completed.completion?.accounting.map((item) =>
+          item.kind === "unresolved_assignment"
+            ? item.assignmentId
+            : item.kind === "unresolved_attempt"
+              ? item.attemptId
+              : item.kind === "unresolved_result"
+                ? item.resultId
+                : "",
+        ),
+        ["comparison", failed.id, failedResult.id],
+      );
     } finally {
       await rm(parent, { recursive: true, force: true });
     }

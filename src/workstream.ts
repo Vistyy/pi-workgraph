@@ -294,11 +294,19 @@ const AttemptSchema = Type.Object(
     composition: Type.Optional(
       Type.Object(
         {
-          state: StringEnum(["pending", "composed", "blocked"] as const),
+          state: StringEnum([
+            "pending",
+            "composed",
+            "blocked",
+            "retained_not_applied",
+          ] as const),
           commit: NonEmptyStringSchema,
           expectedHead: NonEmptyStringSchema,
           revision: Type.Optional(NonEmptyStringSchema),
           error: Type.Optional(NonEmptyStringSchema),
+          reason: Type.Optional(NonEmptyStringSchema),
+          retainedRef: Type.Optional(NonEmptyStringSchema),
+          integratedRevision: Type.Optional(NonEmptyStringSchema),
         },
         { additionalProperties: false },
       ),
@@ -358,26 +366,57 @@ const DeliverySchema = Type.Object(
     deliveredAt: Type.Optional(TimestampSchema),
     acknowledgedAt: Type.Optional(TimestampSchema),
     acknowledgment: Type.Optional(NonEmptyStringSchema),
+    failureHistory: Type.Optional(
+      Type.Array(
+        Type.Object(
+          { at: TimestampSchema, detail: NonEmptyStringSchema },
+          { additionalProperties: false },
+        ),
+      ),
+    ),
   },
   { additionalProperties: false },
 );
-const UnresolvedEvidenceSchema = Type.Object(
-  {
-    resultId: NonEmptyStringSchema,
-    reason: NonEmptyStringSchema,
-  },
-  { additionalProperties: false },
-);
+const CompletionAccountingSchema = Type.Union([
+  Type.Object(
+    {
+      kind: Type.Literal("unresolved_assignment"),
+      assignmentId: NonEmptyStringSchema,
+      reason: NonEmptyStringSchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("unresolved_attempt"),
+      attemptId: NonEmptyStringSchema,
+      reason: NonEmptyStringSchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("unresolved_result"),
+      resultId: NonEmptyStringSchema,
+      reason: NonEmptyStringSchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("undelivered_result"),
+      resultId: NonEmptyStringSchema,
+      reason: NonEmptyStringSchema,
+    },
+    { additionalProperties: false },
+  ),
+]);
 const CompletionSchema = Type.Object(
   {
     conclusion: NonEmptyStringSchema,
     evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
     limitations: Type.Array(NonEmptyStringSchema),
-    unresolvedAssignmentIds: Type.Array(NonEmptyStringSchema),
-    unresolvedAttemptIds: Type.Optional(Type.Array(NonEmptyStringSchema)),
-    unresolvedResultIds: Type.Optional(Type.Array(NonEmptyStringSchema)),
-    undeliveredResultIds: Type.Optional(Type.Array(NonEmptyStringSchema)),
-    undeliveredEvidence: Type.Optional(Type.Array(UnresolvedEvidenceSchema)),
+    accounting: Type.Array(CompletionAccountingSchema),
     completedAt: TimestampSchema,
   },
   { additionalProperties: false },
@@ -421,6 +460,7 @@ export type WorkResult = Static<typeof ResultSchema>;
 export type ResultDisposition = Static<typeof DispositionSchema>;
 export type WorkAttempt = Static<typeof AttemptSchema>;
 export type ResultDelivery = Static<typeof DeliverySchema>;
+export type CompletionAccounting = Static<typeof CompletionAccountingSchema>;
 export type WorkstreamState = Static<typeof WorkstreamStateSchema>;
 
 type OmitEach<T, K extends PropertyKey> = T extends unknown
@@ -1010,6 +1050,51 @@ export class WorkstreamStore {
     );
   }
 
+  async retryComposition(id: string, now?: Date): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const composition = attempt.composition;
+        if (composition?.state !== "blocked")
+          throw new Error(`Composition for ${id} is not blocked.`);
+        attempt.composition = {
+          state: "pending",
+          commit: composition.commit,
+          expectedHead: composition.expectedHead,
+        };
+      },
+      now,
+    );
+  }
+
+  async retainCompositionNotApplied(input: {
+    id: string;
+    reason: string;
+    retainedRef: string;
+    integratedRevision: string;
+    now?: Date;
+  }): Promise<WorkstreamState> {
+    requireText(input.reason, "Retained-not-applied reason");
+    requireText(input.retainedRef, "Retained commit ref");
+    requireText(input.integratedRevision, "Integrated revision");
+    return this.changeAttempt(
+      input.id,
+      (attempt) => {
+        const composition = attempt.composition;
+        if (composition?.state !== "blocked")
+          throw new Error(`Composition for ${input.id} is not blocked.`);
+        attempt.composition = {
+          ...composition,
+          state: "retained_not_applied",
+          reason: input.reason.trim(),
+          retainedRef: input.retainedRef.trim(),
+          integratedRevision: input.integratedRevision.trim(),
+        };
+      },
+      input.now,
+    );
+  }
+
   async finishComposition(
     id: string,
     revision: string,
@@ -1248,13 +1333,21 @@ export class WorkstreamStore {
     error?: string,
   ): Promise<WorkstreamState> {
     return this.update(
-      (draft) => {
+      (draft, now) => {
         const delivery = draft.deliveries.find(
           (item) => item.resultId === resultId,
         );
         if (!delivery) throw new Error(`Unknown delivery ${resultId}.`);
         delivery.attemptedBy = owner;
-        if (error) delivery.error = error;
+        if (error) {
+          requireText(error, "Delivery failure");
+          delivery.error = error.trim();
+          delivery.failureHistory ??= [];
+          delivery.failureHistory.push({
+            at: now.toISOString(),
+            detail: error.trim(),
+          });
+        }
       },
       undefined,
       ["active", "suspended"],
@@ -1291,7 +1384,7 @@ export class WorkstreamStore {
         );
         if (!delivery)
           throw new Error(`Result ${resultId} is not pending delivery.`);
-        if (delivery.state === "acknowledged") return;
+        if (delivery.state !== "pending") return;
         delivery.state = "delivered";
         delivery.deliveredAt = (now ?? current).toISOString();
         delete delivery.error;
@@ -1352,8 +1445,7 @@ export class WorkstreamStore {
     limitations: string[];
     unresolvedAttemptIds?: string[];
     unresolvedResultIds?: string[];
-    undeliveredResultIds?: string[];
-    undeliveredEvidence?: { resultId: string; reason: string }[];
+    accounting: CompletionAccounting[];
     now?: Date;
   }): Promise<WorkstreamState> {
     requireText(input.conclusion, "Completion conclusion");
@@ -1378,82 +1470,29 @@ export class WorkstreamStore {
           "Complete only after workers and owned resources have settled and cleaned up.",
         );
       }
-      const unresolvedAssignmentIds = draft.assignments
-        .filter((assignment) => !assignmentResolved(draft, assignment))
-        .map((assignment) => assignment.id);
-      const unresolvedAttemptIds = draft.attempts
-        .filter((attempt) => !attemptResolved(draft, attempt))
-        .map((attempt) => attempt.id);
-      const unresolvedResultIds = draft.results
-        .filter((result) => resultUnresolved(draft, result.id))
-        .map((result) => result.id);
-      const pendingResultIds = draft.deliveries
-        .filter((delivery) => delivery.state === "pending")
-        .map((delivery) => delivery.resultId);
-      const suppliedAttempts = uniqueInputIds(input.unresolvedAttemptIds ?? []);
-      const suppliedResults = uniqueInputIds(input.unresolvedResultIds ?? []);
-      const suppliedUndelivered = uniqueInputIds(
-        input.undeliveredResultIds ?? [],
-      );
-      if (!sameIds(suppliedAttempts, unresolvedAttemptIds))
-        throw new Error(
-          `Completion must explicitly account for unresolved attempts: ${unresolvedAttemptIds.join(", ") || "none"}.`,
-        );
-      const resultIdsRequireExplicitAccounting = unresolvedResultIds.filter(
-        (resultId) => {
-          const assignmentId = draft.results.find(
-            (result) => result.id === resultId,
-          )?.assignmentId;
-          return draft.attempts.some(
-            (attempt) => attempt.assignmentId === assignmentId,
-          );
-        },
-      );
+      const expectedAccounting = completionAccounting(draft);
+      const suppliedAccounting = validateAccounting(input.accounting);
+      const expectedKeys = expectedAccounting.map(accountingKey);
+      const suppliedKeys = suppliedAccounting.map(accountingKey);
       if (
-        resultIdsRequireExplicitAccounting.length > 0 &&
-        !sameIds(suppliedResults, resultIdsRequireExplicitAccounting)
+        suppliedKeys.length !== new Set(suppliedKeys).size ||
+        suppliedKeys.some((key) => !expectedKeys.includes(key)) ||
+        expectedKeys.some((key) => !suppliedKeys.includes(key))
       )
         throw new Error(
-          `Completion must explicitly account for unresolved results: ${resultIdsRequireExplicitAccounting.join(", ")}.`,
+          `Completion accounting must exactly identify unresolved assignments, attempts, results or delivery: ${expectedKeys.join(", ") || "none"}.`,
         );
-      if (!sameIds(suppliedUndelivered, pendingResultIds))
-        throw new Error(
-          `Pending result delivery requires explicit undelivered result accounting: ${pendingResultIds.join(", ") || "none"}.`,
-        );
-      if (
-        (unresolvedAssignmentIds.length > 0 ||
-          unresolvedAttemptIds.length > 0 ||
-          unresolvedResultIds.length > 0 ||
-          pendingResultIds.length > 0) &&
-        input.limitations.length === 0
-      )
-        throw new Error(
-          "Completion with unresolved assignments, attempts, results or delivery requires a specific limitation.",
-        );
-      for (const resultId of pendingResultIds) {
-        const reason = input.undeliveredEvidence?.find(
-          (item) => item.resultId === resultId,
-        );
-        if (
-          !reason?.reason.trim() &&
-          !input.limitations.some((item) => item.includes(resultId))
-        )
-          throw new Error(
-            `Undelivered result ${resultId} requires an identified reason.`,
-          );
-      }
       const completedAt = (input.now ?? now).toISOString();
       draft.completion = {
         conclusion: input.conclusion.trim(),
         evidence: structuredClone(input.evidence),
         limitations: input.limitations.map((item) => item.trim()),
-        unresolvedAssignmentIds,
-        unresolvedAttemptIds,
-        unresolvedResultIds,
-        undeliveredResultIds: pendingResultIds,
-        ...(input.undeliveredEvidence
-          ? { undeliveredEvidence: structuredClone(input.undeliveredEvidence) }
-          : {}),
+        accounting: expectedAccounting.map(
+          (expected) =>
+            suppliedAccounting.find(
+              (supplied) => accountingKey(supplied) === accountingKey(expected),
+            )!,
+        ),
         completedAt,
       };
       draft.lifecycle = {
@@ -1490,9 +1529,10 @@ export class WorkstreamStore {
       this.assertOwner(current);
       if (!allowedLifecycleStates.includes(current.lifecycle.state))
         throw new Error(`Workstream is ${current.lifecycle.state}.`);
-      const draft = current; // readState returns a fresh, unshared JSON value.
+      const draft = structuredClone(current);
       const now = suppliedNow ?? new Date();
       mutator(draft, now);
+      if (sameValue(draft, current)) return structuredClone(current);
       draft.revision = current.revision + 1;
       draft.updatedAt = now.toISOString();
       await this.write(draft);
@@ -1675,26 +1715,35 @@ function validateState(value: unknown): asserts value is WorkstreamState {
     "delivery",
   );
   if (state.completion) {
-    for (const id of state.completion.unresolvedAssignmentIds)
-      if (!assignmentIds.has(id))
+    for (const item of state.completion.accounting) {
+      if (
+        item.kind === "unresolved_assignment" &&
+        !assignmentIds.has(item.assignmentId)
+      )
         throw new InvalidWorkstreamStateError(
-          `Completion references unknown assignment ${id}.`,
+          `Completion references unknown assignment ${item.assignmentId}.`,
         );
-    for (const id of state.completion.unresolvedAttemptIds ?? [])
-      if (!state.attempts.some((attempt) => attempt.id === id))
+      if (
+        item.kind === "unresolved_attempt" &&
+        !state.attempts.some((attempt) => attempt.id === item.attemptId)
+      )
         throw new InvalidWorkstreamStateError(
-          `Completion references unknown attempt ${id}.`,
+          `Completion references unknown attempt ${item.attemptId}.`,
         );
-    for (const id of state.completion.unresolvedResultIds ?? [])
-      if (!resultIds.has(id))
+      if (item.kind === "unresolved_result" && !resultIds.has(item.resultId))
         throw new InvalidWorkstreamStateError(
-          `Completion references unknown result ${id}.`,
+          `Completion references unknown result ${item.resultId}.`,
         );
-    for (const id of state.completion.undeliveredResultIds ?? [])
-      if (!state.deliveries.some((delivery) => delivery.resultId === id))
+      if (
+        item.kind === "undelivered_result" &&
+        !state.deliveries.some(
+          (delivery) => delivery.resultId === item.resultId,
+        )
+      )
         throw new InvalidWorkstreamStateError(
-          `Completion references unknown delivery ${id}.`,
+          `Completion references unknown delivery ${item.resultId}.`,
         );
+    }
   }
   if (state.lifecycle.state === "completed" && !state.completion)
     throw new InvalidWorkstreamStateError(
@@ -1912,15 +1961,59 @@ function resultUnresolved(state: WorkstreamState, resultId: string): boolean {
   );
 }
 
-function uniqueInputIds(ids: string[]): string[] {
-  return [...new Set(ids)].sort();
+function completionAccounting(state: WorkstreamState): CompletionAccounting[] {
+  const accounting: CompletionAccounting[] = [];
+  for (const assignment of state.assignments)
+    if (!assignmentResolved(state, assignment))
+      accounting.push({
+        kind: "unresolved_assignment",
+        assignmentId: assignment.id,
+        reason: "Unresolved assignment requires coordinator accounting.",
+      });
+  for (const attempt of state.attempts)
+    if (!attemptResolved(state, attempt))
+      accounting.push({
+        kind: "unresolved_attempt",
+        attemptId: attempt.id,
+        reason: "Unresolved attempt requires coordinator accounting.",
+      });
+  for (const result of state.results)
+    if (resultUnresolved(state, result.id))
+      accounting.push({
+        kind: "unresolved_result",
+        resultId: result.id,
+        reason: "Unresolved result requires coordinator accounting.",
+      });
+  for (const delivery of state.deliveries)
+    if (delivery.state === "pending")
+      accounting.push({
+        kind: "undelivered_result",
+        resultId: delivery.resultId,
+        reason: "Undelivered result requires coordinator accounting.",
+      });
+  return accounting;
 }
 
-function sameIds(left: string[], right: string[]): boolean {
-  return (
-    JSON.stringify(uniqueInputIds(left)) ===
-    JSON.stringify(uniqueInputIds(right))
-  );
+function validateAccounting(
+  accounting: CompletionAccounting[],
+): CompletionAccounting[] {
+  if (!Array.isArray(accounting))
+    throw new Error("Completion accounting is required.");
+  if (
+    !accounting.every((item) => Value.Check(CompletionAccountingSchema, item))
+  )
+    throw new Error(
+      "Completion accounting entries require an identified reason.",
+    );
+  return accounting.map((item) => ({ ...item, reason: item.reason.trim() }));
+}
+
+function accountingKey(item: CompletionAccounting): string {
+  return item.kind === "unresolved_assignment"
+    ? `${item.kind}:${item.assignmentId}`
+    : item.kind === "unresolved_attempt"
+      ? `${item.kind}:${item.attemptId}`
+      : `${item.kind}:${item.resultId}`;
 }
 
 function sameValue(left: unknown, right: unknown): boolean {

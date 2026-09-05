@@ -623,14 +623,17 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     label: "Workgraph Status",
     description:
       "Inspect compact progress, selected models and reasons, result handles, actionable attention and resource recovery.",
-    parameters: Type.Object({}),
-    async execute() {
+    parameters: Type.Object({
+      offset: Type.Optional(Type.Integer({ minimum: 0 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+    }),
+    async execute(_id, params) {
       return serial(async () => {
         const state = await current().store.load();
         return result(
           `Workstream ${state.id}: ${state.lifecycle.state}`,
           state,
-          compactStatus(state),
+          compactStatus(state, params.offset ?? 0, params.limit ?? 20),
         );
       });
     },
@@ -683,19 +686,45 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_control",
     label: "Workgraph Control",
     description:
-      "Suspend new work and composition while retaining observations, resume, cancel, or submit steering to one live attempt.",
+      "Suspend or resume work, cancel or steer a live attempt, retry an inspected blocked boundary, or explicitly retain a conflicting commit as not applied.",
     parameters: Type.Object({
-      action: StringEnum(["suspend", "resume", "cancel", "steer"] as const),
+      action: StringEnum([
+        "suspend",
+        "resume",
+        "cancel",
+        "steer",
+        "recover",
+        "retain_not_applied",
+      ] as const),
       reason: Type.String(),
       attemptId: Type.Optional(Type.String()),
+      integratedRevision: Type.Optional(
+        Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+      ),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       return serial(async () => {
         const active = current();
-        if (params.action === "cancel" || params.action === "steer") {
+        if (
+          params.action === "cancel" ||
+          params.action === "steer" ||
+          params.action === "recover" ||
+          params.action === "retain_not_applied"
+        ) {
           if (!params.attemptId) throw new Error("An attempt id is required.");
           if (params.action === "cancel") await active.cancel(params.attemptId);
-          else await active.steer(params.attemptId, params.reason);
+          else if (params.action === "steer")
+            await active.steer(params.attemptId, params.reason);
+          else
+            await active.recoverAttempt({
+              attemptId: params.attemptId,
+              action:
+                params.action === "recover" ? "retry" : "retain_not_applied",
+              reason: params.reason,
+              ...(params.integratedRevision
+                ? { integratedRevision: params.integratedRevision }
+                : {}),
+            });
         } else
           await active.perform(() =>
             active.store.setLifecycle({
@@ -706,7 +735,10 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         return result(
           params.action === "steer"
             ? "Steering submitted; application is not yet established."
-            : "Control request recorded.",
+            : params.action === "recover" ||
+                params.action === "retain_not_applied"
+              ? "Recovery inspected the exact boundary and recorded its outcome."
+              : "Control request recorded.",
           remember(await active.store.load(), ctx),
         );
       });
@@ -781,13 +813,29 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       conclusion: Type.String(),
       evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
       limitations: Type.Array(Type.String()),
-      unresolvedAttemptIds: Type.Optional(Type.Array(Type.String())),
-      unresolvedResultIds: Type.Optional(Type.Array(Type.String())),
-      undeliveredResultIds: Type.Optional(Type.Array(Type.String())),
-      undeliveredEvidence: Type.Optional(
-        Type.Array(
-          Type.Object({ resultId: Type.String(), reason: Type.String() }),
-        ),
+      accounting: Type.Array(
+        Type.Union([
+          Type.Object({
+            kind: Type.Literal("unresolved_assignment"),
+            assignmentId: Type.String(),
+            reason: Type.String({ minLength: 1 }),
+          }),
+          Type.Object({
+            kind: Type.Literal("unresolved_attempt"),
+            attemptId: Type.String(),
+            reason: Type.String({ minLength: 1 }),
+          }),
+          Type.Object({
+            kind: Type.Literal("unresolved_result"),
+            resultId: Type.String(),
+            reason: Type.String({ minLength: 1 }),
+          }),
+          Type.Object({
+            kind: Type.Literal("undelivered_result"),
+            resultId: Type.String(),
+            reason: Type.String({ minLength: 1 }),
+          }),
+        ]),
       ),
     }),
     async execute(_id, params, _signal, _update, ctx) {
@@ -806,65 +854,121 @@ function coordinatorView(state: WorkstreamState) {
   return compactStatus(state);
 }
 
-function compactStatus(state: WorkstreamState) {
+function compactStatus(state: WorkstreamState, offset = 0, limit = 20) {
+  const page = <T>(items: T[]) => ({
+    items: items.slice(offset, offset + limit),
+    total: items.length,
+    offset,
+    limit,
+    remaining: Math.max(0, items.length - offset - limit),
+    ...(offset + limit < items.length ? { nextOffset: offset + limit } : {}),
+  });
+  const attention = state.attempts.flatMap((attempt) =>
+    attempt.error
+      ? [{ attemptId: attempt.id, detail: attempt.error }]
+      : attempt.composition?.state === "blocked" ||
+          attempt.cleanup?.state === "blocked"
+        ? [
+            {
+              attemptId: attempt.id,
+              detail:
+                attempt.composition?.error ??
+                attempt.cleanup?.error ??
+                "Blocked attempt requires recovery.",
+            },
+          ]
+        : [],
+  );
+  const accounting = state.completion?.accounting ?? [];
   return {
     id: state.id,
     lifecycle: state.lifecycle,
-    attention: state.attempts
-      .filter((attempt) => attempt.error)
-      .map((attempt) => ({ attemptId: attempt.id, detail: attempt.error })),
-    assignments: state.assignments.map((assignment) => ({
-      id: assignment.id,
-      capability: assignment.capability,
-      objective: assignment.objective,
-      attempts: state.attempts
-        .filter((attempt) => attempt.assignmentId === assignment.id)
-        .map((attempt) => ({
-          id: attempt.id,
-          state: attempt.state,
-          models: attempt.models,
-          effectiveModels: attempt.effectiveModels,
-          submission: attempt.submission,
-          resultId: attempt.resultId,
-          composition: attempt.composition?.state,
-          cleanup: attempt.cleanup?.state,
-          attention: attempt.error,
-        })),
-    })),
-    results: state.results.map((item) => ({
-      id: item.id,
-      assignmentId: item.assignmentId,
-      validity: item.validity,
-      summary:
-        item.validity === "typed"
-          ? item.report.summary
-          : item.validity === "untyped"
-            ? item.text.slice(0, 240)
-            : item.detail,
-      handles: {
-        summary: "summary",
-        evidence: "evidence",
-        findings: "findings",
-        attention: "attention",
-      },
-    })),
-    delivery: state.deliveries.map((delivery) => ({
-      resultId: delivery.resultId,
-      state: delivery.state,
-      error: delivery.error,
-    })),
-    judgment: state.dispositions.map(({ resultId, status, reason }) => ({
-      resultId,
-      status,
-      reason,
-    })),
+    counts: {
+      assignments: state.assignments.length,
+      attempts: state.attempts.length,
+      results: state.results.length,
+      deliveries: state.deliveries.length,
+      attention: attention.length,
+      accounting: accounting.length,
+    },
+    assignments: page(
+      state.assignments.map((assignment) => ({
+        id: assignment.id,
+        capability: assignment.capability,
+        objective: assignment.objective,
+        attempts: state.attempts
+          .filter((attempt) => attempt.assignmentId === assignment.id)
+          .map((attempt) => ({
+            id: attempt.id,
+            state: attempt.state,
+            models: attempt.models,
+            effectiveModels: attempt.effectiveModels,
+            submission: attempt.submission,
+            resultId: attempt.resultId,
+            composition: attempt.composition?.state,
+            compositionReason: attempt.composition?.reason,
+            retainedRef: attempt.composition?.retainedRef,
+            cleanup: attempt.cleanup?.state,
+            attention: attempt.error,
+          })),
+      })),
+    ),
+    results: page(
+      state.results.map((item) => ({
+        id: item.id,
+        assignmentId: item.assignmentId,
+        validity: item.validity,
+        summary:
+          item.validity === "typed"
+            ? item.report.summary.slice(0, 240)
+            : item.validity === "untyped"
+              ? item.text.slice(0, 240)
+              : item.detail.slice(0, 240),
+        undeliveredEvidence: accounting.filter(
+          (entry) =>
+            entry.kind === "undelivered_result" && entry.resultId === item.id,
+        ),
+        retainedNotApplied: state.attempts
+          .filter(
+            (attempt) =>
+              attempt.resultId === item.id &&
+              attempt.composition?.state === "retained_not_applied",
+          )
+          .map((attempt) => ({
+            attemptId: attempt.id,
+            reason: attempt.composition?.reason,
+            retainedRef: attempt.composition?.retainedRef,
+            integratedRevision: attempt.composition?.integratedRevision,
+          })),
+        handles: {
+          summary: "summary",
+          evidence: "evidence",
+          findings: "findings",
+          attention: "attention",
+        },
+      })),
+    ),
+    delivery: page(
+      state.deliveries.map((delivery) => ({
+        resultId: delivery.resultId,
+        state: delivery.state,
+        error: delivery.error,
+        failureHistory: delivery.failureHistory,
+      })),
+    ),
+    attention: page(attention),
+    accounting: page(accounting),
+    judgment: page(
+      state.dispositions.map(({ resultId, status, reason }) => ({
+        resultId,
+        status,
+        reason,
+      })),
+    ),
     completion: state.completion
       ? {
           completedAt: state.completion.completedAt,
-          unresolvedAssignmentIds: state.completion.unresolvedAssignmentIds,
-          unresolvedAttemptIds: state.completion.unresolvedAttemptIds ?? [],
-          unresolvedResultIds: state.completion.unresolvedResultIds ?? [],
-          undeliveredResultIds: state.completion.undeliveredResultIds ?? [],
+          accounting: state.completion.accounting,
         }
       : undefined,
   };
@@ -883,6 +987,12 @@ function focusedResult(
     id: item.id,
     assignmentId: item.assignmentId,
     validity: item.validity,
+    accounting: state.completion?.accounting.filter(
+      (entry) =>
+        (entry.kind === "unresolved_result" ||
+          entry.kind === "undelivered_result") &&
+        entry.resultId === item.id,
+    ),
   };
   if (item.validity !== "typed")
     return {
@@ -925,6 +1035,24 @@ function focusedResult(
       judgments: state.dispositions.filter(
         (disposition) => disposition.resultId === resultId,
       ),
+      accounting: state.completion?.accounting.filter(
+        (entry) =>
+          (entry.kind === "unresolved_result" ||
+            entry.kind === "undelivered_result") &&
+          entry.resultId === resultId,
+      ),
+      retainedNotApplied: state.attempts
+        .filter(
+          (attempt) =>
+            attempt.resultId === resultId &&
+            attempt.composition?.state === "retained_not_applied",
+        )
+        .map((attempt) => ({
+          attemptId: attempt.id,
+          reason: attempt.composition?.reason,
+          retainedRef: attempt.composition?.retainedRef,
+          integratedRevision: attempt.composition?.integratedRevision,
+        })),
     };
   return {
     ...base,

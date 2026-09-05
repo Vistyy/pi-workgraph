@@ -258,6 +258,7 @@ test("registered status stays compact and focused result retrieval projects boun
             },
           ],
           limitations: [],
+          accounting: [],
         })
       ).details,
     );

@@ -655,6 +655,7 @@ test("wrong-mode and stale maintained results remain retained without compositio
           conclusion: "done",
           evidence: [{ label: "limit", observation: "Not done" }],
           limitations: ["stale"],
+          accounting: [],
         }),
       ),
       /workers and owned resources/,
@@ -781,10 +782,11 @@ test("failed notification is not retried by polling and manual observed receipt 
       conclusion: "The bounded question is answered",
       evidence: [{ label: "Read", observation: "value.txt says initial" }],
       limitations: [],
+      accounting: [],
     };
     await assert.rejects(
       active.perform(() => f.store.complete(completion)),
-      /Pending result delivery/,
+      /Completion accounting|Pending result delivery/,
     );
     await active.reconcile();
     await active.reconcile();

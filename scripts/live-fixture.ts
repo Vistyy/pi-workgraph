@@ -4,6 +4,7 @@ import {
   copyFile,
   mkdir,
   mkdtemp,
+  readdir,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -14,6 +15,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { runProcess } from "../src/git.js";
 import { loadModelPolicy } from "../src/model-policy.js";
 import type { WorkerIdentity } from "../src/types.js";
+import { WorkstreamStore } from "../src/workstream.js";
 
 export function object(value: unknown): Record<string, unknown> {
   assert.ok(
@@ -134,7 +136,14 @@ export async function createLiveFixture(label: string) {
     join(agentDir, "settings.json"),
     JSON.stringify({ packages: [candidate] }),
   );
-  await writeFile(join(root, "README.md"), "# Fixture\n\nMarker: AMBER.\n");
+  await writeFile(
+    join(root, "README.md"),
+    "# Fixture\n\nMarker: AMBER.\n\nThe parser's normalized marker is used for the correction decision.\n",
+  );
+  await writeFile(
+    join(root, "parse-marker.mjs"),
+    'import { readFileSync } from "node:fs";\nconst text = readFileSync("README.md", "utf8");\nconst raw = text.match(/^Marker:\\s*(.+)$/m)?.[1] ?? "";\nconst parsed = raw.replace(/[.!?]+$/, "");\nconsole.log(JSON.stringify({ raw, parsed }));\n',
+  );
   await writeFile(join(root, "value.txt"), "before\n");
   await writeFile(
     join(root, "verify.mjs"),
@@ -355,12 +364,60 @@ export async function retainFailure(
     workspaceId: f?.workspaceId,
     limitation:
       "Owned resources and evidence are retained. Inspect identities and worker state before cleanup; no blind retry or broad workspace deletion was attempted.",
+    diagnostic: undefined as string | undefined,
   };
-  if (f)
+  if (f) {
+    try {
+      const directory = join(f.root, ".git", "pi-workgraph", "workstreams");
+      const names = await readdir(directory);
+      const states = [];
+      for (const name of names) {
+        try {
+          const state = await WorkstreamStore.inspect(
+            join(directory, name, "workstream.json"),
+          );
+          states.push({
+            id: state.id,
+            lifecycle: state.lifecycle,
+            assignments: state.assignments.map((item) => item.id),
+            attempts: state.attempts.map((attempt) => ({
+              id: attempt.id,
+              state: attempt.state,
+              worker: attempt.worker,
+              resource: attempt.resource,
+              error: attempt.error,
+              cleanup: attempt.cleanup,
+              composition: attempt.composition,
+            })),
+            results: state.results.map((result) => ({
+              id: result.id,
+              assignmentId: result.assignmentId,
+              validity: result.validity,
+            })),
+          });
+        } catch (stateError) {
+          states.push({
+            name,
+            diagnostic:
+              stateError instanceof Error
+                ? stateError.message
+                : String(stateError),
+          });
+        }
+      }
+      await writeFile(
+        join(f.parent, "state-observation.json"),
+        JSON.stringify(states, null, 2),
+      );
+    } catch (stateError) {
+      failure.diagnostic =
+        stateError instanceof Error ? stateError.message : String(stateError);
+    }
     await writeFile(
       join(f.parent, "failure.json"),
       JSON.stringify(failure, null, 2),
     );
+  }
   console.error(JSON.stringify(failure));
   process.exitCode = 1;
 }

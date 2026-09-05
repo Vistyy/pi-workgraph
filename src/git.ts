@@ -81,6 +81,44 @@ export class GitRepository {
     );
   }
 
+  async retainCommit(
+    runId: string,
+    attemptId: string,
+    commit: string,
+  ): Promise<string> {
+    if (
+      ![runId, attemptId].every((id) => /^[a-z0-9][a-z0-9_-]{0,63}$/.test(id))
+    )
+      throw new Error("Invalid retained commit identity.");
+    const resolved = await this.resolveRevision(commit);
+    const ref = `refs/workgraph-retained/${runId}/${attemptId}`;
+    const existing = await runProcess(
+      "git",
+      ["-C", this.root, "rev-parse", "--verify", "--quiet", ref],
+      { cwd: this.root, timeoutMs: 30_000 },
+    );
+    if (existing.exitCode === 0) {
+      const current = await gitText(this.root, ["rev-parse", ref]);
+      if (current !== resolved)
+        throw new Error(`Retained ref ${ref} points to a different commit.`);
+      return ref;
+    }
+    if (existing.exitCode !== 1)
+      throw new Error(`Could not inspect retained ref ${ref}.`);
+    const update = await runProcess(
+      "git",
+      ["-C", this.root, "update-ref", ref, resolved],
+      { cwd: this.root, timeoutMs: 30_000 },
+    );
+    if (update.exitCode !== 0)
+      throw new Error(
+        `Could not retain commit ${resolved}: ${update.stderr || update.stdout}`,
+      );
+    if ((await gitText(this.root, ["rev-parse", ref])) !== resolved)
+      throw new Error(`Retained ref ${ref} did not reach ${resolved}.`);
+    return ref;
+  }
+
   async assertClean(cwd = this.root): Promise<void> {
     const status = await this.status(cwd);
     if (status) throw new Error(`Git working tree is not clean:\n${status}`);

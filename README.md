@@ -75,9 +75,11 @@ Suspension stops new launches and composition, while observations, evidence rete
 Result notifications have stable identifiers and can recur after an interrupted delivery; this is not an exactly-once transport.
 After a notification failure, read the result through status or reattach; acknowledgment remains available as an explicit receipt but is not needed to use the result.
 The runtime does not repeatedly wake the coordinator on every poll.
-Completion always refuses unfinished or blocked owned work and requires named, reasoned accounting for unresolved attempts and evidence; undelivered result identifiers are retained only when that evidence is explicitly abandoned.
+Completion always refuses unfinished or blocked owned work and requires one exact structured accounting entry with an explicit reason for every unresolved assignment, attempt, result, and undelivered result; unknown or extra accounting identities are rejected. A blocked boundary is recoverable only through the guarded coordinator recovery operation after exact native and Git inspection. A conflicting implementation may be explicitly retained-not-applied under an owned reachable ref and reason, but is not reported as composed.
 Routine completion does not require acknowledgment or disposition; focused presentation is the transport receipt and those remain separate optional facts.
 Blocked work is preserved for inspection rather than force-deleted.
+
+`workgraph_control` supports guarded `recover` for an inspected transient cleanup or composition failure, and `retain_not_applied` with an exact integrated revision and reason for a deliberately un-applied conflicting commit. Repeated result reads preserve the first delivery timestamp and retain failed-wake history. Status and result views are bounded, count their history, provide continuation offsets, and expose accounting and retained-not-applied reasons.
 
 The CLI provides read-only state inspection and explicit conversation forking:
 

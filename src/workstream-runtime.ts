@@ -428,7 +428,8 @@ export class WorkstreamRuntime {
         assignment.capability === "implement" &&
         result.validity === "typed" &&
         result.report.status === "completed" &&
-        attempt.state !== "cancelled"
+        attempt.state !== "cancelled" &&
+        attempt.composition?.state !== "retained_not_applied"
       ) {
         if (state.lifecycle.state !== "active") return;
         await this.compose(state, attempt, assignment);
@@ -818,6 +819,94 @@ export class WorkstreamRuntime {
     } catch (error) {
       await this.store.blockCleanup(id, asError(error).message);
     }
+  }
+
+  async recoverAttempt(input: {
+    attemptId: string;
+    action: "retry" | "retain_not_applied";
+    reason: string;
+    integratedRevision?: string;
+  }): Promise<WorkstreamState> {
+    return this.perform(async () => {
+      if (!input.reason.trim()) throw new Error("Recovery reason is required.");
+      let state = await this.store.load();
+      const attempt = findAttempt(state, input.attemptId);
+      const composition = attempt.composition;
+      const cleanup = attempt.cleanup;
+      if (input.action === "retain_not_applied" && !input.integratedRevision)
+        throw new Error(
+          "Retained-not-applied recovery requires the integrated revision.",
+        );
+      if (composition?.state === "blocked") {
+        if (!attempt.worker)
+          throw new Error(
+            "Recovery cannot inspect the missing worker identity.",
+          );
+        const observation = await this.workers.observe(attempt.worker);
+        if (!["idle", "done"].includes(observation.status))
+          throw new Error(
+            `Recovery inspected worker ${observation.status}; leave resources intact.`,
+          );
+        await this.repository.assertClean();
+        await this.repository.validateWorkerCommit(
+          placementOf(attempt),
+          composition.commit,
+        );
+        const retainedRef = await this.repository.retainCommit(
+          state.id,
+          attempt.id,
+          composition.commit,
+        );
+        if (input.action === "retry") {
+          await this.store.retryComposition(attempt.id);
+          await this.advance(attempt.id);
+        } else {
+          const integratedRevision = await this.repository.resolveRevision(
+            input.integratedRevision!,
+          );
+          const currentHead = await this.repository.head();
+          if (currentHead !== integratedRevision)
+            throw new Error(
+              `Integrated revision is ${integratedRevision}, but repository HEAD is ${currentHead}.`,
+            );
+          await this.store.retainCompositionNotApplied({
+            id: attempt.id,
+            reason: input.reason,
+            retainedRef,
+            integratedRevision,
+          });
+          state = await this.store.load();
+          if (!state.attempts.find((item) => item.id === attempt.id)?.cleanup) {
+            await this.store.beginCleanup({
+              id: attempt.id,
+              expectedHead: await this.repository.head(
+                placementOf(attempt).path,
+              ),
+              discard: false,
+            });
+          }
+          await this.cleanup(attempt.id);
+        }
+      } else if (cleanup?.state === "blocked") {
+        if (!attempt.worker)
+          throw new Error(
+            "Cleanup recovery cannot inspect the missing worker identity.",
+          );
+        const observation = await this.workers.observe(attempt.worker);
+        if (!["idle", "done"].includes(observation.status))
+          throw new Error(
+            `Recovery inspected worker ${observation.status}; leave resources intact.`,
+          );
+        await this.repository.assertClean(placementOf(attempt).path);
+        await this.store.retryCleanup(attempt.id);
+        await this.cleanup(attempt.id);
+      } else {
+        throw new Error(
+          `Attempt ${attempt.id} has no blocked recovery boundary.`,
+        );
+      }
+      return this.store.load();
+    });
   }
 
   async steer(attemptId: string, instruction: string): Promise<void> {
