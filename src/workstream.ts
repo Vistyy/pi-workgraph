@@ -444,7 +444,12 @@ const CompletionSchema = Type.Object(
 const RetainedTerminalEnvelopeSchema = Type.Object(
   {
     format: Type.Literal(WORKSTREAM_FORMAT),
-    version: Type.Literal(WORKSTREAM_STATE_VERSION),
+    version: Type.Union([
+      Type.Literal(1),
+      Type.Literal(2),
+      Type.Literal(3),
+      Type.Literal(WORKSTREAM_STATE_VERSION),
+    ]),
     revision: Type.Integer({ minimum: 0 }),
     id: NonEmptyStringSchema,
     gitCommonDir: NonEmptyStringSchema,
@@ -649,31 +654,44 @@ export class WorkstreamStore {
 
   /**
    * Read a startup pointer without writes or ownership changes.
-   * Only a canonical current-version terminal envelope may skip full mutable-state validation.
+   * A canonical terminal envelope from a known workstream version may be retained
+   * without applying the current mutable schema or adopting its ownership.
    */
   static async inspectForReattachment(
     path: string,
   ): Promise<WorkstreamReattachmentInspection> {
     const resolvedPath = resolve(path);
-    const value = await readSupportedStateValue(resolvedPath);
-    try {
-      validateState(value);
-      validateStoredPath(value, resolvedPath);
-      return { kind: "current", state: structuredClone(value) };
-    } catch (error) {
-      if (
-        Value.Check(RetainedTerminalEnvelopeSchema, value) &&
-        value.statePath === resolvedPath &&
-        value.statePath ===
-          WorkstreamStore.pathFor(value.gitCommonDir, value.id)
-      )
-        return {
-          kind: "retained_terminal",
-          id: value.id,
-          lifecycle: structuredClone(value.lifecycle),
-        };
-      throw error;
+    const value = await readStateValue(resolvedPath);
+    if (
+      value.format === WORKSTREAM_FORMAT &&
+      value.version === WORKSTREAM_STATE_VERSION
+    ) {
+      try {
+        validateState(value);
+        validateStoredPath(value, resolvedPath);
+        return { kind: "current", state: structuredClone(value) };
+      } catch (error) {
+        const retained = retainedTerminalInspection(value, resolvedPath);
+        if (retained) return retained;
+        throw error;
+      }
     }
+    if (
+      value.format === WORKSTREAM_FORMAT &&
+      isKnownHistoricalWorkstreamVersion(value.version)
+    ) {
+      const retained = retainedTerminalInspection(value, resolvedPath);
+      if (retained) return retained;
+      if (
+        isRecord(value.lifecycle) &&
+        ["active", "suspended"].includes(String(value.lifecycle.state))
+      )
+        throw new UnsupportedWorkstreamStateError(value.format, value.version);
+      throw new InvalidWorkstreamStateError(
+        `Historical workstream state version ${value.version} cannot be classified as canonical terminal history.`,
+      );
+    }
+    throw new UnsupportedWorkstreamStateError(value.format, value.version);
   }
 
   async load(): Promise<WorkstreamState> {
@@ -1477,6 +1495,11 @@ export class WorkstreamStore {
     );
   }
 
+  /**
+   * Record that the configured result callback accepted the notification enqueue.
+   * Pi does not report when a queued follow-up is presented or inspected, so this
+   * retained delivery state must not be interpreted as either of those events.
+   */
   async markDelivered(resultId: string, now?: Date): Promise<WorkstreamState> {
     return this.update(
       (draft, current) => {
@@ -1681,6 +1704,16 @@ async function readState(path: string): Promise<WorkstreamState> {
 async function readSupportedStateValue(
   path: string,
 ): Promise<Record<string, unknown>> {
+  const value = await readStateValue(path);
+  if (
+    value.format !== WORKSTREAM_FORMAT ||
+    value.version !== WORKSTREAM_STATE_VERSION
+  )
+    throw new UnsupportedWorkstreamStateError(value.format, value.version);
+  return value;
+}
+
+async function readStateValue(path: string): Promise<Record<string, unknown>> {
   let value: unknown;
   try {
     value = JSON.parse(await readFile(path, "utf8")) as unknown;
@@ -1689,16 +1722,34 @@ async function readSupportedStateValue(
       error instanceof Error ? error.message : String(error),
     );
   }
-  if (
-    !isRecord(value) ||
-    value.format !== WORKSTREAM_FORMAT ||
-    value.version !== WORKSTREAM_STATE_VERSION
-  )
-    throw new UnsupportedWorkstreamStateError(
-      isRecord(value) ? value.format : undefined,
-      isRecord(value) ? value.version : undefined,
-    );
+  if (!isRecord(value))
+    throw new UnsupportedWorkstreamStateError(undefined, undefined);
   return value;
+}
+
+function retainedTerminalInspection(
+  value: Record<string, unknown>,
+  resolvedPath: string,
+): WorkstreamReattachmentInspection | undefined {
+  if (!Value.Check(RetainedTerminalEnvelopeSchema, value)) return undefined;
+  try {
+    if (
+      value.statePath !== resolvedPath ||
+      value.statePath !== WorkstreamStore.pathFor(value.gitCommonDir, value.id)
+    )
+      return undefined;
+  } catch {
+    return undefined;
+  }
+  return {
+    kind: "retained_terminal",
+    id: value.id,
+    lifecycle: structuredClone(value.lifecycle),
+  };
+}
+
+function isKnownHistoricalWorkstreamVersion(value: unknown): boolean {
+  return value === 1 || value === 2 || value === 3;
 }
 
 function validateStoredPath(state: WorkstreamState, path: string): void {

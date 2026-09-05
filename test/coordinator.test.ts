@@ -296,6 +296,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
       const legacy = JSON.parse(
         await readFile(state.statePath, "utf8"),
       ) as Record<string, unknown>;
+      legacy.version = 3;
       legacy.lifecycle = {
         state: "completed",
         changedAt: "2026-09-05T12:00:00.000Z",
@@ -312,7 +313,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
       const before = await readFile(state.statePath);
       await assert.rejects(
         WorkstreamStore.inspect(state.statePath),
-        /Invalid workstream state/,
+        /Unsupported workstream state/,
       );
       f.session.appendCustomEntry("pi-workgraph-workstream", {
         path: state.statePath,
@@ -322,12 +323,47 @@ test("registered session_start safely inspects retained and pointed workstreams"
         state.statePath,
       );
       assert.equal(inspection.kind, "retained_terminal");
+      assert.equal(
+        f.notifications.some((notification) => notification.type === "warning"),
+        false,
+      );
+      assert.match(
+        f.notifications
+          .filter((notification) => notification.type === "info")
+          .map((notification) => notification.message)
+          .join("\n"),
+        /completed older history .*preserved and not attached/,
+      );
+      assert.deepEqual(await readFile(state.statePath), before);
+      await assert.rejects(
+        f.call("workgraph_status", {}),
+        /No attached workstream/,
+      );
+    } finally {
+      await f.dispose();
+    }
+  }
+
+  {
+    const f = await fixture();
+    try {
+      const { state } = await createState(f, "legacy-active");
+      const legacy = JSON.parse(
+        await readFile(state.statePath, "utf8"),
+      ) as Record<string, unknown>;
+      legacy.version = 3;
+      await writeFile(state.statePath, `${JSON.stringify(legacy, null, 2)}\n`);
+      f.session.appendCustomEntry("pi-workgraph-workstream", {
+        path: state.statePath,
+      });
+      const before = await readFile(state.statePath);
+      await f.runner.emit({ type: "session_start", reason: "reload" });
       assert.match(
         f.notifications
           .filter((notification) => notification.type === "warning")
           .map((notification) => notification.message)
           .join("\n"),
-        /retained terminal history.*not attached.*history was not changed/,
+        /Unsupported workstream state.*Inspect the retained pointer and state.*reconcile explicitly/,
       );
       assert.deepEqual(await readFile(state.statePath), before);
       await assert.rejects(

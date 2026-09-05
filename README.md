@@ -77,6 +77,8 @@ Expired ownership is not sufficient for takeover when the prior owner's liveness
 
 Suspension stops new launches and composition, while observations, evidence retention, and safe cleanup continue.
 Result notifications have stable identifiers and can recur after an interrupted delivery; this is not an exactly-once transport.
+The runtime records successful enqueue as delivery, but Pi exposes no supported selective cancellation or presentation/inspection receipt for one queued follow-up.
+The notice therefore describes retained-result availability, not new outstanding work; it may appear after inspection or workstream completion and must not cause reprocessing or reopening solely because it surfaced.
 After a notification failure, read the result through status or reattach; acknowledgment remains available as an explicit receipt but is not needed to use the result.
 The runtime does not repeatedly wake the coordinator on every poll.
 Completion always refuses unfinished or blocked owned work and requires one exact structured accounting entry with an explicit reason for every unresolved assignment, attempt, result, and undelivered result; unknown or extra accounting identities are rejected. A blocked boundary is recoverable only through the guarded coordinator recovery operation after exact native and Git inspection. A conflicting implementation may be explicitly retained-not-applied under an owned reachable ref and reason, but is not reported as composed.

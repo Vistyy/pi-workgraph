@@ -284,8 +284,8 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         );
         if (inspection.kind === "retained_terminal") {
           ctx.ui.notify(
-            `Workstream reattachment skipped: retained terminal history ${inspection.id} is not attached because its current mutable state is unsupported. Inspect ${data.path} and reconcile explicitly; history was not changed.`,
-            "warning",
+            `Workstream reattachment skipped: ${inspection.lifecycle.state} older history ${inspection.id} was preserved and not attached.`,
+            "info",
           );
           return;
         }
@@ -1243,7 +1243,9 @@ function focusedResult(
 
 function resultNotification(state: WorkstreamState, resultId: string): string {
   return [
-    `Workgraph retained result ${resultId} for ${state.id}.`,
+    `Workgraph retained result ${resultId} is available for ${state.id}.`,
+    "This is a retained-result availability notice, not new outstanding work.",
+    "It may be presented after the result was already inspected or the workstream was completed; do not reprocess or reopen work solely because of this notice.",
     JSON.stringify(focusedResult(state, resultId, "summary", 0, 20), null, 2),
     "Use workgraph_result with this resultId and section evidence or findings for bounded detail; continuation offsets are returned when needed.",
   ].join("\n");
