@@ -94,6 +94,18 @@ export class WorkgraphRegistry {
 
   close(): void { this.db.close(); }
 
+  indexWorkstream(reference: Omit<RegistryRun, "phase" | "ownerSessionId" | "leaseExpiresAt">): void {
+    const now = new Date().toISOString();
+    const previous = this.findRun(reference.runId);
+    if (previous && previous.statePath !== reference.statePath) throw new Error("Workstream registry identity collision.");
+    this.db.prepare(`INSERT INTO runs(run_id,state_path,project_root,git_common_dir,phase,lifecycle,updated_at,indexed_at)
+      VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(run_id) DO UPDATE SET lifecycle=excluded.lifecycle,
+      updated_at=excluded.updated_at,indexed_at=excluded.indexed_at`).run(
+      reference.runId, reference.statePath, reference.projectRoot, reference.gitCommonDir,
+      "workstream", reference.lifecycle, reference.updatedAt, now,
+    );
+  }
+
   indexRun(run: WorkgraphRun): void {
     const now = new Date().toISOString();
     this.db.prepare(`INSERT INTO runs(run_id,state_path,project_root,git_common_dir,phase,lifecycle,updated_at,indexed_at)
@@ -119,7 +131,7 @@ export class WorkgraphRegistry {
     return (this.db.prepare("SELECT r.*, l.owner_session_id, l.expires_at AS lease_expires_at FROM runs r LEFT JOIN leases l ON l.run_id=r.run_id WHERE r.project_root=? ORDER BY r.updated_at DESC").all(projectRoot) as Record<string, unknown>[]).map(toRegistryRun);
   }
 
-  acquire(runId: string, owner: LeaseOwner, now = new Date(), liveness: "alive" | "dead" | "unknown" = "unknown"): Lease {
+  acquire(runId: string, owner: LeaseOwner, now = new Date(), liveness: "alive" | "dead" | "unknown" = "unknown", exclusive = false): Lease {
     const acquiredAt = now.toISOString();
     const expiresAt = new Date(now.getTime() + LEASE_DURATION_MS).toISOString();
     const token = randomUUID();
@@ -132,7 +144,10 @@ export class WorkgraphRegistry {
       if (current && current.expires_at > acquiredAt && current.owner_session_id !== owner.sessionId) {
         throw new Error(`Workgraph ${runId} is leased by session ${current.owner_session_id}.`);
       }
-      if (current && current.owner_session_id === owner.sessionId) {
+      if (exclusive && current && (current.expires_at > acquiredAt || liveness !== "dead")) {
+        throw new LeaseDecisionRequiredError(`Workstream ${runId} already has a runtime owner; stop it or establish expired dead ownership before reattachment.`);
+      }
+      if (current && current.owner_session_id === owner.sessionId && !exclusive) {
         const renewed: Lease = { runId, token: current.token, owner, acquiredAt: current.acquired_at, heartbeatAt: acquiredAt, expiresAt };
         this.db.prepare("UPDATE leases SET owner_session_file=?, heartbeat_at=?, expires_at=? WHERE run_id=? AND token=?").run(owner.sessionFile, acquiredAt, expiresAt, runId, current.token);
         this.db.exec("COMMIT");
@@ -151,6 +166,14 @@ export class WorkgraphRegistry {
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
+    }
+  }
+
+  assertLease(lease: Lease, now = new Date()): void {
+    const row = this.db.prepare("SELECT token, expires_at FROM leases WHERE run_id=? AND owner_session_id=?")
+      .get(lease.runId, lease.owner.sessionId);
+    if (!row || row.token !== lease.token || String(row.expires_at) <= now.toISOString()) {
+      throw new LeaseDecisionRequiredError(`Workstream ${lease.runId} no longer holds a live lease.`);
     }
   }
 

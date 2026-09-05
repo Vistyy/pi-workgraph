@@ -7,7 +7,7 @@ import { Value } from "typebox/value";
 import { EvidenceSchema, WorkerReportSchema } from "./report-schema.js";
 import type { WorkerReport } from "./types.js";
 
-export const WORKSTREAM_STATE_VERSION = 1 as const;
+export const WORKSTREAM_STATE_VERSION = 2 as const;
 const WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
 
 const NonEmptyStringSchema = Type.String({ minLength: 1 });
@@ -117,6 +117,42 @@ const DispositionSchema = Type.Object({
   reason: NonEmptyStringSchema,
   recordedAt: TimestampSchema,
 }, { additionalProperties: false });
+const ModelTargetSchema = Type.Object({ model: NonEmptyStringSchema, thinking: StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const) }, { additionalProperties: false });
+const ModelsSchema = Type.Object({ guide: ModelTargetSchema, executor: Type.Optional(ModelTargetSchema), source: StringEnum(["policy", "override"] as const) }, { additionalProperties: false });
+const ResourceSchema = Type.Object({ workspaceId: NonEmptyStringSchema, tabId: NonEmptyStringSchema, paneId: NonEmptyStringSchema, terminalId: NonEmptyStringSchema, agentName: NonEmptyStringSchema, cwd: NonEmptyStringSchema }, { additionalProperties: false });
+const AttemptSchema = Type.Object({
+  id: NonEmptyStringSchema,
+  assignmentId: NonEmptyStringSchema,
+  state: StringEnum(["queued", "starting", "running", "settled", "failed", "cancel_requested", "cancelled"] as const),
+  models: Type.Optional(ModelsSchema),
+  effectiveModels: Type.Optional(Type.Array(Type.Object({ model: NonEmptyStringSchema, thinking: Type.Optional(NonEmptyStringSchema), source: Type.Optional(StringEnum(["selection", "message"] as const)) }, { additionalProperties: false }))),
+  continuationOf: Type.Optional(NonEmptyStringSchema),
+  launchPane: Type.Optional(Type.Object({ workspaceId: NonEmptyStringSchema, paneId: NonEmptyStringSchema }, { additionalProperties: false })),
+  resource: Type.Optional(ResourceSchema),
+  submission: Type.Optional(StringEnum(["not_sent", "uncertain", "submitted", "started"] as const)),
+  steering: Type.Optional(Type.Object({ text: NonEmptyStringSchema, state: StringEnum(["uncertain", "submitted"] as const) }, { additionalProperties: false })),
+  composition: Type.Optional(Type.Object({ state: StringEnum(["pending", "composed", "blocked"] as const), commit: NonEmptyStringSchema, expectedHead: NonEmptyStringSchema, revision: Type.Optional(NonEmptyStringSchema), error: Type.Optional(NonEmptyStringSchema) }, { additionalProperties: false })),
+  cleanup: Type.Optional(Type.Object({ state: StringEnum(["pending", "blocked", "completed"] as const), expectedHead: NonEmptyStringSchema, workerClosed: Type.Boolean(), discard: Type.Boolean(), error: Type.Optional(NonEmptyStringSchema) }, { additionalProperties: false })),
+  sessionFile: Type.Optional(NonEmptyStringSchema),
+  worktreePath: Type.Optional(NonEmptyStringSchema),
+  branch: Type.Optional(NonEmptyStringSchema),
+  baseRevision: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
+  worker: Type.Optional(Type.Object({ workspaceId: NonEmptyStringSchema, tabId: NonEmptyStringSchema, paneId: NonEmptyStringSchema, terminalId: NonEmptyStringSchema, agentName: NonEmptyStringSchema, cwd: NonEmptyStringSchema, sessionFile: NonEmptyStringSchema }, { additionalProperties: false })),
+  resultId: Type.Optional(NonEmptyStringSchema),
+  error: Type.Optional(NonEmptyStringSchema),
+  createdAt: TimestampSchema,
+  updatedAt: TimestampSchema,
+}, { additionalProperties: false });
+const DeliverySchema = Type.Object({
+  resultId: NonEmptyStringSchema,
+  state: StringEnum(["pending", "delivered", "acknowledged"] as const),
+  requestedAt: TimestampSchema,
+  attemptedBy: Type.Optional(NonEmptyStringSchema),
+  error: Type.Optional(NonEmptyStringSchema),
+  deliveredAt: Type.Optional(TimestampSchema),
+  acknowledgedAt: Type.Optional(TimestampSchema),
+  acknowledgment: Type.Optional(NonEmptyStringSchema),
+}, { additionalProperties: false });
 const CompletionSchema = Type.Object({
   conclusion: NonEmptyStringSchema,
   evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
@@ -141,6 +177,8 @@ export const WorkstreamStateSchema = Type.Object({
   assignments: Type.Array(AssignmentSchema),
   results: Type.Array(ResultSchema),
   dispositions: Type.Array(DispositionSchema),
+  attempts: Type.Array(AttemptSchema),
+  deliveries: Type.Array(DeliverySchema),
   completion: Type.Optional(CompletionSchema),
   createdAt: TimestampSchema,
   updatedAt: TimestampSchema,
@@ -156,6 +194,8 @@ export type WorkAssignment = Static<typeof AssignmentSchema>;
 export type RetainedArtifact = Static<typeof ArtifactSchema>;
 export type WorkResult = Static<typeof ResultSchema>;
 export type ResultDisposition = Static<typeof DispositionSchema>;
+export type WorkAttempt = Static<typeof AttemptSchema>;
+export type ResultDelivery = Static<typeof DeliverySchema>;
 export type WorkstreamState = Static<typeof WorkstreamStateSchema>;
 
 type AssignmentInput =
@@ -190,7 +230,18 @@ export class UnsupportedWorkstreamStateError extends Error {
 export class WorkstreamStore {
   private queue: Promise<unknown> = Promise.resolve();
 
-  private constructor(readonly path: string, private readonly owner: SessionIdentity) {}
+  private mutationGuard: (() => void) | undefined;
+
+  private constructor(readonly path: string, private owner: SessionIdentity) {}
+
+  bindMutationGuard(guard: () => void): void { this.mutationGuard = guard; }
+
+  async adopt(owner: SessionIdentity): Promise<WorkstreamState> {
+    validateSession(owner);
+    const state = await this.update((draft) => { draft.coordinator = { ...owner }; }, undefined, ["active", "suspended"]);
+    this.owner = { ...owner };
+    return state;
+  }
 
   static pathFor(gitCommonDir: string, id: string): string {
     validateId(id, "Workstream id");
@@ -230,6 +281,8 @@ export class WorkstreamStore {
       assignments: [],
       results: [],
       dispositions: [],
+      attempts: [],
+      deliveries: [],
       createdAt: now,
       updatedAt: now,
     };
@@ -259,6 +312,7 @@ export class WorkstreamStore {
   }
 
   async recordInputEvent(input: {
+    id?: string;
     sessionId: string;
     sessionFile: string;
     source: HumanInputSource;
@@ -271,11 +325,15 @@ export class WorkstreamStore {
     requireText(input.text, "Human input");
     let receipt: HumanInputReceipt | undefined;
     const state = await this.update((draft, now) => {
-      if (input.sessionId !== this.owner.sessionId || input.sessionFile !== this.owner.sessionFile) {
-        throw new Error("Human input does not belong to the bound coordinator session.");
+      if (input.sessionId !== this.owner.sessionId || input.sessionFile !== this.owner.sessionFile) throw new Error("Input receipt belongs to another session.");
+      const previous = input.id ? draft.inputs.find((item) => item.id === input.id) : undefined;
+      if (previous) {
+        if (previous.text !== input.text.trim() || previous.source !== source || previous.sessionId !== input.sessionId) throw new Error("Conflicting input receipt.");
+        receipt = previous;
+        return;
       }
       receipt = {
-        id: randomUUID(),
+        id: input.id ?? randomUUID(),
         sessionId: input.sessionId,
         sessionFile: input.sessionFile,
         source,
@@ -285,7 +343,7 @@ export class WorkstreamStore {
       const recorded = receipt;
       if (!recorded) throw new Error("Human input receipt was not recorded.");
       draft.inputs.push(recorded);
-    }, input.now);
+    }, input.now, ["active", "suspended"]);
     if (!receipt) throw new Error("Human input receipt was not recorded.");
     return { state, receipt };
   }
@@ -321,37 +379,114 @@ export class WorkstreamStore {
   }
 
   async assign(input: AssignmentInput & { now?: Date }): Promise<WorkstreamState> {
-    validateId(input.id, "Assignment id");
-    requireText(input.objective, "Assignment objective");
+    return this.update((draft, now) => addAssignment(draft, input, now), input.now);
+  }
+
+  async enqueue(input: AssignmentInput, attempt: { id: string; models: NonNullable<WorkAttempt["models"]>; continuationOf?: string }): Promise<WorkstreamState> {
     return this.update((draft, now) => {
-      requireActive(draft);
-      if (draft.assignments.some((assignment) => assignment.id === input.id)) throw new Error(`Duplicate assignment ${input.id}.`);
-      const current = currentIntent(draft);
-      if (input.intentVersion !== current.version) throw new Error(`Intent version ${input.intentVersion} is stale; current version is ${current.version}.`);
-      if (input.artifactIntent === "disposable_experiment" || input.capability === "implement") {
-        requireAuthority(draft, input.authority);
-      }
-      if (input.capability === "review") requireSubject(draft, input.subject);
-      const { now: _now, ...fields } = input;
-      const assignment: unknown = { ...fields, createdAt: (input.now ?? now).toISOString() };
-      if (!Value.Check(AssignmentSchema, assignment)) throw new Error("Assignment input does not satisfy its capability contract.");
-      draft.assignments.push(assignment);
-    }, input.now);
+      addAssignment(draft, input, now);
+      validateId(attempt.id, "Attempt id");
+      if (draft.attempts.some((item) => item.id === attempt.id)) throw new Error("Duplicate attempt.");
+      if (attempt.continuationOf && !draft.attempts.some((item) => item.id === attempt.continuationOf && item.state === "settled" && item.cleanup?.state === "completed" && item.sessionFile)) throw new Error("Continuation requires a settled, cleaned worker trajectory; retained blocked work must be inspected first.");
+      draft.attempts.push({ ...attempt, assignmentId: input.id, state: "queued", createdAt: now.toISOString(), updatedAt: now.toISOString() });
+    });
   }
 
   async retainResult(input: ResultInput & { now?: Date }): Promise<WorkstreamState> {
     validateId(input.id, "Result id");
     return this.update((draft, now) => {
-      requireActive(draft);
       if (draft.results.some((result) => result.id === input.id)) throw new Error(`Duplicate result ${input.id}.`);
       const assignment = requireAssignment(draft, input.assignmentId);
       if (input.assignmentIntentVersion !== assignment.intentVersion) throw new Error("Result intent version does not match its assignment.");
       const { now: _now, artifacts = [], ...fields } = input;
-      validateArtifactsForAssignment(assignment, artifacts);
+      validateArtifactsForAssignment(assignment, artifacts, input.validity === "typed" && input.report.status === "completed" ? "typed" : "absent");
       const result: unknown = { ...fields, artifacts, observedAt: (input.now ?? now).toISOString() };
       if (!Value.Check(ResultSchema, result)) throw new Error("Result input does not satisfy its validity contract.");
       draft.results.push(result);
+    }, input.now, ["active", "suspended"]);
+  }
+
+  async recordAttempt(input: { id: string; assignmentId: string; models?: WorkAttempt["models"]; continuationOf?: string; now?: Date }): Promise<WorkstreamState> {
+    validateId(input.id, "Attempt id");
+    return this.update((draft, now) => {
+      requireActive(draft);
+      requireAssignment(draft, input.assignmentId);
+      if (draft.attempts.some((attempt) => attempt.id === input.id)) throw new Error(`Duplicate attempt ${input.id}.`);
+      const at = (input.now ?? now).toISOString();
+      if (input.continuationOf && !draft.attempts.some((attempt) => attempt.id === input.continuationOf && attempt.state === "settled" && attempt.sessionFile)) throw new Error("Continuation requires a settled retained worker trajectory.");
+      draft.attempts.push({ id: input.id, assignmentId: input.assignmentId, state: "queued", ...(input.models ? { models: input.models } : {}), ...(input.continuationOf ? { continuationOf: input.continuationOf } : {}), createdAt: at, updatedAt: at });
     }, input.now);
+  }
+
+  async updateAttempt(input: Pick<WorkAttempt, "id"> & Partial<Omit<WorkAttempt, "id" | "assignmentId" | "createdAt" | "updatedAt">> & { now?: Date }): Promise<WorkstreamState> {
+    return this.update((draft, now) => {
+      const attempt = draft.attempts.find((candidate) => candidate.id === input.id);
+      if (!attempt) throw new Error(`Unknown attempt ${input.id}.`);
+      if (input.state !== undefined) attempt.state = input.state;
+      if (input.models !== undefined) attempt.models = input.models;
+      if (input.launchPane !== undefined) attempt.launchPane = input.launchPane;
+      if (input.resource !== undefined) attempt.resource = input.resource;
+      if (input.submission !== undefined) attempt.submission = input.submission;
+      if (input.steering !== undefined) attempt.steering = input.steering;
+      if (input.composition !== undefined) attempt.composition = input.composition;
+      if (input.cleanup !== undefined) attempt.cleanup = input.cleanup;
+      if (input.effectiveModels !== undefined) attempt.effectiveModels = input.effectiveModels;
+      if (input.sessionFile !== undefined) attempt.sessionFile = input.sessionFile;
+      if (input.worktreePath !== undefined) attempt.worktreePath = input.worktreePath;
+      if (input.branch !== undefined) attempt.branch = input.branch;
+      if (input.baseRevision !== undefined) attempt.baseRevision = input.baseRevision;
+      if (input.worker !== undefined) attempt.worker = input.worker;
+      if (input.resultId !== undefined) attempt.resultId = input.resultId;
+      if (input.error !== undefined) attempt.error = input.error;
+      attempt.updatedAt = (input.now ?? now).toISOString();
+    }, input.now, ["active", "suspended"]);
+  }
+
+  async requestDelivery(resultId: string, now?: Date): Promise<WorkstreamState> {
+    return this.update((draft, current) => {
+      if (!draft.results.some((result) => result.id === resultId)) throw new Error(`Unknown result ${resultId}.`);
+      if (!draft.deliveries.some((delivery) => delivery.resultId === resultId)) {
+        draft.deliveries.push({ resultId, state: "pending", requestedAt: (now ?? current).toISOString() });
+      }
+    }, now, ["active", "suspended"]);
+  }
+
+  async deliveryAttempt(resultId: string, owner: string, error?: string): Promise<WorkstreamState> {
+    return this.update((draft) => {
+      const delivery = draft.deliveries.find((item) => item.resultId === resultId);
+      if (!delivery) throw new Error(`Unknown delivery ${resultId}.`);
+      delivery.attemptedBy = owner;
+      if (error) delivery.error = error;
+    }, undefined, ["active", "suspended"]);
+  }
+
+  async addResultArtifacts(resultId: string, artifacts: RetainedArtifact[]): Promise<WorkstreamState> {
+    return this.update((draft) => {
+      const result = draft.results.find((item) => item.id === resultId);
+      if (!result) throw new Error(`Unknown result ${resultId}.`);
+      result.artifacts = artifacts;
+    }, undefined, ["active", "suspended"]);
+  }
+
+  async markDelivered(resultId: string, now?: Date): Promise<WorkstreamState> {
+    return this.update((draft, current) => {
+      const delivery = draft.deliveries.find((candidate) => candidate.resultId === resultId);
+      if (!delivery) throw new Error(`Result ${resultId} is not pending delivery.`);
+      if (delivery.state === "acknowledged") return;
+      delivery.state = "delivered";
+      delivery.deliveredAt = (now ?? current).toISOString();
+    }, now, ["active", "suspended"]);
+  }
+
+  async acknowledge(resultId: string, acknowledgment: string, now?: Date): Promise<WorkstreamState> {
+    requireText(acknowledgment, "Acknowledgment");
+    return this.update((draft, current) => {
+      const delivery = draft.deliveries.find((candidate) => candidate.resultId === resultId);
+      if (!delivery || delivery.state !== "delivered") throw new Error(`Result ${resultId} is not delivered.`);
+      delivery.state = "acknowledged";
+      delivery.acknowledgedAt = (now ?? current).toISOString();
+      delivery.acknowledgment = acknowledgment.trim();
+    }, now, ["active", "suspended"]);
   }
 
   async disposition(input: { resultId: string; status: ResultDisposition["status"]; reason: string; now?: Date }): Promise<WorkstreamState> {
@@ -374,6 +509,9 @@ export class WorkstreamStore {
     requireTexts(input.limitations, "Completion limitations");
     return this.update((draft, now) => {
       requireActive(draft);
+      if (draft.attempts.some((attempt) => ["queued", "starting", "running", "cancel_requested"].includes(attempt.state) || (attempt.worktreePath && attempt.cleanup?.state !== "completed"))) {
+        throw new Error("Complete only after workers and owned resources have settled and cleaned up.");
+      }
       const unresolvedAssignmentIds = draft.assignments
         .filter((assignment) => !assignmentResolved(draft, assignment))
         .map((assignment) => assignment.id);
@@ -408,6 +546,7 @@ export class WorkstreamStore {
     allowedLifecycleStates: WorkstreamState["lifecycle"]["state"][] = ["active"],
   ): Promise<WorkstreamState> {
     const operation = this.queue.then(async () => {
+      this.mutationGuard?.();
       const current = await readState(this.path);
       this.assertOwner(current);
       if (!allowedLifecycleStates.includes(current.lifecycle.state)) throw new Error(`Workstream is ${current.lifecycle.state}.`);
@@ -417,6 +556,7 @@ export class WorkstreamStore {
       draft.revision = current.revision + 1;
       draft.updatedAt = now.toISOString();
       validateState(draft);
+      this.mutationGuard?.();
       await this.write(draft);
       return structuredClone(draft);
     });
@@ -466,10 +606,7 @@ function validateState(state: WorkstreamState): void {
   if (state.statePath !== WorkstreamStore.pathFor(state.gitCommonDir, state.id)) throw new InvalidWorkstreamStateError("Workstream state path does not match its identity.");
   validateSession(state.coordinator);
   const inputIds = unique(state.inputs.map((input) => input.id), "human input receipt");
-  for (const input of state.inputs) {
-    if (input.sessionId !== state.coordinator.sessionId || input.sessionFile !== state.coordinator.sessionFile) throw new InvalidWorkstreamStateError("Human input receipt belongs to another coordinator.");
-    requireText(input.text, "Human input");
-  }
+  for (const input of state.inputs) requireText(input.text, "Human input");
   state.intents.forEach((intent, index) => {
     if (intent.version !== index) throw new InvalidWorkstreamStateError("Intent versions must be contiguous.");
     for (const receiptId of intent.authorityReceiptIds) if (!inputIds.has(receiptId)) throw new InvalidWorkstreamStateError(`Intent references unknown receipt ${receiptId}.`);
@@ -486,11 +623,33 @@ function validateState(state: WorkstreamState): void {
     const assignment = state.assignments.find((candidate) => candidate.id === result.assignmentId)!;
     if (assignment.intentVersion !== result.assignmentIntentVersion) throw new InvalidWorkstreamStateError(`Result ${result.id} has the wrong intent version.`);
     unique(result.artifacts.map((artifact) => artifact.id), `artifact in result ${result.id}`);
-    validateArtifactsForAssignment(assignment, result.artifacts);
+    validateArtifactsForAssignment(assignment, result.artifacts, result.validity === "typed" && result.report.status === "completed" ? "typed" : "absent");
   }
   for (const disposition of state.dispositions) if (!resultIds.has(disposition.resultId)) throw new InvalidWorkstreamStateError(`Disposition references unknown result ${disposition.resultId}.`);
+  const attemptIds = unique(state.attempts.map((attempt) => attempt.id), "attempt");
+  for (const attempt of state.attempts) {
+    if (!assignmentIds.has(attempt.assignmentId)) throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} references unknown assignment.`);
+    if (attempt.resultId && !resultIds.has(attempt.resultId)) throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} references unknown result.`);
+  }
+  for (const delivery of state.deliveries) if (!resultIds.has(delivery.resultId)) throw new InvalidWorkstreamStateError(`Delivery references unknown result ${delivery.resultId}.`);
+  unique(state.deliveries.map((delivery) => delivery.resultId), "delivery");
   if (state.lifecycle.state === "completed" && !state.completion) throw new InvalidWorkstreamStateError("Completed workstream has no completion record.");
   if (state.completion && state.lifecycle.state !== "completed") throw new InvalidWorkstreamStateError("Completion record requires completed lifecycle.");
+}
+
+function addAssignment(draft: WorkstreamState, input: AssignmentInput & { now?: Date }, now: Date): void {
+  validateId(input.id, "Assignment id");
+  requireText(input.objective, "Assignment objective");
+  requireActive(draft);
+  if (draft.assignments.some((item) => item.id === input.id)) throw new Error(`Duplicate assignment ${input.id}.`);
+  const current = currentIntent(draft);
+  if (input.intentVersion !== current.version) throw new Error(`Intent version ${input.intentVersion} is stale; current version is ${current.version}.`);
+  if (input.artifactIntent === "disposable_experiment" || input.capability === "implement") requireAuthority(draft, input.authority);
+  if (input.capability === "review") requireSubject(draft, input.subject);
+  const { now: suppliedNow, ...fields } = input;
+  const assignment: unknown = { ...fields, createdAt: (suppliedNow ?? now).toISOString() };
+  if (!Value.Check(AssignmentSchema, assignment)) throw new Error("Assignment input does not satisfy its capability contract.");
+  draft.assignments.push(assignment);
 }
 
 function currentIntent(state: WorkstreamState): Intent {
@@ -542,8 +701,8 @@ function validateSubject(state: WorkstreamState, subject: ResultSubject): void {
   if (!retained) throw new InvalidWorkstreamStateError(`Review revision ${subject.revision} is not retained.`);
 }
 
-function validateArtifactsForAssignment(assignment: WorkAssignment, artifacts: RetainedArtifact[]): void {
-  if (assignment.artifactIntent !== "disposable_experiment") return;
+function validateArtifactsForAssignment(assignment: WorkAssignment, artifacts: RetainedArtifact[], validity: WorkResult["validity"] = "typed"): void {
+  if (assignment.artifactIntent !== "disposable_experiment" || validity !== "typed") return;
   const retainedIds = artifacts.filter((artifact) => artifact.retention === "retained").map((artifact) => artifact.id);
   const plannedIds = new Set(assignment.artifactPolicy.retain);
   if (new Set(retainedIds).size !== retainedIds.length || retainedIds.length !== plannedIds.size || retainedIds.some((id) => !plannedIds.has(id))) {
@@ -554,7 +713,7 @@ function validateArtifactsForAssignment(assignment: WorkAssignment, artifacts: R
 function assignmentResolved(state: WorkstreamState, assignment: WorkAssignment): boolean {
   if (assignment.intentVersion !== currentIntent(state).version) return false;
   const result = [...state.results].reverse().find((candidate) => candidate.assignmentId === assignment.id);
-  if (!result || result.validity !== "typed") return false;
+  if (!result || result.validity !== "typed" || result.report.status !== "completed") return false;
   const disposition = [...state.dispositions].reverse().find((candidate) => candidate.resultId === result.id);
   return disposition?.status === "accepted";
 }

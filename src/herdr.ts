@@ -23,6 +23,7 @@ export interface WorkerLaunchRequest {
   model?: string;
   thinking?: ThinkingLevel;
   env: Record<string, string>;
+  onTab?: (tab: { workspaceId: string; paneId: string }) => void | Promise<void>;
   onResource?: (resource: WorkerResourceIdentity) => void | Promise<void>;
   onIdentity?: (identity: WorkerIdentity) => void | Promise<void>;
   onSubmitted?: () => void | Promise<void>;
@@ -105,8 +106,21 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       sessionFile: request.sessionFile,
       cwd: request.cwd,
     };
-    assertIdentity(identity, started);
-    return identity;
+    return this.awaitNativeIdentity(resourceOf(started), request.sessionFile);
+  }
+
+  async coordinatorLiveness(sessionFile: string): Promise<"alive" | "dead" | "unknown"> {
+    const response = await this.call(["api", "snapshot"]);
+    const agents = object(object(response, "result"), "snapshot").agents;
+    if (!Array.isArray(agents)) throw new Error("Herdr snapshot omitted agents; owner liveness is unknown.");
+    let unknown = false;
+    for (const agent of agents) {
+      if (!agent || typeof agent !== "object" || !("agent_session" in agent)) { unknown = true; continue; }
+      const session: unknown = agent.agent_session;
+      if (!session || typeof session !== "object" || !("value" in session) || typeof session.value !== "string") { unknown = true; continue; }
+      if (session.value === sessionFile) return "alive";
+    }
+    return unknown ? "unknown" : "dead";
   }
 
   async observeCurrentCoordinator(request: CoordinatorObservationRequest): Promise<CoordinatorRuntimeIdentity> {
@@ -130,6 +144,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     const tabResult = object(tabResponse, "result");
     const pane = object(tabResult, "root_pane");
     const paneId = string(pane, "pane_id");
+    await request.onTab?.({ workspaceId: request.workspaceId, paneId });
     const workerName = herdrAgentName(request.runId, request.nodeId, request.attemptId);
     const args = [
       "agent", "start", workerName,

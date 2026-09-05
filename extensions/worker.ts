@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { reportSchemaForMode } from "../src/report-schema.js";
+import { isWorkerReport, reportSchemaForMode } from "../src/report-schema.js";
 import type { AssuranceResponsibility, EnvelopeImpact, ImplementationReport, WorkerMode, WorkerReport } from "../src/types.js";
 
 const configuredMode = readMode();
@@ -47,8 +47,11 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     name: "workgraph_report",
     label: "Workgraph Report",
     description: "Return the typed terminal report for this bounded Workgraph assignment.",
+    promptSnippet: "Finish the assigned work with a typed report",
+    promptGuidelines: ["Use workgraph_report as the final action for the assigned work, with actual evidence and explicit limitations."],
     parameters: ReportSchema,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!isWorkerReport(params)) throw new Error("Report does not satisfy the Workgraph report contract.");
       if (params.kind !== mode) throw new Error(`Report kind must be ${mode}.`);
       if (mode === "assurance_review" && params.kind === mode) {
         if (params.responsibility !== responsibility) throw new Error(`Assurance responsibility must be ${responsibility}.`);
@@ -69,25 +72,35 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         return terminalReport(report, { todos, todoRecorded: todos.length > 0, switchedAt, continued: startInExecutor });
       }
 
-      if (mode !== "implementation") {
+      if (mode !== "implementation" && process.env.PI_WORKGRAPH_EXPERIMENT !== "1") {
         const status = await git(pi, ctx.cwd, ["status", "--porcelain", "--untracked-files=all"], true);
         if (status) throw new Error(`${mode} workers are read-only for product files, but the repository is dirty:\n${status}`);
       }
-      return terminalReport(params as WorkerReport, { todos, switchedAt, switchError });
+      return terminalReport(params, { todos, switchedAt, switchError });
     },
   });
 
   pi.on("tool_execution_end", async (event, ctx) => {
-    if (mode !== "implementation" || phase !== "guide" || event.isError) return;
-    if (event.toolName !== "edit" && event.toolName !== "write") return;
-    phase = "executor";
+    if (mode !== "implementation" || phase !== "guide") return;
+    const directEdit = !event.isError && (event.toolName === "edit" || event.toolName === "write");
+    if (!directEdit) {
+      if (!baseCommit) return;
+      const diff = await pi.exec("git", ["-C", ctx.cwd, "diff", "--quiet", baseCommit, "--"]);
+      const status = await git(pi, ctx.cwd, ["status", "--porcelain", "--untracked-files=all"], true);
+      if (diff.code !== 0 && diff.code !== 1) throw new Error(`Cannot observe guide mutation: ${diff.stderr}`);
+      if (diff.code === 0 && !status) return;
+    }
     try {
       const [provider, modelId] = splitModel(executorModel);
       const model = ctx.modelRegistry.find(provider, modelId);
       if (!model) throw new Error(`Executor model is unavailable: ${executorModel}`);
       const selected = await pi.setModel(model);
       if (!selected) throw new Error(`Executor model has no usable credentials: ${executorModel}`);
-      pi.setThinkingLevel(executorThinking as Parameters<typeof pi.setThinkingLevel>[0]);
+      const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+      const selectedThinking = levels.find((level) => level === executorThinking);
+      if (!selectedThinking) throw new Error(`Invalid executor thinking: ${executorThinking}`);
+      pi.setThinkingLevel(selectedThinking);
+      phase = "executor";
       switchedAt = new Date().toISOString();
       pi.appendEntry("pi-workgraph-worker-state", { runId, nodeId, phase, todos, executorModel, executorThinking, switchedAt });
     } catch (error) {
@@ -96,7 +109,28 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("agent_start", async () => {
+  pi.on("model_select", (event) => {
+    pi.appendEntry("pi-workgraph-effective-model", { runId, nodeId, model: `${event.model.provider}/${event.model.id}`, thinking: pi.getThinkingLevel() });
+  });
+  pi.on("thinking_level_select", (_event, ctx) => {
+    if (ctx.model) pi.appendEntry("pi-workgraph-effective-model", { runId, nodeId, model: `${ctx.model.provider}/${ctx.model.id}`, thinking: pi.getThinkingLevel() });
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    const previous = [...ctx.sessionManager.getBranch()].reverse().find((entry) => {
+      if (entry.type !== "custom" || entry.customType !== "pi-workgraph-worker-state") return false;
+      const data = entry.data;
+      return data !== null && typeof data === "object" && "runId" in data && "nodeId" in data && data.runId === runId && data.nodeId === nodeId;
+    });
+    const data = previous?.type === "custom" ? previous.data : undefined;
+    if (!data || typeof data !== "object") return;
+    if ("todos" in data && Array.isArray(data.todos)) todos = data.todos.filter((item): item is string => typeof item === "string");
+    if ("switchedAt" in data && typeof data.switchedAt === "string") switchedAt = data.switchedAt;
+    if ("phase" in data && data.phase === "executor") phase = "executor";
+  });
+
+  pi.on("agent_start", async (_event, ctx) => {
+    if (ctx.model) pi.appendEntry("pi-workgraph-effective-model", { runId, nodeId, model: `${ctx.model.provider}/${ctx.model.id}`, thinking: pi.getThinkingLevel() });
     pi.appendEntry("pi-workgraph-agent-running", { runId, nodeId, startedAt: new Date().toISOString() });
   });
 
@@ -148,6 +182,9 @@ export function verificationWorkerInstructions(): string {
 }
 
 function modeInstructions(): string {
+  if (mode === "discovery" && process.env.PI_WORKGRAPH_EXPERIMENT === "1") {
+    return "[WORKGRAPH EXPERIMENT]\nAnswer the assigned question within the explicitly permitted effects and stopping condition. Work only in this disposable worktree. Retain the named artifacts and report direct observations, failures and limits with workgraph_report. Do not compose or publish experimental code or delegate another worker.";
+  }
   if (mode === "discovery") {
     return `[WORKGRAPH DISCOVERY]\nInvestigate only the assigned responsibility.\nUse read-only repository evidence and classify each item as direct, inference, conflict, or unknown.\nFor blast-radius-sensitive changes, identify and prove the external safety fact at the actual dependent boundary.\nDo not implement, edit files, or expand the question.\nFinish with a concise discovery report and account for unknowns that could change the implementation envelope.`;
   }

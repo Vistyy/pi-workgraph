@@ -1,1146 +1,669 @@
+import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
-import {
-  WorkgraphEngine,
-  type AgreementInput,
-  type ChildResultReviewInput,
-  type ModelAssignment,
-} from "../src/engine.js";
-import { GitRepository } from "../src/git.js";
-import {
-  loadModelPolicy,
-  MODEL_ROLES,
-  modelPolicyPath,
-  roleTargets,
-  setModelRole,
-  type ModelRole,
-  type ModelTarget,
-} from "../src/model-policy.js";
-import { forkConversationSession, stableParentEntry } from "../src/pi-process.js";
-import { HerdrCliRuntime } from "../src/herdr.js";
-import { WorkgraphRegistry } from "../src/registry.js";
-import { persistSchedule, WorkgraphSupervisor } from "../src/supervisor.js";
 import type {
-  AssuranceResponsibility,
-  CoordinatorWakeRecord,
-  EvidenceItem,
-  DiscoveryAssignment,
-  DiscoveryTopology,
-  RunPointer,
-  ThinkingLevel,
-  UsageSummary,
-  WorkgraphRun,
-} from "../src/types.js";
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { Type, type Static } from "typebox";
+import { Value } from "typebox/value";
+import { GitRepository } from "../src/git.js";
+import { HerdrCliRuntime } from "../src/herdr.js";
+import { forkConversationSession } from "../src/pi-process.js";
+import { EvidenceSchema } from "../src/report-schema.js";
+import {
+  WorkstreamRuntime,
+  type QueueOptions,
+} from "../src/workstream-runtime.js";
+import {
+  WorkstreamStore,
+  type SessionIdentity,
+  type WorkstreamState,
+} from "../src/workstream.js";
 
-const POINTER_ENTRY = "pi-workgraph-active";
-const ThinkingSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const);
-const ModelRoleSchema = StringEnum([...MODEL_ROLES]);
-const AssuranceResponsibilitySchema = StringEnum(["behavior", "structure", "evidence"] as const);
-
-export function deliverCoordinatorWake(pi: ExtensionAPI, ctx: ExtensionContext, wake: CoordinatorWakeRecord, run: WorkgraphRun): void {
-  const sessionFile = ctx.sessionManager.getSessionFile();
-  if (ctx.sessionManager.getSessionId() !== run.coordinator.sessionId || !sessionFile || sessionFile !== run.coordinator.sessionFile) {
-    throw new Error("Coordinator wake refused because the current Pi session does not match the durable coordinator binding.");
-  }
-  pi.sendUserMessage(
-    `[WORKGRAPH AUTOMATIC EXTENSION CONTINUATION]\nWorkgraph ${run.runId} reached ${wake.kind} boundary ${wake.boundaryRevision} at ${run.composedCommit}. Inspect durable status and continue within the approved plan. This message was generated automatically by the Workgraph extension. It is not a human message, human approval, envelope change, assurance judgment, or completion decision, and it cannot authorize any of them.`,
-    { deliverAs: "followUp" },
-  );
-}
-
-const ModelTargetSchema = Type.Object({
-  model: Type.String({ description: "Model selector as provider/model." }),
-  thinking: Type.Optional(ThinkingSchema),
-});
-
-const InvestigationSchema = Type.Object({
+const POINTER = "pi-workgraph-workstream";
+const INPUT = "pi-workgraph-human-input";
+const Thinking = StringEnum([
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const);
+const Target = Type.Object({ model: Type.String(), thinking: Thinking });
+const InputReceipt = Type.Object({
   id: Type.String(),
-  lens: Type.String(),
-  objective: Type.String(),
+  sessionId: Type.String(),
+  sessionFile: Type.String(),
+  source: StringEnum(["interactive", "rpc"] as const),
+  text: Type.String(),
+});
+const ModelOptions = {
   model: Type.Optional(Type.String()),
-  thinking: Type.Optional(ThinkingSchema),
-  supersedes: Type.Optional(Type.Array(Type.String())),
-});
-
-const BriefSchema = Type.Object({
-  goal: Type.String(),
-  context: Type.Array(Type.String()),
-  acceptance: Type.Array(Type.String(), { minItems: 1 }),
-  timeboxMinutes: Type.Integer({ minimum: 1, maximum: 240 }),
-  forbidden: Type.Array(Type.String()),
-  report: Type.String(),
-});
-
-const NodeSchema = Type.Object({
-  id: Type.String(),
-  brief: BriefSchema,
-  claimedPaths: Type.Array(Type.String(), { minItems: 1 }),
-  dependencies: Type.Array(Type.String()),
-  priority: Type.Optional(Type.Integer({ minimum: -1000, maximum: 1000 })),
-  verificationCommands: Type.Array(Type.String()),
-  supersedes: Type.Optional(Type.Array(Type.String())),
+  thinking: Type.Optional(Thinking),
   continuationOf: Type.Optional(Type.String()),
-  guideModel: Type.Optional(Type.String()),
-  executorModel: Type.Optional(Type.String()),
-  guideThinking: Type.Optional(ThinkingSchema),
-  executorThinking: Type.Optional(ThinkingSchema),
-});
+};
 
 export default function workgraphCoordinator(pi: ExtensionAPI): void {
   if (process.env.PI_WORKGRAPH_MODE) return;
-  let engine: WorkgraphEngine | undefined;
-  let activeRun: WorkgraphRun | undefined;
-  let supervisor: WorkgraphSupervisor | undefined;
-  let exclusiveTail: Promise<unknown> = Promise.resolve();
-
-  const exclusively = <T>(operation: () => Promise<T>): Promise<T> => {
-    const result = exclusiveTail.then(operation, operation);
-    exclusiveTail = result.catch(() => undefined);
-    return result;
+  let runtime: WorkstreamRuntime | undefined;
+  let pending: Static<typeof InputReceipt>[] = [];
+  let tail: Promise<unknown> = Promise.resolve();
+  const serial = <T>(operation: () => Promise<T>): Promise<T> => {
+    const next = tail.then(operation, operation);
+    tail = next.catch(() => undefined);
+    return next;
   };
-
-  const remember = (run: WorkgraphRun): WorkgraphRun => {
-    activeRun = run;
-    return run;
-  };
-
-  const requireEngine = (): WorkgraphEngine => {
-    if (!engine) throw new Error("No active Workgraph. Delegate research first or call workgraph_begin.");
-    return engine;
-  };
-
-  const ensureResearchEngine = async (ctx: ExtensionContext, request: string): Promise<WorkgraphEngine> => {
-    if (engine) {
-      const current = await engine.load();
-      if (current.lifecycle === "active") return engine;
-      if (current.lifecycle === "suspended") throw new Error("The current Workgraph is suspended. Resume it explicitly before delegating research.");
-      await supervisor?.shutdown();
-      supervisor = undefined;
-      engine.registry.close();
-      engine = undefined;
-    }
+  const owner = (ctx: ExtensionContext): SessionIdentity => {
     const sessionFile = ctx.sessionManager.getSessionFile();
-    if (!sessionFile) throw new Error("Research requires a persistent parent Pi session.");
-    const repositoryInfo = await GitRepository.inspect(ctx.cwd);
-    if (repositoryInfo.status) throw new Error(`Start research from a clean Git worktree:\n${repositoryInfo.status}`);
-    const begun = await WorkgraphEngine.begin({
-      request,
-      projectRoot: repositoryInfo.root,
-      gitCommonDir: repositoryInfo.commonDir,
-      parentSessionId: ctx.sessionManager.getSessionId(),
-      parentSessionFile: sessionFile,
-      baseCommit: repositoryInfo.head,
-      capabilityMode: true,
-      outcome: {
-        kind: "answer",
-        statement: `Answer the research question: ${request}`,
-        completionPredicate: "The coordinator has received and judged the retained research result.",
+    if (!sessionFile)
+      throw new Error("Workgraph requires a persistent Pi session.");
+    return { sessionId: ctx.sessionManager.getSessionId(), sessionFile };
+  };
+  const current = (): WorkstreamRuntime => {
+    if (!runtime)
+      throw new Error(
+        "No attached workstream. Delegate work or attach a retained workstream first.",
+      );
+    return runtime;
+  };
+  const remember = (
+    state: WorkstreamState,
+    ctx: ExtensionContext,
+  ): WorkstreamState => {
+    ctx.ui.setStatus(
+      "workgraph",
+      `WG ${state.lifecycle.state} - ${state.attempts.filter((item) => ["running", "starting"].includes(item.state)).length} active`,
+    );
+    return state;
+  };
+  const attach = async (
+    ctx: ExtensionContext,
+    target: WorkstreamStore,
+    priorOwnerLiveness: "alive" | "dead" | "unknown" = "unknown",
+  ) => {
+    if (runtime) await runtime.stop();
+    runtime = undefined;
+    const state = await target.load();
+    const next = new WorkstreamRuntime(
+      target,
+      new GitRepository(state.projectRoot, state.gitCommonDir),
+      new HerdrCliRuntime(),
+      {
+        workspaceId: process.env.HERDR_WORKSPACE_ID ?? "",
+        parentSessionFile: owner(ctx).sessionFile,
       },
-    });
-    engine = begun.engine;
-    remember(begun.run);
-    pi.appendEntry(POINTER_ENTRY, { runId: begun.run.runId, statePath: begun.run.statePath } satisfies RunPointer);
-    attachSupervisor(ctx);
-    return engine;
-  };
-
-  const attachSupervisor = (ctx: ExtensionContext): WorkgraphSupervisor => {
-    const currentEngine = requireEngine();
-    supervisor?.stop();
-    supervisor = new WorkgraphSupervisor(currentEngine, new HerdrCliRuntime(), {
-      ...(process.env.HERDR_WORKSPACE_ID ? { workspaceId: process.env.HERDR_WORKSPACE_ID } : {}),
-      stableEntryId: stableParentEntry(ctx.sessionManager),
-      onRun: (run) => { activeRun = run; updateStatus(ctx, run); },
-      onCoordinatorWake: (wake, run) => deliverCoordinatorWake(pi, ctx, wake, run),
-      onError: (error) => ctx.ui.notify(`Workgraph supervisor: ${error.message}`, "warning"),
-    });
-    supervisor.start();
-    return supervisor;
-  };
-
-  const restore = async (ctx: ExtensionContext): Promise<void> => {
-    await supervisor?.shutdown();
-    supervisor = undefined;
-    engine = undefined;
-    activeRun = undefined;
-    const branch = ctx.sessionManager.getBranch();
-    for (let index = branch.length - 1; index >= 0; index -= 1) {
-      const entry = branch[index];
-      if (entry?.type !== "custom" || entry.customType !== POINTER_ENTRY) continue;
-      const pointer = entry.data as Partial<RunPointer> | undefined;
-      if (!pointer?.statePath) continue;
-      try {
-        engine = WorkgraphEngine.open(pointer.statePath);
-        activeRun = await engine.load();
-        engine.registry.indexRun(activeRun);
-        const sessionFile = ctx.sessionManager.getSessionFile();
-        if (sessionFile) {
-          const runtime = new HerdrCliRuntime();
-          if (runtime.available && !process.env.HERDR_PANE_ID) throw new Error("Herdr adoption requires the current pane identity.");
-          const runtimeIdentity = runtime.available
-            ? await runtime.observeCurrentCoordinator({ paneId: process.env.HERDR_PANE_ID!, sessionFile, cwd: activeRun.projectRoot })
-            : undefined;
-          activeRun = await engine.adopt(ctx.sessionManager.getSessionId(), sessionFile, "unknown", runtimeIdentity);
-        }
-        if (activeRun.lifecycle === "active") attachSupervisor(ctx);
-        updateStatus(ctx, activeRun);
-      } catch (error) {
-        ctx.ui.notify(`Could not restore Workgraph ${pointer.runId ?? ""}: ${errorMessage(error)}`, "warning");
-      }
-      return;
-    }
-  };
-
-  pi.on("session_start", async (_event, ctx) => restore(ctx));
-  pi.on("session_tree", async (_event, ctx) => restore(ctx));
-  pi.on("session_shutdown", async () => { await supervisor?.shutdown(); supervisor = undefined; });
-
-  pi.on("before_agent_start", async (event) => {
-    let run = activeRun;
-    if (engine && run?.agreementProposal) {
-      const decision = conversationalDecision(event.prompt);
-      const proposed = run.plans.at(-1);
-      if (decision !== undefined && proposed?.status === "proposed") {
-        run = remember(await engine.recordPlanDecision(proposed.version, decision, event.prompt));
-      }
-    }
-    const inProgress = run !== undefined && (run.lifecycle === "active" || run.lifecycle === "suspended");
-    const state = inProgress && run
-      ? `Workgraph ${run.runId} is ${run.lifecycle} with plan ${run.control.planStatus}, execution ${run.control.executionStatus}, attention ${run.control.attentionStatus}, and verification ${run.control.verificationStatus} for a ${run.outcome.kind} outcome. All normal coordinator tools remain available. Keep substantial product implementation behind the approved plan and use Workgraph boundaries for delegated writes, composition, evidence, and assurance.`
-      : "All normal coordinator tools remain available. For materially ambiguous or structurally consequential work, begin a durable Workgraph before substantial product implementation. Clear, local, reversible work may proceed directly.";
-    const proposal = run?.agreementProposal
-      ? " A Workgraph implementation plan is awaiting an exact approval or rejection in a later user message."
-      : "";
-    return {
-      message: {
-        customType: "pi-workgraph-policy",
-        content: `[WORKGRAPH COORDINATION POLICY]\n${state}${proposal}\nThe coordinator owns semantic synthesis and final judgment. Keep outcome and milestone progress durable, account for every child, and expose only the agreement, authority-changing decisions, material blockers, and final evidenced result to the user.`,
-        display: false,
+      (resultId, latest) => {
+        if (ctx.sessionManager.getSessionId() !== latest.coordinator.sessionId)
+          throw new Error(
+            "Coordinator session changed before result delivery.",
+          );
+        pi.sendMessage(
+          {
+            customType: POINTER,
+            content: `Workstream ${latest.id} has retained result ${resultId}. Inspect its evidence and execution status, then acknowledge it. This is an extension notification, not human authorization.`,
+            display: true,
+            details: { resultId, statePath: latest.statePath },
+          },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
       },
-    };
-  });
-
-  pi.registerTool({
-    name: "workgraph_models",
-    label: "Workgraph Models",
-    description: "Read or update Workgraph's durable role-to-model policy without depending on external configuration.",
-    promptSnippet: "Inspect or configure Workgraph model roles",
-    parameters: Type.Object({
-      action: StringEnum(["get", "set"] as const),
-      role: Type.Optional(ModelRoleSchema),
-      targets: Type.Optional(Type.Array(ModelTargetSchema, { minItems: 1, maxItems: 4 })),
-    }),
-    async execute(_id, params) {
-      const policy = params.action === "set"
-        ? await setConfiguredRole(params.role, params.targets)
-        : await loadModelPolicy();
-      return {
-        content: [{ type: "text", text: formatModelPolicy(policy.roles) }],
-        details: { path: modelPolicyPath(), policy },
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_fork",
-    label: "Workgraph Fork",
-    description: "Fork the selected conversation branch into a new requested working directory and start a plain normal-config Pi coordinator through Herdr.",
-    promptSnippet: "Fork this conversation branch into another repository",
-    parameters: Type.Object({
-      targetCwd: Type.String({ description: "Repository working directory for the new coordinator." }),
-      entryId: Type.Optional(Type.String({ description: "Conversation entry id whose branch should be preserved." })),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const sessionFile = ctx.sessionManager.getSessionFile();
-        if (!sessionFile) throw new Error("Fork requires a persistent current Pi session.");
-        const repository = await GitRepository.inspect(params.targetCwd);
-        const childSession = await forkConversationSession({
-          parentSessionFile: sessionFile,
-          targetCwd: repository.root,
-          ...(params.entryId ? { entryId: params.entryId } : {}),
+      (error) => {
+        ctx.ui.notify(`Workgraph: ${error.message}`, "warning");
+        pi.sendMessage(
+          {
+            customType: "pi-workgraph-attention",
+            content: `Workgraph requires reconciliation: ${error.message}. Inspect retained status; this notification does not authorize new scope.`,
+            display: true,
+          },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      },
+      { owner: owner(ctx), priorOwnerLiveness },
+    );
+    try {
+      await next.perform(async () => undefined);
+    } catch (error) {
+      await next.stop();
+      throw error;
+    }
+    runtime = next;
+    next.start();
+    return next;
+  };
+  const importInputs = async (active: WorkstreamRuntime): Promise<void> => {
+    await active.perform(async () => {
+      for (const receipt of pending)
+        await active.store.recordInputEvent(receipt);
+    });
+  };
+  const ensure = async (
+    ctx: ExtensionContext,
+    purpose: string,
+  ): Promise<WorkstreamRuntime> => {
+    if (runtime) {
+      const state = await runtime.store.load();
+      if (state.lifecycle.state === "suspended")
+        throw new Error(
+          "Workstream is suspended; resume explicitly before delegating.",
+        );
+      if (state.lifecycle.state === "active") return runtime;
+      await runtime.stop();
+      runtime = undefined;
+    }
+    const repository = await GitRepository.inspect(ctx.cwd);
+    if (repository.status)
+      throw new Error(
+        `Delegate from a clean committed repository snapshot:\n${repository.status}`,
+      );
+    const created = await WorkstreamStore.create({
+      id: `ws-${randomUUID()}`,
+      purpose,
+      projectRoot: repository.root,
+      gitCommonDir: repository.commonDir,
+      coordinator: owner(ctx),
+    });
+    const active = await attach(ctx, created.store);
+    await importInputs(active);
+    pi.appendEntry(POINTER, { path: created.store.path });
+    return active;
+  };
+  const authorize = async (
+    active: WorkstreamRuntime,
+    statement: string,
+    receiptId?: string,
+  ): Promise<{ receiptId: string; intentVersion: number }> =>
+    active.perform(async () => {
+      let state = await active.store.load();
+      let intent = state.intents.at(-1);
+      if (!intent) throw new Error("Missing workstream intent.");
+      if (
+        intent.version === 0 ||
+        (receiptId && !intent.authorityReceiptIds.includes(receiptId))
+      ) {
+        const receipt = receiptId ?? state.inputs.at(-1)?.id;
+        if (!receipt)
+          throw new Error(
+            "Mutation requires an actual retained human input receipt.",
+          );
+        state = await active.store.reviseIntent({
+          authorityReceiptId: receipt,
+          statement,
+          constraints: intent.constraints,
         });
-        const runtime = new HerdrCliRuntime();
-        if (!runtime.available || !process.env.HERDR_WORKSPACE_ID) throw new Error("Herdr coordinator runtime is unavailable. No hidden fallback was started.");
-        const identity = await runtime.launchCoordinator({ workspaceId: process.env.HERDR_WORKSPACE_ID, cwd: repository.root, sessionFile: childSession });
-        return { content: [{ type: "text", text: `Forked conversation into ${repository.root} and started coordinator ${identity.agentName} through Herdr.` }], details: { sessionFile: childSession, identity, cwd: repository.root } };
-      });
-    },
-  });
+        intent = state.intents.at(-1);
+      }
+      const authorityReceipt = receiptId ?? intent?.authorityReceiptIds[0];
+      if (!intent || !authorityReceipt)
+        throw new Error("No applicable human-backed intent.");
+      return { receiptId: authorityReceipt, intentVersion: intent.version };
+    });
 
-  pi.registerTool({
-    name: "workgraph_research",
-    label: "Workgraph Research",
-    description: "Delegate one bounded research question to a fresh visible worker. The first delegation creates a durable answer workstream; research can be repeated without a mandatory plan.",
-    promptSnippet: "Delegate a bounded research question without requiring a prior plan",
-    promptGuidelines: [
-      "Use workgraph_research for investigation, design inquiry, or a bounded evidence probe.",
-      "A research result informs coordinator judgment; it does not authorize product mutation.",
-    ],
-    parameters: Type.Object({
-      question: Type.String({ description: "The bounded question the worker must answer." }),
-      context: Type.Optional(Type.Array(Type.String())),
-      expectedEvidence: Type.Optional(Type.Array(Type.String())),
-      artifactIntent: Type.Optional(StringEnum(["evidence_only", "disposable_experiment"] as const)),
-      sideEffects: Type.Optional(Type.Array(Type.String())),
-      stopWhen: Type.Optional(Type.String()),
-      model: Type.Optional(Type.String()),
-      thinking: Type.Optional(ThinkingSchema),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        if (!params.question.trim()) throw new Error("Research requires a bounded question.");
-        const currentEngine = await ensureResearchEngine(ctx, params.question.trim());
-        const current = await currentEngine.load();
-        const target = withAvailability(await resolveTarget("discovery.partition", params.model, params.thinking), ctx, "research worker");
-        const id = `research-${current.discoveries.length + 1}`;
-        const objective = [params.question.trim(), ...(params.context ?? []).map((item) => `Context: ${item}`), ...(params.expectedEvidence ?? []).map((item) => `Expected evidence: ${item}`), ...(params.artifactIntent === "disposable_experiment" ? ["This is a disposable experiment; do not promote its artifacts into the maintained product.", ...(params.sideEffects ?? []).map((item) => `Permitted side effect: ${item}`), ...(params.stopWhen ? [`Stop when: ${params.stopWhen}`] : [])] : [])].join("\n");
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        const queued = remember(await currentEngine.queueDiscovery({
-          topology: "evidence",
-          assignments: [{ id, lens: "Coordinator-requested research", objective, ...(params.artifactIntent ? { artifactIntent: params.artifactIntent } : {}), ...target }],
-          stableEntryId: null,
-        }));
-        activeSupervisor.kick();
-        return {
-          content: [{ type: "text", text: queued.discoveries.find((candidate) => candidate.id === id)?.state === "unavailable"
-            ? `Research ${id} was recorded as unavailable; no worker was started.`
-            : `Queued research ${id} in Workgraph ${queued.runId}; a visible worker will start asynchronously.` }],
-          details: { ...summaryDetails(queued), research: queued.discoveries.find((candidate) => candidate.id === id) },
-        };
-      });
-    },
+  pi.on("input", async (event, ctx) => {
+    if (
+      (event.source !== "interactive" && event.source !== "rpc") ||
+      !event.text.trim()
+    )
+      return;
+    const receipt = {
+      id: randomUUID(),
+      ...owner(ctx),
+      source: event.source,
+      text: event.text,
+    };
+    // This receipt exists even when delegation has not created a workstream yet.
+    pi.appendEntry(INPUT, receipt);
+    await serial(async () => {
+      pending.push(receipt);
+      if (!runtime) return;
+      const state = await runtime.store.load();
+      if (
+        state.lifecycle.state === "active" ||
+        state.lifecycle.state === "suspended"
+      ) {
+        await runtime.perform(async () => {
+          await runtime?.store.recordInputEvent(receipt);
+        });
+      }
+    });
   });
+  pi.on("session_start", async (_event, ctx) => {
+    await serial(async () => {
+      if (runtime) await runtime.stop();
+      runtime = undefined;
+      const identity = owner(ctx);
+      const entries = ctx.sessionManager.getBranch();
+      pending = entries.flatMap((entry) =>
+        entry.type === "custom" &&
+        entry.customType === INPUT &&
+        Value.Check(InputReceipt, entry.data) &&
+        entry.data.sessionId === identity.sessionId &&
+        entry.data.sessionFile === identity.sessionFile
+          ? [entry.data]
+          : [],
+      );
+      const pointer = [...entries]
+        .reverse()
+        .find(
+          (entry) => entry.type === "custom" && entry.customType === POINTER,
+        );
+      const data = pointer?.type === "custom" ? pointer.data : undefined;
+      if (
+        !data ||
+        typeof data !== "object" ||
+        !("path" in data) ||
+        typeof data.path !== "string"
+      )
+        return;
+      const state = await WorkstreamStore.inspect(data.path);
+      if (
+        state.lifecycle.state === "completed" ||
+        state.lifecycle.state === "archived" ||
+        state.lifecycle.state === "abandoned"
+      )
+        return;
+      try {
+        await attach(ctx, WorkstreamStore.open(data.path, identity));
+        await importInputs(current());
+        remember(await current().store.load(), ctx);
+      } catch (error) {
+        ctx.ui.notify(
+          `Workstream reattachment requires reconciliation: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
+      }
+    });
+  });
+  pi.on("session_shutdown", async () => {
+    await tail;
+    await runtime?.stop();
+  });
+  pi.on("before_agent_start", async () => ({
+    message: {
+      customType: "pi-workgraph-policy",
+      content:
+        "[WORKGRAPH]\nUse research, implementation and selective review as needed, not a pipeline. The coordinator interprets human authority and judges evidence. Mutation tools reference genuine retained human inputs; worker reports and extension notifications do not grant authority. Finish the requested work through verification and correction within scope.",
+      display: false,
+    },
+  }));
 
   pi.registerTool({
     name: "workgraph_begin",
     label: "Workgraph Begin",
-    description: "Begin a durable outcome-driven Workgraph for a materially ambiguous or structurally consequential repository task.",
-    promptSnippet: "Begin a durable Workgraph with an explicit outcome and completion predicate",
-    promptGuidelines: [
-      "Choose the outcome kind and begin Workgraph before substantial product implementation for consequential requests.",
-      "Normal coordinator tools remain available; this boundary records orchestration state and does not install a tool gate.",
-    ],
-    parameters: Type.Object({
-      request: Type.String({ description: "The user's requested outcome in their terms." }),
-      reason: Type.String({ description: "Why the Workgraph lifecycle is proportionate." }),
-      outcomeKind: StringEnum(["answer", "decision", "product_change", "operation"] as const),
-      outcomeStatement: Type.String({ description: "The explicit answer, decision, change, or operation outcome." }),
-      completionPredicate: Type.String({ description: "A falsifiable condition for completion." }),
-      milestones: Type.Optional(Type.Array(Type.Object({ id: Type.String(), description: Type.String() }), { maxItems: 12 })),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        if (activeRun && (activeRun.lifecycle === "active" || activeRun.lifecycle === "suspended")) {
-          throw new Error(`Workgraph ${activeRun.runId} lifecycle is still ${activeRun.lifecycle}.`);
-        }
-        const sessionFile = ctx.sessionManager.getSessionFile();
-        if (!sessionFile) throw new Error("Workgraph orchestration requires a persistent parent Pi session.");
-        const repositoryInfo = await GitRepository.inspect(ctx.cwd);
-        if (repositoryInfo.status) throw new Error(`Start from a clean Git worktree:\n${repositoryInfo.status}`);
-        const begun = await WorkgraphEngine.begin({
-          request: params.request.trim(),
-          projectRoot: repositoryInfo.root,
-          gitCommonDir: repositoryInfo.commonDir,
-          parentSessionId: ctx.sessionManager.getSessionId(),
-          parentSessionFile: sessionFile,
-          baseCommit: repositoryInfo.head,
-          outcome: {
-            kind: params.outcomeKind,
-            statement: params.outcomeStatement.trim(),
-            completionPredicate: params.completionPredicate.trim(),
-          },
-          ...(params.milestones ? { milestones: params.milestones } : {}),
-        });
-        engine = begun.engine;
-        remember(begun.run);
-        pi.appendEntry(POINTER_ENTRY, { runId: begun.run.runId, statePath: begun.run.statePath } satisfies RunPointer);
-        attachSupervisor(ctx);
-        return {
-          content: [{ type: "text", text: `Started Workgraph ${begun.run.runId} for ${begun.run.outcome.kind}. All coordinator tools remain stable. Reason: ${params.reason}` }],
-          details: summaryDetails(begun.run),
-        };
-      });
+    description:
+      "Optionally record a purpose before delegation. First delegation also creates a workstream.",
+    parameters: Type.Object({ purpose: Type.String() }),
+    async execute(_id, params, _signal, _update, ctx) {
+      return serial(async () =>
+        result(
+          "Workstream ready.",
+          remember(await (await ensure(ctx, params.purpose)).store.load(), ctx),
+        ),
+      );
     },
   });
-
   pi.registerTool({
-    name: "workgraph_adopt",
-    label: "Workgraph Adopt",
-    description: "Adopt an existing eligible Workgraph into this current Pi session without creating or forking a session.",
-    promptSnippet: "Adopt an existing Workgraph into the current Pi conversation",
-    parameters: Type.Object({
-      runId: Type.String(),
-      priorOwnerLiveness: Type.Optional(StringEnum(["alive", "dead", "unknown"] as const)),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        await supervisor?.shutdown();
-        supervisor = undefined;
-        const registry = new WorkgraphRegistry();
-        const indexed = registry.findRun(params.runId);
-        if (!indexed) throw new Error(`Unknown Workgraph ${params.runId}.`);
-        const repositoryInfo = await GitRepository.inspect(ctx.cwd);
-        if (repositoryInfo.root !== indexed.projectRoot) throw new Error(`Workgraph ${params.runId} belongs to ${indexed.projectRoot}, not ${repositoryInfo.root}.`);
-        const sessionFile = ctx.sessionManager.getSessionFile();
-        if (!sessionFile) throw new Error("Adoption requires a persistent current Pi session.");
-        const adoptedEngine = WorkgraphEngine.open(indexed.statePath, { registry });
-        const runtime = new HerdrCliRuntime();
-        if (runtime.available && !process.env.HERDR_PANE_ID) throw new Error("Herdr adoption requires the current pane identity.");
-        const runtimeIdentity = runtime.available
-          ? await runtime.observeCurrentCoordinator({ paneId: process.env.HERDR_PANE_ID!, sessionFile, cwd: repositoryInfo.root })
-          : undefined;
-        const adopted = await adoptedEngine.adopt(ctx.sessionManager.getSessionId(), sessionFile, params.priorOwnerLiveness ?? "unknown", runtimeIdentity);
-        engine = adoptedEngine;
-        remember(adopted);
-        pi.appendEntry(POINTER_ENTRY, { runId: adopted.runId, statePath: adopted.statePath } satisfies RunPointer);
-        attachSupervisor(ctx);
-        return { content: [{ type: "text", text: `Adopted Workgraph ${adopted.runId} into the current Pi session without forking.` }], details: { ...summaryDetails(adopted), lifecycle: adopted.lifecycle, coordinator: adopted.coordinator } };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_lifecycle",
-    label: "Workgraph Lifecycle",
-    description: "Explicitly suspend, resume, complete, abandon, or archive a Workgraph. Inactivity never abandons a run.",
-    promptSnippet: "Change a Workgraph lifecycle state explicitly",
-    parameters: Type.Object({ lifecycle: StringEnum(["active", "suspended", "completed", "abandoned", "archived"] as const), reason: Type.String() }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        if (params.lifecycle === "completed" || params.lifecycle === "abandoned") await supervisor?.reconcileNow();
-        let run = remember(await requireEngine().setLifecycle(params.lifecycle, params.reason));
-        if (run.lifecycle === "active") attachSupervisor(ctx);
-        else if (run.lifecycle === "completed" || run.lifecycle === "abandoned") {
-          if (supervisor) run = remember(await supervisor.reconcileNow());
-          supervisor?.stop();
-          supervisor = undefined;
-        } else { supervisor?.stop(); supervisor = undefined; }
-        updateStatus(ctx, run);
-        return { content: [{ type: "text", text: `Workgraph ${run.runId} lifecycle: ${run.lifecycle}.` }], details: { ...summaryDetails(run), lifecycle: run.lifecycle, lifecycleReason: run.lifecycleReason } };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_progress",
-    label: "Workgraph Milestone",
-    description: "Mark a run-declared task milestone completed or explicitly skipped.",
-    promptSnippet: "Record durable task-specific milestone progress",
-    parameters: Type.Object({
-      milestone: Type.String(),
-      status: StringEnum(["completed", "skipped"] as const),
-      reason: Type.Optional(Type.String()),
-    }),
-    async execute(_id, params) {
-      return exclusively(async () => {
-        const run = remember(await requireEngine().recordMilestone(params.milestone, params.status, params.reason));
-        return {
-          content: [{ type: "text", text: formatMilestoneProgress(run) }],
-          details: { ...summaryDetails(run), milestones: run.milestones },
-        };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_complete",
-    label: "Workgraph Complete",
-    description: "Complete an answer, decision, or operation outcome with typed evidence and no implementation claim.",
-    promptSnippet: "Finish a non-change Workgraph outcome with direct evidence",
-    parameters: Type.Object({
-      conclusion: Type.String(),
-      evidence: Type.Array(Type.Object({
-        label: Type.String(), observation: Type.String(), class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
-        command: Type.Optional(Type.String()), artifact: Type.Optional(Type.String()),
-      }), { minItems: 1, maxItems: 30 }),
-    }),
-    async execute(_id, params) {
-      return exclusively(async () => {
-        const current = await requireEngine().load();
-        if (current.outcome.kind === "product_change") throw new Error("Product-change outcomes must use agreement, execution, verification, assurance, and judgment.");
-        const run = remember(await requireEngine().completeNonChange(current.outcome.kind, params.conclusion, params.evidence));
-        return { content: [{ type: "text", text: `Outcome ${run.outcome.kind} completed: ${run.terminalOutcome?.conclusion}` }], details: { ...summaryDetails(run), terminalOutcome: run.terminalOutcome } };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_discover",
-    label: "Workgraph Discover",
-    description: "Run one topology-declared discovery fan-out with role-based models, inherited session context, typed evidence, and explicit dropout accounting.",
-    promptSnippet: "Run partitioned, replicated, or evidence-source Workgraph discovery",
-    parameters: Type.Object({
-      topology: StringEnum(["partition", "replicate", "evidence"] as const),
-      investigations: Type.Optional(Type.Array(InvestigationSchema, { minItems: 1, maxItems: 5 })),
-      question: Type.Optional(Type.String({ description: "The identical question for replicated discovery." })),
-      idPrefix: Type.Optional(Type.String({ description: "Stable lowercase id prefix for replicated lanes." })),
-      panelSize: Type.Optional(Type.Integer({ minimum: 2, maximum: 4 })),
-      models: Type.Optional(Type.Array(ModelTargetSchema, { minItems: 1, maxItems: 4 })),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const assignments = await expandDiscovery(params, ctx, activeRun);
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        const run = remember(await requireEngine().queueDiscovery({
-          topology: params.topology,
-          assignments,
-          stableEntryId: null,
-        }));
-        activeSupervisor.kick();
-        const selectedIds = new Set(assignments.map((assignment) => assignment.id));
-        const records = run.discoveries.filter((record) => selectedIds.has(record.id));
-        return {
-          content: [{ type: "text", text: `Queued ${assignments.length} ${params.topology} discovery lane(s). Use workgraph_status or workgraph_reconcile to inspect retained reports.` }],
-          details: {
-            ...summaryDetails(run),
-            topology: params.topology,
-            records,
-          },
-          usage: nestedUsage(records.flatMap((record) => record.usage ? [record.usage] : [])),
-        };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_synthesize",
-    label: "Workgraph Synthesize",
-    description: "Reduce two to five settled discovery lanes, including explicit dropouts, into one independently generated convergence, disagreement, and unknowns report.",
-    promptSnippet: "Synthesize substantial Workgraph discovery fan-out before coordinator judgment",
+    name: "workgraph_research",
+    label: "Workgraph Research",
+    description:
+      "Delegate bounded research or an explicitly authorized disposable experiment.",
+    promptSnippet: "Delegate research or a bounded experiment",
     parameters: Type.Object({
       id: Type.String(),
-      sourceIds: Type.Array(Type.String(), { minItems: 2, maxItems: 5 }),
-      model: Type.Optional(Type.String()),
-      thinking: Type.Optional(ThinkingSchema),
+      question: Type.String(),
+      expectedEvidence: Type.Array(Type.String(), { minItems: 1 }),
+      ...ModelOptions,
+      experiment: Type.Optional(
+        Type.Object({
+          authorityReceiptId: Type.Optional(Type.String()),
+          permittedEffects: Type.Array(Type.String(), { minItems: 1 }),
+          stopCondition: Type.String(),
+          retain: Type.Array(Type.String()),
+        }),
+      ),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const target = withAvailability(await resolveTarget("discovery.synthesis", params.model, params.thinking), ctx, "discovery synthesizer");
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        const run = remember(await requireEngine().queueDiscoverySynthesis({
+    async execute(_id, params, _signal, _update, ctx) {
+      return serial(async () => {
+        const active = await ensure(ctx, params.question);
+        const authority = params.experiment
+          ? await authorize(
+              active,
+              params.question,
+              params.experiment.authorityReceiptId,
+            )
+          : undefined;
+        const intent = (await active.store.load()).intents.at(-1);
+        if (!intent) throw new Error("Missing intent.");
+        const common = {
           id: params.id,
-          sourceIds: params.sourceIds,
-          ...target,
-          stableEntryId: stableParentEntry(ctx.sessionManager),
-        }));
-        activeSupervisor.kick();
-        const record = run.discoveries.find((candidate) => candidate.id === params.id);
-        return {
-          content: [{ type: "text", text: `Queued discovery synthesis ${params.id}. Use workgraph_status or workgraph_reconcile to inspect the retained report.` }],
-          details: { ...summaryDetails(run), synthesis: record },
-          ...(record?.usage ? { usage: nestedUsage([record.usage]) } : {}),
+          capability: "research" as const,
+          objective: params.question,
+          intentVersion: intent.version,
+          expectedEvidence: params.expectedEvidence,
         };
+        const assignment =
+          params.experiment && authority
+            ? {
+                ...common,
+                artifactIntent: "disposable_experiment" as const,
+                authority,
+                permittedEffects: params.experiment.permittedEffects,
+                stopCondition: params.experiment.stopCondition,
+                artifactPolicy: {
+                  retain: params.experiment.retain,
+                  discardOthers: true as const,
+                },
+              }
+            : { ...common, artifactIntent: "evidence_only" as const };
+        const state = await active.queue(assignment, queueOptions(params));
+        return result(
+          `Queued ${params.id}; submission and execution are observed asynchronously.`,
+          remember(state, ctx),
+        );
       });
     },
   });
-
   pi.registerTool({
-    name: "workgraph_review",
-    label: "Workgraph Review",
-    description: "Delegate a bounded review of a proposal, artifact, or exact revision. Review is selective and does not authorize changes.",
-    promptSnippet: "Delegate a selective review without entering a mandatory assurance phase",
+    name: "workgraph_intent",
+    label: "Workgraph Intent",
+    description:
+      "Record changed human-authorized scope. Earlier results remain tied to their old intent.",
     parameters: Type.Object({
-      subject: Type.String({ description: "Proposal, artifact, or revision to inspect." }),
-      concern: Type.String({ description: "The concrete concern or question for the reviewer." }),
-      revision: Type.Optional(Type.String()),
-      model: Type.Optional(Type.String()),
-      thinking: Type.Optional(ThinkingSchema),
+      authorityReceiptId: Type.String(),
+      statement: Type.String(),
+      constraints: Type.Array(Type.String()),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const target = withAvailability(await resolveTarget("verification.product", params.model, params.thinking), ctx, "review worker");
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        const run = remember(await (engine ?? await ensureResearchEngine(ctx, params.subject)).queueReview({ subject: params.subject, concern: params.concern, ...(params.revision ? { revision: params.revision } : {}), ...target, stableEntryId: null }));
-        activeSupervisor.kick();
-        const review = run.reviews.at(-1);
-        return { content: [{ type: "text", text: review?.state === "unavailable" ? `Review ${review.id} was recorded as unavailable.` : `Queued ${review?.id ?? "review"}; the reviewer will run asynchronously.` }], details: { ...summaryDetails(run), review } };
-      });
+    async execute(_id, params, _signal, _update, ctx) {
+      return serial(async () =>
+        result(
+          "Recorded intent revision.",
+          remember(
+            await current().perform(() => current().store.reviseIntent(params)),
+            ctx,
+          ),
+        ),
+      );
     },
   });
-
-  pi.registerTool({
-    name: "workgraph_review_result",
-    label: "Workgraph Review Child Result",
-    description: "Explicitly disposition an untyped or absent child result while retaining the original session and prose.",
-    promptSnippet: "Review retained untyped Workgraph evidence without silently promoting it",
-    parameters: Type.Object({
-      attemptId: Type.String(),
-      disposition: StringEnum(["accept", "retry", "reject"] as const),
-      summary: Type.String(),
-      evidence: Type.Array(Type.Object({
-        label: Type.String(), observation: Type.String(), class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
-        command: Type.Optional(Type.String()), artifact: Type.Optional(Type.String()),
-      }), { minItems: 1, maxItems: 30 }),
-      report: Type.Optional(Type.Any()),
-    }),
-    async execute(_id, params) {
-      return exclusively(async () => {
-        const input: ChildResultReviewInput = { ...params, report: params.report as ChildResultReviewInput["report"] };
-        const run = remember(await requireEngine().reviewChildResult(input));
-        return { content: [{ type: "text", text: `Recorded ${params.disposition} disposition for child attempt ${params.attemptId}.` }], details: { ...summaryDetails(run), review: run.resultReviews?.at(-1) } };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_plan",
-    label: "Workgraph Plan",
-    description: "Create a versioned Workgraph plan. Initial and authority-changing plans await a normal conversational decision; internal DAG repairs apply without another approval.",
-    promptSnippet: "Propose or revise a versioned Workgraph plan without trapping other control operations",
-    parameters: Type.Object({
-      changeKind: StringEnum(["initial", "internal", "authority"] as const),
-      outcome: Type.String(),
-      nonGoals: Type.Array(Type.String()),
-      reuseDecision: Type.String(),
-      structure: Type.String(),
-      expectedScale: Type.String(),
-      verificationBoundary: Type.String(),
-      verificationCommands: Type.Array(Type.String()),
-      verificationMethod: StringEnum(["commands", "independent"] as const),
-      verificationProcedure: Type.String(),
-      requiredEvidence: Type.Array(Type.String()),
-      unresolvedDecisions: Type.Array(Type.String()),
-    }),
-    async execute(_id, params) {
-      return exclusively(async () => {
-        const { changeKind, ...agreement } = params;
-        const checkpoint = formatAgreementSummary(agreement);
-        const run = remember(await requireEngine().proposePlan(agreement, checkpoint, changeKind));
-        const plan = run.plans.at(-1)!;
-        return {
-          content: [{ type: "text", text: plan.status === "proposed"
-            ? `${checkpoint}\n\nPlan v${plan.version} changes authority. Reply with your approval or requested changes; Workgraph will record the next exact user decision.`
-            : `Applied internal plan v${plan.version}. ${checkpoint}` }],
-          details: { ...summaryDetails(run), plan },
-        };
-      });
-    },
-  });
-
   pi.registerTool({
     name: "workgraph_implement",
     label: "Workgraph Implement",
-    description: "Delegate one bounded maintained change under applicable human authorization. This creates the workstream when needed and schedules one isolated implementation worker.",
-    promptSnippet: "Implement a bounded authorized product change",
+    description:
+      "Delegate a maintained change covered by genuine human intent. Defaults to the current human-backed scope or latest human request, not an extra approval ceremony.",
+    promptSnippet: "Delegate an authorized maintained change",
     parameters: Type.Object({
-      statement: Type.String({ description: "The bounded change authorized by the user." }),
-      authorizationRef: Type.String({ description: "A reference to the applicable human request or decision." }),
-      goal: Type.String(),
-      context: Type.Array(Type.String()),
+      id: Type.String(),
+      objective: Type.String(),
+      authorityReceiptId: Type.Optional(Type.String()),
       acceptance: Type.Array(Type.String(), { minItems: 1 }),
-      claimedPaths: Type.Array(Type.String(), { minItems: 1 }),
-      verificationCommands: Type.Array(Type.String()),
-      forbidden: Type.Array(Type.String()),
-      report: Type.String(),
-      timeboxMinutes: Type.Integer({ minimum: 1, maximum: 240 }),
-      model: Type.Optional(Type.String()),
-      thinking: Type.Optional(ThinkingSchema),
-      executorModel: Type.Optional(Type.String()),
-      executorThinking: Type.Optional(ThinkingSchema),
+      ...ModelOptions,
+      executor: Type.Optional(Target),
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const currentEngine = engine ?? await ensureResearchEngine(ctx, params.statement);
-        const activated = remember(await currentEngine.activateImplementation({ authorizationRef: params.authorizationRef, statement: params.statement, acceptance: params.acceptance }));
-        const policy = await loadModelPolicy();
-        const guide = await resolveTarget("implementation.guide", params.model, params.thinking);
-        const executorDefault = roleTargets(policy, "implementation.executor")[0]!;
-        const executor = params.executorModel ? { model: params.executorModel, thinking: params.executorThinking ?? executorDefault.thinking } : executorDefault;
-        requireAvailable(guide.model, ctx, "implementation guide");
-        requireAvailable(executor.model, ctx, "implementation executor");
-        const nodeId = `implement-${activated.nodes.length + 1}`;
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        activeSupervisor.options.stableEntryId = stableParentEntry(ctx.sessionManager);
-        const run = remember(await persistSchedule(currentEngine, { maxConcurrency: 1, nodes: [{ id: nodeId, brief: { goal: params.goal, context: params.context, acceptance: params.acceptance, timeboxMinutes: params.timeboxMinutes, forbidden: params.forbidden, report: params.report }, claimedPaths: params.claimedPaths, dependencies: [], verificationCommands: params.verificationCommands, supersedes: [], guideModel: guide.model, executorModel: executor.model, guideThinking: guide.thinking, executorThinking: executor.thinking, artifactIntent: "maintained_change", authorizationRef: params.authorizationRef }] }, activeSupervisor));
-        return { content: [{ type: "text", text: `Scheduled authorized implementation ${nodeId} in Workgraph ${run.runId}.` }], details: { ...summaryDetails(run), node: run.nodes.find((node) => node.id === nodeId), authorizationRef: params.authorizationRef } };
+    async execute(_id, params, _signal, _update, ctx) {
+      return serial(async () => {
+        const active = await ensure(ctx, params.objective);
+        const authority = await authorize(
+          active,
+          params.objective,
+          params.authorityReceiptId,
+        );
+        const state = await active.queue(
+          {
+            id: params.id,
+            capability: "implement",
+            artifactIntent: "maintained_change",
+            objective: params.objective,
+            intentVersion: authority.intentVersion,
+            authority,
+            acceptance: params.acceptance,
+          },
+          {
+            ...queueOptions(params),
+            ...(params.executor ? { executor: params.executor } : {}),
+          },
+        );
+        return result(
+          `Queued maintained change ${params.id}.`,
+          remember(state, ctx),
+        );
       });
     },
   });
-
   pi.registerTool({
-    name: "workgraph_schedule",
-    label: "Workgraph Schedule",
-    description: "Persist bounded nodes against the current approved plan and return immediately. The independent visible-worker supervisor advances them afterward.",
-    promptSnippet: "Schedule approved Workgraph nodes without waiting for worker settlement",
+    name: "workgraph_review",
+    label: "Workgraph Review",
+    description:
+      "Delegate an independent review of a retained proposal, artifact or exact revision for a specified concern.",
+    promptSnippet: "Delegate selective review",
     parameters: Type.Object({
-      nodes: Type.Array(NodeSchema, { minItems: 0, maxItems: 8 }),
-      maxConcurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
+      id: Type.String(),
+      objective: Type.String(),
+      concern: Type.String(),
+      subject: Type.Union([
+        Type.Object({ kind: Type.Literal("result"), resultId: Type.String() }),
+        Type.Object({
+          kind: Type.Literal("artifact"),
+          resultId: Type.String(),
+          artifactId: Type.String(),
+        }),
+        Type.Object({
+          kind: Type.Literal("revision"),
+          revision: Type.String(),
+        }),
+      ]),
+      ...ModelOptions,
     }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const policy = await loadModelPolicy();
-        const guideDefault = roleTargets(policy, "implementation.guide")[0]!;
-        const executorDefault = roleTargets(policy, "implementation.executor")[0]!;
-        const nodes = params.nodes.map((node) => ({
-          ...node,
-          supersedes: node.supersedes ?? [],
-          guideModel: node.guideModel ?? guideDefault.model,
-          executorModel: node.executorModel ?? executorDefault.model,
-          guideThinking: node.guideThinking ?? guideDefault.thinking,
-          executorThinking: node.executorThinking ?? executorDefault.thinking,
-        }));
-        for (const node of nodes) {
-          requireAvailable(node.guideModel, ctx, `${node.id} guide`);
-          requireAvailable(node.executorModel, ctx, `${node.id} executor`);
-        }
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        activeSupervisor.options.stableEntryId = stableParentEntry(ctx.sessionManager);
-        const run = remember(await persistSchedule(requireEngine(), { nodes, maxConcurrency: params.maxConcurrency ?? 2 }, activeSupervisor));
-        updateStatus(ctx, run);
-        return {
-          content: [{ type: "text", text: `Scheduled ${nodes.length || run.nodes.filter((node) => node.state === "pending").length} Workgraph node(s) at plan v${run.control.currentPlanVersion}. This call did not wait for worker startup or settlement.` }],
-          details: { ...summaryDetails(run), control: run.control, nodeIds: nodes.map((node) => node.id) },
-        };
+    async execute(_id, params, _signal, _update, ctx) {
+      return serial(async () => {
+        const active = await ensure(ctx, params.objective);
+        const intent = (await active.store.load()).intents.at(-1);
+        if (!intent) throw new Error("Missing intent.");
+        return result(
+          `Queued review ${params.id}.`,
+          remember(
+            await active.queue(
+              {
+                id: params.id,
+                capability: "review",
+                artifactIntent: "evidence_only",
+                objective: params.objective,
+                intentVersion: intent.version,
+                subject: params.subject,
+                concern: params.concern,
+              },
+              queueOptions(params),
+            ),
+            ctx,
+          ),
+        );
       });
     },
   });
-
-  pi.registerTool({
-    name: "workgraph_verify",
-    label: "Workgraph Verify",
-    description: "Run independent product verification against the exact composed revision when the approved boundary cannot be established by commands alone.",
-    promptSnippet: "Observe the composed product independently and retain exact-revision evidence",
-    parameters: Type.Object({
-      model: Type.Optional(Type.String()),
-      thinking: Type.Optional(ThinkingSchema),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const target = await resolveTarget("verification.product", params.model, params.thinking);
-        requireAvailable(target.model, ctx, "product verifier");
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        const run = remember(await requireEngine().queueVerification({
-          ...target,
-          stableEntryId: stableParentEntry(ctx.sessionManager),
-        }));
-        activeSupervisor.kick();
-        return {
-          content: [{ type: "text", text: `Queued independent verification at ${run.composedCommit}. Use workgraph_status or workgraph_reconcile to inspect the retained report.` }],
-          details: { ...summaryDetails(run), verification: run.productVerification },
-          ...(run.productVerification?.usage ? { usage: nestedUsage([run.productVerification.usage]) } : {}),
-        };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_assure",
-    label: "Workgraph Assure",
-    description: "Run exactly one behavior, structure, and evidence reviewer, then have Luna synthesize their candidate findings for coordinator judgment.",
-    promptSnippet: "Run responsibility-specific assurance and synthesis over exact-revision product evidence",
-    parameters: Type.Object({
-      behavior: Type.Optional(ModelTargetSchema),
-      structure: Type.Optional(ModelTargetSchema),
-      evidence: Type.Optional(ModelTargetSchema),
-      synthesis: Type.Optional(ModelTargetSchema),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const reviewers = await resolveReviewers(params, ctx);
-        const synthesis = withAvailability(await resolveTarget("assurance.synthesis", params.synthesis?.model, params.synthesis?.thinking), ctx, "assurance synthesis");
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        const run = remember(await requireEngine().queueAssurance({
-          reviewers,
-          synthesis,
-          stableEntryId: stableParentEntry(ctx.sessionManager),
-        }));
-        activeSupervisor.kick();
-        const usages = [
-          ...(run.assurance?.reviews.flatMap((review) => review.usage ? [review.usage] : []) ?? []),
-          ...(run.assurance?.synthesis?.usage ? [run.assurance.synthesis.usage] : []),
-        ];
-        return {
-          content: [{ type: "text", text: `Queued assurance reviewers for revision ${run.composedCommit}. Use workgraph_status or workgraph_reconcile to inspect retained reports.` }],
-          details: { ...summaryDetails(run), assurance: run.assurance },
-          ...(usages.length > 0 ? { usage: nestedUsage(usages) } : {}),
-        };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_judge",
-    label: "Workgraph Judge",
-    description: "Record the Sol coordinator's final accept or dismiss judgment for every assurance candidate and route accepted findings.",
-    promptSnippet: "Make the final coordinator judgment over synthesized assurance candidates",
-    parameters: Type.Object({
-      judgments: Type.Array(Type.Object({
-        findingId: Type.String(),
-        disposition: StringEnum(["accept", "dismiss"] as const),
-        reason: Type.String(),
-      }), { maxItems: 60 }),
-    }),
-    async execute(_id, params) {
-      return exclusively(async () => {
-        const run = remember(await requireEngine().judgeAssurance(params));
-        return {
-          content: [{ type: "text", text: formatJudgment(run) }],
-          details: { ...summaryDetails(run), judgment: run.assurance?.finalJudgment },
-        };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_steer",
-    label: "Workgraph Steer",
-    description: "Send a bounded steering instruction to an active visible worker and retain queued, submitted, or uncertain status.",
-    promptSnippet: "Steer an active worker without claiming the instruction was applied",
-    parameters: Type.Object({ attemptId: Type.String(), instruction: Type.String() }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        try {
-          const run = remember(await activeSupervisor.steer(params.attemptId, params.instruction));
-          return { content: [{ type: "text", text: `Steering for attempt ${params.attemptId} was submitted to the visible worker; application is not yet proven.` }], details: { ...summaryDetails(run), steering: run.attempts.find((attempt) => attempt.id === params.attemptId)?.steering } };
-        } catch (error) {
-          const run = await requireEngine().recordUnsupportedControl(params.attemptId, params.instruction, error instanceof Error ? error.message : String(error));
-          return { content: [{ type: "text", text: `Steering for attempt ${params.attemptId} was not submitted; the request was retained as uncertain or unsupported.` }], details: { ...summaryDetails(run), unsupportedControl: run.unsupportedControls?.at(-1) } };
-        }
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_control",
-    label: "Workgraph Control",
-    description: "Pause, resume, cancel, or reprioritize durable Workgraph execution without waiting for visible workers to settle.",
-    promptSnippet: "Control scheduled Workgraph execution independently of worker completion",
-    parameters: Type.Object({
-      action: StringEnum(["pause", "resume", "cancel", "reprioritize"] as const),
-      mode: Type.Optional(StringEnum(["drain", "immediate"] as const)),
-      reason: Type.String(),
-      nodeIds: Type.Optional(Type.Array(Type.String())),
-      priorities: Type.Optional(Type.Array(Type.Object({ nodeId: Type.String(), priority: Type.Integer({ minimum: -1000, maximum: 1000 }) }))),
-    }),
-    async execute(_id, params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const control = params.action === "pause"
-          ? { action: "pause" as const, mode: params.mode ?? "drain", reason: params.reason }
-          : params.action === "resume"
-            ? { action: "resume" as const, reason: params.reason }
-            : params.action === "cancel"
-              ? { action: "cancel" as const, reason: params.reason, ...(params.nodeIds ? { nodeIds: params.nodeIds } : {}) }
-              : { action: "reprioritize" as const, reason: params.reason, priorities: params.priorities ?? [] };
-        const run = remember(await requireEngine().controlExecution(control));
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        activeSupervisor.kick();
-        updateStatus(ctx, run);
-        return { content: [{ type: "text", text: `Recorded ${params.action}; execution is ${run.control.executionStatus}. Worker interruption, when requested, is reconciled by exact Herdr identity in the background.` }], details: { ...summaryDetails(run), control: run.control, attempts: run.attempts } };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_reconcile",
-    label: "Workgraph Reconcile",
-    description: "Perform one bounded idempotent pass over durable attempts, live Herdr identities, typed reports, validation, and composition. It never waits for a worker to finish.",
-    promptSnippet: "Reconcile visible Workgraph worker observations without owning their wait loop",
-    parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
-        const run = remember(await activeSupervisor.reconcileNow());
-        updateStatus(ctx, run);
-        return { content: [{ type: "text", text: formatControlStatus(run) }], details: { ...summaryDetails(run), control: run.control, attempts: run.attempts, nodes: run.nodes } };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_settle",
-    label: "Workgraph Settle",
-    description: "Settle a quiescent execution result and run the approved exact-revision verification boundary. It does not wait for active workers.",
-    promptSnippet: "Settle quiescent Workgraph execution into verification or actionable attention",
-    parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, ctx) {
-      return exclusively(async () => {
-        if (supervisor) remember(await supervisor.reconcileNow());
-        const run = remember(await requireEngine().settle());
-        updateStatus(ctx, run);
-        return { content: [{ type: "text", text: formatControlStatus(run) }], details: { ...summaryDetails(run), control: run.control, productVerification: run.productVerification } };
-      });
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_acknowledge",
-    label: "Workgraph Acknowledge",
-    description: "Record the coordinator's durable acknowledgment and disposition of a delivered Workgraph result or attention wake.",
-    promptSnippet: "Acknowledge and disposition a delivered Workgraph result",
-    parameters: Type.Object({ id: Type.String(), acknowledgment: Type.String() }),
-    async execute(_id, params) {
-      return exclusively(async () => {
-        const run = remember(await requireEngine().acknowledgeCoordinatorWake(params.id, params.acknowledgment));
-        return { content: [{ type: "text", text: `Acknowledged Workgraph wake ${params.id}.` }], details: { ...summaryDetails(run), wake: run.coordinatorWakeups?.find((wake) => wake.id === params.id) } };
-      });
-    },
-  });
-
   pi.registerTool({
     name: "workgraph_status",
     label: "Workgraph Status",
-    description: "Read durable outcome, milestone, lane, child, exact-commit, verification, assurance, and pending-decision state.",
-    promptSnippet: "Inspect durable Workgraph status and evidence",
+    description:
+      "Inspect durable intent, human receipts, assignments, model observations, results and resource recovery.",
     parameters: Type.Object({}),
     async execute() {
-      return exclusively(async () => {
-        const run = remember(await requireEngine().load());
+      return serial(async () => {
+        const state = await current().store.load();
+        return result(
+          `Workstream ${state.id}: ${state.lifecycle.state}`,
+          state,
+        );
+      });
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_acknowledge",
+    label: "Workgraph Acknowledge",
+    description:
+      "Acknowledge receipt of delivered evidence, independently of accepting it.",
+    parameters: Type.Object({
+      resultId: Type.String(),
+      acknowledgment: Type.String(),
+    }),
+    async execute(_id, params) {
+      return serial(async () =>
+        result(
+          "Acknowledged result.",
+          await current().perform(() =>
+            current().store.acknowledge(params.resultId, params.acknowledgment),
+          ),
+        ),
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_disposition",
+    label: "Workgraph Disposition",
+    description:
+      "Record coordinator judgment of retained evidence, not worker or transport success.",
+    parameters: Type.Object({
+      resultId: Type.String(),
+      status: StringEnum(["accepted", "rejected", "needs_followup"] as const),
+      reason: Type.String(),
+    }),
+    async execute(_id, params) {
+      return serial(async () =>
+        result(
+          "Recorded disposition.",
+          await current().perform(() => current().store.disposition(params)),
+        ),
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_control",
+    label: "Workgraph Control",
+    description:
+      "Suspend new work and composition while retaining observations, resume, cancel, or submit steering to one live attempt.",
+    parameters: Type.Object({
+      action: StringEnum(["suspend", "resume", "cancel", "steer"] as const),
+      reason: Type.String(),
+      attemptId: Type.Optional(Type.String()),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      return serial(async () => {
+        const active = current();
+        if (params.action === "cancel" || params.action === "steer") {
+          if (!params.attemptId) throw new Error("An attempt id is required.");
+          if (params.action === "cancel") await active.cancel(params.attemptId);
+          else await active.steer(params.attemptId, params.reason);
+        } else
+          await active.perform(() =>
+            active.store.setLifecycle({
+              state: params.action === "suspend" ? "suspended" : "active",
+              reason: params.reason,
+            }),
+          );
+        return result(
+          params.action === "steer"
+            ? "Steering submitted; application is not yet established."
+            : "Control request recorded.",
+          remember(await active.store.load(), ctx),
+        );
+      });
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_adopt",
+    label: "Workgraph Adopt",
+    description:
+      "Attach a retained workstream only after expired prior ownership is authoritatively dead. Preserve suspension and original human receipts.",
+    parameters: Type.Object({ statePath: Type.String() }),
+    async execute(_id, params, _signal, _update, ctx) {
+      return serial(async () => {
+        const state = await WorkstreamStore.inspect(params.statePath);
+        const repository = await GitRepository.inspect(ctx.cwd);
+        if (repository.commonDir !== state.gitCommonDir)
+          throw new Error(
+            "The retained workstream belongs to another repository.",
+          );
+        const liveness = await new HerdrCliRuntime().coordinatorLiveness(
+          state.coordinator.sessionFile,
+        );
+        const target = WorkstreamStore.open(
+          params.statePath,
+          state.coordinator,
+        );
+        const active = await attach(ctx, target, liveness);
+        pi.appendEntry(POINTER, { path: target.path });
+        await importInputs(active);
+        return result(
+          "Adopted without changing lifecycle.",
+          remember(await target.load(), ctx),
+        );
+      });
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_fork",
+    label: "Workgraph Fork",
+    description:
+      "Explicitly fork the coordinator conversation to a separate visible session, not a worker continuation or workstream adoption.",
+    parameters: Type.Object({ targetCwd: Type.String() }),
+    async execute(_id, params, _signal, _update, ctx) {
+      return serial(async () => {
+        const sessionFile = await forkConversationSession({
+          parentSessionFile: owner(ctx).sessionFile,
+          targetCwd: params.targetCwd,
+        });
+        const identity = await new HerdrCliRuntime().launchCoordinator({
+          workspaceId: process.env.HERDR_WORKSPACE_ID ?? "",
+          cwd: params.targetCwd,
+          sessionFile,
+        });
         return {
-          content: [{ type: "text", text: formatStatus(run) }],
-          details: { ...summaryDetails(run), run },
+          content: [
+            {
+              type: "text",
+              text: `Forked coordinator into ${identity.tabId}.`,
+            },
+          ],
+          details: identity,
         };
+      });
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_complete",
+    label: "Workgraph Complete",
+    description:
+      "Complete after owned workers/resources settle, with evidence and explicit limitations.",
+    parameters: Type.Object({
+      conclusion: Type.String(),
+      evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
+      limitations: Type.Array(Type.String()),
+    }),
+    async execute(_id, params, _signal, _update, ctx) {
+      return serial(async () => {
+        const active = current();
+        const state = await active.perform(() => active.store.complete(params));
+        await active.stop();
+        runtime = undefined;
+        return result("Completed workstream.", remember(state, ctx));
       });
     },
   });
 }
 
-async function setConfiguredRole(role: ModelRole | undefined, targets: Array<{ model: string; thinking?: ThinkingLevel }> | undefined) {
-  if (!role || !targets) throw new Error("Model role and targets are required for action set.");
-  return setModelRole(role, targets.map((target) => ({ model: target.model, thinking: target.thinking ?? "high" })));
-}
-
-export async function expandDiscovery(
-  params: {
-    topology: DiscoveryTopology;
-    investigations?: Array<{ id: string; lens: string; objective: string; model?: string; thinking?: ThinkingLevel; supersedes?: string[] }>;
-    question?: string;
-    idPrefix?: string;
-    panelSize?: number;
-    models?: Array<{ model: string; thinking?: ThinkingLevel }>;
-  },
-  ctx: ExtensionContext,
-  run: WorkgraphRun | undefined,
-): Promise<DiscoveryAssignment[]> {
-  const policy = await loadModelPolicy();
-  if (params.topology === "replicate") {
-    if (!params.question?.trim()) throw new Error("Replicated discovery requires one identical question.");
-    const configured = params.models?.map((target) => ({ model: target.model, thinking: target.thinking ?? "high" }))
-      ?? roleTargets(policy, "discovery.replicate");
-    const panelSize = params.panelSize ?? Math.min(3, configured.length);
-    if (configured.length < panelSize) throw new Error(`Replicated discovery requested ${panelSize} models but only ${configured.length} were supplied.`);
-    const priorRuns = run?.discoveries.filter((record) => record.topology === "replicate").length ?? 0;
-    const prefix = params.idPrefix?.trim() || `replicate${priorRuns + 1}`;
-    return configured.slice(0, panelSize).map((target, index) => ({
-      id: `${prefix}-${String.fromCharCode(97 + index)}`,
-      lens: `Independent replication ${index + 1} of ${panelSize}`,
-      objective: params.question!.trim(),
-      ...withAvailability(target, ctx, `replicated lane ${index + 1}`),
-    }));
-  }
-
-  if (!params.investigations || params.investigations.length === 0) {
-    throw new Error(`${params.topology} discovery requires explicit investigation responsibilities.`);
-  }
-  const role: ModelRole = params.topology === "partition" ? "discovery.partition" : "discovery.evidence";
-  const defaultTarget = params.models?.[0]
-    ? { model: params.models[0].model, thinking: params.models[0].thinking ?? "high" }
-    : roleTargets(policy, role)[0]!;
-  return params.investigations.map((investigation) => ({
-    id: investigation.id,
-    lens: investigation.lens,
-    objective: investigation.objective,
-    ...(investigation.supersedes ? { supersedes: investigation.supersedes } : {}),
-    ...withAvailability({
-      model: investigation.model ?? defaultTarget.model,
-      thinking: investigation.thinking ?? defaultTarget.thinking,
-    }, ctx, `${investigation.id} discovery lane`),
-  }));
-}
-
-async function resolveTarget(role: ModelRole, model?: string, thinking?: ThinkingLevel): Promise<ModelTarget> {
-  const configured = roleTargets(await loadModelPolicy(), role)[0]!;
-  return { model: model ?? configured.model, thinking: thinking ?? configured.thinking };
-}
-
-async function resolveReviewers(
-  params: Partial<Record<AssuranceResponsibility, { model: string; thinking?: ThinkingLevel }>>,
-  ctx: ExtensionContext,
-): Promise<Array<ModelAssignment & { responsibility: AssuranceResponsibility }>> {
-  const responsibilities: AssuranceResponsibility[] = ["behavior", "structure", "evidence"];
-  return Promise.all(responsibilities.map(async (responsibility) => ({
-    responsibility,
-    ...withAvailability(await resolveTarget(`assurance.${responsibility}`, params[responsibility]?.model, params[responsibility]?.thinking), ctx, `${responsibility} reviewer`),
-  })));
-}
-
-function withAvailability(target: ModelTarget, ctx: ExtensionContext, owner: string): ModelAssignment {
-  const available = new Set(ctx.modelRegistry.getAvailable().map((model) => `${model.provider}/${model.id}`));
-  return available.has(target.model)
-    ? { ...target }
-    : { ...target, unavailableReason: `${owner} model is unavailable: ${target.model}` };
-}
-
-function requireAvailable(model: string, ctx: ExtensionContext, owner: string): void {
-  const target = withAvailability({ model, thinking: "off" }, ctx, owner);
-  if (target.unavailableReason) throw new Error(target.unavailableReason);
-}
-
-function formatAgreementSummary(agreement: AgreementInput): string {
-  return [
-    `Plan: ${agreement.outcome}`,
-    `Scope: ${agreement.structure}`,
-    `Verification: ${agreement.verificationMethod} at ${agreement.verificationBoundary}`,
-    `Checks: ${agreement.verificationCommands.join(", ")}`,
-    agreement.nonGoals.length > 0 ? `Non-goals: ${agreement.nonGoals.join("; ")}` : "Non-goals: none",
-  ].join("\n");
-}
-
-function conversationalDecision(prompt: string): boolean | undefined {
-  const normalized = prompt.trim().toLowerCase().replace(/[.!?]+$/g, "");
-  if (/^(approve|approved|yes|y|lgtm)$/.test(normalized)) return true;
-  if (/^(reject|rejected|decline|declined|no|n)$/.test(normalized)) return false;
-  return undefined;
-}
-
-function formatDiscoveries(run: WorkgraphRun, records: WorkgraphRun["discoveries"]): string {
-  const lines = [`${records[0]?.topology ?? "Discovery"} settled for ${run.runId}:`];
-  for (const record of records) {
-    lines.push(`- ${record.id} [${record.model}; ${record.state}]: ${record.report?.summary ?? record.error ?? "No report."}`);
-  }
-  lines.push("The Sol coordinator should reconcile convergence, disagreement, dropouts, and unknowns before choosing the next operation.");
-  return lines.join("\n");
-}
-
-function formatExecution(run: WorkgraphRun, nodes: WorkgraphRun["nodes"]): string {
-  const lines = [`Workgraph execution phase: ${run.phase}.`, `Composed HEAD: ${run.composedCommit}.`];
-  for (const node of nodes) {
-    const commit = node.commit ? ` commit ${node.commit.slice(0, 12)}` : "";
-    lines.push(`- ${node.id}: ${node.state}${commit}${node.error ? ` - ${node.error}` : ""}`);
-  }
-  if (run.phase === "awaiting_verification") lines.push("Run workgraph_verify next.");
-  if (run.phase === "awaiting_assurance") lines.push("Run workgraph_assure.");
-  if (run.phase === "needs_decision") lines.push("Affected work stopped. Present only the authority-changing decision to the user.");
-  if (run.phase === "revision_required") lines.push("Add bounded corrective nodes if accepted findings remain inside the approved envelope.");
-  return lines.join("\n");
-}
-
-function formatVerification(run: WorkgraphRun): string {
-  const verification = run.productVerification;
-  return [
-    `Product verification phase: ${run.phase}.`,
-    `Revision: ${verification?.revision ?? "none"}.`,
-    `State: ${verification?.state ?? "missing"}.`,
-    verification?.report?.summary ?? verification?.error ?? "No verifier report.",
-  ].join("\n");
-}
-
-function formatAssurance(run: WorkgraphRun): string {
-  const lines = [`Assurance phase: ${run.phase}.`, `Revision: ${run.assurance?.revision ?? "none"}.`];
-  for (const review of run.assurance?.reviews ?? []) {
-    lines.push(`- ${review.responsibility} [${review.model}; ${review.state}]: ${review.report?.summary ?? review.error ?? "No report."}`);
-    for (const finding of review.report?.findings ?? []) lines.push(`  - ${finding.id}: ${finding.violatedInvariant}`);
-  }
-  if (run.assurance?.synthesis) {
-    lines.push(`- synthesis [${run.assurance.synthesis.model}; ${run.assurance.synthesis.state}]: ${run.assurance.synthesis.report?.summary ?? run.assurance.synthesis.error ?? "No report."}`);
-  }
-  if (run.phase === "awaiting_judgment") lines.push("The coordinator must inspect and disposition every candidate with workgraph_judge.");
-  return lines.join("\n");
-}
-
-function formatJudgment(run: WorkgraphRun): string {
-  const accepted = run.assurance?.finalJudgment?.acceptedFindings ?? [];
-  const lines = [`Coordinator judgment routed Workgraph to ${run.phase}.`, `Accepted findings: ${accepted.length}.`];
-  for (const finding of accepted) lines.push(`- ${finding.id} [${finding.envelopeImpact}]: ${finding.violatedInvariant}`);
-  return lines.join("\n");
-}
-
-function formatMilestoneProgress(run: WorkgraphRun): string {
-  return [
-    `${run.outcome.kind} milestones:`,
-    ...(run.milestones.length ? run.milestones.map((milestone) => `- ${milestone.id}: ${milestone.status}${milestone.reason ? ` - ${milestone.reason}` : ""}`) : ["- None declared"]),
-  ].join("\n");
-}
-
-function formatControlStatus(run: WorkgraphRun): string {
-  const active = run.attempts.filter((attempt) => attempt.state === "starting" || attempt.state === "running" || attempt.state === "settling" || attempt.state === "cancel_requested");
-  return [
-    `Workgraph ${run.runId}: plan=${run.control.planStatus}${run.control.currentPlanVersion ? ` v${run.control.currentPlanVersion}` : ""}, execution=${run.control.executionStatus}, attention=${run.control.attentionStatus}, verification=${run.control.verificationStatus}.`,
-    ...active.map((attempt) => `- ${attempt.mode ?? "implementation"}/${attempt.responsibility ?? attempt.nodeId}/${attempt.id.slice(0, 8)}: ${attempt.state}, model=${attempt.model ?? "node-policy"}, thinking=${attempt.thinking ?? "node-policy"}, observed=${attempt.observedStatus ?? "not-observed"}, stage=${attempt.stage}, worker=${attempt.worker?.agentName ?? "unbound"}, pane=${attempt.worker?.paneId ?? "unbound"}, session=${attempt.worker?.sessionFile ?? attempt.sessionFile ?? "unbound"}, worktree=${attempt.worktreePath ?? "unbound"}, started=${attempt.startedAt ?? "not-started"}, activity=${attempt.lastActivityAt}, heartbeat=${attempt.heartbeatAt ?? "none"}${attempt.attention ? `, attention=${attempt.attention}` : ""}`),
-  ].join("\n");
-}
-
-function formatStatus(run: WorkgraphRun): string {
-  const nodeCounts = new Map<string, number>();
-  for (const node of run.nodes) nodeCounts.set(node.state, (nodeCounts.get(node.state) ?? 0) + 1);
-  const counts = [...nodeCounts].map(([state, count]) => `${state}=${count}`).join(", ") || "none";
-  const dropouts = run.discoveries.filter((record) => record.state !== "completed").length;
-  return [
-    `Workgraph ${run.runId}`,
-    `Lifecycle: ${run.lifecycle}${run.lifecycleReason ? ` - ${run.lifecycleReason}` : ""}`,
-    `Coordinator: ${run.coordinator.sessionId} (${run.coordinator.sessionFile})`,
-    `Creator: ${run.creator.sessionId} (${run.creator.sessionFile})`,
-    `Handoffs: ${run.handoffs.length}`,
-    `Control: plan=${run.control.planStatus}${run.control.currentPlanVersion ? ` v${run.control.currentPlanVersion}` : ""}, execution=${run.control.executionStatus}, attention=${run.control.attentionStatus}, verification=${run.control.verificationStatus}`,
-    `Legacy phase: ${run.phase}`,
-    `Outcome: ${run.outcome.kind}`,
-    `Statement: ${run.outcome.statement}`,
-    `Predicate: ${run.outcome.completionPredicate}`,
-    `Milestones: ${run.milestones.map((milestone) => `${milestone.id}=${milestone.status}`).join(", ") || "none"}`,
-    `Discovery lanes: ${run.discoveries.length}, dropouts=${dropouts}`,
-    `Result reviews: ${run.resultReviews?.length ?? 0}`,
-    `Cleanup: ${(run.cleanup ?? []).map((record) => `${record.kind}=${record.state}`).join(", ") || "none"}`,
-    `Base: ${run.baseCommit}`,
-    `Composed: ${run.composedCommit}`,
-    `Product evidence: ${run.productVerification?.state ?? "none"} at ${run.productVerification?.revision ?? "none"}`,
-    `Nodes: ${counts}`,
-    `Attempts: ${run.attempts.length}`,
-    ...run.attempts.map((attempt) => `- ${attempt.mode ?? "implementation"}/${attempt.responsibility ?? attempt.nodeId}/${attempt.id.slice(0, 8)} [${attempt.state}; model=${attempt.model ?? "node-policy"}; thinking=${attempt.thinking ?? "node-policy"}; observed=${attempt.observedStatus ?? "not-observed"}; stage=${attempt.stage}]: worker=${attempt.worker?.agentName ?? "unbound"}, workspace=${attempt.worker?.workspaceId ?? "unbound"}, tab=${attempt.worker?.tabId ?? "unbound"}, pane=${attempt.worker?.paneId ?? "unbound"}, terminal=${attempt.worker?.terminalId ?? "unbound"}, session=${attempt.worker?.sessionFile ?? attempt.sessionFile ?? "unbound"}, worktree=${attempt.worktreePath ?? "unbound"}, started=${attempt.startedAt ?? "not-started"}, activity=${attempt.lastActivityAt}, heartbeat=${attempt.heartbeatAt ?? "none"}${attempt.attention ? `, attention=${attempt.attention}` : ""}`),
-    `State: ${run.statePath}`,
-  ].join("\n");
-}
-
-function formatModelPolicy(roles: Record<ModelRole, ModelTarget[]>): string {
-  return MODEL_ROLES.flatMap((role) => [
-    `${role}:`,
-    ...roles[role].map((target) => `- ${target.model} (${target.thinking})`),
-  ]).join("\n");
-}
-
-function updateStatus(ctx: ExtensionContext, run: WorkgraphRun): void {
-  ctx.ui.setStatus("workgraph", `WG ${run.control.executionStatus}/${run.control.attentionStatus} - ${run.attempts.filter((attempt) => attempt.state === "running" || attempt.state === "starting").length} active`);
-}
-
-function summaryDetails(run: WorkgraphRun) {
+function queueOptions(params: {
+  model?: string;
+  thinking?: QueueOptions["thinking"];
+  continuationOf?: string;
+}): QueueOptions {
   return {
-    runId: run.runId,
-    lifecycle: run.lifecycle,
-    coordinator: run.coordinator,
-    phase: run.phase,
-    control: run.control,
-    currentPlan: run.plans.at(-1),
-    attempts: run.attempts,
-    resultReviews: run.resultReviews ?? [],
-    cleanup: run.cleanup ?? [],
-    statePath: run.statePath,
-    outcome: run.outcome,
-    milestones: run.milestones,
-    baseCommit: run.baseCommit,
-    composedCommit: run.composedCommit,
+    ...(params.model ? { model: params.model } : {}),
+    ...(params.thinking ? { thinking: params.thinking } : {}),
+    ...(params.continuationOf ? { continuationOf: params.continuationOf } : {}),
   };
 }
-
-function nestedUsage(items: UsageSummary[]) {
-  const aggregate = items.reduce<UsageSummary>((total, item) => ({
-    input: total.input + item.input,
-    output: total.output + item.output,
-    cacheRead: total.cacheRead + item.cacheRead,
-    cacheWrite: total.cacheWrite + item.cacheWrite,
-    cost: total.cost + item.cost,
-    turns: total.turns + item.turns,
-  }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+function result(text: string, state: WorkstreamState) {
   return {
-    input: aggregate.input,
-    output: aggregate.output,
-    cacheRead: aggregate.cacheRead,
-    cacheWrite: aggregate.cacheWrite,
-    totalTokens: aggregate.input + aggregate.output + aggregate.cacheRead + aggregate.cacheWrite,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: aggregate.cost },
+    content: [{ type: "text" as const, text }],
+    details: { workstream: state, statePath: state.statePath },
   };
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

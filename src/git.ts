@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, realpath, rm } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { CommandEvidence } from "./types.js";
 
@@ -184,6 +184,24 @@ export class GitRepository {
     }
     await this.assertClean();
     return this.head();
+  }
+
+  /** Discard only an explicitly disposable, stopped experiment at its recorded identity. */
+  async discardExperiment(placement: WorktreePlacement, expectedHead: string): Promise<void> {
+    const records = parseWorktreeList(await gitText(this.root, ["worktree", "list", "--porcelain"], true));
+    const record = records.find((item) => resolve(item.path) === resolve(placement.path));
+    if (!record) return; // A prior cleanup already removed this exact placement.
+    if (record.branch !== placement.branch || await realpath(placement.path) !== resolve(placement.path) || await this.head(placement.path) !== expectedHead) {
+      throw new Error("Refusing disposable cleanup: experiment identity or revision changed.");
+    }
+    const actualBranch = await gitText(placement.path, ["symbolic-ref", "--short", "HEAD"]);
+    const actualRoot = await gitText(placement.path, ["rev-parse", "--show-toplevel"]);
+    if (actualBranch !== placement.branch || resolve(actualRoot) !== resolve(placement.path)) throw new Error("Refusing disposable cleanup: worktree Git metadata changed.");
+    for (const args of [["reset", "--hard", expectedHead], ["clean", "-fdx"]]) {
+      const result = await runProcess("git", ["-C", placement.path, ...args], { cwd: this.root, timeoutMs: 30_000 });
+      if (result.exitCode !== 0) throw new Error(`Disposable cleanup failed: ${result.stderr || result.stdout}`);
+    }
+    await this.assertClean(placement.path);
   }
 
   async cleanupWorktree(placement: WorktreePlacement, expectedHead: string): Promise<WorktreeCleanupResult> {

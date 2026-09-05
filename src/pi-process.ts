@@ -281,9 +281,9 @@ export interface WorkgraphReportRead {
   error?: string;
 }
 
-export function readWorkgraphReportResult(sessionFile: string): WorkgraphReportRead {
+export function readWorkgraphReportResult(sessionFile: string, generation?: { runId: string; nodeId: string }): WorkgraphReportRead {
   try {
-    const messages = SessionManager.open(sessionFile).buildSessionContext().messages;
+    const messages = generation ? attemptMessages(sessionFile, generation) : SessionManager.open(sessionFile).buildSessionContext().messages;
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
       if (message?.role !== "toolResult" || message.toolName !== "workgraph_report") continue;
@@ -312,12 +312,12 @@ export function hasNativeAgentSettled(sessionFile: string, runId?: string, nodeI
 
 function hasNativeMarker(sessionFile: string, customType: string, runId?: string, nodeId?: string): boolean {
   try {
-    const entries = SessionManager.open(sessionFile).getEntries();
+    const entries = SessionManager.open(sessionFile).getBranch();
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
       if (entry?.type !== "custom") continue;
       if (entry.customType === customType && markerMatches(entry.data, runId, nodeId)) return true;
-      if (entry.customType === "pi-workgraph-agent-running" && customType === "pi-workgraph-agent-settled") return false;
+      if (entry.customType === "pi-workgraph-agent-running" && customType === "pi-workgraph-agent-settled" && markerMatches(entry.data, runId, nodeId)) return false;
     }
   } catch {
     return false;
@@ -335,13 +335,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-export function readTerminalText(sessionFile: string): string | undefined {
+function attemptEntries(sessionFile: string, generation: { runId: string; nodeId: string }) {
+  const entries = SessionManager.open(sessionFile).getBranch();
+  const boundary = entries.findLastIndex((entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective" && markerMatches(entry.details, generation.runId, generation.nodeId));
+  if (boundary < 0) throw new Error("Session has no objective for the current attempt generation.");
+  return entries.slice(boundary + 1);
+}
+
+export function attemptMessages(sessionFile: string, generation: { runId: string; nodeId: string }) {
+  return attemptEntries(sessionFile, generation).flatMap((entry) => entry.type === "message" ? [entry.message] : []);
+}
+
+export function effectiveModelObservations(sessionFile: string, generation: { runId: string; nodeId: string }) {
+  return attemptEntries(sessionFile, generation).flatMap((entry): Array<{ model: string; thinking?: string; source: "selection" | "message" }> => {
+    if (entry.type === "message" && entry.message.role === "assistant" && entry.message.provider !== "workgraph") return [{ model: `${entry.message.provider}/${entry.message.model}`, source: "message" }];
+    if (entry.type !== "custom" || entry.customType !== "pi-workgraph-effective-model" || !isRecord(entry.data) || !markerMatches(entry.data, generation.runId, generation.nodeId)) return [];
+    if (typeof entry.data.model !== "string" || typeof entry.data.thinking !== "string") return [];
+    return [{ model: entry.data.model, thinking: entry.data.thinking, source: "selection" }];
+  });
+}
+
+export function readTerminalText(sessionFile: string, generation?: { runId: string; nodeId: string }): string | undefined {
   try {
-    const messages = SessionManager.open(sessionFile).buildSessionContext().messages;
+    const messages = generation ? attemptMessages(sessionFile, generation) : SessionManager.open(sessionFile).buildSessionContext().messages;
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index];
-      if (message?.role !== "assistant") continue;
-      const text = assistantText(message as unknown as Record<string, unknown>);
+      if (message?.role !== "assistant" || (generation && message.provider === "workgraph")) continue;
+      const text = message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").trim();
       if (text) return text;
     }
   } catch {

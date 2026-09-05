@@ -3,8 +3,6 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { expandDiscovery } from "../extensions/coordinator.js";
 import { DEFAULT_MODEL_POLICY, loadModelPolicy, roleTargets, setModelRole } from "../src/model-policy.js";
 
 test("the default policy keeps heterogeneous replication and independently assigned assurance roles", () => {
@@ -34,31 +32,9 @@ test("a role override persists independently of external configuration configura
   }
 });
 
-test("replicated discovery sends one question to diverse models and marks unavailable members", async () => {
-  const ctx = {
-    modelRegistry: {
-      getAvailable: () => [
-        { provider: "provider-a", id: "model-a" },
-        { provider: "provider-b", id: "model-b" },
-      ],
-    },
-  } as unknown as ExtensionContext;
-  const assignments = await expandDiscovery({
-    topology: "replicate",
-    question: "Which ownership shape best preserves the invariant?",
-    idPrefix: "shape",
-    panelSize: 3,
-    models: [
-      { model: "provider-a/model-a", thinking: "high" },
-      { model: "provider-b/model-b", thinking: "high" },
-      { model: "provider-c/model-c", thinking: "high" },
-    ],
-  }, ctx, undefined);
-  assert.deepEqual(assignments.map((item) => item.objective), [
-    "Which ownership shape best preserves the invariant?",
-    "Which ownership shape best preserves the invariant?",
-    "Which ownership shape best preserves the invariant?",
-  ]);
-  assert.deepEqual(assignments.map((item) => item.model), ["provider-a/model-a", "provider-b/model-b", "provider-c/model-c"]);
-  assert.equal(assignments[2]!.unavailableReason, "replicated lane 3 model is unavailable: provider-c/model-c");
+test("configured model targets retain their recorded ordered fallbacks", () => {
+  const targets = roleTargets(DEFAULT_MODEL_POLICY, "discovery.replicate");
+  assert.equal(targets.length, 4);
+  assert.deepEqual(targets[0], DEFAULT_MODEL_POLICY.roles["discovery.replicate"][0]);
+  assert.notEqual(targets[0], DEFAULT_MODEL_POLICY.roles["discovery.replicate"][0]);
 });

@@ -38,14 +38,14 @@ export async function runCli(argv: readonly string[], env: NodeJS.ProcessEnv = p
   const options = parseOptions(rest);
   switch (command) {
     case "status": return status(options);
-    case "adopt": return adopt(options, env);
     case "fork": return fork(options, env);
-    case "suspend": return lifecycle("suspended", options, env);
-    case "resume": return lifecycle("active", options, env);
-    case "abandon": return lifecycle("abandoned", options, env);
-    case "archive": return lifecycle("archived", options, env);
-    case "recovery": return recovery(options);
-    case "cleanup": return cleanup(options, env);
+    case "adopt":
+    case "suspend":
+    case "resume":
+    case "abandon":
+    case "archive":
+    case "recovery":
+    case "cleanup": throw new CliError("unsupported", `${command} is retired for current Workstreams. Use the coordinator capability tools; status is read-only historical inspection.`);
     default: throw new CliError("usage", `Unknown Workgraph command: ${command}`);
   }
 }
@@ -173,9 +173,9 @@ function parseOptions(args: readonly string[]): CliOptions {
 function usage(): string {
   return [
     "pi-workgraph <command> [options]",
-    "commands: status, adopt, fork, suspend, resume, abandon, archive, recovery, cleanup",
+    "commands: status, fork",
+    "status reads retained historical runs; current Workstreams are controlled by coordinator capability tools.",
     "common options: --run-id ID --state PATH --registry PATH --reason TEXT",
-    "adopt options: --session-id ID --session-file PATH --liveness alive|dead|unknown",
     "fork options: --parent-session-file PATH --target-cwd PATH --entry-id ID --workspace ID",
   ].join("\n");
 }

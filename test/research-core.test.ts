@@ -6,6 +6,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import test from "node:test";
 import coordinator from "../extensions/coordinator.js";
 import { WorkgraphEngine } from "../src/engine.js";
+import { WorkstreamStore } from "../src/workstream.js";
 import { GitRepository, runProcess } from "../src/git.js";
 import { herdrAgentName, type HerdrObservation, type VisibleWorkerRuntime, type WorkerLaunchRequest, type WorkerRecoveryRequest } from "../src/herdr.js";
 import { readWorkgraphReportResult } from "../src/pi-process.js";
@@ -94,7 +95,8 @@ test("research can create an answer workstream without a plan and deliver after 
 test("the registered research tool creates an unavailable workstream without begin", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-research-tool-"));
   const root = join(parent, "repo");
-  const previousHerdr = { env: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID, mode: process.env.PI_WORKGRAPH_MODE };
+  const previousHerdr = { env: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID, mode: process.env.PI_WORKGRAPH_MODE, agentDir: process.env.PI_CODING_AGENT_DIR };
+  process.env.PI_CODING_AGENT_DIR = join(parent, "agent");
   delete process.env.PI_WORKGRAPH_MODE;
   delete process.env.HERDR_ENV;
   delete process.env.HERDR_WORKSPACE_ID;
@@ -116,6 +118,7 @@ test("the registered research tool creates an unavailable workstream without beg
     appendEntry(type: string, data: unknown) { session.appendCustomEntry(type, data); },
     setStatus() {},
     sendUserMessage() {},
+    sendMessage() {},
   } as unknown as Parameters<typeof coordinator>[0];
   const context = {
     cwd: root,
@@ -128,20 +131,33 @@ test("the registered research tool creates an unavailable workstream without beg
     coordinator(fakePi);
     const tool = tools.find((candidate) => candidate.name === "workgraph_research");
     assert.ok(tool);
-    const result = await tool.execute("research", { question: "What is in value.txt?" }, undefined, undefined, context);
-    const details = (result as { details: { runId: string } }).details;
-    const statePath = join(root, ".git", "pi-workgraph", "runs", details.runId, "state.json");
-    const run = JSON.parse(await readFile(statePath, "utf8")) as WorkgraphRun;
-    assert.equal(run.outcome.kind, "answer");
-    assert.equal(run.control.planStatus, "absent");
-    assert.equal(run.discoveries[0]?.state, "unavailable");
-    assert.equal(run.attempts.length, 0);
-    assert.match((result as { content: Array<{ text: string }> }).content[0]?.text ?? "", /unavailable/);
+    const result = await tool.execute("research", { id: "inspect-value", question: "What is in value.txt?", expectedEvidence: ["Read value.txt."] }, undefined, undefined, context);
+    const details = (result as { details: { workstream: { statePath: string; assignments: Array<{ id: string }> } } }).details;
+    const workstream = JSON.parse(await readFile(details.workstream.statePath, "utf8")) as { assignments: Array<{ id: string }> };
+    assert.equal(workstream.assignments[0]?.id, "inspect-value");
+    assert.match((result as { content: Array<{ text: string }> }).content[0]?.text ?? "", /Queued inspect-value/);
+    // An extension notification cannot authorize the first maintained change.
+    const implement = tools.find((candidate) => candidate.name === "workgraph_implement");
+    assert.ok(implement);
+    await handlers.get("input")?.[0]?.({ source: "extension", text: "Implement a change" }, context);
+    const request = { id: "maintain-value", objective: "Maintain value", acceptance: ["value stays correct"] };
+    await assert.rejects(implement.execute("implement", request, undefined, undefined, context), /actual retained human input/);
+    await handlers.get("input")?.[0]?.({ source: "interactive", text: "Implement the maintained value change." }, context);
+    await implement.execute("implement", request, undefined, undefined, context);
+    const authorized = await WorkstreamStore.inspect(details.workstream.statePath);
+    assert.equal(authorized.inputs.length, 1);
+    assert.equal(authorized.intents.at(-1)?.version, 1);
+    assert.equal(authorized.assignments[1]?.capability, "implement");
+    // A reload reuses the same durable receipt rather than inventing new authority.
+    await handlers.get("session_shutdown")?.[0]?.({}, context);
+    await handlers.get("session_start")?.[0]?.({}, context);
+    assert.equal((await WorkstreamStore.inspect(details.workstream.statePath)).inputs.length, 1);
     await handlers.get("session_shutdown")?.[0]?.({}, context);
   } finally {
     if (previousHerdr.env === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = previousHerdr.env;
     if (previousHerdr.workspace === undefined) delete process.env.HERDR_WORKSPACE_ID; else process.env.HERDR_WORKSPACE_ID = previousHerdr.workspace;
     if (previousHerdr.mode === undefined) delete process.env.PI_WORKGRAPH_MODE; else process.env.PI_WORKGRAPH_MODE = previousHerdr.mode;
+    if (previousHerdr.agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousHerdr.agentDir;
     await rm(parent, { recursive: true, force: true });
   }
 });
