@@ -22,6 +22,7 @@
     "src",
     "skills",
     "README.md",
+    "DESIGN.md",
     "VERIFICATION.md"
   ],
   "scripts": {

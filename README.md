@@ -2,6 +2,7 @@
 
 Workgraph coordinates bounded repository work within a normal Pi conversation.
 Research, disposable experiments, maintained implementation, and selective review are capabilities, not phases of a mandatory pipeline.
+The durable rationale for this direction is in [DESIGN.md](DESIGN.md).
 
 ## Run
 
