@@ -1,29 +1,166 @@
-import type {
-  Agreement,
-  AssuranceFinding,
-  AssuranceReviewReport,
-  AssuranceSynthesisReport,
-  DiscoveryReport,
-  ImplementationReport,
-  VerificationReport,
-  WorkNodeSpec,
-} from "../src/types.js";
+import assert from "node:assert/strict";
+import { join, resolve } from "node:path";
+import type { ExtensionActions } from "@earendil-works/pi-coding-agent";
+import {
+  discoverAndLoadExtensions,
+  ExtensionRunner,
+  ModelRegistry,
+  ModelRuntime,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
+import { runProcess } from "../src/git.js";
+import type { WorkerReport } from "../src/types.js";
+import { WorkstreamStateSchema } from "../src/workstream.js";
 
-export const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-
-export const testOutcome = {
-  outcome: { kind: "product_change" as const, statement: "The requested behavior is present.", completionPredicate: "The requested behavior is verified." },
-  milestones: ["understand", "design", "decompose", "implement", "verify"].map((id) => ({ id, description: `Complete ${id}.` })),
+export const usage = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+export function researchReport(summary = "Evidence found."): WorkerReport {
+  return {
+    kind: "research",
+    status: "completed",
+    summary,
+    evidence: [],
+    findings: [],
+  };
+}
 
-export const commandAgreement: Agreement = {
-  outcome: "The requested behavior is present.", nonGoals: [], reuseDecision: "Reuse the existing fixture.", structure: "One bounded owner.", expectedScale: "Small.", verificationBoundary: "Observe the fixture output.", verificationCommands: ["true"], verificationMethod: "commands", verificationProcedure: "Run the composed-root command.", requiredEvidence: ["A successful composed-root command."], unresolvedDecisions: [], approvedAt: new Date(0).toISOString(),
-};
+export async function git(cwd: string, ...args: string[]): Promise<string> {
+  const result = await runProcess("git", ["-C", cwd, ...args], {
+    cwd,
+    timeoutMs: 30_000,
+  });
+  assert.equal(result.exitCode, 0, result.stderr);
+  return result.stdout.trim();
+}
 
-export function nodeSpec(id: string, claimedPaths: string[], dependencies: string[] = []): WorkNodeSpec { return { id, brief: { goal: `Implement ${id}.`, context: ["Use the fixture."], acceptance: [`${id} is complete.`], timeboxMinutes: 20, forbidden: ["Do not change unrelated files."], report: "Return the commit and verification evidence." }, claimedPaths, dependencies, verificationCommands: [], supersedes: [], guideModel: "provider/guide", executorModel: "provider/executor", guideThinking: "high", executorThinking: "high" }; }
-export function discoveryReport(summary = "Evidence found."): DiscoveryReport { return { kind: "discovery", status: "completed", summary, evidence: [], findings: [] }; }
-export function implementationReport(summary = "Implemented.", commit?: string, changedFiles?: string[]): ImplementationReport { return { kind: "implementation", status: "completed", summary, evidence: [], findings: [], ...(commit ? { commit } : {}), ...(changedFiles ? { changedFiles } : {}) }; }
-export function verificationReport(verdict: VerificationReport["verdict"] = "verified"): VerificationReport { return { kind: "verification", status: "completed", summary: verdict === "verified" ? "Product behavior verified." : "Product behavior was not verified.", evidence: [], findings: [], verdict }; }
-export function assuranceFinding(id: string, envelopeImpact: AssuranceFinding["envelopeImpact"] = "none"): AssuranceFinding { return { id, category: "correctness", violatedInvariant: `Invariant ${id} is violated.`, evidence: ["Concrete repository evidence."], reachableScenario: "A supported request reaches the affected branch.", consequence: "The requested result is incorrect.", simplestResponse: "Correct the affected branch.", complexityEffect: "neutral", confidence: "high", envelopeImpact }; }
-export function assuranceReview(responsibility: AssuranceReviewReport["responsibility"], findings: AssuranceFinding[] = []): AssuranceReviewReport { return { kind: "assurance_review", status: "completed", summary: findings.length > 0 ? "Found a material candidate." : "No material findings.", evidence: [], responsibility, recommendation: findings.length > 0 ? "changes_required" : "approve", findings }; }
-export function assuranceSynthesis(findings: AssuranceFinding[], disposition: "accept" | "dismiss" = "accept"): AssuranceSynthesisReport { const accepted = disposition === "accept" && findings.length > 0; return { kind: "assurance_synthesis", status: "completed", summary: findings.length > 0 ? "Candidates reconciled." : "No candidates to reconcile.", evidence: [], verdict: accepted ? findings.some((finding) => finding.envelopeImpact !== "none") ? "needs_decision" : "revision_required" : "approve", dispositions: findings.map((finding) => ({ finding, disposition, reason: disposition === "accept" ? "The evidence is material." : "The evidence is not material." })) }; }
+export function persistentSession(root: string, sessionDir: string) {
+  const session = SessionManager.create(root, sessionDir);
+  session.appendMessage({
+    role: "user",
+    content: "Fixture request",
+    timestamp: Date.now(),
+  });
+  session.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "Ready" }],
+    api: "test",
+    provider: "test",
+    model: "fixture",
+    usage,
+    stopReason: "stop",
+    timestamp: Date.now(),
+  });
+  return session;
+}
+
+/** Real Pi registration/context machinery; only session actions are replaced, never a model call. */
+export async function extensionFixture(
+  name: "coordinator" | "worker",
+  root: string,
+  parent: string,
+  actions: Partial<ExtensionActions> = {},
+) {
+  const session = persistentSession(root, join(parent, "sessions"));
+  const loaded = await discoverAndLoadExtensions(
+    [resolve(`extensions/${name}.ts`)],
+    root,
+    join(parent, "agent"),
+  );
+  assert.deepEqual(loaded.errors, []);
+  const models = await ModelRuntime.create({
+    authPath: join(parent, "auth.json"),
+    modelsPath: null,
+    modelsStorePath: join(parent, "catalog.json"),
+    refreshOnCreate: false,
+    allowModelNetwork: false,
+  });
+  const registry = new ModelRegistry(models);
+  const runner = new ExtensionRunner(
+    loaded.extensions,
+    loaded.runtime,
+    root,
+    session,
+    registry,
+  );
+  const messages: Parameters<ExtensionActions["sendMessage"]>[0][] = [];
+  const selected: string[] = [];
+  let level: ReturnType<ExtensionActions["getThinkingLevel"]> = "high";
+  let model = registry.getAll()[0];
+  const errors: string[] = [];
+  runner.onError((error) => errors.push(error.error));
+  runner.bindCore(
+    {
+      ...loaded.runtime,
+      appendEntry: (type, data) => {
+        session.appendCustomEntry(type, data);
+      },
+      sendMessage: (message) => {
+        messages.push(message);
+      },
+      getThinkingLevel: () => level,
+      setThinkingLevel: (next) => {
+        level = next;
+      },
+      setModel: async (next) => {
+        model = next;
+        selected.push(`${next.provider}/${next.id}`);
+        return true;
+      },
+      ...actions,
+    },
+    {
+      getModel: () => model,
+      getScopedModels: () => [],
+      isIdle: () => true,
+      isProjectTrusted: () => true,
+      getSignal: () => undefined,
+      abort() {},
+      hasPendingMessages: () => false,
+      shutdown() {},
+      getContextUsage: () => undefined,
+      compact() {
+        throw new Error("Unexpected compaction");
+      },
+      getSystemPrompt: () => "Fixture",
+    },
+  );
+  return {
+    runner,
+    session,
+    messages,
+    selected,
+    registry,
+    async call(toolName: string, params: unknown) {
+      const tool = runner.getToolDefinition(toolName);
+      assert.ok(tool, `Missing registered tool ${toolName}`);
+      assert.ok(
+        Value.Check(tool.parameters, params),
+        `Invalid fixture input to ${toolName}`,
+      );
+      return tool.execute(
+        "fixture",
+        params,
+        undefined,
+        undefined,
+        runner.createContext(),
+      );
+    },
+    async close() {
+      await runner.emit({ type: "session_shutdown", reason: "quit" });
+      assert.deepEqual(errors, []);
+    },
+  };
+}
+
+export function resultState(details: unknown) {
+  assert.ok(details && typeof details === "object" && "workstream" in details);
+  assert.ok(Value.Check(WorkstreamStateSchema, details.workstream));
+  return details.workstream;
+}

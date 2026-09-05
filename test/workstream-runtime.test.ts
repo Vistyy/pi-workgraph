@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import {
-  mkdtemp,
   mkdir,
+  mkdtemp,
   readFile,
   rm,
   symlink,
@@ -13,16 +13,17 @@ import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { GitRepository, runProcess } from "../src/git.js";
 import {
-  herdrAgentName,
   type HerdrObservation,
+  herdrAgentName,
   type VisibleWorkerRuntime,
   type WorkerLaunchRequest,
   type WorkerRecoveryRequest,
 } from "../src/herdr.js";
+import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { WorkgraphRegistry } from "../src/registry.js";
-import { WorkstreamRuntime } from "../src/workstream-runtime.js";
-import { WorkstreamStore, type WorkstreamState } from "../src/workstream.js";
 import type { WorkerIdentity, WorkerReport } from "../src/types.js";
+import { type WorkstreamState, WorkstreamStore } from "../src/workstream.js";
+import { WorkstreamRuntime } from "../src/workstream-runtime.js";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await runProcess("git", ["-C", cwd, ...args], {
@@ -41,7 +42,7 @@ const usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 const researchReport: WorkerReport = {
-  kind: "discovery",
+  kind: "research",
   status: "completed",
   summary: "Read fixture",
   evidence: [
@@ -56,6 +57,8 @@ class Worker implements VisibleWorkerRuntime {
   readonly identities = new Map<string, WorkerIdentity>();
   promptCount = 0;
   cleanupCount = 0;
+  deferWork = false;
+  status: HerdrObservation["status"] = "idle";
   failBeforeSubmission = false;
   failAfterSubmission = false;
   onWork: (request: WorkerLaunchRequest) => Promise<unknown> = async () =>
@@ -122,22 +125,20 @@ class Worker implements VisibleWorkerRuntime {
     if (this.failBeforeSubmission)
       throw new Error("fixture readiness interruption");
     await request.onIdentity?.(identity);
-    await this.produce(request);
+    if (!this.deferWork) await this.produce(request);
     if (this.failAfterSubmission)
       throw new Error("fixture uncertain prompt acknowledgment");
     await request.onSubmitted?.();
     return {
       identity,
       status: "working",
-      stage: "executing",
       observedAt: new Date().toISOString(),
     };
   }
   async observe(identity: WorkerIdentity): Promise<HerdrObservation> {
     return {
       identity,
-      status: "idle",
-      stage: "reporting",
+      status: this.status,
       observedAt: new Date().toISOString(),
     };
   }
@@ -208,6 +209,7 @@ async function fixture() {
   const registry = new WorkgraphRegistry(join(parent, "registry.sqlite"));
   const workers = new Worker();
   const delivered: string[] = [];
+  const errors: string[] = [];
   const runtimes: WorkstreamRuntime[] = [];
   function runtime(
     onResult: (id: string, state: WorkstreamState) => Promise<void> = async (
@@ -221,10 +223,12 @@ async function fixture() {
       store,
       repository,
       workers,
-      { workspaceId: "w1", parentSessionFile: sessionFile },
+      { workspaceId: "w1" },
       onResult,
-      () => undefined,
-      { registry, ...options },
+      (error) => {
+        errors.push(error.message);
+      },
+      { registry, policy: DEFAULT_MODEL_POLICY, ...options },
     );
     runtimes.push(value);
     return value;
@@ -259,6 +263,7 @@ async function fixture() {
     repository,
     workers,
     delivered,
+    errors,
     runtime,
     authority,
     dispose,
@@ -283,6 +288,10 @@ test("new runtime drives fresh research through native evidence, durable retryab
     await first.reconcile();
     const request = f.workers.requests[0];
     assert.ok(request);
+    assert.match(
+      await readFile(request.sessionFile, "utf8"),
+      /Expected evidence: File evidence/,
+    );
     assert.equal(
       (await readFile(request.sessionFile, "utf8")).includes(
         "UNRELATED_PARENT_SECRET",
@@ -418,6 +427,10 @@ test("experiments retain authorized artifacts without composition, including fai
     });
     f.workers.onWork = async (request) => {
       assert.equal(request.env.PI_WORKGRAPH_EXPERIMENT, "1");
+      assert.match(
+        await readFile(request.sessionFile, "utf8"),
+        /Expected evidence: Probe output/,
+      );
       await writeFile(join(request.cwd, "probe.txt"), "observed\n");
       await writeFile(join(request.cwd, "scratch.txt"), "discardable\n");
       return researchReport;
@@ -610,6 +623,100 @@ test("worker continuation uses an isolated new workspace and current generation,
     assert.notEqual(state.attempts[1]?.sessionFile, previous.sessionFile);
     assert.equal(state.attempts[1]?.models?.guide.model, "provider/other");
     assert.equal(state.attempts[1]?.models?.source, "override");
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("failed notification is not retried by polling and manual observed receipt permits completion without claiming transport success", async () => {
+  const f = await fixture();
+  try {
+    let notifications = 0;
+    const active = f.runtime(async () => {
+      notifications++;
+      throw new Error("uncertain transport");
+    });
+    await active.queue(research("read"));
+    await active.reconcile();
+    const state = await active.reconcile();
+    const result = state.results[0];
+    assert.ok(result);
+    await active.perform(() =>
+      f.store.disposition({
+        resultId: result.id,
+        status: "accepted",
+        reason: "Read the exact retained evidence through status",
+      }),
+    );
+    const completion = {
+      conclusion: "The bounded question is answered",
+      evidence: [{ label: "Read", observation: "value.txt says initial" }],
+      limitations: [],
+    };
+    await assert.rejects(
+      active.perform(() => f.store.complete(completion)),
+      /Pending result delivery/,
+    );
+    await active.reconcile();
+    await active.reconcile();
+    assert.equal(notifications, 1);
+    await active.perform(() =>
+      f.store.acknowledge(result.id, "Read the retained report through status"),
+    );
+    const acknowledged = await active.reconcile();
+    assert.equal(acknowledged.deliveries[0]?.state, "acknowledged");
+    assert.equal(acknowledged.deliveries[0]?.deliveredAt, undefined);
+    assert.equal(notifications, 1);
+    assert.equal(
+      (await active.perform(() => f.store.complete(completion))).lifecycle
+        .state,
+      "completed",
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("healthy startup/running is quiet; a blocked boundary is recorded once and cleared after observed recovery", async () => {
+  const f = await fixture();
+  try {
+    f.workers.deferWork = true;
+    const active = f.runtime();
+    await active.queue(research("read"));
+    await active.reconcile();
+    let state = await active.reconcile();
+    assert.equal(state.attempts[0]?.error, undefined);
+    assert.deepEqual(f.errors, []);
+    const request = f.workers.requests[0];
+    assert.ok(request);
+    const session = SessionManager.open(request.sessionFile);
+    session.appendCustomEntry("pi-workgraph-agent-running", {
+      runId: request.runId,
+      nodeId: request.nodeId,
+    });
+    f.workers.status = "working";
+    state = await active.reconcile();
+    assert.equal(state.attempts[0]?.submission, "started");
+    assert.equal(state.attempts[0]?.error, undefined);
+    assert.deepEqual(f.errors, []);
+    f.workers.status = "blocked";
+    await active.reconcile();
+    await active.reconcile();
+    assert.equal(f.errors.length, 1);
+    f.workers.status = "working";
+    state = await active.reconcile();
+    assert.equal(state.attempts[0]?.error, undefined);
+    assert.equal(state.attempts[0]?.attentionHistory?.length, 1);
+    await f.workers.produce(request);
+    f.workers.status = "idle";
+    state = await active.reconcile();
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.error, undefined);
+    assert.match(
+      state.attempts[0]?.attentionHistory?.[0]?.detail ?? "",
+      /blocked/,
+    );
+    assert.equal(f.errors.length, 1);
   } finally {
     await f.dispose();
   }

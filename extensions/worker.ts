@@ -1,80 +1,137 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Value } from "typebox/value";
+import { ThinkingSchema } from "../src/model-policy.js";
 import { isWorkerReport, reportSchemaForMode } from "../src/report-schema.js";
-import type { AssuranceResponsibility, EnvelopeImpact, ImplementationReport, WorkerMode, WorkerReport } from "../src/types.js";
-
-const configuredMode = readMode();
-const mode = configuredMode ?? "discovery";
-const runId = process.env.PI_WORKGRAPH_RUN_ID || "unknown-run";
-const nodeId = process.env.PI_WORKGRAPH_NODE_ID || "unknown-node";
-const responsibility = process.env.PI_WORKGRAPH_RESPONSIBILITY || "";
-const executorModel = process.env.PI_WORKGRAPH_EXECUTOR_MODEL || "";
-const executorThinking = process.env.PI_WORKGRAPH_EXECUTOR_THINKING || "high";
-const baseCommit = process.env.PI_WORKGRAPH_BASE_COMMIT || "";
-const startInExecutor = process.env.PI_WORKGRAPH_IMPLEMENTATION_START === "executor";
-
-const ReportSchema = reportSchemaForMode(mode);
-
-const TodoSchema = Type.Object({
-  items: Type.Array(Type.String({ minLength: 3 }), { minItems: 1, maxItems: 8 }),
-});
+import type {
+  ImplementationReport,
+  WorkerMode,
+  WorkerReport,
+} from "../src/types.js";
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
-  if (!configuredMode) return;
-  let phase: "guide" | "executor" = mode === "implementation" && !startInExecutor ? "guide" : "executor";
+  const mode = readMode();
+  if (!mode) return;
+  const runId = process.env.PI_WORKGRAPH_RUN_ID || "unknown-workstream";
+  const nodeId = process.env.PI_WORKGRAPH_NODE_ID || "unknown-attempt";
+  const generation = { runId, nodeId };
+  const executorModel = process.env.PI_WORKGRAPH_EXECUTOR_MODEL || "";
+  const executorThinking = process.env.PI_WORKGRAPH_EXECUTOR_THINKING || "high";
+  const baseCommit = process.env.PI_WORKGRAPH_BASE_COMMIT || "";
+  const continued =
+    process.env.PI_WORKGRAPH_IMPLEMENTATION_START === "executor";
+  const experiment = process.env.PI_WORKGRAPH_EXPERIMENT === "1";
+  let phase: "guide" | "executor" =
+    mode === "implementation" && !continued ? "guide" : "executor";
   let todos: string[] = [];
   let switchError: string | undefined;
-  let switchedAt: string | undefined = startInExecutor ? new Date().toISOString() : undefined;
+  let switchedAt: string | undefined;
 
   pi.registerTool({
     name: "workgraph_todo",
     label: "Workgraph TODO",
-    description: "Record the bounded local implementation TODO list before the first edit.",
-    parameters: TodoSchema,
-    async execute(_toolCallId, params) {
-      if (mode !== "implementation") throw new Error("workgraph_todo is only available during implementation.");
-      if (phase !== "guide") throw new Error("A Local Prewalk TODO list can only be recorded before the first edit.");
-      todos = [...params.items];
-      pi.appendEntry("pi-workgraph-worker-state", { runId, nodeId, phase, todos });
+    description:
+      "Record a bounded local implementation TODO before the first edit.",
+    parameters: Type.Object({
+      items: Type.Array(Type.String({ minLength: 3 }), {
+        minItems: 1,
+        maxItems: 8,
+      }),
+    }),
+    async execute(_id, params) {
+      if (mode !== "implementation" || phase !== "guide")
+        throw new Error(
+          "Local Prewalk TODOs belong before the first implementation edit.",
+        );
+      todos = params.items;
+      pi.appendEntry("pi-workgraph-worker-state", {
+        ...generation,
+        phase,
+        todos,
+      });
       return {
-        content: [{ type: "text", text: `Recorded ${todos.length} Local Prewalk TODO item(s).` }],
+        content: [
+          {
+            type: "text",
+            text: `Recorded ${todos.length} Local Prewalk items.`,
+          },
+        ],
         details: { items: todos },
       };
     },
   });
-
   pi.registerTool({
     name: "workgraph_report",
     label: "Workgraph Report",
-    description: "Return the typed terminal report for this bounded Workgraph assignment.",
-    promptSnippet: "Finish the assigned work with a typed report",
-    promptGuidelines: ["Use workgraph_report as the final action for the assigned work, with actual evidence and explicit limitations."],
-    parameters: ReportSchema,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!isWorkerReport(params)) throw new Error("Report does not satisfy the Workgraph report contract.");
-      if (params.kind !== mode) throw new Error(`Report kind must be ${mode}.`);
-      if (mode === "assurance_review" && params.kind === mode) {
-        if (params.responsibility !== responsibility) throw new Error(`Assurance responsibility must be ${responsibility}.`);
-        const invalidId = params.findings.find((finding) => !finding.id.startsWith(`${responsibility}-`));
-        if (invalidId) throw new Error(`Assurance finding ids must start with ${responsibility}-: ${invalidId.id}`);
+    description: "Return the terminal report for this bounded assignment.",
+    promptSnippet: "Finish assigned work with a typed report",
+    promptGuidelines: [
+      "Use workgraph_report as the final action, with actual evidence and explicit limitations.",
+    ],
+    parameters: reportSchemaForMode(mode),
+    async execute(_id, params, _signal, _update, ctx) {
+      if (!isWorkerReport(params) || params.kind !== mode)
+        throw new Error(`Report must satisfy the ${mode} contract.`);
+      if (params.kind === "implementation" && params.status === "completed") {
+        if (phase !== "executor")
+          throw new Error(
+            "Completed implementation requires the first-edit model transition.",
+          );
+        if (switchError)
+          throw new Error(`Executor model transition failed: ${switchError}`);
+        if (!baseCommit)
+          throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
+        const status = await git(
+          pi,
+          ctx.cwd,
+          ["status", "--porcelain", "--untracked-files=all"],
+          true,
+        );
+        if (status)
+          throw new Error(
+            `Commit and leave a clean worktree before reporting:\n${status}`,
+          );
+        const [commit, parent, ...extraParents] = (
+          await git(pi, ctx.cwd, ["rev-list", "--parents", "-n", "1", "HEAD"])
+        ).split(" ");
+        if (!commit || parent !== baseCommit || extraParents.length)
+          throw new Error(
+            "A completed implementation requires exactly one direct commit on the supplied base.",
+          );
+        const changedText = await git(
+          pi,
+          ctx.cwd,
+          ["diff", "--name-only", "--no-renames", baseCommit, commit],
+          true,
+        );
+        const report: ImplementationReport = {
+          ...params,
+          commit,
+          changedFiles: changedText.split("\n").filter(Boolean).sort(),
+        };
+        return terminalReport(report, {
+          todos,
+          todoRecorded: todos.length > 0,
+          switchedAt,
+          continued,
+        });
       }
-      if (mode === "implementation" && params.kind === mode && params.status === "completed") {
-        if (phase !== "executor") throw new Error("A completed implementation can only be reported after the first-edit model transition.");
-        if (switchError) throw new Error(`Executor model transition failed: ${switchError}`);
-        if (!baseCommit) throw new Error("PI_WORKGRAPH_BASE_COMMIT is required for implementation reports.");
-        const status = await git(pi, ctx.cwd, ["status", "--porcelain", "--untracked-files=all"], true);
-        if (status) throw new Error(`Commit the implementation and leave a clean worktree before reporting:\n${status}`);
-        const commit = await git(pi, ctx.cwd, ["rev-parse", "HEAD"]);
-        if (commit === baseCommit) throw new Error("A completed implementation requires one new commit.");
-        const changedText = await git(pi, ctx.cwd, ["diff", "--name-only", "--no-renames", baseCommit, commit], true);
-        const changedFiles = changedText ? changedText.split("\n").filter(Boolean).sort() : [];
-        const report: ImplementationReport = { ...params, commit, changedFiles };
-        return terminalReport(report, { todos, todoRecorded: todos.length > 0, switchedAt, continued: startInExecutor });
-      }
-
-      if (mode !== "implementation" && process.env.PI_WORKGRAPH_EXPERIMENT !== "1") {
-        const status = await git(pi, ctx.cwd, ["status", "--porcelain", "--untracked-files=all"], true);
-        if (status) throw new Error(`${mode} workers are read-only for product files, but the repository is dirty:\n${status}`);
+      if (mode !== "implementation" && !experiment) {
+        const status = await git(
+          pi,
+          ctx.cwd,
+          ["status", "--porcelain", "--untracked-files=all"],
+          true,
+        );
+        if (status)
+          throw new Error(
+            `${mode} workers are read-only, but the repository is dirty:\n${status}`,
+          );
+        if (
+          baseCommit &&
+          (await git(pi, ctx.cwd, ["rev-parse", "HEAD"])) !== baseCommit
+        )
+          throw new Error("Read-only worker changed the assigned revision.");
       }
       return terminalReport(params, { todos, switchedAt, switchError });
     },
@@ -82,160 +139,211 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
 
   pi.on("tool_execution_end", async (event, ctx) => {
     if (mode !== "implementation" || phase !== "guide") return;
-    const directEdit = !event.isError && (event.toolName === "edit" || event.toolName === "write");
+    const directEdit =
+      !event.isError &&
+      (event.toolName === "edit" || event.toolName === "write");
     if (!directEdit) {
       if (!baseCommit) return;
-      const diff = await pi.exec("git", ["-C", ctx.cwd, "diff", "--quiet", baseCommit, "--"]);
-      const status = await git(pi, ctx.cwd, ["status", "--porcelain", "--untracked-files=all"], true);
-      if (diff.code !== 0 && diff.code !== 1) throw new Error(`Cannot observe guide mutation: ${diff.stderr}`);
-      if (diff.code === 0 && !status) return;
+      // Any tool can mutate or commit. Observe Git, not shell-command spelling.
+      const status = await git(
+        pi,
+        ctx.cwd,
+        ["status", "--porcelain", "--untracked-files=all"],
+        true,
+      );
+      if (
+        !status &&
+        (await git(pi, ctx.cwd, ["rev-parse", "HEAD"])) === baseCommit
+      )
+        return;
     }
     try {
-      const [provider, modelId] = splitModel(executorModel);
-      const model = ctx.modelRegistry.find(provider, modelId);
-      if (!model) throw new Error(`Executor model is unavailable: ${executorModel}`);
-      const selected = await pi.setModel(model);
-      if (!selected) throw new Error(`Executor model has no usable credentials: ${executorModel}`);
-      const levels = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-      const selectedThinking = levels.find((level) => level === executorThinking);
-      if (!selectedThinking) throw new Error(`Invalid executor thinking: ${executorThinking}`);
-      pi.setThinkingLevel(selectedThinking);
+      const slash = executorModel.indexOf("/");
+      if (slash <= 0)
+        throw new Error(`Invalid executor model: ${executorModel}`);
+      const model = ctx.modelRegistry.find(
+        executorModel.slice(0, slash),
+        executorModel.slice(slash + 1),
+      );
+      if (!model)
+        throw new Error(`Executor model is unavailable: ${executorModel}`);
+      if (!(await pi.setModel(model)))
+        throw new Error(
+          `Executor model has no usable credentials: ${executorModel}`,
+        );
+      if (!Value.Check(ThinkingSchema, executorThinking))
+        throw new Error(`Invalid executor thinking: ${executorThinking}`);
+      pi.setThinkingLevel(executorThinking);
       phase = "executor";
+      switchError = undefined;
       switchedAt = new Date().toISOString();
-      pi.appendEntry("pi-workgraph-worker-state", { runId, nodeId, phase, todos, executorModel, executorThinking, switchedAt });
+      pi.appendEntry("pi-workgraph-worker-state", {
+        ...generation,
+        phase,
+        todos,
+        executorModel,
+        executorThinking,
+        switchedAt,
+      });
     } catch (error) {
       switchError = error instanceof Error ? error.message : String(error);
-      pi.appendEntry("pi-workgraph-worker-state", { runId, nodeId, phase, todos, switchError });
+      pi.appendEntry("pi-workgraph-worker-state", {
+        ...generation,
+        phase,
+        todos,
+        switchError,
+      });
     }
   });
-
   pi.on("model_select", (event) => {
-    pi.appendEntry("pi-workgraph-effective-model", { runId, nodeId, model: `${event.model.provider}/${event.model.id}`, thinking: pi.getThinkingLevel() });
+    pi.appendEntry("pi-workgraph-effective-model", {
+      ...generation,
+      model: `${event.model.provider}/${event.model.id}`,
+      thinking: pi.getThinkingLevel(),
+    });
   });
   pi.on("thinking_level_select", (_event, ctx) => {
-    if (ctx.model) pi.appendEntry("pi-workgraph-effective-model", { runId, nodeId, model: `${ctx.model.provider}/${ctx.model.id}`, thinking: pi.getThinkingLevel() });
+    if (ctx.model)
+      pi.appendEntry("pi-workgraph-effective-model", {
+        ...generation,
+        model: `${ctx.model.provider}/${ctx.model.id}`,
+        thinking: pi.getThinkingLevel(),
+      });
   });
-
-  pi.on("session_start", async (_event, ctx) => {
-    const previous = [...ctx.sessionManager.getBranch()].reverse().find((entry) => {
-      if (entry.type !== "custom" || entry.customType !== "pi-workgraph-worker-state") return false;
-      const data = entry.data;
-      return data !== null && typeof data === "object" && "runId" in data && "nodeId" in data && data.runId === runId && data.nodeId === nodeId;
+  pi.on("session_start", (_event, ctx) => {
+    for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+      if (
+        entry.type !== "custom" ||
+        entry.customType !== "pi-workgraph-worker-state"
+      )
+        continue;
+      const data: unknown = entry.data;
+      if (
+        !data ||
+        typeof data !== "object" ||
+        !("runId" in data) ||
+        !("nodeId" in data) ||
+        data.runId !== runId ||
+        data.nodeId !== nodeId
+      )
+        continue;
+      if ("todos" in data && Array.isArray(data.todos))
+        todos = data.todos.filter(
+          (item): item is string => typeof item === "string",
+        );
+      if ("switchedAt" in data && typeof data.switchedAt === "string")
+        switchedAt = data.switchedAt;
+      if ("phase" in data && data.phase === "executor") phase = "executor";
+      if ("switchError" in data && typeof data.switchError === "string")
+        switchError = data.switchError;
+      break;
+    }
+  });
+  pi.on("agent_start", (_event, ctx) => {
+    if (ctx.model)
+      pi.appendEntry("pi-workgraph-effective-model", {
+        ...generation,
+        model: `${ctx.model.provider}/${ctx.model.id}`,
+        thinking: pi.getThinkingLevel(),
+      });
+    pi.appendEntry("pi-workgraph-agent-running", {
+      ...generation,
+      startedAt: new Date().toISOString(),
     });
-    const data = previous?.type === "custom" ? previous.data : undefined;
-    if (!data || typeof data !== "object") return;
-    if ("todos" in data && Array.isArray(data.todos)) todos = data.todos.filter((item): item is string => typeof item === "string");
-    if ("switchedAt" in data && typeof data.switchedAt === "string") switchedAt = data.switchedAt;
-    if ("phase" in data && data.phase === "executor") phase = "executor";
   });
-
-  pi.on("agent_start", async (_event, ctx) => {
-    if (ctx.model) pi.appendEntry("pi-workgraph-effective-model", { runId, nodeId, model: `${ctx.model.provider}/${ctx.model.id}`, thinking: pi.getThinkingLevel() });
-    pi.appendEntry("pi-workgraph-agent-running", { runId, nodeId, startedAt: new Date().toISOString() });
+  pi.on("agent_settled", () => {
+    pi.appendEntry("pi-workgraph-agent-settled", {
+      ...generation,
+      settledAt: new Date().toISOString(),
+    });
   });
-
-  pi.on("agent_settled", async () => {
-    pi.appendEntry("pi-workgraph-agent-settled", { runId, nodeId, settledAt: new Date().toISOString() });
-  });
-
   pi.on("context", (event) => {
-    const withoutGuide = event.messages.filter((message) => {
-      const custom = message as { role?: string; customType?: string };
-      return !(phase === "executor" && custom.role === "custom" && custom.customType === "pi-workgraph-guide");
-    });
-    if (mode !== "implementation" || phase !== "executor") return { messages: withoutGuide };
+    if (mode !== "implementation" || phase !== "executor") return;
     return {
       messages: [
-        ...withoutGuide,
+        ...event.messages.filter(
+          (message) =>
+            !(
+              message.role === "custom" &&
+              message.customType === "pi-workgraph-guide"
+            ),
+        ),
         {
           role: "custom" as const,
           customType: "pi-workgraph-executor",
           content: executorInstructions(),
           display: false,
-          details: { runId, nodeId },
+          details: generation,
           timestamp: Date.now(),
         },
       ],
     };
   });
-
   pi.on("before_agent_start", () => ({
     message: {
-      customType: mode === "implementation" && phase === "guide" ? "pi-workgraph-guide" : `pi-workgraph-${mode}`,
-      content: modeInstructions(),
+      customType:
+        mode === "implementation" && phase === "guide"
+          ? "pi-workgraph-guide"
+          : `pi-workgraph-${mode}`,
+      content:
+        mode === "implementation"
+          ? phase === "guide"
+            ? guideInstructions
+            : executorInstructions()
+          : mode === "review"
+            ? reviewInstructions
+            : experiment
+              ? experimentInstructions
+              : researchInstructions,
       display: false,
-      details: { runId, nodeId, mode, responsibility },
+      details: generation,
     },
   }));
 }
 
 function terminalReport(report: WorkerReport, state: Record<string, unknown>) {
   return {
-    content: [{ type: "text" as const, text: `${report.kind} ${report.status}: ${report.summary}` }],
+    content: [
+      {
+        type: "text" as const,
+        text: `${report.kind} ${report.status}: ${report.summary}`,
+      },
+    ],
     details: { report, state },
     terminate: true,
   };
 }
-
-export function verificationWorkerInstructions(): string {
-  return `[WORKGRAPH PRODUCT VERIFICATION - ASSIGNED VERIFIER]\nThis session is already the independent product-verification worker assigned by Workgraph for the objective.\nDirectly execute the supplied verification procedure and report what you observe.\nDo not create, adopt, plan, schedule, verify, assure, judge, or otherwise coordinate another Workgraph, and do not delegate this assignment.\nDo not edit product files.\nUse the real product surface when commands alone cannot prove the behavior.\nRecord concrete artifacts such as screenshots, browser state, console or network output, traces, profiles, or stored values.\nDo not favor a verified verdict: return failed, inconclusive, or escalated when the observations warrant it.\nReturn inconclusive when the required browser, CLI, or TUI control surface is unavailable.\nReturn verified only when the evidence directly establishes the required scenarios.`;
-}
-
-function modeInstructions(): string {
-  if (mode === "discovery" && process.env.PI_WORKGRAPH_EXPERIMENT === "1") {
-    return "[WORKGRAPH EXPERIMENT]\nAnswer the assigned question within the explicitly permitted effects and stopping condition. Work only in this disposable worktree. Retain the named artifacts and report direct observations, failures and limits with workgraph_report. Do not compose or publish experimental code or delegate another worker.";
-  }
-  if (mode === "discovery") {
-    return `[WORKGRAPH DISCOVERY]\nInvestigate only the assigned responsibility.\nUse read-only repository evidence and classify each item as direct, inference, conflict, or unknown.\nFor blast-radius-sensitive changes, identify and prove the external safety fact at the actual dependent boundary.\nDo not implement, edit files, or expand the question.\nFinish with a concise discovery report and account for unknowns that could change the implementation envelope.`;
-  }
-  if (mode === "review") {
-    return `[WORKGRAPH REVIEW]\nInspect only the assigned subject and concern. Review the exact revision or proposal named in the assignment. Do not edit files or coordinate another Workgraph. Return concrete evidence and only actionable findings; zero findings is valid.`;
-  }
-  if (mode === "verification") return verificationWorkerInstructions();
-  if (mode === "assurance_review") {
-    return assuranceReviewInstructions(responsibility as AssuranceResponsibility);
-  }
-  if (mode === "assurance_synthesis") {
-    return `[WORKGRAPH ASSURANCE SYNTHESIS]\nReconcile the three responsibility reports without inventing findings.\nDismiss duplicate, impossible, immaterial, speculative, stylistic, or unsupported findings.\nClassify a supported but non-required improvement as optional.\nAccept only findings whose invariant, evidence, reachable scenario, consequence, and simplest response establish required correction work.\nPrefer deletion and simpler ownership over additive correction.\nAPPROVE with no findings is valid.\nClassify an accepted envelope-changing finding as needs_decision and an accepted internal correction as revision_required.`;
-  }
-  if (startInExecutor) return executorInstructions();
-  return `[WORKGRAPH LOCAL PREWALK - GUIDE PHASE]\nInspect the inherited trajectory and current worktree before deciding how to proceed.\nBefore the first edit, call workgraph_todo with no more than eight concrete local items.\nIf omitted, the report will honestly record that no Local Prewalk TODO list was supplied instead of blocking an otherwise valid implementation.\nThen make the smallest useful first edit through edit or write.\nThe runtime will switch models after that edit.\nIf evidence requires changing the approved envelope, do not edit and report an escalation instead.\nDo not report completion during the guide phase.`;
-}
-
-function assuranceReviewInstructions(role: AssuranceResponsibility): string {
-  const focus = role === "behavior"
-    ? "Inspect realistic correctness, integration, failures, concurrency, recovery, security, and performance only where relevant."
-    : role === "structure"
-      ? "Inspect deletion opportunities, simplicity, types, ownership, boundaries, abstractions, reader load, and maintainability."
-      : "Inspect whether evidence proves distinct meaningful invariants without duplicate or implementation-detail test bloat.";
-  return `[WORKGRAPH ASSURANCE - ${role.toUpperCase()}]\n${focus}\nStay within this responsibility and remain read-only.\nDo not seek a quota of issues, and treat approval with zero findings as a valid result.\nReject impossible, immaterial, duplicate, speculative, stylistic, or unsupported concerns.\nPrefix every finding id with ${role}-.\nEvery proposed finding must name the violated invariant, concrete evidence, a reachable scenario, material consequence, simplest response, confidence, envelope impact, and complexity effect.`;
-}
-
+const researchInstructions =
+  "[WORKGRAPH RESEARCH]\nAnswer only the assigned question using read-only evidence. Supply the requested observations and retain material unknowns. Do not edit product files or delegate another worker. Finish with workgraph_report.";
+const experimentInstructions =
+  "[WORKGRAPH EXPERIMENT]\nAnswer the question within the explicitly permitted effects and stop condition in this disposable worktree. Retain the named artifacts and report direct observations, failures and limits. Do not compose, publish, or delegate another worker. Finish with workgraph_report.";
+const reviewInstructions =
+  "[WORKGRAPH REVIEW]\nReview only the identified subject and concern, at the named revision when supplied. Execute the assigned verification procedure when requested and authorized. Do not edit product files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
+const guideInstructions =
+  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current worktree. Record at most eight concrete local TODO items with workgraph_todo before the first edit. Missing TODO telemetry does not block an otherwise valid implementation. Make the first useful edit; the runtime then switches models. If required work crosses the authorized scope, report escalation without editing. Do not report completion during the guide phase.";
 function executorInstructions(): string {
-  return `[WORKGRAPH EXECUTOR PHASE]\nContinue the same node trajectory${startInExecutor ? " from the retained implementer session" : " after the guide's first edit"}.\nComplete only the bounded brief for node ${nodeId}.\nRun the node verification commands from the objective.\nCreate exactly one commit directly on the provided worker branch and leave the worktree clean.\nThen return a completed implementation report with evidence.\nIf a required change crosses the approved envelope, stop and report an escalation.`;
+  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory. Complete the bounded assignment, run its verification, create exactly one direct commit on the supplied base, and leave the worktree clean. Return workgraph_report with evidence. Escalate required work beyond the authorized scope.";
 }
-
-async function git(pi: ExtensionAPI, cwd: string, args: string[], allowEmpty = false): Promise<string> {
+async function git(
+  pi: ExtensionAPI,
+  cwd: string,
+  args: string[],
+  allowEmpty = false,
+): Promise<string> {
   const result = await pi.exec("git", ["-C", cwd, ...args]);
-  if (result.code !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+  if (result.code !== 0)
+    throw new Error(
+      `git ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
+    );
   const output = result.stdout.trim();
-  if (!allowEmpty && !output) throw new Error(`git ${args.join(" ")} returned no output.`);
+  if (!allowEmpty && !output)
+    throw new Error(`git ${args.join(" ")} returned no output.`);
   return output;
 }
-
-function splitModel(selector: string): [string, string] {
-  const slash = selector.indexOf("/");
-  if (slash <= 0 || slash === selector.length - 1) throw new Error(`Model selector must be provider/model: ${selector}`);
-  return [selector.slice(0, slash), selector.slice(slash + 1)];
-}
-
 function readMode(): WorkerMode | undefined {
   const value = process.env.PI_WORKGRAPH_MODE;
   if (!value) return undefined;
-  if (value === "discovery" || value === "review" || value === "implementation" || value === "verification" || value === "assurance_review" || value === "assurance_synthesis") return value;
+  if (value === "research" || value === "review" || value === "implementation")
+    return value;
   throw new Error(`Invalid PI_WORKGRAPH_MODE: ${value}`);
-}
-
-export function isEnvelopeChangingFinding(impact: EnvelopeImpact): boolean {
-  return impact !== "none";
 }

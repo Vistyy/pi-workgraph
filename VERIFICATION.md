@@ -1,51 +1,27 @@
-# Pi Workgraph verification
+# Workgraph verification boundaries
 
-The accepted result is the explicit outcome contract and its observed terminal operation.
+## Pi and Herdr
 
-## Required checks
+Deterministic adapters cannot establish ordinary Pi package loading, native Herdr identity, automatic coordinator continuation, or an actual guide-to-executor model transition.
+Changes to those boundaries need a normal visible Pi operation against the exact candidate in addition to focused contract checks.
+A missing integration, trust prompt, unavailable model, or absent native identity is an evidence limitation, not permission to bypass approval or claim settlement.
+Herdr's idle/done observation can lag Pi events; native attempt-generation markers establish settlement.
 
-Run `pnpm check` to type-check the runtime and execute deterministic tests.
+## Persistence and external effects
 
-Run `pnpm pack --dry-run` to verify that the package contains the executable fallback, runtime sources, extensions, skills, and current documentation.
+A retained report, successful tool response, or worker statement alone does not establish Git composition, artifact retention, or resource cleanup.
+Those claims require the exact repository revision, retained bytes, or resource identity at the dependent boundary.
+Interrupted operations can leave effects despite an uncertain response; recovery must inspect those effects before retrying.
+Delivery is recoverable and identifier-based, not exactly once.
+Tests must distinguish notification transport, explicit coordinator receipt, report validity, and evidence disposition.
 
-Run `pnpm smoke:herdr` when Herdr 0.8.2 is available inside a Herdr-managed pane.
+Lease and ownership checks use real isolated SQLite storage.
+Git safety checks use disposable real repositories and preserve mismatched or unattributed resources.
+Human authority tests enter through Pi's registered input/tool path, including rejection of extension-generated authority.
+Historical work keeps its original intent scope; current maintained composition requires current intent.
 
-Run `pnpm smoke:real` and `pnpm smoke:coordinator` from that environment when the configured models are authenticated.
+## Environment and limits
 
-The deterministic tests cover answer, decision, operation, and product-change outcomes, milestone persistence, agreement and plan gating, isolated composition, recovery, visible worker control, lifecycle transitions, evidence routing, assurance, package metadata, and implementation report behavior when optional Local Prewalk telemetry is absent.
-
-## Evidence boundary
-
-Direct evidence crosses the required product boundary.
-
-Inference records reasoning that is not a direct observation.
-
-Conflicts and unknowns remain explicit and cannot be treated as success.
-
-Product verification is tied to the exact composed revision named by the run.
-
-Product verification prefers repository-native harnesses, then a project-local verification skill, then Workgraph-owned browser or CLI/TUI control guidance.
-
-A missing required control surface is inconclusive.
-
-The live Herdr smoke creates a disposable repository, isolated registry, and new workspace.
-
-It verifies unnamed current-session rebind and records exact Herdr cleanup before Git worktree cleanup for a live worker.
-
-The real smoke requires typed reports from replicated discovery, concurrent visible implementation, and assurance, and it verifies durable coordinator wakes, exact composition, command verification, final judgment, and cleanup for every attempt.
-
-It fails promptly with node and attempt diagnostics if execution becomes idle while implementation work remains failed or escalated.
-
-The coordinator smoke loads the candidate extension in an isolated Pi RPC process, supplies only an initial request and the exact approval reply, and requires automatic wake-driven continuation through independent verification, assurance, and judgment.
-
-Each smoke verifies that only its root tab remains before closing its exact disposable workspace.
-
-## Limits
-
-Evidence covers the local supported Node.js, Pi, Git, Herdr 0.8.2, and configured-model environment.
-
-It does not establish arbitrary provider, operating-system, repository, or interactive-control behavior.
-
-Workers are isolated Git worktrees rather than operating-system sandboxes.
-
-The command fallback does not replace Pi's normal package loading or coordinator conversation.
+Live evidence is specific to the tested Node.js, Pi, Git, Herdr, model configuration, and candidate revision.
+Worktree isolation does not constrain arbitrary filesystem, network, or credential access by a worker.
+Verification fixtures must not change user-global configuration or trust decisions, and retained credential-bearing evidence must stay private.

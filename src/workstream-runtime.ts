@@ -1,37 +1,29 @@
-import { access, cp, lstat, mkdir, realpath } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
+import { access, cp, lstat, mkdir, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
-import { GitRepository, type WorktreePlacement } from "./git.js";
+import type { GitRepository, WorktreePlacement } from "./git.js";
 import { herdrAgentName, type VisibleWorkerRuntime } from "./herdr.js";
+import { loadModelPolicy, type ModelPolicy } from "./model-policy.js";
 import {
+  createWorkerSession,
   effectiveModelObservations,
-  forkSession,
   hasNativeAgentSettled,
   hasNativeAgentStarted,
   readTerminalText,
   readWorkgraphReportResult,
 } from "./pi-process.js";
-import { WorkgraphRegistry, type Lease, type LeaseOwner } from "./registry.js";
-import {
-  loadModelPolicy,
-  roleTargets,
-  type ModelPolicy,
-} from "./model-policy.js";
-import type { ThinkingLevel, WorkerIdentity } from "./types.js";
-import {
+import { type Lease, type LeaseOwner, WorkgraphRegistry } from "./registry.js";
+import type { ThinkingLevel } from "./types.js";
+import type {
+  RetainedArtifact,
+  WorkAssignment,
+  WorkAttempt,
+  WorkstreamState,
   WorkstreamStore,
-  type RetainedArtifact,
-  type WorkAssignment,
-  type WorkAttempt,
-  type WorkstreamState,
 } from "./workstream.js";
 
 export interface WorkstreamLaunch {
   workspaceId: string;
-  parentSessionFile: string;
-  model?: string;
-  thinking?: ThinkingLevel;
-  executor?: { model: string; thinking: ThinkingLevel };
 }
 export interface QueueOptions {
   model?: string;
@@ -52,6 +44,8 @@ export class WorkstreamRuntime {
   private heartbeat: ReturnType<typeof setInterval> | undefined;
   private tail: Promise<unknown> = Promise.resolve();
   private stopped = false;
+  private polling = false;
+  private reconciliationError: string | undefined;
   private lease: Lease | undefined;
   private readonly deliveryOwner = randomUUID();
   private readonly registry: WorkgraphRegistry;
@@ -80,12 +74,9 @@ export class WorkstreamRuntime {
   private async claim(options: RuntimeOwnership): Promise<void> {
     const state = await this.store.load();
     this.registry.indexWorkstream({
+      ...state,
       runId: state.id,
-      statePath: state.statePath,
-      projectRoot: state.projectRoot,
-      gitCommonDir: state.gitCommonDir,
       lifecycle: state.lifecycle.state,
-      updatedAt: state.updatedAt,
     });
     const owner = options.owner ?? state.coordinator;
     this.lease = this.registry.acquire(
@@ -93,7 +84,6 @@ export class WorkstreamRuntime {
       owner,
       new Date(),
       options.priorOwnerLiveness ?? "unknown",
-      true,
     );
     this.store.bindMutationGuard(() => this.assertOwnership());
     if (
@@ -101,9 +91,8 @@ export class WorkstreamRuntime {
       owner.sessionFile !== state.coordinator.sessionFile
     ) {
       await this.store.adopt(owner);
-      this.registry.bind(state.id, owner);
     }
-    this.policy = options.policy ?? (await loadModelPolicy());
+    this.policy = options.policy;
     this.heartbeat = setInterval(() => {
       try {
         this.assertOwnership();
@@ -137,7 +126,22 @@ export class WorkstreamRuntime {
   start(): void {
     if (this.timer || this.stopped) return;
     this.timer = setInterval(() => {
-      void this.reconcile().catch((error) => this.onError(asError(error)));
+      if (this.polling) return;
+      this.polling = true;
+      void this.reconcile()
+        .then(() => {
+          this.reconciliationError = undefined;
+        })
+        .catch((error) => {
+          const detail = asError(error).message;
+          if (detail !== this.reconciliationError) {
+            this.reconciliationError = detail;
+            this.onError(asError(error));
+          }
+        })
+        .finally(() => {
+          this.polling = false;
+        });
     }, 1_000);
     this.timer.unref();
   }
@@ -160,36 +164,28 @@ export class WorkstreamRuntime {
     options: QueueOptions = {},
   ): Promise<WorkstreamState> {
     return this.perform(async () => {
-      const policy = this.policy;
-      if (!policy) throw new Error("Model policy is unavailable.");
+      const policy = this.policy ?? (await loadModelPolicy());
       const role =
         input.capability === "implement"
           ? "implementation.guide"
           : input.capability === "review"
-            ? "verification.product"
-            : "discovery.evidence";
-      const guide = roleTargets(policy, role)[0];
-      if (!guide) throw new Error(`No model configured for ${role}.`);
+            ? "review"
+            : "research";
+      const guide = policy.roles[role];
       const executor =
         input.capability === "implement"
-          ? (options.executor ??
-            this.launch.executor ??
-            roleTargets(policy, "implementation.executor")[0])
+          ? (options.executor ?? policy.roles["implementation.executor"])
           : undefined;
       return this.store.enqueue(input, {
         id: `attempt-${randomUUID()}`,
         models: {
           guide: {
-            model: options.model ?? this.launch.model ?? guide.model,
-            thinking:
-              options.thinking ?? this.launch.thinking ?? guide.thinking,
+            model: options.model ?? guide.model,
+            thinking: options.thinking ?? guide.thinking,
           },
           ...(executor ? { executor } : {}),
           source:
-            options.model ||
-            options.thinking ||
-            options.executor ||
-            this.launch.model
+            options.model || options.thinking || options.executor
               ? "override"
               : "policy",
         },
@@ -208,6 +204,16 @@ export class WorkstreamRuntime {
       for (const item of state.attempts) {
         try {
           await this.advance(item.id);
+          const advanced = findAttempt(await this.store.load(), item.id);
+          const blocked =
+            advanced.composition?.state === "blocked"
+              ? advanced.composition.error
+              : advanced.cleanup?.state === "blocked"
+                ? advanced.cleanup.error
+                : undefined;
+          if (blocked) throw new Error(blocked);
+          if (advanced.error)
+            await this.store.updateAttempt({ id: item.id, error: null });
         } catch (error) {
           const latest = await this.store.load();
           const attempt = findAttempt(latest, item.id);
@@ -251,6 +257,7 @@ export class WorkstreamRuntime {
     let state = await this.store.load();
     let attempt = findAttempt(state, id);
     const assignment = findAssignment(state, attempt.assignmentId);
+    if (attempt.cleanup?.state === "completed") return;
     if (
       attempt.state === "queued" ||
       (attempt.state === "starting" && !attempt.sessionFile)
@@ -315,10 +322,16 @@ export class WorkstreamRuntime {
         return;
       }
       if (!hasNativeAgentSettled(worker.sessionFile, state.id, id)) {
-        if (["idle", "done", "blocked"].includes(observation.status))
+        if (observation.status === "blocked")
           throw new Error(
-            "No current Pi settlement; submission or approval remains unresolved. Do not resend blindly.",
+            "Worker is blocked; inspect its visible session before proceeding.",
           );
+        if (attempt.submission === "uncertain" && !started)
+          throw new Error(
+            "Submission is uncertain and no current native start is recorded. Inspect before resending.",
+          );
+        // Herdr idle/done can lag Pi's native markers during ordinary startup/settlement.
+        // Absence of settlement alone is not an error or permission to resend.
         return;
       }
       if (observation.status === "working" || observation.status === "blocked")
@@ -330,18 +343,15 @@ export class WorkstreamRuntime {
     if (attempt.resultId) {
       const result = state.results.find((item) => item.id === attempt.resultId);
       if (!result) throw new Error("Retained attempt result is missing.");
+      if (!state.deliveries.some((delivery) => delivery.resultId === result.id))
+        await this.store.requestDelivery(result.id);
       if (
         assignment.capability === "implement" &&
         (result.validity !== "typed" || result.report.status !== "completed")
       ) {
-        if (!attempt.error)
-          await this.store.updateAttempt({
-            id,
-            error:
-              "Implementation did not produce valid successful evidence; retain its workspace for inspection or an explicit cancellation decision.",
-          });
-        await this.store.requestDelivery(result.id);
-        return;
+        throw new Error(
+          "Implementation did not produce valid successful evidence; retain its workspace for inspection.",
+        );
       }
       if (
         assignment.capability === "implement" &&
@@ -367,7 +377,6 @@ export class WorkstreamRuntime {
         });
       }
       await this.cleanup(id);
-      await this.store.requestDelivery(required(attempt.resultId, "result"));
     }
   }
 
@@ -398,18 +407,21 @@ export class WorkstreamRuntime {
     const previous = attempt.continuationOf
       ? findAttempt(state, attempt.continuationOf)
       : undefined;
-    const parentSessionFile = previous
-      ? required(previous.sessionFile, "continuation session")
-      : this.launch.parentSessionFile;
-    const sessionFile = await forkSession({
-      parentSessionFile,
+    const sessionFile = await createWorkerSession({
       targetCwd: placement.path,
       sessionDir: join(dirname(state.statePath), "sessions"),
       objective: objectiveFor(state, assignment, baseRevision),
       mode: modeFor(assignment),
       runId: state.id,
       nodeId: attempt.id,
-      ...(previous ? {} : { stableEntryId: null }),
+      ...(previous
+        ? {
+            continuationSessionFile: required(
+              previous.sessionFile,
+              "continuation session",
+            ),
+          }
+        : {}),
     });
     await this.store.updateAttempt({ id: attempt.id, sessionFile });
     const models = required(attempt.models, "assignment models");
@@ -575,8 +587,7 @@ export class WorkstreamRuntime {
     }
     const result = state.results.find((item) => item.id === attempt.resultId);
     if (
-      !result ||
-      result.validity !== "typed" ||
+      result?.validity !== "typed" ||
       result.report.kind !== "implementation" ||
       !result.report.commit
     )
@@ -604,16 +615,10 @@ export class WorkstreamRuntime {
         });
       }
       this.assertOwnership();
-      const recovered = await this.repository.recoverComposedCandidate(
-        expectedHead,
-        [
-          {
-            nodeId: attempt.id,
-            baseCommit: required(attempt.baseRevision, "base revision"),
-            commit,
-          },
-        ],
-      );
+      const recovered = await this.repository.recoverComposition(expectedHead, {
+        baseCommit: required(attempt.baseRevision, "base revision"),
+        commit,
+      });
       const revision =
         recovered?.head ??
         (await this.repository.compose(commit, expectedHead));
@@ -636,13 +641,10 @@ export class WorkstreamRuntime {
     } catch (error) {
       // A command or persistence error can occur after Git changed HEAD. Inspect before retry.
       const recovered = await this.repository
-        .recoverComposedCandidate(expectedHead, [
-          {
-            nodeId: attempt.id,
-            baseCommit: required(attempt.baseRevision, "base revision"),
-            commit,
-          },
-        ])
+        .recoverComposition(expectedHead, {
+          baseCommit: required(attempt.baseRevision, "base revision"),
+          commit,
+        })
         .catch(() => undefined);
       if (recovered) {
         await this.store.updateAttempt({
@@ -675,7 +677,6 @@ export class WorkstreamRuntime {
             expectedHead,
             error: asError(error).message,
           },
-          error: asError(error).message,
         });
     }
   }
@@ -749,8 +750,7 @@ export class WorkstreamRuntime {
     const attempt = findAttempt(state, id);
     const cleanup = attempt.cleanup;
     if (
-      !cleanup ||
-      cleanup.state !== "pending" ||
+      cleanup?.state !== "pending" ||
       attempt.composition?.state === "blocked"
     )
       return;
@@ -759,6 +759,7 @@ export class WorkstreamRuntime {
         const result = await this.workers.cleanup?.(
           required(attempt.worker, "worker identity"),
         );
+        if (result?.state === "pending") return;
         if (result?.state !== "completed")
           throw new Error(
             result?.detail ?? "Worker cleanup is not proven complete.",
@@ -877,7 +878,7 @@ function modeFor(assignment: WorkAssignment) {
     ? "implementation"
     : assignment.capability === "review"
       ? "review"
-      : "discovery";
+      : "research";
 }
 function objectiveFor(
   state: WorkstreamState,
@@ -893,6 +894,8 @@ function objectiveFor(
     `Constraints: ${intent?.constraints.join("; ") ?? ""}`,
     `Base revision: ${baseRevision}`,
   ];
+  if (assignment.capability === "research")
+    common.push(`Expected evidence: ${assignment.expectedEvidence.join("; ")}`);
   if (assignment.artifactIntent === "disposable_experiment")
     common.push(
       `Permitted effects: ${assignment.permittedEffects.join("; ")}`,

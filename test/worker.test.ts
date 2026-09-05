@@ -1,115 +1,139 @@
 import assert from "node:assert/strict";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { extensionFixture, git } from "./helpers.js";
 
-test("assignment resources are role-aware without tool-call policing", async () => {
-  const previous = process.env.PI_WORKGRAPH_MODE;
-  const previousStart = process.env.PI_WORKGRAPH_IMPLEMENTATION_START;
-  process.env.PI_WORKGRAPH_MODE = "implementation";
-  process.env.PI_WORKGRAPH_IMPLEMENTATION_START = "guide";
-  process.env.PI_WORKGRAPH_RUN_ID = "run";
-  process.env.PI_WORKGRAPH_NODE_ID = "alpha";
-  process.env.PI_WORKGRAPH_EXECUTOR_MODEL = "provider/executor";
+async function fixture(mode: "implementation" | "review") {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
+  const root = join(parent, "repo");
+  await mkdir(root);
+  await git(root, "init", "-b", "main");
+  await git(root, "config", "user.email", "fixture@example.test");
+  await git(root, "config", "user.name", "Fixture");
+  await writeFile(join(root, "value.txt"), "before\n");
+  await git(root, "add", ".");
+  await git(root, "commit", "-m", "Fixture");
+  const previous = { ...process.env };
+  process.env.PI_WORKGRAPH_MODE = mode;
+  process.env.PI_WORKGRAPH_RUN_ID = "fixture";
+  process.env.PI_WORKGRAPH_NODE_ID = "attempt";
+  process.env.PI_WORKGRAPH_BASE_COMMIT = await git(root, "rev-parse", "HEAD");
+  process.env.PI_WORKGRAPH_EXECUTOR_MODEL = "openai/gpt-4o";
   process.env.PI_WORKGRAPH_EXECUTOR_THINKING = "high";
-  process.env.PI_WORKGRAPH_BASE_COMMIT = "base";
+  delete process.env.PI_WORKGRAPH_IMPLEMENTATION_START;
+  delete process.env.PI_WORKGRAPH_EXPERIMENT;
+  const pi = await extensionFixture("worker", root, parent);
+  return {
+    ...pi,
+    root,
+    async dispose() {
+      await pi.close();
+      for (const key of Object.keys(process.env))
+        if (!(key in previous)) delete process.env[key];
+      Object.assign(process.env, previous);
+      await rm(parent, { recursive: true, force: true });
+    },
+  };
+}
 
+test("registered worker observes a non-edit mutation, switches locally, reports a direct commit and native settlement", async () => {
+  const f = await fixture("implementation");
   try {
-    const tools = new Map<string, any>();
-    const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
-    const fakePi = {
-      registerTool(tool: any) { tools.set(tool.name, tool); },
-      appendEntry() {},
-      on(name: string, handler: (event: any, ctx: any) => any) {
-        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
-      },
-    } as unknown as ExtensionAPI;
-    const extension = (await import("../extensions/worker.js")).default;
-    extension(fakePi);
-
-    assert.deepEqual([...tools.keys()], ["workgraph_todo", "workgraph_report"]);
-    assert.equal(handlers.has("tool_call"), false);
-    assert.equal(handlers.has("tool_execution_end"), true);
-
-    const todo = tools.get("workgraph_todo");
-    await todo.execute("todo", { items: ["Inspect current behavior"] });
-    const report = tools.get("workgraph_report");
-    assert.equal(typeof report.execute, "function");
+    assert.ok(f.registry.find("openai", "gpt-4o"));
+    const report = {
+      kind: "implementation",
+      status: "completed",
+      summary: "Changed fixture",
+      evidence: [],
+      findings: [],
+    };
+    await assert.rejects(
+      f.call("workgraph_report", report),
+      /first-edit model transition/,
+    );
+    await f.runner.emit({ type: "agent_start" });
+    await f.runner.emit({
+      type: "tool_execution_end",
+      toolCallId: "read",
+      toolName: "read",
+      result: {},
+      isError: false,
+    });
+    assert.deepEqual(f.selected, []);
+    await writeFile(join(f.root, "value.txt"), "after\n");
+    await f.runner.emit({
+      type: "tool_execution_end",
+      toolCallId: "opaque",
+      toolName: "custom_mutation",
+      result: {},
+      isError: false,
+    });
+    assert.deepEqual(f.selected, ["openai/gpt-4o"]);
+    await assert.rejects(f.call("workgraph_report", report), /clean worktree/);
+    await git(f.root, "add", ".");
+    await git(f.root, "commit", "-m", "Changed value");
+    const result = await f.call("workgraph_report", report);
+    assert.equal(result.terminate, true);
+    const details = result.details;
+    assert.ok(
+      details &&
+        typeof details === "object" &&
+        "state" in details &&
+        "report" in details,
+    );
+    assert.ok(
+      details.state &&
+        typeof details.state === "object" &&
+        "todos" in details.state &&
+        "todoRecorded" in details.state,
+    );
+    assert.deepEqual(details.state.todos, []);
+    assert.equal(details.state.todoRecorded, false);
+    assert.ok(
+      details.report &&
+        typeof details.report === "object" &&
+        "commit" in details.report,
+    );
+    assert.equal(details.report.commit, await git(f.root, "rev-parse", "HEAD"));
+    await f.runner.emit({ type: "agent_settled" });
+    const markers = f.session
+      .getBranch()
+      .filter((entry) => entry.type === "custom")
+      .map((entry) => entry.customType);
+    assert.ok(markers.includes("pi-workgraph-agent-running"));
+    assert.ok(markers.includes("pi-workgraph-agent-settled"));
+    await writeFile(join(f.root, "value.txt"), "third\n");
+    await git(f.root, "commit", "-am", "Extra commit");
+    await assert.rejects(
+      f.call("workgraph_report", report),
+      /exactly one direct commit/,
+    );
   } finally {
-    if (previous === undefined) delete process.env.PI_WORKGRAPH_MODE;
-    else process.env.PI_WORKGRAPH_MODE = previous;
-    delete process.env.PI_WORKGRAPH_RUN_ID;
-    delete process.env.PI_WORKGRAPH_NODE_ID;
-    delete process.env.PI_WORKGRAPH_EXECUTOR_MODEL;
-    delete process.env.PI_WORKGRAPH_EXECUTOR_THINKING;
-    delete process.env.PI_WORKGRAPH_BASE_COMMIT;
-    if (previousStart === undefined) delete process.env.PI_WORKGRAPH_IMPLEMENTATION_START;
-    else process.env.PI_WORKGRAPH_IMPLEMENTATION_START = previousStart;
+    await f.dispose();
   }
 });
 
-test("verification workers own the assigned product procedure", async () => {
-  const { verificationWorkerInstructions } = await import("../extensions/worker.js");
-  const instructions = verificationWorkerInstructions();
-  assert.match(instructions, /ASSIGNED VERIFIER/);
-  assert.match(instructions, /already the independent product-verification worker assigned by Workgraph/);
-  assert.match(instructions, /Directly execute the supplied verification procedure/);
-  assert.match(instructions, /Do not create, adopt, plan, schedule, verify, assure, judge, or otherwise coordinate another Workgraph/);
-  assert.match(instructions, /Do not favor a verified verdict/);
-  assert.match(instructions, /return failed, inconclusive, or escalated/);
-});
-
-test("an implementation can report without a Local Prewalk TODO", async () => {
-  const previous = { ...process.env };
-  process.env.PI_WORKGRAPH_MODE = "implementation";
-  process.env.PI_WORKGRAPH_IMPLEMENTATION_START = "guide";
-  process.env.PI_WORKGRAPH_RUN_ID = "run-no-todo";
-  process.env.PI_WORKGRAPH_NODE_ID = "no-todo";
-  process.env.PI_WORKGRAPH_EXECUTOR_MODEL = "provider/executor";
-  process.env.PI_WORKGRAPH_EXECUTOR_THINKING = "high";
-  process.env.PI_WORKGRAPH_BASE_COMMIT = "base";
-
+test("read-only review rejects a committed revision change as well as dirty files", async () => {
+  const f = await fixture("review");
+  const report = {
+    kind: "review",
+    status: "completed",
+    summary: "Reviewed",
+    evidence: [],
+    findings: [],
+  };
   try {
-    const tools = new Map<string, any>();
-    const handlers = new Map<string, Array<(event: any, ctx: any) => any>>();
-    const fakePi = {
-      registerTool(tool: any) { tools.set(tool.name, tool); },
-      appendEntry() {},
-      on(name: string, handler: (event: any, ctx: any) => any) {
-        handlers.set(name, [...(handlers.get(name) ?? []), handler]);
-      },
-      setModel: async () => true,
-      setThinkingLevel() {},
-      exec: async (_command: string, args: string[]) => {
-        const operation = args.slice(2).join(" ");
-        if (operation.startsWith("status")) return { code: 0, stdout: "", stderr: "" };
-        if (operation.startsWith("rev-parse")) return { code: 0, stdout: "commit", stderr: "" };
-        if (operation.startsWith("diff")) return { code: 0, stdout: "src/a.txt", stderr: "" };
-        return { code: 1, stdout: "", stderr: `unexpected git operation: ${operation}` };
-      },
-    } as unknown as ExtensionAPI;
-    const extension = (await import(`../extensions/worker.js?absent-todo-${Date.now()}`)).default;
-    extension(fakePi);
-    const transition = handlers.get("tool_execution_end")?.[0];
-    assert.ok(transition);
-    await transition({ toolName: "edit", isError: false }, {
-      modelRegistry: { find: () => ({}) },
-    });
-    const result = await tools.get("workgraph_report")!.execute("report", {
-      kind: "implementation",
-      status: "completed",
-      summary: "Committed without a prewalk TODO.",
-      evidence: [],
-      findings: [],
-      commit: "ignored-by-worker",
-      changedFiles: [],
-    }, undefined, undefined, { cwd: "/tmp/fixture" });
-    assert.equal(result.terminate, true);
-    assert.equal(result.details.state.todoRecorded, false);
-    assert.deepEqual(result.details.state.todos, []);
+    assert.equal((await f.call("workgraph_report", report)).terminate, true);
+    await writeFile(join(f.root, "value.txt"), "changed\n");
+    await assert.rejects(f.call("workgraph_report", report), /read-only/);
+    await git(f.root, "commit", "-am", "Unauthorized change");
+    await assert.rejects(
+      f.call("workgraph_report", report),
+      /assigned revision/,
+    );
   } finally {
-    for (const key of Object.keys(process.env)) {
-      if (!(key in previous)) delete process.env[key];
-    }
-    Object.assign(process.env, previous);
+    await f.dispose();
   }
 });

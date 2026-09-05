@@ -1,152 +1,55 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { WorkgraphEngine } from "../src/engine.js";
 import { WorkgraphRegistry } from "../src/registry.js";
-import { RunStateStore } from "../src/state-store.js";
-import { GitRepository, runProcess } from "../src/git.js";
-import { commandAgreement, testOutcome } from "./helpers.js";
 
-async function git(cwd: string, ...args: string[]): Promise<string> {
-  const result = await runProcess("git", ["-C", cwd, ...args], { cwd, timeoutMs: 30_000 });
-  if (result.exitCode !== 0) throw new Error(result.stderr || result.stdout);
-  return result.stdout.trim();
-}
-
-async function makeFixture() {
-  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-registry-"));
-  const root = join(parent, "repo");
-  await runProcess("mkdir", ["-p", root], { cwd: parent, timeoutMs: 5_000 });
-  await git(root, "init", "-b", "main");
-  await git(root, "config", "user.email", "workgraph@example.test");
-  await git(root, "config", "user.name", "Workgraph Registry");
-  await writeFile(join(root, "value.txt"), "value\n");
-  await git(root, "add", ".");
-  await git(root, "commit", "-m", "fixture");
-  const repository = await GitRepository.open(root);
-  const registry = new WorkgraphRegistry(join(parent, "registry.sqlite"));
-  const begun = await WorkgraphEngine.begin({
-    request: "Registry fixture.", projectRoot: root, gitCommonDir: repository.commonDir,
-    parentSessionId: "session-a", parentSessionFile: join(parent, "a.jsonl"), baseCommit: await repository.head(),
-    outcome: testOutcome.outcome,
-  }, { repository, registry });
-  return { parent, root, repository, registry, begun };
-}
-
-test("registry grants one lease, renews it, and requires authoritative stale-owner reconciliation", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-lease-"));
-  const registry = new WorkgraphRegistry(join(parent, "registry.sqlite"));
+test("SQLite leases fence competing instances, expired unknown owners, renewal and stale release", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-lease-"));
+  const a = new WorkgraphRegistry(join(parent, "registry.sqlite"));
+  const b = new WorkgraphRegistry(a.path);
   try {
-    const run = {
-      runId: "run", statePath: join(parent, "state.json"), projectRoot: parent, gitCommonDir: join(parent, ".git"),
-      phase: "discovery", lifecycle: "active" as const, updatedAt: new Date(0).toISOString(),
-      coordinator: { sessionId: "a", sessionFile: join(parent, "a.jsonl"), boundAt: new Date(0).toISOString() },
-    } as any;
-    registry.indexRun(run);
-    const first = registry.acquire("run", { sessionId: "a", sessionFile: run.coordinator.sessionFile }, new Date(0));
-    assert.throws(() => registry.acquire("run", { sessionId: "b", sessionFile: join(parent, "b.jsonl") }, new Date(1)), /leased by session a/);
-    const renewed = registry.renew(first, new Date(10));
-    assert.equal(renewed.owner.sessionId, "a");
-    const resumed = registry.acquire("run", { sessionId: "a", sessionFile: run.coordinator.sessionFile }, new Date(LEASE_END));
-    assert.equal(resumed.token, first.token);
-    assert.throws(() => registry.acquire("run", { sessionId: "b", sessionFile: join(parent, "b.jsonl") }, new Date(SECOND_LEASE_END)), /liveness is unknown/);
-    const takeover = registry.acquire("run", { sessionId: "b", sessionFile: join(parent, "b.jsonl") }, new Date(SECOND_LEASE_END), "dead");
-    assert.equal(takeover.owner.sessionId, "b");
-  } finally { registry.close(); await rm(parent, { recursive: true, force: true }); }
-});
-
-const LEASE_END = 31_000;
-const SECOND_LEASE_END = 62_000;
-
-test("engine adoption changes coordinator identity without forking and lifecycle transitions are explicit", async () => {
-  const fixture = await makeFixture();
-  try {
-    fixture.begun.engine.releaseLease();
-    const runtimeIdentity = { workspaceId: "workspace-1", tabId: "workspace-1:tab-1", paneId: "workspace-1:pane-1", terminalId: "terminal-1", sessionFile: join(fixture.parent, "b.jsonl"), cwd: fixture.root };
-    const adopted = await fixture.begun.engine.adopt("session-b", runtimeIdentity.sessionFile, "unknown", runtimeIdentity);
-    assert.equal(adopted.coordinator.sessionId, "session-b");
-    assert.deepEqual(adopted.coordinator.runtimeIdentity, runtimeIdentity);
-    assert.equal(adopted.handoffs.at(-1)?.kind, "adopt");
-    assert.equal(adopted.handoffs.at(-1)?.fromSessionId, "session-a");
-    const suspended = await fixture.begun.engine.setLifecycle("suspended", "User paused the run.");
-    assert.equal(suspended.lifecycle, "suspended");
-    const attached = await fixture.begun.engine.adopt("session-b", join(fixture.parent, "b.jsonl"));
-    assert.equal(attached.lifecycle, "suspended");
-    const resumed = await fixture.begun.engine.setLifecycle("active", "User resumed the run.");
-    assert.equal(resumed.lifecycle, "active");
-    await assert.rejects(() => fixture.begun.engine.setLifecycle("archived", "Not settled."), /Invalid lifecycle transition/);
-    const completed = await fixture.begun.engine.setLifecycle("completed", "Work settled.");
-    assert.equal(completed.lifecycle, "completed");
-    await assert.rejects(() => fixture.begun.engine.setLifecycle("abandoned", "Too late."), /Invalid lifecycle transition/);
-  } finally { fixture.registry.close(); await rm(fixture.parent, { recursive: true, force: true }); }
-});
-
-test("version 3 migration preserves reports, sessions, decisions, nodes, evidence, and commits", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-migration-"));
-  try {
-    const path = join(parent, "state.json");
-    const legacy = {
-      version: 3, revision: 7, runId: "legacy", request: "legacy", projectRoot: parent, gitCommonDir: join(parent, ".git"), statePath: path,
-      parentSessionId: "legacy-session", parentSessionFile: join(parent, "legacy.jsonl"), phase: "approved", baseCommit: "base", composedCommit: "commit",
-      createdAt: new Date(0).toISOString(), updatedAt: new Date(1).toISOString(), outcome: testOutcome.outcome,
-      milestones: [], discoveries: [{ id: "d", lens: "d", objective: "d", model: "provider/model", thinking: "high", topology: "partition", state: "completed", sessionFile: "d.jsonl", report: { kind: "discovery", status: "completed", summary: "kept", evidence: [], findings: [] } }],
-      nodes: [], composition: [], humanDecisions: [{ kind: "agreement", prompt: "kept", accepted: true, at: new Date(0).toISOString() }], globalVerification: [],
-    };
-    await writeFile(path, JSON.stringify(legacy));
-    const run = await new RunStateStore(path).load();
-    assert.equal(run.version, 7);
-    assert.equal(run.lifecycle, "active");
-    assert.equal(run.creator.sessionId, "legacy-session");
-    assert.equal(run.discoveries[0]?.report?.summary, "kept");
-    assert.equal(run.humanDecisions[0]?.prompt, "kept");
-    assert.equal(run.control.planStatus, "absent");
-    assert.deepEqual(run.plans, []);
-    assert.deepEqual(run.attempts, []);
-    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 7);
-  } finally { await rm(parent, { recursive: true, force: true }); }
-});
-
-test("version 5 migration preserves versioned plan history and active plan identity", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-plan-migration-"));
-  try {
-    const path = join(parent, "state.json");
-    const { approvedAt: _approvedAt, ...agreement } = commandAgreement;
-    const plans = [
-      { version: 1, status: "superseded", changeKind: "initial", agreement: { ...agreement, outcome: "First authority." }, summary: "First plan.", proposedAt: "2026-01-01T00:00:00.000Z", decisionText: "approved first", approvedAt: "2026-01-01T00:01:00.000Z" },
-      { version: 2, status: "approved", changeKind: "authority", agreement: { ...agreement, outcome: "Current authority." }, summary: "Current plan.", proposedAt: "2026-01-02T00:00:00.000Z", decisionText: "approved current", approvedAt: "2026-01-02T00:01:00.000Z" },
-    ] as const;
-    const legacy = {
-      version: 5, revision: 12, runId: "planned", request: "planned", projectRoot: parent, gitCommonDir: join(parent, ".git"), statePath: path,
-      parentSessionId: "coordinator", parentSessionFile: join(parent, "coordinator.jsonl"), phase: "executing", lifecycle: "active",
-      baseCommit: "base", composedCommit: "commit", createdAt: new Date(0).toISOString(), updatedAt: new Date(1).toISOString(), outcome: testOutcome.outcome,
-      agreement: { ...plans[1].agreement, approvedAt: plans[1].approvedAt }, plans, control: { planStatus: "approved", currentPlanVersion: 2, executionStatus: "idle", attentionStatus: "clear", verificationStatus: "absent", maxConcurrency: 1, updatedAt: new Date(1).toISOString() },
-      milestones: [], discoveries: [], nodes: [], attempts: [], resultReviews: [], cleanup: [], composition: [], humanDecisions: [
-        { kind: "agreement", prompt: plans[0].decisionText, accepted: true, at: plans[0].approvedAt },
-        { kind: "envelope_change", prompt: plans[1].decisionText, accepted: true, at: plans[1].approvedAt },
-      ], globalVerification: [], transitions: [], handoffs: [],
-    };
-    await writeFile(path, JSON.stringify(legacy));
-    const run = await new RunStateStore(path).load();
-    assert.equal(run.version, 7);
-    assert.deepEqual(run.plans, plans);
-    assert.equal(run.control.currentPlanVersion, 2);
-    assert.equal(run.control.planStatus, "approved");
-    assert.deepEqual(run.humanDecisions, legacy.humanDecisions);
-  } finally { await rm(parent, { recursive: true, force: true }); }
-});
-
-test("registry rebuild indexes retained state without inventing ownership", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-rebuild-"));
-  const registry = new WorkgraphRegistry(join(parent, "registry.sqlite"));
-  try {
-    const runs = join(parent, "runs", "run");
-    await runProcess("mkdir", ["-p", runs], { cwd: parent, timeoutMs: 5_000 });
-    await writeFile(join(runs, "state.json"), JSON.stringify({ runId: "run", projectRoot: parent, gitCommonDir: join(parent, ".git"), statePath: join(runs, "state.json"), phase: "discovery", lifecycle: "active", updatedAt: new Date(0).toISOString(), coordinator: { sessionId: "s", sessionFile: "s.jsonl", boundAt: new Date(0).toISOString() } }));
-    assert.equal(await registry.rebuild(join(parent, "runs")), 1);
-    const indexed = registry.findRun("run");
-    assert.equal(indexed?.ownerSessionId, undefined);
-    assert.equal(indexed?.lifecycle, "active");
-  } finally { registry.close(); await rm(parent, { recursive: true, force: true }); }
+    a.indexWorkstream({
+      runId: "fixture",
+      statePath: join(parent, "state.json"),
+      projectRoot: parent,
+      gitCommonDir: parent,
+      lifecycle: "active",
+      updatedAt: new Date(0).toISOString(),
+    });
+    const owner = { sessionId: "one", sessionFile: "/one.jsonl" };
+    const lease = a.acquire("fixture", owner, new Date(0));
+    assert.throws(
+      () => b.acquire("fixture", owner, new Date(1)),
+      /runtime owner/,
+    );
+    assert.throws(
+      () =>
+        b.acquire(
+          "fixture",
+          { sessionId: "two", sessionFile: "/two.jsonl" },
+          new Date(1),
+        ),
+      /runtime owner/,
+    );
+    assert.throws(
+      () => b.acquire("fixture", owner, new Date(31_000), "unknown"),
+      /runtime owner/,
+    );
+    assert.throws(() => a.renew(lease, new Date(31_000)), /live lease/);
+    const replacement = b.acquire("fixture", owner, new Date(31_000), "dead");
+    assert.notEqual(replacement.token, lease.token);
+    a.release(lease);
+    b.assertLease(replacement, new Date(32_000));
+    const renewed = b.renew(replacement, new Date(32_000));
+    assert.equal(renewed.expiresAt, new Date(62_000).toISOString());
+    assert.throws(() => a.assertLease(lease, new Date(32_000)), /live lease/);
+    b.release(renewed);
+    assert.throws(() => b.assertLease(renewed, new Date(32_000)), /live lease/);
+  } finally {
+    a.close();
+    b.close();
+    await rm(parent, { recursive: true, force: true });
+  }
 });

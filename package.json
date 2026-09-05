@@ -2,7 +2,10 @@
   "name": "@vistyy/pi-workgraph",
   "version": "0.1.0",
   "type": "module",
-  "description": "Outcome-driven, evidence-backed workgraph orchestration for Pi.",
+  "description": "Conversational, durable local work coordination for Pi.",
+  "engines": {
+    "node": ">=24"
+  },
   "license": "MIT",
   "bin": {
     "pi-workgraph": "./bin/pi-workgraph.mjs"
@@ -19,15 +22,14 @@
     "src",
     "skills",
     "README.md",
-    "PLAN.md",
     "VERIFICATION.md"
   ],
   "scripts": {
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "check": "pnpm typecheck && pnpm test",
+    "quality": "biome check --error-on-warnings && node --import tsx scripts/check-assertions.ts",
+    "check": "pnpm typecheck && pnpm quality && pnpm test",
     "smoke:herdr": "node --import tsx scripts/herdr-smoke.ts",
-    "smoke:real": "node --import tsx scripts/real-smoke.ts",
     "smoke:coordinator": "node --import tsx scripts/coordinator-smoke.ts"
   },
   "pi": {
@@ -48,6 +50,7 @@
     "typebox": "*"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.5.12",
     "@earendil-works/pi-ai": "0.84.4",
     "@earendil-works/pi-coding-agent": "0.84.4",
     "@types/node": "^24.0.0",

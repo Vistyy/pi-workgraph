@@ -4,11 +4,18 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
     "noEmit": true,
     "types": ["node"],
     "skipLibCheck": true
   },
-  "include": ["extensions/**/*.ts", "src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"]
+  "include": [
+    "extensions/**/*.ts",
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "scripts/**/*.ts"
+  ]
 }

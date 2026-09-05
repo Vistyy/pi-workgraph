@@ -4,34 +4,32 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { Type, type Static } from "typebox";
+import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { GitRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
+import {
+  loadModelPolicy,
+  MODEL_ROLES,
+  modelPolicyPath,
+  setModelRole,
+  ModelTargetSchema as Target,
+  ThinkingSchema as Thinking,
+} from "../src/model-policy.js";
 import { forkConversationSession } from "../src/pi-process.js";
 import { EvidenceSchema } from "../src/report-schema.js";
 import {
-  WorkstreamRuntime,
-  type QueueOptions,
-} from "../src/workstream-runtime.js";
-import {
-  WorkstreamStore,
   type SessionIdentity,
   type WorkstreamState,
+  WorkstreamStore,
 } from "../src/workstream.js";
+import {
+  type QueueOptions,
+  WorkstreamRuntime,
+} from "../src/workstream-runtime.js";
 
 const POINTER = "pi-workgraph-workstream";
 const INPUT = "pi-workgraph-human-input";
-const Thinking = StringEnum([
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const);
-const Target = Type.Object({ model: Type.String(), thinking: Thinking });
 const InputReceipt = Type.Object({
   id: Type.String(),
   sessionId: Type.String(),
@@ -83,8 +81,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     target: WorkstreamStore,
     priorOwnerLiveness: "alive" | "dead" | "unknown" = "unknown",
   ) => {
-    if (runtime) await runtime.stop();
-    runtime = undefined;
+    if (runtime?.store.path === target.path) {
+      await runtime.perform(async () => undefined);
+      return runtime;
+    }
+    const previous = runtime;
     const state = await target.load();
     const next = new WorkstreamRuntime(
       target,
@@ -92,7 +93,6 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       new HerdrCliRuntime(),
       {
         workspaceId: process.env.HERDR_WORKSPACE_ID ?? "",
-        parentSessionFile: owner(ctx).sessionFile,
       },
       (resultId, latest) => {
         if (ctx.sessionManager.getSessionId() !== latest.coordinator.sessionId)
@@ -124,6 +124,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     );
     try {
       await next.perform(async () => undefined);
+      await previous?.stop();
     } catch (error) {
       await next.stop();
       throw error;
@@ -287,6 +288,42 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       display: false,
     },
   }));
+
+  pi.registerTool({
+    name: "workgraph_models",
+    label: "Workgraph Models",
+    description:
+      "Get model defaults and their configuration path, or set one role when the user requests a persistent policy change. Assignment model/thinking/executor parameters override defaults without changing policy or the coordinator model.",
+    promptSnippet: "Inspect or configure Workgraph model defaults",
+    parameters: Type.Object({
+      action: StringEnum(["get", "set"] as const),
+      role: Type.Optional(StringEnum(MODEL_ROLES)),
+      target: Type.Optional(Target),
+    }),
+    async execute(_id, params) {
+      return serial(async () => {
+        if (params.action === "set" && (!params.role || !params.target))
+          throw new Error("Setting a model default requires role and target.");
+        const policy =
+          params.action === "set" && params.role && params.target
+            ? await setModelRole(params.role, params.target)
+            : await loadModelPolicy();
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                { path: modelPolicyPath(), policy },
+                null,
+                2,
+              ),
+            },
+          ],
+          details: { path: modelPolicyPath(), policy },
+        };
+      });
+    },
+  });
 
   pi.registerTool({
     name: "workgraph_begin",
@@ -500,7 +537,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_acknowledge",
     label: "Workgraph Acknowledge",
     description:
-      "Acknowledge receipt of delivered evidence, independently of accepting it.",
+      "Acknowledge evidence actually read, including through status after a failed notification. This records receipt, not acceptance or transport success.",
     parameters: Type.Object({
       resultId: Type.String(),
       acknowledgment: Type.String(),
@@ -594,7 +631,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         await importInputs(active);
         return result(
           "Adopted without changing lifecycle.",
-          remember(await target.load(), ctx),
+          remember(await active.store.load(), ctx),
         );
       });
     },
