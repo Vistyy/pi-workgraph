@@ -94,7 +94,22 @@ export async function extensionFixture(
   let level: ReturnType<ExtensionActions["getThinkingLevel"]> = "high";
   let model = registry.getAll()[0];
   const errors: string[] = [];
+  const notifications: Array<{
+    message: string;
+    type?: "info" | "warning" | "error";
+  }> = [];
   runner.onError((error) => errors.push(error.error));
+  runner.setUIContext(
+    {
+      ...runner.getUIContext(),
+      notify(message, type) {
+        notifications.push(
+          type === undefined ? { message } : { message, type },
+        );
+      },
+    },
+    "rpc",
+  );
   runner.bindCore(
     {
       ...loaded.runtime,
@@ -135,6 +150,7 @@ export async function extensionFixture(
     runner,
     session,
     messages,
+    notifications,
     selected,
     registry,
     async call(toolName: string, params: unknown) {

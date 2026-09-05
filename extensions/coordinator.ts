@@ -263,24 +263,41 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       if (
         !data ||
         typeof data !== "object" ||
+        Array.isArray(data) ||
         !("path" in data) ||
-        typeof data.path !== "string"
-      )
+        typeof data.path !== "string" ||
+        !data.path.trim()
+      ) {
+        if (pointer)
+          ctx.ui.notify(
+            "Workstream reattachment skipped: the retained pointer is malformed; inspect its session entry and repair it explicitly.",
+            "warning",
+          );
         return;
-      const state = await WorkstreamStore.inspect(data.path);
-      if (
-        state.lifecycle.state === "completed" ||
-        state.lifecycle.state === "archived" ||
-        state.lifecycle.state === "abandoned"
-      )
-        return;
+      }
       try {
+        const inspection = await WorkstreamStore.inspectForReattachment(
+          data.path,
+        );
+        if (inspection.kind === "retained_terminal") {
+          ctx.ui.notify(
+            `Workstream reattachment skipped: retained terminal history ${inspection.id} is not attached because its current mutable state is unsupported. Inspect ${data.path} and reconcile explicitly; history was not changed.`,
+            "warning",
+          );
+          return;
+        }
+        if (
+          inspection.state.lifecycle.state === "completed" ||
+          inspection.state.lifecycle.state === "archived" ||
+          inspection.state.lifecycle.state === "abandoned"
+        )
+          return;
         await attach(ctx, WorkstreamStore.open(data.path, identity));
         await importInputs(current());
         remember(await current().store.load(), ctx);
       } catch (error) {
         ctx.ui.notify(
-          `Workstream reattachment requires reconciliation: ${error instanceof Error ? error.message : String(error)}`,
+          `Workstream reattachment skipped for ${data.path}: ${error instanceof Error ? error.message : String(error)}. Inspect the retained pointer and state, then reconcile explicitly; no state was changed.`,
           "warning",
         );
       }

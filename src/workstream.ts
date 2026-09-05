@@ -421,6 +421,25 @@ const CompletionSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+const RetainedTerminalEnvelopeSchema = Type.Object(
+  {
+    format: Type.Literal(WORKSTREAM_FORMAT),
+    version: Type.Literal(WORKSTREAM_STATE_VERSION),
+    revision: Type.Integer({ minimum: 0 }),
+    id: NonEmptyStringSchema,
+    gitCommonDir: NonEmptyStringSchema,
+    statePath: NonEmptyStringSchema,
+    lifecycle: Type.Object(
+      {
+        state: StringEnum(["completed", "abandoned", "archived"] as const),
+        changedAt: TimestampSchema,
+        reason: NonEmptyStringSchema,
+      },
+      { additionalProperties: false },
+    ),
+  },
+  { additionalProperties: true },
+);
 
 export const WorkstreamStateSchema = Type.Object(
   {
@@ -462,6 +481,13 @@ export type WorkAttempt = Static<typeof AttemptSchema>;
 export type ResultDelivery = Static<typeof DeliverySchema>;
 export type CompletionAccounting = Static<typeof CompletionAccountingSchema>;
 export type WorkstreamState = Static<typeof WorkstreamStateSchema>;
+export type WorkstreamReattachmentInspection =
+  | { kind: "current"; state: WorkstreamState }
+  | {
+      kind: "retained_terminal";
+      id: string;
+      lifecycle: Static<typeof RetainedTerminalEnvelopeSchema>["lifecycle"];
+    };
 
 type OmitEach<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
@@ -599,6 +625,35 @@ export class WorkstreamStore {
 
   static async inspect(path: string): Promise<WorkstreamState> {
     return readState(resolve(path));
+  }
+
+  /**
+   * Read a startup pointer without writes or ownership changes.
+   * Only a canonical current-version terminal envelope may skip full mutable-state validation.
+   */
+  static async inspectForReattachment(
+    path: string,
+  ): Promise<WorkstreamReattachmentInspection> {
+    const resolvedPath = resolve(path);
+    const value = await readSupportedStateValue(resolvedPath);
+    try {
+      validateState(value);
+      validateStoredPath(value, resolvedPath);
+      return { kind: "current", state: structuredClone(value) };
+    } catch (error) {
+      if (
+        Value.Check(RetainedTerminalEnvelopeSchema, value) &&
+        value.statePath === resolvedPath &&
+        value.statePath ===
+          WorkstreamStore.pathFor(value.gitCommonDir, value.id)
+      )
+        return {
+          kind: "retained_terminal",
+          id: value.id,
+          lifecycle: structuredClone(value.lifecycle),
+        };
+      throw error;
+    }
   }
 
   async load(): Promise<WorkstreamState> {
@@ -1578,6 +1633,15 @@ export class WorkstreamStore {
 }
 
 async function readState(path: string): Promise<WorkstreamState> {
+  const value = await readSupportedStateValue(path);
+  validateState(value);
+  validateStoredPath(value, path);
+  return value;
+}
+
+async function readSupportedStateValue(
+  path: string,
+): Promise<Record<string, unknown>> {
   let value: unknown;
   try {
     value = JSON.parse(await readFile(path, "utf8")) as unknown;
@@ -1590,18 +1654,19 @@ async function readState(path: string): Promise<WorkstreamState> {
     !isRecord(value) ||
     value.format !== WORKSTREAM_FORMAT ||
     value.version !== WORKSTREAM_STATE_VERSION
-  ) {
+  )
     throw new UnsupportedWorkstreamStateError(
       isRecord(value) ? value.format : undefined,
       isRecord(value) ? value.version : undefined,
     );
-  }
-  validateState(value);
-  if (value.statePath !== path)
-    throw new InvalidWorkstreamStateError(
-      `Workstream state is stored at ${value.statePath}, not ${path}.`,
-    );
   return value;
+}
+
+function validateStoredPath(state: WorkstreamState, path: string): void {
+  if (state.statePath !== path)
+    throw new InvalidWorkstreamStateError(
+      `Workstream state is stored at ${state.statePath}, not ${path}.`,
+    );
 }
 
 function validateState(value: unknown): asserts value is WorkstreamState {
