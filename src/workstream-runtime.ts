@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import { access, cp, lstat, mkdir, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import type { GitRepository, WorktreePlacement } from "./git.js";
-import { herdrAgentName, type VisibleWorkerRuntime } from "./herdr.js";
+import {
+  herdrWorkerName,
+  legacyHerdrAgentName,
+  type VisibleWorkerRuntime,
+} from "./herdr.js";
 import {
   loadModelPolicy,
   type ModelPolicy,
@@ -360,7 +364,17 @@ export class WorkstreamRuntime {
           );
         const recovered = await recover.call(this.workers, {
           workspaceId: this.launch.workspaceId,
-          agentName: herdrAgentName(state.id, attempt.id, attempt.id),
+          agentName: herdrWorkerName({
+            runId: state.id,
+            nodeId: attempt.id,
+            attemptId: attempt.id,
+            assignmentId: assignment.id,
+            objective: assignment.objective,
+            role: assignment.capability,
+          }),
+          compatibleAgentNames: [
+            legacyHerdrAgentName(state.id, attempt.id, attempt.id),
+          ],
           cwd: placementPath(state, attempt),
           sessionFile: attempt.sessionFile,
           ...(attempt.resource ? { resource: attempt.resource } : {}),
@@ -516,6 +530,9 @@ export class WorkstreamRuntime {
       runId: state.id,
       nodeId: attempt.id,
       attemptId: attempt.id,
+      assignmentId: assignment.id,
+      objective: assignment.objective,
+      role: assignment.capability,
       cwd: workerCwd,
       sessionFile,
       prompt: "Continue the assigned Workgraph objective now.",

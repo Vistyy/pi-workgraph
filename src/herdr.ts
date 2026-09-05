@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { basename } from "node:path";
 import type {
   CoordinatorRuntimeIdentity,
   ThinkingLevel,
@@ -25,11 +26,26 @@ export interface HerdrAbsentObservation {
 
 export type HerdrInspection = HerdrObservation | HerdrAbsentObservation;
 
+export type WorkerRole = "implement" | "research" | "review";
+
+export interface WorkerNamingContext {
+  runId: string;
+  nodeId?: string;
+  attemptId: string;
+  assignmentId?: string;
+  objective?: string;
+  role?: WorkerRole;
+}
+
 export interface WorkerLaunchRequest {
   workspaceId: string;
   runId: string;
   nodeId: string;
   attemptId: string;
+  /** Naming context is optional for retained/custom transports; production launches provide it. */
+  assignmentId?: string;
+  objective?: string;
+  role?: WorkerRole;
   cwd: string;
   sessionFile: string;
   prompt: string;
@@ -48,6 +64,7 @@ export interface WorkerLaunchRequest {
 export interface WorkerRecoveryRequest {
   workspaceId: string;
   agentName: string;
+  compatibleAgentNames?: readonly string[];
   sessionFile: string;
   cwd: string;
   resource?: WorkerResourceIdentity;
@@ -139,12 +156,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
   ): Promise<WorkerIdentity> {
     if (!this.available)
       throw new Error("Herdr coordinator runtime is unavailable.");
-    const key = createHash("sha256")
-      .update(`${request.sessionFile}\0${request.cwd}`)
-      .digest("hex")
-      .slice(0, 16);
-    const agentName = `wg-coordinator-${key}`;
-    const label = `Workgraph coordinator ${key}`;
+    const { agentName, label } = herdrCoordinatorNames(request);
     let resource: CoordinatorLaunchResource;
     try {
       const created = object(
@@ -272,6 +284,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
   async launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
     if (!this.available)
       throw new Error("Herdr worker runtime is unavailable.");
+    const workerName = herdrWorkerName(request);
     const tabResponse = await this.call([
       "tab",
       "create",
@@ -280,7 +293,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       "--cwd",
       request.cwd,
       "--label",
-      `WG ${slug(request.nodeId).slice(0, 24) || "worker"}`,
+      herdrWorkerTabLabel(request),
       "--no-focus",
       ...envArgs(request.env),
     ]);
@@ -288,11 +301,6 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     const pane = object(tabResult, "root_pane");
     const paneId = string(pane, "pane_id");
     await request.onTab?.({ workspaceId: request.workspaceId, paneId });
-    const workerName = herdrAgentName(
-      request.runId,
-      request.nodeId,
-      request.attemptId,
-    );
     const args = [
       "agent",
       "start",
@@ -335,6 +343,10 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     const agents = snapshot.agents;
     if (!Array.isArray(agents))
       throw new Error("Herdr snapshot omitted agents.");
+    const compatibleAgentNames = new Set([
+      request.agentName,
+      ...(request.compatibleAgentNames ?? []),
+    ]);
     const matches = agents.filter(
       (candidate): candidate is Record<string, unknown> => {
         if (
@@ -358,7 +370,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
             value.name === resource.agentName &&
             value.cwd === resource.cwd
           : value.workspace_id === request.workspaceId &&
-            value.name === request.agentName &&
+            compatibleAgentNames.has(String(value.name)) &&
             value.cwd === request.cwd;
         return (
           resourceMatches &&
@@ -680,20 +692,117 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const HERDR_AGENT_NAME_LIMIT = 32;
+const IDENTITY_SUFFIX_LENGTH = 6;
+
+export function herdrWorkerName(request: WorkerNamingContext): string {
+  if (!request.assignmentId && !request.objective && !request.role)
+    return herdrAgentName(
+      request.runId,
+      request.nodeId ?? "worker",
+      request.attemptId,
+    );
+  const assignmentId = request.assignmentId ?? request.nodeId ?? "assignment";
+  const objective = request.objective ?? request.nodeId ?? assignmentId;
+  const role = request.role ?? "research";
+  return readableIdentityName(
+    readableSlug(objective) || readableSlug(assignmentId) || "task",
+    role,
+    `${request.runId}\0${assignmentId}\0${request.attemptId}`,
+  );
+}
+
+export function herdrWorkerTabLabel(request: WorkerNamingContext): string {
+  const assignmentId = request.assignmentId ?? request.nodeId ?? "assignment";
+  const objective = request.objective ?? request.nodeId ?? assignmentId;
+  const role = request.role ?? "research";
+  const subject =
+    readableLabel(objective) || readableLabel(assignmentId) || "Task";
+  const suffix = identitySuffix(
+    `${request.runId}\0${assignmentId}\0${request.attemptId}`,
+    IDENTITY_SUFFIX_LENGTH,
+  );
+  return `Workgraph ${bound(subject, 48)} - ${role} - ${suffix}`;
+}
+
+export function herdrCoordinatorNames(request: CoordinatorLaunchRequest): {
+  agentName: string;
+  label: string;
+} {
+  const repository = readableSlug(basename(request.cwd)) || "repository";
+  const repositoryLabel = readableLabel(basename(request.cwd)) || "Repository";
+  const suffix = identitySuffix(`${request.sessionFile}\0${request.cwd}`, 8);
+  const agentName = readableIdentityName(
+    repository,
+    "coord-fork",
+    `${request.sessionFile}\0${request.cwd}`,
+  );
+  return {
+    agentName,
+    label: `Workgraph fork - ${bound(repositoryLabel, 48)} - ${suffix}`,
+  };
+}
+
+/** Compatibility identity for resources launched before task-first names. */
+export function legacyHerdrAgentName(
+  runId: string,
+  nodeId: string,
+  attemptId: string,
+): string {
+  const node = legacySlug(nodeId).slice(0, 12) || "worker";
+  return `wg-${node}-${identitySuffix(`${runId}\0${nodeId}\0${attemptId}`, 12)}`;
+}
+
+/** @deprecated Use herdrWorkerName with assignment context for new launches. */
 export function herdrAgentName(
   runId: string,
   nodeId: string,
   attemptId: string,
 ): string {
-  const node = slug(nodeId).slice(0, 12) || "worker";
-  const attemptKey = createHash("sha256")
-    .update(`${runId}\0${nodeId}\0${attemptId}`)
-    .digest("hex")
-    .slice(0, 12);
-  return `wg-${node}-${attemptKey}`;
+  return legacyHerdrAgentName(runId, nodeId, attemptId);
 }
 
-function slug(value: string): string {
+function readableIdentityName(
+  subject: string,
+  role: WorkerRole | "coord-fork",
+  identity: string,
+): string {
+  const suffix = identitySuffix(identity, IDENTITY_SUFFIX_LENGTH);
+  const subjectLimit = HERDR_AGENT_NAME_LIMIT - role.length - suffix.length - 2;
+  const boundedSubject = subject.slice(0, subjectLimit).replace(/-+$/g, "");
+  return `${boundedSubject || "task"}-${role}-${suffix}`;
+}
+
+function identitySuffix(value: string, length: number): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, length);
+}
+
+function bound(value: string, limit: number): string {
+  return value.slice(0, limit).replace(/[ -]+$/g, "");
+}
+
+function readableLabel(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[’']/g, "")
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .trim()
+    .replace(/ +/g, " ");
+}
+
+function readableSlug(value: string): string {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[’']/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^[^a-z]+/, "")
+    .replace(/-+$/g, "");
+}
+
+function legacySlug(value: string): string {
   return value
     .toLowerCase()
     .replace(/[^a-z0-9_-]+/g, "-")

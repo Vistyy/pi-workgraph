@@ -4,23 +4,50 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { HerdrCliRuntime, herdrAgentName } from "../src/herdr.js";
+import {
+  HerdrCliRuntime,
+  herdrAgentName,
+  herdrCoordinatorNames,
+  herdrWorkerName,
+  herdrWorkerTabLabel,
+  legacyHerdrAgentName,
+} from "../src/herdr.js";
 import type { WorkerIdentity, WorkerResourceIdentity } from "../src/types.js";
 
-test("Herdr agent names satisfy the authoritative boundary and distinguish attempts", () => {
-  const first = herdrAgentName(
-    "RUN/with spaces and symbols",
-    "123-VERY-LONG-NODE-NAME-with_symbols",
-    "attempt-one",
-  );
-  const second = herdrAgentName(
-    "RUN/with spaces and symbols",
-    "123-VERY-LONG-NODE-NAME-with_symbols",
-    "attempt-two",
-  );
+test("task-first Herdr names are bounded, readable, role-specific, and distinguish attempts", () => {
+  const request = {
+    runId: "RUN/with spaces and symbols",
+    nodeId: "attempt-one",
+    attemptId: "attempt-one",
+    assignmentId: "assignment-implement-parser",
+    objective:
+      "Implement parser support for accented input and a very long trailing explanation",
+    role: "implement" as const,
+  };
+  const first = herdrWorkerName(request);
+  const second = herdrWorkerName({ ...request, attemptId: "attempt-two" });
+  const label = herdrWorkerTabLabel(request);
+  assert.match(first, /^implement-pars[a-z]*-implement-[a-f0-9]{6}$/);
   assert.match(first, /^[a-z][a-z0-9_-]{0,31}$/);
-  assert.match(second, /^[a-z][a-z0-9_-]{0,31}$/);
+  assert.match(label, /^Workgraph Implement parser support for accented input/);
+  assert.ok(label.length <= 80);
   assert.notEqual(first, second);
+  assert.equal(
+    herdrAgentName("run", "node", "attempt"),
+    legacyHerdrAgentName("run", "node", "attempt"),
+  );
+});
+
+test("coordinator fork names use repository context without exposing paths", () => {
+  const names = herdrCoordinatorNames({
+    cwd: "/private/Customer Work/repo-name",
+    sessionFile: "/private/session.jsonl",
+  });
+  assert.match(names.agentName, /^repo-name-coord-fork-[a-f0-9]{6}$/);
+  assert.match(names.agentName, /^[a-z][a-z0-9_-]{0,31}$/);
+  assert.match(names.label, /^Workgraph fork - repo name - [a-f0-9]{8}$/);
+  assert.equal(names.label.includes("Customer"), false);
+  assert.equal(names.label.includes("/"), false);
 });
 
 test("Herdr identity validation rejects missing and mismatched native session or cwd", async () => {
@@ -137,14 +164,17 @@ test("coordinator forks into a new unfocused workspace with isolated Pi identity
   const command = join(parent, "fake-herdr-fork.mjs");
   const cwd = join(parent, "child-repo");
   const sessionFile = join(parent, "child.jsonl");
+  const coordinatorAgentName = herdrCoordinatorNames({
+    cwd,
+    sessionFile,
+  }).agentName;
   await writeFile(
     command,
     `#!/usr/bin/env node
-import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
-const agentName = "wg-coordinator-" + createHash("sha256").update(${JSON.stringify(`${sessionFile}\0${cwd}`)}).digest("hex").slice(0, 16);
+const agentName = ${JSON.stringify(coordinatorAgentName)};
 const agent = (native) => ({workspace_id:"child-workspace",tab_id:"child-workspace:tab-1",pane_id:"child-workspace:pane-1",terminal_id:"child-terminal",agent_status:"idle",name:agentName,cwd:${JSON.stringify(cwd)},...(native ? {agent_session:{value:${JSON.stringify(sessionFile)}}} : {})});
 if (args[0] === "workspace" && args[1] === "create") console.log(JSON.stringify({result:{workspace:{workspace_id:"child-workspace"},tab:{tab_id:"child-workspace:tab-1"},root_pane:{pane_id:"child-workspace:pane-1"}}}));
 else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:agent(false)}}));
@@ -325,7 +355,15 @@ test("the Herdr adapter launches without waiting and validates exact identity be
   const command = join(parent, "fake-herdr.mjs");
   const cwd = join(parent, "worktree");
   const sessionFile = join(parent, "worker.jsonl");
-  const agentName = herdrAgentName("run", "node", "attempt");
+  const naming = {
+    runId: "run",
+    nodeId: "node",
+    attemptId: "attempt",
+    assignmentId: "parse",
+    objective: "Implement parser support",
+    role: "implement" as const,
+  };
+  const agentName = herdrWorkerName(naming);
   const agent = {
     workspace_id: "workspace-1",
     tab_id: "workspace-1:tab-1",
@@ -349,9 +387,7 @@ test("the Herdr adapter launches without waiting and validates exact identity be
     let retained: WorkerIdentity | undefined;
     const observation = await runtime.launch({
       workspaceId: "workspace-1",
-      runId: "run",
-      nodeId: "node",
-      attemptId: "attempt",
+      ...naming,
       cwd,
       sessionFile,
       prompt: "Continue now.",
@@ -366,7 +402,15 @@ test("the Herdr adapter launches without waiting and validates exact identity be
     assert.equal(observation.identity.sessionFile, sessionFile);
     const recovered = await runtime.recover({
       workspaceId: "workspace-1",
-      agentName: observation.identity.agentName,
+      agentName: herdrWorkerName({
+        runId: "run",
+        nodeId: "node",
+        attemptId: "attempt",
+        assignmentId: "assignment",
+        objective: "Inspect the node",
+        role: "research",
+      }),
+      compatibleAgentNames: [observation.identity.agentName],
       sessionFile,
       cwd,
     });
@@ -383,6 +427,10 @@ test("the Herdr adapter launches without waiting and validates exact identity be
       (args) => args[0] === "agent" && args[1] === "prompt",
     )!;
     assert.equal(prompt.includes("--wait"), false);
+    const tabCreate = calls.find(
+      (args) => args[0] === "tab" && args[1] === "create",
+    )!;
+    assert.ok(tabCreate.includes(herdrWorkerTabLabel(naming)));
     assert.deepEqual(
       calls
         .find((args) => args[0] === "agent" && args[1] === "send-keys")

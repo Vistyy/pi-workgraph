@@ -151,7 +151,13 @@ class Worker implements VisibleWorkerRuntime {
   async recover(
     request: WorkerRecoveryRequest,
   ): Promise<HerdrObservation | undefined> {
-    const identity = this.identities.get(request.agentName);
+    const names = new Set([
+      request.agentName,
+      ...(request.compatibleAgentNames ?? []),
+    ]);
+    const identity = [...this.identities.values()].find((item) =>
+      names.has(item.agentName),
+    );
     return identity ? this.observe(identity) : undefined;
   }
   async steer(identity: WorkerIdentity, _instruction: string): Promise<void> {
@@ -335,6 +341,9 @@ test("new runtime drives fresh research through native evidence, durable retryab
     await first.reconcile();
     const request = f.workers.requests[0];
     assert.ok(request);
+    assert.equal(request.assignmentId, "inspect");
+    assert.equal(request.objective, "Inspect value.txt");
+    assert.equal(request.role, "research");
     assert.match(
       await readFile(request.sessionFile, "utf8"),
       /Expected evidence: File evidence/,

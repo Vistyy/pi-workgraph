@@ -17,6 +17,10 @@ Start from the project directory and ask the coordinator to delegate the needed 
 Composition still requires a clean destination at the maintained-application boundary.
 First delegation creates a workstream automatically; `workgraph_begin` is optional.
 Workers run in visible Herdr tabs with ordinary Pi package/configuration loading and fresh context.
+Worker tab labels and native agent names begin with bounded sanitized assignment text, identify the capability role, and include a short attempt suffix so repeated attempts are distinguishable.
+Forked coordinator workspaces use the target repository basename and a short identity suffix rather than exposing the full path or inventing a user purpose.
+Workspace, tab, pane, terminal, session, and stored resource IDs remain authoritative for ownership, observation, and cleanup; display labels are never cleanup targets.
+Retained states launched before task-first names remain recoverable through their stored exact resource identity, with the legacy name accepted only when that resource identity was not retained.
 Read-only research and review use the existing coordinator project directory, so they observe live tracked and untracked changes without a clean-tree prerequisite or copying.
 Implementation and disposable experiments use owned isolated Git worktrees; those worktrees are not operating-system sandboxes.
 Read-only is an instruction and authority boundary, not a filesystem sandbox, and shared files may change while research runs.
