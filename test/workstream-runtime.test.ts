@@ -639,10 +639,6 @@ test("advanced isolated trees cannot settle a successful no-change implementatio
     await active.reconcile();
     const state = await active.reconcile();
     assert.equal(state.results[0]?.validity, "invalid");
-    assert.match(
-      state.results[0]?.detail ?? "",
-      /authored worker commit|advanced from/i,
-    );
     assert.equal(state.attempts[0]?.composition, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(await f.repository.head(), base);

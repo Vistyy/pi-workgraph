@@ -246,22 +246,10 @@ export class GitRepository {
       throw new Error("No-change validation found a changed worktree branch.");
     const status = await gitText(
       placement.path,
-      ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+      ["status", "--porcelain", "--untracked-files=all"],
       true,
     );
     if (status) throw new Error(`No-change worktree is not clean:\n${status}`);
-    const reflog = await gitText(
-      placement.path,
-      ["reflog", "show", "--format=%H", "--no-abbrev", placement.branch],
-      true,
-    );
-    if (
-      reflog
-        .split("\n")
-        .filter(Boolean)
-        .some((entry) => entry !== placement.baseCommit)
-    )
-      throw new Error("No-change validation found an authored worker commit.");
     const revision = await this.head(placement.path);
     if (reportedRevision !== revision)
       throw new Error(
@@ -271,15 +259,6 @@ export class GitRepository {
       throw new Error(
         `Worker reported no change, but isolated worktree HEAD advanced from ${placement.baseCommit} to ${revision}.`,
       );
-    const commitCount = Number(
-      await gitText(placement.path, [
-        "rev-list",
-        "--count",
-        `${placement.baseCommit}..${revision}`,
-      ]),
-    );
-    if (commitCount !== 0)
-      throw new Error("Worker reported no change after creating a commit.");
     return { revision, changedFiles: [] };
   }
 

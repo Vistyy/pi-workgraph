@@ -123,7 +123,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
           const status = await git(
             pi,
             ctx.cwd,
-            ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+            ["status", "--porcelain", "--untracked-files=all"],
             true,
           );
           if (status)
@@ -376,9 +376,9 @@ const experimentInstructions =
 const reviewInstructions =
   "[WORKGRAPH REVIEW]\nReview only the identified subject and concern. For an exact revision subject, inspect that exact commit with Git (for example git show, git diff, and git ls-tree) and cite the revision in evidence; do not silently treat live working files as that commit. Do not claim tests against current working files validate another revision. Execute verification only when it genuinely targets the requested subject. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
 const guideInstructions =
-  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current isolated worktree. Record at most eight concrete local TODO items with workgraph_todo before the first edit. Missing TODO telemetry does not block an otherwise valid implementation. Make the first useful edit; the runtime then switches models. If required work crosses the authorized scope, report escalation without editing. Do not report completion during the guide phase.";
+  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current isolated worktree. If the requirement already holds, verify it and report no_change with the inspected base revision and reason; no edit or executor turn is required. If a change is needed, record at most eight concrete local TODO items with workgraph_todo before the first useful edit; the runtime then switches models and changed work must complete through the executor. Missing TODO telemetry does not block an otherwise valid implementation. If required work crosses the authorized scope, report escalation without editing.";
 function executorInstructions(): string {
-  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory in the isolated worktree. Complete the bounded assignment, run its verification, create exactly one direct commit on the supplied base, and leave the worktree clean. Return workgraph_report with evidence. Escalate required work beyond the authorized scope.";
+  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory in the isolated worktree. Complete the bounded assignment and run its verification. For changed code, create exactly one direct commit on the supplied base and leave the worktree clean. If verification establishes no change is needed and the worktree is clean at the supplied base, report no_change with that revision and reason instead. Return workgraph_report with evidence. Escalate required work beyond the authorized scope.";
 }
 async function git(
   pi: ExtensionAPI,

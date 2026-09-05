@@ -916,6 +916,8 @@ function compactStatus(state: WorkstreamState, offset = 0, limit = 20) {
     }
     return {
       observations: entries.length,
+      distinctCount: distinct.size,
+      omittedDistinct: Math.max(0, distinct.size - 8),
       distinct: [...distinct.values()]
         .slice(0, 8)
         .map(({ sources, ...entry }) => ({

@@ -1100,7 +1100,7 @@ function objectiveFor(
   if (assignment.capability === "implement")
     common.push(
       `Acceptance: ${assignment.acceptance.join("; ")}`,
-      "Create one clean maintained commit and report its exact commit for composition.",
+      "If a change is needed, create one clean maintained commit and report its exact commit for composition. If the requirement already holds, verify it and report no_change with the inspected base revision and reason, without manufacturing an edit, commit, or executor turn.",
     );
   if (assignment.capability === "review") {
     common.push(
