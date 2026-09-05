@@ -278,6 +278,47 @@ const research = (id: string, intentVersion = 0) => ({
   expectedEvidence: ["File evidence"],
 });
 
+test("multi-attempt queueing resolves one shared validated base and exact-review conflicts have no effects", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const initial = await f.repository.head();
+    const queued = await active.queue(research("shared-base"), {
+      selection: { count: 2, diversity: "distinct-models" },
+    });
+    assert.deepEqual(
+      queued.attempts.map((attempt) => attempt.baseRevision),
+      [initial, initial],
+    );
+    await writeFile(join(f.root, "moved.txt"), "moved\n");
+    await git(f.root, "add", ".");
+    await git(f.root, "commit", "-m", "move head");
+    const moved = await f.repository.head();
+    assert.notEqual(moved, initial);
+    const retainedBefore = (await f.store.load()).assignments.length;
+    await assert.rejects(
+      active.queue(
+        {
+          id: "conflicting-review",
+          capability: "review",
+          artifactIntent: "evidence_only",
+          objective: "Review an exact revision",
+          intentVersion: 0,
+          subject: { kind: "revision", revision: initial },
+          concern: "Conflicting base must fail before queueing",
+        },
+        { baseRevision: moved },
+      ),
+      /conflicts with its exact subject/,
+    );
+    const state = await f.store.load();
+    assert.equal(state.assignments.length, retainedBefore);
+    assert.equal(state.attempts.length, 2);
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("new runtime drives fresh research through native evidence, durable retryable delivery and exact Git cleanup", async () => {
   const f = await fixture();
   try {

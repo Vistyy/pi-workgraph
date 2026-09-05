@@ -361,13 +361,23 @@ const DeliverySchema = Type.Object(
   },
   { additionalProperties: false },
 );
+const UnresolvedEvidenceSchema = Type.Object(
+  {
+    resultId: NonEmptyStringSchema,
+    reason: NonEmptyStringSchema,
+  },
+  { additionalProperties: false },
+);
 const CompletionSchema = Type.Object(
   {
     conclusion: NonEmptyStringSchema,
     evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
     limitations: Type.Array(NonEmptyStringSchema),
     unresolvedAssignmentIds: Type.Array(NonEmptyStringSchema),
+    unresolvedAttemptIds: Type.Optional(Type.Array(NonEmptyStringSchema)),
+    unresolvedResultIds: Type.Optional(Type.Array(NonEmptyStringSchema)),
     undeliveredResultIds: Type.Optional(Type.Array(NonEmptyStringSchema)),
+    undeliveredEvidence: Type.Optional(Type.Array(UnresolvedEvidenceSchema)),
     completedAt: TimestampSchema,
   },
   { additionalProperties: false },
@@ -768,7 +778,18 @@ export class WorkstreamStore {
     return this.changeAttempt(
       input.id,
       (attempt) => {
-        if (!["queued", "starting"].includes(attempt.state))
+        if (attempt.state === "starting") {
+          if (
+            attempt.worktreePath === input.worktreePath &&
+            attempt.branch === input.branch &&
+            attempt.baseRevision === input.baseRevision
+          )
+            return;
+          throw new Error(
+            `Attempt ${input.id} has contradictory launch placement.`,
+          );
+        }
+        if (attempt.state !== "queued")
           throw new Error(`Attempt ${input.id} is not awaiting launch.`);
         attempt.state = "starting";
         attempt.worktreePath = input.worktreePath;
@@ -789,6 +810,10 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
+        if (attempt.sessionFile) {
+          if (attempt.sessionFile === sessionFile) return;
+          throw new Error(`Attempt ${id} has contradictory session identity.`);
+        }
         if (attempt.state !== "starting")
           throw new Error(`Attempt ${id} is not starting.`);
         attempt.sessionFile = sessionFile;
@@ -805,6 +830,13 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
+        if (!["starting", "running"].includes(attempt.state)) {
+          if (attempt.launchPane && sameValue(attempt.launchPane, launchPane))
+            return;
+          throw new Error(`Attempt ${id} is not accepting launch placement.`);
+        }
+        if (attempt.launchPane && !sameValue(attempt.launchPane, launchPane))
+          throw new Error(`Attempt ${id} has contradictory launch placement.`);
         attempt.launchPane = launchPane;
       },
       now,
@@ -819,6 +851,12 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
+        if (!["starting", "running"].includes(attempt.state)) {
+          if (attempt.resource && sameValue(attempt.resource, resource)) return;
+          throw new Error(`Attempt ${id} is not accepting a resource.`);
+        }
+        if (attempt.resource && !sameValue(attempt.resource, resource))
+          throw new Error(`Attempt ${id} has contradictory resource identity.`);
         attempt.resource = resource;
       },
       now,
@@ -833,8 +871,14 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
+        if (attempt.worker) {
+          if (sameValue(attempt.worker, worker)) return;
+          throw new Error(`Attempt ${id} has contradictory worker identity.`);
+        }
         if (!attempt.sessionFile)
           throw new Error("Worker identity requires a session file.");
+        if (!["starting", "running"].includes(attempt.state))
+          throw new Error(`Attempt ${id} is not accepting worker identity.`);
         attempt.worker = worker;
       },
       now,
@@ -886,10 +930,16 @@ export class WorkstreamStore {
           throw new Error(
             `Settlement references unknown result ${input.resultId}.`,
           );
-        if (
-          !["running", "starting", "cancel_requested", "settled"].includes(
-            attempt.state,
+        if (attempt.state === "settled" || attempt.state === "cancelled") {
+          if (
+            attempt.resultId === input.resultId &&
+            sameValue(attempt.effectiveModels, input.effectiveModels)
           )
+            return;
+          throw new Error(`Attempt ${input.id} has an immutable settlement.`);
+        }
+        if (
+          !["running", "starting", "cancel_requested"].includes(attempt.state)
         )
           throw new Error(`Attempt ${input.id} is not settleable.`);
         attempt.state =
@@ -941,8 +991,15 @@ export class WorkstreamStore {
     return this.changeAttempt(
       input.id,
       (attempt) => {
-        if (attempt.composition)
+        if (attempt.composition) {
+          if (
+            attempt.composition.state === "pending" &&
+            attempt.composition.commit === input.commit &&
+            attempt.composition.expectedHead === input.expectedHead
+          )
+            return;
           throw new Error(`Composition for ${input.id} is already recorded.`);
+        }
         attempt.composition = {
           state: "pending",
           commit: input.commit,
@@ -962,6 +1019,10 @@ export class WorkstreamStore {
       id,
       (attempt) => {
         const composition = attempt.composition;
+        if (composition?.state === "composed") {
+          if (composition.revision === revision) return;
+          throw new Error(`Composition for ${id} has an immutable revision.`);
+        }
         if (composition?.state !== "pending")
           throw new Error(`Composition for ${id} is not pending.`);
         attempt.composition = { ...composition, state: "composed", revision };
@@ -980,6 +1041,12 @@ export class WorkstreamStore {
       id,
       (attempt) => {
         const composition = attempt.composition;
+        if (composition?.state === "blocked") {
+          if (composition.error === error.trim()) return;
+          throw new Error(
+            `Composition for ${id} has contradictory failure evidence.`,
+          );
+        }
         if (composition?.state !== "pending")
           throw new Error(`Composition for ${id} is not pending.`);
         attempt.composition = {
@@ -1001,8 +1068,15 @@ export class WorkstreamStore {
     return this.changeAttempt(
       input.id,
       (attempt) => {
-        if (attempt.cleanup)
+        if (attempt.cleanup) {
+          if (
+            attempt.cleanup.state === "pending" &&
+            attempt.cleanup.expectedHead === input.expectedHead &&
+            attempt.cleanup.discard === input.discard
+          )
+            return;
           throw new Error(`Cleanup for ${input.id} is already recorded.`);
+        }
         if (!attempt.worktreePath)
           throw new Error("Cleanup requires a worktree.");
         attempt.cleanup = {
@@ -1020,6 +1094,7 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
+        if (attempt.cleanup?.state === "completed") return;
         if (attempt.cleanup?.state !== "pending")
           throw new Error(`Cleanup for ${id} is not pending.`);
         if (attempt.cleanup.workerClosed) return;
@@ -1048,6 +1123,7 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
+        if (attempt.cleanup?.state === "completed") return;
         if (
           attempt.cleanup?.state !== "pending" ||
           !attempt.cleanup.workerClosed
@@ -1070,6 +1146,14 @@ export class WorkstreamStore {
       (attempt) => {
         if (!attempt.cleanup)
           throw new Error(`Cleanup for ${id} is not recorded.`);
+        if (attempt.cleanup.state === "completed")
+          throw new Error(`Cleanup for ${id} is already completed.`);
+        if (attempt.cleanup.state === "blocked") {
+          if (attempt.cleanup.error === error.trim()) return;
+          throw new Error(
+            `Cleanup for ${id} has contradictory failure evidence.`,
+          );
+        }
         attempt.cleanup = {
           ...attempt.cleanup,
           state: "blocked",
@@ -1185,7 +1269,14 @@ export class WorkstreamStore {
       (draft) => {
         const result = draft.results.find((item) => item.id === resultId);
         if (!result) throw new Error(`Unknown result ${resultId}.`);
-        result.artifacts = artifacts;
+        if (sameValue(result.artifacts, artifacts)) return;
+        if (result.artifacts.length === 0) {
+          result.artifacts = artifacts;
+          return;
+        }
+        throw new Error(
+          `Result ${resultId} artifacts are immutable after retention.`,
+        );
       },
       undefined,
       ["active", "suspended"],
@@ -1259,6 +1350,10 @@ export class WorkstreamStore {
     conclusion: string;
     evidence: Static<typeof EvidenceSchema>[];
     limitations: string[];
+    unresolvedAttemptIds?: string[];
+    unresolvedResultIds?: string[];
+    undeliveredResultIds?: string[];
+    undeliveredEvidence?: { resultId: string; reason: string }[];
     now?: Date;
   }): Promise<WorkstreamState> {
     requireText(input.conclusion, "Completion conclusion");
@@ -1283,25 +1378,69 @@ export class WorkstreamStore {
           "Complete only after workers and owned resources have settled and cleaned up.",
         );
       }
-      if (draft.deliveries.some((delivery) => delivery.state === "pending")) {
-        throw new Error(
-          "Pending result delivery requires explicit acknowledgment after reading the result, or recovery by reattachment.",
-        );
-      }
       const unresolvedAssignmentIds = draft.assignments
         .filter((assignment) => !assignmentResolved(draft, assignment))
         .map((assignment) => assignment.id);
-      const undeliveredResultIds = draft.deliveries
+      const unresolvedAttemptIds = draft.attempts
+        .filter((attempt) => !attemptResolved(draft, attempt))
+        .map((attempt) => attempt.id);
+      const unresolvedResultIds = draft.results
+        .filter((result) => resultUnresolved(draft, result.id))
+        .map((result) => result.id);
+      const pendingResultIds = draft.deliveries
         .filter((delivery) => delivery.state === "pending")
         .map((delivery) => delivery.resultId);
+      const suppliedAttempts = uniqueInputIds(input.unresolvedAttemptIds ?? []);
+      const suppliedResults = uniqueInputIds(input.unresolvedResultIds ?? []);
+      const suppliedUndelivered = uniqueInputIds(
+        input.undeliveredResultIds ?? [],
+      );
+      if (!sameIds(suppliedAttempts, unresolvedAttemptIds))
+        throw new Error(
+          `Completion must explicitly account for unresolved attempts: ${unresolvedAttemptIds.join(", ") || "none"}.`,
+        );
+      const resultIdsRequireExplicitAccounting = unresolvedResultIds.filter(
+        (resultId) => {
+          const assignmentId = draft.results.find(
+            (result) => result.id === resultId,
+          )?.assignmentId;
+          return draft.attempts.some(
+            (attempt) => attempt.assignmentId === assignmentId,
+          );
+        },
+      );
+      if (
+        resultIdsRequireExplicitAccounting.length > 0 &&
+        !sameIds(suppliedResults, resultIdsRequireExplicitAccounting)
+      )
+        throw new Error(
+          `Completion must explicitly account for unresolved results: ${resultIdsRequireExplicitAccounting.join(", ")}.`,
+        );
+      if (!sameIds(suppliedUndelivered, pendingResultIds))
+        throw new Error(
+          `Pending result delivery requires explicit undelivered result accounting: ${pendingResultIds.join(", ") || "none"}.`,
+        );
       if (
         (unresolvedAssignmentIds.length > 0 ||
-          undeliveredResultIds.length > 0) &&
+          unresolvedAttemptIds.length > 0 ||
+          unresolvedResultIds.length > 0 ||
+          pendingResultIds.length > 0) &&
         input.limitations.length === 0
-      ) {
+      )
         throw new Error(
-          "Completion with unresolved assignments or undelivered results requires an explicit limitation.",
+          "Completion with unresolved assignments, attempts, results or delivery requires a specific limitation.",
         );
+      for (const resultId of pendingResultIds) {
+        const reason = input.undeliveredEvidence?.find(
+          (item) => item.resultId === resultId,
+        );
+        if (
+          !reason?.reason.trim() &&
+          !input.limitations.some((item) => item.includes(resultId))
+        )
+          throw new Error(
+            `Undelivered result ${resultId} requires an identified reason.`,
+          );
       }
       const completedAt = (input.now ?? now).toISOString();
       draft.completion = {
@@ -1309,7 +1448,12 @@ export class WorkstreamStore {
         evidence: structuredClone(input.evidence),
         limitations: input.limitations.map((item) => item.trim()),
         unresolvedAssignmentIds,
-        undeliveredResultIds,
+        unresolvedAttemptIds,
+        unresolvedResultIds,
+        undeliveredResultIds: pendingResultIds,
+        ...(input.undeliveredEvidence
+          ? { undeliveredEvidence: structuredClone(input.undeliveredEvidence) }
+          : {}),
         completedAt,
       };
       draft.lifecycle = {
@@ -1506,6 +1650,13 @@ function validateState(value: unknown): asserts value is WorkstreamState {
       throw new InvalidWorkstreamStateError(
         `Attempt ${attempt.id} references unknown result.`,
       );
+    if (attempt.resultId) {
+      const result = state.results.find((item) => item.id === attempt.resultId);
+      if (result?.assignmentId !== attempt.assignmentId)
+        throw new InvalidWorkstreamStateError(
+          `Attempt ${attempt.id} references a result from another assignment.`,
+        );
+    }
     if (
       attempt.models?.selection &&
       attempt.models.selection.selected.length === 0
@@ -1523,6 +1674,28 @@ function validateState(value: unknown): asserts value is WorkstreamState {
     state.deliveries.map((delivery) => delivery.resultId),
     "delivery",
   );
+  if (state.completion) {
+    for (const id of state.completion.unresolvedAssignmentIds)
+      if (!assignmentIds.has(id))
+        throw new InvalidWorkstreamStateError(
+          `Completion references unknown assignment ${id}.`,
+        );
+    for (const id of state.completion.unresolvedAttemptIds ?? [])
+      if (!state.attempts.some((attempt) => attempt.id === id))
+        throw new InvalidWorkstreamStateError(
+          `Completion references unknown attempt ${id}.`,
+        );
+    for (const id of state.completion.unresolvedResultIds ?? [])
+      if (!resultIds.has(id))
+        throw new InvalidWorkstreamStateError(
+          `Completion references unknown result ${id}.`,
+        );
+    for (const id of state.completion.undeliveredResultIds ?? [])
+      if (!state.deliveries.some((delivery) => delivery.resultId === id))
+        throw new InvalidWorkstreamStateError(
+          `Completion references unknown delivery ${id}.`,
+        );
+  }
   if (state.lifecycle.state === "completed" && !state.completion)
     throw new InvalidWorkstreamStateError(
       "Completed workstream has no completion record.",
@@ -1694,22 +1867,64 @@ function assignmentResolved(
   assignment: WorkAssignment,
 ): boolean {
   // Resolution closes this assignment's original scope, not the current intent.
-  // A maintained result must actually have composed, not merely report a stale commit.
-  if (
-    assignment.capability === "implement" &&
-    !state.attempts.some(
-      (attempt) =>
-        attempt.assignmentId === assignment.id &&
-        attempt.composition?.state === "composed",
-    )
-  )
-    return false;
-  const result = [...state.results]
-    .reverse()
-    .find((candidate) => candidate.assignmentId === assignment.id);
+  // Every requested attempt is an independent contribution; no later success hides a failure.
+  const attempts = state.attempts.filter(
+    (attempt) => attempt.assignmentId === assignment.id,
+  );
+  if (attempts.length > 0)
+    return attempts.every((attempt) => attemptResolved(state, attempt));
+  if (assignment.capability === "implement") return false;
+  const results = state.results.filter(
+    (result) => result.assignmentId === assignment.id,
+  );
+  return (
+    results.length > 0 &&
+    results.every((result) => !resultUnresolved(state, result.id))
+  );
+}
+
+function attemptResolved(
+  state: WorkstreamState,
+  attempt: WorkAttempt,
+): boolean {
+  const result = attempt.resultId
+    ? state.results.find((candidate) => candidate.id === attempt.resultId)
+    : undefined;
+  if (!result || resultUnresolved(state, result.id)) return false;
+  const assignment = state.assignments.find(
+    (item) => item.id === attempt.assignmentId,
+  );
+  return (
+    result.validity === "typed" &&
+    result.report.status === "completed" &&
+    (assignment?.capability !== "implement" ||
+      attempt.composition?.state === "composed")
+  );
+}
+
+function resultUnresolved(state: WorkstreamState, resultId: string): boolean {
+  const result = state.results.find((candidate) => candidate.id === resultId);
   if (result?.validity !== "typed" || result.report.status !== "completed")
-    return false;
-  return true;
+    return true;
+  return state.dispositions.some(
+    (disposition) =>
+      disposition.resultId === resultId && disposition.status !== "accepted",
+  );
+}
+
+function uniqueInputIds(ids: string[]): string[] {
+  return [...new Set(ids)].sort();
+}
+
+function sameIds(left: string[], right: string[]): boolean {
+  return (
+    JSON.stringify(uniqueInputIds(left)) ===
+    JSON.stringify(uniqueInputIds(right))
+  );
+}
+
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function requireActive(state: WorkstreamState): void {

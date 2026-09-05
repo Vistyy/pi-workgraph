@@ -30,7 +30,8 @@
     "quality": "biome check --error-on-warnings && node --import tsx scripts/check-assertions.ts",
     "check": "pnpm typecheck && pnpm quality && pnpm test",
     "smoke:herdr": "node --import tsx scripts/herdr-smoke.ts",
-    "smoke:coordinator": "node --import tsx scripts/coordinator-smoke.ts"
+    "smoke:coordinator": "node --import tsx scripts/coordinator-smoke.ts",
+    "smoke:natural": "node --import tsx scripts/natural-coordinator-smoke.ts"
   },
   "pi": {
     "extensions": [

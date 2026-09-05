@@ -399,6 +399,132 @@ test("workstream keeps worker validity, disposition, limitations, and stale resu
   }
 });
 
+test("every independent attempt remains accounted for regardless of result arrival order", async () => {
+  for (const order of [
+    ["failed", "success"],
+    ["success", "failed"],
+  ]) {
+    const { parent, store } = await fixture();
+    try {
+      const queued = await store.enqueue(
+        {
+          id: "comparison",
+          capability: "research",
+          artifactIntent: "evidence_only",
+          objective: "Compare independent observations",
+          intentVersion: 0,
+          expectedEvidence: ["Observation"],
+        },
+        order.map((_, index) => ({
+          id: `attempt-${index}`,
+          models: {
+            guide: { model: "fixture/research", thinking: "low" },
+            source: "policy" as const,
+          },
+        })),
+      );
+      for (let index = 0; index < order.length; index++) {
+        await store.startAttempt({
+          id: `attempt-${index}`,
+          worktreePath: `/tmp/worktree-${index}`,
+          branch: `branch-${index}`,
+          baseRevision: "a".repeat(40),
+        });
+        await store.recordLaunchPane(`attempt-${index}`, {
+          workspaceId: "fixture",
+          paneId: `pane-${index}`,
+        });
+        await store.recordResource(`attempt-${index}`, {
+          workspaceId: "fixture",
+          tabId: `tab-${index}`,
+          paneId: `pane-${index}`,
+          terminalId: `terminal-${index}`,
+          agentName: `agent-${index}`,
+          cwd: `/tmp/worktree-${index}`,
+        });
+        await store.recordSessionFile(
+          `attempt-${index}`,
+          `/tmp/session-${index}`,
+        );
+        await store.markSubmission(`attempt-${index}`, "uncertain");
+        await store.markSubmission(`attempt-${index}`, "submitted");
+        await store.retainResult({
+          id: `result-${index}`,
+          assignmentId: "comparison",
+          assignmentIntentVersion: 0,
+          validity: "typed",
+          report: {
+            ...researchReport(`${order[index]} observation`),
+            status: order[index] === "success" ? "completed" : "failed",
+          },
+        });
+        await store.settleAttempt({
+          id: `attempt-${index}`,
+          resultId: `result-${index}`,
+          effectiveModels: [{ model: "fixture/research", thinking: "low" }],
+        });
+        await store.beginCleanup({
+          id: `attempt-${index}`,
+          expectedHead: "a".repeat(40),
+          discard: false,
+        });
+        await store.markWorkerClosed(`attempt-${index}`);
+        await store.finishCleanup(`attempt-${index}`);
+        await assert.doesNotReject(
+          store.recordLaunchPane(`attempt-${index}`, {
+            workspaceId: "fixture",
+            paneId: `pane-${index}`,
+          }),
+        );
+        await assert.rejects(
+          store.recordLaunchPane(`attempt-${index}`, {
+            workspaceId: "fixture",
+            paneId: "contradictory",
+          }),
+          /contradictory|not accepting/,
+        );
+        await assert.rejects(
+          store.blockCleanup(`attempt-${index}`, "late cleanup failure"),
+          /already completed/,
+        );
+      }
+      const state = await store.load();
+      assert.equal(queued.attempts.length, 2);
+      await assert.rejects(
+        store.complete({
+          conclusion: "One contribution failed",
+          evidence: [
+            { label: "comparison", observation: "Both attempts retained" },
+          ],
+          limitations: ["The failed attempt remains unresolved."],
+        }),
+        /unresolved attempts|unresolved results/,
+      );
+      const failed = state.attempts.find((attempt) =>
+        attempt.id.endsWith(order.indexOf("failed").toString()),
+      )!;
+      const failedResult = state.results.find(
+        (result) => result.id === failed.resultId,
+      )!;
+      const completed = await store.complete({
+        conclusion: "One contribution failed",
+        evidence: [
+          { label: "comparison", observation: "Both attempts retained" },
+        ],
+        limitations: ["The failed attempt remains unresolved."],
+        unresolvedAttemptIds: [failed.id],
+        unresolvedResultIds: [failedResult.id],
+      });
+      assert.deepEqual(completed.completion?.unresolvedAttemptIds, [failed.id]);
+      assert.deepEqual(completed.completion?.unresolvedResultIds, [
+        failedResult.id,
+      ]);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  }
+});
+
 test("workstream serializes receipt writes and rejects corrupt or foreign history without rewriting it", async () => {
   const { parent, store } = await fixture();
   try {

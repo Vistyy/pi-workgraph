@@ -236,14 +236,6 @@ export async function setModelRole(
     throw new Error("Invalid model role or target.");
   const policy = await loadModelPolicy(path);
   policy.roles[role] = target;
-  if (role === "research" || role === "review") {
-    policy.workerPool = [
-      target,
-      ...policy.workerPool.filter(
-        (candidate) => candidate.model !== target.model,
-      ),
-    ];
-  }
   return writeModelPolicy(policy, path);
 }
 

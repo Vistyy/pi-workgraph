@@ -8,7 +8,21 @@ import { HerdrCliRuntime } from "../src/herdr.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { WorkstreamStore } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
-import { extensionFixture, git, resultState } from "./helpers.js";
+import {
+  extensionFixture,
+  git,
+  researchReport,
+  resultState,
+} from "./helpers.js";
+
+function record(value: unknown): Record<string, unknown> {
+  assert.ok(value && typeof value === "object" && !Array.isArray(value));
+  return value as Record<string, unknown>;
+}
+function records(value: unknown): Record<string, unknown>[] {
+  assert.ok(Array.isArray(value));
+  return value.map(record);
+}
 
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-coordinator-"));
@@ -157,6 +171,98 @@ test("failed registered adoption preserves the attached runtime lease; same-targ
   } finally {
     await competing?.stop();
     registry.close();
+    await f.dispose();
+  }
+});
+
+test("registered status stays compact and focused result retrieval projects bounded sections", async () => {
+  const f = await fixture();
+  try {
+    const initial = resultState(
+      (
+        await f.call("workgraph_begin", {
+          purpose: "Inspect retained evidence",
+        })
+      ).details,
+    );
+    const owner = {
+      sessionId: f.session.getSessionId(),
+      sessionFile: f.session.getSessionFile()!,
+    };
+    const store = WorkstreamStore.open(initial.statePath, owner);
+    await store.assign({
+      id: "large-result",
+      capability: "research",
+      artifactIntent: "evidence_only",
+      objective: "Retain bounded evidence",
+      intentVersion: 0,
+      expectedEvidence: ["evidence"],
+    });
+    await store.retainResult({
+      id: "large-result-1",
+      assignmentId: "large-result",
+      assignmentIntentVersion: 0,
+      validity: "typed",
+      report: {
+        ...researchReport("A bounded summary"),
+        evidence: Array.from({ length: 6 }, (_, index) => ({
+          label: `evidence-${index}`,
+          observation: `observation-${index}`,
+        })),
+        findings: Array.from({ length: 4 }, (_, index) => ({
+          severity: "info" as const,
+          title: `finding-${index}`,
+          detail: `detail-${index}`,
+          envelopeImpact: "none" as const,
+        })),
+      },
+    });
+    const status = await f.call("workgraph_status", {});
+    const statusContent = status.content[0];
+    const statusText =
+      statusContent && "text" in statusContent ? statusContent.text : "";
+    assert.match(statusText, /large-result-1/);
+    assert.doesNotMatch(statusText, /observation-0/);
+    const evidence = await f.call("workgraph_result", {
+      resultId: "large-result-1",
+      section: "evidence",
+      offset: 2,
+      limit: 2,
+    });
+    const evidenceDetails = record(evidence.details);
+    const evidenceView = record(evidenceDetails.result);
+    const evidencePage = record(evidenceView.evidence);
+    assert.equal(records(evidencePage.items).length, 2);
+    assert.equal(record(records(evidencePage.items)[0]).label, "evidence-2");
+    assert.equal(evidencePage.remaining, 2);
+    assert.equal(evidencePage.nextOffset, 4);
+    const findings = await f.call("workgraph_result", {
+      resultId: "large-result-1",
+      section: "findings",
+      limit: 1,
+    });
+    const findingsView = record(record(findings.details).result);
+    const findingsPage = record(findingsView.findings);
+    assert.equal(record(records(findingsPage.items)[0]).title, "finding-0");
+    assert.equal(findingsView.evidence, undefined);
+    const state = resultState((await f.call("workgraph_status", {})).details);
+    assert.equal(state.deliveries[0]?.state, "delivered");
+    const completed = resultState(
+      (
+        await f.call("workgraph_complete", {
+          conclusion: "The retained evidence is available and bounded.",
+          evidence: [
+            {
+              label: "focused retrieval",
+              observation: "Evidence and findings were retrieved by section.",
+            },
+          ],
+          limitations: [],
+        })
+      ).details,
+    );
+    assert.equal(completed.lifecycle.state, "completed");
+  } finally {
     await f.dispose();
   }
 });

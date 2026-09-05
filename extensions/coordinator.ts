@@ -587,45 +587,33 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           "attention",
         ] as const),
       ),
+      offset: Type.Optional(Type.Integer({ minimum: 0 })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
     }),
     async execute(_id, params) {
       return serial(async () => {
         const state = await current().store.load();
-        const view = coordinatorView(state);
-        const retained = view.results.find(
-          (item) => item.id === params.resultId,
+        if (!state.results.some((item) => item.id === params.resultId))
+          throw new Error(`Unknown result ${params.resultId}.`);
+        await current().perform(() =>
+          current().store.requestDelivery(params.resultId),
         );
-        if (!retained) throw new Error(`Unknown result ${params.resultId}.`);
-        const section = params.section ?? "all";
-        const selected =
-          section === "all"
-            ? retained
-            : section === "summary"
-              ? {
-                  id: retained.id,
-                  validity: retained.validity,
-                  report: retained.report,
-                }
-              : section === "attention"
-                ? {
-                    id: retained.id,
-                    delivery: view.delivery.find(
-                      (item) => item.resultId === retained.id,
-                    ),
-                    attempt: view.assignments
-                      .flatMap((item) => item.attempts)
-                      .find((item) => item.resultId === retained.id),
-                  }
-                : {
-                    id: retained.id,
-                    validity: retained.validity,
-                    report: retained.report,
-                  };
+        await current().perform(() =>
+          current().store.markDelivered(params.resultId),
+        );
+        const latest = await current().store.load();
+        const selected = focusedResult(
+          latest,
+          params.resultId,
+          params.section ?? "all",
+          params.offset ?? 0,
+          params.limit ?? 20,
+        );
         return {
           content: [
             { type: "text" as const, text: JSON.stringify(selected, null, 2) },
           ],
-          details: { result: selected, statePath: state.statePath },
+          details: { result: selected, statePath: latest.statePath },
         };
       });
     },
@@ -634,7 +622,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_status",
     label: "Workgraph Status",
     description:
-      "Inspect durable intent, human receipts, assignments, model observations, results and resource recovery.",
+      "Inspect compact progress, selected models and reasons, result handles, actionable attention and resource recovery.",
     parameters: Type.Object({}),
     async execute() {
       return serial(async () => {
@@ -642,6 +630,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         return result(
           `Workstream ${state.id}: ${state.lifecycle.state}`,
           state,
+          compactStatus(state),
         );
       });
     },
@@ -792,6 +781,14 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       conclusion: Type.String(),
       evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
       limitations: Type.Array(Type.String()),
+      unresolvedAttemptIds: Type.Optional(Type.Array(Type.String())),
+      unresolvedResultIds: Type.Optional(Type.Array(Type.String())),
+      undeliveredResultIds: Type.Optional(Type.Array(Type.String())),
+      undeliveredEvidence: Type.Optional(
+        Type.Array(
+          Type.Object({ resultId: Type.String(), reason: Type.String() }),
+        ),
+      ),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       return serial(async () => {
@@ -806,6 +803,10 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
 }
 
 function coordinatorView(state: WorkstreamState) {
+  return compactStatus(state);
+}
+
+function compactStatus(state: WorkstreamState) {
   return {
     id: state.id,
     lifecycle: state.lifecycle,
@@ -822,61 +823,135 @@ function coordinatorView(state: WorkstreamState) {
           id: attempt.id,
           state: attempt.state,
           models: attempt.models,
+          effectiveModels: attempt.effectiveModels,
           submission: attempt.submission,
-          settlement: attempt.resultId ? "settled" : "unproven",
-          composition: attempt.composition,
-          cleanup: attempt.cleanup,
           resultId: attempt.resultId,
+          composition: attempt.composition?.state,
+          cleanup: attempt.cleanup?.state,
           attention: attempt.error,
         })),
     })),
-    results: state.results.map((result) => ({
-      id: result.id,
-      assignmentId: result.assignmentId,
-      validity: result.validity,
-      report:
-        result.validity === "typed"
-          ? {
-              kind: result.report.kind,
-              status: result.report.status,
-              summary: result.report.summary,
-              uncertainty: result.report.uncertainty ?? [],
-              evidence: result.report.evidence,
-              findings: result.report.findings,
-              commit:
-                result.report.kind === "implementation"
-                  ? result.report.commit
-                  : undefined,
-            }
-          : result.validity === "untyped"
-            ? { text: result.text }
-            : { detail: result.detail },
-      artifacts: result.artifacts,
+    results: state.results.map((item) => ({
+      id: item.id,
+      assignmentId: item.assignmentId,
+      validity: item.validity,
+      summary:
+        item.validity === "typed"
+          ? item.report.summary
+          : item.validity === "untyped"
+            ? item.text.slice(0, 240)
+            : item.detail,
+      handles: {
+        summary: "summary",
+        evidence: "evidence",
+        findings: "findings",
+        attention: "attention",
+      },
     })),
     delivery: state.deliveries.map((delivery) => ({
       resultId: delivery.resultId,
       state: delivery.state,
       error: delivery.error,
     })),
-    judgment: state.dispositions,
-    completion: state.completion,
+    judgment: state.dispositions.map(({ resultId, status, reason }) => ({
+      resultId,
+      status,
+      reason,
+    })),
+    completion: state.completion
+      ? {
+          completedAt: state.completion.completedAt,
+          unresolvedAssignmentIds: state.completion.unresolvedAssignmentIds,
+          unresolvedAttemptIds: state.completion.unresolvedAttemptIds ?? [],
+          unresolvedResultIds: state.completion.unresolvedResultIds ?? [],
+          undeliveredResultIds: state.completion.undeliveredResultIds ?? [],
+        }
+      : undefined,
+  };
+}
+
+function focusedResult(
+  state: WorkstreamState,
+  resultId: string,
+  section: "all" | "summary" | "evidence" | "findings" | "attention",
+  offset: number,
+  limit: number,
+): Record<string, unknown> {
+  const item = state.results.find((candidate) => candidate.id === resultId);
+  if (!item) throw new Error(`Unknown result ${resultId}.`);
+  const base = {
+    id: item.id,
+    assignmentId: item.assignmentId,
+    validity: item.validity,
+  };
+  if (item.validity !== "typed")
+    return {
+      ...base,
+      ...(item.validity === "untyped"
+        ? { text: item.text }
+        : { detail: item.detail }),
+    };
+  const report = item.report;
+  const page = (values: unknown[]) => ({
+    items: values.slice(offset, offset + limit),
+    total: values.length,
+    offset,
+    limit,
+    remaining: Math.max(0, values.length - offset - limit),
+    ...(offset + limit < values.length ? { nextOffset: offset + limit } : {}),
+    continuation: "Call workgraph_result with the same section and nextOffset.",
+  });
+  if (section === "summary")
+    return {
+      ...base,
+      kind: report.kind,
+      status: report.status,
+      summary: report.summary,
+      uncertainty: report.uncertainty ?? [],
+      evidenceCount: report.evidence.length,
+      findingsCount: report.findings.length,
+      commit: report.kind === "implementation" ? report.commit : undefined,
+    };
+  if (section === "evidence")
+    return { ...base, evidence: page(report.evidence) };
+  if (section === "findings")
+    return { ...base, findings: page(report.findings) };
+  if (section === "attention")
+    return {
+      ...base,
+      delivery: state.deliveries.find(
+        (delivery) => delivery.resultId === resultId,
+      ),
+      judgments: state.dispositions.filter(
+        (disposition) => disposition.resultId === resultId,
+      ),
+    };
+  return {
+    ...base,
+    kind: report.kind,
+    status: report.status,
+    summary: report.summary,
+    uncertainty: report.uncertainty ?? [],
+    evidence: page(report.evidence),
+    findings: page(report.findings),
+    commit: report.kind === "implementation" ? report.commit : undefined,
+    artifacts: item.artifacts,
   };
 }
 
 function resultNotification(state: WorkstreamState, resultId: string): string {
-  const view = coordinatorView(state);
-  const result = view.results.find((item) => item.id === resultId);
   return [
     `Workgraph retained result ${resultId} for ${state.id}.`,
-    result
-      ? JSON.stringify(result, null, 2)
-      : "The result is no longer present in the current view.",
-    "Use workgraph_status for focused execution, evidence and cleanup details. This notification is not human authorization.",
+    JSON.stringify(focusedResult(state, resultId, "summary", 0, 20), null, 2),
+    "Use workgraph_result with this resultId and section evidence or findings for bounded detail; continuation offsets are returned when needed.",
   ].join("\n");
 }
 
-function result(text: string, state: WorkstreamState) {
-  const view = coordinatorView(state);
+function result(
+  text: string,
+  state: WorkstreamState,
+  view = coordinatorView(state),
+) {
   return {
     content: [
       {

@@ -174,6 +174,7 @@ export class WorkstreamRuntime {
   ): Promise<WorkstreamState> {
     return this.perform(async () => {
       const policy = this.policy ?? (await loadModelPolicy());
+      const baseRevision = await this.resolveQueueBase(input, options);
       if (input.capability === "implement") {
         const guide = policy.roles["implementation.guide"];
         const explicit =
@@ -209,9 +210,7 @@ export class WorkstreamRuntime {
           ...(options.continuationOf
             ? { continuationOf: options.continuationOf }
             : {}),
-          ...(options.baseRevision
-            ? { baseRevision: options.baseRevision }
-            : {}),
+          baseRevision,
         });
       }
       const role = input.capability === "review" ? "review" : "research";
@@ -243,12 +242,29 @@ export class WorkstreamRuntime {
           ...(index === 0 && options.continuationOf
             ? { continuationOf: options.continuationOf }
             : {}),
-          ...(options.baseRevision
-            ? { baseRevision: options.baseRevision }
-            : {}),
+          baseRevision,
         })),
       );
     });
+  }
+
+  private async resolveQueueBase(
+    input: Parameters<WorkstreamStore["assign"]>[0],
+    options: QueueOptions,
+  ): Promise<string> {
+    const subjectRevision =
+      input.capability === "review" && input.subject.kind === "revision"
+        ? input.subject.revision
+        : undefined;
+    if (
+      subjectRevision &&
+      options.baseRevision &&
+      subjectRevision !== options.baseRevision
+    )
+      throw new Error("Review base revision conflicts with its exact subject.");
+    const requested =
+      options.baseRevision ?? subjectRevision ?? (await this.repository.head());
+    return this.repository.resolveRevision(requested);
   }
 
   async reconcile(): Promise<WorkstreamState> {

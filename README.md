@@ -75,8 +75,8 @@ Suspension stops new launches and composition, while observations, evidence rete
 Result notifications have stable identifiers and can recur after an interrupted delivery; this is not an exactly-once transport.
 After a notification failure, read the result through status or reattach; acknowledgment remains available as an explicit receipt but is not needed to use the result.
 The runtime does not repeatedly wake the coordinator on every poll.
-Completion refuses unfinished or blocked owned work unless the conclusion includes an explicit limitation and records undelivered result identifiers honestly.
-Routine completion does not require acknowledgment or disposition; those remain separate optional facts.
+Completion always refuses unfinished or blocked owned work and requires named, reasoned accounting for unresolved attempts and evidence; undelivered result identifiers are retained only when that evidence is explicitly abandoned.
+Routine completion does not require acknowledgment or disposition; focused presentation is the transport receipt and those remain separate optional facts.
 Blocked work is preserved for inspection rather than force-deleted.
 
 The CLI provides read-only state inspection and explicit conversation forking:
@@ -101,7 +101,7 @@ pnpm smoke:coordinator
 ```
 
 A natural-use verification request should state the desired outcome, constraints, and uncertainty to resolve without naming Workgraph tools, worker counts, or model panels.
-For example, ask for a cheap evidence check, an isolated probe retained for inspection, and a focused implementation only if the evidence supports it, then judge the returned findings and exact result yourself.
+The runnable `pnpm smoke:natural` fixture asks the coordinator to resolve whether a disposable parser probe is justified and, only if it is, make one authorized small change, then checks the exact retained observation, bytes, commit, and cleanup.
 This natural procedure is evidence of caller usability, while the deterministic smoke remains a protocol check of identity, retention, composition, and cleanup boundaries.
 `pnpm check` owns full TypeScript checking, Biome formatting/recommended lint, targeted assertion checks, and deterministic tests.
 The assertion check uses the already-installed TypeScript parser to reject type laundering through `unknown` and assertions to `never`, while permitting legitimate unknown inputs, ordinary narrowing, and `as const`.

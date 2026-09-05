@@ -63,6 +63,16 @@ export class GitRepository {
     return gitText(cwd, ["rev-parse", "HEAD"]);
   }
 
+  async resolveRevision(revision: string): Promise<string> {
+    if (!/^[0-9a-f]{40,64}$/.test(revision))
+      throw new Error("Revision must be an exact hexadecimal commit id.");
+    return gitText(this.root, [
+      "rev-parse",
+      "--verify",
+      `${revision}^{commit}`,
+    ]);
+  }
+
   async status(cwd = this.root): Promise<string> {
     return gitText(
       cwd,
