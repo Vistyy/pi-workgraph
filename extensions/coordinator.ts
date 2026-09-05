@@ -131,6 +131,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       parentSessionId: ctx.sessionManager.getSessionId(),
       parentSessionFile: sessionFile,
       baseCommit: repositoryInfo.head,
+      capabilityMode: true,
       outcome: {
         kind: "answer",
         statement: `Answer the research question: ${request}`,
@@ -281,6 +282,9 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       question: Type.String({ description: "The bounded question the worker must answer." }),
       context: Type.Optional(Type.Array(Type.String())),
       expectedEvidence: Type.Optional(Type.Array(Type.String())),
+      artifactIntent: Type.Optional(StringEnum(["evidence_only", "disposable_experiment"] as const)),
+      sideEffects: Type.Optional(Type.Array(Type.String())),
+      stopWhen: Type.Optional(Type.String()),
       model: Type.Optional(Type.String()),
       thinking: Type.Optional(ThinkingSchema),
     }),
@@ -291,11 +295,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const current = await currentEngine.load();
         const target = withAvailability(await resolveTarget("discovery.partition", params.model, params.thinking), ctx, "research worker");
         const id = `research-${current.discoveries.length + 1}`;
-        const objective = [params.question.trim(), ...(params.context ?? []).map((item) => `Context: ${item}`), ...(params.expectedEvidence ?? []).map((item) => `Expected evidence: ${item}`)].join("\n");
+        const objective = [params.question.trim(), ...(params.context ?? []).map((item) => `Context: ${item}`), ...(params.expectedEvidence ?? []).map((item) => `Expected evidence: ${item}`), ...(params.artifactIntent === "disposable_experiment" ? ["This is a disposable experiment; do not promote its artifacts into the maintained product.", ...(params.sideEffects ?? []).map((item) => `Permitted side effect: ${item}`), ...(params.stopWhen ? [`Stop when: ${params.stopWhen}`] : [])] : [])].join("\n");
         const activeSupervisor = supervisor ?? attachSupervisor(ctx);
         const queued = remember(await currentEngine.queueDiscovery({
           topology: "evidence",
-          assignments: [{ id, lens: "Coordinator-requested research", objective, ...target }],
+          assignments: [{ id, lens: "Coordinator-requested research", objective, ...(params.artifactIntent ? { artifactIntent: params.artifactIntent } : {}), ...target }],
           stableEntryId: null,
         }));
         activeSupervisor.kick();
@@ -534,8 +538,32 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "workgraph_review",
+    label: "Workgraph Review",
+    description: "Delegate a bounded review of a proposal, artifact, or exact revision. Review is selective and does not authorize changes.",
+    promptSnippet: "Delegate a selective review without entering a mandatory assurance phase",
+    parameters: Type.Object({
+      subject: Type.String({ description: "Proposal, artifact, or revision to inspect." }),
+      concern: Type.String({ description: "The concrete concern or question for the reviewer." }),
+      revision: Type.Optional(Type.String()),
+      model: Type.Optional(Type.String()),
+      thinking: Type.Optional(ThinkingSchema),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return exclusively(async () => {
+        const target = withAvailability(await resolveTarget("verification.product", params.model, params.thinking), ctx, "review worker");
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        const run = remember(await (engine ?? await ensureResearchEngine(ctx, params.subject)).queueReview({ subject: params.subject, concern: params.concern, ...(params.revision ? { revision: params.revision } : {}), ...target, stableEntryId: null }));
+        activeSupervisor.kick();
+        const review = run.reviews.at(-1);
+        return { content: [{ type: "text", text: review?.state === "unavailable" ? `Review ${review.id} was recorded as unavailable.` : `Queued ${review?.id ?? "review"}; the reviewer will run asynchronously.` }], details: { ...summaryDetails(run), review } };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_review_result",
     label: "Workgraph Review Child Result",
-    description: "Explicitly disposition an untyped or absent child result while retaining the original session and prose. Acceptance requires a matching completed typed report.",
+    description: "Explicitly disposition an untyped or absent child result while retaining the original session and prose.",
     promptSnippet: "Review retained untyped Workgraph evidence without silently promoting it",
     parameters: Type.Object({
       attemptId: Type.String(),
@@ -587,6 +615,46 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             : `Applied internal plan v${plan.version}. ${checkpoint}` }],
           details: { ...summaryDetails(run), plan },
         };
+      });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_implement",
+    label: "Workgraph Implement",
+    description: "Delegate one bounded maintained change under applicable human authorization. This creates the workstream when needed and schedules one isolated implementation worker.",
+    promptSnippet: "Implement a bounded authorized product change",
+    parameters: Type.Object({
+      statement: Type.String({ description: "The bounded change authorized by the user." }),
+      authorizationRef: Type.String({ description: "A reference to the applicable human request or decision." }),
+      goal: Type.String(),
+      context: Type.Array(Type.String()),
+      acceptance: Type.Array(Type.String(), { minItems: 1 }),
+      claimedPaths: Type.Array(Type.String(), { minItems: 1 }),
+      verificationCommands: Type.Array(Type.String()),
+      forbidden: Type.Array(Type.String()),
+      report: Type.String(),
+      timeboxMinutes: Type.Integer({ minimum: 1, maximum: 240 }),
+      model: Type.Optional(Type.String()),
+      thinking: Type.Optional(ThinkingSchema),
+      executorModel: Type.Optional(Type.String()),
+      executorThinking: Type.Optional(ThinkingSchema),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      return exclusively(async () => {
+        const currentEngine = engine ?? await ensureResearchEngine(ctx, params.statement);
+        const activated = remember(await currentEngine.activateImplementation({ authorizationRef: params.authorizationRef, statement: params.statement, acceptance: params.acceptance }));
+        const policy = await loadModelPolicy();
+        const guide = await resolveTarget("implementation.guide", params.model, params.thinking);
+        const executorDefault = roleTargets(policy, "implementation.executor")[0]!;
+        const executor = params.executorModel ? { model: params.executorModel, thinking: params.executorThinking ?? executorDefault.thinking } : executorDefault;
+        requireAvailable(guide.model, ctx, "implementation guide");
+        requireAvailable(executor.model, ctx, "implementation executor");
+        const nodeId = `implement-${activated.nodes.length + 1}`;
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        activeSupervisor.options.stableEntryId = stableParentEntry(ctx.sessionManager);
+        const run = remember(await persistSchedule(currentEngine, { maxConcurrency: 1, nodes: [{ id: nodeId, brief: { goal: params.goal, context: params.context, acceptance: params.acceptance, timeboxMinutes: params.timeboxMinutes, forbidden: params.forbidden, report: params.report }, claimedPaths: params.claimedPaths, dependencies: [], verificationCommands: params.verificationCommands, supersedes: [], guideModel: guide.model, executorModel: executor.model, guideThinking: guide.thinking, executorThinking: executor.thinking, artifactIntent: "maintained_change", authorizationRef: params.authorizationRef }] }, activeSupervisor));
+        return { content: [{ type: "text", text: `Scheduled authorized implementation ${nodeId} in Workgraph ${run.runId}.` }], details: { ...summaryDetails(run), node: run.nodes.find((node) => node.id === nodeId), authorizationRef: params.authorizationRef } };
       });
     },
   });
@@ -718,13 +786,19 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "workgraph_steer",
     label: "Workgraph Steer",
-    description: "Record that direct worker steering is unsupported at the current Herdr boundary; no instruction is falsely reported as applied.",
-    promptSnippet: "Record unsupported worker steering without claiming it was delivered",
+    description: "Send a bounded steering instruction to an active visible worker and retain queued, submitted, or uncertain status.",
+    promptSnippet: "Steer an active worker without claiming the instruction was applied",
     parameters: Type.Object({ attemptId: Type.String(), instruction: Type.String() }),
-    async execute(_id, params) {
+    async execute(_id, params, _signal, _onUpdate, ctx) {
       return exclusively(async () => {
-        const run = remember(await requireEngine().recordUnsupportedControl(params.attemptId, params.instruction, "The current Herdr worker adapter exposes observation and interruption, but no supported text-steering operation."));
-        return { content: [{ type: "text", text: `Steering is unsupported for attempt ${params.attemptId}; the request was retained without being sent.` }], details: { ...summaryDetails(run), unsupportedControl: run.unsupportedControls?.at(-1) } };
+        const activeSupervisor = supervisor ?? attachSupervisor(ctx);
+        try {
+          const run = remember(await activeSupervisor.steer(params.attemptId, params.instruction));
+          return { content: [{ type: "text", text: `Steering for attempt ${params.attemptId} was submitted to the visible worker; application is not yet proven.` }], details: { ...summaryDetails(run), steering: run.attempts.find((attempt) => attempt.id === params.attemptId)?.steering } };
+        } catch (error) {
+          const run = await requireEngine().recordUnsupportedControl(params.attemptId, params.instruction, error instanceof Error ? error.message : String(error));
+          return { content: [{ type: "text", text: `Steering for attempt ${params.attemptId} was not submitted; the request was retained as uncertain or unsupported.` }], details: { ...summaryDetails(run), unsupportedControl: run.unsupportedControls?.at(-1) } };
+        }
       });
     },
   });

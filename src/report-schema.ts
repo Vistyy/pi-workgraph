@@ -53,6 +53,14 @@ export const DiscoveryReportSchema = Type.Object({
   findings: Type.Array(FindingSchema, { maxItems: 20 }),
 });
 
+export const ReviewReportSchema = Type.Object({
+  kind: Type.Literal("review"),
+  status: StatusSchema,
+  summary: Type.String(),
+  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
+  findings: Type.Array(FindingSchema, { maxItems: 20 }),
+});
+
 export const ImplementationReportSchema = Type.Object({
   kind: Type.Literal("implementation"),
   status: StatusSchema,
@@ -97,6 +105,7 @@ export const AssuranceSynthesisReportSchema = Type.Object({
 
 export const WorkerReportSchema = Type.Union([
   DiscoveryReportSchema,
+  ReviewReportSchema,
   ImplementationReportSchema,
   VerificationReportSchema,
   AssuranceReviewReportSchema,
@@ -106,6 +115,7 @@ export const WorkerReportSchema = Type.Union([
 export function reportSchemaForMode(mode: WorkerMode) {
   switch (mode) {
     case "discovery": return DiscoveryReportSchema;
+    case "review": return ReviewReportSchema;
     case "implementation": return ImplementationReportSchema;
     case "verification": return VerificationReportSchema;
     case "assurance_review": return AssuranceReviewReportSchema;

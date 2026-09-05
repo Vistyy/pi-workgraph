@@ -31,6 +31,7 @@ function runFixture(): WorkgraphRun {
     attempts: [],
     milestones: testOutcome.milestones.map((milestone) => ({ ...milestone, status: "pending" as const })),
     discoveries: [],
+    reviews: [],
     nodes: [],
     composition: [],
     humanDecisions: [],

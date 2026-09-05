@@ -32,6 +32,7 @@ export interface NewRunInput {
     statement: string;
     completionPredicate: string;
   };
+  capabilityMode?: boolean;
   milestones?: readonly { id: string; description: string }[];
   now?: Date;
   runId?: string;
@@ -64,6 +65,7 @@ export class RunStateStore {
       handoffs: [],
       lifecycle: "active",
       lifecycleUpdatedAt: now,
+      ...(input.capabilityMode ? { capabilityMode: true } : {}),
       parentSessionId: input.parentSessionId,
       parentSessionFile: input.parentSessionFile,
       phase: "discovery",
@@ -92,6 +94,7 @@ export class RunStateStore {
         status: "pending" as const,
       })),
       discoveries: [],
+      reviews: [],
       nodes: [],
       composition: [],
       humanDecisions: [],
@@ -151,10 +154,10 @@ export class RunStateStore {
 
 function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): WorkgraphRun {
   const version = (parsed as { version?: number }).version;
-  if (version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== RUN_STATE_VERSION) {
+  if (version !== 3 && version !== 4 && version !== 5 && version !== 6 && version !== 7 && version !== RUN_STATE_VERSION) {
     throw new UnsupportedWorkgraphStateVersionError(version, parsed.runId!);
   }
-  if (version === RUN_STATE_VERSION && parsed.resultReviews && parsed.cleanup && parsed.coordinatorWakeups) return parsed as WorkgraphRun;
+  if (version === RUN_STATE_VERSION && parsed.resultReviews && parsed.cleanup && parsed.coordinatorWakeups && parsed.reviews) return parsed as WorkgraphRun;
   const createdAt = parsed.createdAt ?? new Date(0).toISOString();
   const updatedAt = parsed.updatedAt ?? createdAt;
   const legacy = parsed as Partial<WorkgraphRun> & { parentSessionId?: string; parentSessionFile?: string };
@@ -180,6 +183,7 @@ function migrateRun(parsed: Partial<WorkgraphRun> & { version?: number }): Workg
     resultReviews: parsed.resultReviews ?? [],
     cleanup: parsed.cleanup ?? [],
     coordinatorWakeups: parsed.coordinatorWakeups ?? [],
+    reviews: parsed.reviews ?? [],
   };
 }
 

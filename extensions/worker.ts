@@ -151,6 +151,9 @@ function modeInstructions(): string {
   if (mode === "discovery") {
     return `[WORKGRAPH DISCOVERY]\nInvestigate only the assigned responsibility.\nUse read-only repository evidence and classify each item as direct, inference, conflict, or unknown.\nFor blast-radius-sensitive changes, identify and prove the external safety fact at the actual dependent boundary.\nDo not implement, edit files, or expand the question.\nFinish with a concise discovery report and account for unknowns that could change the implementation envelope.`;
   }
+  if (mode === "review") {
+    return `[WORKGRAPH REVIEW]\nInspect only the assigned subject and concern. Review the exact revision or proposal named in the assignment. Do not edit files or coordinate another Workgraph. Return concrete evidence and only actionable findings; zero findings is valid.`;
+  }
   if (mode === "verification") return verificationWorkerInstructions();
   if (mode === "assurance_review") {
     return assuranceReviewInstructions(responsibility as AssuranceResponsibility);
@@ -192,7 +195,7 @@ function splitModel(selector: string): [string, string] {
 function readMode(): WorkerMode | undefined {
   const value = process.env.PI_WORKGRAPH_MODE;
   if (!value) return undefined;
-  if (value === "discovery" || value === "implementation" || value === "verification" || value === "assurance_review" || value === "assurance_synthesis") return value;
+  if (value === "discovery" || value === "review" || value === "implementation" || value === "verification" || value === "assurance_review" || value === "assurance_synthesis") return value;
   throw new Error(`Invalid PI_WORKGRAPH_MODE: ${value}`);
 }
 

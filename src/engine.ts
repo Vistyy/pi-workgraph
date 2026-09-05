@@ -23,6 +23,8 @@ import type {
   DiscoveryAssignment,
   DiscoveryRecord,
   DiscoveryTopology,
+  ReviewRecord,
+  ReviewReport,
   HumanDecision,
   ProductVerificationRecord,
   PlanChangeKind,
@@ -57,6 +59,16 @@ export interface AsyncDiscoveryInput {
   topology: DiscoveryTopology;
   assignments: DiscoveryAssignment[];
   stableEntryId?: string | null;
+}
+
+export interface AsyncReviewInput {
+  subject: string;
+  concern: string;
+  revision?: string;
+  model: string;
+  thinking: ThinkingLevel;
+  stableEntryId?: string | null;
+  unavailableReason?: string;
 }
 
 export interface AsyncDiscoverySynthesisInput extends ModelAssignment {
@@ -265,7 +277,6 @@ export class WorkgraphEngine {
   async queueDiscovery(input: AsyncDiscoveryInput): Promise<WorkgraphRun> {
     const run = await this.load();
     requireActiveLifecycle(run);
-    if (run.phase !== "discovery" && run.phase !== "awaiting_agreement") throw new Error(`Research is unavailable during ${run.phase}.`);
     validateDiscoveryAssignments(run, input.assignments);
     const now = new Date().toISOString();
     return this.store.update((draft) => {
@@ -300,11 +311,76 @@ export class WorkgraphEngine {
           thinking: assignment.thinking,
           objective: discoveryObjective(draft, input.topology, assignment),
           stableEntryId: input.stableEntryId,
+          ...(assignment.artifactIntent ? { artifactIntent: assignment.artifactIntent } : {}),
           planVersion: draft.control.currentPlanVersion ?? 0,
         }));
       }
       draft.control.executionStatus = "scheduled";
       draft.control.updatedAt = now;
+    });
+  }
+
+  async activateImplementation(input: { authorizationRef: string; statement: string; acceptance: string[] }): Promise<WorkgraphRun> {
+    const run = await this.load();
+    requireActiveLifecycle(run);
+    if (!input.authorizationRef.trim()) throw new Error("Implementation requires a reference to applicable human authorization.");
+    if (!input.statement.trim() || input.acceptance.length === 0 || input.acceptance.some((item) => !item.trim())) throw new Error("Implementation requires a bounded statement and acceptance.");
+    if (run.outcome.kind === "product_change") return run;
+    return this.store.update((draft) => {
+      const now = new Date().toISOString();
+      draft.outcome = { kind: "product_change", statement: input.statement.trim(), completionPredicate: "The authorized change is composed and verified at its exact revision." };
+      const agreement: Agreement = {
+        outcome: input.statement.trim(), nonGoals: [], reuseDecision: "Use the smallest existing implementation boundary.", structure: "Keep ownership local and remove replaced paths.", expectedScale: "Bounded change described by the implementation assignment.", verificationBoundary: "Verify the exact composed revision.", verificationCommands: [], verificationMethod: "independent", verificationProcedure: "Inspect the exact composed revision and its supported behavior.", requiredEvidence: input.acceptance.map((item) => item.trim()), unresolvedDecisions: [], approvedAt: now,
+      };
+      draft.agreement = agreement;
+      const { approvedAt: _approvedAt, ...planAgreement } = agreement;
+      draft.plans.push({ version: 1, status: "approved", changeKind: "initial", agreement: planAgreement, summary: `Authorized by ${input.authorizationRef.trim()}.`, proposedAt: now, approvedAt: now, decisionText: input.authorizationRef.trim() });
+      draft.control.planStatus = "approved";
+      draft.control.currentPlanVersion = 1;
+      draft.control.updatedAt = now;
+    });
+  }
+
+  async queueReview(input: AsyncReviewInput): Promise<WorkgraphRun> {
+    const run = await this.load();
+    requireActiveLifecycle(run);
+    if (!input.subject.trim() || !input.concern.trim()) throw new Error("Review requires a subject and concern.");
+    if (input.revision && input.revision !== run.composedCommit && !run.nodes.some((node) => node.commit === input.revision)) {
+      throw new Error(`Review revision ${input.revision} is not a retained Workgraph revision.`);
+    }
+    validateModel(input.model, "Review worker");
+    const id = `review-${run.reviews.length + 1}`;
+    return this.store.update((draft) => {
+      const review: ReviewRecord = {
+        id,
+        subject: input.subject.trim(),
+        concern: input.concern.trim(),
+        ...(input.revision ? { revision: input.revision } : {}),
+        model: input.model,
+        thinking: input.thinking,
+        resultId: `${draft.runId}:review:${id}:${randomUUID()}`,
+        state: input.unavailableReason ? "unavailable" : "running",
+        ...(input.unavailableReason ? { resultKind: "absent" as const, error: input.unavailableReason } : {}),
+      };
+      draft.reviews.push(review);
+      if (!input.unavailableReason) {
+        const attemptId = randomUUID();
+        review.attemptId = attemptId;
+        draft.attempts.push(observerAttempt(draft, {
+          id: attemptId,
+          nodeId: id,
+          mode: "review",
+          capability: "review",
+          model: input.model,
+          thinking: input.thinking,
+          objective: reviewObjective(draft, review),
+          stableEntryId: input.stableEntryId,
+          planVersion: draft.control.currentPlanVersion ?? 0,
+          ...(input.revision ? { subjectRevision: input.revision } : {}),
+        }));
+      }
+      if (!input.unavailableReason) draft.control.executionStatus = "scheduled";
+      draft.control.updatedAt = new Date().toISOString();
     });
   }
 
@@ -901,6 +977,13 @@ export class WorkgraphEngine {
       return this.store.update((draft) => {
         draft.control.executionStatus = "idle";
         draft.control.attentionStatus = attention;
+        draft.control.updatedAt = new Date().toISOString();
+      });
+    }
+    if (run.capabilityMode) {
+      return this.store.update((draft) => {
+        draft.control.executionStatus = "idle";
+        draft.control.attentionStatus = "clear";
         draft.control.updatedAt = new Date().toISOString();
       });
     }
@@ -1859,6 +1942,10 @@ function observerAttempt(
     objective: string;
     stableEntryId?: string | null | undefined;
     responsibility?: AssuranceResponsibility;
+    capability?: "research" | "implement" | "review";
+    artifactIntent?: "evidence_only" | "disposable_experiment" | "maintained_change";
+    authorizationRef?: string;
+    subjectRevision?: string;
   },
 ): WorkAttempt {
   const now = new Date().toISOString();
@@ -1879,6 +1966,10 @@ function observerAttempt(
     model: input.model,
     thinking: input.thinking,
     ...(input.responsibility ? { responsibility: input.responsibility } : {}),
+    ...(input.capability ? { capability: input.capability } : {}),
+    ...(input.artifactIntent ? { artifactIntent: input.artifactIntent } : {}),
+    ...(input.authorizationRef ? { authorizationRef: input.authorizationRef } : {}),
+    ...(input.subjectRevision ? { subjectRevision: input.subjectRevision } : {}),
     agentName: herdrAgentName(run.runId, input.nodeId, input.id),
   };
 }
@@ -1978,6 +2069,7 @@ type ResultCarrier = { resultKind?: ChildResultKind; terminalText?: string; repo
 function childResultRecord(run: WorkgraphRun, attempt: WorkAttempt): ResultCarrier | undefined {
   if (attempt.mode === "implementation") return run.nodes.find((node) => node.activeAttemptId === attempt.id || node.id === attempt.nodeId);
   if (attempt.mode === "discovery") return run.discoveries.find((record) => record.attemptId === attempt.id);
+  if (attempt.mode === "review") return run.reviews.find((record) => record.attemptId === attempt.id);
   if (attempt.mode === "verification") return run.productVerification?.attemptId === attempt.id ? run.productVerification : undefined;
   if (attempt.mode === "assurance_review") return run.assurance?.reviews.find((record) => record.attemptId === attempt.id);
   if (attempt.mode === "assurance_synthesis") return run.assurance?.synthesis?.attemptId === attempt.id ? run.assurance.synthesis : undefined;
@@ -1993,6 +2085,9 @@ function promoteReviewedResult(run: WorkgraphRun, attempt: WorkAttempt, report: 
   attempt.lastActivityAt = now;
   if (attempt.mode === "discovery" && report.kind === "discovery") {
     const record = run.discoveries.find((candidate) => candidate.attemptId === attempt.id);
+    if (record) { record.resultKind = "typed"; record.report = report; record.state = "completed"; delete record.error; }
+  } else if (attempt.mode === "review" && report.kind === "review") {
+    const record = run.reviews.find((candidate) => candidate.attemptId === attempt.id);
     if (record) { record.resultKind = "typed"; record.report = report; record.state = "completed"; delete record.error; }
   } else if (attempt.mode === "verification" && report.kind === "verification") {
     const verification = run.productVerification;
@@ -2065,6 +2160,15 @@ function setPhase(run: WorkgraphRun, to: RunPhase, reason: string): void {
     reason,
   });
   run.phase = to;
+}
+
+function reviewObjective(run: WorkgraphRun, review: ReviewRecord): string {
+  return [
+    `Review subject: ${review.subject}`,
+    `Concern: ${review.concern}`,
+    ...(review.revision ? [`Exact revision: ${review.revision}`] : [`Current composed revision: ${run.composedCommit}`]),
+    "Inspect only the evidence needed to address the concern and return a review report.",
+  ].join("\n");
 }
 
 function discoveryObjective(run: WorkgraphRun, topology: DiscoveryTopology, assignment: DiscoveryAssignment): string {

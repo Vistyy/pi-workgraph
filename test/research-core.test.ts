@@ -146,6 +146,29 @@ test("the registered research tool creates an unavailable workstream without beg
   }
 });
 
+test("implementation and review capabilities share an answer workstream without phase gates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-workgraph-capability-core-"));
+  try {
+    const begun = await WorkgraphEngine.begin({
+      request: "Investigate and fix the fixture.", projectRoot: root, gitCommonDir: join(root, ".git"),
+      parentSessionId: "parent", parentSessionFile: join(root, "parent.jsonl"), baseCommit: "base",
+      capabilityMode: true,
+      outcome: { kind: "answer", statement: "Investigate the fixture.", completionPredicate: "The coordinator judges the result." },
+    });
+    let run = await begun.engine.activateImplementation({ authorizationRef: "human request: fix the fixture", statement: "Fix the fixture", acceptance: ["The fixture passes its check."] });
+    assert.equal(run.outcome.kind, "product_change");
+    assert.equal(run.control.planStatus, "approved");
+    run = await begun.engine.queueReview({ subject: "the proposed fix", concern: "Does the change preserve the fixture behavior?", model: "provider/reviewer", thinking: "high", stableEntryId: null });
+    assert.equal(run.reviews[0]?.state, "running");
+    run = await begun.engine.queueDiscovery({ topology: "evidence", stableEntryId: null, assignments: [{ id: "research-after", lens: "follow-up", objective: "Check the remaining uncertainty.", model: "provider/research", thinking: "high" }] });
+    assert.equal(run.discoveries[0]?.id, "research-after");
+    assert.equal(run.phase, "discovery");
+    begun.engine.registry.close();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("malformed persisted worker reports are classified as invalid evidence", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-workgraph-invalid-report-"));
   try {

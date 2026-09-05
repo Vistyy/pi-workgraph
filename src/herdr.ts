@@ -68,6 +68,7 @@ export interface VisibleWorkerRuntime {
   recover?(request: WorkerRecoveryRequest): Promise<HerdrObservation | undefined>;
   observe(identity: WorkerIdentity): Promise<HerdrObservation>;
   interrupt(identity: WorkerIdentity): Promise<HerdrObservation>;
+  steer?(identity: WorkerIdentity, instruction: string): Promise<void>;
   cleanup?(identity: WorkerIdentity): Promise<WorkerCleanupResult>;
   cleanupDeletedWorktree?(identity: WorkerIdentity): Promise<WorkerCleanupResult>;
 }
@@ -224,6 +225,13 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     await this.observe(identity);
     await this.call(["agent", "send-keys", identity.agentName, "esc"]);
     return this.observe(identity);
+  }
+
+  async steer(identity: WorkerIdentity, instruction: string): Promise<void> {
+    if (!instruction.trim()) throw new Error("Worker steering requires an instruction.");
+    const current = await this.observe(identity);
+    if (current.status === "blocked") throw new Error("Worker is blocked and cannot receive steering.");
+    await this.call(["agent", "prompt", identity.agentName, instruction.trim()]);
   }
 
   async cleanup(identity: WorkerIdentity): Promise<WorkerCleanupResult> {

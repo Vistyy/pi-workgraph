@@ -1,4 +1,7 @@
-export const RUN_STATE_VERSION = 6 as const;
+export const RUN_STATE_VERSION = 7 as const;
+
+export type CoordinationCapability = "research" | "implement" | "review";
+export type ArtifactIntent = "evidence_only" | "disposable_experiment" | "maintained_change";
 
 export type RunLifecycle = "active" | "suspended" | "completed" | "abandoned" | "archived";
 export type PlanStatus = "absent" | "proposed" | "approved" | "superseded";
@@ -59,7 +62,7 @@ export type NodeState =
   | "cancelled"
   | "superseded";
 
-export type WorkerMode = "discovery" | "implementation" | "verification" | "assurance_review" | "assurance_synthesis";
+export type WorkerMode = "discovery" | "review" | "implementation" | "verification" | "assurance_review" | "assurance_synthesis";
 export type ReportKind = WorkerMode;
 export type ReportStatus = "completed" | "escalated" | "failed";
 export type FindingSeverity = "info" | "warning" | "error" | "blocker";
@@ -127,6 +130,10 @@ export interface DiscoveryReport extends ReportBase<"discovery"> {
   findings: Finding[];
 }
 
+export interface ReviewReport extends ReportBase<"review"> {
+  findings: Finding[];
+}
+
 export interface ImplementationReport extends ReportBase<"implementation"> {
   findings: Finding[];
   commit?: string;
@@ -175,6 +182,7 @@ export interface AssuranceSynthesisReport extends ReportBase<"assurance_synthesi
 
 export type WorkerReport =
   | DiscoveryReport
+  | ReviewReport
   | ImplementationReport
   | VerificationReport
   | AssuranceReviewReport
@@ -239,6 +247,7 @@ export interface InvestigationSpec {
 export interface DiscoveryAssignment extends InvestigationSpec {
   model: string;
   thinking: ThinkingLevel;
+  artifactIntent?: ArtifactIntent;
   unavailableReason?: string;
   supersedes?: string[];
 }
@@ -257,6 +266,24 @@ export interface DiscoveryRecord extends DiscoveryAssignment {
   error?: string;
   usage?: UsageSummary;
   capabilities?: ChildCapabilityRecord[];
+}
+
+export interface ReviewRecord {
+  id: string;
+  subject: string;
+  concern: string;
+  revision?: string;
+  model: string;
+  thinking: ThinkingLevel;
+  resultId?: string;
+  resultKind?: ChildResultKind;
+  terminalText?: string;
+  state: "running" | "completed" | "failed" | "review_required" | "cancelled" | "unavailable";
+  attemptId?: string;
+  sessionFile?: string;
+  report?: ReviewReport;
+  error?: string;
+  usage?: UsageSummary;
 }
 
 export type VerificationMethod = "commands" | "independent";
@@ -291,6 +318,9 @@ export interface WorkerBrief {
 export interface WorkNodeSpec {
   id: string;
   brief: WorkerBrief;
+  artifactIntent?: ArtifactIntent;
+  authorizationRef?: string;
+  subjectRevision?: string;
   claimedPaths: string[];
   dependencies: string[];
   priority?: number;
@@ -523,6 +553,10 @@ export type ResourceCleanupRecord = GitWorktreeCleanupRecord | HerdrWorkerCleanu
 export interface WorkAttempt {
   id: string;
   nodeId: string;
+  capability?: CoordinationCapability;
+  artifactIntent?: ArtifactIntent;
+  authorizationRef?: string;
+  subjectRevision?: string;
   mode?: WorkerMode;
   planVersion: number;
   state: AttemptState;
@@ -552,6 +586,7 @@ export interface WorkAttempt {
   worker?: WorkerIdentity;
   resource?: WorkerResourceIdentity;
   submission?: WorkerSubmissionRecord;
+  steering?: { id: string; instruction: string; state: "queued" | "submitted" | "uncertain"; requestedAt: string; submittedAt?: string; detail?: string };
   resultKind?: ChildResultKind;
   workerHistory?: WorkerIdentity[];
   attention?: string;
@@ -594,6 +629,7 @@ export interface WorkgraphRun {
   handoffs: CoordinatorHandoff[];
   lifecycle: RunLifecycle;
   lifecycleUpdatedAt: string;
+  capabilityMode?: boolean;
   lifecycleReason?: string;
   phase: RunPhase;
   baseCommit: string;
@@ -614,6 +650,7 @@ export interface WorkgraphRun {
   agreementProposal?: AgreementDraft;
   agreementProposalText?: string;
   discoveries: DiscoveryRecord[];
+  reviews: ReviewRecord[];
   nodes: WorkNode[];
   composition: CompositionRecord[];
   productVerification?: ProductVerificationRecord;
