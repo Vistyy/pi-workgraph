@@ -89,6 +89,7 @@ test("accepting a failed report or uncomposed stale implementation as evidence d
             : {
                 kind: "implementation",
                 status: "completed",
+                outcome: "changed",
                 summary: "Old change",
                 commit: "a".repeat(40),
                 evidence: [],
@@ -502,8 +503,14 @@ test("every independent attempt remains accounted for regardless of result arriv
           assignmentIntentVersion: 0,
           validity: "typed",
           report: {
-            ...researchReport(`${order[index]} observation`),
-            status: order[index] === "success" ? "completed" : "failed",
+            kind: "research" as const,
+            status:
+              order[index] === "success"
+                ? ("completed" as const)
+                : ("failed" as const),
+            summary: `${order[index]} observation`,
+            evidence: [],
+            findings: [],
           },
         });
         await store.settleAttempt({

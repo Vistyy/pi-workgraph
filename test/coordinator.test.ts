@@ -190,11 +190,12 @@ test("registered status stays compact and focused result retrieval projects boun
       sessionFile: f.session.getSessionFile()!,
     };
     const store = WorkstreamStore.open(initial.statePath, owner);
+    const longObjective = `Retain bounded evidence ${"full assignment brief ".repeat(500)}`;
     await store.assign({
       id: "large-result",
       capability: "research",
       artifactIntent: "evidence_only",
-      objective: "Retain bounded evidence",
+      objective: longObjective,
       intentVersion: 0,
       expectedEvidence: ["evidence"],
     });
@@ -223,6 +224,8 @@ test("registered status stays compact and focused result retrieval projects boun
       statusContent && "text" in statusContent ? statusContent.text : "";
     assert.match(statusText, /large-result-1/);
     assert.doesNotMatch(statusText, /observation-0/);
+    assert.equal(statusText.includes(longObjective), false);
+    assert.ok(statusText.length < 8_000);
     const evidence = await f.call("workgraph_result", {
       resultId: "large-result-1",
       section: "evidence",

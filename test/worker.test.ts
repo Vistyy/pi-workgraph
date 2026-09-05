@@ -17,6 +17,7 @@ function assistant(session: SessionManager, model = "gpt-4o") {
         arguments: {
           kind: "implementation",
           status: "completed",
+          outcome: "changed",
           summary: "Changed fixture",
           evidence: [],
           findings: [],
@@ -73,6 +74,7 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
     const report = {
       kind: "implementation",
       status: "completed",
+      outcome: "changed",
       summary: "Changed fixture",
       evidence: [],
       findings: [],
@@ -165,11 +167,41 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
   }
 });
 
+test("no-change implementation can report from the guide without manufacturing an edit or executor turn", async () => {
+  const f = await fixture("implementation");
+  try {
+    const revision = await git(f.root, "rev-parse", "HEAD");
+    const report = {
+      kind: "implementation" as const,
+      status: "completed" as const,
+      outcome: "no_change" as const,
+      summary: "No source change was needed.",
+      revision,
+      reason: "The requirement already holds on the inspected base.",
+      evidence: [
+        { label: "Git boundary", observation: `HEAD remains ${revision}` },
+      ],
+      findings: [],
+    };
+    const result = await f.call("workgraph_report", report);
+    assert.equal(result.terminate, true);
+    assert.equal(
+      (result.details as { report: typeof report }).report.outcome,
+      "no_change",
+    );
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), revision);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "before\n");
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("continued implementation requires this attempt's native start and later executor message, not inherited evidence", async () => {
   const f = await fixture("implementation", true);
   const report = {
     kind: "implementation",
     status: "completed",
+    outcome: "changed",
     summary: "Continued work",
     evidence: [],
     findings: [],

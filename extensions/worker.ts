@@ -117,15 +117,43 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       if (!isWorkerReport(params) || params.kind !== mode)
         throw new Error(`Report must satisfy the ${mode} contract.`);
       if (params.kind === "implementation" && params.status === "completed") {
+        if (params.outcome === "no_change") {
+          if (!baseCommit)
+            throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
+          const status = await git(
+            pi,
+            ctx.cwd,
+            ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+            true,
+          );
+          if (status)
+            throw new Error(
+              `No-change implementation requires a clean worktree:\n${status}`,
+            );
+          const revision = await git(pi, ctx.cwd, ["rev-parse", "HEAD"]);
+          if (params.revision !== revision || revision !== baseCommit)
+            throw new Error(
+              `No-change implementation must report the unchanged base revision ${baseCommit}.`,
+            );
+          return terminalReport(params, {
+            todos,
+            todoRecorded: todos.length > 0,
+            switchedAt,
+            continued,
+            outcome: "no_change",
+            baseCommit,
+            revision,
+          });
+        }
         if (phase !== "executor")
           throw new Error(
-            "Completed implementation requires the first-edit model transition.",
+            "Completed changed implementation requires the first-edit model transition.",
           );
         if (switchError)
           throw new Error(`Executor model transition failed: ${switchError}`);
         if (!hasExecutorMessage(ctx.sessionManager.getBranch()))
           throw new Error(
-            "Completed implementation requires an actual executor assistant message after this attempt's transition/start. Continue with the executor before reporting.",
+            "Completed changed implementation requires an actual executor assistant message after this attempt's transition/start. Continue with the executor before reporting.",
           );
         if (!baseCommit)
           throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
@@ -144,7 +172,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         ).split(" ");
         if (!commit || parent !== baseCommit || extraParents.length)
           throw new Error(
-            "A completed implementation requires exactly one direct commit on the supplied base.",
+            "A completed changed implementation requires exactly one direct commit on the supplied base.",
           );
         const changedText = await git(
           pi,
@@ -162,6 +190,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
           todoRecorded: todos.length > 0,
           switchedAt,
           continued,
+          outcome: "changed",
         });
       }
       // Read-only is an instruction and authority boundary, not a filesystem sandbox.

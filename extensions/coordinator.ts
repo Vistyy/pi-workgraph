@@ -23,6 +23,7 @@ import { EvidenceSchema } from "../src/report-schema.js";
 import {
   type ResultDisposition,
   type SessionIdentity,
+  type WorkAttempt,
   type WorkstreamState,
   WorkstreamStore,
 } from "../src/workstream.js";
@@ -33,6 +34,12 @@ import {
 
 const POINTER = "pi-workgraph-workstream";
 const INPUT = "pi-workgraph-human-input";
+
+function compactText(value: string, max = 240): string {
+  const text = value.replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
 const InputReceipt = Type.Object({
   id: Type.String(),
   sessionId: Type.String(),
@@ -876,18 +883,119 @@ function compactStatus(state: WorkstreamState, offset = 0, limit = 20) {
     remaining: Math.max(0, items.length - offset - limit),
     ...(offset + limit < items.length ? { nextOffset: offset + limit } : {}),
   });
+  const effectiveModelView = (
+    entries: NonNullable<WorkAttempt["effectiveModels"]> = [],
+  ) => {
+    const distinct = new Map<
+      string,
+      { model: string; thinking?: string; sources: Set<string> }
+    >();
+    const transitions: Array<{
+      model: string;
+      thinking?: string;
+      source?: string;
+    }> = [];
+    let previous: string | undefined;
+    for (const entry of entries) {
+      const key = `${entry.model}|${entry.thinking ?? ""}`;
+      if (!distinct.has(key))
+        distinct.set(key, {
+          model: entry.model,
+          ...(entry.thinking ? { thinking: entry.thinking } : {}),
+          sources: new Set(),
+        });
+      distinct.get(key)?.sources.add(entry.source ?? "unknown");
+      if (key !== previous) {
+        transitions.push({
+          model: entry.model,
+          ...(entry.thinking ? { thinking: entry.thinking } : {}),
+          ...(entry.source ? { source: entry.source } : {}),
+        });
+        previous = key;
+      }
+    }
+    return {
+      observations: entries.length,
+      distinct: [...distinct.values()]
+        .slice(0, 8)
+        .map(({ sources, ...entry }) => ({
+          ...entry,
+          sources: [...sources],
+        })),
+      transitions: transitions.slice(0, 8),
+      truncatedTransitions: Math.max(0, transitions.length - 8),
+    };
+  };
+  const selectionView = (models: WorkAttempt["models"]) =>
+    models
+      ? {
+          guide: models.guide,
+          ...(models.executor ? { executor: models.executor } : {}),
+          source: models.source,
+          ...(models.overrideReason
+            ? { overrideReason: compactText(models.overrideReason) }
+            : {}),
+          ...(models.selection
+            ? {
+                selection: {
+                  requested: models.selection.requested,
+                  diversity: models.selection.diversity,
+                  selected: models.selection.selected.slice(0, 8),
+                  selectedCount: models.selection.selected.length,
+                  ...(models.selection.selected.length > 8
+                    ? { omittedSelected: models.selection.selected.length - 8 }
+                    : {}),
+                  unfulfilled: models.selection.unfulfilled.slice(0, 8),
+                  unfulfilledCount: models.selection.unfulfilled.length,
+                  ...(models.selection.unfulfilled.length > 8
+                    ? {
+                        omittedUnfulfilled:
+                          models.selection.unfulfilled.length - 8,
+                      }
+                    : {}),
+                  source: models.selection.source,
+                  reason: compactText(models.selection.reason),
+                },
+              }
+            : {}),
+        }
+      : undefined;
+  const attemptView = (attempt: WorkAttempt) => {
+    const result = state.results.find((item) => item.id === attempt.resultId);
+    const report = result?.validity === "typed" ? result.report : undefined;
+    return {
+      id: attempt.id,
+      state: attempt.state,
+      submission: attempt.submission,
+      placement: attempt.placement?.kind,
+      resultId: attempt.resultId,
+      outcome:
+        report?.kind === "implementation" && report.status === "completed"
+          ? report.outcome
+          : report?.status,
+      models: selectionView(attempt.models),
+      effectiveModels: effectiveModelView(attempt.effectiveModels),
+      composition: attempt.composition?.state,
+      compositionReason: attempt.composition?.reason,
+      retainedRef: attempt.composition?.retainedRef,
+      cleanup: attempt.cleanup?.state,
+      attention: attempt.error ? compactText(attempt.error, 320) : undefined,
+    };
+  };
   const attention = state.attempts.flatMap((attempt) =>
     attempt.error
-      ? [{ attemptId: attempt.id, detail: attempt.error }]
+      ? [{ attemptId: attempt.id, detail: compactText(attempt.error, 320) }]
       : attempt.composition?.state === "blocked" ||
           attempt.cleanup?.state === "blocked"
         ? [
             {
               attemptId: attempt.id,
-              detail:
+              detail: compactText(
                 attempt.composition?.error ??
-                attempt.cleanup?.error ??
-                "Blocked attempt requires recovery.",
+                  attempt.cleanup?.error ??
+                  "Blocked attempt requires recovery.",
+                320,
+              ),
             },
           ]
         : [],
@@ -895,7 +1003,11 @@ function compactStatus(state: WorkstreamState, offset = 0, limit = 20) {
   const accounting = state.completion?.accounting ?? [];
   return {
     id: state.id,
-    lifecycle: state.lifecycle,
+    purpose: compactText(state.purpose),
+    lifecycle: {
+      ...state.lifecycle,
+      reason: compactText(state.lifecycle.reason),
+    },
     counts: {
       assignments: state.assignments.length,
       attempts: state.attempts.length,
@@ -905,43 +1017,68 @@ function compactStatus(state: WorkstreamState, offset = 0, limit = 20) {
       accounting: accounting.length,
     },
     assignments: page(
-      state.assignments.map((assignment) => ({
-        id: assignment.id,
-        capability: assignment.capability,
-        objective: assignment.objective,
-        attempts: state.attempts
-          .filter((attempt) => attempt.assignmentId === assignment.id)
-          .map((attempt) => ({
-            id: attempt.id,
-            state: attempt.state,
-            models: attempt.models,
-            effectiveModels: attempt.effectiveModels,
-            submission: attempt.submission,
-            placement: attempt.placement,
-            resultId: attempt.resultId,
-            composition: attempt.composition?.state,
-            compositionReason: attempt.composition?.reason,
-            retainedRef: attempt.composition?.retainedRef,
-            cleanup: attempt.cleanup?.state,
-            attention: attempt.error,
-          })),
-      })),
+      state.assignments.map((assignment) => {
+        const attempts = state.attempts.filter(
+          (attempt) => attempt.assignmentId === assignment.id,
+        );
+        return {
+          id: assignment.id,
+          capability: assignment.capability,
+          objective: compactText(assignment.objective),
+          attempts: {
+            count: attempts.length,
+            active: attempts.filter((attempt) =>
+              ["starting", "running", "cancel_requested"].includes(
+                attempt.state,
+              ),
+            ).length,
+            items: attempts.slice(-3).map(attemptView),
+            ...(attempts.length > 3
+              ? { omittedHistory: attempts.length - 3 }
+              : {}),
+          },
+        };
+      }),
     ),
     results: page(
       state.results.map((item) => ({
         id: item.id,
         assignmentId: item.assignmentId,
         validity: item.validity,
-        summary:
+        ...(item.validity === "typed"
+          ? {
+              kind: item.report.kind,
+              status: item.report.status,
+              ...(item.report.kind === "implementation" &&
+              item.report.status === "completed"
+                ? {
+                    outcome: item.report.outcome,
+                    ...(item.report.outcome === "no_change"
+                      ? {
+                          revision: item.report.revision,
+                          reason: compactText(item.report.reason),
+                        }
+                      : {}),
+                  }
+                : {}),
+            }
+          : {}),
+        summary: compactText(
           item.validity === "typed"
-            ? item.report.summary.slice(0, 240)
+            ? item.report.summary
             : item.validity === "untyped"
-              ? item.text.slice(0, 240)
-              : item.detail.slice(0, 240),
-        undeliveredEvidence: accounting.filter(
-          (entry) =>
-            entry.kind === "undelivered_result" && entry.resultId === item.id,
+              ? item.text
+              : item.detail,
         ),
+        undeliveredEvidence: accounting
+          .filter(
+            (entry) =>
+              entry.kind === "undelivered_result" && entry.resultId === item.id,
+          )
+          .map((entry) => ({
+            ...entry,
+            reason: compactText(entry.reason, 320),
+          })),
         retainedNotApplied: state.attempts
           .filter(
             (attempt) =>
@@ -950,7 +1087,9 @@ function compactStatus(state: WorkstreamState, offset = 0, limit = 20) {
           )
           .map((attempt) => ({
             attemptId: attempt.id,
-            reason: attempt.composition?.reason,
+            reason: attempt.composition?.reason
+              ? compactText(attempt.composition.reason, 320)
+              : undefined,
             retainedRef: attempt.composition?.retainedRef,
             integratedRevision: attempt.composition?.integratedRevision,
           })),
@@ -966,23 +1105,28 @@ function compactStatus(state: WorkstreamState, offset = 0, limit = 20) {
       state.deliveries.map((delivery) => ({
         resultId: delivery.resultId,
         state: delivery.state,
-        error: delivery.error,
-        failureHistory: delivery.failureHistory,
+        error: delivery.error ? compactText(delivery.error, 320) : undefined,
+        failureCount: delivery.failureHistory?.length ?? 0,
       })),
     ),
     attention: page(attention),
-    accounting: page(accounting),
+    accounting: page(
+      accounting.map((entry) => ({
+        ...entry,
+        reason: compactText(entry.reason, 320),
+      })),
+    ),
     judgment: page(
       state.dispositions.map(({ resultId, status, reason }) => ({
         resultId,
         status,
-        reason,
+        reason: compactText(reason, 320),
       })),
     ),
     completion: state.completion
       ? {
           completedAt: state.completion.completedAt,
-          accounting: state.completion.accounting,
+          accountingCount: state.completion.accounting.length,
         }
       : undefined,
   };
@@ -1034,7 +1178,14 @@ function focusedResult(
       uncertainty: report.uncertainty ?? [],
       evidenceCount: report.evidence.length,
       findingsCount: report.findings.length,
-      commit: report.kind === "implementation" ? report.commit : undefined,
+      ...(report.kind === "implementation" && report.status === "completed"
+        ? {
+            outcome: report.outcome,
+            ...(report.outcome === "no_change"
+              ? { revision: report.revision, reason: report.reason }
+              : { commit: report.commit }),
+          }
+        : {}),
     };
   if (section === "evidence")
     return { ...base, evidence: page(report.evidence) };
@@ -1076,7 +1227,14 @@ function focusedResult(
     uncertainty: report.uncertainty ?? [],
     evidence: page(report.evidence),
     findings: page(report.findings),
-    commit: report.kind === "implementation" ? report.commit : undefined,
+    ...(report.kind === "implementation" && report.status === "completed"
+      ? {
+          outcome: report.outcome,
+          ...(report.outcome === "no_change"
+            ? { revision: report.revision, reason: report.reason }
+            : { commit: report.commit }),
+        }
+      : {}),
     artifacts: item.artifacts,
   };
 }

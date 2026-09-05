@@ -40,7 +40,8 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 
 The coordinator interprets what a human request authorizes and chooses which independent contributions are meaningful.
 Research, experiments, implementation slices, comparison, review, and integration are optional capabilities rather than a prescribed route.
-The runtime hides routine model and infrastructure administration while returning the full brief, selected models and reasons, substantive findings, evidence, uncertainty, and recovery attention.
+Routine coordinator responses show concise purpose, assignment and result outcomes, lifecycle, actionable attention, model selection reasons, and bounded effective-model transitions with counts.
+Focused result retrieval retains substantive findings, evidence, uncertainty, and recovery attention.
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic approval oracle.
 Extension notifications and worker reports do not grant authority.
 New constraints leave historical evidence intact and tied to its original scope, while stale maintained output cannot compose into the current intent.
@@ -49,7 +50,8 @@ An experiment retains its named artifacts before scratch files are discarded; it
 Implementation uses Local Prewalk in the same worker session: a guide inspects the assignment and makes the first edit, then the executor continues.
 A bounded TODO is useful telemetry, not an artificial prerequisite for accepting a valid implementation.
 Both selected models and actual message models are retained.
-A maintained result requires one clean direct commit on the assigned base before composition.
+A maintained result that changes code requires one clean direct commit on the assigned base before composition.
+A maintained result may instead report `no_change` with a reason and the inspected base revision; the isolated worktree must be independently Git-validated clean and unchanged, and no composition is performed.
 Worker settlement, report validity, coordinator acknowledgment, and acceptance remain separate facts.
 
 ## Models

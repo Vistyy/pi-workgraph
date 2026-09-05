@@ -433,6 +433,8 @@ export class WorkstreamRuntime {
         assignment.capability === "implement" &&
         result.validity === "typed" &&
         result.report.status === "completed" &&
+        result.report.kind === "implementation" &&
+        result.report.outcome === "changed" &&
         attempt.state !== "cancelled" &&
         attempt.composition?.state !== "retained_not_applied"
       ) {
@@ -573,6 +575,16 @@ export class WorkstreamRuntime {
       if (read.report && read.report.kind === modeFor(assignment)) {
         let artifacts: RetainedArtifact[] = [];
         try {
+          if (
+            assignment.capability === "implement" &&
+            read.report.kind === "implementation" &&
+            read.report.status === "completed" &&
+            read.report.outcome === "no_change"
+          )
+            await this.repository.validateWorkerNoChange(
+              placementOf(attempt),
+              read.report.revision,
+            );
           if (assignment.artifactIntent === "disposable_experiment")
             artifacts = await this.retainExperiment(
               state,
@@ -588,10 +600,16 @@ export class WorkstreamRuntime {
             artifacts,
           });
         } catch (error) {
+          const detail = asError(error).message;
+          const noChangeValidation =
+            assignment.capability === "implement" &&
+            read.report.kind === "implementation" &&
+            read.report.status === "completed" &&
+            read.report.outcome === "no_change";
           await this.store.retainResult({
             ...base,
             validity: "invalid",
-            detail: `Artifact retention failed: ${asError(error).message}`,
+            detail: `${noChangeValidation ? "No-change validation failed" : "Artifact retention failed"}: ${detail}`,
           });
           await this.store
             .beginCleanup({
@@ -605,9 +623,7 @@ export class WorkstreamRuntime {
                 : {}),
               discard: false,
             })
-            .then(() =>
-              this.store.blockCleanup(attempt.id, asError(error).message),
-            );
+            .then(() => this.store.blockCleanup(attempt.id, detail));
         }
       } else if (read.report || read.invalid || read.unreadable) {
         await this.store.retainResult({
@@ -667,10 +683,12 @@ export class WorkstreamRuntime {
     if (
       result?.validity !== "typed" ||
       result.report.kind !== "implementation" ||
+      result.report.status !== "completed" ||
+      result.report.outcome !== "changed" ||
       !result.report.commit
     )
       throw new Error(
-        "Composition requires the completed implementation report's exact commit.",
+        "Composition requires a completed changed implementation report's exact commit.",
       );
     const commit = result.report.commit;
     const expectedHead =

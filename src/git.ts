@@ -215,6 +215,74 @@ export class GitRepository {
     return { path, branch, baseCommit };
   }
 
+  async validateWorkerNoChange(
+    placement: WorktreePlacement,
+    reportedRevision: string,
+  ): Promise<{ revision: string; changedFiles: string[] }> {
+    const records = parseWorktreeList(
+      await gitText(this.root, ["worktree", "list", "--porcelain"], true),
+    );
+    const registered = records.find(
+      (worktree) => resolve(worktree.path) === resolve(placement.path),
+    );
+    if (!registered || registered.branch !== placement.branch)
+      throw new Error(
+        `No-change validation requires the recorded isolated worktree ${placement.path} on ${placement.branch}.`,
+      );
+    if ((await realpath(placement.path)) !== resolve(placement.path))
+      throw new Error("No-change validation found a relocated worktree.");
+    const actualRoot = await gitText(placement.path, [
+      "rev-parse",
+      "--show-toplevel",
+    ]);
+    if (resolve(actualRoot) !== resolve(placement.path))
+      throw new Error("No-change validation found a changed worktree root.");
+    const actualBranch = await gitText(placement.path, [
+      "symbolic-ref",
+      "--short",
+      "HEAD",
+    ]);
+    if (actualBranch !== placement.branch)
+      throw new Error("No-change validation found a changed worktree branch.");
+    const status = await gitText(
+      placement.path,
+      ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+      true,
+    );
+    if (status) throw new Error(`No-change worktree is not clean:\n${status}`);
+    const reflog = await gitText(
+      placement.path,
+      ["reflog", "show", "--format=%H", "--no-abbrev", placement.branch],
+      true,
+    );
+    if (
+      reflog
+        .split("\n")
+        .filter(Boolean)
+        .some((entry) => entry !== placement.baseCommit)
+    )
+      throw new Error("No-change validation found an authored worker commit.");
+    const revision = await this.head(placement.path);
+    if (reportedRevision !== revision)
+      throw new Error(
+        `Worker reported no-change revision ${reportedRevision}, but worktree HEAD is ${revision}.`,
+      );
+    if (revision !== placement.baseCommit)
+      throw new Error(
+        `Worker reported no change, but isolated worktree HEAD advanced from ${placement.baseCommit} to ${revision}.`,
+      );
+    const commitCount = Number(
+      await gitText(placement.path, [
+        "rev-list",
+        "--count",
+        `${placement.baseCommit}..${revision}`,
+      ]),
+    );
+    if (commitCount !== 0)
+      throw new Error("Worker reported no change after creating a commit.");
+    return { revision, changedFiles: [] };
+  }
+
   async validateWorkerCommit(
     placement: WorktreePlacement,
     reportedCommit?: string,

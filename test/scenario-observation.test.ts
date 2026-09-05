@@ -195,6 +195,7 @@ test("delegated native outcome requires attributable composition, cleanup, and r
       report: {
         kind: "implementation",
         status: "completed",
+        outcome: "changed",
         summary: "changed",
         evidence: [],
         findings: [],

@@ -28,12 +28,15 @@ const FindingSchema = Type.Object({
     "reuse",
   ] as const),
 });
-const ReportFields = {
-  status: StringEnum(["completed", "escalated", "failed"] as const),
+const ReportContentFields = {
   summary: Type.String(),
   uncertainty: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
   evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
   findings: Type.Array(FindingSchema, { maxItems: 20 }),
+};
+const ReportFields = {
+  status: StringEnum(["completed", "escalated", "failed"] as const),
+  ...ReportContentFields,
 };
 const ResearchReportSchema = Type.Object({
   kind: Type.Literal("research"),
@@ -43,12 +46,38 @@ const ReviewReportSchema = Type.Object({
   kind: Type.Literal("review"),
   ...ReportFields,
 });
-export const ImplementationReportSchema = Type.Object({
-  kind: Type.Literal("implementation"),
-  ...ReportFields,
-  commit: Type.Optional(Type.String()),
-  changedFiles: Type.Optional(Type.Array(Type.String())),
-});
+export const ImplementationReportSchema = Type.Union([
+  Type.Object(
+    {
+      kind: Type.Literal("implementation"),
+      status: Type.Literal("completed"),
+      outcome: Type.Literal("changed"),
+      ...ReportContentFields,
+      commit: Type.Optional(Type.String()),
+      changedFiles: Type.Optional(Type.Array(Type.String())),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("implementation"),
+      status: Type.Literal("completed"),
+      outcome: Type.Literal("no_change"),
+      ...ReportContentFields,
+      revision: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+      reason: Type.String({ minLength: 1 }),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("implementation"),
+      status: StringEnum(["escalated", "failed"] as const),
+      ...ReportContentFields,
+    },
+    { additionalProperties: false },
+  ),
+]);
 export const WorkerReportSchema = Type.Union([
   ResearchReportSchema,
   ReviewReportSchema,

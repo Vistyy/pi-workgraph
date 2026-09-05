@@ -247,6 +247,7 @@ async function prepareBlockedComposition(
   await f.settle({
     kind: "implementation",
     status: "completed",
+    outcome: "changed",
     summary: "Worker changed value",
     evidence: [{ label: "commit", observation: workerCommit }],
     findings: [],

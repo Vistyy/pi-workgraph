@@ -2083,7 +2083,9 @@ function attemptResolved(
     result.validity === "typed" &&
     result.report.status === "completed" &&
     (assignment?.capability !== "implement" ||
-      attempt.composition?.state === "composed")
+      attempt.composition?.state === "composed" ||
+      (result.report.kind === "implementation" &&
+        result.report.outcome === "no_change"))
   );
 }
 

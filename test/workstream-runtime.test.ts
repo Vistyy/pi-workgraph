@@ -507,6 +507,150 @@ test("cleaned history has constant reconciliation reads while error clearing and
   }
 });
 
+test("completed no-change implementations retain explicit attribution, skip composition, and clean only the isolated worker", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const authority = await f.authority(active);
+    const base = await f.repository.head();
+    const before = await readFile(join(f.root, "value.txt"), "utf8");
+    f.workers.onWork = async (request) => ({
+      kind: "implementation",
+      status: "completed",
+      outcome: "no_change",
+      summary: "No source change was needed.",
+      revision: request.env.PI_WORKGRAPH_BASE_COMMIT!,
+      reason: "The requested behavior already holds on the inspected base.",
+      evidence: [
+        {
+          label: "Git base",
+          observation: request.env.PI_WORKGRAPH_BASE_COMMIT!,
+        },
+      ],
+      findings: [],
+    });
+    await active.queue({
+      id: "already-holds",
+      capability: "implement",
+      artifactIntent: "maintained_change",
+      objective: "Confirm the existing behavior without changing source",
+      intentVersion: 1,
+      authority,
+      acceptance: ["Existing behavior remains correct"],
+    });
+    await active.reconcile();
+    const state = await active.reconcile();
+    const attempt = state.attempts[0]!;
+    const result = state.results[0]!;
+    assert.equal(result.validity, "typed");
+    assert.equal(result.report.kind, "implementation");
+    assert.equal(result.report.status, "completed");
+    assert.ok(
+      result.report.kind === "implementation" &&
+        result.report.status === "completed",
+    );
+    assert.equal(result.report.outcome, "no_change");
+    assert.equal(result.report.revision, base);
+    assert.equal(attempt.composition, undefined);
+    assert.equal(attempt.cleanup?.state, "completed");
+    assert.equal(f.workers.cleanupCount, 1);
+    assert.equal(await f.repository.head(), base);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), before);
+    const worktrees = await git(f.root, "worktree", "list", "--porcelain");
+    assert.equal(worktrees.includes(attempt.placement?.path ?? ""), false);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("dirty isolated trees cannot settle a successful no-change implementation", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const authority = await f.authority(active);
+    const base = await f.repository.head();
+    f.workers.onWork = async (request) => {
+      await writeFile(join(request.cwd, "unreported.txt"), "dirty\n");
+      return {
+        kind: "implementation",
+        status: "completed",
+        outcome: "no_change",
+        summary: "No source change was needed.",
+        revision: request.env.PI_WORKGRAPH_BASE_COMMIT!,
+        reason: "The source already holds.",
+        evidence: [],
+        findings: [],
+      };
+    };
+    await active.queue({
+      id: "false-no-change",
+      capability: "implement",
+      artifactIntent: "maintained_change",
+      objective: "Confirm behavior",
+      intentVersion: 1,
+      authority,
+      acceptance: ["Existing behavior remains correct"],
+    });
+    await active.reconcile();
+    const state = await active.reconcile();
+    assert.equal(state.results[0]?.validity, "invalid");
+    assert.match(
+      state.results[0]?.detail ?? "",
+      /clean worktree|No-change validation failed|Artifact retention failed/i,
+    );
+    assert.equal(state.attempts[0]?.composition, undefined);
+    assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
+    assert.equal(await f.repository.head(), base);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("advanced isolated trees cannot settle a successful no-change implementation", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const authority = await f.authority(active);
+    const base = await f.repository.head();
+    f.workers.onWork = async (request) => {
+      await writeFile(join(request.cwd, "value.txt"), "advanced\n");
+      await git(request.cwd, "add", "value.txt");
+      await git(request.cwd, "commit", "-m", "unreported worker change");
+      return {
+        kind: "implementation",
+        status: "completed",
+        outcome: "no_change",
+        summary: "No source change was needed.",
+        revision: request.env.PI_WORKGRAPH_BASE_COMMIT!,
+        reason: "The source already holds.",
+        evidence: [],
+        findings: [],
+      };
+    };
+    await active.queue({
+      id: "advanced-no-change",
+      capability: "implement",
+      artifactIntent: "maintained_change",
+      objective: "Confirm behavior",
+      intentVersion: 1,
+      authority,
+      acceptance: ["Existing behavior remains correct"],
+    });
+    await active.reconcile();
+    const state = await active.reconcile();
+    assert.equal(state.results[0]?.validity, "invalid");
+    assert.match(
+      state.results[0]?.detail ?? "",
+      /authored worker commit|advanced from/i,
+    );
+    assert.equal(state.attempts[0]?.composition, undefined);
+    assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
+    assert.equal(await f.repository.head(), base);
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("maintained changes use guide/executor policy and review checks the requested earlier revision", async () => {
   const f = await fixture();
   try {
@@ -529,6 +673,7 @@ test("maintained changes use guide/executor policy and review checks the request
         return {
           kind: "implementation",
           status: "completed",
+          outcome: "changed",
           summary: "Changed value",
           commit: await git(request.cwd, "rev-parse", "HEAD"),
           evidence: [],
@@ -687,6 +832,7 @@ test("wrong-mode and stale maintained results remain retained without compositio
       return {
         kind: "implementation",
         status: "completed",
+        outcome: "changed",
         summary: "old constraint",
         evidence: [],
         findings: [],
@@ -738,6 +884,7 @@ test("recovery fences retained-ref writes after asynchronous worker inspection",
       return {
         kind: "implementation",
         status: "completed",
+        outcome: "changed",
         summary: "Worker proposal",
         evidence: [],
         findings: [],
