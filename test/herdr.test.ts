@@ -131,6 +131,143 @@ test("current-session coordinator observation accepts an unnamed detected Pi pan
   }
 });
 
+test("coordinator forks into a new unfocused workspace with isolated Pi identity", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-fork-"));
+  const log = join(parent, "commands.jsonl");
+  const command = join(parent, "fake-herdr-fork.mjs");
+  const cwd = join(parent, "child-repo");
+  const sessionFile = join(parent, "child.jsonl");
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { createHash } from "node:crypto";
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+const agentName = "wg-coordinator-" + createHash("sha256").update(${JSON.stringify(`${sessionFile}\0${cwd}`)}).digest("hex").slice(0, 16);
+const agent = (native) => ({workspace_id:"child-workspace",tab_id:"child-workspace:tab-1",pane_id:"child-workspace:pane-1",terminal_id:"child-terminal",agent_status:"idle",name:agentName,cwd:${JSON.stringify(cwd)},...(native ? {agent_session:{value:${JSON.stringify(sessionFile)}}} : {})});
+if (args[0] === "workspace" && args[1] === "create") console.log(JSON.stringify({result:{workspace:{workspace_id:"child-workspace"},tab:{tab_id:"child-workspace:tab-1"},root_pane:{pane_id:"child-workspace:pane-1"}}}));
+else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:agent(false)}}));
+else if (args[0] === "agent" && args[1] === "get") console.log(JSON.stringify({result:{agent:agent(true)}}));
+else console.log(JSON.stringify({result:{accepted:true}}));
+`,
+  );
+  await chmod(command, 0o755);
+  try {
+    const runtime = new HerdrCliRuntime(command, {
+      HERDR_ENV: "1",
+      HERDR_WORKSPACE_ID: "parent-workspace",
+      PI_CODING_AGENT_DIR: join(parent, "private-agent"),
+      PI_WORKGRAPH_MODE: "implementation",
+      PI_WORKGRAPH_RUN_ID: "parent-run",
+      PI_WORKGRAPH_NODE_ID: "parent-attempt",
+      PI_WORKGRAPH_BASE_COMMIT: "deadbeef",
+      PI_WORKGRAPH_EXECUTOR_MODEL: "private-model",
+      PI_WORKGRAPH_EXECUTOR_THINKING: "high",
+    });
+    const identity = await runtime.launchCoordinator({ cwd, sessionFile });
+    assert.deepEqual(identity, {
+      workspaceId: "child-workspace",
+      tabId: "child-workspace:tab-1",
+      paneId: "child-workspace:pane-1",
+      terminalId: "child-terminal",
+      agentName: identity.agentName,
+      sessionFile,
+      cwd,
+    });
+    assert.notEqual(identity.workspaceId, "parent-workspace");
+    const calls = (await readFile(log, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const create = calls.find(
+      (args) => args[0] === "workspace" && args[1] === "create",
+    )!;
+    assert.equal(create.includes("--workspace"), false);
+    assert.equal(create.includes("--no-focus"), true);
+    assert.ok(
+      create.includes(`PI_CODING_AGENT_DIR=${join(parent, "private-agent")}`),
+    );
+    for (const key of [
+      "PI_WORKGRAPH_MODE",
+      "PI_WORKGRAPH_RUN_ID",
+      "PI_WORKGRAPH_NODE_ID",
+      "PI_WORKGRAPH_BASE_COMMIT",
+      "PI_WORKGRAPH_EXECUTOR_MODEL",
+      "PI_WORKGRAPH_EXECUTOR_THINKING",
+    ])
+      assert.ok(create.includes(`${key}=`));
+    const start = calls.find(
+      (args) => args[0] === "agent" && args[1] === "start",
+    )!;
+    assert.deepEqual(start.slice(0, 7), [
+      "agent",
+      "start",
+      identity.agentName,
+      "--kind",
+      "pi",
+      "--pane",
+      identity.paneId,
+    ]);
+    assert.deepEqual(start.slice(-2), ["--session", sessionFile]);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("uncertain coordinator startup retains the exact created workspace handles", async () => {
+  const parent = await mkdtemp(
+    join(tmpdir(), "pi-workgraph-herdr-fork-failure-"),
+  );
+  const command = join(parent, "fake-herdr-fork-failure.mjs");
+  const cwd = join(parent, "child-repo");
+  const sessionFile = join(parent, "child.jsonl");
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const agent = {workspace_id:"child-workspace",tab_id:"child-workspace:tab-1",pane_id:"child-workspace:pane-1",terminal_id:"child-terminal",agent_status:"working",name:args[2] || "unknown",cwd:${JSON.stringify(cwd)}};
+if (args[0] === "workspace") console.log(JSON.stringify({result:{workspace:{workspace_id:"child-workspace"},tab:{tab_id:"child-workspace:tab-1"},root_pane:{pane_id:"child-workspace:pane-1"}}}));
+else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent}}));
+else if (args[0] === "agent" && args[1] === "get") console.log(JSON.stringify({result:{agent}}));
+else console.log(JSON.stringify({result:{accepted:true}}));
+`,
+  );
+  await chmod(command, 0o755);
+  try {
+    const runtime = new HerdrCliRuntime(command, {
+      HERDR_ENV: "1",
+      HERDR_WORKSPACE_ID: "parent-workspace",
+    });
+    await assert.rejects(
+      () => runtime.launchCoordinator({ cwd, sessionFile }),
+      (error: unknown) => {
+        assert.equal(
+          error instanceof Error && error.name,
+          "CoordinatorLaunchError",
+        );
+        const resource = (error as { resource?: unknown }).resource;
+        assert.deepEqual(resource, {
+          workspaceId: "child-workspace",
+          tabId: "child-workspace:tab-1",
+          paneId: "child-workspace:pane-1",
+          agentName: (resource as { agentName: string }).agentName,
+          terminalId: "child-terminal",
+          sessionFile,
+          cwd,
+        });
+        assert.match(
+          String(error),
+          /Inspect these exact handles before retrying/,
+        );
+        return true;
+      },
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("cleanup rejects mismatched cwd, verifies exact tab absence and tolerates already completed closure", async () => {
   const parent = await mkdtemp(
     join(tmpdir(), "pi-workgraph-herdr-deleted-cleanup-"),

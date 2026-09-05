@@ -799,7 +799,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_fork",
     label: "Workgraph Fork",
     description:
-      "Explicitly fork the coordinator conversation to a separate visible session, not a worker continuation or workstream adoption.",
+      "Explicitly fork the coordinator conversation into a new no-focus Herdr workspace; workers remain tabs in that coordinator workspace, not a worker continuation or workstream adoption.",
     parameters: Type.Object({ targetCwd: Type.String() }),
     async execute(_id, params, _signal, _update, ctx) {
       return serial(async () => {
@@ -808,7 +808,6 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           targetCwd: params.targetCwd,
         });
         const identity = await new HerdrCliRuntime().launchCoordinator({
-          workspaceId: process.env.HERDR_WORKSPACE_ID ?? "",
           cwd: params.targetCwd,
           sessionFile,
         });
@@ -816,7 +815,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           content: [
             {
               type: "text",
-              text: `Forked coordinator into ${identity.tabId}.`,
+              text: `Forked coordinator: workspace ${identity.workspaceId}, tab ${identity.tabId}, pane ${identity.paneId}, cwd ${identity.cwd}, native session ${identity.sessionFile}.`,
             },
           ],
           details: identity,

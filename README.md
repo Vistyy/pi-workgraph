@@ -34,7 +34,7 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 | `workgraph_disposition` | Optionally record explicit coordinator judgment of retained evidence. Presentation and validity do not imply acceptance. |
 | `workgraph_control` | Suspend/resume work or cancel/steer a specific live attempt. |
 | `workgraph_adopt` | Attach retained work without forking the conversation or implicitly resuming suspension. |
-| `workgraph_fork` | Explicitly fork the coordinator conversation into another visible session. |
+| `workgraph_fork` | Explicitly fork the coordinator conversation into a new no-focus Herdr workspace; workers remain tabs in their owning workspace. |
 | `workgraph_complete` | Record a conclusion, evidence, and limitations after workers and owned resources settle. |
 | `workgraph_models` | Inspect or explicitly change model defaults. |
 
@@ -92,7 +92,7 @@ The CLI provides read-only state inspection and explicit conversation forking:
 ```bash
 pi-workgraph status --state STATE_PATH
 pi-workgraph status --run-id ID --registry REGISTRY_PATH
-pi-workgraph fork --parent-session-file SESSION_PATH --target-cwd REPOSITORY --workspace WORKSPACE_ID
+pi-workgraph fork --parent-session-file SESSION_PATH --target-cwd REPOSITORY
 ```
 
 CLI results are JSON; failures exit nonzero.
@@ -119,7 +119,7 @@ Non-null assertions are not blanket-banned; their correctness depends on the enf
 
 Run live scenarios only from a Herdr-managed pane, against a clean committed candidate when the scenario itself requires composition.
 Shared research is separately expected to start with local tracked or untracked changes and leave those bytes untouched after native worker closure and retry.
-`smoke:herdr` starts idle Pi sessions without submitting model prompts and checks native identity, unnamed coordinator lookup, cleanup refusal for mismatched identity, and Herdr closure before Git removal.
+`smoke:herdr` starts idle Pi sessions without submitting model prompts and checks native parent/fork identity, a distinct no-focus coordinator workspace, child tab-scoped workers, cleanup refusal for mismatched identity, and Herdr closure before Git removal.
 `smoke:coordinator` submits one authorized request through a normal visible Pi coordinator and observes automatic handling of research, experiment retention/non-composition, implementation with guide/executor messages, concurrent research, exact-revision review, and resource cleanup.
 It requires authenticated configured models and does not supply later approval or progress nudges.
 

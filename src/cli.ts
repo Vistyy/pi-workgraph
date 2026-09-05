@@ -48,25 +48,22 @@ export async function runCli(
       throw new Error(
         "Fork requires --parent-session-file or PI_SESSION_FILE.",
       );
-    const repository = await GitRepository.inspect(
-      resolve(options.get("target-cwd") ?? process.cwd()),
+    const targetCwd = resolve(options.get("target-cwd") ?? process.cwd());
+    await GitRepository.inspect(targetCwd);
+    const runtime = new HerdrCliRuntime(
+      env.PI_WORKGRAPH_HERDR_BIN || "herdr",
+      env,
     );
-    const workspaceId = options.get("workspace") ?? env.HERDR_WORKSPACE_ID;
-    const runtime = new HerdrCliRuntime(env.PI_WORKGRAPH_HERDR_BIN || "herdr", {
-      ...env,
-      ...(workspaceId ? { HERDR_WORKSPACE_ID: workspaceId } : {}),
-    });
-    if (!runtime.available || !workspaceId)
+    if (!runtime.available)
       throw new Error("Herdr is unavailable. No hidden fallback was started.");
     const entryId = options.get("entry-id");
     const sessionFile = await forkConversationSession({
       parentSessionFile,
-      targetCwd: repository.root,
+      targetCwd,
       ...(entryId ? { entryId } : {}),
     });
     const identity = await runtime.launchCoordinator({
-      workspaceId,
-      cwd: repository.root,
+      cwd: targetCwd,
       sessionFile,
     });
     return { command, sessionFile, identity };
@@ -83,7 +80,6 @@ function parseOptions(args: readonly string[]): Map<string, string> {
     "parent-session-file",
     "target-cwd",
     "entry-id",
-    "workspace",
   ];
   for (let index = 0; index < args.length; index += 2) {
     const key = args[index]?.slice(2);
@@ -105,7 +101,7 @@ function parseOptions(args: readonly string[]): Map<string, string> {
 function usage(): string {
   return [
     "pi-workgraph status --state PATH | --run-id ID [--registry PATH]",
-    "pi-workgraph fork --parent-session-file PATH --target-cwd PATH [--entry-id ID] [--workspace ID]",
+    "pi-workgraph fork --parent-session-file PATH --target-cwd PATH [--entry-id ID]",
     "Status reads current or historical JSON without migration. Workstream mutation belongs to coordinator tools.",
   ].join("\n");
 }

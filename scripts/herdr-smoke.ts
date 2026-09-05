@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { GitRepository } from "../src/git.js";
-import { HerdrCliRuntime } from "../src/herdr.js";
-import { createWorkerSession } from "../src/pi-process.js";
+import { CoordinatorLaunchError, HerdrCliRuntime } from "../src/herdr.js";
+import {
+  createWorkerSession,
+  forkConversationSession,
+} from "../src/pi-process.js";
 import {
   closeOwnedWorkspace,
   createLiveFixture,
   herdr,
+  items,
   type LiveFixture,
   object,
   retainFailure,
@@ -21,7 +25,10 @@ try {
   fixture = await createLiveFixture("Workgraph Herdr boundary scenario");
   const f = fixture;
   const coordinator = await startCoordinator(f);
-  const runtime = new HerdrCliRuntime();
+  const runtime = new HerdrCliRuntime(
+    process.env.PI_WORKGRAPH_HERDR_BIN || "herdr",
+    { ...process.env, PI_CODING_AGENT_DIR: f.agentDir },
+  );
   await herdr(f.root, "agent", "rename", coordinator.paneId, "--clear");
   const observed = await runtime.observeCurrentCoordinator({
     paneId: coordinator.paneId,
@@ -32,6 +39,42 @@ try {
   assert.equal(
     await runtime.coordinatorLiveness(coordinator.sessionFile),
     "alive",
+  );
+  const parentTabsBeforeFork = items(
+    (await herdr(f.root, "tab", "list", "--workspace", f.workspaceId)).tabs,
+  ).map((tab) => text(tab.tab_id));
+  const childSessionFile = await forkConversationSession({
+    parentSessionFile: coordinator.sessionFile,
+    targetCwd: f.root,
+  });
+  const childCoordinator = await runtime.launchCoordinator({
+    cwd: f.root,
+    sessionFile: childSessionFile,
+  });
+  await writeFile(
+    join(f.parent, "fork-identity.json"),
+    JSON.stringify(childCoordinator, null, 2),
+  );
+  assert.notEqual(childCoordinator.workspaceId, f.workspaceId);
+  assert.equal(
+    object(
+      (await herdr(f.root, "workspace", "get", childCoordinator.workspaceId))
+        .workspace,
+    ).focused,
+    false,
+  );
+  const childObserved = await runtime.observeCurrentCoordinator({
+    paneId: childCoordinator.paneId,
+    sessionFile: childSessionFile,
+    cwd: f.root,
+  });
+  assert.equal(childObserved.workspaceId, childCoordinator.workspaceId);
+  assert.equal(childObserved.sessionFile, childSessionFile);
+  assert.deepEqual(
+    items(
+      (await herdr(f.root, "tab", "list", "--workspace", f.workspaceId)).tabs,
+    ).map((tab) => text(tab.tab_id)),
+    parentTabsBeforeFork,
   );
   await herdr(
     f.root,
@@ -60,7 +103,7 @@ try {
     "tab",
     "create",
     "--workspace",
-    f.workspaceId,
+    childCoordinator.workspaceId,
     "--cwd",
     placement.path,
     "--no-focus",
@@ -93,7 +136,7 @@ try {
     ).agent,
   );
   const worker = {
-    workspaceId: f.workspaceId,
+    workspaceId: childCoordinator.workspaceId,
     tabId: text(started.tab_id),
     paneId,
     terminalId: text(started.terminal_id),
@@ -126,6 +169,13 @@ try {
   assert.equal(workerCleanup.state, "completed");
   const gitCleanup = await repository.cleanupWorktree(placement, f.base);
   assert.equal(gitCleanup.state, "completed");
+  const childFixture = {
+    ...f,
+    workspaceId: childCoordinator.workspaceId,
+    rootTab: childCoordinator.tabId,
+    paneId: childCoordinator.paneId,
+  };
+  await closeOwnedWorkspace(childFixture, childCoordinator);
   await closeOwnedWorkspace(f, coordinator);
   await writeFile(
     join(f.parent, "passed.json"),
@@ -134,10 +184,12 @@ try {
         candidateRevision: f.revision,
         modelPrompts: 0,
         observed,
+        childObserved,
+        childCoordinator,
         workerCleanup,
         gitCleanup,
         checks:
-          "native identity, unnamed coordinator lookup, identity-mismatch refusal, exact Herdr closure before Git removal and verified workspace absence",
+          "native parent and fork identity, distinct unfocused workspace, parent preservation, child tab-scoped worker, identity-mismatch refusal, exact Herdr closure before Git removal and verified workspace absence",
       },
       null,
       2,
@@ -151,5 +203,10 @@ try {
     }),
   );
 } catch (error) {
+  if (fixture && error instanceof CoordinatorLaunchError && error.resource)
+    await writeFile(
+      join(fixture.parent, "fork-resource-retained.json"),
+      JSON.stringify(error.resource, null, 2),
+    );
   await retainFailure(fixture, error);
 }

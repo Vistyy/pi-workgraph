@@ -64,9 +64,28 @@ export class WorkerLaunchReadinessError extends Error {
 }
 
 export interface CoordinatorLaunchRequest {
-  workspaceId: string;
   cwd: string;
   sessionFile: string;
+}
+
+export interface CoordinatorLaunchResource {
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+  agentName: string;
+  terminalId?: string;
+  sessionFile: string;
+  cwd: string;
+}
+
+export class CoordinatorLaunchError extends Error {
+  constructor(
+    readonly resource: CoordinatorLaunchResource | undefined,
+    message: string,
+  ) {
+    super(message);
+    this.name = "CoordinatorLaunchError";
+  }
 }
 
 export interface CoordinatorObservationRequest {
@@ -99,10 +118,12 @@ interface CommandResult {
   code: number;
   stdout: string;
   stderr: string;
+  timedOut: boolean;
 }
 
 export class HerdrCliRuntime implements VisibleWorkerRuntime {
   readonly available: boolean;
+  private readonly coordinatorEnvironment: Record<string, string>;
 
   constructor(
     private readonly command = process.env.PI_WORKGRAPH_HERDR_BIN || "herdr",
@@ -110,6 +131,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
   ) {
     this.available =
       env.HERDR_ENV === "1" && typeof env.HERDR_WORKSPACE_ID === "string";
+    this.coordinatorEnvironment = coordinatorEnvironment(env);
   }
 
   async launchCoordinator(
@@ -117,44 +139,85 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
   ): Promise<WorkerIdentity> {
     if (!this.available)
       throw new Error("Herdr coordinator runtime is unavailable.");
-    const tabResponse = await this.call([
-      "tab",
-      "create",
-      "--workspace",
-      request.workspaceId,
-      "--cwd",
-      request.cwd,
-      "--label",
-      "Workgraph coordinator",
-      "--no-focus",
-    ]);
-    const tab = object(object(tabResponse, "result"), "root_pane");
-    const paneId = string(tab, "pane_id");
-    const agentName = `wg-coordinator-${createHash("sha256").update(`${request.sessionFile}\0${request.cwd}`).digest("hex").slice(0, 16)}`;
-    const started = parseAgent(
-      object(
+    const key = createHash("sha256")
+      .update(`${request.sessionFile}\0${request.cwd}`)
+      .digest("hex")
+      .slice(0, 16);
+    const agentName = `wg-coordinator-${key}`;
+    const label = `Workgraph coordinator ${key}`;
+    let created: Record<string, unknown>;
+    try {
+      created = object(
+        await this.call([
+          "workspace",
+          "create",
+          "--cwd",
+          request.cwd,
+          "--label",
+          label,
+          "--no-focus",
+          ...envArgs(this.coordinatorEnvironment),
+        ]),
+        "result",
+      );
+    } catch (error) {
+      throw new CoordinatorLaunchError(
+        undefined,
+        `Coordinator workspace creation is uncertain for session ${request.sessionFile} at ${request.cwd} with exact label ${JSON.stringify(label)}: ${errorMessage(error)} Inspect that label before retrying; no tab fallback or cleanup was attempted.`,
+      );
+    }
+    const workspaceId = string(object(created, "workspace"), "workspace_id");
+    const tabId = string(object(created, "tab"), "tab_id");
+    const paneId = string(object(created, "root_pane"), "pane_id");
+    const resource: CoordinatorLaunchResource = {
+      workspaceId,
+      tabId,
+      paneId,
+      agentName,
+      sessionFile: request.sessionFile,
+      cwd: request.cwd,
+    };
+    let retainedResource = resource;
+    try {
+      const started = parseAgent(
         object(
-          await this.call(
-            [
-              "agent",
-              "start",
-              agentName,
-              "--kind",
-              "pi",
-              "--pane",
-              paneId,
-              "--",
-              "--session",
-              request.sessionFile,
-            ],
-            45_000,
+          object(
+            await this.call(
+              [
+                "agent",
+                "start",
+                agentName,
+                "--kind",
+                "pi",
+                "--pane",
+                paneId,
+                "--",
+                "--session",
+                request.sessionFile,
+              ],
+              45_000,
+            ),
+            "result",
           ),
-          "result",
+          "agent",
         ),
-        "agent",
-      ),
-    );
-    return this.awaitNativeIdentity(resourceOf(started), request.sessionFile);
+      );
+      assertCoordinatorPlacement(resource, started);
+      const startedResource = resourceOf(started);
+      retainedResource = {
+        ...resource,
+        terminalId: startedResource.terminalId,
+      };
+      return await this.awaitNativeIdentity(
+        startedResource,
+        request.sessionFile,
+      );
+    } catch (error) {
+      throw new CoordinatorLaunchError(
+        retainedResource,
+        `Coordinator launch is uncertain in workspace ${workspaceId}, tab ${tabId}, pane ${paneId}, agent ${agentName}, session ${request.sessionFile}, cwd ${request.cwd}: ${errorMessage(error)} Inspect these exact handles before retrying; the workspace was retained.`,
+      );
+    }
   }
 
   async coordinatorLiveness(
@@ -554,6 +617,21 @@ function assertResource(
   if (actual.cwd !== expected.cwd) throw new Error("Herdr worker cwd changed.");
 }
 
+function assertCoordinatorPlacement(
+  expected: CoordinatorLaunchResource,
+  actual: ParsedAgent,
+): void {
+  if (
+    actual.workspaceId !== expected.workspaceId ||
+    actual.tabId !== expected.tabId ||
+    actual.paneId !== expected.paneId ||
+    actual.name !== expected.agentName
+  )
+    throw new Error("Herdr coordinator resource identity changed.");
+  if (actual.cwd !== expected.cwd)
+    throw new Error("Herdr coordinator cwd changed.");
+}
+
 function assertIdentity(expected: WorkerIdentity, actual: ParsedAgent): void {
   assertResource(expected, actual);
   if (!actual.sessionFile)
@@ -574,10 +652,34 @@ function identityOf(
     );
   return { ...expected, sessionFile: actual.sessionFile };
 }
+function coordinatorEnvironment(
+  env: NodeJS.ProcessEnv,
+): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (env.PI_CODING_AGENT_DIR)
+    result.PI_CODING_AGENT_DIR = env.PI_CODING_AGENT_DIR;
+  for (const key of [
+    "PI_WORKGRAPH_MODE",
+    "PI_WORKGRAPH_RUN_ID",
+    "PI_WORKGRAPH_NODE_ID",
+    "PI_WORKGRAPH_BASE_COMMIT",
+    "PI_WORKGRAPH_EXPERIMENT",
+    "PI_WORKGRAPH_IMPLEMENTATION_START",
+    "PI_WORKGRAPH_EXECUTOR_MODEL",
+    "PI_WORKGRAPH_EXECUTOR_THINKING",
+  ])
+    result[key] = "";
+  return result;
+}
+
 function envArgs(env: Record<string, string>): string[] {
   return Object.entries(env)
     .sort(([left], [right]) => left.localeCompare(right))
     .flatMap(([key, value]) => ["--env", `${key}=${value}`]);
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 export function herdrAgentName(
@@ -670,8 +772,9 @@ function isNotFound(
 }
 
 function herdrError(args: string[], result: CommandResult): Error {
-  let message =
-    result.stderr || result.stdout || `Herdr exited ${result.code}.`;
+  let message = result.timedOut
+    ? "command timed out"
+    : result.stderr || result.stdout || `Herdr exited ${result.code}.`;
   for (const candidate of [result.stderr, result.stdout]) {
     try {
       const parsed = JSON.parse(candidate) as {
@@ -700,7 +803,11 @@ function spawnCommand(
     let stdout = "";
     let stderr = "";
     let settled = false;
-    const timeout = setTimeout(() => child.kill("SIGTERM"), timeoutMs);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
     timeout.unref();
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString();
@@ -722,6 +829,7 @@ function spawnCommand(
         code: code ?? 1,
         stdout: stdout.trim(),
         stderr: stderr.trim(),
+        timedOut,
       });
     });
   });
