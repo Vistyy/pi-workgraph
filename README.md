@@ -23,20 +23,22 @@ Worktrees are not operating-system sandboxes.
 
 | Tool | Purpose |
 | --- | --- |
-| `workgraph_research` | Delegate a question with `expectedEvidence`; optionally declare an authorized experiment's effects, stop condition, and retained paths. |
-| `workgraph_implement` | Delegate a maintained change with acceptance requirements, using human-backed intent. |
-| `workgraph_review` | Independently inspect a retained result, artifact, or exact revision for a specified concern. |
+| `workgraph_research` | Delegate focused evidence gathering, or an explicitly authorized disposable experiment with effects, stopping rules, and retained artifact paths. Optional repeated attempts use policy-selected models. |
+| `workgraph_implement` | Delegate one bounded maintained slice with acceptance requirements and human-backed intent. Independent slices may share an exact base revision. |
+| `workgraph_review` | Independently inspect a retained result, artifact, exact revision, or comparison of retained results for a specified concern. |
 | `workgraph_intent` | Record changed scope against an actual retained human input receipt. |
-| `workgraph_status` | Inspect attached work, input receipts, model observations, results, and resources. |
-| `workgraph_acknowledge` | Record evidence actually read, independently of acceptance or notification transport success. |
-| `workgraph_disposition` | Accept, reject, or request follow-up on retained evidence. |
+| `workgraph_status` | Inspect a compact view of assignments, selected models and reasons, findings, evidence, uncertainty, delivery, and resource recovery. |
+| `workgraph_acknowledge` | Optionally record that evidence was actually read after a transport interruption. It is not required for ordinary result use. |
+| `workgraph_disposition` | Optionally record explicit coordinator judgment of retained evidence. Presentation and validity do not imply acceptance. |
 | `workgraph_control` | Suspend/resume work or cancel/steer a specific live attempt. |
 | `workgraph_adopt` | Attach retained work without forking the conversation or implicitly resuming suspension. |
 | `workgraph_fork` | Explicitly fork the coordinator conversation into another visible session. |
 | `workgraph_complete` | Record a conclusion, evidence, and limitations after workers and owned resources settle. |
 | `workgraph_models` | Inspect or explicitly change model defaults. |
 
-The coordinator interprets what a human request authorizes.
+The coordinator interprets what a human request authorizes and chooses which independent contributions are meaningful.
+Research, experiments, implementation slices, comparison, review, and integration are optional capabilities rather than a prescribed route.
+The runtime hides routine model and infrastructure administration while returning the full brief, selected models and reasons, substantive findings, evidence, uncertainty, and recovery attention.
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic approval oracle.
 Extension notifications and worker reports do not grant authority.
 New constraints leave historical evidence intact and tied to its original scope, while stale maintained output cannot compose into the current intent.
@@ -57,8 +59,10 @@ Assignment `model`, `thinking`, and implementation `executor` parameters overrid
 Policy changes affect subsequent assignments, not already queued work.
 
 Policy lives at `workgraph/models.json` under Pi's agent directory.
-Version 1 settings are read without rewriting: research uses the first `discovery.evidence` target, review uses the first `verification.product` target, and guide/executor keep their corresponding first targets.
-An explicit policy write stores only the four current roles in version 2 format.
+Versions 1 and 2 are read without rewriting and retain their historical role mapping.
+The active version 3 policy stores the four role defaults and one ordered worker pool for optional research/review fan-out.
+The default ordinary worker is Muse Spark, and pool order is a preference rather than a price or quality claim.
+Explicit target overrides require a specific retained reason, and uncertain launches never trigger silent replacement.
 
 ## Recovery and inspection
 
@@ -69,9 +73,10 @@ Expired ownership is not sufficient for takeover when the prior owner's liveness
 
 Suspension stops new launches and composition, while observations, evidence retention, and safe cleanup continue.
 Result notifications have stable identifiers and can recur after an interrupted delivery; this is not an exactly-once transport.
-After a notification failure, read the result through status and acknowledge that observation, or reattach to recover pending delivery.
+After a notification failure, read the result through status or reattach; acknowledgment remains available as an explicit receipt but is not needed to use the result.
 The runtime does not repeatedly wake the coordinator on every poll.
-Completion refuses pending deliveries until they are accounted for and refuses uncleaned owned resources.
+Completion refuses unfinished or blocked owned work unless the conclusion includes an explicit limitation and records undelivered result identifiers honestly.
+Routine completion does not require acknowledgment or disposition; those remain separate optional facts.
 Blocked work is preserved for inspection rather than force-deleted.
 
 The CLI provides read-only state inspection and explicit conversation forking:
@@ -95,6 +100,9 @@ pnpm smoke:herdr
 pnpm smoke:coordinator
 ```
 
+A natural-use verification request should state the desired outcome, constraints, and uncertainty to resolve without naming Workgraph tools, worker counts, or model panels.
+For example, ask for a cheap evidence check, an isolated probe retained for inspection, and a focused implementation only if the evidence supports it, then judge the returned findings and exact result yourself.
+This natural procedure is evidence of caller usability, while the deterministic smoke remains a protocol check of identity, retention, composition, and cleanup boundaries.
 `pnpm check` owns full TypeScript checking, Biome formatting/recommended lint, targeted assertion checks, and deterministic tests.
 The assertion check uses the already-installed TypeScript parser to reject type laundering through `unknown` and assertions to `never`, while permitting legitimate unknown inputs, ordinary narrowing, and `as const`.
 Non-null assertions are not blanket-banned; their correctness depends on the enforced boundary.

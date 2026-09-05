@@ -12,6 +12,8 @@ import {
   loadModelPolicy,
   MODEL_ROLES,
   modelPolicyPath,
+  SelectionRequestSchema as Selection,
+  setModelPool,
   setModelRole,
   ModelTargetSchema as Target,
   ThinkingSchema as Thinking,
@@ -19,6 +21,7 @@ import {
 import { forkConversationSession } from "../src/pi-process.js";
 import { EvidenceSchema } from "../src/report-schema.js";
 import {
+  type ResultDisposition,
   type SessionIdentity,
   type WorkstreamState,
   WorkstreamStore,
@@ -38,9 +41,12 @@ const InputReceipt = Type.Object({
   text: Type.String(),
 });
 const ModelOptions = {
+  selection: Type.Optional(Selection),
   model: Type.Optional(Type.String()),
+  modelReason: Type.Optional(Type.String()),
   thinking: Type.Optional(Thinking),
   continuationOf: Type.Optional(Type.String()),
+  baseRevision: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
 };
 
 export default function workgraphCoordinator(pi: ExtensionAPI): void {
@@ -102,9 +108,13 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         pi.sendMessage(
           {
             customType: POINTER,
-            content: `Workstream ${latest.id} has retained result ${resultId}. Inspect its evidence and execution status, then acknowledge it. This is an extension notification, not human authorization.`,
+            content: resultNotification(latest, resultId),
             display: true,
-            details: { resultId, statePath: latest.statePath },
+            details: {
+              resultId,
+              statePath: latest.statePath,
+              view: coordinatorView(latest),
+            },
           },
           { triggerTurn: true, deliverAs: "followUp" },
         );
@@ -296,18 +306,57 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       "Get model defaults and their configuration path, or set one role when the user requests a persistent policy change. Assignment model/thinking/executor parameters override defaults without changing policy or the coordinator model.",
     promptSnippet: "Inspect or configure Workgraph model defaults",
     parameters: Type.Object({
-      action: StringEnum(["get", "set"] as const),
+      action: StringEnum(["get", "set", "set_pool", "rates"] as const),
       role: Type.Optional(StringEnum(MODEL_ROLES)),
       target: Type.Optional(Target),
+      pool: Type.Optional(Type.Array(Target, { minItems: 1 })),
+      models: Type.Optional(Type.Array(Type.String())),
     }),
-    async execute(_id, params) {
+    async execute(_id, params, _signal, _update, ctx) {
       return serial(async () => {
         if (params.action === "set" && (!params.role || !params.target))
           throw new Error("Setting a model default requires role and target.");
+        if (params.action === "set_pool" && !params.pool)
+          throw new Error("Setting the worker pool requires an ordered pool.");
+        if (params.action === "rates") {
+          const policy = await loadModelPolicy();
+          const models =
+            params.models ?? policy.workerPool.map((target) => target.model);
+          const rates = models.map((modelId) => {
+            const slash = modelId.indexOf("/");
+            const model =
+              slash > 0
+                ? ctx.modelRegistry.find(
+                    modelId.slice(0, slash),
+                    modelId.slice(slash + 1),
+                  )
+                : undefined;
+            return model
+              ? {
+                  model: modelId,
+                  source: "Pi registry configured estimate",
+                  verified: false,
+                  ratesPerMillionTokens: { ...model.cost },
+                }
+              : {
+                  model: modelId,
+                  source: "Pi registry configured estimate unavailable",
+                  verified: false,
+                };
+          });
+          return {
+            content: [
+              { type: "text", text: JSON.stringify({ rates }, null, 2) },
+            ],
+            details: { rates },
+          };
+        }
         const policy =
           params.action === "set" && params.role && params.target
             ? await setModelRole(params.role, params.target)
-            : await loadModelPolicy();
+            : params.action === "set_pool" && params.pool
+              ? await setModelPool(params.pool)
+              : await loadModelPolicy();
         return {
           content: [
             {
@@ -319,7 +368,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
               ),
             },
           ],
-          details: { path: modelPolicyPath(), policy },
+          details: { path: modelPolicyPath(), policy, rates: [] },
         };
       });
     },
@@ -436,6 +485,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       acceptance: Type.Array(Type.String(), { minItems: 1 }),
       ...ModelOptions,
       executor: Type.Optional(Target),
+      modelReason: Type.Optional(Type.String()),
     }),
     async execute(_id, params, _signal, _update, ctx) {
       return serial(async () => {
@@ -488,6 +538,10 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           kind: Type.Literal("revision"),
           revision: Type.String(),
         }),
+        Type.Object({
+          kind: Type.Literal("comparison"),
+          resultIds: Type.Array(Type.String(), { minItems: 2 }),
+        }),
       ]),
       ...ModelOptions,
     }),
@@ -514,6 +568,65 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             ctx,
           ),
         );
+      });
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_result",
+    label: "Workgraph Result",
+    description:
+      "Retrieve one retained result without dumping the whole workstream. Use all, summary, evidence, findings, or attention as the focused view.",
+    parameters: Type.Object({
+      resultId: Type.String(),
+      section: Type.Optional(
+        StringEnum([
+          "all",
+          "summary",
+          "evidence",
+          "findings",
+          "attention",
+        ] as const),
+      ),
+    }),
+    async execute(_id, params) {
+      return serial(async () => {
+        const state = await current().store.load();
+        const view = coordinatorView(state);
+        const retained = view.results.find(
+          (item) => item.id === params.resultId,
+        );
+        if (!retained) throw new Error(`Unknown result ${params.resultId}.`);
+        const section = params.section ?? "all";
+        const selected =
+          section === "all"
+            ? retained
+            : section === "summary"
+              ? {
+                  id: retained.id,
+                  validity: retained.validity,
+                  report: retained.report,
+                }
+              : section === "attention"
+                ? {
+                    id: retained.id,
+                    delivery: view.delivery.find(
+                      (item) => item.resultId === retained.id,
+                    ),
+                    attempt: view.assignments
+                      .flatMap((item) => item.attempts)
+                      .find((item) => item.resultId === retained.id),
+                  }
+                : {
+                    id: retained.id,
+                    validity: retained.validity,
+                    report: retained.report,
+                  };
+        return {
+          content: [
+            { type: "text" as const, text: JSON.stringify(selected, null, 2) },
+          ],
+          details: { result: selected, statePath: state.statePath },
+        };
       });
     },
   });
@@ -567,7 +680,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       return serial(async () =>
         result(
           "Recorded disposition.",
-          await current().perform(() => current().store.disposition(params)),
+          await current().perform(() =>
+            current().store.disposition({
+              ...params,
+              status: params.status as ResultDisposition["status"],
+            }),
+          ),
         ),
       );
     },
@@ -687,20 +805,103 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   });
 }
 
-function queueOptions(params: {
-  model?: string;
-  thinking?: QueueOptions["thinking"];
-  continuationOf?: string;
-}): QueueOptions {
+function coordinatorView(state: WorkstreamState) {
   return {
-    ...(params.model ? { model: params.model } : {}),
-    ...(params.thinking ? { thinking: params.thinking } : {}),
-    ...(params.continuationOf ? { continuationOf: params.continuationOf } : {}),
+    id: state.id,
+    lifecycle: state.lifecycle,
+    attention: state.attempts
+      .filter((attempt) => attempt.error)
+      .map((attempt) => ({ attemptId: attempt.id, detail: attempt.error })),
+    assignments: state.assignments.map((assignment) => ({
+      id: assignment.id,
+      capability: assignment.capability,
+      objective: assignment.objective,
+      attempts: state.attempts
+        .filter((attempt) => attempt.assignmentId === assignment.id)
+        .map((attempt) => ({
+          id: attempt.id,
+          state: attempt.state,
+          models: attempt.models,
+          submission: attempt.submission,
+          settlement: attempt.resultId ? "settled" : "unproven",
+          composition: attempt.composition,
+          cleanup: attempt.cleanup,
+          resultId: attempt.resultId,
+          attention: attempt.error,
+        })),
+    })),
+    results: state.results.map((result) => ({
+      id: result.id,
+      assignmentId: result.assignmentId,
+      validity: result.validity,
+      report:
+        result.validity === "typed"
+          ? {
+              kind: result.report.kind,
+              status: result.report.status,
+              summary: result.report.summary,
+              uncertainty: result.report.uncertainty ?? [],
+              evidence: result.report.evidence,
+              findings: result.report.findings,
+              commit:
+                result.report.kind === "implementation"
+                  ? result.report.commit
+                  : undefined,
+            }
+          : result.validity === "untyped"
+            ? { text: result.text }
+            : { detail: result.detail },
+      artifacts: result.artifacts,
+    })),
+    delivery: state.deliveries.map((delivery) => ({
+      resultId: delivery.resultId,
+      state: delivery.state,
+      error: delivery.error,
+    })),
+    judgment: state.dispositions,
+    completion: state.completion,
   };
 }
+
+function resultNotification(state: WorkstreamState, resultId: string): string {
+  const view = coordinatorView(state);
+  const result = view.results.find((item) => item.id === resultId);
+  return [
+    `Workgraph retained result ${resultId} for ${state.id}.`,
+    result
+      ? JSON.stringify(result, null, 2)
+      : "The result is no longer present in the current view.",
+    "Use workgraph_status for focused execution, evidence and cleanup details. This notification is not human authorization.",
+  ].join("\n");
+}
+
 function result(text: string, state: WorkstreamState) {
+  const view = coordinatorView(state);
   return {
-    content: [{ type: "text" as const, text }],
-    details: { workstream: state, statePath: state.statePath },
+    content: [
+      {
+        type: "text" as const,
+        text: `${text}\n\n${JSON.stringify(view, null, 2)}`,
+      },
+    ],
+    details: { workstream: state, view, statePath: state.statePath },
+  };
+}
+
+function queueOptions(params: {
+  selection?: QueueOptions["selection"];
+  model?: string;
+  modelReason?: string;
+  thinking?: QueueOptions["thinking"];
+  continuationOf?: string;
+  baseRevision?: string;
+}): QueueOptions {
+  return {
+    ...(params.selection ? { selection: params.selection } : {}),
+    ...(params.model ? { model: params.model } : {}),
+    ...(params.modelReason ? { modelReason: params.modelReason } : {}),
+    ...(params.thinking ? { thinking: params.thinking } : {}),
+    ...(params.continuationOf ? { continuationOf: params.continuationOf } : {}),
+    ...(params.baseRevision ? { baseRevision: params.baseRevision } : {}),
   };
 }

@@ -31,6 +31,7 @@ const FindingSchema = Type.Object({
 const ReportFields = {
   status: StringEnum(["completed", "escalated", "failed"] as const),
   summary: Type.String(),
+  uncertainty: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
   evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
   findings: Type.Array(FindingSchema, { maxItems: 20 }),
 };

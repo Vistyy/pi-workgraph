@@ -53,7 +53,7 @@ export async function createWorkerSession(
       "",
       request.objective.trim(),
     ].join("\n"),
-    false,
+    true,
     { runId: request.runId, nodeId: request.nodeId, mode: request.mode },
   );
   if (!request.continuationSessionFile) {

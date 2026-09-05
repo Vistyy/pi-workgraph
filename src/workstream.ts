@@ -75,6 +75,13 @@ const ResultSubjectSchema = Type.Union([
   ),
   Type.Object(
     {
+      kind: Type.Literal("comparison"),
+      resultIds: Type.Array(NonEmptyStringSchema, { minItems: 2 }),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
       kind: Type.Literal("artifact"),
       resultId: NonEmptyStringSchema,
       artifactId: NonEmptyStringSchema,
@@ -203,11 +210,25 @@ const DispositionSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+const SelectionReceiptSchema = Type.Object(
+  {
+    role: StringEnum(["research", "review"] as const),
+    requested: Type.Integer({ minimum: 1 }),
+    diversity: StringEnum(["same-model", "distinct-models"] as const),
+    selected: Type.Array(ModelTargetSchema),
+    unfulfilled: Type.Array(NonEmptyStringSchema),
+    source: StringEnum(["policy", "override"] as const),
+    reason: NonEmptyStringSchema,
+  },
+  { additionalProperties: false },
+);
 const ModelsSchema = Type.Object(
   {
     guide: ModelTargetSchema,
     executor: Type.Optional(ModelTargetSchema),
     source: StringEnum(["policy", "override"] as const),
+    overrideReason: Type.Optional(NonEmptyStringSchema),
+    selection: Type.Optional(SelectionReceiptSchema),
   },
   { additionalProperties: false },
 );
@@ -346,6 +367,7 @@ const CompletionSchema = Type.Object(
     evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
     limitations: Type.Array(NonEmptyStringSchema),
     unresolvedAssignmentIds: Type.Array(NonEmptyStringSchema),
+    undeliveredResultIds: Type.Optional(Type.Array(NonEmptyStringSchema)),
     completedAt: TimestampSchema,
   },
   { additionalProperties: false },
@@ -652,37 +674,50 @@ export class WorkstreamStore {
 
   async enqueue(
     input: AssignmentInput,
-    attempt: {
-      id: string;
-      models: NonNullable<WorkAttempt["models"]>;
-      continuationOf?: string;
-    },
+    attempts:
+      | {
+          id: string;
+          models: NonNullable<WorkAttempt["models"]>;
+          continuationOf?: string;
+          baseRevision?: string;
+        }
+      | Array<{
+          id: string;
+          models: NonNullable<WorkAttempt["models"]>;
+          continuationOf?: string;
+          baseRevision?: string;
+        }>,
   ): Promise<WorkstreamState> {
     return this.update((draft, now) => {
       addAssignment(draft, input, now);
-      validateId(attempt.id, "Attempt id");
-      if (draft.attempts.some((item) => item.id === attempt.id))
-        throw new Error("Duplicate attempt.");
-      if (
-        attempt.continuationOf &&
-        !draft.attempts.some(
-          (item) =>
-            item.id === attempt.continuationOf &&
-            item.state === "settled" &&
-            item.cleanup?.state === "completed" &&
-            item.sessionFile,
+      const entries = Array.isArray(attempts) ? attempts : [attempts];
+      if (entries.length === 0)
+        throw new Error("At least one attempt is required.");
+      for (const attempt of entries) {
+        validateId(attempt.id, "Attempt id");
+        if (draft.attempts.some((item) => item.id === attempt.id))
+          throw new Error("Duplicate attempt.");
+        if (
+          attempt.continuationOf &&
+          !draft.attempts.some(
+            (item) =>
+              item.id === attempt.continuationOf &&
+              item.state === "settled" &&
+              item.cleanup?.state === "completed" &&
+              item.sessionFile,
+          )
         )
-      )
-        throw new Error(
-          "Continuation requires a settled, cleaned worker trajectory; retained blocked work must be inspected first.",
-        );
-      draft.attempts.push({
-        ...attempt,
-        assignmentId: input.id,
-        state: "queued",
-        createdAt: now.toISOString(),
-        updatedAt: now.toISOString(),
-      });
+          throw new Error(
+            "Continuation requires a settled, cleaned worker trajectory; retained blocked work must be inspected first.",
+          );
+        draft.attempts.push({
+          ...attempt,
+          assignmentId: input.id,
+          state: "queued",
+          createdAt: now.toISOString(),
+          updatedAt: now.toISOString(),
+        });
+      }
     });
   }
 
@@ -723,60 +758,379 @@ export class WorkstreamStore {
     );
   }
 
-  async updateAttempt(
-    input: Pick<WorkAttempt, "id"> &
-      Partial<
-        Omit<
-          WorkAttempt,
-          | "id"
-          | "assignmentId"
-          | "createdAt"
-          | "updatedAt"
-          | "error"
-          | "attentionHistory"
-        >
-      > & { error?: string | null; now?: Date },
+  async startAttempt(input: {
+    id: string;
+    worktreePath: string;
+    branch: string;
+    baseRevision: string;
+    now?: Date;
+  }): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      input.id,
+      (attempt) => {
+        if (!["queued", "starting"].includes(attempt.state))
+          throw new Error(`Attempt ${input.id} is not awaiting launch.`);
+        attempt.state = "starting";
+        attempt.worktreePath = input.worktreePath;
+        attempt.branch = input.branch;
+        attempt.baseRevision = input.baseRevision;
+        attempt.submission = "not_sent";
+      },
+      input.now,
+    );
+  }
+
+  async recordSessionFile(
+    id: string,
+    sessionFile: string,
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    requireText(sessionFile, "Worker session file");
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (attempt.state !== "starting")
+          throw new Error(`Attempt ${id} is not starting.`);
+        attempt.sessionFile = sessionFile;
+      },
+      now,
+    );
+  }
+
+  async recordLaunchPane(
+    id: string,
+    launchPane: NonNullable<WorkAttempt["launchPane"]>,
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        attempt.launchPane = launchPane;
+      },
+      now,
+    );
+  }
+
+  async recordResource(
+    id: string,
+    resource: NonNullable<WorkAttempt["resource"]>,
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        attempt.resource = resource;
+      },
+      now,
+    );
+  }
+
+  async recordWorker(
+    id: string,
+    worker: NonNullable<WorkAttempt["worker"]>,
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (!attempt.sessionFile)
+          throw new Error("Worker identity requires a session file.");
+        attempt.worker = worker;
+      },
+      now,
+    );
+  }
+
+  async markSubmission(
+    id: string,
+    state: NonNullable<WorkAttempt["submission"]>,
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (!attempt.sessionFile)
+          throw new Error("Submission state requires a session file.");
+        const previous = attempt.submission ?? "not_sent";
+        const allowed =
+          (previous === "not_sent" && state === "uncertain") ||
+          (previous === "uncertain" &&
+            ["submitted", "started"].includes(state)) ||
+          (previous === "submitted" && state === "started") ||
+          previous === state;
+        if (!allowed)
+          throw new Error(
+            `Cannot transition submission from ${previous} to ${state}.`,
+          );
+        attempt.submission = state;
+        if (state === "submitted") attempt.state = "running";
+        if (state === "started" && attempt.state === "starting")
+          attempt.state = "running";
+      },
+      now,
+    );
+  }
+
+  async settleAttempt(input: {
+    id: string;
+    resultId: string;
+    effectiveModels: NonNullable<WorkAttempt["effectiveModels"]>;
+    now?: Date;
+  }): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      input.id,
+      (attempt, draft) => {
+        if (!attempt.sessionFile)
+          throw new Error("Settlement requires a session file.");
+        if (!draft.results.some((result) => result.id === input.resultId))
+          throw new Error(
+            `Settlement references unknown result ${input.resultId}.`,
+          );
+        if (
+          !["running", "starting", "cancel_requested", "settled"].includes(
+            attempt.state,
+          )
+        )
+          throw new Error(`Attempt ${input.id} is not settleable.`);
+        attempt.state =
+          attempt.state === "cancel_requested" ? "cancelled" : "settled";
+        attempt.resultId = input.resultId;
+        attempt.effectiveModels = input.effectiveModels;
+      },
+      input.now,
+    );
+  }
+
+  async recordAttention(
+    id: string,
+    detail: string,
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    requireText(detail, "Attention detail");
+    return this.changeAttempt(
+      id,
+      (attempt, _draft, current) => {
+        if (attempt.error === detail) return;
+        attempt.error = detail;
+        attempt.attentionHistory ??= [];
+        attempt.attentionHistory.push({
+          detail: detail.trim(),
+          at: current.toISOString(),
+        });
+      },
+      now,
+    );
+  }
+
+  async clearAttention(id: string, now?: Date): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        delete attempt.error;
+      },
+      now,
+    );
+  }
+
+  async beginComposition(input: {
+    id: string;
+    commit: string;
+    expectedHead: string;
+    now?: Date;
+  }): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      input.id,
+      (attempt) => {
+        if (attempt.composition)
+          throw new Error(`Composition for ${input.id} is already recorded.`);
+        attempt.composition = {
+          state: "pending",
+          commit: input.commit,
+          expectedHead: input.expectedHead,
+        };
+      },
+      input.now,
+    );
+  }
+
+  async finishComposition(
+    id: string,
+    revision: string,
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const composition = attempt.composition;
+        if (composition?.state !== "pending")
+          throw new Error(`Composition for ${id} is not pending.`);
+        attempt.composition = { ...composition, state: "composed", revision };
+      },
+      now,
+    );
+  }
+
+  async blockComposition(
+    id: string,
+    error: string,
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    requireText(error, "Composition error");
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const composition = attempt.composition;
+        if (composition?.state !== "pending")
+          throw new Error(`Composition for ${id} is not pending.`);
+        attempt.composition = {
+          ...composition,
+          state: "blocked",
+          error: error.trim(),
+        };
+      },
+      now,
+    );
+  }
+
+  async beginCleanup(input: {
+    id: string;
+    expectedHead: string;
+    discard: boolean;
+    now?: Date;
+  }): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      input.id,
+      (attempt) => {
+        if (attempt.cleanup)
+          throw new Error(`Cleanup for ${input.id} is already recorded.`);
+        if (!attempt.worktreePath)
+          throw new Error("Cleanup requires a worktree.");
+        attempt.cleanup = {
+          state: "pending",
+          expectedHead: input.expectedHead,
+          workerClosed: false,
+          discard: input.discard,
+        };
+      },
+      input.now,
+    );
+  }
+
+  async markWorkerClosed(id: string, now?: Date): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (attempt.cleanup?.state !== "pending")
+          throw new Error(`Cleanup for ${id} is not pending.`);
+        if (attempt.cleanup.workerClosed) return;
+        attempt.cleanup = { ...attempt.cleanup, workerClosed: true };
+      },
+      now,
+    );
+  }
+
+  async retryCleanup(id: string, now?: Date): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (attempt.cleanup?.state !== "blocked")
+          throw new Error(`Cleanup for ${id} is not blocked.`);
+        const cleanup = attempt.cleanup;
+        if (!cleanup) throw new Error(`Cleanup for ${id} is not blocked.`);
+        attempt.cleanup = { ...cleanup, state: "pending" };
+        delete attempt.cleanup.error;
+      },
+      now,
+    );
+  }
+
+  async finishCleanup(id: string, now?: Date): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (
+          attempt.cleanup?.state !== "pending" ||
+          !attempt.cleanup.workerClosed
+        )
+          throw new Error(`Cleanup for ${id} requires a closed worker.`);
+        attempt.cleanup = { ...attempt.cleanup, state: "completed" };
+      },
+      now,
+    );
+  }
+
+  async blockCleanup(
+    id: string,
+    error: string,
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    requireText(error, "Cleanup error");
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (!attempt.cleanup)
+          throw new Error(`Cleanup for ${id} is not recorded.`);
+        attempt.cleanup = {
+          ...attempt.cleanup,
+          state: "blocked",
+          error: error.trim(),
+        };
+      },
+      now,
+    );
+  }
+
+  async recordSteering(
+    id: string,
+    text: string,
+    state: "uncertain" | "submitted",
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    requireText(text, "Steering instruction");
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (!attempt.worker)
+          throw new Error("Steering requires a worker identity.");
+        if (state === "submitted" && attempt.steering?.state !== "uncertain")
+          throw new Error(
+            "Submitted steering requires an uncertain submission record.",
+          );
+        attempt.steering = { text: text.trim(), state };
+      },
+      now,
+    );
+  }
+
+  async cancelAttempt(id: string, now?: Date): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (attempt.state === "queued") {
+          attempt.state = "cancelled";
+          return;
+        }
+        if (!["starting", "running"].includes(attempt.state))
+          throw new Error(`Attempt ${id} is not active.`);
+        attempt.state = "cancel_requested";
+      },
+      now,
+    );
+  }
+
+  private async changeAttempt(
+    id: string,
+    mutator: (attempt: WorkAttempt, draft: WorkstreamState, now: Date) => void,
+    suppliedNow?: Date,
   ): Promise<WorkstreamState> {
     return this.update(
       (draft, now) => {
-        const attempt = draft.attempts.find(
-          (candidate) => candidate.id === input.id,
-        );
-        if (!attempt) throw new Error(`Unknown attempt ${input.id}.`);
-        if (input.state !== undefined) attempt.state = input.state;
-        if (input.models !== undefined) attempt.models = input.models;
-        if (input.launchPane !== undefined)
-          attempt.launchPane = input.launchPane;
-        if (input.resource !== undefined) attempt.resource = input.resource;
-        if (input.submission !== undefined)
-          attempt.submission = input.submission;
-        if (input.steering !== undefined) attempt.steering = input.steering;
-        if (input.composition !== undefined)
-          attempt.composition = input.composition;
-        if (input.cleanup !== undefined) attempt.cleanup = input.cleanup;
-        if (input.effectiveModels !== undefined)
-          attempt.effectiveModels = input.effectiveModels;
-        if (input.sessionFile !== undefined)
-          attempt.sessionFile = input.sessionFile;
-        if (input.worktreePath !== undefined)
-          attempt.worktreePath = input.worktreePath;
-        if (input.branch !== undefined) attempt.branch = input.branch;
-        if (input.baseRevision !== undefined)
-          attempt.baseRevision = input.baseRevision;
-        if (input.worker !== undefined) attempt.worker = input.worker;
-        if (input.resultId !== undefined) attempt.resultId = input.resultId;
-        if (input.error === null) delete attempt.error;
-        else if (input.error !== undefined && input.error !== attempt.error) {
-          attempt.error = input.error;
-          attempt.attentionHistory ??= [];
-          attempt.attentionHistory.push({
-            detail: input.error,
-            at: (input.now ?? now).toISOString(),
-          });
-        }
-        attempt.updatedAt = (input.now ?? now).toISOString();
+        const attempt = draft.attempts.find((candidate) => candidate.id === id);
+        if (!attempt) throw new Error(`Unknown attempt ${id}.`);
+        mutator(attempt, draft, suppliedNow ?? now);
+        attempt.updatedAt = (suppliedNow ?? now).toISOString();
       },
-      input.now,
+      suppliedNow,
       ["active", "suspended"],
     );
   }
@@ -937,12 +1291,16 @@ export class WorkstreamStore {
       const unresolvedAssignmentIds = draft.assignments
         .filter((assignment) => !assignmentResolved(draft, assignment))
         .map((assignment) => assignment.id);
+      const undeliveredResultIds = draft.deliveries
+        .filter((delivery) => delivery.state === "pending")
+        .map((delivery) => delivery.resultId);
       if (
-        unresolvedAssignmentIds.length > 0 &&
+        (unresolvedAssignmentIds.length > 0 ||
+          undeliveredResultIds.length > 0) &&
         input.limitations.length === 0
       ) {
         throw new Error(
-          "Completion with unresolved assignments requires an explicit limitation.",
+          "Completion with unresolved assignments or undelivered results requires an explicit limitation.",
         );
       }
       const completedAt = (input.now ?? now).toISOString();
@@ -951,6 +1309,7 @@ export class WorkstreamStore {
         evidence: structuredClone(input.evidence),
         limitations: input.limitations.map((item) => item.trim()),
         unresolvedAssignmentIds,
+        undeliveredResultIds,
         completedAt,
       };
       draft.lifecycle = {
@@ -1147,6 +1506,13 @@ function validateState(value: unknown): asserts value is WorkstreamState {
       throw new InvalidWorkstreamStateError(
         `Attempt ${attempt.id} references unknown result.`,
       );
+    if (
+      attempt.models?.selection &&
+      attempt.models.selection.selected.length === 0
+    )
+      throw new InvalidWorkstreamStateError(
+        `Attempt ${attempt.id} has an empty model selection.`,
+      );
   }
   for (const delivery of state.deliveries)
     if (!resultIds.has(delivery.resultId))
@@ -1253,6 +1619,19 @@ function requireSubject(state: WorkstreamState, subject: ResultSubject): void {
 }
 
 function validateSubject(state: WorkstreamState, subject: ResultSubject): void {
+  if (subject.kind === "comparison") {
+    const ids = new Set(subject.resultIds);
+    if (ids.size !== subject.resultIds.length || subject.resultIds.length < 2)
+      throw new InvalidWorkstreamStateError(
+        "Comparison requires distinct retained results.",
+      );
+    for (const resultId of subject.resultIds)
+      if (!state.results.some((result) => result.id === resultId))
+        throw new InvalidWorkstreamStateError(
+          `Comparison references unknown result ${resultId}.`,
+        );
+    return;
+  }
   if (subject.kind === "result") {
     if (!state.results.some((result) => result.id === subject.resultId))
       throw new InvalidWorkstreamStateError(
@@ -1330,10 +1709,7 @@ function assignmentResolved(
     .find((candidate) => candidate.assignmentId === assignment.id);
   if (result?.validity !== "typed" || result.report.status !== "completed")
     return false;
-  const disposition = [...state.dispositions]
-    .reverse()
-    .find((candidate) => candidate.resultId === result.id);
-  return disposition?.status === "accepted";
+  return true;
 }
 
 function requireActive(state: WorkstreamState): void {

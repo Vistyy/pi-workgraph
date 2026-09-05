@@ -195,6 +195,7 @@ test("registered model policy get/set affects later assignments but not override
           question: "Read",
           expectedEvidence: ["bytes"],
           model: "fixture/override",
+          modelReason: "The fixture checks explicit override provenance.",
         })
       ).details,
     );

@@ -6,6 +6,8 @@ description: Use when delegating or recovering repository work with Workgraph.
 # Workgraph coordination
 
 Choose assignments by the information, isolation, or independence the work needs, rather than constructing a mandatory pipeline.
+A small evidence check is often enough for a low-risk question, while an explicitly authorized experiment can resolve uncertainty with named effects, stopping conditions, and retained artifacts.
+Independent repeated research or candidate work, a comparison review over retained results, parallel maintained slices, and an ordinary bounded integration assignment are available when their independence is meaningful.
 First delegation creates a workstream; research can proceed before maintained implementation is authorized and alongside implementation or review.
 Use a separate coordinator conversation for unrelated work.
 
@@ -23,8 +25,9 @@ Record changed scope as a new intent before delegating changed requirements; his
 
 ## Returned work and recovery
 
-Judge execution settlement, report validity, transport receipt, and evidence acceptance separately.
-Acknowledge evidence you actually read, including through status after a failed notification, then record your disposition.
+Judge execution settlement, report validity, transport receipt, and semantic judgment separately.
+Use directly returned reports or focused status results in coordinator reasoning.
+Acknowledge evidence after a failed notification only when an explicit durable receipt is useful, and record disposition only when explicit semantic judgment is useful; neither is an everyday completion ritual.
 Pending notifications retry on reattachment, not every polling cycle; the same result identifier can recur after an interrupted delivery.
 Do not blindly resubmit an uncertain worker prompt.
 Inspect the retained native session and exact resource identities before deciding whether an operation needs recovery.

@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   DEFAULT_MODEL_POLICY,
   loadModelPolicy,
+  resolveSelection,
   setModelRole,
 } from "../src/model-policy.js";
 
@@ -29,7 +30,7 @@ test("policy defaults, read-only legacy mapping and explicit current-role writes
     });
     await writeFile(path, legacy);
     const mapped = await loadModelPolicy(path);
-    assert.equal(mapped.version, 2);
+    assert.equal(mapped.version, 3);
     assert.equal(mapped.roles.research.model, "fixture/research");
     assert.equal(mapped.roles.review.model, "fixture/reviewer");
     assert.equal(mapped.roles["implementation.guide"].model, "fixture/guide");
@@ -69,4 +70,39 @@ test("policy defaults, read-only legacy mapping and explicit current-role writes
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
+});
+
+test("selection is policy-owned, deterministic, and explicit about insufficient diversity", async () => {
+  const policy = structuredClone(DEFAULT_MODEL_POLICY);
+  const repeated = resolveSelection("research", { count: 3 }, policy);
+  assert.equal(repeated.selected.length, 3);
+  assert.equal(
+    new Set(repeated.selected.map((target) => target.model)).size,
+    1,
+  );
+  const distinct = resolveSelection(
+    "review",
+    { count: 3, diversity: "distinct-models" },
+    policy,
+  );
+  assert.deepEqual(
+    distinct.selected.map((target) => target.model),
+    policy.workerPool.slice(0, 3).map((target) => target.model),
+  );
+  const unavailable = resolveSelection(
+    "research",
+    { count: 99, diversity: "distinct-models" },
+    policy,
+  );
+  assert.equal(unavailable.selected.length, policy.workerPool.length);
+  assert.equal(unavailable.unfulfilled.length, 1);
+  assert.throws(
+    () =>
+      resolveSelection(
+        "research",
+        { override: { target: policy.roles.research, reason: "" } },
+        policy,
+      ),
+    /specific reason/,
+  );
 });

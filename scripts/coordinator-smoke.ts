@@ -25,13 +25,13 @@ try {
   const privateToken = "PRIVATE_COORDINATOR_VIOLET";
   const prompt = `Use Workgraph capability tools to complete this single bounded workstream without another approval ceremony.
 Coordinator-only context: ${privateToken}. Never include that token in worker assignments.
-Do not call workgraph_begin; first delegate research id baseline-research to read the README marker and exact current value.txt bytes, then end your turn. Only after its actual retained-result notification resumes you, inspect, acknowledge and disposition its evidence.
+First gather cheap evidence about the README marker and exact current value.txt bytes, then use the returned findings to decide what bounded work is justified. End your turn when only workers are running and resume on actual results.
 Next delegate disposable experiment id uppercase-experiment, explicitly authorized to read value.txt and write only probe.txt containing its uppercase bytes. Stop after one observation, retain probe.txt, never compose scratch code.
 Then delegate maintained implementation id update-value, explicitly authorized to change only value.txt to exactly after followed by one newline, with acceptance node verify.mjs and exact bytes/scope. Use policy guide/executor defaults.
 Immediately after queueing implementation, before waiting for its result, queue read-only research id concurrent-readme to read the README marker, demonstrating interleaving.
 After maintained composition, delegate independent review id exact-revision-review of that exact retained revision, concerned with scope, exact bytes, absence of probe.txt and node verify.mjs.
 You may run read-only verification yourself but do not edit the fixture directly. Do not delegate extra workers or change model policy.
-Handle result notifications automatically, inspect execution/cleanup, acknowledge every result and record a disposition based on its actual evidence. After queueing useful independent work, end your turn to receive notifications; do not poll status, run waits for workers, or wait inside shell commands. Status inspection for an actual result or attention is appropriate.
+Handle result notifications automatically and inspect execution, findings, evidence, uncertainty, and cleanup. After queueing useful independent work, end your turn to receive notifications; do not poll status, run waits for workers, or wait inside shell commands. Status inspection for an actual result or attention is appropriate.
 Independently verify retained probe.txt is BEFORE followed by a newline, maintained value.txt is after followed by a newline, only value.txt changed, node verify.mjs passes, and all owned attempts/resources settled and cleaned.
 Complete with concrete evidence and honest limitations only after those conditions hold. Report a blocker instead of claiming success if a required boundary is unavailable.`;
   await writeFile(join(f.parent, "initial-request.txt"), prompt);
@@ -115,17 +115,8 @@ Complete with concrete evidence and honest limitations only after those conditio
         result.validity === "typed" && result.report.status === "completed",
     ),
   );
-  assert.ok(
-    state.results.every(
-      (result) =>
-        state.dispositions.findLast((item) => item.resultId === result.id)
-          ?.status === "accepted",
-    ),
-  );
   assert.equal(state.deliveries.length, 5);
-  assert.ok(
-    state.deliveries.every((delivery) => delivery.state === "acknowledged"),
-  );
+  assert.ok(state.deliveries.every((delivery) => delivery.state !== "pending"));
   assert.deepEqual(state.completion?.unresolvedAssignmentIds, []);
   for (const attempt of state.attempts) {
     assert.equal(attempt.state, "settled");

@@ -356,9 +356,9 @@ test("cleaned history has constant reconciliation reads while error clearing and
     );
     const id = state.attempts[0]!.id;
     await active.perform(() =>
-      f.store.updateAttempt({ id, error: "retained stale attention" }),
+      f.store.recordAttention(id, "retained stale attention"),
     );
-    const updates = t.mock.method(f.store, "updateAttempt");
+    const updates = t.mock.method(f.store, "clearAttention");
     state = await active.reconcile();
     assert.equal(updates.mock.callCount(), 1);
     assert.equal(state.attempts[0]?.error, undefined);
@@ -405,12 +405,7 @@ test("cleaned history has constant reconciliation reads while error clearing and
     await rm(obstruction);
     // Rearm only after inspecting/removing the exact fixture-owned obstruction.
     assert.ok(blocked.cleanup);
-    await recovered.perform(() =>
-      f.store.updateAttempt({
-        id: blocked.id,
-        cleanup: { ...blocked.cleanup!, state: "pending" },
-      }),
-    );
+    await recovered.perform(() => f.store.retryCleanup(blocked.id));
     state = await recovered.reconcile();
     assert.equal(state.attempts.at(-1)?.cleanup?.state, "completed");
     assert.equal(state.attempts.at(-1)?.error, undefined);
@@ -706,6 +701,7 @@ test("worker continuation uses an isolated new workspace and current generation,
     await active.queue(research("followup"), {
       continuationOf: previous.id,
       model: "provider/other",
+      modelReason: "Test an explicitly selected continuation model.",
       thinking: "low",
     });
     await active.reconcile();
