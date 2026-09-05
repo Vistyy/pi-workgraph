@@ -203,6 +203,12 @@ export class WorkstreamRuntime {
         return state;
       for (const item of state.attempts) {
         try {
+          // Cleanup is terminal; delivery is reconciled independently below.
+          if (item.cleanup?.state === "completed") {
+            if (item.error)
+              await this.store.updateAttempt({ id: item.id, error: null });
+            continue;
+          }
           await this.advance(item.id);
           const advanced = findAttempt(await this.store.load(), item.id);
           const blocked =

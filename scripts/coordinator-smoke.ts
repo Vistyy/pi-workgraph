@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { hasNativeAgentSettled } from "../src/pi-process.js";
 import { type WorkstreamState, WorkstreamStore } from "../src/workstream.js";
+import { notificationDrivenProgress } from "./coordinator-observation.js";
 import {
   closeOwnedWorkspace,
   command,
@@ -24,13 +25,13 @@ try {
   const privateToken = "PRIVATE_COORDINATOR_VIOLET";
   const prompt = `Use Workgraph capability tools to complete this single bounded workstream without another approval ceremony.
 Coordinator-only context: ${privateToken}. Never include that token in worker assignments.
-Do not call workgraph_begin; first delegate research id baseline-research to read the README marker and exact current value.txt bytes, then inspect, acknowledge and disposition its evidence.
+Do not call workgraph_begin; first delegate research id baseline-research to read the README marker and exact current value.txt bytes, then end your turn. Only after its actual retained-result notification resumes you, inspect, acknowledge and disposition its evidence.
 Next delegate disposable experiment id uppercase-experiment, explicitly authorized to read value.txt and write only probe.txt containing its uppercase bytes. Stop after one observation, retain probe.txt, never compose scratch code.
 Then delegate maintained implementation id update-value, explicitly authorized to change only value.txt to exactly after followed by one newline, with acceptance node verify.mjs and exact bytes/scope. Use policy guide/executor defaults.
 Immediately after queueing implementation, before waiting for its result, queue read-only research id concurrent-readme to read the README marker, demonstrating interleaving.
 After maintained composition, delegate independent review id exact-revision-review of that exact retained revision, concerned with scope, exact bytes, absence of probe.txt and node verify.mjs.
 You may run read-only verification yourself but do not edit the fixture directly. Do not delegate extra workers or change model policy.
-Handle result notifications automatically, inspect execution/cleanup, acknowledge every result and record a disposition based on its actual evidence.
+Handle result notifications automatically, inspect execution/cleanup, acknowledge every result and record a disposition based on its actual evidence. After queueing useful independent work, end your turn to receive notifications; do not poll status, run waits for workers, or wait inside shell commands. Status inspection for an actual result or attention is appropriate.
 Independently verify retained probe.txt is BEFORE followed by a newline, maintained value.txt is after followed by a newline, only value.txt changed, node verify.mjs passes, and all owned attempts/resources settled and cleaned.
 Complete with concrete evidence and honest limitations only after those conditions hold. Report a blocker instead of claiming success if a required boundary is unavailable.`;
   await writeFile(join(f.parent, "initial-request.txt"), prompt);
@@ -73,10 +74,24 @@ Complete with concrete evidence and honest limitations only after those conditio
         latest.lifecycle.state !== "completed"
       )
         throw new Error(`Unexpected lifecycle ${latest.lifecycle.state}`);
-      return latest.lifecycle.state === "completed" ? latest : undefined;
+      const baseline = latest.results.find(
+        (result) => result.assignmentId === "baseline-research",
+      );
+      const progressed =
+        baseline &&
+        notificationDrivenProgress(
+          SessionManager.open(coordinator.sessionFile).getBranch(),
+          latest.results.map((result) => result.id),
+          baseline.id,
+        );
+      // Completion can precede the last queued followUp. Observe its actual
+      // message and assistant continuation, without accepting late-only progression.
+      return latest.lifecycle.state === "completed" && progressed
+        ? latest
+        : undefined;
     },
     timeoutMs,
-    "normal coordinator capability flow; inspect retained sessions and workstream state",
+    "notification-driven capability flow and actual assistant continuations; inspect retained coordinator session and workstream state",
   );
   await writeFile(
     join(f.parent, "state-observation.json"),
@@ -192,30 +207,6 @@ Complete with concrete evidence and honest limitations only after those conditio
   const coordinatorEntries = SessionManager.open(
     coordinator.sessionFile,
   ).getBranch();
-  for (const delivery of state.deliveries) {
-    const index = coordinatorEntries.findIndex(
-      (entry) =>
-        entry.type === "custom_message" &&
-        entry.customType === "pi-workgraph-workstream" &&
-        entry.details !== null &&
-        typeof entry.details === "object" &&
-        "resultId" in entry.details &&
-        entry.details.resultId === delivery.resultId,
-    );
-    assert.ok(
-      index >= 0,
-      "Missing automatic result notification in the actual Pi session",
-    );
-    assert.ok(
-      coordinatorEntries
-        .slice(index + 1)
-        .some(
-          (entry) =>
-            entry.type === "message" && entry.message.role === "assistant",
-        ),
-      "Notification did not cause coordinator continuation",
-    );
-  }
   assert.ok(
     !coordinatorEntries.some(
       (entry) =>
@@ -238,7 +229,7 @@ Complete with concrete evidence and honest limitations only after those conditio
         candidateRevision: f.revision,
         fixtureRevision: review.baseRevision,
         checks:
-          "normal package loading, fresh worker isolation, automatic result handling, experiment retention/non-composition, maintained bytes/scope, model messages and Prewalk transition, concurrent research, exact revision review, native settlement and exact cleanup",
+          "normal package loading, fresh worker isolation, actual notification-driven baseline-to-experiment progression and assistant continuations for every result, experiment retention/non-composition, maintained bytes/scope, model messages and Prewalk transition, concurrent research, exact revision review, native settlement and exact cleanup",
       },
       null,
       2,

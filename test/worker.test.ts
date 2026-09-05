@@ -3,9 +3,36 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { extensionFixture, git } from "./helpers.js";
+import type { SessionManager } from "@earendil-works/pi-coding-agent";
+import { extensionFixture, git, usage } from "./helpers.js";
 
-async function fixture(mode: "implementation" | "review") {
+function assistant(session: SessionManager, model = "gpt-4o") {
+  return session.appendMessage({
+    role: "assistant",
+    content: [
+      {
+        type: "toolCall",
+        id: "fixture",
+        name: "workgraph_report",
+        arguments: {
+          kind: "implementation",
+          status: "completed",
+          summary: "Changed fixture",
+          evidence: [],
+          findings: [],
+        },
+      },
+    ],
+    api: "openai-responses",
+    provider: "openai",
+    model,
+    usage,
+    stopReason: "toolUse",
+    timestamp: Date.now(),
+  });
+}
+
+async function fixture(mode: "implementation" | "review", continued = false) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
   const root = join(parent, "repo");
   await mkdir(root);
@@ -22,7 +49,8 @@ async function fixture(mode: "implementation" | "review") {
   process.env.PI_WORKGRAPH_BASE_COMMIT = await git(root, "rev-parse", "HEAD");
   process.env.PI_WORKGRAPH_EXECUTOR_MODEL = "openai/gpt-4o";
   process.env.PI_WORKGRAPH_EXECUTOR_THINKING = "high";
-  delete process.env.PI_WORKGRAPH_IMPLEMENTATION_START;
+  if (continued) process.env.PI_WORKGRAPH_IMPLEMENTATION_START = "executor";
+  else delete process.env.PI_WORKGRAPH_IMPLEMENTATION_START;
   delete process.env.PI_WORKGRAPH_EXPERIMENT;
   const pi = await extensionFixture("worker", root, parent);
   return {
@@ -49,6 +77,15 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
       evidence: [],
       findings: [],
     };
+    // A forked trajectory's earlier attempt must not restore this attempt's phase.
+    f.session.appendCustomEntry("pi-workgraph-worker-state", {
+      runId: "fixture",
+      nodeId: "prior-attempt",
+      phase: "executor",
+      switchedAt: new Date().toISOString(),
+    });
+    assistant(f.session);
+    await f.runner.emit({ type: "session_start", reason: "startup" });
     await assert.rejects(
       f.call("workgraph_report", report),
       /first-edit model transition/,
@@ -62,6 +99,8 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
       isError: false,
     });
     assert.deepEqual(f.selected, []);
+    // Even guide == executor must produce a later generation, not merely select itself.
+    assistant(f.session);
     await writeFile(join(f.root, "value.txt"), "after\n");
     await f.runner.emit({
       type: "tool_execution_end",
@@ -71,9 +110,20 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
       isError: false,
     });
     assert.deepEqual(f.selected, ["openai/gpt-4o"]);
-    await assert.rejects(f.call("workgraph_report", report), /clean worktree/);
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Changed value");
+    // A clean direct commit and selection metadata cannot validate a batched guide report.
+    await assert.rejects(
+      f.call("workgraph_report", report),
+      /actual executor assistant message/,
+    );
+    assistant(f.session, "wrong-model");
+    await assert.rejects(
+      f.call("workgraph_report", report),
+      /actual executor assistant message/,
+    );
+    assistant(f.session);
+    await f.runner.emit({ type: "session_start", reason: "reload" });
     const result = await f.call("workgraph_report", report);
     assert.equal(result.terminate, true);
     const details = result.details;
@@ -110,6 +160,48 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
       f.call("workgraph_report", report),
       /exactly one direct commit/,
     );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("continued implementation requires this attempt's native start and later executor message, not inherited evidence", async () => {
+  const f = await fixture("implementation", true);
+  const report = {
+    kind: "implementation",
+    status: "completed",
+    summary: "Continued work",
+    evidence: [],
+    findings: [],
+  };
+  try {
+    f.session.appendCustomEntry("pi-workgraph-worker-state", {
+      runId: "fixture",
+      nodeId: "prior-attempt",
+      phase: "executor",
+      switchedAt: new Date().toISOString(),
+    });
+    f.session.appendCustomEntry("pi-workgraph-agent-running", {
+      runId: "fixture",
+      nodeId: "prior-attempt",
+    });
+    assistant(f.session);
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    await writeFile(join(f.root, "value.txt"), "after\n");
+    await git(f.root, "commit", "-am", "Continued change");
+    await assert.rejects(
+      f.call("workgraph_report", report),
+      /actual executor assistant message/,
+    );
+    await f.runner.emit({ type: "agent_start" });
+    await assert.rejects(
+      f.call("workgraph_report", report),
+      /actual executor assistant message/,
+    );
+    assistant(f.session);
+    assert.equal((await f.call("workgraph_report", report)).terminate, true);
+    await writeFile(join(f.root, "value.txt"), "dirty\n");
+    await assert.rejects(f.call("workgraph_report", report), /clean worktree/);
   } finally {
     await f.dispose();
   }

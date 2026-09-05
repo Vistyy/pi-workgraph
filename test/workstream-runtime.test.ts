@@ -327,6 +327,98 @@ test("new runtime drives fresh research through native evidence, durable retryab
   }
 });
 
+test("cleaned history has constant reconciliation reads while error clearing and pending delivery remain independent", async (t) => {
+  const f = await fixture();
+  try {
+    const active = f.runtime(async () => {
+      throw new Error("interrupted notification");
+    });
+    await active.perform(async () => undefined);
+    const reads = t.mock.method(f.store, "load");
+    await active.reconcile();
+    const emptyReads = reads.mock.callCount();
+    for (let index = 0; index < 4; index++)
+      await active.queue(research(`read-${index}`));
+    await active.reconcile();
+    let state = await active.reconcile();
+    assert.ok(
+      state.attempts.every((attempt) => attempt.cleanup?.state === "completed"),
+    );
+    assert.ok(
+      state.deliveries.every((delivery) => delivery.state === "pending"),
+    );
+    let before = reads.mock.callCount();
+    await active.reconcile();
+    assert.equal(
+      reads.mock.callCount() - before,
+      emptyReads,
+      "Cleaned attempts must not add per-attempt durable loads",
+    );
+    const id = state.attempts[0]!.id;
+    await active.perform(() =>
+      f.store.updateAttempt({ id, error: "retained stale attention" }),
+    );
+    const updates = t.mock.method(f.store, "updateAttempt");
+    state = await active.reconcile();
+    assert.equal(updates.mock.callCount(), 1);
+    assert.equal(state.attempts[0]?.error, undefined);
+    assert.equal(
+      state.attempts[0]?.attentionHistory?.[0]?.detail,
+      "retained stale attention",
+    );
+    before = reads.mock.callCount();
+    await active.reconcile();
+    assert.equal(reads.mock.callCount() - before, emptyReads);
+    assert.equal(
+      updates.mock.callCount(),
+      1,
+      "Resolved attention must only be cleared once",
+    );
+    await active.stop();
+    const recovered = f.runtime();
+    state = await recovered.reconcile();
+    assert.equal(
+      f.delivered.length,
+      4,
+      "Terminal skipping must not skip pending delivery on reattachment",
+    );
+    assert.ok(
+      state.deliveries.every((delivery) => delivery.state === "delivered"),
+    );
+    assert.equal(f.workers.cleanupCount, 4);
+
+    // A blocked (not completed) cleanup must still be inspected and recoverable.
+    await recovered.queue(research("blocked-cleanup"));
+    await recovered.reconcile();
+    const request = f.workers.requests.at(-1)!;
+    const obstruction = join(request.cwd, "unattributed.txt");
+    await writeFile(
+      obstruction,
+      "Created by this fixture after worker settlement\n",
+    );
+    state = await recovered.reconcile();
+    const blocked = state.attempts.at(-1)!;
+    assert.equal(blocked.cleanup?.state, "blocked");
+    before = reads.mock.callCount();
+    await recovered.reconcile();
+    assert.ok(reads.mock.callCount() - before > emptyReads);
+    await rm(obstruction);
+    // Rearm only after inspecting/removing the exact fixture-owned obstruction.
+    assert.ok(blocked.cleanup);
+    await recovered.perform(() =>
+      f.store.updateAttempt({
+        id: blocked.id,
+        cleanup: { ...blocked.cleanup!, state: "pending" },
+      }),
+    );
+    state = await recovered.reconcile();
+    assert.equal(state.attempts.at(-1)?.cleanup?.state, "completed");
+    assert.equal(state.attempts.at(-1)?.error, undefined);
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("maintained changes use guide/executor policy and review checks the requested earlier revision", async () => {
   const f = await fixture();
   try {

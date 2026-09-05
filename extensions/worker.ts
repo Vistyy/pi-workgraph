@@ -1,4 +1,7 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { ThinkingSchema } from "../src/model-policy.js";
@@ -26,6 +29,47 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   let todos: string[] = [];
   let switchError: string | undefined;
   let switchedAt: string | undefined;
+
+  function belongsToAttempt(data: unknown): data is typeof generation {
+    return (
+      !!data &&
+      typeof data === "object" &&
+      "runId" in data &&
+      "nodeId" in data &&
+      data.runId === runId &&
+      data.nodeId === nodeId
+    );
+  }
+
+  // Session order, not model selection or wall-clock time, proves a later generation.
+  // Pi drains the current assistant message before tool preflight/execution.
+  function hasExecutorMessage(entries: SessionEntry[]): boolean {
+    const boundary = entries.findIndex((entry) => {
+      if (entry.type !== "custom" || !belongsToAttempt(entry.data))
+        return false;
+      const data = entry.data;
+      return continued
+        ? entry.customType === "pi-workgraph-agent-running"
+        : entry.customType === "pi-workgraph-worker-state" &&
+            "phase" in data &&
+            data.phase === "executor" &&
+            "switchedAt" in data &&
+            typeof data.switchedAt === "string";
+    });
+    return (
+      boundary >= 0 &&
+      entries
+        .slice(boundary + 1)
+        .some(
+          (entry) =>
+            entry.type === "message" &&
+            entry.message.role === "assistant" &&
+            `${entry.message.provider}/${entry.message.model}` ===
+              executorModel &&
+            !["error", "aborted", "pending"].includes(entry.message.stopReason),
+        )
+    );
+  }
 
   pi.registerTool({
     name: "workgraph_todo",
@@ -79,6 +123,10 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
           );
         if (switchError)
           throw new Error(`Executor model transition failed: ${switchError}`);
+        if (!hasExecutorMessage(ctx.sessionManager.getBranch()))
+          throw new Error(
+            "Completed implementation requires an actual executor assistant message after this attempt's transition/start. Continue with the executor before reporting.",
+          );
         if (!baseCommit)
           throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
         const status = await git(
@@ -218,15 +266,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       )
         continue;
       const data: unknown = entry.data;
-      if (
-        !data ||
-        typeof data !== "object" ||
-        !("runId" in data) ||
-        !("nodeId" in data) ||
-        data.runId !== runId ||
-        data.nodeId !== nodeId
-      )
-        continue;
+      if (!belongsToAttempt(data)) continue;
       if ("todos" in data && Array.isArray(data.todos))
         todos = data.todos.filter(
           (item): item is string => typeof item === "string",
