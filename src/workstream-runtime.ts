@@ -5,6 +5,7 @@ import type { GitRepository, WorktreePlacement } from "./git.js";
 import {
   herdrWorkerName,
   legacyHerdrAgentName,
+  legacyObjectiveHerdrWorkerName,
   type VisibleWorkerRuntime,
 } from "./herdr.js";
 import {
@@ -373,6 +374,14 @@ export class WorkstreamRuntime {
             role: assignment.capability,
           }),
           compatibleAgentNames: [
+            legacyObjectiveHerdrWorkerName({
+              runId: state.id,
+              nodeId: attempt.id,
+              attemptId: attempt.id,
+              assignmentId: assignment.id,
+              objective: assignment.objective,
+              role: assignment.capability,
+            }),
             legacyHerdrAgentName(state.id, attempt.id, attempt.id),
           ],
           cwd: placementPath(state, attempt),

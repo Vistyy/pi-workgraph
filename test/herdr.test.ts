@@ -11,6 +11,7 @@ import {
   herdrWorkerName,
   herdrWorkerTabLabel,
   legacyHerdrAgentName,
+  legacyObjectiveHerdrWorkerName,
 } from "../src/herdr.js";
 import type { WorkerIdentity, WorkerResourceIdentity } from "../src/types.js";
 
@@ -19,7 +20,7 @@ test("task-first Herdr names are bounded, readable, role-specific, and distingui
     runId: "RUN/with spaces and symbols",
     nodeId: "attempt-one",
     attemptId: "attempt-one",
-    assignmentId: "assignment-implement-parser",
+    assignmentId: "meaningful-agent-names",
     objective:
       "Implement parser support for accented input and a very long trailing explanation",
     role: "implement" as const,
@@ -27,14 +28,27 @@ test("task-first Herdr names are bounded, readable, role-specific, and distingui
   const first = herdrWorkerName(request);
   const second = herdrWorkerName({ ...request, attemptId: "attempt-two" });
   const label = herdrWorkerTabLabel(request);
-  assert.match(first, /^implement-pars[a-z]*-implement-[a-f0-9]{6}$/);
+  assert.match(first, /^meaningful-agen[a-z]*-implement-[a-f0-9]{6}$/);
   assert.match(first, /^[a-z][a-z0-9_-]{0,31}$/);
-  assert.match(label, /^Workgraph Implement parser support for accented input/);
-  assert.ok(label.length <= 80);
+  assert.match(label, /^Meaningful agent names - implement - [a-f0-9]{6}$/);
+  assert.ok(label.length <= 48);
   assert.notEqual(first, second);
+  const fallback = herdrWorkerTabLabel({
+    ...request,
+    assignmentId: "assignment-123456789abcdef0",
+    objective: "Implement parser support",
+  });
+  assert.match(
+    fallback,
+    /^Implement parser support - implement - [a-f0-9]{6}$/,
+  );
   assert.equal(
     herdrAgentName("run", "node", "attempt"),
     legacyHerdrAgentName("run", "node", "attempt"),
+  );
+  assert.notEqual(
+    legacyObjectiveHerdrWorkerName(request),
+    herdrWorkerName(request),
   );
 });
 
@@ -43,9 +57,9 @@ test("coordinator fork names use repository context without exposing paths", () 
     cwd: "/private/Customer Work/repo-name",
     sessionFile: "/private/session.jsonl",
   });
-  assert.match(names.agentName, /^repo-name-coord-fork-[a-f0-9]{6}$/);
+  assert.match(names.agentName, /^repo-name-coordinator-[a-f0-9]{6}$/);
   assert.match(names.agentName, /^[a-z][a-z0-9_-]{0,31}$/);
-  assert.match(names.label, /^Workgraph fork - repo name - [a-f0-9]{8}$/);
+  assert.match(names.label, /^repo name - coordinator - [a-f0-9]{6}$/);
   assert.equal(names.label.includes("Customer"), false);
   assert.equal(names.label.includes("/"), false);
 });
@@ -450,7 +464,7 @@ test("the Herdr adapter launches without waiting and validates exact identity be
   }
 });
 
-test("the Herdr launch waits for native session identity before submitting work", async () => {
+test("the Herdr launch can wait for native session identity without submitting a prompt", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-readiness-"));
   const log = join(parent, "commands.jsonl");
   const command = join(parent, "fake-herdr-readiness.mjs");
@@ -494,7 +508,6 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       attemptId: "attempt",
       cwd,
       sessionFile,
-      prompt: "Submit only after readiness.",
       env: {},
       onResource(resourceValue) {
         retainedResource = resourceValue;
@@ -522,7 +535,8 @@ else console.log(JSON.stringify({result:{accepted:true}}));
     const getIndex = calls.findIndex(
       (args) => args[0] === "agent" && args[1] === "get",
     );
-    assert.ok(getIndex >= 0 && getIndex < promptIndex);
+    assert.equal(promptIndex, -1);
+    assert.ok(getIndex >= 0);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

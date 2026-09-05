@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { GitRepository } from "../src/git.js";
-import { CoordinatorLaunchError, HerdrCliRuntime } from "../src/herdr.js";
+import {
+  CoordinatorLaunchError,
+  HerdrCliRuntime,
+  herdrCoordinatorNames,
+  herdrWorkerTabLabel,
+} from "../src/herdr.js";
 import {
   createWorkerSession,
   forkConversationSession,
@@ -56,12 +61,17 @@ try {
     JSON.stringify(childCoordinator, null, 2),
   );
   assert.notEqual(childCoordinator.workspaceId, f.workspaceId);
+  const childWorkspace = object(
+    (await herdr(f.root, "workspace", "get", childCoordinator.workspaceId))
+      .workspace,
+  );
+  assert.equal(childWorkspace.focused, false);
   assert.equal(
-    object(
-      (await herdr(f.root, "workspace", "get", childCoordinator.workspaceId))
-        .workspace,
-    ).focused,
-    false,
+    text(childWorkspace.label),
+    herdrCoordinatorNames({
+      cwd: f.root,
+      sessionFile: childSessionFile,
+    }).label,
   );
   const childObserved = await runtime.observeCurrentCoordinator({
     paneId: childCoordinator.paneId,
@@ -98,75 +108,60 @@ try {
     objective:
       "This boundary fixture remains idle. No model prompt will be submitted.",
   });
-  const created = await herdr(
-    f.root,
-    "tab",
-    "create",
-    "--workspace",
-    childCoordinator.workspaceId,
-    "--cwd",
-    placement.path,
-    "--no-focus",
-    "--env",
-    `PI_CODING_AGENT_DIR=${f.agentDir}`,
-    "--env",
-    "PI_WORKGRAPH_MODE=research",
-    "--env",
-    "PI_WORKGRAPH_RUN_ID=herdr-smoke",
-    "--env",
-    "PI_WORKGRAPH_NODE_ID=worker",
-  );
-  const paneId = text(object(created.root_pane).pane_id);
-  const agentName = `wg-boundary-${Date.now().toString(36)}`;
-  const started = object(
-    (
-      await herdr(
-        f.root,
-        "agent",
-        "start",
-        agentName,
-        "--kind",
-        "pi",
-        "--pane",
-        paneId,
-        "--",
-        "--session",
-        sessionFile,
-      )
-    ).agent,
-  );
-  const worker = {
-    workspaceId: childCoordinator.workspaceId,
-    tabId: text(started.tab_id),
-    paneId,
-    terminalId: text(started.terminal_id),
-    agentName,
-    sessionFile,
-    cwd: placement.path,
+  const workerNaming = {
+    runId: "herdr-smoke",
+    nodeId: "worker",
+    attemptId: "worker",
+    assignmentId: "meaningful-agent-names",
+    objective:
+      "This boundary fixture remains idle. No model prompt will be submitted",
+    role: "research" as const,
   };
-  await writeFile(
-    join(f.parent, "worker-identity.json"),
-    JSON.stringify(worker, null, 2),
-  );
-  await waitFor(
+  const workerObservation = await runtime.launch({
+    workspaceId: childCoordinator.workspaceId,
+    ...workerNaming,
+    cwd: placement.path,
+    sessionFile,
+    env: {
+      PI_CODING_AGENT_DIR: f.agentDir,
+      PI_WORKGRAPH_MODE: "research",
+      PI_WORKGRAPH_RUN_ID: workerNaming.runId,
+      PI_WORKGRAPH_NODE_ID: workerNaming.nodeId,
+    },
+  });
+  const worker = await waitFor(
     async () => {
-      const agent = object((await herdr(f.root, "agent", "get", paneId)).agent);
-      if (agent.agent_status === "blocked")
+      const current = await runtime.observe(workerObservation.identity);
+      if (current.status === "blocked")
         throw new Error(
           "Worker requires operator action; no prompt submitted.",
         );
-      if (!agent.agent_session) return undefined;
-      return runtime.observe(worker);
+      return ["idle", "done"].includes(current.status)
+        ? current.identity
+        : undefined;
     },
     30_000,
     "native idle worker identity",
   );
+  const workerTab = items(
+    (await herdr(f.root, "tab", "list", "--workspace", worker.workspaceId))
+      .tabs,
+  ).find((tab) => text(tab.tab_id) === worker.tabId);
+  assert.ok(workerTab, "Production launch tab is present in native list");
+  assert.equal(text(workerTab.label), herdrWorkerTabLabel(workerNaming));
+  await writeFile(
+    join(f.parent, "worker-identity.json"),
+    JSON.stringify(worker, null, 2),
+  );
+  assert.equal(workerObservation.identity.sessionFile, sessionFile);
+  assert.notEqual(workerObservation.status, "blocked");
   await assert.rejects(
     runtime.cleanup({ ...worker, cwd: join(f.parent, "different-worktree") }),
     /cwd/,
   );
   const workerCleanup = await runtime.cleanup(worker);
   assert.equal(workerCleanup.state, "completed");
+  assert.equal(workerCleanup.identity.tabId, worker.tabId);
   const gitCleanup = await repository.cleanupWorktree(placement, f.base);
   assert.equal(gitCleanup.state, "completed");
   const childFixture = {
@@ -186,10 +181,13 @@ try {
         observed,
         childObserved,
         childCoordinator,
+        childWorkspaceLabel: text(childWorkspace.label),
+        worker,
+        workerTabLabel: text(workerTab.label),
         workerCleanup,
         gitCleanup,
         checks:
-          "native parent and fork identity, distinct unfocused workspace, parent preservation, child tab-scoped worker, identity-mismatch refusal, exact Herdr closure before Git removal and verified workspace absence",
+          "native parent and fork identity, meaningful native fork and worker labels, production runtime.launch without a model prompt, child tab-scoped worker, identity-mismatch refusal, exact Herdr closure before Git removal and verified workspace absence",
       },
       null,
       2,

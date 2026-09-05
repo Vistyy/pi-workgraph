@@ -48,7 +48,7 @@ export interface WorkerLaunchRequest {
   role?: WorkerRole;
   cwd: string;
   sessionFile: string;
-  prompt: string;
+  prompt?: string;
   model?: string;
   thinking?: ThinkingLevel;
   env: Record<string, string>;
@@ -326,13 +326,16 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       request.sessionFile,
     );
     await request.onIdentity?.(identity);
-    await this.call(["agent", "prompt", workerName, request.prompt], 15_000);
-    await request.onSubmitted?.();
-    return {
-      identity,
-      status: "working",
-      observedAt: new Date().toISOString(),
-    };
+    if (request.prompt !== undefined) {
+      await this.call(["agent", "prompt", workerName, request.prompt], 15_000);
+      await request.onSubmitted?.();
+      return {
+        identity,
+        status: "working",
+        observedAt: new Date().toISOString(),
+      };
+    }
+    return this.observe(identity);
   }
 
   async recover(
@@ -694,6 +697,21 @@ function errorMessage(error: unknown): string {
 
 const HERDR_AGENT_NAME_LIMIT = 32;
 const IDENTITY_SUFFIX_LENGTH = 6;
+const TAB_SUBJECT_LIMIT = 24;
+const GENERIC_ASSIGNMENT_IDS = new Set([
+  "assignment",
+  "change",
+  "implement",
+  "implementation",
+  "job",
+  "node",
+  "request",
+  "research",
+  "review",
+  "task",
+  "work",
+  "worker",
+]);
 
 export function herdrWorkerName(request: WorkerNamingContext): string {
   if (!request.assignmentId && !request.objective && !request.role)
@@ -702,27 +720,34 @@ export function herdrWorkerName(request: WorkerNamingContext): string {
       request.nodeId ?? "worker",
       request.attemptId,
     );
-  const assignmentId = request.assignmentId ?? request.nodeId ?? "assignment";
-  const objective = request.objective ?? request.nodeId ?? assignmentId;
   const role = request.role ?? "research";
   return readableIdentityName(
-    readableSlug(objective) || readableSlug(assignmentId) || "task",
+    readableSlug(workerSubject(request)) || "task",
     role,
-    `${request.runId}\0${assignmentId}\0${request.attemptId}`,
+    workerIdentity(request),
+  );
+}
+
+/** Compatibility identity for workers launched by the first task-first release. */
+export function legacyObjectiveHerdrWorkerName(
+  request: WorkerNamingContext,
+): string {
+  const assignmentId = request.assignmentId ?? request.nodeId ?? "assignment";
+  const objective = request.objective ?? request.nodeId ?? assignmentId;
+  return readableIdentityName(
+    readableSlug(objective) || readableSlug(assignmentId) || "task",
+    request.role ?? "research",
+    workerIdentity(request),
   );
 }
 
 export function herdrWorkerTabLabel(request: WorkerNamingContext): string {
-  const assignmentId = request.assignmentId ?? request.nodeId ?? "assignment";
-  const objective = request.objective ?? request.nodeId ?? assignmentId;
   const role = request.role ?? "research";
-  const subject =
-    readableLabel(objective) || readableLabel(assignmentId) || "Task";
   const suffix = identitySuffix(
-    `${request.runId}\0${assignmentId}\0${request.attemptId}`,
+    workerIdentity(request),
     IDENTITY_SUFFIX_LENGTH,
   );
-  return `Workgraph ${bound(subject, 48)} - ${role} - ${suffix}`;
+  return `${bound(workerSubject(request), TAB_SUBJECT_LIMIT)} - ${role} - ${suffix}`;
 }
 
 export function herdrCoordinatorNames(request: CoordinatorLaunchRequest): {
@@ -731,16 +756,45 @@ export function herdrCoordinatorNames(request: CoordinatorLaunchRequest): {
 } {
   const repository = readableSlug(basename(request.cwd)) || "repository";
   const repositoryLabel = readableLabel(basename(request.cwd)) || "Repository";
-  const suffix = identitySuffix(`${request.sessionFile}\0${request.cwd}`, 8);
-  const agentName = readableIdentityName(
-    repository,
-    "coord-fork",
-    `${request.sessionFile}\0${request.cwd}`,
-  );
+  const identity = `${request.sessionFile}\0${request.cwd}`;
+  const suffix = identitySuffix(identity, IDENTITY_SUFFIX_LENGTH);
+  const agentName = readableIdentityName(repository, "coordinator", identity);
   return {
     agentName,
-    label: `Workgraph fork - ${bound(repositoryLabel, 48)} - ${suffix}`,
+    label: `${bound(repositoryLabel, TAB_SUBJECT_LIMIT)} - coordinator - ${suffix}`,
   };
+}
+
+function workerIdentity(request: WorkerNamingContext): string {
+  const assignmentId = request.assignmentId ?? request.nodeId ?? "assignment";
+  return `${request.runId}\0${assignmentId}\0${request.attemptId}`;
+}
+
+function workerSubject(request: WorkerNamingContext): string {
+  const assignmentId = request.assignmentId ?? request.nodeId ?? "";
+  const assignmentLabel = readableLabel(assignmentId);
+  if (isDescriptiveAssignmentId(assignmentId, assignmentLabel))
+    return sentenceCase(assignmentLabel);
+  const objectiveLabel = readableLabel(request.objective ?? "");
+  return objectiveLabel || assignmentLabel || "Task";
+}
+
+function isDescriptiveAssignmentId(id: string, label: string): boolean {
+  if (!label || label.length > 48) return false;
+  const normalized = id.trim().toLowerCase();
+  if (GENERIC_ASSIGNMENT_IDS.has(normalized)) return false;
+  if (/^[0-9a-f]{8,}$/i.test(normalized)) return false;
+  if (
+    /^(?:assignment|attempt|job|node|request|task|work|worker)[-_](?:\d+|[0-9a-f]{8,}|[0-9a-f]{8}-[0-9a-f-]{19,})$/i.test(
+      normalized,
+    )
+  )
+    return false;
+  return true;
+}
+
+function sentenceCase(value: string): string {
+  return value ? `${value[0]!.toUpperCase()}${value.slice(1)}` : value;
 }
 
 /** Compatibility identity for resources launched before task-first names. */
@@ -764,7 +818,7 @@ export function herdrAgentName(
 
 function readableIdentityName(
   subject: string,
-  role: WorkerRole | "coord-fork",
+  role: WorkerRole | "coordinator",
   identity: string,
 ): string {
   const suffix = identitySuffix(identity, IDENTITY_SUFFIX_LENGTH);
