@@ -1,0 +1,272 @@
+import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { discoveryReport } from "./helpers.js";
+import {
+  InvalidWorkstreamStateError,
+  UnsupportedWorkstreamStateError,
+  WorkstreamStore,
+  type AuthorityReference,
+  type HumanInputReceipt,
+  type SessionIdentity,
+} from "../src/workstream.js";
+
+const coordinator: SessionIdentity = {
+  sessionId: "coordinator-session",
+  sessionFile: "/sessions/coordinator.jsonl",
+};
+
+async function fixture(): Promise<{ parent: string; store: WorkstreamStore }> {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-workstream-"));
+  const { store } = await WorkstreamStore.create({
+    id: "workstream",
+    purpose: "Determine the safe fixture change.",
+    projectRoot: join(parent, "project"),
+    gitCommonDir: join(parent, "project", ".git"),
+    coordinator,
+    now: new Date(0),
+  });
+  return { parent, store };
+}
+
+async function recordedAuthority(store: WorkstreamStore): Promise<{ receipt: HumanInputReceipt; authority: AuthorityReference }> {
+  const { receipt } = await store.recordInputEvent({
+    ...coordinator,
+    source: "interactive",
+    text: "I approve the bounded fixture experiment and maintained correction.",
+    now: new Date(1_000),
+  });
+  const revised = await store.reviseIntent({
+    authorityReceiptId: receipt.id,
+    statement: "Establish and correct the fixture behavior.",
+    constraints: ["Keep the fixture local."],
+    now: new Date(2_000),
+  });
+  const authority = { receiptId: receipt.id, intentVersion: revised.intents.at(-1)!.version };
+  return { receipt, authority };
+}
+
+test("workstream persists human-backed intent, local readiness, and retained experiment evidence", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const { authority } = await recordedAuthority(store);
+    let state = await store.assign({
+      id: "research",
+      capability: "research",
+      artifactIntent: "evidence_only",
+      objective: "Inspect the fixture behavior.",
+      intentVersion: authority.intentVersion,
+      expectedEvidence: ["A direct fixture observation."],
+      now: new Date(3_000),
+    });
+    assert.equal(state.assignments[0]?.capability, "research");
+
+    state = await store.assign({
+      id: "experiment",
+      capability: "research",
+      artifactIntent: "disposable_experiment",
+      objective: "Probe whether the fixture accepts the candidate input.",
+      intentVersion: authority.intentVersion,
+      authority,
+      permittedEffects: ["Write only under the disposable experiment directory."],
+      stopCondition: "The fixture either accepts or rejects the candidate input.",
+      expectedEvidence: ["The observed fixture output."],
+      artifactPolicy: { retain: ["experiment-log"], discardOthers: true },
+      now: new Date(4_000),
+    });
+    assert.equal(state.assignments[1]?.artifactIntent, "disposable_experiment");
+
+    await assert.rejects(
+      store.retainResult({
+        id: "unplanned-experiment-result",
+        assignmentId: "experiment",
+        assignmentIntentVersion: authority.intentVersion,
+        validity: "typed",
+        report: discoveryReport("The probe produced an unplanned artifact."),
+        artifacts: [{ id: "unplanned", kind: "path", reference: "artifacts/unplanned.log", retention: "retained", summary: "Not approved for retention." }],
+      }),
+      /exactly the artifacts named by its policy/,
+    );
+
+    state = await store.retainResult({
+      id: "experiment-result",
+      assignmentId: "experiment",
+      assignmentIntentVersion: authority.intentVersion,
+      validity: "typed",
+      report: discoveryReport("The disposable probe rejected the candidate."),
+      artifacts: [{
+        id: "experiment-log",
+        kind: "path",
+        reference: "artifacts/experiment.log",
+        retention: "retained",
+        summary: "The bounded experiment output.",
+      }],
+      now: new Date(5_000),
+    });
+    assert.equal(state.results[0]?.artifacts[0]?.retention, "retained");
+
+    state = await store.assign({
+      id: "review",
+      capability: "review",
+      artifactIntent: "evidence_only",
+      objective: "Review the experiment result.",
+      intentVersion: authority.intentVersion,
+      subject: { kind: "artifact", resultId: "experiment-result", artifactId: "experiment-log" },
+      concern: "Does the retained output support the proposed conclusion?",
+      now: new Date(6_000),
+    });
+    assert.equal(state.assignments[2]?.capability, "review");
+
+    const persisted = await WorkstreamStore.inspect(state.statePath);
+    assert.deepEqual(persisted.assignments.map((assignment) => assignment.id), ["research", "experiment", "review"]);
+    const experimentResult = persisted.results[0];
+    assert.ok(experimentResult && experimentResult.validity === "typed");
+    assert.equal(experimentResult.report.summary, "The disposable probe rejected the candidate.");
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("workstream rejects extension or arbitrary authority and stale intent", async () => {
+  const { parent, store } = await fixture();
+  try {
+    await assert.rejects(
+      store.recordInputEvent({ ...coordinator, source: "extension", text: "approved" }),
+      /Extension-generated input/,
+    );
+    await assert.rejects(
+      store.reviseIntent({ authorityReceiptId: "invented", statement: "Mutate the fixture.", constraints: [] }),
+      /Unknown human input receipt/,
+    );
+
+    const { receipt, authority } = await recordedAuthority(store);
+    await assert.rejects(
+      store.assign({
+        id: "invalid-experiment",
+        capability: "research",
+        artifactIntent: "disposable_experiment",
+        objective: "Run an unauthorized probe.",
+        intentVersion: authority.intentVersion,
+        authority: { receiptId: "invented", intentVersion: authority.intentVersion },
+        permittedEffects: ["Write an experiment file."],
+        stopCondition: "The probe finishes.",
+        expectedEvidence: ["Probe output."],
+        artifactPolicy: { retain: [], discardOthers: true },
+      }),
+      /retained human-backed intent/,
+    );
+
+    const changed = await store.reviseIntent({
+      authorityReceiptId: receipt.id,
+      statement: "Correct the fixture with the newly added constraint.",
+      constraints: ["Do not alter the fixture API."],
+    });
+    assert.equal(changed.intents.at(-1)?.version, authority.intentVersion + 1);
+    await assert.rejects(
+      store.assign({
+        id: "stale-implementation",
+        capability: "implement",
+        artifactIntent: "maintained_change",
+        objective: "Apply the old correction.",
+        intentVersion: authority.intentVersion,
+        authority,
+        acceptance: ["The fixture passes."],
+      }),
+      /stale/,
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("workstream keeps worker validity, disposition, limitations, and stale results distinct", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const { receipt, authority } = await recordedAuthority(store);
+    await store.assign({
+      id: "research",
+      capability: "research",
+      artifactIntent: "evidence_only",
+      objective: "Determine the fixture behavior.",
+      intentVersion: authority.intentVersion,
+      expectedEvidence: ["Direct fixture evidence."],
+    });
+    let state = await store.retainResult({
+      id: "research-result",
+      assignmentId: "research",
+      assignmentIntentVersion: authority.intentVersion,
+      validity: "typed",
+      report: discoveryReport("The fixture currently accepts the input."),
+    });
+    assert.equal(store.isResultCurrent(state, "research-result"), true);
+    state = await store.disposition({ resultId: "research-result", status: "accepted", reason: "The evidence answers the bounded question." });
+    assert.equal(state.dispositions[0]?.status, "accepted");
+
+    state = await store.reviseIntent({
+      authorityReceiptId: receipt.id,
+      statement: "Determine behavior under the new fixture constraint.",
+      constraints: ["Exercise a second fixture input."],
+    });
+    assert.equal(store.isResultCurrent(state, "research-result"), false);
+    state = await store.retainResult({
+      id: "stale-result",
+      assignmentId: "research",
+      assignmentIntentVersion: authority.intentVersion,
+      validity: "untyped",
+      text: "Old worker prose.",
+    });
+    assert.equal(store.isResultCurrent(state, "stale-result"), false);
+
+    state = await store.complete({
+      conclusion: "The earlier fixture answer is retained but does not answer the revised question.",
+      evidence: [{ label: "retained result", observation: "The first result was produced under intent version 1.", class: "unknown" }],
+      limitations: ["The revised constraint has no accepted result yet."],
+    });
+    assert.equal(state.lifecycle.state, "completed");
+    assert.deepEqual(state.completion?.unresolvedAssignmentIds, ["research"]);
+    assert.equal(state.completion?.evidence[0]?.class, "unknown");
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("workstream serializes receipt writes and rejects corrupt or foreign history without rewriting it", async () => {
+  const { parent, store } = await fixture();
+  try {
+    await Promise.all([
+      store.recordInputEvent({ ...coordinator, source: "interactive", text: "First human constraint." }),
+      store.recordInputEvent({ ...coordinator, source: "rpc", text: "Second human constraint." }),
+      store.recordInputEvent({ ...coordinator, source: "interactive", text: "Third human constraint." }),
+    ]);
+    let state = await store.load();
+    assert.equal(state.revision, 3);
+    assert.equal(new Set(state.inputs.map((input) => input.id)).size, 3);
+    state = await store.setLifecycle({ state: "suspended", reason: "Coordinator is offline." });
+    assert.equal(state.lifecycle.state, "suspended");
+    await assert.rejects(
+      store.assign({ id: "blocked", capability: "research", artifactIntent: "evidence_only", objective: "Do not queue while suspended.", intentVersion: 0, expectedEvidence: ["No worker."] }),
+      /suspended/,
+    );
+    state = await store.setLifecycle({ state: "active", reason: "Coordinator resumed." });
+    assert.equal(state.lifecycle.state, "active");
+
+    const foreignPath = join(parent, "foreign.json");
+    await writeFile(foreignPath, JSON.stringify({ version: 7, runId: "old-run", phase: "discovery" }));
+    await assert.rejects(WorkstreamStore.inspect(foreignPath), UnsupportedWorkstreamStateError);
+    assert.equal(JSON.parse(await readFile(foreignPath, "utf8")).runId, "old-run");
+
+    const copiedPath = join(parent, "copied.json");
+    await writeFile(copiedPath, await readFile(state.statePath, "utf8"));
+    await assert.rejects(WorkstreamStore.inspect(copiedPath), InvalidWorkstreamStateError);
+    assert.equal(JSON.parse(await readFile(copiedPath, "utf8")).statePath, state.statePath);
+
+    const corruptPath = join(parent, "corrupt.json");
+    await writeFile(corruptPath, "not JSON");
+    await assert.rejects(WorkstreamStore.inspect(corruptPath), InvalidWorkstreamStateError);
+    assert.equal(await readFile(corruptPath, "utf8"), "not JSON");
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
