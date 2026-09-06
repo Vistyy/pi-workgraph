@@ -1,73 +1,76 @@
 import assert from "node:assert/strict";
-import {
-  access,
-  copyFile,
-  mkdir,
-  mkdtemp,
-  readdir,
-  symlink,
-  writeFile,
-} from "node:fs/promises";
+import { access, copyFile, mkdir, mkdtemp, readdir, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { DateTime, Effect } from "effect";
 import { runProcess } from "../src/git.js";
 import { loadModelPolicy } from "../src/model-policy.js";
 import type { WorkerIdentity } from "../src/types.js";
 import { WorkstreamStore } from "../src/workstream.js";
 
+// SAFETY: Herdr responses are checked before callers inspect their fields.
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Native JSON has no TypeScript contract at this boundary.
 export function object(value: unknown): Record<string, unknown> {
-  assert.ok(
-    value && typeof value === "object" && !Array.isArray(value),
-    "Expected a Herdr object",
-  );
+  assert.ok(value && typeof value === "object" && !Array.isArray(value), "Expected a Herdr object");
+  // SAFETY: The assertion above establishes the object contract for this external response.
   return value as Record<string, unknown>;
 }
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Native JSON value is checked at this boundary.
 export function text(value: unknown): string {
   assert.ok(typeof value === "string");
   return value;
 }
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Native JSON array value is checked at this boundary.
 export function items(value: unknown): Record<string, unknown>[] {
   assert.ok(Array.isArray(value));
   return value.map(object);
 }
-export async function command(
+export function command(
   cwd: string,
   executable: string,
   args: string[],
   timeoutMs = 30_000,
 ): Promise<string> {
-  const result = await runProcess(executable, args, { cwd, timeoutMs });
-  if (result.exitCode !== 0)
-    throw new Error(
-      `${executable} ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
-    );
-  return result.stdout.trim();
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const result = yield* Effect.promise(() => runProcess(executable, args, { cwd, timeoutMs }));
+      if (result.exitCode !== 0)
+        throw new Error(
+          `${executable} ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
+        );
+      return result.stdout.trim();
+    }),
+  );
 }
-export async function herdr(
-  cwd: string,
-  ...args: string[]
-): Promise<Record<string, unknown>> {
+// oxlint-disable-next-line effecttsgo/async-function -- JSON protocol decoding retains Promise interoperability with the native CLI.
+export async function herdr(cwd: string, ...args: string[]): Promise<Record<string, unknown>> {
   const parsed: unknown = JSON.parse(await command(cwd, "herdr", args, 60_000));
-  return object(object(parsed).result);
+  return object(object(parsed)["result"]);
 }
-export async function waitFor<T>(
+export function waitFor<T>(
   observe: () => Promise<T | undefined>,
   timeoutMs: number,
   description: string,
 ): Promise<T> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const result = await observe();
-    if (result !== undefined) return result;
-    await new Promise((done) => setTimeout(done, 500));
-  }
-  throw new Error(`Timed out after ${timeoutMs}ms: ${description}`);
+  return Effect.runPromise(
+    Effect.gen(function* () {
+      const deadline = DateTime.toEpochMillis(DateTime.nowUnsafe()) + timeoutMs;
+      while (DateTime.toEpochMillis(DateTime.nowUnsafe()) < deadline) {
+        const result = yield* Effect.promise(observe);
+        if (result !== undefined) return result;
+        yield* Effect.sleep("500 millis");
+      }
+      throw new Error(`Timed out after ${timeoutMs}ms: ${description}`);
+    }),
+  );
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- Fixture setup coordinates Node filesystem and native Herdr promises.
 export async function createLiveFixture(label: string) {
-  if (process.env.HERDR_ENV !== "1")
+  // oxlint-disable-next-line effecttsgo/process-env -- HERDR_ENV is the explicit native smoke-test gate.
+  if (process.env["HERDR_ENV"] !== "1")
     throw new Error("This live scenario requires a Herdr-managed pane.");
   const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   assert.equal(
@@ -76,10 +79,10 @@ export async function createLiveFixture(label: string) {
     "Use a clean committed candidate",
   );
   const revision = await command(packageRoot, "git", ["rev-parse", "HEAD"]);
-  const sourceAgent =
-    process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
+  // oxlint-disable-next-line effecttsgo/process-env -- This host boundary selects the isolated credential source.
+  const sourceAgent = process.env["PI_CODING_AGENT_DIR"] || join(homedir(), ".pi", "agent");
   const integration =
-    process.env.PI_WORKGRAPH_HERDR_EXTENSION ||
+    process.env["PI_WORKGRAPH_HERDR_EXTENSION"] ||
     join(sourceAgent, "extensions", "herdr-agent-state.ts");
   await access(integration);
   const parent = await mkdtemp(join(tmpdir(), "workgraph-live-"));
@@ -90,11 +93,7 @@ export async function createLiveFixture(label: string) {
   console.error(`Retaining live evidence at ${parent}`);
   await writeFile(
     join(parent, "setup.json"),
-    JSON.stringify(
-      { parent, root, agentDir, candidate, revision, label },
-      null,
-      2,
-    ),
+    JSON.stringify({ parent, root, agentDir, candidate, revision, label }, null, 2),
   );
   await Promise.all([
     mkdir(root),
@@ -108,34 +107,17 @@ export async function createLiveFixture(label: string) {
     join(parent, "candidate.tar"),
     revision,
   ]);
-  await command(parent, "tar", [
-    "-xf",
-    join(parent, "candidate.tar"),
-    "-C",
-    candidate,
-  ]);
-  await symlink(
-    join(packageRoot, "node_modules"),
-    join(candidate, "node_modules"),
-  );
+  await command(parent, "tar", ["-xf", join(parent, "candidate.tar"), "-C", candidate]);
+  await symlink(join(packageRoot, "node_modules"), join(candidate, "node_modules"));
   for (const file of ["auth.json", "models.json", "workgraph/models.json"]) {
     try {
       await copyFile(join(sourceAgent, file), join(agentDir, file));
     } catch (error) {
-      if (
-        !(error instanceof Error && "code" in error && error.code === "ENOENT")
-      )
-        throw error;
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
   }
-  await symlink(
-    integration,
-    join(agentDir, "extensions", "herdr-agent-state.ts"),
-  );
-  await writeFile(
-    join(agentDir, "settings.json"),
-    JSON.stringify({ packages: [candidate] }),
-  );
+  await symlink(integration, join(agentDir, "extensions", "herdr-agent-state.ts"));
+  await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [candidate] }));
   await writeFile(
     join(root, "README.md"),
     "# Fixture\n\nMarker: AMBER.\n\nThe parser's normalized marker is used for the correction decision.\n",
@@ -155,16 +137,11 @@ export async function createLiveFixture(label: string) {
   await command(root, "git", ["add", "."]);
   await command(root, "git", ["commit", "-m", "Fixture"]);
   const base = await command(root, "git", ["rev-parse", "HEAD"]);
-  const policy = await loadModelPolicy(
-    join(agentDir, "workgraph", "models.json"),
+  const policy = await loadModelPolicy(join(agentDir, "workgraph", "models.json"));
+  const before = items((await herdr(root, "workspace", "list"))["workspaces"]).map((item) =>
+    text(item["workspace_id"]),
   );
-  const before = items((await herdr(root, "workspace", "list")).workspaces).map(
-    (item) => text(item.workspace_id),
-  );
-  await writeFile(
-    join(parent, "workspaces-before.json"),
-    JSON.stringify(before),
-  );
+  await writeFile(join(parent, "workspaces-before.json"), JSON.stringify(before));
   const created = await herdr(
     root,
     "workspace",
@@ -179,22 +156,14 @@ export async function createLiveFixture(label: string) {
     "--env",
     "PI_WORKGRAPH_MODE=",
   );
-  await writeFile(
-    join(parent, "workspace-created.json"),
-    JSON.stringify(created, null, 2),
-  );
-  const workspace = object(created.workspace);
-  const workspaceId = text(workspace.workspace_id);
-  assert.ok(
-    !before.includes(workspaceId) &&
-      workspaceId !== process.env.HERDR_WORKSPACE_ID,
-  );
-  const tabs = items(
-    (await herdr(root, "tab", "list", "--workspace", workspaceId)).tabs,
-  );
+  await writeFile(join(parent, "workspace-created.json"), JSON.stringify(created, null, 2));
+  const workspace = object(created["workspace"]);
+  const workspaceId = text(workspace["workspace_id"]);
+  assert.ok(!before.includes(workspaceId) && workspaceId !== process.env["HERDR_WORKSPACE_ID"]);
+  const tabs = items((await herdr(root, "tab", "list", "--workspace", workspaceId))["tabs"]);
   assert.equal(tabs.length, 1);
-  const rootTab = text(tabs[0]?.tab_id);
-  const paneId = text(object(created.root_pane).pane_id);
+  const rootTab = text(tabs[0]?.["tab_id"]);
+  const paneId = text(object(created["root_pane"])["pane_id"]);
   const metadata = {
     parent,
     root,
@@ -207,26 +176,17 @@ export async function createLiveFixture(label: string) {
     paneId,
     policy,
   };
-  await writeFile(
-    join(parent, "evidence.json"),
-    JSON.stringify(metadata, null, 2),
-  );
+  await writeFile(join(parent, "evidence.json"), JSON.stringify(metadata, null, 2));
   return metadata;
 }
 export type LiveFixture = Awaited<ReturnType<typeof createLiveFixture>>;
 
-export async function startCoordinator(
-  f: LiveFixture,
-): Promise<WorkerIdentity> {
-  const session = SessionManager.create(
-    f.root,
-    join(f.parent, "coordinator-sessions"),
-  );
+// oxlint-disable-next-line effecttsgo/async-function -- Coordinator startup is a native Herdr Promise boundary.
+export async function startCoordinator(f: LiveFixture): Promise<WorkerIdentity> {
+  const session = SessionManager.create(f.root, join(f.parent, "coordinator-sessions"));
   session.appendMessage({
     role: "assistant",
-    content: [
-      { type: "text", text: "Fixture initialized; await the human request." },
-    ],
+    content: [{ type: "text", text: "Fixture initialized; await the human request." }],
     api: "test",
     provider: "fixture",
     model: "fixture",
@@ -271,37 +231,30 @@ export async function startCoordinator(
     "--session",
     sessionFile,
     "--model",
-    process.env.PI_WORKGRAPH_COORDINATOR_MODEL || "openai-codex/gpt-6-astra",
+    process.env["PI_WORKGRAPH_COORDINATOR_MODEL"] || "openai-codex/gpt-6-astra",
     "--thinking",
     "high",
   );
-  const agent = object(result.agent);
+  const agent = object(result["agent"]);
   const identity = {
     workspaceId: f.workspaceId,
     tabId: f.rootTab,
     paneId: f.paneId,
-    terminalId: text(agent.terminal_id),
+    terminalId: text(agent["terminal_id"]),
     agentName,
     cwd: f.root,
     sessionFile,
   };
-  await writeFile(
-    join(f.parent, "coordinator-identity.json"),
-    JSON.stringify(identity, null, 2),
-  );
+  await writeFile(join(f.parent, "coordinator-identity.json"), JSON.stringify(identity, null, 2));
   await waitFor(
     async () => {
-      const observed = object(
-        (await herdr(f.root, "agent", "get", f.paneId)).agent,
-      );
-      assert.equal(observed.cwd, f.root);
-      assert.equal(observed.terminal_id, identity.terminalId);
-      if (observed.agent_status === "blocked")
-        throw new Error(
-          "Pi requires operator action; no prompt was submitted.",
-        );
-      if (!observed.agent_session) return undefined;
-      assert.equal(object(observed.agent_session).value, sessionFile);
+      const observed = object((await herdr(f.root, "agent", "get", f.paneId))["agent"]);
+      assert.equal(observed["cwd"], f.root);
+      assert.equal(observed["terminal_id"], identity.terminalId);
+      if (observed["agent_status"] === "blocked")
+        throw new Error("Pi requires operator action; no prompt was submitted.");
+      if (!observed["agent_session"]) return undefined;
+      assert.equal(object(observed["agent_session"])["value"], sessionFile);
       return identity;
     },
     30_000,
@@ -310,6 +263,7 @@ export async function startCoordinator(
   return identity;
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- Cleanup must await native Herdr and filesystem operations.
 export async function closeOwnedWorkspace(
   f: LiveFixture,
   coordinator?: WorkerIdentity,
@@ -317,34 +271,25 @@ export async function closeOwnedWorkspace(
   if (coordinator)
     await waitFor(
       async () => {
-        const agent = object(
-          (await herdr(f.root, "agent", "get", coordinator.paneId)).agent,
-        );
-        assert.equal(
-          object(agent.agent_session).value,
-          coordinator.sessionFile,
-        );
-        assert.equal(agent.terminal_id, coordinator.terminalId);
-        assert.equal(agent.cwd, coordinator.cwd);
-        return ["idle", "done"].includes(text(agent.agent_status))
-          ? true
-          : undefined;
+        const agent = object((await herdr(f.root, "agent", "get", coordinator.paneId))["agent"]);
+        assert.equal(object(agent["agent_session"])["value"], coordinator.sessionFile);
+        assert.equal(agent["terminal_id"], coordinator.terminalId);
+        assert.equal(agent["cwd"], coordinator["cwd"]);
+        return ["idle", "done"].includes(text(agent["agent_status"])) ? true : undefined;
       },
       30_000,
       "coordinator settlement before exact workspace closure",
     );
-  const tabs = items(
-    (await herdr(f.root, "tab", "list", "--workspace", f.workspaceId)).tabs,
-  );
+  const tabs = items((await herdr(f.root, "tab", "list", "--workspace", f.workspaceId))["tabs"]);
   assert.deepEqual(
-    tabs.map((tab) => tab.tab_id),
+    tabs.map((tab) => tab["tab_id"]),
     [f.rootTab],
     "Worker or unknown tabs remain; preserve the workspace for reconciliation",
   );
   await herdr(f.root, "workspace", "close", f.workspaceId);
   assert.ok(
-    items((await herdr(f.root, "workspace", "list")).workspaces).every(
-      (workspace) => workspace.workspace_id !== f.workspaceId,
+    items((await herdr(f.root, "workspace", "list"))["workspaces"]).every(
+      (workspace) => workspace["workspace_id"] !== f.workspaceId,
     ),
   );
   await writeFile(
@@ -353,10 +298,8 @@ export async function closeOwnedWorkspace(
   );
 }
 
-export async function retainFailure(
-  f: LiveFixture | undefined,
-  error: unknown,
-): Promise<void> {
+// oxlint-disable-next-line effecttsgo/async-function -- Failure retention preserves asynchronous private evidence.
+export async function retainFailure(f: LiveFixture | undefined, error: unknown): Promise<void> {
   const failure = {
     status: "failed",
     error: error instanceof Error ? error.message : String(error),
@@ -373,9 +316,7 @@ export async function retainFailure(
       const states = [];
       for (const name of names) {
         try {
-          const state = await WorkstreamStore.inspect(
-            join(directory, name, "workstream.json"),
-          );
+          const state = await WorkstreamStore.inspect(join(directory, name, "workstream.json"));
           states.push({
             id: state.id,
             lifecycle: state.lifecycle,
@@ -398,25 +339,15 @@ export async function retainFailure(
         } catch (stateError) {
           states.push({
             name,
-            diagnostic:
-              stateError instanceof Error
-                ? stateError.message
-                : String(stateError),
+            diagnostic: stateError instanceof Error ? stateError.message : String(stateError),
           });
         }
       }
-      await writeFile(
-        join(f.parent, "state-observation.json"),
-        JSON.stringify(states, null, 2),
-      );
+      await writeFile(join(f.parent, "state-observation.json"), JSON.stringify(states, null, 2));
     } catch (stateError) {
-      failure.diagnostic =
-        stateError instanceof Error ? stateError.message : String(stateError);
+      failure.diagnostic = stateError instanceof Error ? stateError.message : String(stateError);
     }
-    await writeFile(
-      join(f.parent, "failure.json"),
-      JSON.stringify(failure, null, 2),
-    );
+    await writeFile(join(f.parent, "failure.json"), JSON.stringify(failure, null, 2));
   }
   console.error(JSON.stringify(failure));
   process.exitCode = 1;

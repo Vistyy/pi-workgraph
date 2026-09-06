@@ -44,23 +44,22 @@ async function fixture(mode: "implementation" | "review", continued = false) {
   await git(root, "add", ".");
   await git(root, "commit", "-m", "Fixture");
   const previous = { ...process.env };
-  process.env.PI_WORKGRAPH_MODE = mode;
-  process.env.PI_WORKGRAPH_RUN_ID = "fixture";
-  process.env.PI_WORKGRAPH_NODE_ID = "attempt";
-  process.env.PI_WORKGRAPH_BASE_COMMIT = await git(root, "rev-parse", "HEAD");
-  process.env.PI_WORKGRAPH_EXECUTOR_MODEL = "openai/gpt-4o";
-  process.env.PI_WORKGRAPH_EXECUTOR_THINKING = "high";
-  if (continued) process.env.PI_WORKGRAPH_IMPLEMENTATION_START = "executor";
-  else delete process.env.PI_WORKGRAPH_IMPLEMENTATION_START;
-  delete process.env.PI_WORKGRAPH_EXPERIMENT;
+  process.env["PI_WORKGRAPH_MODE"] = mode;
+  process.env["PI_WORKGRAPH_RUN_ID"] = "fixture";
+  process.env["PI_WORKGRAPH_NODE_ID"] = "attempt";
+  process.env["PI_WORKGRAPH_BASE_COMMIT"] = await git(root, "rev-parse", "HEAD");
+  process.env["PI_WORKGRAPH_EXECUTOR_MODEL"] = "openai/gpt-4o";
+  process.env["PI_WORKGRAPH_EXECUTOR_THINKING"] = "high";
+  if (continued) process.env["PI_WORKGRAPH_IMPLEMENTATION_START"] = "executor";
+  else delete process.env["PI_WORKGRAPH_IMPLEMENTATION_START"];
+  delete process.env["PI_WORKGRAPH_EXPERIMENT"];
   const pi = await extensionFixture("worker", root, parent);
   return {
     ...pi,
     root,
     async dispose() {
       await pi.close();
-      for (const key of Object.keys(process.env))
-        if (!(key in previous)) delete process.env[key];
+      for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
       Object.assign(process.env, previous);
       await rm(parent, { recursive: true, force: true });
     },
@@ -88,10 +87,7 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
     });
     assistant(f.session);
     await f.runner.emit({ type: "session_start", reason: "startup" });
-    await assert.rejects(
-      f.call("workgraph_report", report),
-      /first-edit model transition/,
-    );
+    await assert.rejects(f.call("workgraph_report", report), /first-edit model transition/);
     await f.runner.emit({ type: "agent_start" });
     await f.runner.emit({
       type: "tool_execution_end",
@@ -115,26 +111,15 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Changed value");
     // A clean direct commit and selection metadata cannot validate a batched guide report.
-    await assert.rejects(
-      f.call("workgraph_report", report),
-      /actual executor assistant message/,
-    );
+    await assert.rejects(f.call("workgraph_report", report), /actual executor assistant message/);
     assistant(f.session, "wrong-model");
-    await assert.rejects(
-      f.call("workgraph_report", report),
-      /actual executor assistant message/,
-    );
+    await assert.rejects(f.call("workgraph_report", report), /actual executor assistant message/);
     assistant(f.session);
     await f.runner.emit({ type: "session_start", reason: "reload" });
     const result = await f.call("workgraph_report", report);
     assert.equal(result.terminate, true);
     const details = result.details;
-    assert.ok(
-      details &&
-        typeof details === "object" &&
-        "state" in details &&
-        "report" in details,
-    );
+    assert.ok(details && typeof details === "object" && "state" in details && "report" in details);
     assert.ok(
       details.state &&
         typeof details.state === "object" &&
@@ -143,11 +128,7 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
     );
     assert.deepEqual(details.state.todos, []);
     assert.equal(details.state.todoRecorded, false);
-    assert.ok(
-      details.report &&
-        typeof details.report === "object" &&
-        "commit" in details.report,
-    );
+    assert.ok(details.report && typeof details.report === "object" && "commit" in details.report);
     assert.equal(details.report.commit, await git(f.root, "rev-parse", "HEAD"));
     await f.runner.emit({ type: "agent_settled" });
     const markers = f.session
@@ -158,10 +139,7 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
     assert.ok(markers.includes("pi-workgraph-agent-settled"));
     await writeFile(join(f.root, "value.txt"), "third\n");
     await git(f.root, "commit", "-am", "Extra commit");
-    await assert.rejects(
-      f.call("workgraph_report", report),
-      /exactly one direct commit/,
-    );
+    await assert.rejects(f.call("workgraph_report", report), /exactly one direct commit/);
   } finally {
     await f.dispose();
   }
@@ -178,17 +156,12 @@ test("no-change implementation can report from the guide without manufacturing a
       summary: "No source change was needed.",
       revision,
       reason: "The requirement already holds on the inspected base.",
-      evidence: [
-        { label: "Git boundary", observation: `HEAD remains ${revision}` },
-      ],
+      evidence: [{ label: "Git boundary", observation: `HEAD remains ${revision}` }],
       findings: [],
     };
     const result = await f.call("workgraph_report", report);
     assert.equal(result.terminate, true);
-    assert.equal(
-      (result.details as { report: typeof report }).report.outcome,
-      "no_change",
-    );
+    assert.equal((result.details as { report: typeof report }).report.outcome, "no_change");
     assert.equal(await git(f.root, "rev-parse", "HEAD"), revision);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "before\n");
   } finally {
@@ -221,15 +194,9 @@ test("continued implementation requires this attempt's native start and later ex
     await f.runner.emit({ type: "session_start", reason: "startup" });
     await writeFile(join(f.root, "value.txt"), "after\n");
     await git(f.root, "commit", "-am", "Continued change");
-    await assert.rejects(
-      f.call("workgraph_report", report),
-      /actual executor assistant message/,
-    );
+    await assert.rejects(f.call("workgraph_report", report), /actual executor assistant message/);
     await f.runner.emit({ type: "agent_start" });
-    await assert.rejects(
-      f.call("workgraph_report", report),
-      /actual executor assistant message/,
-    );
+    await assert.rejects(f.call("workgraph_report", report), /actual executor assistant message/);
     assistant(f.session);
     assert.equal((await f.call("workgraph_report", report)).terminate, true);
     await writeFile(join(f.root, "value.txt"), "dirty\n");
@@ -252,10 +219,7 @@ test("read-only review observes dirty live files without changing them", async (
     assert.equal((await f.call("workgraph_report", report)).terminate, true);
     await writeFile(join(f.root, "value.txt"), "changed\n");
     assert.equal((await f.call("workgraph_report", report)).terminate, true);
-    assert.equal(
-      await readFile(join(f.root, "value.txt"), "utf8"),
-      "changed\n",
-    );
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "changed\n");
     await git(f.root, "commit", "-am", "Observed local change");
     assert.equal((await f.call("workgraph_report", report)).terminate, true);
   } finally {
