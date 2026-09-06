@@ -215,28 +215,24 @@ void test("activity indicator remains active for coordinator or workers and sett
   );
 });
 
-void test("garden and compact activity share truthful labels and remain width-safe", () => {
+void test("minimal activity pulses without layout changes and keeps truthful width-safe labels", () => {
   const theme = fakeTheme();
   const coordinator = { coordinatorActive: true, activeWorkers: 0 };
   const workers = { coordinatorActive: false, activeWorkers: 2 };
   const combined = { coordinatorActive: true, activeWorkers: 2 };
   const wideA = calmActivityLines(coordinator, 1, 80, theme);
   const wideB = calmActivityLines(coordinator, 2, 80, theme);
-  assert.equal(wideA.length, 3);
+  assert.equal(wideA.length, 1);
   assert.notDeepEqual(wideA, wideB);
-  assert.match(stripAnsiLikeTheme(wideA[0] ?? ""), /Workgraph {2}· {2}coordinating/);
-  assert.ok(wideA.every((line) => visibleWidth(line) === 80));
-  assert.match(stripAnsiLikeTheme(wideA[2] ?? ""), /─┴─/);
-  const compact = calmActivityLines(coordinator, 1, 80, theme, false);
-  assert.equal(compact.length, 1);
-  assert.match(stripAnsiLikeTheme(compact[0] ?? ""), /coordinating/);
+  assert.equal(stripAnsiLikeTheme(wideA[0] ?? ""), "• Workgraph · coordinating");
+  assert.equal(stripAnsiLikeTheme(wideA[0] ?? ""), stripAnsiLikeTheme(wideB[0] ?? ""));
   assert.match(
     stripAnsiLikeTheme(calmActivityLines(workers, 0, 80, theme)[0] ?? ""),
     /2 workers active/,
   );
   assert.match(
     stripAnsiLikeTheme(calmActivityLines(combined, 0, 80, theme)[0] ?? ""),
-    /Workgraph {2}· {2}coordinating · 2 workers active/,
+    /Workgraph · coordinating · 2 workers active/,
   );
   assert.doesNotMatch(
     stripAnsiLikeTheme(calmActivityLines(workers, 0, 80, theme)[0] ?? ""),
@@ -244,11 +240,9 @@ void test("garden and compact activity share truthful labels and remain width-sa
   );
 
   for (const width of [160, 80, 40, 36, 35, 24, 12, 8, 3, 1]) {
-    for (const garden of [true, false]) {
-      const lines = calmActivityLines(combined, 4, width, theme, garden);
-      assert.equal(lines.length, garden && width >= 36 ? 3 : 1);
-      assert.ok(lines.every((line) => visibleWidth(line) <= width));
-    }
+    const lines = calmActivityLines(combined, 4, width, theme);
+    assert.equal(lines.length, 1);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width));
   }
   assert.match(
     stripAnsiLikeTheme(
@@ -288,7 +282,7 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   const widgetFactory = ui.widgets.at(-1)?.[1];
   assert.ok(widgetFactory);
   const widget = widgetFactory({ requestRender() {} }, ui.theme);
-  assert.equal(widget.render(80).length, 3);
+  assert.equal(widget.render(80).length, 1);
   assert.match(widget.render(80)[0] ?? "", /Workgraph/);
   assert.ok(ui.workingVisibility.includes(false));
   calm.setActiveWorkers(0);
@@ -405,7 +399,7 @@ void test("activity uses compact mode outside Calm and freezes for a genuine UI 
     assert.equal(widget.render(80).length, 1);
     assert.equal(ui.workingVisibility.at(-1), false);
     await pi.commands.get("calm")?.("", context);
-    assert.equal(widget.render(80).length, 3);
+    assert.equal(widget.render(80).length, 1);
     await pi.events.get("ui_prompt_start")?.({}, context);
     assert.match(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /awaiting input/);
     await pi.events.get("ui_prompt_end")?.({}, context);

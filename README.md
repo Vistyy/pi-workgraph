@@ -24,9 +24,8 @@ The coordinator extension registers `/calm` to toggle hiding operational tool ro
 The default is initially off and is stored atomically in `workgraph/calm-default` beneath Pi's agent directory (normally `~/.pi/agent`, respecting `PI_CODING_AGENT_DIR`).
 Each session retains its own choice across reload and resume; new and forked sessions start from the saved default.
 The preference is session metadata, not a model message, and does not modify conversation content, tool execution, or worker tabs.
-Calm shows a full-width signal garden with gently traveling light; non-Calm shows the same factual activity in a compact line with tools still visible.
-Both replace the ordinary working row instead of stacking another spinner above it.
-The garden is decorative, not a progress bar or a one-flower-per-worker map, and narrows to the compact view in small terminals.
+Both Calm and non-Calm show one compact activity line with a gently pulsing dot and readable status text; Calm additionally hides the configured operational rows.
+This replaces the ordinary working row instead of stacking another spinner above it, and truncates safely in narrow terminals.
 The default hidden tool-name list covers Pi builtins, installed search tools, Workgraph tools, and `herdr_rename`.
 Override it with `PI_WORKGRAPH_CALM_HIDDEN_TOOLS=tool_a,tool_b` before starting Pi.
 The internal adapter targets Pi's exported `ToolExecutionComponent` and `CustomMessageComponent` render seams, so it is compatibility-limited to Pi versions exposing those classes.

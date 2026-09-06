@@ -60,7 +60,7 @@ export const CALM_OPERATIONAL_MESSAGE_TYPES = [
   "pi-workgraph-attention",
 ] as const;
 
-const CALM_INTERVAL_MS = 240;
+const CALM_INTERVAL_MS = 400;
 const CALM_SESSION_ENTRY = "pi-workgraph-calm-preference";
 const CalmSessionSchema = Type.Object({ sessionId: Type.String(), on: Type.Boolean() });
 const PATCH_OWNER = Symbol.for("@vistyy/pi-workgraph/calm-presentation");
@@ -208,7 +208,7 @@ export function installCalmMode(
       const request = (): void => tui.requestRender();
       requestWidgetRender = request;
       return {
-        render: (width) => calmActivityLines(activity(), frame, width, theme, state.on),
+        render: (width) => calmActivityLines(activity(), frame, width, theme),
         invalidate() {},
         dispose() {
           if (requestWidgetRender === request) requestWidgetRender = undefined;
