@@ -6,23 +6,29 @@ import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Effect } from "effect";
 import { Type } from "typebox";
-import { hasNativeAgentSettled } from "../src/pi-process.js";
-import { WorkstreamStore } from "../src/workstream.js";
+import { loadModelPolicy } from "../../src/model-policy.js";
+import { hasNativeAgentSettled } from "../../src/pi-process.js";
+import { WorkstreamStore } from "../../src/workstream.js";
+import {
+  closeOwnedWorkspace,
+  command,
+  createFixtureCheckpoint,
+  createLiveFixture,
+  finalizeSuccessfulFixture,
+  herdr,
+  liveCoordinatorModel,
+  observeNativeSessionUsage,
+  retainFailure,
+  startCoordinator,
+  waitFor,
+} from "./harness.js";
 import {
   observeCoordinatorTurn,
   observeDelegatedOutcome,
   observeDirectEffect,
+  observeIsolatedGitResourceAbsence,
   type RepositorySnapshot,
-} from "./coordinator-observation.js";
-import {
-  closeOwnedWorkspace,
-  command,
-  createLiveFixture,
-  herdr,
-  retainFailure,
-  startCoordinator,
-  waitFor,
-} from "./live-fixture.js";
+} from "./scenario-observation.js";
 
 function snapshotWorkingTree(root: string): Promise<RepositorySnapshot> {
   return Promise.all([
@@ -120,31 +126,34 @@ function verifyDelegatedSettlements(
   }
 }
 
-// biome-ignore-start lint/complexity/noExcessiveCognitiveComplexity: Experiment verification keeps retention and readability failures separately attributable.
-function verifyRetainedExperiments(
+function retainedExperimentReferences(
   state: Awaited<ReturnType<typeof WorkstreamStore.inspect>>,
-): Promise<void> {
-  const retainedReferences: Array<{ artifactId: string; reference: string }> = [];
-  for (const assignment of state.assignments) {
-    if (assignment.artifactIntent !== "disposable_experiment") continue;
+): Array<{ artifactId: string; reference: string }> {
+  const references: Array<{ artifactId: string; reference: string }> = [];
+  const experiments = state.assignments.filter(
+    (assignment) => assignment.artifactIntent === "disposable_experiment",
+  );
+  for (const assignment of experiments) {
     const result = state.results.find((item) => item.assignmentId === assignment.id);
     if (result?.validity !== "typed")
-      throw new Error(
-        `Experiment ${assignment.id} has no typed result to verify retained outputs.`,
-      );
+      throw new Error(`Experiment ${assignment.id} has no typed retained result.`);
     for (const artifactId of assignment.artifactPolicy.retain) {
       const artifact = result.artifacts.find(
         (item) => item.id === artifactId && item.retention === "retained",
       );
-      if (!artifact)
-        throw new Error(
-          `Experiment ${assignment.id} did not declare retained output ${artifactId}.`,
-        );
-      retainedReferences.push({ artifactId, reference: artifact.reference });
+      if (artifact === undefined)
+        throw new Error(`Experiment ${assignment.id} did not retain ${artifactId}.`);
+      references.push({ artifactId, reference: artifact.reference });
     }
   }
+  return references;
+}
+
+function verifyRetainedExperiments(
+  state: Awaited<ReturnType<typeof WorkstreamStore.inspect>>,
+): Promise<void> {
   return Promise.all(
-    retainedReferences.map(({ artifactId, reference }) =>
+    retainedExperimentReferences(state).map(({ artifactId, reference }) =>
       readFile(reference)
         // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Native filesystem rejection is normalized into retained-artifact evidence.
         .catch((error: unknown) => {
@@ -155,7 +164,26 @@ function verifyRetainedExperiments(
     ),
   ).then(() => undefined);
 }
-// biome-ignore-end lint/complexity/noExcessiveCognitiveComplexity: End retained experiment observation.
+
+// oxlint-disable-next-line effecttsgo/async-function -- This live oracle independently queries native Git worktree and ref state.
+async function verifyIsolatedGitResourcesAbsent(
+  root: string,
+  state: Awaited<ReturnType<typeof WorkstreamStore.inspect>>,
+) {
+  const placements = state.attempts.flatMap((attempt) =>
+    attempt.placement?.kind === "isolated_worktree" ? [attempt.placement] : [],
+  );
+  const observation = observeIsolatedGitResourceAbsence(
+    placements,
+    await command(root, "git", ["worktree", "list", "--porcelain"]),
+    await command(root, "git", ["for-each-ref", "--format=%(refname)", "refs/heads"]),
+  );
+  assert.ok(
+    observation.valid,
+    `Isolated Git resources remain: ${JSON.stringify(observation.resources)}`,
+  );
+  return observation.resources;
+}
 
 const smokeTimeout = Effect.runSync(
   Config.number("PI_WORKGRAPH_SMOKE_TIMEOUT_MS")
@@ -163,11 +191,21 @@ const smokeTimeout = Effect.runSync(
     .parse(ConfigProvider.fromEnvRecord(process.env)),
 );
 
+const checkpoint = createFixtureCheckpoint("Workgraph optional natural UX observation");
 let fixture: Awaited<ReturnType<typeof createLiveFixture>> | undefined;
 let latest: Awaited<ReturnType<typeof WorkstreamStore.inspect>> | undefined;
 try {
-  fixture = await createLiveFixture("Workgraph natural bounded correction");
+  fixture = await createLiveFixture("Workgraph optional natural UX observation", checkpoint);
   const f = fixture;
+  const policy = await loadModelPolicy(join(f.agentDir, "workgraph", "models.json"));
+  const launchPlan = {
+    coordinatorModel: liveCoordinatorModel,
+    expectedAttempts:
+      "Not predetermined; the coordinator may choose a direct or delegated strategy.",
+    selectedWorkerModelsIfDelegated: policy.roles,
+  };
+  await writeFile(join(f.parent, "launch-plan.json"), JSON.stringify(launchPlan, null, 2));
+  process.stderr.write(`Optional natural scenario launch plan: ${JSON.stringify(launchPlan)}\n`);
   const coordinator = await startCoordinator(f);
   const prompt = `Inspect the fixture's parser and marker bytes to determine the concrete normalization issue, using the least expensive useful evidence. A disposable scratch effect is permitted only for a small, isolated observation and only if reading the supplied files does not resolve the question; retain any resulting observation. If the evidence supports a correction, make the smallest authorized change so value.txt contains exactly after followed by one newline, without changing any other maintained file. Verify the final bytes, parser/verifier behavior, exact changed-file set, and every owned worker/resource cleanup before concluding. If any check cannot be established, report the concrete blocker instead of claiming success.`;
   await writeFile(join(f.parent, "initial-request.txt"), prompt);
@@ -284,17 +322,31 @@ try {
     join(f.parent, "natural-observations.json"),
     JSON.stringify(observations, null, 2),
   );
+  const gitResourceCleanup = latest ? await verifyIsolatedGitResourcesAbsent(f.root, latest) : [];
+  const usage = observeNativeSessionUsage([
+    coordinator.sessionFile,
+    ...(latest?.attempts.flatMap((attempt) =>
+      attempt.sessionFile === undefined ? [] : [attempt.sessionFile],
+    ) ?? []),
+  ]);
+  await writeFile(join(f.parent, "usage.json"), JSON.stringify(usage, null, 2));
   await closeOwnedWorkspace(f, coordinator);
+  const cleanup = await finalizeSuccessfulFixture(f);
   await writeFile(
     join(f.parent, "passed.json"),
     JSON.stringify(
       {
         status: "passed",
+        evidenceScope: "optional-ux-observation-not-lifecycle-gate",
         candidateRevision: f.revision,
         finalRevision: observations.finalRevision,
         delegationExercised: observations.delegationExercised,
+        launchPlan,
+        usage,
+        gitResourceCleanup,
+        cleanup,
         checks:
-          "native request message progression and identity, direct or delegated strategy, independent tracked/untracked bytes, parser, verifier, attributable outcomes, retained experiment outputs when present, and exact cleanup",
+          "native request message progression and identity, direct or delegated strategy, independent tracked/untracked bytes, parser, verifier, attributable outcomes, retained experiment outputs when present, independent isolated worktree/branch absence, exact workspace absence, and copied-agent-file cleanup; this optional UX observation is not a worker lifecycle gate",
       },
       null,
       2,
@@ -303,10 +355,11 @@ try {
   process.stdout.write(
     `${JSON.stringify({
       status: "passed",
+      evidenceScope: "optional-ux-observation-not-lifecycle-gate",
       evidence: f.parent,
       candidateRevision: f.revision,
     })}\n`,
   );
 } catch (error) {
-  await retainFailure(fixture, error);
+  await retainFailure(checkpoint, error instanceof Error ? error : String(error));
 }

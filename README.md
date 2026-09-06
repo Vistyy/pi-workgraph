@@ -124,7 +124,9 @@ The `processEffect` adapter owns child acquisition, bounded output, timeout, int
 `WorkstreamStore` owns validated workstream files, serializes mutations with an Effect semaphore, and publishes updates by atomic replacement; `WorkgraphRegistry` remains the SQLite owner of the workstream index and fenced leases.
 Promise-returning Pi, Herdr, Git, and store APIs are compatibility boundaries around those owners rather than a second lifecycle system.
 
-## Development and live verification
+## Source-checkout development and live verification
+
+These commands are checkout-only development tooling and are not included in the published package.
 
 ```bash
 pnpm install --frozen-lockfile
@@ -145,23 +147,27 @@ Only `effecttsgo/async-function` is disabled for `test/**/*.test.ts`, where `nod
 The shared blocking policy rejects non-null assertions, assertions to `never`, and chained assertions through the configured Biome and Oxlint checks.
 
 A natural-use verification request should state the desired outcome, constraints, and uncertainty to resolve without naming Workgraph tools, worker counts, or model panels.
-The runnable `pnpm smoke:natural` fixture asks the coordinator to resolve whether a disposable parser probe is justified and, only if it is, make one authorized small change, then checks native request settlement, the actual direct or delegated strategy, exact bytes, retained outputs when present, and cleanup.
-This natural procedure is evidence of caller usability, while the deterministic smoke remains a protocol check of identity, retention, composition, and cleanup boundaries.
+The explicitly optional `pnpm smoke:natural` UX observation asks the coordinator to resolve whether a disposable parser probe is justified and, only if it is, make one authorized small change.
+It checks native request settlement, the actual direct or delegated strategy, exact bytes, retained outputs when present, and independent isolated worktree, branch, and workspace absence.
+A natural pass is evidence of caller usability only and is never a substitute for the fixed capability scenario's lifecycle, composition, or model-transition coverage.
 `pnpm pack --dry-run` verifies the published file list but not dependency resolution or executable startup in an installed consumer; [VERIFICATION.md](VERIFICATION.md) gives the disposable packed-consumer check.
 
 Run live scenarios only from a Herdr-managed pane, against a clean committed candidate when the scenario itself requires composition.
 Shared research is separately expected to start with local tracked or untracked changes and leave those bytes untouched after native worker closure and retry.
-`smoke:herdr` starts idle Pi sessions without submitting model prompts and checks native parent/fork identity, a distinct no-focus coordinator workspace, child tab-scoped workers, cleanup refusal for mismatched identity, and Herdr closure before Git removal.
-`smoke:coordinator` submits one authorized request through a normal visible Pi coordinator and observes automatic handling of research, experiment retention/non-composition, implementation with guide/executor messages, concurrent research, exact-revision review, and resource cleanup.
+`smoke:herdr` starts idle Pi sessions without harness prompt submissions and checks native parent/fork identity, a distinct no-focus coordinator workspace, child tab-scoped workers, cleanup refusal for mismatched identity, and Herdr closure before Git removal.
+It does not claim to measure provider-side model requests.
+`smoke:coordinator` submits one authorized request through a normal visible Pi coordinator and observes automatic handling of research, experiment retention/non-composition, implementation with guide/executor messages, concurrent research, review launched against the exact implementation revision, and resource cleanup.
 It requires authenticated configured models and does not supply later approval or progress nudges.
+Before either model-driven scenario submits its request, it prints and privately records selected models and the expected attempt shape without imposing automatic model or retry decisions.
+Available usage and cost attached to native assistant messages are recorded with an explicit limitation that provider-side requests or accounting may be unavailable.
 
-Both scenarios freeze the candidate with Git archive and use a private temporary fixture, copied authentication/model configuration, isolated `PI_CODING_AGENT_DIR`, and the installed Herdr integration.
+All three scenarios freeze the candidate with Git archive and use a private temporary fixture, copied authentication/model configuration, isolated `PI_CODING_AGENT_DIR`, and the installed Herdr integration.
 The integration defaults to `extensions/herdr-agent-state.ts` under the source Pi agent directory; set `PI_WORKGRAPH_HERDR_EXTENSION` if it is installed elsewhere.
 `PI_WORKGRAPH_COORDINATOR_MODEL` overrides only the fixture coordinator selection, and `PI_WORKGRAPH_SMOKE_TIMEOUT_MS` overrides the capability scenario's 30-minute deadline.
 No trust settings or approval bypass flags are supplied.
-Successful scenarios verify exact workspace absence and retain their evidence directory.
-Failures retain diagnostics and resources for identity-aware reconciliation instead of deleting uncertain work.
-These private directories may contain copied credentials and must not be published wholesale.
+Successful scenarios verify exact checkpointed workspace absence, remove only copied agent credential/configuration files, and retain private sessions and useful evidence.
+Failures retain checkpointed exact handles, diagnostics, copied files needed by potentially live agents, and explicit identity-aware cleanup instructions instead of deleting uncertain work.
+These private directories can contain credentials after a failed or interrupted run and must not be published wholesale.
 
 The package skill supplies Workgraph-specific coordination guidance, not a replacement for design or verification methodology.
 [VERIFICATION.md](VERIFICATION.md) records durable local evidence boundaries; executable commands own the checks.

@@ -66,8 +66,17 @@ It does not establish Pi package loading or any live Herdr behavior.
 
 ## Environment and limits
 
+The `scripts/live/` harness and native, capability, and natural entrypoints are source-checkout development tooling and are excluded from the published package.
+The native scenario protects the cheap Herdr/Pi identity boundary without harness prompt submissions, while the model-driven capability scenario protects the fixed lifecycle boundary.
+The natural scenario is an explicitly optional UX observation and is not a lifecycle or release gate.
 Live evidence is specific to the tested Node.js, Pi, Git, Herdr, model configuration, and candidate revision.
+Before model submission, the runners disclose the selected coordinator and policy models and whether attempt count is fixed or strategy-dependent.
+They retain available native assistant-message usage and cost, but do not treat that as measurement of hidden provider requests or unavailable provider-side accounting.
 Implementation and disposable experiments use isolated worktrees, while read-only research and review use the live project cwd.
 Worktree isolation does not constrain arbitrary filesystem, network, or credential access by a worker.
 An exact-revision review is verified by Git evidence for that revision; tests run against live working files do not validate another revision.
 Verification fixtures must not change user-global configuration or trust decisions, and retained credential-bearing evidence must stay private.
+Fixture construction checkpoints exact paths and Herdr handles as soon as they are known so a pre-return failure remains actionable without blind cleanup.
+After independently verified successful resource closure, the harness removes only copied agent credential/configuration files and preserves useful private evidence.
+On failure it preserves exact reconciliation evidence and records identity-aware cleanup instructions.
+A natural-scenario cleanup claim additionally requires independent absence checks for every isolated worktree path and branch.

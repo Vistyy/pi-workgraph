@@ -1,7 +1,7 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import type { WorkstreamState } from "../src/workstream.js";
+import type { WorkstreamState } from "../../src/workstream.js";
 
 const TextSchema = Type.String();
 const TextBlockSchema = Type.Object({ type: Type.Literal("text"), text: Type.String() });
@@ -48,11 +48,49 @@ function messageText(entry: SessionEntry): string {
     .join("\n");
 }
 
-/**
- * Observe the native Pi turn after the submitted human request.
- * Startup messages, idle metadata, tool-use stops, and queued delivery are not completion.
- */
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: The pure observer keeps all terminal Pi states explicit and side-effect free.
+function classifyAssistantTurn(
+  entry: SessionEntry,
+  assistantIndex: number,
+): CoordinatorTurnObservation | undefined {
+  if (
+    entry.type !== "message" ||
+    entry.message.role !== "assistant" ||
+    !("stopReason" in entry.message)
+  )
+    return undefined;
+  const reason = entry.message.stopReason;
+  const text = messageText(entry) || "no diagnostic text";
+  if (reason === "error" || reason === "aborted")
+    return {
+      state: "failed",
+      detail: `Native coordinator turn ended with ${reason}: ${text}`,
+      assistantIndex,
+    };
+  if (reason === "length")
+    return {
+      state: "failed",
+      detail: `Native coordinator turn ended incomplete (${reason}): ${text}`,
+      assistantIndex,
+    };
+  if (reason !== "stop") return undefined;
+  if (
+    /(?:cannot|can't|unable|refus(?:e|ed|al)|blocked)\s+(?:complete|continue|proceed|the request)/i.test(
+      text,
+    )
+  )
+    return {
+      state: "blocked",
+      detail: `Native coordinator reported a blocker: ${text}`,
+      assistantIndex,
+    };
+  return {
+    state: "settled",
+    detail: messageText(entry) || "Native coordinator turn settled without text.",
+    assistantIndex,
+  };
+}
+
+/** Observe the native Pi turn after the submitted human request. */
 export function observeCoordinatorTurn(
   entries: SessionEntry[],
   requestText: string,
@@ -64,51 +102,17 @@ export function observeCoordinatorTurn(
       messageText(entry) === requestText,
   );
   if (requestIndex < 0)
-    return {
-      state: "waiting",
-      detail: "Submitted request is not in the native session yet.",
-    };
-
-  let settled: CoordinatorTurnObservation | undefined;
-  for (let index = requestIndex + 1; index < entries.length; index++) {
-    const entry = entries[index];
-    if (entry === undefined) continue;
-    if (
-      entry.type !== "message" ||
-      entry.message.role !== "assistant" ||
-      !("stopReason" in entry.message)
-    )
-      continue;
-    const reason = entry.message.stopReason;
-    if (reason === "error" || reason === "aborted")
-      return {
-        state: "failed",
-        detail: `Native coordinator turn ended with ${reason}: ${messageText(entry) || "no diagnostic text"}`,
-        assistantIndex: index,
-      };
-    if (reason === "length")
-      return {
-        state: "failed",
-        detail: `Native coordinator turn ended incomplete (${reason}): ${messageText(entry) || "no diagnostic text"}`,
-        assistantIndex: index,
-      };
-    if (reason === "stop") {
-      const detail = messageText(entry) || "Native coordinator turn settled without text.";
-      if (
-        /(?:cannot|can't|unable|refus(?:e|ed|al)|blocked)\s+(?:complete|continue|proceed|the request)/i.test(
-          detail,
-        )
-      )
-        return {
-          state: "blocked",
-          detail: `Native coordinator reported a blocker: ${detail}`,
-          assistantIndex: index,
-        };
-      settled = { state: "settled", detail, assistantIndex: index };
-    }
-  }
+    return { state: "waiting", detail: "Submitted request is not in the native session yet." };
+  const observations = entries
+    .slice(requestIndex + 1)
+    .map((entry, offset) => classifyAssistantTurn(entry, requestIndex + offset + 1))
+    .filter((item) => item !== undefined);
+  const interruption = observations.find(
+    (item) => item.state === "failed" || item.state === "blocked",
+  );
+  if (interruption !== undefined) return interruption;
   return (
-    settled ?? {
+    observations.findLast((item) => item.state === "settled") ?? {
       state: "waiting",
       detail:
         "Native coordinator request is still progressing; no terminal assistant turn observed.",
@@ -131,6 +135,33 @@ export interface DirectEffectObservation {
   valid: boolean;
   changedPaths: string[];
   detail: string;
+}
+
+export interface IsolatedGitPlacement {
+  path: string;
+  branch: string;
+}
+
+export function observeIsolatedGitResourceAbsence(
+  placements: IsolatedGitPlacement[],
+  worktreePorcelain: string,
+  branchRefLines: string,
+) {
+  const worktreePaths = worktreePorcelain
+    .split("\n")
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => line.slice("worktree ".length));
+  const branchRefs = new Set(branchRefLines.split("\n").filter(Boolean));
+  const resources = placements.map((placement) => ({
+    path: placement.path,
+    branch: placement.branch,
+    worktreeAbsent: !worktreePaths.includes(placement.path),
+    branchAbsent: !branchRefs.has(`refs/heads/${placement.branch}`),
+  }));
+  return {
+    valid: resources.every((resource) => resource.worktreeAbsent && resource.branchAbsent),
+    resources,
+  };
 }
 
 /** Validate direct native work against independent before/after file bytes. */
@@ -161,16 +192,8 @@ export interface DelegatedEffectObservation {
   experiment: "verified" | "not-run";
 }
 
-/** Validate the state-level attribution and cleanup guarantees of a delegated natural strategy. */
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: The pure observer deliberately reports every independent attribution and cleanup invariant.
-export function observeDelegatedOutcome(
-  state: WorkstreamState,
-  directEffect: DirectEffectObservation,
-): DelegatedEffectObservation {
+function validateAssignmentAttribution(state: WorkstreamState): string[] {
   const problems: string[] = [];
-  if (state.lifecycle.state !== "completed")
-    problems.push(`workstream lifecycle is ${state.lifecycle.state}`);
-  if (state.attempts.length === 0) problems.push("no delegated attempts are attributable");
   const assignmentsById = new Map(
     state.assignments.map((assignment) => [assignment.id, assignment]),
   );
@@ -180,10 +203,9 @@ export function observeDelegatedOutcome(
     if (!state.attempts.some((attempt) => attempt.assignmentId === assignment.id))
       problems.push(`delegated assignment ${assignment.id} has no attempt`);
   }
-  const resultOwners = new Set<string>();
   for (const attempt of state.attempts) {
     const assignment = assignmentsById.get(attempt.assignmentId);
-    if (!assignment) {
+    if (assignment === undefined) {
       problems.push(`attempt ${attempt.id} has no delegated assignment`);
       continue;
     }
@@ -195,19 +217,31 @@ export function observeDelegatedOutcome(
       problems.push(`attempt ${attempt.id} worker session is not attributable`);
     else if (attempt.placement !== undefined && attempt.worker.cwd !== attempt.placement.path)
       problems.push(`attempt ${attempt.id} worker cwd is not attributable`);
-    if (attempt.resultId === undefined)
+  }
+  return problems;
+}
+
+function validateResultAttribution(state: WorkstreamState): string[] {
+  const problems: string[] = [];
+  const resultOwners = new Set<string>();
+  for (const attempt of state.attempts) {
+    if (attempt.resultId === undefined) {
       problems.push(`attempt ${attempt.id} has no retained result`);
-    else {
-      if (resultOwners.has(attempt.resultId))
-        problems.push(`result ${attempt.resultId} has multiple attempt owners`);
-      resultOwners.add(attempt.resultId);
-      const result = state.results.find((item) => item.id === attempt.resultId);
-      if (!result) problems.push(`attempt ${attempt.id} retained result is missing`);
-      else if (result.assignmentId !== assignment.id)
-        problems.push(`attempt ${attempt.id} result assignment is mismatched`);
-      else if (result.assignmentIntentVersion !== assignment.intentVersion)
-        problems.push(`attempt ${attempt.id} result intent is mismatched`);
+      continue;
     }
+    if (resultOwners.has(attempt.resultId))
+      problems.push(`result ${attempt.resultId} has multiple attempt owners`);
+    resultOwners.add(attempt.resultId);
+    const result = state.results.find((item) => item.id === attempt.resultId);
+    const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
+    if (result === undefined) problems.push(`attempt ${attempt.id} retained result is missing`);
+    else if (result.assignmentId !== attempt.assignmentId)
+      problems.push(`attempt ${attempt.id} result assignment is mismatched`);
+    else if (
+      assignment !== undefined &&
+      result.assignmentIntentVersion !== assignment.intentVersion
+    )
+      problems.push(`attempt ${attempt.id} result intent is mismatched`);
   }
   for (const result of state.results) {
     if (
@@ -217,6 +251,14 @@ export function observeDelegatedOutcome(
     )
       problems.push(`result ${result.id} has no attributable attempt`);
   }
+  return problems;
+}
+
+function validateSettlements(state: WorkstreamState): string[] {
+  const problems: string[] = [];
+  if (state.lifecycle.state !== "completed")
+    problems.push(`workstream lifecycle is ${state.lifecycle.state}`);
+  if (state.attempts.length === 0) problems.push("no delegated attempts are attributable");
   if (state.attempts.some((attempt) => attempt.state !== "settled"))
     problems.push("one or more delegated attempts are not settled");
   if (
@@ -231,48 +273,66 @@ export function observeDelegatedOutcome(
     )
   )
     problems.push("one or more delegated worker results are not typed completed outcomes");
+  return problems;
+}
 
-  const implementationAttempts = state.attempts.filter((attempt) =>
+function validateImplementation(state: WorkstreamState) {
+  const attempts = state.attempts.filter((attempt) =>
     state.assignments.some(
       (assignment) =>
         assignment.id === attempt.assignmentId && assignment.capability === "implement",
     ),
   );
-  const implementationOrigin: "direct" | "delegated" =
-    implementationAttempts.length > 0 ? "delegated" : "direct";
+  const origin: "delegated" | "direct" = attempts.length > 0 ? "delegated" : "direct";
+  const problems: string[] = [];
   if (
-    implementationOrigin === "delegated" &&
-    implementationAttempts.some((attempt) => attempt.composition?.state !== "composed")
+    origin === "delegated" &&
+    attempts.some((attempt) => attempt.composition?.state !== "composed")
   )
     problems.push("attributable maintained implementation is not composed");
-  if (implementationOrigin === "direct" && state.attempts.some((attempt) => attempt.composition))
+  if (origin === "direct" && state.attempts.some((attempt) => attempt.composition !== undefined))
     problems.push("a non-implementation delegation has a composition");
+  return { problems, origin };
+}
 
-  const experimentAssignments = state.assignments.filter(
+function validateExperiments(state: WorkstreamState) {
+  const assignments = state.assignments.filter(
     (assignment) => assignment.artifactIntent === "disposable_experiment",
   );
-  let experiment: "verified" | "not-run" = "not-run";
-  if (experimentAssignments.length > 0) {
-    experiment = "verified";
-    for (const assignment of experimentAssignments) {
-      const attempt = state.attempts.find((item) => item.assignmentId === assignment.id);
-      const result = state.results.find((item) => item.assignmentId === assignment.id);
-      if (!attempt || !result || attempt.composition)
-        problems.push(`experiment ${assignment.id} lacks attributable non-composed outcome`);
-      if (result?.validity === "typed") {
-        for (const artifactId of assignment.artifactPolicy.retain) {
-          if (
-            !result.artifacts.some(
-              (artifact) => artifact.id === artifactId && artifact.retention === "retained",
-            )
-          )
-            problems.push(
-              `experiment ${assignment.id} did not retain declared artifact ${artifactId}`,
-            );
-        }
-      }
+  const problems: string[] = [];
+  for (const assignment of assignments) {
+    const attempt = state.attempts.find((item) => item.assignmentId === assignment.id);
+    const result = state.results.find((item) => item.assignmentId === assignment.id);
+    if (attempt === undefined || result === undefined || attempt.composition !== undefined)
+      problems.push(`experiment ${assignment.id} lacks attributable non-composed outcome`);
+    if (result?.validity !== "typed") continue;
+    for (const artifactId of assignment.artifactPolicy.retain) {
+      if (
+        !result.artifacts.some(
+          (artifact) => artifact.id === artifactId && artifact.retention === "retained",
+        )
+      )
+        problems.push(`experiment ${assignment.id} did not retain declared artifact ${artifactId}`);
     }
   }
+  const experiment: "verified" | "not-run" = assignments.length > 0 ? "verified" : "not-run";
+  return { problems, experiment };
+}
+
+/** Validate state-level attribution and cleanup guarantees of a delegated natural strategy. */
+export function observeDelegatedOutcome(
+  state: WorkstreamState,
+  directEffect: DirectEffectObservation,
+): DelegatedEffectObservation {
+  const implementation = validateImplementation(state);
+  const experiments = validateExperiments(state);
+  const problems = [
+    ...validateAssignmentAttribution(state),
+    ...validateResultAttribution(state),
+    ...validateSettlements(state),
+    ...implementation.problems,
+    ...experiments.problems,
+  ];
   if (!directEffect.valid) problems.push(directEffect.detail);
   return {
     valid: problems.length === 0,
@@ -281,12 +341,12 @@ export function observeDelegatedOutcome(
         ? "Delegated outcomes, composition, cleanup, and authorized bytes are attributable and valid."
         : problems.join("; "),
     delegationExercised: true,
-    implementationOrigin,
-    experiment,
+    implementationOrigin: implementation.origin,
+    experiment: experiments.experiment,
   };
 }
 
-/** Observe the capability scenario at Pi's actual message boundary, not queued delivery state. */
+/** Observe capability progress at Pi's actual message boundary, not queued delivery state. */
 export function notificationDrivenProgress(
   entries: SessionEntry[],
   resultIds: string[],
@@ -314,7 +374,6 @@ export function notificationDrivenProgress(
       ),
   );
   const baselineIndex = notificationIndex(baselineResultId);
-  // A later drained notification cannot repair a transition made by polling.
   if (experimentIndex >= 0 && (baselineIndex < 0 || experimentIndex < baselineIndex))
     throw new Error(
       "Experiment was queued before the actual baseline result notification; notification-driven progression was not observed.",
@@ -323,17 +382,15 @@ export function notificationDrivenProgress(
     experimentIndex >= 0 &&
     resultIds.every((resultId) => {
       const index = notificationIndex(resultId);
-      return (
-        index >= 0 &&
-        entries
-          .slice(index + 1)
-          .some(
-            (entry) =>
-              entry.type === "message" &&
-              entry.message.role === "assistant" &&
-              !["error", "aborted", "pending"].includes(entry.message.stopReason),
-          )
-      );
+      return index >= 0 && entries.slice(index + 1).some(isActualAssistantContinuation);
     })
+  );
+}
+
+function isActualAssistantContinuation(entry: SessionEntry): boolean {
+  return (
+    entry.type === "message" &&
+    entry.message.role === "assistant" &&
+    !["error", "aborted", "pending"].includes(entry.message.stopReason)
   );
 }

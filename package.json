@@ -32,9 +32,9 @@
     "quality:prepare": "effect-tsgo patch --oxlint --no-typescript",
     "quality": "pnpm run quality:prepare && biome check --error-on-warnings . && oxlint --config oxlint.config.ts .",
     "check": "pnpm run quality && pnpm run test",
-    "smoke:herdr": "node --import tsx scripts/herdr-smoke.ts",
-    "smoke:coordinator": "node --import tsx scripts/coordinator-smoke.ts",
-    "smoke:natural": "node --import tsx scripts/natural-coordinator-smoke.ts"
+    "smoke:herdr": "node --import tsx scripts/live/native-smoke.ts",
+    "smoke:coordinator": "node --import tsx scripts/live/capability-smoke.ts",
+    "smoke:natural": "node --import tsx scripts/live/natural-smoke.ts"
   },
   "pi": {
     "extensions": [

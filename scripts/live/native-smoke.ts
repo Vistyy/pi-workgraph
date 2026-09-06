@@ -5,23 +5,26 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Config, ConfigProvider, Effect } from "effect";
 import { Type } from "typebox";
-import { GitRepository } from "../src/git.js";
+import { GitRepository } from "../../src/git.js";
 import {
   CoordinatorLaunchError,
   HerdrCliRuntime,
   herdrCoordinatorNames,
   herdrWorkerTabLabel,
-} from "../src/herdr.js";
-import { createWorkerSession, forkConversationSession } from "../src/pi-process.js";
+} from "../../src/herdr.js";
+import { createWorkerSession, forkConversationSession } from "../../src/pi-process.js";
 import {
   closeOwnedWorkspace,
+  createFixtureCheckpoint,
   createLiveFixture,
+  finalizeSuccessfulFixture,
   herdr,
   type LiveFixture,
+  registerOwnedWorkspace,
   retainFailure,
   startCoordinator,
   waitFor,
-} from "./live-fixture.js";
+} from "./harness.js";
 
 const hostEnvironment = process.env;
 const herdrBin = Effect.runSync(
@@ -33,9 +36,10 @@ const tabsSchema = Type.Object({
   tabs: Type.Array(Type.Object({ tab_id: Type.String(), label: Type.String() })),
 });
 
+const checkpoint = createFixtureCheckpoint("Workgraph native boundary scenario");
 let fixture: LiveFixture | undefined;
 try {
-  fixture = await createLiveFixture("Workgraph Herdr boundary scenario");
+  fixture = await createLiveFixture("Workgraph native boundary scenario", checkpoint);
   const f = fixture;
   const coordinator = await startCoordinator(f);
   const runtime = new HerdrCliRuntime(herdrBin, {
@@ -60,6 +64,11 @@ try {
   const childCoordinator = await runtime.launchCoordinator({
     cwd: f.root,
     sessionFile: childSessionFile,
+  });
+  await registerOwnedWorkspace(checkpoint, {
+    workspaceId: childCoordinator.workspaceId,
+    paneId: childCoordinator.paneId,
+    rootTab: childCoordinator.tabId,
   });
   await writeFile(join(f.parent, "fork-identity.json"), JSON.stringify(childCoordinator, null, 2));
   assert.notEqual(childCoordinator.workspaceId, f.workspaceId);
@@ -168,12 +177,13 @@ try {
   };
   await closeOwnedWorkspace(childFixture, childCoordinator);
   await closeOwnedWorkspace(f, coordinator);
+  const cleanup = await finalizeSuccessfulFixture(f);
   await writeFile(
     join(f.parent, "passed.json"),
     JSON.stringify(
       {
         candidateRevision: f.revision,
-        modelPrompts: 0,
+        harnessPromptSubmissions: 0,
         observed,
         childObserved,
         childCoordinator,
@@ -182,8 +192,9 @@ try {
         workerTabLabel: workerTab.label,
         workerCleanup,
         gitCleanup,
+        cleanup,
         checks:
-          "native parent and fork identity, meaningful native fork and worker labels, production runtime.launch without a model prompt, child tab-scoped worker, identity-mismatch refusal, exact Herdr closure before Git removal and verified workspace absence",
+          "native parent and fork identity, meaningful native fork and worker labels, production runtime.launch without a harness prompt submission, child tab-scoped worker, identity-mismatch refusal, exact Herdr closure before Git removal, verified resource absence, and copied-agent-file cleanup",
       },
       null,
       2,
@@ -198,10 +209,16 @@ try {
     }),
   );
 } catch (error) {
-  if (fixture && error instanceof CoordinatorLaunchError && error.resource)
+  if (fixture && error instanceof CoordinatorLaunchError && error.resource) {
+    await registerOwnedWorkspace(checkpoint, {
+      workspaceId: error.resource.workspaceId,
+      paneId: error.resource.paneId,
+      rootTab: error.resource.tabId,
+    });
     await writeFile(
       join(fixture.parent, "fork-resource-retained.json"),
       JSON.stringify(error.resource, null, 2),
     );
-  await retainFailure(fixture, error);
+  }
+  await retainFailure(checkpoint, error instanceof Error ? error : String(error));
 }

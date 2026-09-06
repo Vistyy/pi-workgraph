@@ -1,6 +1,15 @@
 import assert from "node:assert/strict";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact native smoke boundary preserves host payload, Promise, filesystem, timing, and cleanup semantics.
-import { access, copyFile, mkdir, mkdtemp, readdir, symlink, writeFile } from "node:fs/promises";
+import {
+  access,
+  copyFile,
+  mkdir,
+  mkdtemp,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+  // oxlint-disable-next-line effecttsgo/node-builtin-import -- This live harness intentionally validates native filesystem behavior.
+} from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact native smoke boundary preserves host payload, Promise, filesystem, timing, and cleanup semantics.
 import { dirname, join, resolve } from "node:path";
@@ -9,10 +18,9 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Clock, Config, ConfigProvider, Effect, Option } from "effect";
 import { type StaticDecode, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
-import { runProcess } from "../src/git.js";
-import { loadModelPolicy } from "../src/model-policy.js";
-import type { WorkerIdentity } from "../src/types.js";
-import { WorkstreamStore } from "../src/workstream.js";
+import { runProcess } from "../../src/git.js";
+import type { WorkerIdentity } from "../../src/types.js";
+import { type WorkstreamState, WorkstreamStore } from "../../src/workstream.js";
 
 const LiveEnvironmentConfig = Config.all({
   herdrEnvironment: Config.string("HERDR_ENV").pipe(Config.withDefault("")),
@@ -25,6 +33,8 @@ const LiveEnvironmentConfig = Config.all({
 });
 const HostConfigProvider = ConfigProvider.fromEnvRecord(process.env);
 const liveEnvironment = Effect.runSync(LiveEnvironmentConfig.parse(HostConfigProvider));
+const COPIED_AGENT_FILES = ["auth.json", "models.json", "workgraph/models.json"] as const;
+export const liveCoordinatorModel = liveEnvironment.coordinatorModel;
 export function command(
   cwd: string,
   executable: string,
@@ -73,11 +83,54 @@ export function waitFor<T>(
   );
 }
 
+export interface OwnedWorkspaceCheckpoint {
+  workspaceId: string;
+  paneId: string;
+  rootTab?: string;
+}
+
+export interface LiveFixtureCheckpoint {
+  label: string;
+  copiedAgentFiles: string[];
+  ownedWorkspaces: OwnedWorkspaceCheckpoint[];
+  parent?: string;
+  root?: string;
+  agentDir?: string;
+  candidate?: string;
+  revision?: string;
+}
+
+export function createFixtureCheckpoint(label: string): LiveFixtureCheckpoint {
+  return { label, copiedAgentFiles: [], ownedWorkspaces: [] };
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Checkpoint persistence is part of the native Promise fixture boundary.
+async function persistCheckpoint(checkpoint: LiveFixtureCheckpoint): Promise<void> {
+  if (checkpoint.parent === undefined) return;
+  await writeFile(
+    join(checkpoint.parent, "ownership-checkpoint.json"),
+    JSON.stringify(checkpoint, null, 2),
+  );
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Exact Herdr ownership is checkpointed through the native Promise boundary.
+export async function registerOwnedWorkspace(
+  checkpoint: LiveFixtureCheckpoint,
+  workspace: OwnedWorkspaceCheckpoint,
+): Promise<void> {
+  const existing = checkpoint.ownedWorkspaces.find(
+    (item) => item.workspaceId === workspace.workspaceId,
+  );
+  if (existing === undefined) checkpoint.ownedWorkspaces.push(workspace);
+  else Object.assign(existing, workspace);
+  await persistCheckpoint(checkpoint);
+}
+
 // oxlint-disable-next-line effecttsgo/async-function -- This exact native smoke boundary preserves host payload, Promise, filesystem, timing, and cleanup semantics.
-export async function createLiveFixture(label: string) {
+export async function createLiveFixture(label: string, checkpoint: LiveFixtureCheckpoint) {
   if (liveEnvironment.herdrEnvironment !== "1")
     throw new Error("This live scenario requires a Herdr-managed pane.");
-  const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   assert.equal(
     await command(packageRoot, "git", ["status", "--porcelain"]),
     "",
@@ -96,7 +149,9 @@ export async function createLiveFixture(label: string) {
   const root = join(parent, "fixture");
   const agentDir = join(parent, "agent");
   const candidate = join(parent, "candidate");
-  process.stderr.write(`Retaining live evidence at ${parent}\n`);
+  Object.assign(checkpoint, { parent, root, agentDir, candidate, revision });
+  process.stderr.write(`Retaining private live evidence at ${parent}\n`);
+  await persistCheckpoint(checkpoint);
   await writeFile(
     join(parent, "setup.json"),
     JSON.stringify({ parent, root, agentDir, candidate, revision, label }, null, 2),
@@ -115,9 +170,12 @@ export async function createLiveFixture(label: string) {
   ]);
   await command(parent, "tar", ["-xf", join(parent, "candidate.tar"), "-C", candidate]);
   await symlink(join(packageRoot, "node_modules"), join(candidate, "node_modules"));
-  for (const file of ["auth.json", "models.json", "workgraph/models.json"]) {
+  for (const file of COPIED_AGENT_FILES) {
+    const copiedFile = join(agentDir, file);
     try {
-      await copyFile(join(sourceAgent, file), join(agentDir, file));
+      await copyFile(join(sourceAgent, file), copiedFile);
+      checkpoint.copiedAgentFiles.push(copiedFile);
+      await persistCheckpoint(checkpoint);
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
     }
@@ -143,7 +201,6 @@ export async function createLiveFixture(label: string) {
   await command(root, "git", ["add", "."]);
   await command(root, "git", ["commit", "-m", "Fixture"]);
   const base = await command(root, "git", ["rev-parse", "HEAD"]);
-  const policy = await loadModelPolicy(join(agentDir, "workgraph", "models.json"));
   const workspaceListSchema = Type.Object({
     workspaces: Type.Array(Type.Object({ workspace_id: Type.String() })),
   });
@@ -169,8 +226,10 @@ export async function createLiveFixture(label: string) {
     "--env",
     "PI_WORKGRAPH_MODE=",
   );
-  await writeFile(join(parent, "workspace-created.json"), JSON.stringify(created, null, 2));
   const workspaceId = created.workspace.workspace_id;
+  const paneId = created.root_pane.pane_id;
+  await registerOwnedWorkspace(checkpoint, { workspaceId, paneId });
+  await writeFile(join(parent, "workspace-created.json"), JSON.stringify(created, null, 2));
   assert.ok(
     !before.includes(workspaceId) &&
       Option.getOrUndefined(liveEnvironment.currentWorkspace) !== workspaceId,
@@ -180,7 +239,7 @@ export async function createLiveFixture(label: string) {
   assert.equal(tabs.length, 1);
   const rootTab = tabs[0]?.tab_id;
   assert.ok(rootTab !== undefined);
-  const paneId = created.root_pane.pane_id;
+  await registerOwnedWorkspace(checkpoint, { workspaceId, paneId, rootTab });
   const metadata = {
     parent,
     root,
@@ -191,7 +250,7 @@ export async function createLiveFixture(label: string) {
     workspaceId,
     rootTab,
     paneId,
-    policy,
+    checkpoint,
   };
   await writeFile(join(parent, "evidence.json"), JSON.stringify(metadata, null, 2));
   return metadata;
@@ -338,60 +397,181 @@ export async function closeOwnedWorkspace(
   );
 }
 
-// biome-ignore-start lint/complexity/noExcessiveCognitiveComplexity: Failure retention records each recoverable state without cleanup or trust mutation.
-// oxlint-disable-next-line anti-slop/no-unknown-parameters, effecttsgo/async-function -- This exact native smoke boundary retains external failure evidence through its Promise API.
-export async function retainFailure(f: LiveFixture | undefined, error: unknown): Promise<void> {
-  const failure = {
-    status: "failed",
-    error: error instanceof Error ? error.message : String(error),
-    fixture: f?.parent,
-    workspaceId: f?.workspaceId,
-    limitation:
-      "Owned resources and evidence are retained. Inspect identities and worker state before cleanup; no blind retry or broad workspace deletion was attempted.",
-    // SAFETY: Failure observation may add a diagnostic string while preserving this stable evidence shape.
-    diagnostic: undefined as string | undefined,
+function projectWorkstreamState(state: WorkstreamState) {
+  return {
+    id: state.id,
+    lifecycle: state.lifecycle,
+    assignments: state.assignments.map((item) => item.id),
+    attempts: state.attempts.map((attempt) => ({
+      id: attempt.id,
+      state: attempt.state,
+      worker: attempt.worker,
+      resource: attempt.resource,
+      error: attempt.error,
+      cleanup: attempt.cleanup,
+      composition: attempt.composition,
+    })),
+    results: state.results.map((result) => ({
+      id: result.id,
+      assignmentId: result.assignmentId,
+      validity: result.validity,
+    })),
   };
-  if (f) {
-    try {
-      const directory = join(f.root, ".git", "pi-workgraph", "workstreams");
-      const names = await readdir(directory);
-      const states = [];
-      for (const name of names) {
-        try {
-          const state = await WorkstreamStore.inspect(join(directory, name, "workstream.json"));
-          states.push({
-            id: state.id,
-            lifecycle: state.lifecycle,
-            assignments: state.assignments.map((item) => item.id),
-            attempts: state.attempts.map((attempt) => ({
-              id: attempt.id,
-              state: attempt.state,
-              worker: attempt.worker,
-              resource: attempt.resource,
-              error: attempt.error,
-              cleanup: attempt.cleanup,
-              composition: attempt.composition,
-            })),
-            results: state.results.map((result) => ({
-              id: result.id,
-              assignmentId: result.assignmentId,
-              validity: result.validity,
-            })),
-          });
-        } catch (stateError) {
-          states.push({
-            name,
-            diagnostic: stateError instanceof Error ? stateError.message : String(stateError),
-          });
-        }
-      }
-      await writeFile(join(f.parent, "state-observation.json"), JSON.stringify(states, null, 2));
-    } catch (stateError) {
-      failure.diagnostic = stateError instanceof Error ? stateError.message : String(stateError);
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- One state inspection is normalized into retained failure evidence.
+async function inspectRetainedStateFile(directory: string, name: string) {
+  try {
+    return projectWorkstreamState(
+      await WorkstreamStore.inspect(join(directory, name, "workstream.json")),
+    );
+  } catch (error) {
+    return { name, diagnostic: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Failure inspection must retain native filesystem and store diagnostics.
+async function inspectRetainedState(root: string) {
+  const directory = join(root, ".git", "pi-workgraph", "workstreams");
+  const names = await readdir(directory);
+  return Promise.all(names.map((name) => inspectRetainedStateFile(directory, name)));
+}
+
+function reconciliationInstructions(checkpoint: LiveFixtureCheckpoint): string[] {
+  const instructions = checkpoint.ownedWorkspaces.flatMap((workspace) => [
+    `Inspect exact workspace: herdr workspace get ${workspace.workspaceId}`,
+    `After matching pane ${workspace.paneId}${workspace.rootTab !== undefined ? ` and root tab ${workspace.rootTab}` : ""}, inspect all agents/tabs and close only exact workspace ${workspace.workspaceId}.`,
+  ]);
+  if (checkpoint.root !== undefined)
+    instructions.push(
+      `Inspect fixture worktrees and branches before removal: git -C ${checkpoint.root} worktree list --porcelain`,
+    );
+  if (checkpoint.copiedAgentFiles.length > 0)
+    instructions.push(
+      `After every retained agent is settled and exact workspaces are absent, remove only copied agent files: ${checkpoint.copiedAgentFiles.join(", ")}`,
+    );
+  return instructions;
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Success curation removes an exact checkpointed native file set.
+export async function removeCopiedAgentFiles(checkpoint: LiveFixtureCheckpoint): Promise<string[]> {
+  const agentDir = checkpoint.agentDir;
+  if (agentDir === undefined)
+    throw new Error("Cannot curate copied files without the exact fixture agent directory.");
+  const allowed = new Set(COPIED_AGENT_FILES.map((file) => join(agentDir, file)));
+  const files = [...checkpoint.copiedAgentFiles];
+  assert.ok(
+    files.every((path) => allowed.has(path)),
+    "Refusing to remove a file outside the exact copied fixture-agent set",
+  );
+  await Promise.all(files.map((path) => rm(path, { force: true })));
+  return files;
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Finalization verifies native Herdr absence before exact evidence curation.
+export async function finalizeSuccessfulFixture(fixture: LiveFixture): Promise<{
+  resourceCleanup: string;
+  evidenceCleanup: string;
+  removedCopiedAgentFiles: string[];
+}> {
+  const workspaceSchema = Type.Object({
+    workspaces: Type.Array(Type.Object({ workspace_id: Type.String() })),
+  });
+  const present = (await herdr(fixture.root, workspaceSchema, "workspace", "list")).workspaces;
+  const ownedIds = new Set(fixture.checkpoint.ownedWorkspaces.map((item) => item.workspaceId));
+  assert.ok(
+    present.every((workspace) => !ownedIds.has(workspace.workspace_id)),
+    "An exact owned workspace remains; preserve copied agent files for reconciliation",
+  );
+  const removedCopiedAgentFiles = await removeCopiedAgentFiles(fixture.checkpoint);
+  const cleanup = {
+    resourceCleanup: "Every checkpointed Herdr workspace was independently absent.",
+    evidenceCleanup:
+      "Only copied agent credential/configuration files were removed; private sessions and useful scenario evidence were retained.",
+    removedCopiedAgentFiles,
+  };
+  await writeFile(
+    join(fixture.parent, "successful-cleanup.json"),
+    JSON.stringify(cleanup, null, 2),
+  );
+  return cleanup;
+}
+
+export interface NativeSessionUsage {
+  source: "native assistant message usage";
+  sessionCount: number;
+  assistantMessagesWithUsage: number;
+  totalTokens?: number;
+  totalCostUsd?: number;
+  limitation: string;
+}
+
+export function observeNativeSessionUsage(sessionFiles: string[]): NativeSessionUsage {
+  let assistantMessagesWithUsage = 0;
+  let totalTokens = 0;
+  let totalCostUsd = 0;
+  for (const sessionFile of new Set(sessionFiles)) {
+    for (const entry of SessionManager.open(sessionFile).getBranch()) {
+      if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+      assistantMessagesWithUsage += 1;
+      totalTokens += entry.message.usage.totalTokens;
+      totalCostUsd += entry.message.usage.cost.total;
     }
-    await writeFile(join(f.parent, "failure.json"), JSON.stringify(failure, null, 2));
+  }
+  const summary: NativeSessionUsage = {
+    source: "native assistant message usage",
+    sessionCount: new Set(sessionFiles).size,
+    assistantMessagesWithUsage,
+    limitation:
+      "Counts usage attached to retained native assistant messages; it does not measure hidden provider requests or unavailable provider-side accounting.",
+  };
+  if (assistantMessagesWithUsage > 0) {
+    summary.totalTokens = totalTokens;
+    summary.totalCostUsd = totalCostUsd;
+  }
+  return summary;
+}
+
+interface RetainedFailureRecord {
+  status: "failed";
+  error: string;
+  fixture: string | undefined;
+  ownedWorkspaces: OwnedWorkspaceCheckpoint[];
+  copiedAgentFiles: string[];
+  limitation: string;
+  cleanupInstructions: string[];
+  diagnostic?: string;
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- This native boundary retains exact external failure evidence without cleanup.
+export async function retainFailure(
+  checkpoint: LiveFixtureCheckpoint,
+  error: Error | string,
+): Promise<void> {
+  const failure: RetainedFailureRecord = {
+    status: "failed",
+    error: error instanceof Error ? error.message : error,
+    fixture: checkpoint.parent,
+    ownedWorkspaces: checkpoint.ownedWorkspaces,
+    copiedAgentFiles: checkpoint.copiedAgentFiles,
+    limitation:
+      "Checkpointed resources and private evidence are retained. Inspect exact identities before cleanup; no blind retry or broad workspace deletion was attempted.",
+    cleanupInstructions: reconciliationInstructions(checkpoint),
+  };
+  if (checkpoint.parent !== undefined) {
+    if (checkpoint.root !== undefined) {
+      try {
+        const states = await inspectRetainedState(checkpoint.root);
+        await writeFile(
+          join(checkpoint.parent, "state-observation.json"),
+          JSON.stringify(states, null, 2),
+        );
+      } catch (stateError) {
+        failure.diagnostic = stateError instanceof Error ? stateError.message : String(stateError);
+      }
+    }
+    await writeFile(join(checkpoint.parent, "failure.json"), JSON.stringify(failure, null, 2));
   }
   process.stderr.write(`${JSON.stringify(failure)}\n`);
   process.exitCode = 1;
 }
-// biome-ignore-end lint/complexity/noExcessiveCognitiveComplexity: End failure-retention boundary.

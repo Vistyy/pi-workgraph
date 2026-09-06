@@ -7,23 +7,28 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Effect } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { hasNativeAgentSettled } from "../src/pi-process.js";
-import { type WorkstreamState, WorkstreamStore } from "../src/workstream.js";
+import { loadModelPolicy } from "../../src/model-policy.js";
+import { hasNativeAgentSettled } from "../../src/pi-process.js";
+import { type WorkstreamState, WorkstreamStore } from "../../src/workstream.js";
+import {
+  closeOwnedWorkspace,
+  command,
+  createFixtureCheckpoint,
+  createLiveFixture,
+  finalizeSuccessfulFixture,
+  herdr,
+  type LiveFixture,
+  liveCoordinatorModel,
+  observeNativeSessionUsage,
+  retainFailure,
+  startCoordinator,
+  waitFor,
+} from "./harness.js";
 import {
   CAPABILITY_SCENARIO_IDS,
   capabilityScenarioPrompt,
   notificationDrivenProgress,
-} from "./coordinator-observation.js";
-import {
-  closeOwnedWorkspace,
-  command,
-  createLiveFixture,
-  herdr,
-  type LiveFixture,
-  retainFailure,
-  startCoordinator,
-  waitFor,
-} from "./live-fixture.js";
+} from "./scenario-observation.js";
 
 const smokeTimeout = Effect.runSync(
   Config.number("PI_WORKGRAPH_SMOKE_TIMEOUT_MS")
@@ -31,11 +36,20 @@ const smokeTimeout = Effect.runSync(
     .parse(ConfigProvider.fromEnvRecord(process.env)),
 );
 
+const checkpoint = createFixtureCheckpoint("Workgraph capability scenario");
 let fixture: LiveFixture | undefined;
 let latest: WorkstreamState | undefined;
 try {
-  fixture = await createLiveFixture("Workgraph capability scenario");
+  fixture = await createLiveFixture("Workgraph capability scenario", checkpoint);
   const f = fixture;
+  const policy = await loadModelPolicy(join(f.agentDir, "workgraph", "models.json"));
+  const launchPlan = {
+    coordinatorModel: liveCoordinatorModel,
+    expectedAttempts: Object.keys(CAPABILITY_SCENARIO_IDS).length,
+    selectedWorkerModels: policy.roles,
+  };
+  await writeFile(join(f.parent, "launch-plan.json"), JSON.stringify(launchPlan, null, 2));
+  process.stderr.write(`Capability scenario launch plan: ${JSON.stringify(launchPlan)}\n`);
   const coordinator = await startCoordinator(f);
   const privateToken = "PRIVATE_COORDINATOR_VIOLET";
   const prompt = capabilityScenarioPrompt(privateToken);
@@ -58,6 +72,10 @@ try {
       const workstreamName = names[0];
       assert.ok(workstreamName !== undefined);
       latest = await WorkstreamStore.inspect(join(directory, workstreamName, "workstream.json"));
+      if (latest.attempts.length > launchPlan.expectedAttempts)
+        throw new Error(
+          `Fixed scenario exceeded ${launchPlan.expectedAttempts} expected attempts; no automatic retries are authorized.`,
+        );
       const blocked = latest.attempts.find(
         (attempt) =>
           attempt.error !== undefined ||
@@ -160,7 +178,7 @@ try {
   for (const role of ["implementation.guide", "implementation.executor"] as const) {
     assert.ok(
       implementation.effectiveModels?.some(
-        (model) => model.source === "message" && model.model === f.policy.roles[role].model,
+        (model) => model.source === "message" && model.model === policy.roles[role].model,
       ) === true,
       `No actual message observed for ${role}`,
     );
@@ -197,15 +215,26 @@ try {
       1,
     1,
   );
+  const usage = observeNativeSessionUsage([
+    coordinator.sessionFile,
+    ...state.attempts.flatMap((attempt) =>
+      attempt.sessionFile === undefined ? [] : [attempt.sessionFile],
+    ),
+  ]);
+  await writeFile(join(f.parent, "usage.json"), JSON.stringify(usage, null, 2));
   await closeOwnedWorkspace(f, coordinator);
+  const cleanup = await finalizeSuccessfulFixture(f);
   await writeFile(
     join(f.parent, "passed.json"),
     JSON.stringify(
       {
         candidateRevision: f.revision,
-        fixtureRevision: review.baseRevision,
+        implementationRevision: review.baseRevision,
+        launchPlan,
+        usage,
+        cleanup,
         checks:
-          "normal package loading, fresh worker isolation, actual notification-driven baseline-to-experiment progression and assistant continuations for every result, experiment retention/non-composition, maintained bytes/scope, model messages and Prewalk transition, concurrent research, exact revision review, native settlement and exact cleanup",
+          "normal package loading, fresh worker isolation, actual notification-driven baseline-to-experiment progression and assistant continuations for every result, experiment retention/non-composition, maintained bytes/scope, model messages and Prewalk transition, concurrent research, review launched against the exact implementation revision, native settlement, resource cleanup, and copied-agent-file cleanup",
       },
       null,
       2,
@@ -224,5 +253,5 @@ try {
       join(fixture.parent, "state-observation.json"),
       JSON.stringify(latest, null, 2),
     );
-  await retainFailure(fixture, error);
+  await retainFailure(checkpoint, error instanceof Error ? error : String(error));
 }

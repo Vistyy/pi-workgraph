@@ -4,7 +4,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   CAPABILITY_SCENARIO_IDS,
   notificationDrivenProgress,
-} from "../scripts/coordinator-observation.js";
+} from "../scripts/live/scenario-observation.js";
 import { usage } from "./helpers.js";
 
 const fixtureTimestamp = 1_788_235_200_000;

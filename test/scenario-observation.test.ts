@@ -6,7 +6,8 @@ import {
   observeCoordinatorTurn,
   observeDelegatedOutcome,
   observeDirectEffect,
-} from "../scripts/coordinator-observation.js";
+  observeIsolatedGitResourceAbsence,
+} from "../scripts/live/scenario-observation.js";
 import { WorkstreamStore } from "../src/workstream.js";
 import { required } from "./decoders.js";
 import { usage } from "./helpers.js";
@@ -72,6 +73,30 @@ void test("direct native outcome accepts the authorized tracked edit and rejects
   const rejected = observeDirectEffect(before, withScratch, "YWZ0ZXIK");
   assert.equal(rejected.valid, false);
   assert.deepEqual(rejected.changedPaths, ["probe.txt", "value.txt"]);
+});
+
+void test("isolated Git cleanup requires exact worktree path and branch absence", () => {
+  const placement = { path: "/tmp/exact-worktree", branch: "pi-workgraph/run/attempt" };
+  assert.equal(
+    observeIsolatedGitResourceAbsence([placement], "worktree /tmp/root", "").valid,
+    true,
+  );
+  assert.equal(
+    observeIsolatedGitResourceAbsence(
+      [placement],
+      "worktree /tmp/root\nworktree /tmp/exact-worktree",
+      "",
+    ).valid,
+    false,
+  );
+  assert.equal(
+    observeIsolatedGitResourceAbsence(
+      [placement],
+      "worktree /tmp/root",
+      "refs/heads/pi-workgraph/run/attempt",
+    ).valid,
+    false,
+  );
 });
 
 void test("delegated native outcome requires attributable composition, cleanup, and retained experiment output", async () => {
