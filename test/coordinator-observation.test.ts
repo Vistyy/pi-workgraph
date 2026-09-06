@@ -7,6 +7,8 @@ import {
 } from "../scripts/coordinator-observation.js";
 import { usage } from "./helpers.js";
 
+const fixtureTimestamp = 1_788_235_200_000;
+
 function assistant(session: SessionManager, experiment = false) {
   session.appendMessage({
     role: "assistant",
@@ -25,26 +27,19 @@ function assistant(session: SessionManager, experiment = false) {
     model: "fixture",
     usage,
     stopReason: experiment ? "toolUse" : "stop",
-    timestamp: Date.now(),
+    timestamp: fixtureTimestamp,
   });
 }
 function notify(session: SessionManager, resultId: string) {
-  session.appendCustomMessageEntry(
-    "pi-workgraph-workstream",
-    "Retained result",
-    true,
-    { resultId },
-  );
+  session.appendCustomMessageEntry("pi-workgraph-workstream", "Retained result", true, {
+    resultId,
+  });
 }
 
-test("live observer requires actual notifications and dependent generation, and waits for trailing followUps", () => {
+void test("live observer requires actual notifications and dependent generation, and waits for trailing followUps", () => {
   const session = SessionManager.inMemory();
   const observe = () =>
-    notificationDrivenProgress(
-      session.getBranch(),
-      ["baseline", "other"],
-      "baseline",
-    );
+    notificationDrivenProgress(session.getBranch(), ["baseline", "other"], "baseline");
   assert.equal(observe(), false);
   // Neither unrelated notifications nor transport metadata establishes receipt.
   session.appendCustomEntry("delivery", {
@@ -67,11 +62,10 @@ test("live observer requires actual notifications and dependent generation, and 
   assert.equal(observe(), true);
 });
 
-test("late queue drainage cannot pass as notification-driven progression", () => {
+void test("late queue drainage cannot pass as notification-driven progression", () => {
   const session = SessionManager.inMemory();
   assistant(session, true);
-  const observe = () =>
-    notificationDrivenProgress(session.getBranch(), ["baseline"], "baseline");
+  const observe = () => notificationDrivenProgress(session.getBranch(), ["baseline"], "baseline");
   assert.throws(observe, /before the actual baseline/);
   notify(session, "baseline");
   assistant(session);

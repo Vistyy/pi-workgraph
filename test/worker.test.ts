@@ -1,10 +1,27 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Worker integration fixtures use real host storage and Git files.
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths identify real repository and session resources.
 import { join } from "node:path";
 import test from "node:test";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import {
+  configureFixtureEnvironment,
+  decodeTestValue,
+  restoreFixtureEnvironment,
+} from "./decoders.js";
 import { extensionFixture, git, usage } from "./helpers.js";
+
+const fixtureTimestamp = 1_788_235_200_000;
+const reportDetailsSchema = Type.Object({
+  state: Type.Object({ todos: Type.Array(Type.String()), todoRecorded: Type.Boolean() }),
+  report: Type.Object({ commit: Type.String() }),
+});
+const noChangeDetailsSchema = Type.Object({
+  report: Type.Object({ outcome: Type.Literal("no_change") }),
+});
 
 function assistant(session: SessionManager, model = "gpt-4o") {
   return session.appendMessage({
@@ -29,10 +46,11 @@ function assistant(session: SessionManager, model = "gpt-4o") {
     model,
     usage,
     stopReason: "toolUse",
-    timestamp: Date.now(),
+    timestamp: fixtureTimestamp,
   });
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- The node:test fixture composes native Promise-based Git, filesystem, and Pi adapters.
 async function fixture(mode: "implementation" | "review", continued = false) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
   const root = join(parent, "repo");
@@ -43,30 +61,31 @@ async function fixture(mode: "implementation" | "review", continued = false) {
   await writeFile(join(root, "value.txt"), "before\n");
   await git(root, "add", ".");
   await git(root, "commit", "-m", "Fixture");
-  const previous = { ...process.env };
-  process.env["PI_WORKGRAPH_MODE"] = mode;
-  process.env["PI_WORKGRAPH_RUN_ID"] = "fixture";
-  process.env["PI_WORKGRAPH_NODE_ID"] = "attempt";
-  process.env["PI_WORKGRAPH_BASE_COMMIT"] = await git(root, "rev-parse", "HEAD");
-  process.env["PI_WORKGRAPH_EXECUTOR_MODEL"] = "openai/gpt-4o";
-  process.env["PI_WORKGRAPH_EXECUTOR_THINKING"] = "high";
-  if (continued) process.env["PI_WORKGRAPH_IMPLEMENTATION_START"] = "executor";
-  else delete process.env["PI_WORKGRAPH_IMPLEMENTATION_START"];
-  delete process.env["PI_WORKGRAPH_EXPERIMENT"];
+  const previous = configureFixtureEnvironment({
+    PI_WORKGRAPH_MODE: mode,
+    PI_WORKGRAPH_RUN_ID: "fixture",
+    PI_WORKGRAPH_NODE_ID: "attempt",
+    PI_WORKGRAPH_BASE_COMMIT: await git(root, "rev-parse", "HEAD"),
+    PI_WORKGRAPH_EXECUTOR_MODEL: "openai/gpt-4o",
+    PI_WORKGRAPH_EXECUTOR_THINKING: "high",
+    PI_WORKGRAPH_IMPLEMENTATION_START: continued ? "executor" : null,
+    PI_WORKGRAPH_EXPERIMENT: null,
+  });
   const pi = await extensionFixture("worker", root, parent);
   return {
     ...pi,
     root,
+    // oxlint-disable-next-line effecttsgo/async-function -- Fixture teardown must await native Pi and filesystem cleanup.
     async dispose() {
       await pi.close();
-      for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
-      Object.assign(process.env, previous);
+      restoreFixtureEnvironment(previous);
       await rm(parent, { recursive: true, force: true });
     },
   };
 }
 
-test("registered worker observes a non-edit mutation, switches locally, reports a direct commit and native settlement", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered worker observes a non-edit mutation, switches locally, reports a direct commit and native settlement", async () => {
   const f = await fixture("implementation");
   try {
     assert.ok(f.registry.find("openai", "gpt-4o"));
@@ -83,7 +102,7 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
       runId: "fixture",
       nodeId: "prior-attempt",
       phase: "executor",
-      switchedAt: new Date().toISOString(),
+      switchedAt: "2026-09-01T00:00:00.000Z",
     });
     assistant(f.session);
     await f.runner.emit({ type: "session_start", reason: "startup" });
@@ -118,17 +137,9 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
     await f.runner.emit({ type: "session_start", reason: "reload" });
     const result = await f.call("workgraph_report", report);
     assert.equal(result.terminate, true);
-    const details = result.details;
-    assert.ok(details && typeof details === "object" && "state" in details && "report" in details);
-    assert.ok(
-      details.state &&
-        typeof details.state === "object" &&
-        "todos" in details.state &&
-        "todoRecorded" in details.state,
-    );
+    const details = decodeTestValue(reportDetailsSchema, result.details);
     assert.deepEqual(details.state.todos, []);
     assert.equal(details.state.todoRecorded, false);
-    assert.ok(details.report && typeof details.report === "object" && "commit" in details.report);
     assert.equal(details.report.commit, await git(f.root, "rev-parse", "HEAD"));
     await f.runner.emit({ type: "agent_settled" });
     const markers = f.session
@@ -145,7 +156,8 @@ test("registered worker observes a non-edit mutation, switches locally, reports 
   }
 });
 
-test("no-change implementation can report from the guide without manufacturing an edit or executor turn", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("no-change implementation can report from the guide without manufacturing an edit or executor turn", async () => {
   const f = await fixture("implementation");
   try {
     const revision = await git(f.root, "rev-parse", "HEAD");
@@ -161,7 +173,10 @@ test("no-change implementation can report from the guide without manufacturing a
     };
     const result = await f.call("workgraph_report", report);
     assert.equal(result.terminate, true);
-    assert.equal((result.details as { report: typeof report }).report.outcome, "no_change");
+    assert.equal(
+      decodeTestValue(noChangeDetailsSchema, result.details).report.outcome,
+      "no_change",
+    );
     assert.equal(await git(f.root, "rev-parse", "HEAD"), revision);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "before\n");
   } finally {
@@ -169,7 +184,8 @@ test("no-change implementation can report from the guide without manufacturing a
   }
 });
 
-test("continued implementation requires this attempt's native start and later executor message, not inherited evidence", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("continued implementation requires this attempt's native start and later executor message, not inherited evidence", async () => {
   const f = await fixture("implementation", true);
   const report = {
     kind: "implementation",
@@ -184,7 +200,7 @@ test("continued implementation requires this attempt's native start and later ex
       runId: "fixture",
       nodeId: "prior-attempt",
       phase: "executor",
-      switchedAt: new Date().toISOString(),
+      switchedAt: "2026-09-01T00:00:00.000Z",
     });
     f.session.appendCustomEntry("pi-workgraph-agent-running", {
       runId: "fixture",
@@ -206,7 +222,8 @@ test("continued implementation requires this attempt's native start and later ex
   }
 });
 
-test("read-only review observes dirty live files without changing them", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("read-only review observes dirty live files without changing them", async () => {
   const f = await fixture("review");
   const report = {
     kind: "review",

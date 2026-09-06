@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Process integration tests inspect real child-process filesystem effects.
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Marker paths identify native child-process resources.
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
@@ -10,7 +12,8 @@ import { ProcessExecutionError, processEffect, runProcess } from "../src/process
 const node = process.execPath;
 const cwd = process.cwd();
 
-test("the Effect process owner returns normal output through its native API", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("the Effect process owner returns normal output through its native API", async () => {
   const result = await Effect.runPromise(
     processEffect(node, ["-e", "process.stdout.write('hello')"], {
       cwd,
@@ -26,7 +29,8 @@ test("the Effect process owner returns normal output through its native API", as
   });
 });
 
-test("bounded diagnostics do not change the complete stdout fingerprint", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("bounded diagnostics do not change the complete stdout fingerprint", async () => {
   const full = `prefix-${"x".repeat(100_000)}-suffix`;
   const result = await runProcess(node, ["-e", `process.stdout.write(${JSON.stringify(full)})`], {
     cwd,
@@ -39,7 +43,8 @@ test("bounded diagnostics do not change the complete stdout fingerprint", async 
   assert.equal(result.stdoutDigest, createHash("sha256").update(full).digest("hex"));
 });
 
-test("timeout keeps the diagnostic result and escalates from SIGTERM to SIGKILL", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("timeout keeps the diagnostic result and escalates from SIGTERM to SIGKILL", async () => {
   const result = await runProcess(
     node,
     ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)"],
@@ -49,14 +54,16 @@ test("timeout keeps the diagnostic result and escalates from SIGTERM to SIGKILL"
   assert.notEqual(result.exitCode, 0);
 });
 
-test("spawn failures are reported through the process error", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("spawn failures are reported through the process error", async () => {
   await assert.rejects(
     runProcess("/definitely/not/a/real/process", [], { cwd, timeoutMs: 1_000 }),
-    (error: unknown) => error instanceof ProcessExecutionError,
+    (error: Error) => error instanceof ProcessExecutionError,
   );
 });
 
-test("bounded output retains a valid UTF-8 suffix within the byte limit", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("bounded output retains a valid UTF-8 suffix within the byte limit", async () => {
   const full = "🙂".repeat(1_000);
   const result = await runProcess(node, ["-e", `process.stdout.write(${JSON.stringify(full)})`], {
     cwd,
@@ -69,7 +76,8 @@ test("bounded output retains a valid UTF-8 suffix within the byte limit", async 
   assert.ok(Buffer.byteLength(result.stdout) <= 7);
 });
 
-test("malformed bytes stay within the display byte limit and preserve the raw digest", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("malformed bytes stay within the display byte limit and preserve the raw digest", async () => {
   const result = await runProcess(
     node,
     ["-e", "process.stdout.write(Buffer.from([0xff])); process.stderr.write(Buffer.from([0xfe]))"],
@@ -93,14 +101,15 @@ test("malformed bytes stay within the display byte limit and preserve the raw di
   );
 });
 
-test("decoded malformed suffixes are bounded for both output streams", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("decoded malformed suffixes are bounded for both output streams", async () => {
   const stdout = Buffer.from([0x41, 0xff, 0xf0, 0x9f, 0x98, 0x80]);
   const stderr = Buffer.from([0xc3, 0x28, 0xe2, 0x82, 0xac]);
   const result = await runProcess(
     node,
     [
       "-e",
-      `process.stdout.write(Buffer.from([${[...stdout]}])); process.stderr.write(Buffer.from([${[...stderr]}]))`,
+      `process.stdout.write(Buffer.from("${stdout.toString("hex")}", "hex")); process.stderr.write(Buffer.from("${stderr.toString("hex")}", "hex"))`,
     ],
     { cwd, timeoutMs: 1_000, outputLimit: 6 },
   );
@@ -111,7 +120,8 @@ test("decoded malformed suffixes are bounded for both output streams", async () 
   assert.ok(Buffer.byteLength(result.stderr) <= 6);
 });
 
-test("interrupting the Effect waits for the owned process to close", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("interrupting the Effect waits for the owned process to close", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-process-"));
   const marker = join(directory, "closed");
   try {
@@ -127,6 +137,7 @@ test("interrupting the Effect waits for the owned process to close", async () =>
       ),
       { signal: controller.signal },
     );
+    // oxlint-disable-next-line effecttsgo/global-timers -- A native timer deliberately races the child-process adapter under test.
     setTimeout(() => controller.abort(), 150).unref();
     await assert.rejects(running);
     assert.equal(await readFile(marker, "utf8"), "closed");
@@ -135,7 +146,8 @@ test("interrupting the Effect waits for the owned process to close", async () =>
   }
 });
 
-test("a pre-aborted signal does not launch a process", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("a pre-aborted signal does not launch a process", async () => {
   const controller = new AbortController();
   controller.abort();
   await assert.rejects(
@@ -147,13 +159,15 @@ test("a pre-aborted signal does not launch a process", async () => {
   );
 });
 
-test("interrupting the Effect cancels the owned process", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("interrupting the Effect cancels the owned process", async () => {
   const controller = new AbortController();
   const running = runProcess(
     node,
     ["-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1_000)"],
     { cwd, timeoutMs: 10_000, signal: controller.signal },
   );
+  // oxlint-disable-next-line effecttsgo/global-timers -- A native timer deliberately interrupts the Promise adapter under test.
   setTimeout(() => controller.abort(), 25).unref();
   await assert.rejects(running);
 });

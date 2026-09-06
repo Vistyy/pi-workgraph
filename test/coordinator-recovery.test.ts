@@ -1,17 +1,14 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Recovery integration fixtures inspect real host resources.
 import { existsSync } from "node:fs";
-import {
-  chmod,
-  mkdir,
-  mkdtemp,
-  readFile,
-  rm,
-  writeFile,
-} from "node:fs/promises";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Recovery integration fixtures mutate disposable native files and Git worktrees.
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths identify real Git, SQLite, Herdr, and session resources.
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { GitRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
@@ -19,10 +16,46 @@ import { WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerReport } from "../src/types.js";
 import { WorkstreamStore } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
+import {
+  configureFixtureEnvironment,
+  decodeTestValue,
+  required,
+  restoreFixtureEnvironment,
+} from "./decoders.js";
 import { extensionFixture, git, resultState, usage } from "./helpers.js";
 
 const workspaceId = "recovery-workspace";
+const transportStateSchema = Type.Object({
+  status: Type.String(),
+  closed: Type.Boolean(),
+  paneGone: Type.Optional(Type.Boolean()),
+  tabGone: Type.Optional(Type.Boolean()),
+  errorCode: Type.Optional(Type.String()),
+  mismatchedCwd: Type.Optional(Type.String()),
+});
+type TransportChange = {
+  status?: string;
+  closed?: boolean;
+  paneGone?: boolean;
+  tabGone?: boolean;
+  errorCode?: string | undefined;
+  mismatchedCwd?: string | undefined;
+};
+const blockedViewSchema = Type.Object({
+  inspection: Type.Object({
+    attention: Type.Object({ items: Type.Array(Type.Object({ blocker: Type.String() })) }),
+  }),
+});
+const taskViewSchema = Type.Object({
+  inspection: Type.Object({
+    tasks: Type.Object({
+      items: Type.Array(Type.Object({ idPreview: Type.String() })),
+    }),
+  }),
+});
+const outcomeViewSchema = Type.Object({ inspection: Type.Object({ result: Type.String() }) });
 
+// oxlint-disable-next-line effecttsgo/async-function -- The node:test fixture composes native Promise-based Git, filesystem, Herdr, SQLite, and Pi adapters.
 async function recoveryFixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-public-recovery-"));
   const root = join(parent, "repo");
@@ -37,10 +70,7 @@ async function recoveryFixture() {
   const transportState = join(parent, "herdr-state.json");
   const transportLog = join(parent, "herdr-commands.jsonl");
   const command = join(parent, "fake-herdr.mjs");
-  await writeFile(
-    transportState,
-    JSON.stringify({ status: "working", closed: false }),
-  );
+  await writeFile(transportState, JSON.stringify({ status: "working", closed: false }));
   await writeFile(
     command,
     `#!/usr/bin/env node
@@ -82,17 +112,18 @@ if (args[0] === "tab" && args[1] === "create") {
   );
   await chmod(command, 0o755);
 
-  const previous = { ...process.env };
-  process.env.PI_CODING_AGENT_DIR = join(parent, "agent");
-  process.env.PI_WORKGRAPH_HERDR_BIN = command;
-  process.env.HERDR_ENV = "1";
-  process.env.HERDR_WORKSPACE_ID = workspaceId;
-  delete process.env.PI_WORKGRAPH_MODE;
+  const previous = configureFixtureEnvironment({
+    PI_CODING_AGENT_DIR: join(parent, "agent"),
+    PI_WORKGRAPH_HERDR_BIN: command,
+    HERDR_ENV: "1",
+    HERDR_WORKSPACE_ID: workspaceId,
+    PI_WORKGRAPH_MODE: null,
+  });
   const pi = await extensionFixture("coordinator", root, parent);
   const repository = await GitRepository.open(root);
   const owner = {
     sessionId: pi.session.getSessionId(),
-    sessionFile: pi.session.getSessionFile()!,
+    sessionFile: required(pi.session.getSessionFile(), "coordinator session file"),
   };
   const { store } = await WorkstreamStore.create({
     id: "ws-recovery",
@@ -101,9 +132,7 @@ if (args[0] === "tab" && args[1] === "create") {
     gitCommonDir: repository.commonDir,
     coordinator: owner,
   });
-  const registry = new WorkgraphRegistry(
-    join(parent, "runtime-registry.sqlite"),
-  );
+  const registry = new WorkgraphRegistry(join(parent, "runtime-registry.sqlite"));
   let registryOpen = true;
   const runtime = new WorkstreamRuntime(
     store,
@@ -117,16 +146,20 @@ if (args[0] === "tab" && args[1] === "create") {
     () => {},
     { registry, policy: DEFAULT_MODEL_POLICY },
   );
-  await runtime.perform(async () => undefined);
+  await runtime.perform(() => Promise.resolve());
 
-  async function setTransport(change: Record<string, unknown>) {
-    const current = JSON.parse(
-      await readFile(transportState, "utf8"),
-    ) as Record<string, unknown>;
+  // oxlint-disable-next-line effecttsgo/async-function -- The fixture updates the native Herdr JSON protocol file through Promise I/O.
+  async function setTransport(change: TransportChange) {
+    const current = decodeTestValue(
+      transportStateSchema,
+      JSON.parse(await readFile(transportState, "utf8")),
+    );
     await writeFile(transportState, JSON.stringify({ ...current, ...change }));
   }
 
+  // oxlint-disable-next-line effecttsgo/async-function -- The helper exercises runtime and store Promise APIs under test.
   async function authorize() {
+    // oxlint-disable-next-line effecttsgo/async-function -- WorkstreamRuntime owns and awaits this transactional Promise callback.
     return runtime.perform(async () => {
       const recorded = await store.recordInputEvent({
         ...owner,
@@ -142,10 +175,11 @@ if (args[0] === "tab" && args[1] === "create") {
     });
   }
 
+  // oxlint-disable-next-line effecttsgo/async-function -- The helper persists a native Pi worker trajectory and Herdr state through Promise APIs.
   async function settle(report: WorkerReport) {
     const state = await store.load();
-    const attempt = state.attempts.at(-1)!;
-    const session = SessionManager.open(attempt.sessionFile!);
+    const attempt = required(state.attempts.at(-1), "latest recovery attempt");
+    const session = SessionManager.open(required(attempt.sessionFile, "worker session file"));
     session.appendCustomEntry("pi-workgraph-agent-running", {
       runId: state.id,
       nodeId: attempt.id,
@@ -158,6 +192,7 @@ if (args[0] === "tab" && args[1] === "create") {
       model: "worker",
       usage,
       stopReason: "stop",
+      // oxlint-disable-next-line effecttsgo/global-date -- Pi's native persisted session contract requires a current epoch timestamp.
       timestamp: Date.now(),
     });
     session.appendMessage({
@@ -167,6 +202,7 @@ if (args[0] === "tab" && args[1] === "create") {
       content: [{ type: "text", text: "report" }],
       details: { report },
       isError: false,
+      // oxlint-disable-next-line effecttsgo/global-date -- Pi's native persisted session contract requires a current epoch timestamp.
       timestamp: Date.now(),
     });
     session.appendCustomEntry("pi-workgraph-agent-settled", {
@@ -176,13 +212,12 @@ if (args[0] === "tab" && args[1] === "create") {
     await setTransport({ status: "idle" });
   }
 
+  // oxlint-disable-next-line effecttsgo/async-function -- Public attachment composes Promise lifecycle APIs under test.
   async function attachPublic() {
     await runtime.stop();
     registry.close();
     registryOpen = false;
-    return resultState(
-      (await pi.call("workgraph_adopt", { statePath: store.path })).details,
-    );
+    return resultState((await pi.call("workgraph_adopt", { statePath: store.path })).details);
   }
 
   return {
@@ -198,22 +233,19 @@ if (args[0] === "tab" && args[1] === "create") {
     settle,
     setTransport,
     attachPublic,
+    // oxlint-disable-next-line effecttsgo/async-function -- Fixture teardown must await native runtime, Pi, and filesystem cleanup.
     async dispose() {
       await runtime.stop();
       if (registryOpen) registry.close();
       await pi.close();
-      for (const key of Object.keys(process.env))
-        if (!(key in previous)) delete process.env[key];
-      Object.assign(process.env, previous);
+      restoreFixtureEnvironment(previous);
       await rm(parent, { recursive: true, force: true });
     },
   };
 }
 
-async function prepareBlockedComposition(
-  integrated: boolean,
-  dirtyRoot = false,
-) {
+// oxlint-disable-next-line effecttsgo/async-function -- This fixture helper composes the native Promise APIs under test.
+async function prepareBlockedComposition(integrated: boolean, dirtyRoot = false) {
   const f = await recoveryFixture();
   const authority = await f.authorize();
   await f.runtime.queue({
@@ -227,11 +259,12 @@ async function prepareBlockedComposition(
   });
   await f.runtime.reconcile();
   let state = await f.store.load();
-  const attempt = state.attempts[0]!;
-  await writeFile(join(attempt.worktreePath!, "value.txt"), "worker\n");
-  await git(attempt.worktreePath!, "add", ".");
-  await git(attempt.worktreePath!, "commit", "-m", "Worker change");
-  const workerCommit = await git(attempt.worktreePath!, "rev-parse", "HEAD");
+  const attempt = required(state.attempts[0], "queued implementation attempt");
+  const worktreePath = required(attempt.worktreePath, "isolated implementation worktree");
+  await writeFile(join(worktreePath, "value.txt"), "worker\n");
+  await git(worktreePath, "add", ".");
+  await git(worktreePath, "commit", "-m", "Worker change");
+  const workerCommit = await git(worktreePath, "rev-parse", "HEAD");
   let integratedRevision: string | undefined;
   if (integrated) {
     await writeFile(join(f.root, "value.txt"), "integrated\n");
@@ -239,11 +272,7 @@ async function prepareBlockedComposition(
     await git(f.root, "commit", "-m", "Integrated change");
     integratedRevision = await f.repository.head();
   }
-  if (dirtyRoot)
-    await writeFile(
-      join(f.root, "transient-root.txt"),
-      "known transient state\n",
-    );
+  if (dirtyRoot) await writeFile(join(f.root, "transient-root.txt"), "known transient state\n");
   await f.settle({
     kind: "implementation",
     status: "completed",
@@ -260,6 +289,7 @@ async function prepareBlockedComposition(
   return { f, attempt, workerCommit, integratedRevision };
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- This fixture helper composes the native Promise APIs under test.
 async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
   const f = await recoveryFixture();
   const authority = await f.authorize();
@@ -274,8 +304,9 @@ async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
   });
   await f.runtime.reconcile();
   let state = await f.store.load();
-  const attempt = state.attempts[0]!;
-  const obstruction = join(attempt.placement!.path, "transient.tmp");
+  const attempt = required(state.attempts[0], "queued cleanup attempt");
+  const placement = required(attempt.placement, "isolated cleanup placement");
+  const obstruction = join(placement.path, "transient.tmp");
   await f.settle({
     kind: "implementation",
     status: "failed",
@@ -287,7 +318,7 @@ async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
   state = await f.runtime.reconcile();
   await f.store.beginCleanup({
     id: attempt.id,
-    expectedHead: await f.repository.head(attempt.placement!.path),
+    expectedHead: await f.repository.head(placement.path),
     discard: false,
   });
   await f.store.markWorkerClosed(attempt.id);
@@ -298,9 +329,11 @@ async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
   assert.equal(existsSync(obstruction), true);
   await rm(obstruction);
   if (removeBeforeRecovery) {
-    assert.equal(attempt.placement?.kind, "isolated_worktree");
-    await git(f.root, "worktree", "remove", attempt.placement.path);
-    await git(f.root, "branch", "-D", attempt.placement.branch);
+    if (placement.kind !== "isolated_worktree") {
+      throw new Error("cleanup fixture requires an isolated worktree placement");
+    }
+    await git(f.root, "worktree", "remove", placement.path);
+    await git(f.root, "branch", "-D", placement.branch);
   }
   await f.attachPublic();
   return { f, attempt };
@@ -309,6 +342,7 @@ async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
 type RecoveryFixture = Awaited<ReturnType<typeof recoveryFixture>>;
 type CompositionFixture = Awaited<ReturnType<typeof prepareBlockedComposition>>;
 
+// oxlint-disable-next-line effecttsgo/async-function -- This assertion helper exercises Promise-based control, Git, and store boundaries.
 async function retainNotApplied(
   f: RecoveryFixture,
   attempt: CompositionFixture["attempt"],
@@ -326,29 +360,23 @@ async function retainNotApplied(
       })
     ).details,
   );
-  const composition = state.attempts[0]?.composition;
-  assert.equal(composition?.state, "retained_not_applied");
+  const composition = required(state.attempts[0]?.composition, "retained-not-applied composition");
+  assert.equal(composition.state, "retained_not_applied");
   assert.equal(
-    await git(f.root, "rev-parse", composition!.retainedRef!),
+    await git(f.root, "rev-parse", required(composition.retainedRef, "retained proposal ref")),
     workerCommit,
   );
   assert.equal(await f.repository.head(), integratedRevision);
-  assert.equal(
-    await readFile(join(f.root, "value.txt"), "utf8"),
-    "integrated\n",
-  );
+  assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "integrated\n");
   assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
   assert.equal(state.attempts[0]?.cleanup?.state, "completed");
   await f.pi.call("workgraph_inspect", { section: "overview" });
-  assert.equal(
-    await f.repository.head(),
-    integratedRevision,
-    "must not reapply",
-  );
+  assert.equal(await f.repository.head(), integratedRevision, "must not reapply");
   return state;
 }
 
-test("registered shared recovery closes an absent worker without touching dirty project files", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered shared recovery closes an absent worker without touching dirty project files", async () => {
   const f = await recoveryFixture();
   try {
     await f.runtime.queue({
@@ -360,7 +388,7 @@ test("registered shared recovery closes an absent worker without touching dirty 
       expectedEvidence: ["Exact bytes"],
     });
     await f.runtime.reconcile();
-    const attempt = (await f.store.load()).attempts[0]!;
+    const attempt = required((await f.store.load()).attempts[0], "queued shared-project attempt");
     assert.equal(attempt.placement?.kind, "shared_project");
     const dirty = join(f.root, "local-edit.txt");
     await writeFile(dirty, "must remain untouched\\n");
@@ -368,16 +396,11 @@ test("registered shared recovery closes an absent worker without touching dirty 
       kind: "research",
       status: "completed",
       summary: "Read exact bytes",
-      evidence: [
-        { label: "value", observation: "value.txt contains before\\n" },
-      ],
+      evidence: [{ label: "value", observation: "value.txt contains before\\n" }],
       findings: [],
     });
     await f.store.beginCleanup({ id: attempt.id, discard: false });
-    await f.store.blockCleanup(
-      attempt.id,
-      "Worker closure bookkeeping interrupted",
-    );
+    await f.store.blockCleanup(attempt.id, "Worker closure bookkeeping interrupted");
     await f.setTransport({ closed: true });
     await f.attachPublic();
     const state = resultState(
@@ -399,7 +422,8 @@ test("registered shared recovery closes an absent worker without touching dirty 
   }
 });
 
-test("registered recover resumes Git cleanup after durable native worker closure", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered recover resumes Git cleanup after durable native worker closure", async () => {
   const { f, attempt } = await prepareBlockedCleanup(false);
   try {
     const state = resultState(
@@ -412,17 +436,16 @@ test("registered recover resumes Git cleanup after durable native worker closure
       ).details,
     );
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-    assert.equal(existsSync(attempt.worktreePath!), false);
-    await assert.rejects(
-      git(f.root, "show-ref", "--verify", `refs/heads/${attempt.branch}`),
-    );
+    assert.equal(existsSync(required(attempt.worktreePath, "cleanup worktree path")), false);
+    await assert.rejects(git(f.root, "show-ref", "--verify", `refs/heads/${attempt.branch}`));
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "before\n");
   } finally {
     await f.dispose();
   }
 });
 
-test("registered recover accepts an exactly attributed worktree and branch already removed", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered recover accepts an exactly attributed worktree and branch already removed", async () => {
   const { f, attempt } = await prepareBlockedCleanup(true);
   try {
     const state = resultState(
@@ -435,11 +458,10 @@ test("registered recover accepts an exactly attributed worktree and branch alrea
       ).details,
     );
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-    assert.equal(existsSync(attempt.worktreePath!), false);
+    const worktreePath = required(attempt.worktreePath, "removed cleanup worktree path");
+    assert.equal(existsSync(worktreePath), false);
     assert.equal(
-      (await git(f.root, "worktree", "list", "--porcelain")).includes(
-        attempt.worktreePath!,
-      ),
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(worktreePath),
       false,
     );
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "before\n");
@@ -448,20 +470,17 @@ test("registered recover accepts an exactly attributed worktree and branch alrea
   }
 });
 
-test("registered recover safely retries a transient Git composition failure and durably attributes the retained proposal", async () => {
-  const { f, attempt, workerCommit } = await prepareBlockedComposition(
-    false,
-    true,
-  );
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered recover safely retries a transient Git composition failure and durably attributes the retained proposal", async () => {
+  const { f, attempt, workerCommit } = await prepareBlockedComposition(false, true);
   try {
-    const blockedView = (
-      await f.pi.call("workgraph_inspect", { section: "overview" })
-    ).details as {
-      inspection: { attention: { items: Array<{ blocker: string }> } };
-    };
+    const blockedView = decodeTestValue(
+      blockedViewSchema,
+      (await f.pi.call("workgraph_inspect", { section: "overview" })).details,
+    );
     assert.equal(blockedView.inspection.attention.items.length, 1);
     assert.match(
-      blockedView.inspection.attention.items[0]!.blocker,
+      required(blockedView.inspection.attention.items[0], "blocked attention item").blocker,
       /Git working tree/,
     );
     const state = resultState(
@@ -475,27 +494,28 @@ test("registered recover safely retries a transient Git composition failure and 
     );
     const composition = state.attempts[0]?.composition;
     assert.equal(composition?.state, "composed", JSON.stringify(state));
-    assert.ok(composition?.revision);
+    const composedRevision = required(composition?.revision, "composed revision");
     assert.equal(
-      await git(f.root, "rev-parse", `${composition.revision}^{tree}`),
+      await git(f.root, "rev-parse", `${composedRevision}^{tree}`),
       await git(f.root, "rev-parse", `${workerCommit}^{tree}`),
       "recovery must compose the exact worker tree, whether Git reuses the commit id or not",
     );
+    assert.equal(composition?.retainedRef, `refs/workgraph-retained/${state.id}/${attempt.id}`);
     assert.equal(
-      composition?.retainedRef,
-      `refs/workgraph-retained/${state.id}/${attempt.id}`,
-    );
-    assert.equal(
-      await git(f.root, "rev-parse", composition!.retainedRef!),
+      await git(
+        f.root,
+        "rev-parse",
+        required(composition?.retainedRef, "composed retained proposal ref"),
+      ),
       workerCommit,
     );
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-    assert.equal(await f.repository.head(), composition.revision);
+    assert.equal(await f.repository.head(), composedRevision);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "worker\n");
     await f.pi.call("workgraph_inspect", { section: "overview" });
     assert.equal(
       await f.repository.head(),
-      composition.revision,
+      composedRevision,
       "later reconciliation must not reapply",
     );
   } finally {
@@ -503,11 +523,9 @@ test("registered recover safely retries a transient Git composition failure and 
   }
 });
 
-test("registered recovery reconciles a proven-absent worker before blocked composition bookkeeping", async () => {
-  const { f, attempt, workerCommit } = await prepareBlockedComposition(
-    false,
-    true,
-  );
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered recovery reconciles a proven-absent worker before blocked composition bookkeeping", async () => {
+  const { f, attempt, workerCommit } = await prepareBlockedComposition(false, true);
   try {
     await f.setTransport({ closed: true });
     const beforeHead = await f.repository.head();
@@ -521,11 +539,15 @@ test("registered recovery reconciles a proven-absent worker before blocked compo
         })
       ).details,
     );
-    const composition = state.attempts[0]?.composition;
-    assert.equal(composition?.state, "composed", JSON.stringify(state));
+    const composition = required(state.attempts[0]?.composition, "recovered composition");
+    assert.equal(composition.state, "composed", JSON.stringify(state));
     assert.notEqual(composition.revision, beforeHead);
     assert.equal(
-      await git(f.root, "rev-parse", composition!.retainedRef!),
+      await git(
+        f.root,
+        "rev-parse",
+        required(composition.retainedRef, "recovered retained proposal ref"),
+      ),
       workerCommit,
     );
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "worker\n");
@@ -539,17 +561,17 @@ test("registered recovery reconciles a proven-absent worker before blocked compo
   }
 });
 
-test("registered absent-worker retain_not_applied preserves integrated HEAD and retained proposal", async () => {
-  const { f, attempt, workerCommit, integratedRevision } =
-    await prepareBlockedComposition(true);
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered absent-worker retain_not_applied preserves integrated HEAD and retained proposal", async () => {
+  const { f, attempt, workerCommit, integratedRevision } = await prepareBlockedComposition(true);
   try {
-    assert.ok(integratedRevision);
+    const integratedHead = required(integratedRevision, "integrated repository revision");
     await f.setTransport({ closed: true });
     await retainNotApplied(
       f,
       attempt,
       workerCommit,
-      integratedRevision!,
+      integratedHead,
       "Integrated change remains authoritative after worker closure",
     );
   } finally {
@@ -557,16 +579,16 @@ test("registered absent-worker retain_not_applied preserves integrated HEAD and 
   }
 });
 
-test("registered retain_not_applied preserves integrated bytes and exact unresolved accounting", async () => {
-  const { f, attempt, workerCommit, integratedRevision } =
-    await prepareBlockedComposition(true);
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered retain_not_applied preserves integrated bytes and exact unresolved accounting", async () => {
+  const { f, attempt, workerCommit, integratedRevision } = await prepareBlockedComposition(true);
   try {
-    assert.ok(integratedRevision);
+    const integratedHead = required(integratedRevision, "integrated repository revision");
     const state = await retainNotApplied(
       f,
       attempt,
       workerCommit,
-      integratedRevision!,
+      integratedHead,
       "Integrated commit is authoritative; worker proposal remains retained",
     );
     const composition = state.attempts[0]?.composition;
@@ -580,23 +602,13 @@ test("registered retain_not_applied preserves integrated bytes and exact unresol
     });
     const again = resultState(againResponse.details);
     assert.equal(again.attempts[0]?.composition?.state, "retained_not_applied");
-    const againView = againResponse.details as {
-      inspection: {
-        tasks: {
-          items: Array<{
-            idPreview: string;
-            attempts: Array<{ outcome?: string }>;
-          }>;
-        };
-      };
-    };
+    const againView = decodeTestValue(taskViewSchema, againResponse.details);
     assert.equal(againView.inspection.tasks.items[0]?.idPreview, "change");
     assert.equal(await f.repository.head(), integratedRevision);
     const unresolved = [
       {
         task: "change",
-        reason:
-          "The conflicting worker proposal was intentionally not applied.",
+        reason: "The conflicting worker proposal was intentionally not applied.",
       },
     ];
     const completed = resultState(
@@ -615,17 +627,17 @@ test("registered retain_not_applied preserves integrated bytes and exact unresol
   }
 });
 
-test("registered recovery rejects live workers and preserves dirty or mismatched resources", async () => {
-  const { f, attempt, integratedRevision } =
-    await prepareBlockedComposition(true);
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered recovery rejects live workers and preserves dirty or mismatched resources", async () => {
+  const { f, attempt, integratedRevision } = await prepareBlockedComposition(true);
   try {
-    assert.ok(integratedRevision);
+    const integratedHead = required(integratedRevision, "integrated repository revision");
     await f.setTransport({ status: "working" });
     await assert.rejects(
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
         attempt: attempt.id,
-        integratedRevision,
+        integratedRevision: integratedHead,
         reason: "Do not recover a working worker",
       }),
       /inspected worker working/,
@@ -638,7 +650,7 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
         attempt: attempt.id,
-        integratedRevision,
+        integratedRevision: integratedHead,
         reason: "Do not recover a mismatched worker",
       }),
       /worker cwd changed/,
@@ -653,7 +665,7 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
         attempt: attempt.id,
-        integratedRevision,
+        integratedRevision: integratedHead,
         reason: "A missing pane with a present tab is ambiguous",
       }),
       /pane_not_found/,
@@ -667,7 +679,7 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
         attempt: attempt.id,
-        integratedRevision,
+        integratedRevision: integratedHead,
         reason: "An ambiguous transport failure is not absence proof",
       }),
       /transport_failure/,
@@ -677,32 +689,29 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
       tabGone: false,
       errorCode: undefined,
     });
-    await writeFile(join(attempt.worktreePath!, "unattributed.txt"), "dirty\n");
+    const worktreePath = required(attempt.worktreePath, "blocked implementation worktree");
+    await writeFile(join(worktreePath, "unattributed.txt"), "dirty\n");
     await assert.rejects(
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
         attempt: attempt.id,
-        integratedRevision,
+        integratedRevision: integratedHead,
         reason: "Dirty worktree remains for inspection",
       }),
       /Git working tree is not clean/,
     );
     const state = await f.store.load();
     assert.equal(state.attempts[0]?.composition?.state, "blocked");
-    assert.equal(
-      existsSync(join(attempt.worktreePath!, "unattributed.txt")),
-      true,
-    );
+    assert.equal(existsSync(join(worktreePath, "unattributed.txt")), true);
   } finally {
     await f.dispose();
   }
 });
 
-test("registered recovery refuses to mutate after its fenced ownership disappears", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered recovery refuses to mutate after its fenced ownership disappears", async () => {
   const { f, attempt } = await prepareBlockedCleanup(false);
-  const registry = new WorkgraphRegistry(
-    join(f.parent, "agent", "workgraph", "registry.sqlite"),
-  );
+  const registry = new WorkgraphRegistry(join(f.parent, "agent", "workgraph", "registry.sqlite"));
   try {
     registry.db.prepare("DELETE FROM leases WHERE run_id=?").run("ws-recovery");
     await assert.rejects(
@@ -715,14 +724,15 @@ test("registered recovery refuses to mutate after its fenced ownership disappear
     );
     const state = await f.store.load();
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
-    assert.equal(existsSync(attempt.worktreePath!), true);
+    assert.equal(existsSync(required(attempt.worktreePath, "blocked cleanup worktree")), true);
   } finally {
     registry.close();
     await f.dispose();
   }
 });
 
-test("registered result and status views retain first presentation and bounded attention history", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered result and status views retain first presentation and bounded attention history", async () => {
   const f = await recoveryFixture();
   try {
     await f.store.assign({
@@ -758,26 +768,29 @@ test("registered result and status views retain first presentation and bounded a
       section: "report",
       maxChars: 1_000,
     });
-    const first = resultState(
-      (await f.pi.call("workgraph_inspect", { section: "overview" })).details,
-    ).deliveries[0]!;
+    const first = required(
+      resultState((await f.pi.call("workgraph_inspect", { section: "overview" })).details)
+        .deliveries[0],
+      "first delivery projection",
+    );
     assert.equal(first.deliveredAt, undefined);
     await f.pi.call("workgraph_inspect", {
       result: "view-result",
       section: "report",
       maxChars: 1_000,
     });
-    const second = resultState(
-      (await f.pi.call("workgraph_inspect", { section: "overview" })).details,
-    ).deliveries[0]!;
+    const second = required(
+      resultState((await f.pi.call("workgraph_inspect", { section: "overview" })).details)
+        .deliveries[0],
+      "second delivery projection",
+    );
     assert.equal(second.deliveredAt, first.deliveredAt);
     assert.equal(second.failureHistory?.length, 2);
     const status = await f.pi.call("workgraph_inspect", {
       section: "outcome",
       result: "view-result",
     });
-    const view = (status.details as { inspection: { result: string } })
-      .inspection;
+    const view = decodeTestValue(outcomeViewSchema, status.details).inspection;
     assert.equal(view.result, "outcome-1");
   } finally {
     await f.dispose();

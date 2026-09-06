@@ -1,25 +1,67 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Coordinator integration fixtures use real host storage.
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are real Git and session identities.
 import { join } from "node:path";
 import test from "node:test";
+import { Type } from "typebox";
 import { GitRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { WorkstreamStore } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
 import {
-  extensionFixture,
-  git,
-  researchReport,
-  resultState,
-} from "./helpers.js";
+  configureFixtureEnvironment,
+  decodeTestValue,
+  required,
+  restoreFixtureEnvironment,
+} from "./decoders.js";
+import { extensionFixture, git, researchReport, resultState } from "./helpers.js";
 
-function record(value: unknown): Record<string, unknown> {
-  assert.ok(value && typeof value === "object" && !Array.isArray(value));
-  return value as Record<string, unknown>;
-}
+const textContentSchema = Type.Object({ type: Type.Literal("text"), text: Type.String() });
+const actionDetailsSchema = Type.Object({
+  view: Type.Object({
+    action: Type.Object({ name: Type.String() }),
+    affected: Type.Object({
+      task: Type.Object({ idPreview: Type.String() }),
+      attempt: Type.Object({
+        models: Type.Object({
+          selected: Type.Object({ guide: Type.Object({ model: Type.String() }) }),
+        }),
+      }),
+    }),
+  }),
+});
+const overviewDetailsSchema = Type.Object({
+  inspection: Type.Object({
+    tasks: Type.Object({ totalItems: Type.Number() }),
+    attention: Type.Object({ items: Type.Array(Type.Object({})) }),
+  }),
+});
+const resultDetailsSchema = Type.Object({
+  inspection: Type.Object({
+    report: Type.Object({ summary: Type.String() }),
+    fullReport: Type.Object({}),
+    fullEvidence: Type.Object({}),
+  }),
+});
+const contentDetailsSchema = Type.Object({
+  inspection: Type.Object({
+    content: Type.Object({
+      offset: Type.Number(),
+      truncated: Type.Boolean(),
+      next: Type.Optional(Type.Object({ offset: Type.Number() })),
+    }),
+  }),
+});
+const persistedHeaderSchema = Type.Object({
+  format: Type.String(),
+  version: Type.Number(),
+  id: Type.String(),
+});
 
+// oxlint-disable-next-line effecttsgo/async-function -- The node:test fixture composes native Promise-based Git, filesystem, and Pi adapters.
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-coordinator-"));
   const root = join(parent, "repo");
@@ -30,26 +72,27 @@ async function fixture() {
   await writeFile(join(root, "value.txt"), "before\n");
   await git(root, "add", ".");
   await git(root, "commit", "-m", "Fixture");
-  const previous = { ...process.env };
-  process.env.PI_CODING_AGENT_DIR = join(parent, "agent");
-  delete process.env.PI_WORKGRAPH_MODE;
-  delete process.env.HERDR_ENV;
-  delete process.env.HERDR_WORKSPACE_ID;
+  const previous = configureFixtureEnvironment({
+    PI_CODING_AGENT_DIR: join(parent, "agent"),
+    PI_WORKGRAPH_MODE: null,
+    HERDR_ENV: null,
+    HERDR_WORKSPACE_ID: null,
+  });
   const pi = await extensionFixture("coordinator", root, parent);
   return {
     ...pi,
     root,
     parent,
+    // oxlint-disable-next-line effecttsgo/async-function -- Fixture teardown must await native Pi and filesystem cleanup.
     async dispose() {
       await pi.close();
-      for (const key of Object.keys(process.env))
-        if (!(key in previous)) delete process.env[key];
-      Object.assign(process.env, previous);
+      restoreFixtureEnvironment(previous);
       await rm(parent, { recursive: true, force: true });
     },
   };
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- This fixture helper composes the Promise APIs under test.
 async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
   const repository = await GitRepository.open(f.root);
   const created = await WorkstreamStore.create({
@@ -59,7 +102,7 @@ async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
     gitCommonDir: repository.commonDir,
     coordinator: {
       sessionId: f.session.getSessionId(),
-      sessionFile: f.session.getSessionFile()!,
+      sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
     },
   });
   f.session.appendCustomEntry("pi-workgraph-workstream", {
@@ -69,7 +112,8 @@ async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
   return created.state;
 }
 
-test("registered capability tools create work implicitly and retain only human input as authority across reload", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered capability tools create work implicitly and retain only human input as authority across reload", async () => {
   const f = await fixture();
   try {
     const initial = resultState(
@@ -88,18 +132,9 @@ test("registered capability tools create work implicitly and retain only human i
       acceptance: ["Correct bytes"],
     };
     await f.runner.emitInput("Implement a change", undefined, "extension");
-    await assert.rejects(
-      f.call("workgraph_implement", request),
-      /actual retained human input/,
-    );
-    await f.runner.emitInput(
-      "Implement the maintained value change",
-      undefined,
-      "interactive",
-    );
-    const authorized = resultState(
-      (await f.call("workgraph_implement", request)).details,
-    );
+    await assert.rejects(f.call("workgraph_implement", request), /actual retained human input/);
+    await f.runner.emitInput("Implement the maintained value change", undefined, "interactive");
+    const authorized = resultState((await f.call("workgraph_implement", request)).details);
     assert.equal(authorized.inputs.length, 1);
     assert.equal(authorized.intents.at(-1)?.version, 1);
     await f.call("workgraph_control", {
@@ -126,12 +161,11 @@ test("registered capability tools create work implicitly and retain only human i
   }
 });
 
-test("failed registered adoption preserves the attached runtime lease; same-target attachment reuses it", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("failed registered adoption preserves the attached runtime lease; same-target attachment reuses it", async () => {
   const f = await fixture();
   let competing: WorkstreamRuntime | undefined;
-  const registry = new WorkgraphRegistry(
-    join(f.parent, "agent", "workgraph", "registry.sqlite"),
-  );
+  const registry = new WorkgraphRegistry(join(f.parent, "agent", "workgraph", "registry.sqlite"));
   try {
     const a = await emptyWorkstream(f);
     const repository = await GitRepository.open(f.root);
@@ -155,21 +189,14 @@ test("failed registered adoption preserves the attached runtime lease; same-targ
       () => {},
       { registry },
     );
-    await competing.perform(async () => undefined);
-    await assert.rejects(
-      f.call("workgraph_adopt", { statePath: store.path }),
-      /runtime owner/,
-    );
+    await competing.perform(() => Promise.resolve());
+    await assert.rejects(f.call("workgraph_adopt", { statePath: store.path }), /runtime owner/);
     assert.equal(
-      resultState(
-        (await f.call("workgraph_inspect", { section: "overview" })).details,
-      ).id,
+      resultState((await f.call("workgraph_inspect", { section: "overview" })).details).id,
       a.id,
     );
     assert.throws(() => registry.acquire(a.id, a.coordinator), /runtime owner/);
-    const same = resultState(
-      (await f.call("workgraph_adopt", { statePath: a.statePath })).details,
-    );
+    const same = resultState((await f.call("workgraph_adopt", { statePath: a.statePath })).details);
     assert.equal(same.id, a.id);
     await f.call("workgraph_control", {
       action: "suspend",
@@ -190,7 +217,8 @@ test("failed registered adoption preserves the attached runtime lease; same-targ
   }
 });
 
-test("mutation responses stay action-focused while retaining handles, models, and exact read paths", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("mutation responses stay action-focused while retaining handles, models, and exact read paths", async () => {
   const f = await fixture();
   try {
     const first = await f.call("workgraph_research", {
@@ -201,27 +229,18 @@ test("mutation responses stay action-focused while retaining handles, models, an
       modelReason: "The regression checks selected model provenance.",
       thinking: "low",
     });
-    const firstText =
-      first.content[0] && "text" in first.content[0]
-        ? first.content[0].text
-        : "";
-    const firstDetails = record(first.details);
-    const firstView = record(firstDetails.view);
-    const firstAffected = record(firstView.affected);
-    const firstAssignment = record(firstAffected.task);
-    const firstAttempt = record(firstAffected.attempt);
-    const firstModels = record(firstAttempt.models);
-    const firstGuide = record(record(firstModels.selected).guide);
-    assert.equal(record(firstView.action).name, "workgraph_research");
-    assert.equal(firstAssignment.idPreview, "focused-research");
-    assert.equal(firstGuide.model, "fixture/research");
+    const firstText = decodeTestValue(textContentSchema, first.content[0]).text;
+    const firstView = decodeTestValue(actionDetailsSchema, first.details).view;
+    assert.equal(firstView.action.name, "workgraph_research");
+    assert.equal(firstView.affected.task.idPreview, "focused-research");
+    assert.equal(firstView.affected.attempt.models.selected.guide.model, "fixture/research");
     assert.match(firstText, /focused-research/);
     assert.doesNotMatch(firstText, /"assignments":\s*\[/);
 
     const initial = resultState(first.details);
     const owner = {
       sessionId: f.session.getSessionId(),
-      sessionFile: f.session.getSessionFile()!,
+      sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
     };
     const store = WorkstreamStore.open(initial.statePath, owner);
     for (let index = 0; index < 12; index++) {
@@ -237,27 +256,25 @@ test("mutation responses stay action-focused while retaining handles, models, an
     const later = await f.call("workgraph_inspect", {
       section: "overview",
     });
-    const laterText =
-      later.content[0] && "text" in later.content[0]
-        ? later.content[0].text
-        : "";
+    const laterText = decodeTestValue(textContentSchema, later.content[0]).text;
     assert.ok(laterText.length < 8_000);
     assert.match(laterText, /Unrelated history 0/);
-    const laterView = record(record(later.details).inspection);
-    assert.equal(record(laterView.tasks).totalItems, 13);
-    assert.deepEqual(record(laterView.attention).items, []);
+    const laterView = decodeTestValue(overviewDetailsSchema, later.details).inspection;
+    assert.equal(laterView.tasks.totalItems, 13);
+    assert.deepEqual(laterView.attention.items, []);
   } finally {
     await f.dispose();
   }
 });
 
-test("registered status stays compact and focused result retrieval projects bounded sections", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered status stays compact and focused result retrieval projects bounded sections", async () => {
   const f = await fixture();
   try {
     const initial = await emptyWorkstream(f);
     const owner = {
       sessionId: f.session.getSessionId(),
-      sessionFile: f.session.getSessionFile()!,
+      sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
     };
     const store = WorkstreamStore.open(initial.statePath, owner);
     const longObjective = `Retain bounded evidence ${"full assignment brief ".repeat(500)}`;
@@ -289,9 +306,7 @@ test("registered status stays compact and focused result retrieval projects boun
       },
     });
     const status = await f.call("workgraph_inspect", { section: "overview" });
-    const statusContent = status.content[0];
-    const statusText =
-      statusContent && "text" in statusContent ? statusContent.text : "";
+    const statusText = decodeTestValue(textContentSchema, status.content[0]).text;
     assert.match(statusText, /large-result/);
     assert.doesNotMatch(statusText, /observation-0/);
     assert.equal(statusText.includes(longObjective), false);
@@ -301,15 +316,10 @@ test("registered status stays compact and focused result retrieval projects boun
       result: "large-result-1",
       maxChars: 100,
     });
-    const defaultView = record(record(defaultResult.details).inspection);
-    const defaultReport = record(defaultView.report);
-    assert.equal(defaultReport.summary, "A bounded summary");
-    assert.ok(record(defaultView.fullReport));
-    assert.ok(record(defaultView.fullEvidence));
+    const defaultView = decodeTestValue(resultDetailsSchema, defaultResult.details).inspection;
+    assert.equal(defaultView.report.summary, "A bounded summary");
     assert.match(
-      defaultResult.content[0] && "text" in defaultResult.content[0]
-        ? defaultResult.content[0].text
-        : "",
+      decodeTestValue(textContentSchema, defaultResult.content[0]).text,
       /large-result-1/,
     );
     const evidence = await f.call("workgraph_inspect", {
@@ -318,25 +328,22 @@ test("registered status stays compact and focused result retrieval projects boun
       offset: 2,
       maxChars: 100,
     });
-    const evidenceDetails = record(evidence.details);
-    const evidenceView = record(evidenceDetails.inspection);
-    const evidenceContent = record(evidenceView.content);
+    const evidenceContent = decodeTestValue(contentDetailsSchema, evidence.details).inspection
+      .content;
     assert.equal(evidenceContent.offset, 2);
     assert.equal(evidenceContent.truncated, true);
-    assert.ok(record(evidenceContent.next));
+    assert.equal(required(evidenceContent.next, "next evidence page").offset > 2, true);
     const findings = await f.call("workgraph_inspect", {
       section: "evidence",
       result: "large-result-1",
       offset: 0,
       maxChars: 100,
     });
-    const findingsView = record(record(findings.details).inspection);
-    const findingsContent = record(findingsView.content);
+    const findingsContent = decodeTestValue(contentDetailsSchema, findings.details).inspection
+      .content;
     assert.equal(findingsContent.offset, 0);
     assert.equal(findingsContent.truncated, true);
-    const state = resultState(
-      (await f.call("workgraph_inspect", { section: "overview" })).details,
-    );
+    const state = resultState((await f.call("workgraph_inspect", { section: "overview" })).details);
     assert.equal(state.deliveries.length, 0);
     const completed = resultState(
       (
@@ -359,11 +366,10 @@ test("registered status stays compact and focused result retrieval projects boun
   }
 });
 
-test("registered session_start safely inspects retained and pointed workstreams", async () => {
-  async function createState(
-    f: Awaited<ReturnType<typeof fixture>>,
-    id: string,
-  ) {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered session_start safely inspects retained and pointed workstreams", async () => {
+  // oxlint-disable-next-line effecttsgo/async-function -- This local fixture helper composes the Promise APIs under test.
+  async function createState(f: Awaited<ReturnType<typeof fixture>>, id: string) {
     const repository = await GitRepository.open(f.root);
     return WorkstreamStore.create({
       id,
@@ -372,7 +378,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
       gitCommonDir: repository.commonDir,
       coordinator: {
         sessionId: f.session.getSessionId(),
-        sessionFile: f.session.getSessionFile()!,
+        sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
       },
     });
   }
@@ -381,21 +387,25 @@ test("registered session_start safely inspects retained and pointed workstreams"
     const f = await fixture();
     try {
       const { state } = await createState(f, "legacy-terminal");
-      const legacy = JSON.parse(
-        await readFile(state.statePath, "utf8"),
-      ) as Record<string, unknown>;
-      legacy.version = 3;
-      legacy.lifecycle = {
-        state: "completed",
-        changedAt: "2026-09-05T12:00:00.000Z",
-        reason: "Retained legacy completion fixture.",
-      };
-      legacy.completion = {
-        conclusion: "A bounded historical completion.",
-        evidence: [{ label: "fixture", observation: "bounded" }],
-        limitations: [],
-        unresolvedAssignmentIds: [],
-        completedAt: "2026-09-05T12:00:00.000Z",
+      const current = decodeTestValue(
+        persistedHeaderSchema,
+        JSON.parse(await readFile(state.statePath, "utf8")),
+      );
+      const legacy = {
+        ...current,
+        version: 3,
+        lifecycle: {
+          state: "completed",
+          changedAt: "2026-09-05T12:00:00.000Z",
+          reason: "Retained legacy completion fixture.",
+        },
+        completion: {
+          conclusion: "A bounded historical completion.",
+          evidence: [{ label: "fixture", observation: "bounded" }],
+          limitations: [],
+          unresolvedAssignmentIds: [],
+          completedAt: "2026-09-05T12:00:00.000Z",
+        },
       };
       await writeFile(state.statePath, `${JSON.stringify(legacy, null, 2)}\n`);
       const before = await readFile(state.statePath);
@@ -407,9 +417,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
         path: state.statePath,
       });
       await f.runner.emit({ type: "session_start", reason: "reload" });
-      const inspection = await WorkstreamStore.inspectForReattachment(
-        state.statePath,
-      );
+      const inspection = await WorkstreamStore.inspectForReattachment(state.statePath);
       assert.equal(inspection.kind, "retained_terminal");
       assert.equal(
         f.notifications.some((notification) => notification.type === "warning"),
@@ -436,10 +444,11 @@ test("registered session_start safely inspects retained and pointed workstreams"
     const f = await fixture();
     try {
       const { state } = await createState(f, "legacy-active");
-      const legacy = JSON.parse(
-        await readFile(state.statePath, "utf8"),
-      ) as Record<string, unknown>;
-      legacy.version = 3;
+      const current = decodeTestValue(
+        persistedHeaderSchema,
+        JSON.parse(await readFile(state.statePath, "utf8")),
+      );
+      const legacy = { ...current, version: 3 };
       await writeFile(state.statePath, `${JSON.stringify(legacy, null, 2)}\n`);
       f.session.appendCustomEntry("pi-workgraph-workstream", {
         path: state.statePath,
@@ -535,13 +544,12 @@ test("registered session_start safely inspects retained and pointed workstreams"
     const f = await fixture();
     try {
       const { state: created } = await createState(f, "current-terminal");
-      const state = await WorkstreamStore.open(
-        created.statePath,
-        created.coordinator,
-      ).setLifecycle({
-        state: "abandoned",
-        reason: "Current terminal startup fixture.",
-      });
+      const state = await WorkstreamStore.open(created.statePath, created.coordinator).setLifecycle(
+        {
+          state: "abandoned",
+          reason: "Current terminal startup fixture.",
+        },
+      );
       f.session.appendCustomEntry("pi-workgraph-workstream", {
         path: state.statePath,
       });
@@ -556,7 +564,8 @@ test("registered session_start safely inspects retained and pointed workstreams"
   }
 });
 
-test("registered model policy get/set affects later assignments but not overrides or coordinator selection", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("registered model policy get/set affects later assignments but not overrides or coordinator selection", async () => {
   const f = await fixture();
   try {
     await f.call("workgraph_models", { action: "get" });

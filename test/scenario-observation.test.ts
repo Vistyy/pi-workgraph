@@ -8,9 +8,12 @@ import {
   observeDirectEffect,
 } from "../scripts/coordinator-observation.js";
 import { WorkstreamStore } from "../src/workstream.js";
+import { required } from "./decoders.js";
 import { usage } from "./helpers.js";
 
 const request = "Inspect the fixture.";
+const fixtureTimestamp = 1_788_235_200_000;
+const fixtureInstant = "2026-09-01T00:00:00.000Z";
 
 function settledAssistant(session: SessionManager, text = "Completed.") {
   session.appendMessage({
@@ -21,14 +24,11 @@ function settledAssistant(session: SessionManager, text = "Completed.") {
     model: "fixture",
     usage,
     stopReason: "stop",
-    timestamp: Date.now(),
+    timestamp: fixtureTimestamp,
   });
 }
 
-function failedAssistant(
-  session: SessionManager,
-  stopReason: "error" | "aborted" | "length",
-) {
+function failedAssistant(session: SessionManager, stopReason: "error" | "aborted" | "length") {
   session.appendMessage({
     role: "assistant",
     content: [{ type: "text", text: "Unable to continue." }],
@@ -37,7 +37,7 @@ function failedAssistant(
     model: "fixture",
     usage,
     stopReason,
-    timestamp: Date.now(),
+    timestamp: fixtureTimestamp,
   });
 }
 
@@ -55,7 +55,7 @@ function baseState() {
   });
 }
 
-test("direct native outcome accepts the authorized tracked edit and rejects untracked effects", () => {
+void test("direct native outcome accepts the authorized tracked edit and rejects untracked effects", () => {
   const before = new Map([
     ["README.md", "cmVhZG1l"],
     ["value.txt", "YmVmb3JlCg=="],
@@ -74,9 +74,10 @@ test("direct native outcome accepts the authorized tracked edit and rejects untr
   assert.deepEqual(rejected.changedPaths, ["probe.txt", "value.txt"]);
 });
 
-test("delegated native outcome requires attributable composition, cleanup, and retained experiment output", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("delegated native outcome requires attributable composition, cleanup, and retained experiment output", async () => {
   const { state } = await baseState();
-  const now = new Date().toISOString();
+  const now = fixtureInstant;
   state.lifecycle = { state: "completed", changedAt: now, reason: "done" };
   state.assignments.push(
     {
@@ -211,9 +212,10 @@ test("delegated native outcome requires attributable composition, cleanup, and r
   assert.equal(result.experiment, "verified");
 });
 
-test("natural observer accepts read-only delegation followed by a direct edit and rejects unaccounted effects", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+void test("natural observer accepts read-only delegation followed by a direct edit and rejects unaccounted effects", async () => {
   const { state } = await baseState();
-  const now = new Date().toISOString();
+  const now = fixtureInstant;
   state.lifecycle = { state: "completed", changedAt: now, reason: "done" };
   state.assignments.push({
     id: "research",
@@ -265,58 +267,40 @@ test("natural observer accepts read-only delegation followed by a direct edit an
   });
   const before = new Map([["value.txt", "YmVmb3JlCg=="]]);
   const after = new Map([["value.txt", "YWZ0ZXIK"]]);
-  const mixed = observeDelegatedOutcome(
-    state,
-    observeDirectEffect(before, after, "YWZ0ZXIK"),
-  );
+  const mixed = observeDelegatedOutcome(state, observeDirectEffect(before, after, "YWZ0ZXIK"));
   assert.equal(mixed.valid, true, mixed.detail);
   assert.equal(mixed.delegationExercised, true);
   assert.equal(mixed.implementationOrigin, "direct");
 
   const unauthorized = observeDelegatedOutcome(
     state,
-    observeDirectEffect(
-      before,
-      new Map([...after, ["probe.txt", "c2NyYXRjaA=="]]),
-      "YWZ0ZXIK",
-    ),
+    observeDirectEffect(before, new Map([...after, ["probe.txt", "c2NyYXRjaA=="]]), "YWZ0ZXIK"),
   );
   assert.equal(unauthorized.valid, false);
 
-  state.attempts[0]!.state = "running";
+  const researchAttempt = required(state.attempts[0], "settled research attempt");
+  researchAttempt.state = "running";
   assert.equal(
-    observeDelegatedOutcome(
-      state,
-      observeDirectEffect(before, after, "YWZ0ZXIK"),
-    ).valid,
+    observeDelegatedOutcome(state, observeDirectEffect(before, after, "YWZ0ZXIK")).valid,
     false,
   );
-  state.attempts[0]!.state = "settled";
-  delete state.attempts[0]!.worker;
+  researchAttempt.state = "settled";
+  delete researchAttempt.worker;
   assert.equal(
-    observeDelegatedOutcome(
-      state,
-      observeDirectEffect(before, after, "YWZ0ZXIK"),
-    ).valid,
+    observeDelegatedOutcome(state, observeDirectEffect(before, after, "YWZ0ZXIK")).valid,
     false,
   );
 });
 
-test("native observer requires request progression and reports early blocker or incomplete turns promptly", () => {
+void test("native observer requires request progression and reports early blocker or incomplete turns promptly", () => {
   const session = SessionManager.inMemory();
-  assert.equal(
-    observeCoordinatorTurn(session.getBranch(), request).state,
-    "waiting",
-  );
+  assert.equal(observeCoordinatorTurn(session.getBranch(), request).state, "waiting");
   session.appendMessage({
     role: "user",
     content: request,
-    timestamp: Date.now(),
+    timestamp: fixtureTimestamp,
   });
-  assert.equal(
-    observeCoordinatorTurn(session.getBranch(), request).state,
-    "waiting",
-  );
+  assert.equal(observeCoordinatorTurn(session.getBranch(), request).state, "waiting");
   failedAssistant(session, "length");
   const incomplete = observeCoordinatorTurn(session.getBranch(), request);
   assert.equal(incomplete.state, "failed");
@@ -325,24 +309,18 @@ test("native observer requires request progression and reports early blocker or 
   settled.appendMessage({
     role: "user",
     content: request,
-    timestamp: Date.now(),
+    timestamp: fixtureTimestamp,
   });
   settledAssistant(settled);
-  assert.equal(
-    observeCoordinatorTurn(settled.getBranch(), request).state,
-    "settled",
-  );
+  assert.equal(observeCoordinatorTurn(settled.getBranch(), request).state, "settled");
 
   const blocked = SessionManager.inMemory();
   blocked.appendMessage({
     role: "user",
     content: request,
-    timestamp: Date.now(),
+    timestamp: fixtureTimestamp,
   });
-  settledAssistant(
-    blocked,
-    "I cannot complete the request because access is unavailable.",
-  );
+  settledAssistant(blocked, "I cannot complete the request because access is unavailable.");
   const blocker = observeCoordinatorTurn(blocked.getBranch(), request);
   assert.equal(blocker.state, "blocked");
 
@@ -350,7 +328,7 @@ test("native observer requires request progression and reports early blocker or 
   failed.appendMessage({
     role: "user",
     content: request,
-    timestamp: Date.now(),
+    timestamp: fixtureTimestamp,
   });
   failedAssistant(failed, "error");
   const failure = observeCoordinatorTurn(failed.getBranch(), request);
