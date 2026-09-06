@@ -7,9 +7,12 @@ import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are exact native Herdr resource identities.
 import { join } from "node:path";
 import test from "node:test";
+import { Effect } from "effect";
 import {
   CoordinatorLaunchError,
+  HERDR_PROTOCOL_OUTPUT_LIMIT,
   HerdrCliRuntime,
+  HerdrProtocolError,
   herdrAgentName,
   herdrCoordinatorNames,
   herdrWorkerName,
@@ -234,6 +237,18 @@ await test("exact worker recover succeeds despite unrelated unnamed snapshot ent
     );
     assert.equal(await runtime.recover(request), undefined);
 
+    await writeFile(responsePath, JSON.stringify([]));
+    assert.equal(await runtime.recover({ ...request, resource: identity }), undefined);
+
+    // SAFETY: This mutable partial fixture intentionally removes native session evidence.
+    const noNativeIdentity = structuredClone(exactWorker) as Partial<typeof exactWorker>;
+    delete noNativeIdentity.agent_session;
+    await writeFile(responsePath, JSON.stringify([unrelatedUnnamed, noNativeIdentity]));
+    await assert.rejects(
+      () => runtime.recover({ ...request, resource: identity }),
+      /still has no native Pi session identity/,
+    );
+
     // SAFETY: This intentionally incomplete protocol fixture verifies that a matching worker is not converted without exact identity fields.
     const malformedWorker = structuredClone(exactWorker) as Partial<typeof exactWorker>;
     delete malformedWorker.terminal_id;
@@ -297,8 +312,8 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    // biome-ignore lint/style/noNonNullAssertion: The preceding fixture command assertion establishes that this call was recorded.
-    const create = calls.find((args) => args[0] === "workspace" && args[1] === "create")!;
+    const create = calls.find((args) => args[0] === "workspace" && args[1] === "create");
+    assert.ok(create, "workspace creation command was recorded");
     assert.equal(create.includes("--workspace"), false);
     assert.equal(create.includes("--no-focus"), true);
     assert.ok(create.includes(`PI_CODING_AGENT_DIR=${join(parent, "private-agent")}`));
@@ -311,8 +326,8 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       "PI_WORKGRAPH_EXECUTOR_THINKING",
     ])
       assert.ok(create.includes(`${key}=`));
-    // biome-ignore lint/style/noNonNullAssertion: The preceding fixture command assertion establishes that this call was recorded.
-    const start = calls.find((args) => args[0] === "agent" && args[1] === "start")!;
+    const start = calls.find((args) => args[0] === "agent" && args[1] === "start");
+    assert.ok(start, "agent start command was recorded");
     assert.deepEqual(start.slice(0, 7), [
       "agent",
       "start",
@@ -459,6 +474,7 @@ await test("the Herdr adapter launches without waiting and validates exact ident
       HERDR_WORKSPACE_ID: "workspace-1",
     });
     let retained: WorkerIdentity | undefined;
+    const callbackSequence: string[] = [];
     const observation = await runtime.launch({
       workspaceId: "workspace-1",
       ...naming,
@@ -466,14 +482,30 @@ await test("the Herdr adapter launches without waiting and validates exact ident
       sessionFile,
       prompt: "Continue now.",
       env: { PI_WORKGRAPH_MODE: "implementation" },
+      onTab(tab) {
+        callbackSequence.push(`tab:${tab.paneId}`);
+      },
+      onResource(resource) {
+        callbackSequence.push(`resource:${resource.terminalId}`);
+      },
       onIdentity(identity) {
         retained = identity;
+        callbackSequence.push(`identity:${identity.sessionFile}`);
+      },
+      onSubmitted() {
+        callbackSequence.push("submitted");
       },
     });
     assert.deepEqual(retained, observation.identity);
     assert.equal(observation.identity.workspaceId, "workspace-1");
     assert.equal(observation.identity.paneId, "workspace-1:pane-1");
     assert.equal(observation.identity.sessionFile, sessionFile);
+    assert.deepEqual(callbackSequence, [
+      `tab:${observation.identity.paneId}`,
+      `resource:${observation.identity.terminalId}`,
+      `identity:${sessionFile}`,
+      "submitted",
+    ]);
     const recovered = await runtime.recover({
       workspaceId: "workspace-1",
       agentName: herdrWorkerName({
@@ -498,11 +530,11 @@ await test("the Herdr adapter launches without waiting and validates exact ident
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    // biome-ignore lint/style/noNonNullAssertion: The preceding fixture command assertion establishes that this call was recorded.
-    const prompt = calls.find((args) => args[0] === "agent" && args[1] === "prompt")!;
+    const prompt = calls.find((args) => args[0] === "agent" && args[1] === "prompt");
+    assert.ok(prompt, "agent prompt command was recorded");
     assert.equal(prompt.includes("--wait"), false);
-    // biome-ignore lint/style/noNonNullAssertion: The preceding fixture command assertion establishes that this call was recorded.
-    const tabCreate = calls.find((args) => args[0] === "tab" && args[1] === "create")!;
+    const tabCreate = calls.find((args) => args[0] === "tab" && args[1] === "create");
+    assert.ok(tabCreate, "tab creation command was recorded");
     assert.ok(tabCreate.includes(herdrWorkerTabLabel(naming)));
     assert.deepEqual(
       calls.find((args) => args[0] === "agent" && args[1] === "send-keys")?.slice(-1),
@@ -756,3 +788,164 @@ else console.log(JSON.stringify({result:{accepted:true}}));
     await rm(parent, { recursive: true, force: true });
   }
 });
+
+await test("Herdr exposes one Effect-native primary operations port", () => {
+  const runtime = new HerdrCliRuntime("unused", {
+    HERDR_ENV: "1",
+    HERDR_WORKSPACE_ID: "workspace-1",
+  });
+  assert.deepEqual(Object.keys(runtime.effects), [
+    "launchCoordinator",
+    "coordinatorLiveness",
+    "observeCurrentCoordinator",
+    "launch",
+    "recover",
+    "inspectLaunch",
+    "inspect",
+    "observe",
+    "interrupt",
+    "steer",
+    "cleanup",
+  ]);
+  assert.equal("effect" in runtime, false);
+});
+
+await test("bounded protocol output fails before a valid truncated JSON suffix can imply absence", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-herdr-protocol-bound-"));
+  const command = join(parent, "fake-herdr-bound.mjs");
+  const mode = join(parent, "mode");
+  const cwd = join(parent, "worktree");
+  const identity: WorkerIdentity = {
+    workspaceId: "workspace-1",
+    tabId: "workspace-1:tab-1",
+    paneId: "workspace-1:pane-1",
+    terminalId: "terminal-1",
+    agentName: "owned-worker",
+    sessionFile: join(parent, "worker.jsonl"),
+    cwd,
+  };
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+const mode = readFileSync(${JSON.stringify(mode)}, "utf8");
+if (mode === "overflow") {
+  process.stdout.write(" ".repeat(${HERDR_PROTOCOL_OUTPUT_LIMIT + 128}) + JSON.stringify({error:{code:"pane_not_found",message:"gone"}}));
+  process.exitCode = 1;
+} else {
+  process.stdout.write("{malformed");
+}
+`,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, {
+    HERDR_ENV: "1",
+    HERDR_WORKSPACE_ID: identity.workspaceId,
+  });
+  try {
+    await writeFile(mode, "overflow");
+    await assert.rejects(
+      () => Effect.runPromise(runtime.effects.inspect(identity)),
+      (error) => {
+        assert.ok(error instanceof HerdrProtocolError);
+        assert.equal(error.reason, "overflow");
+        assert.match(error.message, /no truncated JSON was decoded/);
+        return true;
+      },
+    );
+
+    await writeFile(mode, "malformed");
+    await assert.rejects(
+      () => Effect.runPromise(runtime.effects.observe(identity)),
+      (error) => {
+        assert.ok(error instanceof HerdrProtocolError);
+        assert.equal(error.reason, "malformed");
+        return true;
+      },
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+await test("cancelling Effect-native readiness terminates its owned native child", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-herdr-cancel-readiness-"));
+  const command = join(parent, "fake-herdr-cancel.mjs");
+  const getStarted = join(parent, "get-started");
+  const terminated = join(parent, "terminated");
+  const cwd = join(parent, "worktree");
+  const sessionFile = join(parent, "worker.jsonl");
+  const agentName = herdrAgentName("run", "node", "attempt");
+  const resource = {
+    workspace_id: "workspace-1",
+    tab_id: "workspace-1:tab-1",
+    pane_id: "workspace-1:pane-1",
+    terminal_id: "terminal-1",
+    agent_status: "idle",
+    name: agentName,
+    cwd,
+  };
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { appendFileSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+if (args[0] === "tab") console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-1"}}}));
+else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:${JSON.stringify(resource)}}}));
+else if (args[0] === "agent" && args[1] === "get") {
+  writeFileSync(${JSON.stringify(getStarted)}, "started");
+  process.on("SIGTERM", () => { appendFileSync(${JSON.stringify(terminated)}, "terminated"); process.exit(0); });
+  setInterval(() => {}, 1000);
+}
+`,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, {
+    HERDR_ENV: "1",
+    HERDR_WORKSPACE_ID: resource.workspace_id,
+  });
+  const controller = new AbortController();
+  const callbacks: string[] = [];
+  try {
+    const running = Effect.runPromise(
+      runtime.effects.launch({
+        workspaceId: resource.workspace_id,
+        runId: "run",
+        nodeId: "node",
+        attemptId: "attempt",
+        cwd,
+        sessionFile,
+        env: {},
+        onTab() {
+          callbacks.push("tab");
+        },
+        onResource() {
+          callbacks.push("resource");
+        },
+        onIdentity() {
+          callbacks.push("identity");
+        },
+        onSubmitted() {
+          callbacks.push("submitted");
+        },
+      }),
+      { signal: controller.signal },
+    );
+    await waitForPath(getStarted);
+    controller.abort();
+    await assert.rejects(running);
+    assert.equal(await readFile(terminated, "utf8"), "terminated");
+    assert.deepEqual(callbacks, ["tab", "resource"]);
+  } finally {
+    controller.abort();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+async function waitForPath(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (existsSync(path)) return;
+    await Effect.runPromise(Effect.sleep(10));
+  }
+  throw new Error(`Timed out waiting for ${path}.`);
+}
