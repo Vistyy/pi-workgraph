@@ -35,6 +35,16 @@ export interface ActionProjectionOptions {
   attemptId?: string;
   resultId?: string;
   outcome?: string;
+  authorityContext?: {
+    selectedScope: {
+      intentVersion: number;
+      authorityReceiptId: string;
+    };
+    latestObservedInput?: {
+      receiptId: string;
+      source: "interactive" | "rpc";
+    };
+  };
 }
 
 interface RetrievalTarget {
@@ -545,9 +555,11 @@ function judgmentSelection(state: WorkstreamState, request: InspectRequest) {
     return { dispositions: state.dispositions, retrieval: { section: "judgments" as const } };
   const selection = resolveSelection(state, request);
   const resultIds =
-    selection.outcome === undefined
-      ? new Set(selection.taskOutcomes.map((result) => result.id))
-      : new Set([selection.outcome.id]);
+    selection.outcome !== undefined
+      ? new Set([selection.outcome.id])
+      : selection.attempt !== undefined
+        ? new Set<string>()
+        : new Set(selection.taskOutcomes.map((result) => result.id));
   const retrieval: RetrievalTarget = { section: "judgments" };
   if (request.task !== undefined) retrieval.task = request.task;
   if (request.attempt !== undefined) retrieval.attempt = request.attempt;
@@ -1020,6 +1032,7 @@ export function actionView(state: WorkstreamState, options: ActionProjectionOpti
       name: compactText(options.action, 120),
       outcome: options.outcome === undefined ? undefined : compactText(options.outcome, 120),
       message: options.message === undefined ? undefined : compactText(options.message, 280),
+      authorityContext: options.authorityContext,
     },
     affected: {
       task: affectedTask === undefined ? undefined : taskPreview(state, affectedTask),

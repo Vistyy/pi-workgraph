@@ -44,10 +44,10 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 | Tool | Purpose |
 | --- | --- |
 | `workgraph_research` | Delegate focused evidence gathering, or an explicitly authorized disposable experiment with effects, stopping rules, and retained artifact paths. Optional repeated attempts use policy-selected models. |
-| `workgraph_implement` | Delegate one bounded maintained slice with acceptance requirements and human-backed intent. Independent slices may share an exact base revision. |
+| `workgraph_implement` | Delegate one bounded maintained slice with acceptance requirements under the established human-backed intent. Independent slices may share an exact base revision. |
 | `workgraph_review` | Independently inspect a retained result, artifact, exact revision, or comparison of retained results for a specified concern. |
-| `workgraph_intent` | Record changed scope against an actual retained human input receipt. |
-| `workgraph_inspect` | Unified bounded inspection of overview, semantic tasks, outcomes/evidence, and exact recovery; large or untyped content has lossless continuation handles. |
+| `workgraph_intent` | Explicitly record the coordinator's changed semantic scope against an actual retained human input receipt. |
+| `workgraph_inspect` | Unified bounded inspection of overview, retained context, semantic tasks, complete assignments, outcomes/evidence/reports, coordinator judgments, and exact recovery; large content has lossless continuation handles. |
 | `workgraph_control` | Suspend/resume work or cancel/steer a specific live attempt. |
 | `workgraph_adopt` | Attach retained work without forking the conversation or implicitly resuming suspension. |
 | `workgraph_fork` | Explicitly fork the coordinator conversation into a new no-focus Herdr workspace; workers remain tabs in their owning workspace. |
@@ -56,8 +56,16 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 
 The coordinator interprets what a human request authorizes and chooses which independent contributions are meaningful.
 Research, experiments, implementation slices, comparison, review, and integration are optional capabilities rather than a prescribed route.
-Routine mutation responses show the action outcome, workstream lifecycle, aggregate counts, affected assignment/attempt/result handles, and selected model provenance without replaying unrelated history.
-`workgraph_inspect` is the only normal inspection surface: use `section: overview` for remaining work, `task` for a semantic task, `outcome` or `evidence` for retained content, and `recovery` for exact resource and settlement evidence.
+Receiving a new human input records a lossless receipt but does not change an established semantic scope or make existing assignments stale.
+The first authorized maintained change or disposable experiment may establish intent version 1 from a genuine retained input when the workstream still has only intent version 0.
+After scope is established, delegation defaults to a real authority receipt from the current intent even when a newer input has been retained.
+Its mutation response reports `authorityContext.selectedScope` and also `authorityContext.latestObservedInput` when that newer retained receipt differs, so the response does not claim that the latest input authorized the assignment.
+An explicitly supplied receipt outside the current intent is rejected with direction to use `workgraph_intent`; receipt age or text never manufactures a scope revision.
+Use `workgraph_intent` when the coordinator judges that retained human input changes semantic scope, without adding an approval ceremony.
+Routine mutation responses show the action outcome, workstream lifecycle, aggregate counts, affected assignment/attempt/result handles, authority context when applicable, and selected model provenance without replaying unrelated history.
+`workgraph_inspect` is the only normal inspection surface: use `section: overview` for remaining work, `context` for exact retained inputs and intent history, `task` for a semantic task, `assignment` for its complete delegation record, `outcome`, `evidence`, or `report` for retained worker content, `judgments` for dispositions and completion, and `recovery` for exact resource and settlement evidence.
+The `context`, `assignment`, `judgments`, `outcome`, `evidence`, and `report` sections return character-bounded content with a lossless `next` handle.
+An explicitly selected pending attempt has no outcome judgment; only task-level judgment selection may include sibling attempt dispositions.
 Notifications include a bounded actionable outcome, including evidence, limitations, applied versus merely reported revisions, blockers, uncertainty, and retained artifact locations.
 When a current attempt settles without a typed or untyped report, the retained absent result may identify a provider rate limit, native abort, or native provider error from current-generation native metadata without copying the raw provider error text into workstream state or notifications.
 When artifact details are truncated, follow the `retainedArtifacts.next` handle to recover them in full.
@@ -65,7 +73,7 @@ Use the returned `next` handle to retrieve every remaining character of typed, u
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic acceptance oracle.
 Completion derives mechanical unresolved accounting and accepts one explicit reason per unresolved semantic task only; it refuses live or blocked resources and never automatically accepts evidence.
 Extension notifications and worker reports do not grant authority.
-New constraints leave historical evidence intact and tied to its original scope, while stale maintained output cannot compose into the current intent.
+An explicit semantic scope revision leaves historical evidence intact and tied to its original intent, while stale maintained output cannot compose into the current intent.
 An experiment retains its named artifacts before scratch files are discarded; its code is never automatically composed.
 
 Implementation uses Local Prewalk in the same worker session: a guide inspects the assignment and makes the first edit, then the executor continues.
@@ -80,6 +88,7 @@ Worker settlement, report validity, coordinator acknowledgment, and acceptance r
 Call `workgraph_models` with `action: "get"` to see the effective defaults and their file path.
 The four roles are `research`, `implementation.guide`, `implementation.executor`, and `review`.
 A persistent change uses `action: "set"`, `role`, and `target: { model, thinking }` when the user requests a policy change.
+Persistent model-policy mutation is separate from workstream semantic scope: it defaults to the latest genuine session input receipt, or uses the explicitly supplied retained receipt, and reports that authority receipt and source.
 Assignment `model`, `thinking`, and implementation `executor` parameters override defaults without changing policy or the coordinator model.
 Policy changes affect subsequent assignments, not already queued work.
 

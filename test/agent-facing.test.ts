@@ -314,16 +314,67 @@ void test("retained authority, complete assignments, and coordinator judgments r
   });
 });
 
-void test("selection preserves pending attempts and rejects mismatched outcomes", () => {
+void test("pending attempt selection never broadens judgments to sibling outcomes", () => {
   const pendingAttempt = attempt("opaque-pending", "research task");
   const sibling = typedResult("opaque-sibling-result", "research task", researchReport("Sibling"));
-  const current = state([assignment("research task")], [pendingAttempt], [sibling]);
+  const siblingAttempt = attempt("opaque-sibling-attempt", "research task", "settled");
+  siblingAttempt.resultId = sibling.id;
+  const current = state([assignment("research task")], [pendingAttempt, siblingAttempt], [sibling]);
+  current.dispositions = [
+    {
+      resultId: sibling.id,
+      status: "accepted",
+      reason: `Exact sibling judgment ${"long retained detail ".repeat(500)}`,
+      recordedAt: timestamp,
+    },
+  ];
+
   const pending = inspectView(current, { section: "outcome", attempt: pendingAttempt.id });
   assert.equal("state" in pending, true);
   if ("state" in pending) {
     assert.equal(pending.state, "pending");
     assert.equal(pending.attempt?.state, "queued");
   }
+
+  let pendingJudgments = "";
+  let pendingOffset = 0;
+  for (;;) {
+    const view = inspectView(current, {
+      section: "judgments",
+      attempt: pendingAttempt.id,
+      offset: pendingOffset,
+      maxChars: 17,
+    });
+    assert.equal(view.dispositionCount, 0);
+    pendingJudgments += view.records.text;
+    if (view.records.next === undefined) break;
+    assert.equal(view.records.next.attempt, pendingAttempt.id);
+    pendingOffset = view.records.next.offset;
+  }
+  assert.deepEqual(JSON.parse(pendingJudgments), {
+    lifecycle: current.lifecycle,
+    dispositions: [],
+  });
+
+  let taskJudgments = "";
+  let taskOffset = 0;
+  for (;;) {
+    const view = inspectView(current, {
+      section: "judgments",
+      task: "research task",
+      offset: taskOffset,
+      maxChars: 127,
+    });
+    taskJudgments += view.records.text;
+    if (view.records.next === undefined) break;
+    assert.equal(view.records.next.task, "research task");
+    taskOffset = view.records.next.offset;
+  }
+  assert.deepEqual(JSON.parse(taskJudgments), {
+    lifecycle: current.lifecycle,
+    dispositions: current.dispositions,
+  });
+
   assert.throws(
     () =>
       inspectView(current, {

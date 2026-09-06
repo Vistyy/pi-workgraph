@@ -39,6 +39,21 @@ const overviewDetailsSchema = Type.Object({
     attention: Type.Object({ items: Type.Array(Type.Object({})) }),
   }),
 });
+const authorityActionDetailsSchema = Type.Object({
+  view: Type.Object({
+    action: Type.Object({
+      authorityContext: Type.Object({
+        selectedScope: Type.Object({
+          intentVersion: Type.Number(),
+          authorityReceiptId: Type.String(),
+        }),
+        latestObservedInput: Type.Optional(
+          Type.Object({ receiptId: Type.String(), source: Type.String() }),
+        ),
+      }),
+    }),
+  }),
+});
 const resultDetailsSchema = Type.Object({
   inspection: Type.Object({
     report: Type.Object({ summary: Type.String() }),
@@ -123,7 +138,7 @@ async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
   return created.state;
 }
 
-void test("registered capability tools create work implicitly and retain only human input as authority across reload", async () => {
+void test("registered delegation keeps established scope until explicit intent revision", async () => {
   const f = await fixture();
   try {
     const initial = resultState(
@@ -151,23 +166,68 @@ void test("registered capability tools create work implicitly and retain only hu
     const firstReceipt = required(firstAuthorized.inputs[0], "first retained human input").id;
     assert.equal(firstAuthorized.intents.at(-1)?.version, 1);
     assert.deepEqual(firstAuthorized.intents.at(-1)?.authorityReceiptIds, [firstReceipt]);
+    assert.equal(firstAuthorized.assignments[1]?.intentVersion, 1);
     assert.equal(JSON.stringify(firstResponse).includes(firstHumanText), false);
 
-    const secondHumanText = "Apply the corrected follow-up scope - private second context";
+    const secondHumanText =
+      "Acknowledged. Continue with a second maintained slice under the same scope - private second context";
     await f.runner.emitInput(secondHumanText, undefined, "rpc");
     const secondResponse = await f.call("workgraph_implement", {
       ...request,
       id: "fix-value-follow-up",
-      objective: "Apply the corrected follow-up",
+      objective: "Apply the second maintained slice",
     });
     const secondAuthorized = resultState(secondResponse.details);
     const secondReceipt = required(secondAuthorized.inputs[1], "second retained human input").id;
     assert.notEqual(secondReceipt, firstReceipt);
-    assert.equal(secondAuthorized.intents.at(-1)?.version, 2);
-    assert.deepEqual(secondAuthorized.intents.at(-1)?.authorityReceiptIds, [secondReceipt]);
+    assert.equal(secondAuthorized.intents.at(-1)?.version, 1);
+    assert.deepEqual(secondAuthorized.intents.at(-1)?.authorityReceiptIds, [firstReceipt]);
+    assert.deepEqual(
+      secondAuthorized.assignments.slice(1).map((item) => item.intentVersion),
+      [1, 1],
+    );
+    const continuedAssignment = secondAuthorized.assignments[2];
+    assert.equal(continuedAssignment?.artifactIntent, "maintained_change");
+    if (continuedAssignment?.artifactIntent !== "maintained_change")
+      throw new Error("Expected the continued maintained assignment.");
+    assert.deepEqual(continuedAssignment.authority, {
+      receiptId: firstReceipt,
+      intentVersion: 1,
+    });
+    const continuationAuthority = decodeTestValue(
+      authorityActionDetailsSchema,
+      secondResponse.details,
+    ).view.action.authorityContext;
+    assert.deepEqual(continuationAuthority.selectedScope, {
+      intentVersion: 1,
+      authorityReceiptId: firstReceipt,
+    });
+    assert.deepEqual(continuationAuthority.latestObservedInput, {
+      receiptId: secondReceipt,
+      source: "rpc",
+    });
     assert.equal(JSON.stringify(secondResponse).includes(secondHumanText), false);
 
-    const explicit = resultState(
+    await assert.rejects(
+      f.call("workgraph_implement", {
+        ...request,
+        id: "new-receipt-without-scope-revision",
+        authorityReceiptId: secondReceipt,
+      }),
+      /not authority for current intent 1.*workgraph_intent/,
+    );
+    const afterRejectedReceipt = resultState(
+      (await f.call("workgraph_inspect", { section: "overview" })).details,
+    );
+    assert.equal(afterRejectedReceipt.intents.at(-1)?.version, 1);
+    assert.equal(
+      afterRejectedReceipt.assignments.some(
+        (item) => item.id === "new-receipt-without-scope-revision",
+      ),
+      false,
+    );
+
+    const explicitCurrent = resultState(
       (
         await f.call("workgraph_implement", {
           ...request,
@@ -177,25 +237,78 @@ void test("registered capability tools create work implicitly and retain only hu
         })
       ).details,
     );
-    assert.equal(explicit.intents.at(-1)?.version, 3);
-    assert.deepEqual(explicit.intents.at(-1)?.authorityReceiptIds, [firstReceipt]);
-    assert.deepEqual(
-      explicit.intents.map((intent) => intent.statement),
-      [
-        "What is value.txt?",
-        "Fix value",
-        "Apply the corrected follow-up",
-        "Apply the coordinator judgment under original scope",
-      ],
+    assert.equal(explicitCurrent.intents.at(-1)?.version, 1);
+
+    const changedScopeText =
+      "Change the semantic scope to include the corrected follow-up - private changed context";
+    await f.runner.emitInput(changedScopeText, undefined, "interactive");
+    const beforeRevision = resultState(
+      (await f.call("workgraph_inspect", { section: "overview" })).details,
     );
+    const changedScopeReceipt = required(
+      beforeRevision.inputs[2],
+      "changed-scope retained human input",
+    ).id;
+    assert.equal(beforeRevision.intents.at(-1)?.version, 1);
+
+    const revised = resultState(
+      (
+        await f.call("workgraph_intent", {
+          authorityReceiptId: changedScopeReceipt,
+          statement: "Apply the corrected follow-up scope",
+          constraints: [],
+        })
+      ).details,
+    );
+    assert.equal(revised.intents.at(-1)?.version, 2);
+    assert.deepEqual(revised.intents.at(-1)?.authorityReceiptIds, [changedScopeReceipt]);
+
+    const changedScope = resultState(
+      (
+        await f.call("workgraph_implement", {
+          ...request,
+          id: "fix-value-revised-scope",
+          objective: "Apply the corrected follow-up",
+        })
+      ).details,
+    );
+    const revisedAssignment = changedScope.assignments.at(-1);
+    assert.equal(revisedAssignment?.artifactIntent, "maintained_change");
+    if (revisedAssignment?.artifactIntent !== "maintained_change")
+      throw new Error("Expected the revised-scope maintained assignment.");
+    assert.equal(revisedAssignment.intentVersion, 2);
+    assert.deepEqual(revisedAssignment.authority, {
+      receiptId: changedScopeReceipt,
+      intentVersion: 2,
+    });
+    assert.equal(changedScope.assignments[1]?.intentVersion, 1);
+    assert.notEqual(
+      changedScope.assignments[1]?.intentVersion,
+      changedScope.intents.at(-1)?.version,
+    );
+    await assert.rejects(
+      f.call("workgraph_implement", {
+        ...request,
+        id: "old-receipt-after-scope-revision",
+        authorityReceiptId: firstReceipt,
+      }),
+      /not authority for current intent 2.*workgraph_intent/,
+    );
+    assert.deepEqual(
+      changedScope.intents.map((intent) => intent.statement),
+      ["What is value.txt?", "Fix value", "Apply the corrected follow-up scope"],
+    );
+
     const retainedContext = decodeTestValue(
       contextDetailsSchema,
       (await f.call("workgraph_inspect", { section: "context", maxChars: 8_000 })).details,
     ).inspection.records.text;
     assert.match(retainedContext, new RegExp(firstReceipt));
     assert.match(retainedContext, new RegExp(secondReceipt));
+    assert.match(retainedContext, new RegExp(changedScopeReceipt));
     assert.match(retainedContext, /private first context/);
     assert.match(retainedContext, /private second context/);
+    assert.match(retainedContext, /private changed context/);
     await f.call("workgraph_control", {
       action: "suspend",
       reason: "Pause fixture",
@@ -206,7 +319,7 @@ void test("registered capability tools create work implicitly and retain only hu
       (await f.call("workgraph_inspect", { section: "overview" })).details,
     );
     assert.equal(reloaded.lifecycle.state, "suspended");
-    assert.equal(reloaded.inputs.length, 2);
+    assert.equal(reloaded.inputs.length, 3);
     await assert.rejects(
       f.call("workgraph_research", {
         id: "while-paused",

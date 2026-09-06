@@ -21,15 +21,23 @@ A coordinator conversation fork is not a worker continuation or workstream adopt
 
 Interpret the scope of actual human requests yourself.
 Receipt references prove provenance, not semantic authorization.
-Record changed scope as a new intent before delegating changed requirements; historical evidence retains its original scope and cannot silently prove the revised request.
+Receiving or selecting a new input receipt does not revise established scope or make in-flight work stale.
+When intent version 0 has no human authority yet, an authorized maintained change or disposable experiment may establish it from a genuine retained input.
+Otherwise, delegation defaults to the current intent's retained authority receipt, not the latest input.
+Check the mutation's `authorityContext.selectedScope`; when `latestObservedInput` is also present, it is newer retained context and was not claimed as the assignment's authority.
+If an explicit receipt is outside the current intent, use `workgraph_intent` first only when you judge that the human request changes semantic scope; do not infer a revision from receipt text or add an approval ceremony.
+Historical evidence retains its original scope, and only an explicit intent revision makes older maintained work stale for composition.
+Persistent `workgraph_models` changes are separate and continue to use the latest genuine session input by default or an explicitly selected retained receipt.
 
 ## Returned work and recovery
 
 Judge execution settlement, report validity, transport receipt, and semantic judgment separately.
 Use the bounded outcome in a normal result notification for ordinary decisions.
 Use `workgraph_inspect` only when uncertainty, a blocker, repeated attempts, or truncation requires it.
-Its sections are `overview`, `task`, `outcome`, `evidence`, `report`, and `recovery`.
-Outcome and report reads are character-bounded and return a lossless `next` handle for every remaining character, including untyped or malformed content.
+Its sections are `overview`, `context`, `task`, `assignment`, `outcome`, `evidence`, `report`, `judgments`, and `recovery`.
+Use `context` for exact retained inputs and intent history, `assignment` for the complete delegation record, and `judgments` for coordinator dispositions and completion.
+An explicitly selected pending attempt has no outcome disposition even when sibling attempts do; task-level selection may include all of the task's dispositions.
+Character-bounded reads return a lossless `next` handle for every remaining character, including long assignments, judgments, and untyped or malformed reports.
 Recorded settlement, cleanup, native, and Git facts are attributed as durable evidence, never presented as a fresh live observation.
 Do not perform routine status/result polling or acknowledgement/disposition ceremony.
 Pending notifications retry on reattachment, not every polling cycle; the same result identifier can recur after an interrupted delivery.
