@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This is a real native SessionManager filesystem boundary test.
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Native temporary paths are part of the SessionManager test boundary.
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   createWorkerSession,
+  effectiveModelObservations,
   hasNativeAgentSettled,
   hasNativeAgentStarted,
   readTerminalText,
@@ -13,7 +16,8 @@ import {
 } from "../src/pi-process.js";
 import { usage } from "./helpers.js";
 
-test("fresh worker context, explicit continuation, native generation markers and invalid reports remain distinct", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+await test("fresh worker context, explicit continuation, native generation markers and invalid reports remain distinct", async () => {
   const root = await mkdtemp(join(tmpdir(), "workgraph-session-"));
   const generation = { runId: "fixture", nodeId: "first" };
   try {
@@ -29,14 +33,19 @@ test("fresh worker context, explicit continuation, native generation markers and
     assert.equal(session.getHeader()?.parentSession, undefined);
     assert.equal(readTerminalText(file, generation), undefined);
     session.appendCustomEntry("pi-workgraph-agent-running", generation);
-    assert.equal(
-      hasNativeAgentStarted(file, generation.runId, generation.nodeId),
-      true,
-    );
-    assert.equal(
-      hasNativeAgentSettled(file, generation.runId, generation.nodeId),
-      false,
-    );
+    assert.equal(hasNativeAgentStarted(file, generation.runId, generation.nodeId), true);
+    assert.equal(hasNativeAgentSettled(file, generation.runId, generation.nodeId), false);
+    session.appendCustomEntry("pi-workgraph-effective-model", {
+      ...generation,
+      model: "policy/selected",
+      thinking: "high",
+    });
+    session.appendCustomEntry("pi-workgraph-effective-model", {
+      runId: generation.runId,
+      nodeId: "other-generation",
+      model: "secret/ignored",
+      thinking: "max",
+    });
     session.appendMessage({
       role: "assistant",
       content: [{ type: "text", text: "Useful prose, not a typed report" }],
@@ -45,18 +54,16 @@ test("fresh worker context, explicit continuation, native generation markers and
       model: "fixture",
       usage,
       stopReason: "stop",
-      timestamp: Date.now(),
+      timestamp: 1,
     });
     session.appendCustomEntry("pi-workgraph-agent-settled", generation);
-    assert.equal(
-      readTerminalText(file, generation),
-      "Useful prose, not a typed report",
-    );
+    assert.deepEqual(effectiveModelObservations(file, generation), [
+      { model: "policy/selected", thinking: "high", source: "selection" },
+      { model: "test/fixture", source: "message" },
+    ]);
+    assert.equal(readTerminalText(file, generation), "Useful prose, not a typed report");
     assert.equal(readWorkgraphReportResult(file, generation).report, undefined);
-    assert.equal(
-      hasNativeAgentSettled(file, generation.runId, generation.nodeId),
-      true,
-    );
+    assert.equal(hasNativeAgentSettled(file, generation.runId, generation.nodeId), true);
     session.appendMessage({
       role: "toolResult",
       toolCallId: "invalid",
@@ -64,7 +71,7 @@ test("fresh worker context, explicit continuation, native generation markers and
       content: [],
       details: { report: { kind: "research", status: "completed" } },
       isError: false,
-      timestamp: Date.now(),
+      timestamp: 2,
     });
     assert.equal(readWorkgraphReportResult(file, generation).invalid, true);
     const next = { ...generation, nodeId: "second" };
@@ -76,19 +83,10 @@ test("fresh worker context, explicit continuation, native generation markers and
       mode: "research",
       continuationSessionFile: file,
     });
-    assert.equal(
-      SessionManager.open(continuation).getHeader()?.parentSession,
-      file,
-    );
-    assert.equal(
-      hasNativeAgentSettled(continuation, next.runId, next.nodeId),
-      false,
-    );
+    assert.equal(SessionManager.open(continuation).getHeader()?.parentSession, file);
+    assert.equal(hasNativeAgentSettled(continuation, next.runId, next.nodeId), false);
     assert.equal(readWorkgraphReportResult(continuation, next).invalid, false);
-    assert.equal(
-      readWorkgraphReportResult(continuation, next).report,
-      undefined,
-    );
+    assert.equal(readWorkgraphReportResult(continuation, next).report, undefined);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

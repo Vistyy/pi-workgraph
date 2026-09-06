@@ -1,32 +1,42 @@
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- SessionManager persistence uses the host's native Promise-based filesystem.
 import { mkdir } from "node:fs/promises";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { type Static, Type } from "typebox";
+import { Value } from "typebox/value";
 import { isWorkerReport } from "./report-schema.js";
 import type { WorkerMode, WorkerReport } from "./types.js";
 
 type Generation = { runId: string; nodeId: string };
+const GenerationDataSchema = Type.Object({
+  runId: Type.String({ minLength: 1 }),
+  nodeId: Type.String({ minLength: 1 }),
+});
+const ReportDetailsSchema = Type.Object({ report: Type.Unknown() });
+const EffectiveModelSchema = Type.Intersect([
+  GenerationDataSchema,
+  Type.Object({ model: Type.String({ minLength: 1 }), thinking: Type.String({ minLength: 1 }) }),
+]);
+type EffectiveModel = Static<typeof EffectiveModelSchema>;
 
+// oxlint-disable-next-line effecttsgo/async-function -- Public Pi host callers require Promise interoperability.
 export async function forkConversationSession(request: {
   parentSessionFile: string;
   targetCwd: string;
   entryId?: string;
 }): Promise<string> {
   const parent = SessionManager.open(request.parentSessionFile);
-  if (request.entryId && !parent.getEntry(request.entryId))
+  if (request.entryId !== undefined && !parent.getEntry(request.entryId))
     throw new Error(`Unknown conversation entry: ${request.entryId}`);
-  const child = SessionManager.forkFrom(
-    request.parentSessionFile,
-    request.targetCwd,
-  );
-  if (request.entryId) child.branch(request.entryId);
+  const child = SessionManager.forkFrom(request.parentSessionFile, request.targetCwd);
+  if (request.entryId !== undefined) child.branch(request.entryId);
   const file = child.getSessionFile();
-  if (!file)
-    throw new Error(
-      "Forked coordinator session did not produce a session file.",
-    );
+  if (file === undefined)
+    throw new Error("Forked coordinator session did not produce a session file.");
   return file;
 }
 
 /** Workers are fresh by default. Continuation explicitly names an earlier worker session. */
+// oxlint-disable-next-line effecttsgo/async-function -- Public Pi host callers and native session persistence require Promise interoperability.
 export async function createWorkerSession(
   request: Generation & {
     targetCwd: string;
@@ -37,13 +47,14 @@ export async function createWorkerSession(
   },
 ): Promise<string> {
   await mkdir(request.sessionDir, { recursive: true });
-  const child = request.continuationSessionFile
-    ? SessionManager.forkFrom(
-        request.continuationSessionFile,
-        request.targetCwd,
-        request.sessionDir,
-      )
-    : SessionManager.create(request.targetCwd, request.sessionDir);
+  const child =
+    request.continuationSessionFile !== undefined
+      ? SessionManager.forkFrom(
+          request.continuationSessionFile,
+          request.targetCwd,
+          request.sessionDir,
+        )
+      : SessionManager.create(request.targetCwd, request.sessionDir);
   child.appendCustomMessageEntry(
     "pi-workgraph-objective",
     [
@@ -56,7 +67,7 @@ export async function createWorkerSession(
     true,
     { runId: request.runId, nodeId: request.nodeId, mode: request.mode },
   );
-  if (!request.continuationSessionFile) {
+  if (request.continuationSessionFile === undefined) {
     // Pi defers a new session's disk flush until its first assistant message.
     // This local persistence marker is excluded from worker evidence/model observations.
     child.appendMessage({
@@ -74,11 +85,12 @@ export async function createWorkerSession(
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
       },
       stopReason: "stop",
+      // oxlint-disable-next-line effecttsgo/global-date -- Pi's native persisted message contract requires an epoch timestamp.
       timestamp: Date.now(),
     });
   }
   const file = child.getSessionFile();
-  if (!file) throw new Error("Worker session did not produce a session file.");
+  if (file === undefined) throw new Error("Worker session did not produce a session file.");
   return file;
 }
 
@@ -96,19 +108,17 @@ export function readWorkgraphReportResult(
   try {
     const messages = attemptMessages(sessionFile, generation);
     for (const message of messages.reverse()) {
-      if (
-        message.role !== "toolResult" ||
-        message.toolName !== "workgraph_report"
-      )
-        continue;
+      if (message.role !== "toolResult" || message.toolName !== "workgraph_report") continue;
       if (message.isError)
         return {
           invalid: true,
           unreadable: false,
           error: "The Workgraph report tool returned an error.",
         };
-      const details = isRecord(message.details) ? message.details : undefined;
-      if (isWorkerReport(details?.report))
+      const details = Value.Check(ReportDetailsSchema, message.details)
+        ? Value.Decode(ReportDetailsSchema, message.details)
+        : undefined;
+      if (details !== undefined && isWorkerReport(details.report))
         return { report: details.report, invalid: false, unreadable: false };
       return {
         invalid: true,
@@ -126,37 +136,24 @@ export function readWorkgraphReportResult(
   return { invalid: false, unreadable: false };
 }
 
-export function hasNativeAgentStarted(
-  sessionFile: string,
-  runId: string,
-  nodeId: string,
-): boolean {
+export function hasNativeAgentStarted(sessionFile: string, runId: string, nodeId: string): boolean {
   return hasNativeMarker(sessionFile, "pi-workgraph-agent-running", {
     runId,
     nodeId,
   });
 }
 
-export function hasNativeAgentSettled(
-  sessionFile: string,
-  runId: string,
-  nodeId: string,
-): boolean {
+export function hasNativeAgentSettled(sessionFile: string, runId: string, nodeId: string): boolean {
   return hasNativeMarker(sessionFile, "pi-workgraph-agent-settled", {
     runId,
     nodeId,
   });
 }
 
-function hasNativeMarker(
-  sessionFile: string,
-  customType: string,
-  generation: Generation,
-): boolean {
+function hasNativeMarker(sessionFile: string, customType: string, generation: Generation): boolean {
   try {
     for (const entry of attemptEntries(sessionFile, generation).reverse()) {
-      if (entry.type !== "custom" || !markerMatches(entry.data, generation))
-        continue;
+      if (entry.type !== "custom" || !markerMatches(entry.data, generation)) continue;
       if (entry.customType === customType) return true;
       if (
         entry.customType === "pi-workgraph-agent-running" &&
@@ -170,16 +167,11 @@ function hasNativeMarker(
   return false;
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- SessionManager custom entry data is a native unknown boundary decoded immediately here.
 function markerMatches(value: unknown, generation: Generation): boolean {
-  return (
-    isRecord(value) &&
-    value.runId === generation.runId &&
-    value.nodeId === generation.nodeId
-  );
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
+  if (!Value.Check(GenerationDataSchema, value)) return false;
+  const data = Value.Decode(GenerationDataSchema, value);
+  return data.runId === generation.runId && data.nodeId === generation.nodeId;
 }
 
 function attemptEntries(sessionFile: string, generation: Generation) {
@@ -190,10 +182,7 @@ function attemptEntries(sessionFile: string, generation: Generation) {
       entry.customType === "pi-workgraph-objective" &&
       markerMatches(entry.details, generation),
   );
-  if (boundary < 0)
-    throw new Error(
-      "Session has no objective for the current attempt generation.",
-    );
+  if (boundary < 0) throw new Error("Session has no objective for the current attempt generation.");
   return entries.slice(boundary + 1);
 }
 
@@ -203,10 +192,7 @@ function attemptMessages(sessionFile: string, generation: Generation) {
   );
 }
 
-export function effectiveModelObservations(
-  sessionFile: string,
-  generation: Generation,
-) {
+export function effectiveModelObservations(sessionFile: string, generation: Generation) {
   return attemptEntries(sessionFile, generation).flatMap(
     (
       entry,
@@ -229,34 +215,20 @@ export function effectiveModelObservations(
       if (
         entry.type !== "custom" ||
         entry.customType !== "pi-workgraph-effective-model" ||
-        !isRecord(entry.data) ||
-        !markerMatches(entry.data, generation)
+        !Value.Check(EffectiveModelSchema, entry.data)
       )
         return [];
-      if (
-        typeof entry.data.model !== "string" ||
-        typeof entry.data.thinking !== "string"
-      )
-        return [];
-      return [
-        {
-          model: entry.data.model,
-          thinking: entry.data.thinking,
-          source: "selection",
-        },
-      ];
+      const data: EffectiveModel = Value.Decode(EffectiveModelSchema, entry.data);
+      if (!markerMatches(data, generation)) return [];
+      return [{ model: data.model, thinking: data.thinking, source: "selection" }];
     },
   );
 }
 
-export function readTerminalText(
-  sessionFile: string,
-  generation: Generation,
-): string | undefined {
+export function readTerminalText(sessionFile: string, generation: Generation): string | undefined {
   try {
     for (const message of attemptMessages(sessionFile, generation).reverse()) {
-      if (message.role !== "assistant" || message.provider === "workgraph")
-        continue;
+      if (message.role !== "assistant" || message.provider === "workgraph") continue;
       const text = message.content
         .filter((block) => block.type === "text")
         .map((block) => block.text)
