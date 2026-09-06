@@ -8,8 +8,6 @@ import {
   activeWorkerCount,
   attachCalmPresentation,
   calmActivityLines,
-  calmStatus,
-  calmWorkingIndicatorFrames,
   DEFAULT_CALM_HIDDEN_TOOLS,
   installCalmMode,
   isCalmActivityActive,
@@ -68,12 +66,14 @@ function fakeUi() {
   type WorkingIndicator = { readonly frames?: readonly string[]; readonly intervalMs?: number };
   type CalmWidget = { render(width: number): string[] };
   type Widget = (tui: { requestRender(): void }, theme: FakeTheme) => CalmWidget;
-  const indicators: WorkingIndicator[] = [];
+  const indicators: Array<WorkingIndicator | undefined> = [];
+  const workingVisibility: boolean[] = [];
   const widgets: Array<[string, Widget | undefined]> = [];
   const notifications: string[] = [];
   const ui = {
     statuses,
     indicators,
+    workingVisibility,
     widgets,
     notifications,
     theme: fakeTheme(),
@@ -81,7 +81,10 @@ function fakeUi() {
       statuses.push([key, text]);
     },
     setWorkingIndicator(options?: WorkingIndicator) {
-      if (options !== undefined) indicators.push(options);
+      indicators.push(options);
+    },
+    setWorkingVisible(visible: boolean) {
+      workingVisibility.push(visible);
     },
     setWidget(key: string, content: Widget | undefined) {
       widgets.push([key, content]);
@@ -193,37 +196,47 @@ void test("activity indicator remains active for coordinator or workers and sett
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 0 }), false);
   assert.equal(isCalmActivityActive({ coordinatorActive: true, activeWorkers: 0 }), true);
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 2 }), true);
-  assert.match(calmStatus({ coordinatorActive: false, activeWorkers: 2 }, 2), /active workers/);
   assert.equal(
     activeWorkerCount({
       attempts: [{ state: "queued" }, { state: "starting" }, { state: "running" }],
     }),
     2,
   );
-  assert.equal(calmStatus({ coordinatorActive: false, activeWorkers: 0 }, 3), "· calm");
 });
 
-void test("constellation frames are themed, compact, and width-safe", () => {
+void test("activity row is one themed traveling line with accurate labels and width-safe fallbacks", () => {
   const theme = fakeTheme();
-  const active = { coordinatorActive: true, activeWorkers: 2 };
-  const wideA = calmActivityLines(active, 2, 80, theme);
-  const wideB = calmActivityLines(active, 8, 80, theme);
-  assert.equal(wideA.length, 2);
+  const coordinator = { coordinatorActive: true, activeWorkers: 0 };
+  const workers = { coordinatorActive: false, activeWorkers: 2 };
+  const combined = { coordinatorActive: true, activeWorkers: 2 };
+  const wideA = calmActivityLines(coordinator, 1, 80, theme);
+  const wideB = calmActivityLines(coordinator, 2, 80, theme);
+  assert.equal(wideA.length, 1);
   assert.notDeepEqual(wideA, wideB);
-  assert.match(wideA[0] ?? "", /Workgraph/);
-  assert.match(wideA[0] ?? "", /<accent>◆<\/?accent>/);
-  assert.match(wideA[1] ?? "", /coordinator \+ 2 workers/);
+  assert.match(stripAnsiLikeTheme(wideA[0] ?? ""), /○──◆──○──○ {3}Workgraph · coordinating/);
+  assert.ok(wideA.every((line) => !line.includes("\n") && !line.includes("╲")));
+  assert.match(
+    stripAnsiLikeTheme(calmActivityLines(workers, 0, 80, theme)[0] ?? ""),
+    /2 workers active/,
+  );
+  assert.match(
+    stripAnsiLikeTheme(calmActivityLines(combined, 0, 80, theme)[0] ?? ""),
+    /Workgraph · coordinating · 2 workers/,
+  );
+  assert.doesNotMatch(
+    stripAnsiLikeTheme(calmActivityLines(workers, 0, 80, theme)[0] ?? ""),
+    /coordinating/,
+  );
 
-  for (const width of [40, 24, 12, 3, 1]) {
-    const lines = calmActivityLines(active, 4, width, theme);
+  for (const width of [40, 24, 12, 8, 3, 1]) {
+    const lines = calmActivityLines(combined, 4, width, theme);
+    assert.ok(lines.length <= 1);
     assert.ok(lines.every((line) => stripAnsiLikeTheme(line).length <= width));
   }
   assert.deepEqual(
     calmActivityLines({ coordinatorActive: false, activeWorkers: 0 }, 1, 80, theme),
     [],
   );
-  assert.equal(calmWorkingIndicatorFrames(theme).length, 4);
-  assert.notEqual(calmWorkingIndicatorFrames(theme)[0], calmWorkingIndicatorFrames(theme)[1]);
 });
 
 void test("coordinator calm command defaults to hiding workgraph notes and restores them when off", async () => {
@@ -249,8 +262,9 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   const widgetFactory = ui.widgets.at(-1)?.[1];
   assert.ok(widgetFactory);
   const widget = widgetFactory({ requestRender() {} }, ui.theme);
-  assert.equal(widget.render(80).length, 2);
+  assert.equal(widget.render(80).length, 1);
   assert.match(widget.render(80)[0] ?? "", /Workgraph/);
+  assert.ok(ui.workingVisibility.includes(false));
   calm.setActiveWorkers(0);
   assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
   calm.setActiveWorkers(1);
@@ -258,6 +272,8 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
   assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
   assert.equal(ui.statuses.at(-1)?.[1], undefined);
+  assert.ok(ui.workingVisibility.includes(true));
+  assert.equal(ui.indicators.at(-1), undefined);
   await pi.events.get("session_shutdown")?.({}, context);
   assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
 });

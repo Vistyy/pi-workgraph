@@ -50,25 +50,9 @@ export const CALM_OPERATIONAL_MESSAGE_TYPES = [
   "pi-workgraph-attention",
 ] as const;
 
-const CALM_STATUS_FRAMES = ["·", "•", "●", "•"] as const;
 const CALM_INTERVAL_MS = 520;
-const CALM_GRAPH_STEPS = 18;
-const CALM_TOP_GRAPH = "  ○────○────○";
-const CALM_TOP_PHASES = [undefined, undefined, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] as const;
-const CALM_BOTTOM_GRAPH = "    ╲──○──╱";
-const CALM_BOTTOM_PHASES = [
-  undefined,
-  undefined,
-  undefined,
-  undefined,
-  17,
-  16,
-  15,
-  14,
-  13,
-  12,
-  11,
-] as const;
+const CALM_GRAPH_NODE_COUNT = 4;
+const CALM_GRAPH_EDGE = "──";
 const PATCH_OWNER = Symbol.for("@vistyy/pi-workgraph/calm-presentation");
 
 type Render = (width: number) => string[];
@@ -131,17 +115,6 @@ export function isCalmActivityActive(state: CalmActivityState): boolean {
   return state.coordinatorActive || state.activeWorkers > 0;
 }
 
-export function calmStatus(state: CalmActivityState, frame: number): string {
-  const marker = isCalmActivityActive(state)
-    ? CALM_STATUS_FRAMES[frame % CALM_STATUS_FRAMES.length]
-    : CALM_STATUS_FRAMES[0];
-  const workers =
-    state.activeWorkers === 0
-      ? ""
-      : ` - ${state.activeWorkers} active worker${state.activeWorkers === 1 ? "" : "s"}`;
-  return `${marker} calm${workers}`;
-}
-
 export function calmActivityLines(
   state: CalmActivityState,
   frame: number,
@@ -149,43 +122,41 @@ export function calmActivityLines(
   theme: CalmTheme,
 ): string[] {
   if (!isCalmActivityActive(state) || width < 1) return [];
-  const phase = positiveModulo(frame, CALM_GRAPH_STEPS);
-  const detail = activityLabel(state, false);
-  if (width >= 42) {
-    const top = renderConstellationLine(CALM_TOP_GRAPH, CALM_TOP_PHASES, phase, theme);
-    const bottom = renderConstellationLine(CALM_BOTTOM_GRAPH, CALM_BOTTOM_PHASES, phase, theme);
+  const activeNode = positiveModulo(frame, CALM_GRAPH_NODE_COUNT);
+  const detail = activityLabel(state);
+  const fullGraph = plainActivityGraph(CALM_GRAPH_NODE_COUNT);
+  const fullSuffix = `   Workgraph · ${detail}`;
+  if (fullGraph.length + fullSuffix.length <= width) {
     return [
-      `${top}   ${theme.fg("text", "Workgraph")}`,
-      `${bottom}     ${theme.fg("dim", detail)}`,
+      renderActivityGraph(CALM_GRAPH_NODE_COUNT, activeNode, theme) +
+        "   " +
+        theme.fg("text", "Workgraph") +
+        theme.fg("dim", ` · ${detail}`),
     ];
   }
 
-  const compact = activityLabel(state, true);
-  const compactPlain = `${CALM_TOP_GRAPH}  WG ${compact}`;
-  if (compactPlain.length <= width) {
-    const compactPhase = positiveModulo(frame, 11);
-    return [
-      `${renderConstellationLine(CALM_TOP_GRAPH, CALM_TOP_PHASES, compactPhase, theme)}  ${theme.fg("text", "WG")} ${theme.fg("dim", compact)}`,
-    ];
+  const compact = compactActivityLabel(state);
+  const compactLayouts = [
+    { nodeCount: 4, wordmark: true },
+    { nodeCount: 4, wordmark: false },
+    { nodeCount: 3, wordmark: false },
+    { nodeCount: 2, wordmark: false },
+    { nodeCount: 1, wordmark: false },
+  ] as const;
+  for (const layout of compactLayouts) {
+    const suffix = layout.wordmark ? `  WG · ${compact}` : ` ${compact}`;
+    if (plainActivityGraph(layout.nodeCount).length + suffix.length > width) continue;
+    const styledSuffix = layout.wordmark
+      ? `  ${theme.fg("text", "WG")}${theme.fg("dim", ` · ${compact}`)}`
+      : theme.fg("dim", suffix);
+    return [renderActivityGraph(layout.nodeCount, activeNode, theme) + styledSuffix];
   }
 
-  const workerOnly =
-    state.activeWorkers > 0 ? `◆ ${boundedWorkerCount(state.activeWorkers)}w` : undefined;
-  const candidates = [`◆ ${compact}`, workerOnly, state.coordinatorActive ? "◆ C" : undefined, "◆"];
-  const fallback = candidates.find(
-    (candidate): candidate is string => candidate !== undefined && candidate.length <= width,
-  );
-  return fallback === undefined
-    ? []
-    : [theme.fg("accent", fallback.slice(0, 1)) + theme.fg("dim", fallback.slice(1))];
-}
-
-export function calmWorkingIndicatorFrames(theme: CalmTheme): string[] {
-  return [0, 1, 2, 1].map((active) =>
-    [0, 1, 2]
-      .map((node) => theme.fg(node === active ? "accent" : "dim", node === active ? "◆" : "○"))
-      .join(theme.fg("muted", "─")),
-  );
+  for (const nodeCount of [4, 3, 2, 1] as const) {
+    if (plainActivityGraph(nodeCount).length <= width)
+      return [renderActivityGraph(nodeCount, activeNode, theme)];
+  }
+  return [];
 }
 
 function positiveModulo(value: number, modulus: number): number {
@@ -196,38 +167,29 @@ function boundedWorkerCount(count: number): string {
   return count > 9 ? "9+" : String(count);
 }
 
-function activityLabel(state: CalmActivityState, compact: boolean): string {
-  if (state.coordinatorActive && state.activeWorkers > 0)
-    return compact
-      ? `${boundedWorkerCount(state.activeWorkers)}w + C`
-      : `coordinator + ${state.activeWorkers} worker${state.activeWorkers === 1 ? "" : "s"}`;
-  if (state.coordinatorActive) return compact ? "C active" : "coordinator active";
-  return compact
-    ? `${boundedWorkerCount(state.activeWorkers)} worker${state.activeWorkers === 1 ? "" : "s"}`
-    : `${state.activeWorkers} active worker${state.activeWorkers === 1 ? "" : "s"}`;
+function activityLabel(state: CalmActivityState): string {
+  const workers = `${state.activeWorkers} worker${state.activeWorkers === 1 ? "" : "s"}`;
+  if (state.coordinatorActive && state.activeWorkers > 0) return `coordinating · ${workers}`;
+  if (state.coordinatorActive) return "coordinating";
+  return `${workers} active`;
 }
 
-function renderConstellationLine(
-  graph: string,
-  phases: readonly (number | undefined)[],
-  phase: number,
-  theme: CalmTheme,
-): string {
-  let output = "";
-  for (let index = 0; index < graph.length; index += 1) {
-    const character = graph[index] ?? "";
-    const nodePhase = phases[index];
-    if (nodePhase === undefined) {
-      output += theme.fg("borderMuted", character);
-    } else if (nodePhase === phase) {
-      output += theme.fg("accent", "◆");
-    } else if (nodePhase === positiveModulo(phase - 1, CALM_GRAPH_STEPS)) {
-      output += theme.fg("muted", "◇");
-    } else {
-      output += theme.fg("text", character);
-    }
-  }
-  return output;
+function compactActivityLabel(state: CalmActivityState): string {
+  const workers = `${boundedWorkerCount(state.activeWorkers)}w`;
+  if (state.coordinatorActive && state.activeWorkers > 0) return `C+${workers}`;
+  if (state.coordinatorActive) return "C";
+  return workers;
+}
+
+function plainActivityGraph(nodeCount: number): string {
+  return Array.from({ length: nodeCount }, () => "○").join(CALM_GRAPH_EDGE);
+}
+
+function renderActivityGraph(nodeCount: number, activeNode: number, theme: CalmTheme): string {
+  const highlighted = positiveModulo(activeNode, nodeCount);
+  return Array.from({ length: nodeCount }, (_, node) =>
+    theme.fg(node === highlighted ? "accent" : "dim", node === highlighted ? "◆" : "○"),
+  ).join(theme.fg("borderMuted", CALM_GRAPH_EDGE));
 }
 
 export function attachCalmPresentation(
@@ -299,11 +261,7 @@ export function installCalmMode(
   };
   const renderStatus = (): void => {
     if (!state.on || ui === undefined) return;
-    const current = activity();
-    ui.setStatus(
-      "calm",
-      ui.theme.fg(isCalmActivityActive(current) ? "accent" : "dim", calmStatus(current, frame)),
-    );
+    ui.setStatus("calm", ui.theme.fg("dim", "calm"));
   };
   const clearWidget = (): void => {
     if (widgetVisible && ui !== undefined) ui.setWidget("calm", undefined);
@@ -341,8 +299,7 @@ export function installCalmMode(
     // SAFETY: This timer only drives presentation animation and is cleared by stopTimer/shutdown.
     // oxlint-disable-next-line effecttsgo/global-timers
     timer = setInterval(() => {
-      frame = (frame + 1) % CALM_GRAPH_STEPS;
-      renderStatus();
+      frame = (frame + 1) % CALM_GRAPH_NODE_COUNT;
       requestWidgetRender?.();
     }, intervalMs);
   };
@@ -353,9 +310,10 @@ export function installCalmMode(
       clearWidget();
       ui.setStatus("calm", undefined);
       ui.setWorkingIndicator();
+      ui.setWorkingVisible(true);
       return;
     }
-    ui.setWorkingIndicator({ frames: calmWorkingIndicatorFrames(ui.theme), intervalMs });
+    ui.setWorkingVisible(false);
     renderStatus();
     syncWidget();
     syncTimer();
@@ -382,6 +340,7 @@ export function installCalmMode(
       clearWidget();
       ui.setStatus("calm", undefined);
       ui.setWorkingIndicator();
+      ui.setWorkingVisible(true);
     }
     ui = undefined;
     coordinatorActive = false;
