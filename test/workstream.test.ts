@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixtures intentionally use real host storage at the node:test boundary.
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Fixtures intentionally use real host storage at the node:test boundary.
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are host filesystem identities.
 import { join } from "node:path";
@@ -960,6 +970,63 @@ void test("Effect store port fences both reads and renames and cleans unique 060
   }
 });
 
+void test("interruption in exclusive acquisition records ownership and removes the real tempfile", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const fileSystem = await liveFileSystem();
+    const acquisitionGate = Deferred.makeUnsafe<void>();
+    const acquisitionObserved = Deferred.makeUnsafe<string>();
+    let handleReleased = false;
+    const delayedFileSystem: FileSystem.FileSystem = {
+      ...fileSystem,
+      open: (path, options) =>
+        Effect.gen(function* () {
+          const file = yield* fileSystem.open(path, options);
+          if (options?.flag !== "wx") return file;
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              handleReleased = true;
+            }),
+          );
+          yield* Deferred.succeed(acquisitionObserved, path);
+          yield* Deferred.await(acquisitionGate);
+          return file;
+        }),
+    };
+    const abort = new AbortController();
+    let settled = false;
+    const pending = runStoreEffect(
+      store.effects.recordInputEvent({
+        ...coordinator,
+        source: "interactive",
+        text: "Interrupt after exclusive creation but before open returns.",
+      }),
+      delayedFileSystem,
+      abort.signal,
+    ).finally(() => {
+      settled = true;
+    });
+
+    const temporaryPath = await Effect.runPromise(Deferred.await(acquisitionObserved));
+    assert.equal((await stat(temporaryPath)).isFile(), true);
+    abort.abort();
+    await Effect.runPromise(Effect.sleep("20 millis"));
+    assert.equal(settled, false);
+    await Effect.runPromise(Deferred.succeed(acquisitionGate, undefined));
+    await assert.rejects(pending);
+
+    assert.equal(handleReleased, true);
+    await assert.rejects(
+      stat(temporaryPath),
+      (error: NodeJS.ErrnoException) => error.code === "ENOENT",
+    );
+    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+    assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 void test("interruption during temporary preparation waits for native release and leaves no delayed file", async () => {
   const { parent, store } = await fixture();
   try {
@@ -1027,6 +1094,140 @@ void test("interruption during temporary preparation waits for native release an
     assert.equal(handleReleased, true);
     assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
     assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("new storage is private across umasks and existing shared directories keep their mode", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-private-storage-"));
+  const originalUmask = process.umask();
+  try {
+    for (const [name, mask] of [
+      ["permissive", 0],
+      ["restrictive", 0o777],
+    ] as const) {
+      const gitCommonDir = join(parent, name, ".git");
+      await mkdir(gitCommonDir, { recursive: true, mode: 0o755 });
+      await chmod(gitCommonDir, 0o755);
+      process.umask(mask);
+      const { state } = await WorkstreamStore.create({
+        id: "private-store",
+        purpose: "Verify private persistence modes.",
+        projectRoot: join(parent, name),
+        gitCommonDir,
+        coordinator,
+        now: dateAt(0),
+      });
+      process.umask(originalUmask);
+
+      for (const directory of [
+        join(gitCommonDir, "pi-workgraph"),
+        join(gitCommonDir, "pi-workgraph", "workstreams"),
+        join(gitCommonDir, "pi-workgraph", "workstreams", "private-store"),
+      ])
+        assert.equal((await lstat(directory)).mode & 0o777, 0o700, directory);
+      assert.equal((await lstat(state.statePath)).mode & 0o777, 0o600);
+    }
+
+    const gitCommonDir = join(parent, "shared", ".git");
+    const sharedStorage = join(gitCommonDir, "pi-workgraph");
+    await mkdir(sharedStorage, { recursive: true, mode: 0o755 });
+    await chmod(sharedStorage, 0o755);
+    await WorkstreamStore.create({
+      id: "compatible-store",
+      purpose: "Preserve a legitimate shared storage parent.",
+      projectRoot: join(parent, "shared"),
+      gitCommonDir,
+      coordinator,
+      now: dateAt(0),
+    });
+    assert.equal((await lstat(sharedStorage)).mode & 0o777, 0o755);
+  } finally {
+    process.umask(originalUmask);
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("state creation refuses static storage redirection before mutation", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-storage-fence-"));
+  try {
+    const gitCommonDir = join(parent, "project", ".git");
+    const storageDirectory = join(gitCommonDir, "pi-workgraph");
+    const external = join(parent, "external");
+    await mkdir(storageDirectory, { recursive: true });
+    await mkdir(external);
+    const workstreamsDirectory = join(storageDirectory, "workstreams");
+    await symlink(external, workstreamsDirectory, "dir");
+
+    await assert.rejects(
+      WorkstreamStore.create({
+        id: "redirected",
+        purpose: "This must not leave the Git storage boundary.",
+        projectRoot: join(parent, "project"),
+        gitCommonDir,
+        coordinator,
+        now: dateAt(0),
+      }),
+      /not an ordinary directory/,
+    );
+    assert.equal((await lstat(workstreamsDirectory)).isSymbolicLink(), true);
+    assert.deepEqual(await readdir(external), []);
+
+    await rm(workstreamsDirectory);
+    await writeFile(workstreamsDirectory, "foreign component");
+    await assert.rejects(
+      WorkstreamStore.create({
+        id: "not-a-directory",
+        purpose: "This must not traverse a file component.",
+        projectRoot: join(parent, "project"),
+        gitCommonDir,
+        coordinator,
+        now: dateAt(0),
+      }),
+      /not an ordinary directory/,
+    );
+    assert.equal(await readFile(workstreamsDirectory, "utf8"), "foreign component");
+    assert.deepEqual(await readdir(external), []);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("legitimate existing storage supports new ids and preserves claimed-directory collisions", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-storage-collision-"));
+  try {
+    const gitCommonDir = join(parent, "project", ".git");
+    await mkdir(gitCommonDir, { recursive: true });
+    const first = await WorkstreamStore.create({
+      id: "first",
+      purpose: "Create the shared storage hierarchy.",
+      projectRoot: join(parent, "project"),
+      gitCommonDir,
+      coordinator,
+      now: dateAt(0),
+    });
+    const firstBytes = await readFile(first.state.statePath, "utf8");
+    await WorkstreamStore.create({
+      id: "second",
+      purpose: "Reuse the legitimate shared storage hierarchy.",
+      projectRoot: join(parent, "project"),
+      gitCommonDir,
+      coordinator,
+      now: dateAt(0),
+    });
+    await assert.rejects(
+      WorkstreamStore.create({
+        id: "first",
+        purpose: "Do not adopt an existing directory claim.",
+        projectRoot: join(parent, "project"),
+        gitCommonDir,
+        coordinator,
+        now: dateAt(0),
+      }),
+      /EEXIST/,
+    );
+    assert.equal(await readFile(first.state.statePath, "utf8"), firstBytes);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
