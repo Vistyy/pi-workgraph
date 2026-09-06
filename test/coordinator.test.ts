@@ -49,11 +49,25 @@ const resultDetailsSchema = Type.Object({
 const contentDetailsSchema = Type.Object({
   inspection: Type.Object({
     content: Type.Object({
+      text: Type.String(),
       offset: Type.Number(),
       truncated: Type.Boolean(),
       next: Type.Optional(Type.Object({ offset: Type.Number() })),
     }),
   }),
+});
+const contextDetailsSchema = Type.Object({
+  inspection: Type.Object({
+    records: Type.Object({ text: Type.String() }),
+  }),
+});
+const modelPolicyDetailsSchema = Type.Object({
+  authority: Type.Optional(
+    Type.Object({
+      receiptId: Type.String(),
+      source: Type.String(),
+    }),
+  ),
 });
 const persistedHeaderSchema = Type.Object({
   format: Type.String(),
@@ -129,10 +143,59 @@ void test("registered capability tools create work implicitly and retain only hu
     };
     await f.runner.emitInput("Implement a change", undefined, "extension");
     await assert.rejects(f.call("workgraph_implement", request), /actual retained human input/);
-    await f.runner.emitInput("Implement the maintained value change", undefined, "interactive");
-    const authorized = resultState((await f.call("workgraph_implement", request)).details);
-    assert.equal(authorized.inputs.length, 1);
-    assert.equal(authorized.intents.at(-1)?.version, 1);
+
+    const firstHumanText = "Implement the maintained value change - private first context";
+    await f.runner.emitInput(firstHumanText, undefined, "interactive");
+    const firstResponse = await f.call("workgraph_implement", request);
+    const firstAuthorized = resultState(firstResponse.details);
+    const firstReceipt = required(firstAuthorized.inputs[0], "first retained human input").id;
+    assert.equal(firstAuthorized.intents.at(-1)?.version, 1);
+    assert.deepEqual(firstAuthorized.intents.at(-1)?.authorityReceiptIds, [firstReceipt]);
+    assert.equal(JSON.stringify(firstResponse).includes(firstHumanText), false);
+
+    const secondHumanText = "Apply the corrected follow-up scope - private second context";
+    await f.runner.emitInput(secondHumanText, undefined, "rpc");
+    const secondResponse = await f.call("workgraph_implement", {
+      ...request,
+      id: "fix-value-follow-up",
+      objective: "Apply the corrected follow-up",
+    });
+    const secondAuthorized = resultState(secondResponse.details);
+    const secondReceipt = required(secondAuthorized.inputs[1], "second retained human input").id;
+    assert.notEqual(secondReceipt, firstReceipt);
+    assert.equal(secondAuthorized.intents.at(-1)?.version, 2);
+    assert.deepEqual(secondAuthorized.intents.at(-1)?.authorityReceiptIds, [secondReceipt]);
+    assert.equal(JSON.stringify(secondResponse).includes(secondHumanText), false);
+
+    const explicit = resultState(
+      (
+        await f.call("workgraph_implement", {
+          ...request,
+          id: "fix-value-original-scope",
+          objective: "Apply the coordinator judgment under original scope",
+          authorityReceiptId: firstReceipt,
+        })
+      ).details,
+    );
+    assert.equal(explicit.intents.at(-1)?.version, 3);
+    assert.deepEqual(explicit.intents.at(-1)?.authorityReceiptIds, [firstReceipt]);
+    assert.deepEqual(
+      explicit.intents.map((intent) => intent.statement),
+      [
+        "What is value.txt?",
+        "Fix value",
+        "Apply the corrected follow-up",
+        "Apply the coordinator judgment under original scope",
+      ],
+    );
+    const retainedContext = decodeTestValue(
+      contextDetailsSchema,
+      (await f.call("workgraph_inspect", { section: "context", maxChars: 8_000 })).details,
+    ).inspection.records.text;
+    assert.match(retainedContext, new RegExp(firstReceipt));
+    assert.match(retainedContext, new RegExp(secondReceipt));
+    assert.match(retainedContext, /private first context/);
+    assert.match(retainedContext, /private second context/);
     await f.call("workgraph_control", {
       action: "suspend",
       reason: "Pause fixture",
@@ -143,7 +206,7 @@ void test("registered capability tools create work implicitly and retain only hu
       (await f.call("workgraph_inspect", { section: "overview" })).details,
     );
     assert.equal(reloaded.lifecycle.state, "suspended");
-    assert.equal(reloaded.inputs.length, 1);
+    assert.equal(reloaded.inputs.length, 2);
     await assert.rejects(
       f.call("workgraph_research", {
         id: "while-paused",
@@ -336,6 +399,26 @@ void test("registered status stays compact and focused result retrieval projects
       .content;
     assert.equal(findingsContent.offset, 0);
     assert.equal(findingsContent.truncated, true);
+
+    let assignmentText = "";
+    let assignmentOffset = 0;
+    for (;;) {
+      const assignmentPage = await f.call("workgraph_inspect", {
+        section: "assignment",
+        task: "large-result",
+        offset: assignmentOffset,
+        maxChars: 173,
+      });
+      const page = decodeTestValue(contentDetailsSchema, assignmentPage.details).inspection.content;
+      assignmentText += page.text;
+      if (page.next === undefined) break;
+      assignmentOffset = page.next.offset;
+    }
+    assert.equal(
+      decodeTestValue(Type.Object({ objective: Type.String() }), JSON.parse(assignmentText))
+        .objective,
+      longObjective,
+    );
     const state = resultState((await f.call("workgraph_inspect", { section: "overview" })).details);
     assert.equal(state.deliveries.length, 0);
     const completed = resultState(
@@ -555,15 +638,35 @@ void test("registered session_start safely inspects retained and pointed workstr
   }
 });
 
-void test("registered model policy get/set affects later assignments but not overrides or coordinator selection", async () => {
+void test("registered model policy mutations require retained genuine input provenance", async () => {
   const f = await fixture();
   try {
     await f.call("workgraph_models", { action: "get" });
-    await f.call("workgraph_models", {
-      action: "set",
-      role: "research",
-      target: { model: "fixture/default", thinking: "low" },
-    });
+    await f.runner.emitInput("Extension model request", undefined, "extension");
+    await assert.rejects(
+      f.call("workgraph_models", {
+        action: "set",
+        role: "research",
+        target: { model: "fixture/rejected", thinking: "low" },
+      }),
+      /actual retained human input/,
+    );
+    const afterExtensionOnly = await f.call("workgraph_models", { action: "get" });
+    assert.equal(JSON.stringify(afterExtensionOnly).includes("fixture/rejected"), false);
+    await f.runner.emitInput("Persist the first research model", undefined, "interactive");
+    const firstMutation = decodeTestValue(
+      modelPolicyDetailsSchema,
+      (
+        await f.call("workgraph_models", {
+          action: "set",
+          role: "research",
+          target: { model: "fixture/default", thinking: "low" },
+        })
+      ).details,
+    );
+    const firstReceipt = required(firstMutation.authority, "first model authority").receiptId;
+    assert.equal(firstMutation.authority?.source, "interactive");
+    assert.match(JSON.stringify(firstMutation), new RegExp(firstReceipt));
     let state = resultState(
       (
         await f.call("workgraph_research", {
@@ -577,11 +680,41 @@ void test("registered model policy get/set affects later assignments but not ove
       model: "fixture/default",
       thinking: "low",
     });
-    await f.call("workgraph_models", {
-      action: "set",
-      role: "research",
-      target: { model: "fixture/changed", thinking: "high" },
-    });
+    await f.runner.emitInput("Persist the changed research model", undefined, "rpc");
+    const secondMutation = decodeTestValue(
+      modelPolicyDetailsSchema,
+      (
+        await f.call("workgraph_models", {
+          action: "set",
+          role: "research",
+          target: { model: "fixture/changed", thinking: "high" },
+        })
+      ).details,
+    );
+    assert.equal(secondMutation.authority?.source, "rpc");
+    assert.notEqual(secondMutation.authority?.receiptId, firstReceipt);
+    const explicitPoolMutation = decodeTestValue(
+      modelPolicyDetailsSchema,
+      (
+        await f.call("workgraph_models", {
+          action: "set_pool",
+          authorityReceiptId: firstReceipt,
+          pool: [{ model: "fixture/pool", thinking: "medium" }],
+        })
+      ).details,
+    );
+    assert.equal(explicitPoolMutation.authority?.receiptId, firstReceipt);
+    await assert.rejects(
+      f.call("workgraph_models", {
+        action: "set_pool",
+        authorityReceiptId: "extension-invented-receipt",
+        pool: [{ model: "fixture/rejected-pool", thinking: "low" }],
+      }),
+      /Unknown retained human input receipt/,
+    );
+    const afterInventedReceipt = await f.call("workgraph_models", { action: "get" });
+    assert.match(JSON.stringify(afterInventedReceipt), /fixture\/pool/);
+    assert.equal(JSON.stringify(afterInventedReceipt).includes("fixture/rejected-pool"), false);
     state = resultState(
       (
         await f.call("workgraph_research", {

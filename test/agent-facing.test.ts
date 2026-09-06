@@ -157,6 +157,163 @@ void test("overview task index recovers every arbitrary task id", () => {
   assert.ok(overview.tasks.next);
 });
 
+void test("retained authority, complete assignments, and coordinator judgments roundtrip exactly", () => {
+  const longInput = `second human scope ${"scope detail 🧭 ".repeat(700)}`;
+  const longObjective = `Implement exact behavior ${"objective detail ".repeat(650)}`;
+  const longAcceptance = `Preserve acceptance ${"acceptance detail ".repeat(600)}`;
+  const longDisposition = `Coordinator judgment ${"judgment detail ".repeat(620)}`;
+  const longConclusion = `Completion substance ${"completion detail ".repeat(640)}`;
+  const implementation: WorkAssignment = {
+    id: "implementation task",
+    capability: "implement",
+    artifactIntent: "maintained_change",
+    objective: longObjective,
+    intentVersion: 2,
+    authority: { receiptId: "receipt-2", intentVersion: 2 },
+    acceptance: [longAcceptance],
+    createdAt: timestamp,
+  };
+  const experiment: WorkAssignment = {
+    id: "experiment task",
+    capability: "research",
+    artifactIntent: "disposable_experiment",
+    objective: "Run the bounded probe",
+    intentVersion: 2,
+    authority: { receiptId: "receipt-2", intentVersion: 2 },
+    permittedEffects: ["Write one temporary probe"],
+    stopCondition: "Stop after the first observation",
+    expectedEvidence: ["Exact probe bytes"],
+    artifactPolicy: { retain: ["artifacts/probe.txt"], discardOthers: true },
+    createdAt: timestamp,
+  };
+  const review: WorkAssignment = {
+    id: "review task",
+    capability: "review",
+    artifactIntent: "evidence_only",
+    objective: "Review the exact retained revision",
+    intentVersion: 2,
+    subject: { kind: "revision", revision: "a".repeat(40) },
+    concern: "Authority and inspection loss",
+    createdAt: timestamp,
+  };
+  const outcome = typedResult("implementation-result", implementation.id, researchReport("Done"));
+  const current = state([implementation, experiment, review], [], [outcome]);
+  current.purpose = `Original human scope ${"original context ".repeat(500)}`;
+  current.inputs = [
+    {
+      id: "receipt-1",
+      sessionId: "agent-facing-test",
+      sessionFile: "/tmp/agent-facing-test.jsonl",
+      source: "interactive",
+      text: "first human scope",
+      receivedAt: timestamp,
+    },
+    {
+      id: "receipt-2",
+      sessionId: "agent-facing-test",
+      sessionFile: "/tmp/agent-facing-test.jsonl",
+      source: "rpc",
+      text: longInput,
+      receivedAt: timestamp,
+    },
+  ];
+  current.intents = [
+    {
+      version: 0,
+      statement: current.purpose,
+      constraints: [],
+      authorityReceiptIds: [],
+      recordedAt: timestamp,
+    },
+    {
+      version: 1,
+      statement: "Coordinator interpretation of first scope",
+      constraints: ["Keep historical scope"],
+      authorityReceiptIds: ["receipt-1"],
+      recordedAt: timestamp,
+    },
+    {
+      version: 2,
+      statement: longObjective,
+      constraints: ["Keep historical scope"],
+      authorityReceiptIds: ["receipt-2"],
+      recordedAt: timestamp,
+    },
+  ];
+  current.dispositions = [
+    {
+      resultId: outcome.id,
+      status: "accepted",
+      reason: longDisposition,
+      recordedAt: timestamp,
+    },
+  ];
+  current.completion = {
+    conclusion: longConclusion,
+    evidence: [{ label: "exact", observation: "All retained decisions were inspected." }],
+    limitations: ["No live host observation"],
+    accounting: [],
+    completedAt: timestamp,
+  };
+
+  let contextText = "";
+  let contextOffset = 0;
+  for (;;) {
+    const view = inspectView(current, {
+      section: "context",
+      offset: contextOffset,
+      maxChars: 257,
+    });
+    contextText += view.records.text;
+    if (view.records.next === undefined) break;
+    assert.equal(view.records.next.section, "context");
+    contextOffset = view.records.next.offset;
+  }
+  assert.deepEqual(JSON.parse(contextText), {
+    purpose: current.purpose,
+    inputs: current.inputs,
+    intents: current.intents,
+  });
+
+  for (const expected of current.assignments) {
+    let assignmentText = "";
+    let assignmentOffset = 0;
+    for (;;) {
+      const view = inspectView(current, {
+        section: "assignment",
+        task: expected.id,
+        offset: assignmentOffset,
+        maxChars: 211,
+      });
+      assignmentText += view.content.text;
+      if (view.content.next === undefined) break;
+      assert.equal(view.content.next.task, expected.id);
+      assignmentOffset = view.content.next.offset;
+    }
+    assert.deepEqual(JSON.parse(assignmentText), expected);
+  }
+
+  let judgmentsText = "";
+  let judgmentsOffset = 0;
+  for (;;) {
+    const view = inspectView(current, {
+      section: "judgments",
+      result: outcome.id,
+      offset: judgmentsOffset,
+      maxChars: 193,
+    });
+    judgmentsText += view.records.text;
+    if (view.records.next === undefined) break;
+    assert.equal(view.records.next.result, outcome.id);
+    judgmentsOffset = view.records.next.offset;
+  }
+  assert.deepEqual(JSON.parse(judgmentsText), {
+    lifecycle: current.lifecycle,
+    dispositions: current.dispositions,
+    completion: current.completion,
+  });
+});
+
 void test("selection preserves pending attempts and rejects mismatched outcomes", () => {
   const pendingAttempt = attempt("opaque-pending", "research task");
   const sibling = typedResult("opaque-sibling-result", "research task", researchReport("Sibling"));

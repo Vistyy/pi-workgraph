@@ -204,11 +204,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     Effect.gen(function* () {
       let state = yield* host("load authorization state", () => active.store.load());
       let intent = requiredValue(state.intents.at(-1), "workstream intent");
-      if (requiresIntentRevision(intent, receiptId)) {
-        const receipt = requiredAuthorityReceipt(receiptId ?? state.inputs.at(-1)?.id);
+      const selectedReceipt = selectWorkstreamAuthority(state, receiptId);
+      if (requiresIntentRevision(intent, selectedReceipt)) {
         state = yield* host("revise authorization intent", () =>
           active.store.reviseIntent({
-            authorityReceiptId: receipt,
+            authorityReceiptId: selectedReceipt,
             statement,
             constraints: intent.constraints,
           }),
@@ -216,7 +216,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         intent = requiredValue(state.intents.at(-1), "revised workstream intent");
       }
       return {
-        receiptId: requiredAuthorityReceipt(receiptId ?? intent.authorityReceiptIds[0]),
+        receiptId: selectedReceipt,
         intentVersion: intent.version,
       };
     });
@@ -342,10 +342,16 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_models",
     label: "Workgraph Models",
     description:
-      "Get model defaults and their configuration path, or set one role when the user requests a persistent policy change. Assignment model/thinking/executor parameters override defaults without changing policy or the coordinator model.",
+      "Get model defaults and their configuration path, or persist a role/pool change backed by a retained interactive or RPC input receipt. Assignment model/thinking/executor parameters override defaults without changing policy or the coordinator model.",
     promptSnippet: "Inspect or configure Workgraph model defaults",
     parameters: Type.Object({
       action: StringEnum(["get", "set", "set_pool", "rates"] as const),
+      authorityReceiptId: Type.Optional(
+        Type.String({
+          description:
+            "Retained interactive/RPC input receipt authorizing set or set_pool. Omit to use the latest retained genuine input.",
+        }),
+      ),
       role: Type.Optional(StringEnum(MODEL_ROLES)),
       target: Type.Optional(Target),
       pool: Type.Optional(Type.Array(Target, { minItems: 1 })),
@@ -364,6 +370,9 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
               details: { rates },
             };
           }
+          const authority = isPersistentModelMutation(params.action)
+            ? selectSessionAuthority(pending, params.authorityReceiptId)
+            : undefined;
           const policy = yield* host("update model policy", () =>
             resolveModelPolicy(params.action, params.role, params.target, params.pool),
           );
@@ -371,10 +380,13 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             content: [
               {
                 type: "text",
-                text: formatPolicy(policy),
+                text:
+                  authority === undefined
+                    ? formatPolicy(policy)
+                    : `${formatPolicy(policy)}\nAuthority receipt: ${authority.receiptId} (${authority.source}).`,
               },
             ],
-            details: { path: modelPolicyPath(), policy, rates: [] },
+            details: { path: modelPolicyPath(), policy, rates: [], authority },
           };
         }),
       );
@@ -571,16 +583,20 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_inspect",
     label: "Workgraph Inspect",
     description:
-      "Inspect one unified bounded view of workstream overview, a semantic task, its outcome/evidence, or exact recovery. Notifications already include a bounded actionable outcome; inspect only for uncertainty, blockers, repeated attempts, or truncated content. Report reads are character-bounded and lossless through the returned next handle, including untyped and malformed reports.",
-    promptSnippet: "Inspect Workgraph overview, outcomes, evidence, or recovery",
+      "Inspect one unified bounded view of workstream overview, retained human context, a semantic task or complete assignment, its outcome/evidence, coordinator judgments, or exact recovery. Notifications already include a bounded actionable outcome; inspect only for uncertainty, blockers, repeated attempts, or truncated content. Detail reads are character-bounded and lossless through the returned next handle, including exact inputs, intents, assignments, dispositions, completion, and untyped or malformed reports.",
+    promptSnippet:
+      "Inspect Workgraph overview, retained context, complete assignments, outcomes, judgments, or recovery",
     parameters: Type.Object({
       section: StringEnum([
         "overview",
+        "context",
         "task",
+        "assignment",
         "outcome",
         "evidence",
         "recovery",
         "report",
+        "judgments",
       ] as const),
       task: Type.Optional(Type.String()),
       attempt: Type.Optional(Type.String()),
@@ -778,17 +794,44 @@ type ResearchParams = {
 
 function requiresIntentRevision(
   intent: WorkstreamState["intents"][number],
-  receiptId: string | undefined,
+  receiptId: string,
 ): boolean {
-  return (
-    intent.version === 0 ||
-    (receiptId !== undefined && !intent.authorityReceiptIds.includes(receiptId))
-  );
+  return intent.version === 0 || !intent.authorityReceiptIds.includes(receiptId);
 }
+
 function requiredAuthorityReceipt(receipt: string | undefined): string {
   if (receipt === undefined || receipt === "")
     throw new Error("Mutation requires an actual retained human input receipt.");
   return receipt;
+}
+
+function selectWorkstreamAuthority(
+  state: WorkstreamState,
+  requestedReceiptId: string | undefined,
+): string {
+  const receiptId = requiredAuthorityReceipt(requestedReceiptId ?? state.inputs.at(-1)?.id);
+  if (!state.inputs.some((receipt) => receipt.id === receiptId))
+    throw new Error(`Unknown retained human input receipt ${receiptId}.`);
+  return receiptId;
+}
+
+function selectSessionAuthority(
+  receipts: Static<typeof InputReceipt>[],
+  requestedReceiptId: string | undefined,
+) {
+  const receiptId = requiredAuthorityReceipt(requestedReceiptId ?? receipts.at(-1)?.id);
+  const receipt = receipts.find((item) => item.id === receiptId);
+  if (receipt === undefined) throw new Error(`Unknown retained human input receipt ${receiptId}.`);
+  return {
+    receiptId: receipt.id,
+    sessionId: receipt.sessionId,
+    sessionFile: receipt.sessionFile,
+    source: receipt.source,
+  };
+}
+
+function isPersistentModelMutation(action: "get" | "set" | "set_pool" | "rates"): boolean {
+  return action === "set" || action === "set_pool";
 }
 
 function researchAssignment(
