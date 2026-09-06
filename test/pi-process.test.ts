@@ -17,7 +17,6 @@ import {
 } from "../src/pi-process.js";
 import { usage } from "./helpers.js";
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 await test("fresh worker context, explicit continuation, native generation markers and invalid reports remain distinct", async () => {
   const root = await mkdtemp(join(tmpdir(), "workgraph-session-"));
   const generation = { runId: "fixture", nodeId: "first" };

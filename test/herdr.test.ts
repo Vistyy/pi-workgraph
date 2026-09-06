@@ -72,7 +72,6 @@ await test("coordinator fork names use repository context without exposing paths
   assert.equal(names.label.includes("/"), false);
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
 await test("Herdr identity validation rejects missing and mismatched native session or cwd", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-identity-"));
   const responsePath = join(parent, "agent.json");
@@ -137,7 +136,6 @@ await test("Herdr identity validation rejects missing and mismatched native sess
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
 await test("current-session coordinator observation accepts an unnamed detected Pi pane without weakening worker identity", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-coordinator-"));
   const command = join(parent, "fake-herdr-coordinator.mjs");
@@ -178,7 +176,6 @@ await test("current-session coordinator observation accepts an unnamed detected 
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
 await test("coordinator forks into a new unfocused workspace with isolated Pi identity", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-fork-"));
   const log = join(parent, "commands.jsonl");
@@ -263,7 +260,6 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
 await test("uncertain coordinator startup retains the exact created workspace handles", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-fork-failure-"));
   const command = join(parent, "fake-herdr-fork-failure.mjs");
@@ -310,7 +306,6 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
 await test("cleanup rejects mismatched cwd, verifies exact tab absence and tolerates already completed closure", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-deleted-cleanup-"));
   const command = join(parent, "fake-herdr-cleanup.mjs");
@@ -360,7 +355,6 @@ await test("cleanup rejects mismatched cwd, verifies exact tab absence and toler
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
 await test("the Herdr adapter launches without waiting and validates exact identity before interrupt", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-"));
   const log = join(parent, "commands.jsonl");
@@ -456,7 +450,6 @@ await test("the Herdr adapter launches without waiting and validates exact ident
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
 await test("the Herdr launch can wait for native session identity without submitting a prompt", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-readiness-"));
   const log = join(parent, "commands.jsonl");
@@ -532,7 +525,6 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
 await test("the Herdr launch retains a blocked resource without submitting an assignment", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-blocked-"));
   const log = join(parent, "commands.jsonl");
@@ -606,7 +598,6 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
 await test("read-only startup inspection distinguishes exact live, absent, and mismatched retained panes", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-herdr-startup-inspection-"));
   const command = join(parent, "fake-herdr-startup.mjs");

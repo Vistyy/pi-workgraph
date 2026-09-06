@@ -12,7 +12,6 @@ function at(milliseconds: number): Date {
   return DateTime.toDate(DateTime.makeUnsafe(milliseconds));
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 await test("SQLite leases fence competing instances, expired unknown owners, renewal and stale release", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-lease-"));
   const a = new WorkgraphRegistry(join(parent, "registry.sqlite"));

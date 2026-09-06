@@ -10,7 +10,6 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { runCli } from "../src/cli.js";
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("CLI status preserves uninterpreted historical bytes and does not create a registry", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-cli-"));
   const path = join(parent, "retained.json");
@@ -30,7 +29,6 @@ void test("CLI status preserves uninterpreted historical bytes and does not crea
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("CLI bootstrap resolves its loader from an unrelated caller cwd", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-cli-bootstrap-"));
   const bootstrap = fileURLToPath(new URL("../bin/pi-workgraph.mjs", import.meta.url));

@@ -50,7 +50,6 @@ function assistant(session: SessionManager, model = "gpt-4o") {
   });
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- The node:test fixture composes native Promise-based Git, filesystem, and Pi adapters.
 async function fixture(mode: "implementation" | "review", continued = false) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
   const root = join(parent, "repo");
@@ -75,7 +74,6 @@ async function fixture(mode: "implementation" | "review", continued = false) {
   return {
     ...pi,
     root,
-    // oxlint-disable-next-line effecttsgo/async-function -- Fixture teardown must await native Pi and filesystem cleanup.
     async dispose() {
       await pi.close();
       restoreFixtureEnvironment(previous);
@@ -84,7 +82,6 @@ async function fixture(mode: "implementation" | "review", continued = false) {
   };
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered worker observes a non-edit mutation, switches locally, reports a direct commit and native settlement", async () => {
   const f = await fixture("implementation");
   try {
@@ -156,7 +153,6 @@ void test("registered worker observes a non-edit mutation, switches locally, rep
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("no-change implementation can report from the guide without manufacturing an edit or executor turn", async () => {
   const f = await fixture("implementation");
   try {
@@ -184,7 +180,6 @@ void test("no-change implementation can report from the guide without manufactur
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("continued implementation requires this attempt's native start and later executor message, not inherited evidence", async () => {
   const f = await fixture("implementation", true);
   const report = {
@@ -222,7 +217,6 @@ void test("continued implementation requires this attempt's native start and lat
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("read-only review observes dirty live files without changing them", async () => {
   const f = await fixture("review");
   const report = {

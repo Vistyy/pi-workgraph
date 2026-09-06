@@ -61,7 +61,6 @@ const persistedHeaderSchema = Type.Object({
   id: Type.String(),
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- The node:test fixture composes native Promise-based Git, filesystem, and Pi adapters.
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-coordinator-"));
   const root = join(parent, "repo");
@@ -83,7 +82,6 @@ async function fixture() {
     ...pi,
     root,
     parent,
-    // oxlint-disable-next-line effecttsgo/async-function -- Fixture teardown must await native Pi and filesystem cleanup.
     async dispose() {
       await pi.close();
       restoreFixtureEnvironment(previous);
@@ -92,7 +90,6 @@ async function fixture() {
   };
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- This fixture helper composes the Promise APIs under test.
 async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
   const repository = await GitRepository.open(f.root);
   const created = await WorkstreamStore.create({
@@ -112,7 +109,6 @@ async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
   return created.state;
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered capability tools create work implicitly and retain only human input as authority across reload", async () => {
   const f = await fixture();
   try {
@@ -161,7 +157,6 @@ void test("registered capability tools create work implicitly and retain only hu
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("failed registered adoption preserves the attached runtime lease; same-target attachment reuses it", async () => {
   const f = await fixture();
   let competing: WorkstreamRuntime | undefined;
@@ -217,7 +212,6 @@ void test("failed registered adoption preserves the attached runtime lease; same
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("mutation responses stay action-focused while retaining handles, models, and exact read paths", async () => {
   const f = await fixture();
   try {
@@ -267,7 +261,6 @@ void test("mutation responses stay action-focused while retaining handles, model
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered status stays compact and focused result retrieval projects bounded sections", async () => {
   const f = await fixture();
   try {
@@ -366,9 +359,7 @@ void test("registered status stays compact and focused result retrieval projects
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered session_start safely inspects retained and pointed workstreams", async () => {
-  // oxlint-disable-next-line effecttsgo/async-function -- This local fixture helper composes the Promise APIs under test.
   async function createState(f: Awaited<ReturnType<typeof fixture>>, id: string) {
     const repository = await GitRepository.open(f.root);
     return WorkstreamStore.create({
@@ -564,7 +555,6 @@ void test("registered session_start safely inspects retained and pointed workstr
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered model policy get/set affects later assignments but not overrides or coordinator selection", async () => {
   const f = await fixture();
   try {

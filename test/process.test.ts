@@ -12,7 +12,6 @@ import { ProcessExecutionError, processEffect, runProcess } from "../src/process
 const node = process.execPath;
 const cwd = process.cwd();
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("the Effect process owner returns normal output through its native API", async () => {
   const result = await Effect.runPromise(
     processEffect(node, ["-e", "process.stdout.write('hello')"], {
@@ -29,7 +28,6 @@ void test("the Effect process owner returns normal output through its native API
   });
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("bounded diagnostics do not change the complete stdout fingerprint", async () => {
   const full = `prefix-${"x".repeat(100_000)}-suffix`;
   const result = await runProcess(node, ["-e", `process.stdout.write(${JSON.stringify(full)})`], {
@@ -43,7 +41,6 @@ void test("bounded diagnostics do not change the complete stdout fingerprint", a
   assert.equal(result.stdoutDigest, createHash("sha256").update(full).digest("hex"));
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("timeout keeps the diagnostic result and escalates from SIGTERM to SIGKILL", async () => {
   const result = await runProcess(
     node,
@@ -54,7 +51,6 @@ void test("timeout keeps the diagnostic result and escalates from SIGTERM to SIG
   assert.notEqual(result.exitCode, 0);
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("spawn failures are reported through the process error", async () => {
   await assert.rejects(
     runProcess("/definitely/not/a/real/process", [], { cwd, timeoutMs: 1_000 }),
@@ -62,7 +58,6 @@ void test("spawn failures are reported through the process error", async () => {
   );
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("bounded output retains a valid UTF-8 suffix within the byte limit", async () => {
   const full = "🙂".repeat(1_000);
   const result = await runProcess(node, ["-e", `process.stdout.write(${JSON.stringify(full)})`], {
@@ -76,7 +71,6 @@ void test("bounded output retains a valid UTF-8 suffix within the byte limit", a
   assert.ok(Buffer.byteLength(result.stdout) <= 7);
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("malformed bytes stay within the display byte limit and preserve the raw digest", async () => {
   const result = await runProcess(
     node,
@@ -101,7 +95,6 @@ void test("malformed bytes stay within the display byte limit and preserve the r
   );
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("decoded malformed suffixes are bounded for both output streams", async () => {
   const stdout = Buffer.from([0x41, 0xff, 0xf0, 0x9f, 0x98, 0x80]);
   const stderr = Buffer.from([0xc3, 0x28, 0xe2, 0x82, 0xac]);
@@ -120,7 +113,6 @@ void test("decoded malformed suffixes are bounded for both output streams", asyn
   assert.ok(Buffer.byteLength(result.stderr) <= 6);
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("interrupting the Effect waits for the owned process to close", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-process-"));
   const marker = join(directory, "closed");
@@ -146,7 +138,6 @@ void test("interrupting the Effect waits for the owned process to close", async 
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("a pre-aborted signal does not launch a process", async () => {
   const controller = new AbortController();
   controller.abort();
@@ -159,7 +150,6 @@ void test("a pre-aborted signal does not launch a process", async () => {
   );
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("interrupting the Effect cancels the owned process", async () => {
   const controller = new AbortController();
   const running = runProcess(

@@ -8,7 +8,6 @@ import test from "node:test";
 import { GitRepository, runProcess } from "../src/git.js";
 import { git } from "./helpers.js";
 
-// oxlint-disable-next-line effecttsgo/async-function -- Node test fixtures compose real Promise-based filesystem and Git boundaries.
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-git-"));
   const root = join(parent, "repo");
@@ -24,7 +23,6 @@ async function fixture() {
   return { parent, root, repository, base: await repository.head() };
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- Node test callbacks are Promise-based by contract.
 void test("Git placements preserve unknown data; cleanup requires exact clean identity and is idempotent", async () => {
   const f = await fixture();
   try {
@@ -66,7 +64,6 @@ void test("Git placements preserve unknown data; cleanup requires exact clean id
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- Node test callbacks are Promise-based by contract.
 void test("composition recovery compares complete large patches and rejects non-direct worker commits", async () => {
   const f = await fixture();
   try {

@@ -74,7 +74,6 @@ void test("direct native outcome accepts the authorized tracked edit and rejects
   assert.deepEqual(rejected.changedPaths, ["probe.txt", "value.txt"]);
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("delegated native outcome requires attributable composition, cleanup, and retained experiment output", async () => {
   const { state } = await baseState();
   const now = fixtureInstant;
@@ -212,7 +211,6 @@ void test("delegated native outcome requires attributable composition, cleanup, 
   assert.equal(result.experiment, "verified");
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("natural observer accepts read-only delegation followed by a direct edit and rejects unaccounted effects", async () => {
   const { state } = await baseState();
   const now = fixtureInstant;

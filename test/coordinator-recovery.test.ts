@@ -55,7 +55,6 @@ const taskViewSchema = Type.Object({
 });
 const outcomeViewSchema = Type.Object({ inspection: Type.Object({ result: Type.String() }) });
 
-// oxlint-disable-next-line effecttsgo/async-function -- The node:test fixture composes native Promise-based Git, filesystem, Herdr, SQLite, and Pi adapters.
 async function recoveryFixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-public-recovery-"));
   const root = join(parent, "repo");
@@ -148,7 +147,6 @@ if (args[0] === "tab" && args[1] === "create") {
   );
   await runtime.perform(() => Promise.resolve());
 
-  // oxlint-disable-next-line effecttsgo/async-function -- The fixture updates the native Herdr JSON protocol file through Promise I/O.
   async function setTransport(change: TransportChange) {
     const current = decodeTestValue(
       transportStateSchema,
@@ -157,9 +155,7 @@ if (args[0] === "tab" && args[1] === "create") {
     await writeFile(transportState, JSON.stringify({ ...current, ...change }));
   }
 
-  // oxlint-disable-next-line effecttsgo/async-function -- The helper exercises runtime and store Promise APIs under test.
   async function authorize() {
-    // oxlint-disable-next-line effecttsgo/async-function -- WorkstreamRuntime owns and awaits this transactional Promise callback.
     return runtime.perform(async () => {
       const recorded = await store.recordInputEvent({
         ...owner,
@@ -175,7 +171,6 @@ if (args[0] === "tab" && args[1] === "create") {
     });
   }
 
-  // oxlint-disable-next-line effecttsgo/async-function -- The helper persists a native Pi worker trajectory and Herdr state through Promise APIs.
   async function settle(report: WorkerReport) {
     const state = await store.load();
     const attempt = required(state.attempts.at(-1), "latest recovery attempt");
@@ -212,7 +207,6 @@ if (args[0] === "tab" && args[1] === "create") {
     await setTransport({ status: "idle" });
   }
 
-  // oxlint-disable-next-line effecttsgo/async-function -- Public attachment composes Promise lifecycle APIs under test.
   async function attachPublic() {
     await runtime.stop();
     registry.close();
@@ -233,7 +227,6 @@ if (args[0] === "tab" && args[1] === "create") {
     settle,
     setTransport,
     attachPublic,
-    // oxlint-disable-next-line effecttsgo/async-function -- Fixture teardown must await native runtime, Pi, and filesystem cleanup.
     async dispose() {
       await runtime.stop();
       if (registryOpen) registry.close();
@@ -244,7 +237,6 @@ if (args[0] === "tab" && args[1] === "create") {
   };
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- This fixture helper composes the native Promise APIs under test.
 async function prepareBlockedComposition(integrated: boolean, dirtyRoot = false) {
   const f = await recoveryFixture();
   const authority = await f.authorize();
@@ -289,7 +281,6 @@ async function prepareBlockedComposition(integrated: boolean, dirtyRoot = false)
   return { f, attempt, workerCommit, integratedRevision };
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- This fixture helper composes the native Promise APIs under test.
 async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
   const f = await recoveryFixture();
   const authority = await f.authorize();
@@ -342,7 +333,6 @@ async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
 type RecoveryFixture = Awaited<ReturnType<typeof recoveryFixture>>;
 type CompositionFixture = Awaited<ReturnType<typeof prepareBlockedComposition>>;
 
-// oxlint-disable-next-line effecttsgo/async-function -- This assertion helper exercises Promise-based control, Git, and store boundaries.
 async function retainNotApplied(
   f: RecoveryFixture,
   attempt: CompositionFixture["attempt"],
@@ -375,7 +365,6 @@ async function retainNotApplied(
   return state;
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered shared recovery closes an absent worker without touching dirty project files", async () => {
   const f = await recoveryFixture();
   try {
@@ -422,7 +411,6 @@ void test("registered shared recovery closes an absent worker without touching d
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered recover resumes Git cleanup after durable native worker closure", async () => {
   const { f, attempt } = await prepareBlockedCleanup(false);
   try {
@@ -444,7 +432,6 @@ void test("registered recover resumes Git cleanup after durable native worker cl
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered recover accepts an exactly attributed worktree and branch already removed", async () => {
   const { f, attempt } = await prepareBlockedCleanup(true);
   try {
@@ -470,7 +457,6 @@ void test("registered recover accepts an exactly attributed worktree and branch 
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered recover safely retries a transient Git composition failure and durably attributes the retained proposal", async () => {
   const { f, attempt, workerCommit } = await prepareBlockedComposition(false, true);
   try {
@@ -523,7 +509,6 @@ void test("registered recover safely retries a transient Git composition failure
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered recovery reconciles a proven-absent worker before blocked composition bookkeeping", async () => {
   const { f, attempt, workerCommit } = await prepareBlockedComposition(false, true);
   try {
@@ -561,7 +546,6 @@ void test("registered recovery reconciles a proven-absent worker before blocked 
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered absent-worker retain_not_applied preserves integrated HEAD and retained proposal", async () => {
   const { f, attempt, workerCommit, integratedRevision } = await prepareBlockedComposition(true);
   try {
@@ -579,7 +563,6 @@ void test("registered absent-worker retain_not_applied preserves integrated HEAD
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered retain_not_applied preserves integrated bytes and exact unresolved accounting", async () => {
   const { f, attempt, workerCommit, integratedRevision } = await prepareBlockedComposition(true);
   try {
@@ -627,7 +610,6 @@ void test("registered retain_not_applied preserves integrated bytes and exact un
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered recovery rejects live workers and preserves dirty or mismatched resources", async () => {
   const { f, attempt, integratedRevision } = await prepareBlockedComposition(true);
   try {
@@ -708,7 +690,6 @@ void test("registered recovery rejects live workers and preserves dirty or misma
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered recovery refuses to mutate after its fenced ownership disappears", async () => {
   const { f, attempt } = await prepareBlockedCleanup(false);
   const registry = new WorkgraphRegistry(join(f.parent, "agent", "workgraph", "registry.sqlite"));
@@ -731,7 +712,6 @@ void test("registered recovery refuses to mutate after its fenced ownership disa
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 void test("registered result and status views retain first presentation and bounded attention history", async () => {
   const f = await recoveryFixture();
   try {

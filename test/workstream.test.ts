@@ -21,7 +21,6 @@ function dateAt(milliseconds: number): Date {
   return DateTime.toDate(DateTime.makeUnsafe(milliseconds));
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("accepted historical research closes its original scope after intent changes, without invented limitations", async () => {
   const { parent, store } = await fixture();
   try {
@@ -61,7 +60,6 @@ void test("accepted historical research closes its original scope after intent c
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("accepting a failed report or uncomposed stale implementation as evidence does not resolve its assignment", async () => {
   for (const capability of ["research", "implement"] as const) {
     const { parent, store } = await fixture();
@@ -196,7 +194,6 @@ function recordedAuthority(
     );
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("workstream persists human-backed intent, local readiness, and retained experiment evidence", async () => {
   const { parent, store } = await fixture();
   try {
@@ -295,7 +292,6 @@ void test("workstream persists human-backed intent, local readiness, and retaine
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("workstream rejects extension or arbitrary authority and stale intent", async () => {
   const { parent, store } = await fixture();
   try {
@@ -359,7 +355,6 @@ void test("workstream rejects extension or arbitrary authority and stale intent"
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("workstream keeps worker validity, disposition, limitations, and stale results distinct", async () => {
   const { parent, store } = await fixture();
   try {
@@ -437,7 +432,6 @@ void test("workstream keeps worker validity, disposition, limitations, and stale
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("every independent attempt remains accounted for regardless of result arrival order", async () => {
   for (const order of [
     ["failed", "success"],
@@ -573,7 +567,6 @@ void test("every independent attempt remains accounted for regardless of result 
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("malformed state diagnostics identify a bounded field path without echoing payloads", async () => {
   const { parent, store } = await fixture();
   try {
@@ -599,7 +592,6 @@ void test("malformed state diagnostics identify a bounded field path without ech
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
 void test("workstream serializes receipt writes and rejects corrupt or foreign history without rewriting it", async () => {
   const { parent, store } = await fixture();
   try {

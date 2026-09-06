@@ -12,7 +12,6 @@ import {
   setModelRole,
 } from "../src/model-policy.js";
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 await test("policy defaults, read-only legacy mapping and explicit current-role writes use isolated paths", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-models-"));
   const path = join(parent, "models.json");
