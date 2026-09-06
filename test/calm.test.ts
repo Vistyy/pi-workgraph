@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { stripVTControlCharacters } from "node:util";
+import {
+  type ExtensionAPI,
+  type ExtensionContext,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 // SAFETY: These fakes terminate at the test boundary; production Pi values are decoded by the adapter.
 // oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion
@@ -57,7 +63,7 @@ type FakeTheme = {
 
 function fakeTheme(): FakeTheme {
   return {
-    fg: (color, text) => `<${color}>${text}</${color}>`,
+    fg: (color, text) => `\u001b[38;5;${color === "accent" ? 183 : 146}m${text}\u001b[39m`,
   };
 }
 
@@ -102,9 +108,14 @@ function fakePi() {
   type FakeHandlerResult = void | Promise<void>;
   const events = new Map<string, (event: FakeEvent, context: FakeContext) => FakeHandlerResult>();
   const commands = new Map<string, (args: string, context: FakeContext) => FakeHandlerResult>();
+  const session = SessionManager.inMemory();
   return {
     events,
     commands,
+    session,
+    appendEntry(customType: string, data: { sessionId: string; on: boolean }) {
+      session.appendCustomEntry(customType, data);
+    },
     on(name: string, handler: (event: FakeEvent, context: FakeContext) => FakeHandlerResult) {
       events.set(name, handler);
     },
@@ -125,7 +136,7 @@ function moduleForFakeRows() {
 }
 
 function stripAnsiLikeTheme(value: string): string {
-  return value.replace(/<\/?[A-Za-z]+>/g, "");
+  return stripVTControlCharacters(value);
 }
 
 void test("calm policy defaults cover builtins, search tools, and Workgraph tools", () => {
@@ -204,35 +215,47 @@ void test("activity indicator remains active for coordinator or workers and sett
   );
 });
 
-void test("activity row is one themed traveling line with accurate labels and width-safe fallbacks", () => {
+void test("garden and compact activity share truthful labels and remain width-safe", () => {
   const theme = fakeTheme();
   const coordinator = { coordinatorActive: true, activeWorkers: 0 };
   const workers = { coordinatorActive: false, activeWorkers: 2 };
   const combined = { coordinatorActive: true, activeWorkers: 2 };
   const wideA = calmActivityLines(coordinator, 1, 80, theme);
   const wideB = calmActivityLines(coordinator, 2, 80, theme);
-  assert.equal(wideA.length, 1);
+  assert.equal(wideA.length, 3);
   assert.notDeepEqual(wideA, wideB);
-  assert.match(stripAnsiLikeTheme(wideA[0] ?? ""), /○──◆──○──○ {3}Workgraph · coordinating/);
-  assert.ok(wideA.every((line) => !line.includes("\n") && !line.includes("╲")));
+  assert.match(stripAnsiLikeTheme(wideA[0] ?? ""), /Workgraph {2}· {2}coordinating/);
+  assert.ok(wideA.every((line) => visibleWidth(line) === 80));
+  assert.match(stripAnsiLikeTheme(wideA[2] ?? ""), /─┴─/);
+  const compact = calmActivityLines(coordinator, 1, 80, theme, false);
+  assert.equal(compact.length, 1);
+  assert.match(stripAnsiLikeTheme(compact[0] ?? ""), /coordinating/);
   assert.match(
     stripAnsiLikeTheme(calmActivityLines(workers, 0, 80, theme)[0] ?? ""),
     /2 workers active/,
   );
   assert.match(
     stripAnsiLikeTheme(calmActivityLines(combined, 0, 80, theme)[0] ?? ""),
-    /Workgraph · coordinating · 2 workers/,
+    /Workgraph {2}· {2}coordinating · 2 workers active/,
   );
   assert.doesNotMatch(
     stripAnsiLikeTheme(calmActivityLines(workers, 0, 80, theme)[0] ?? ""),
     /coordinating/,
   );
 
-  for (const width of [40, 24, 12, 8, 3, 1]) {
-    const lines = calmActivityLines(combined, 4, width, theme);
-    assert.ok(lines.length <= 1);
-    assert.ok(lines.every((line) => stripAnsiLikeTheme(line).length <= width));
+  for (const width of [160, 80, 40, 36, 35, 24, 12, 8, 3, 1]) {
+    for (const garden of [true, false]) {
+      const lines = calmActivityLines(combined, 4, width, theme, garden);
+      assert.equal(lines.length, garden && width >= 36 ? 3 : 1);
+      assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    }
   }
+  assert.match(
+    stripAnsiLikeTheme(
+      calmActivityLines({ ...coordinator, waitingForInput: true }, 0, 80, theme)[0] ?? "",
+    ),
+    /awaiting input/,
+  );
   assert.deepEqual(
     calmActivityLines({ coordinatorActive: false, activeWorkers: 0 }, 1, 80, theme),
     [],
@@ -245,11 +268,14 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   const calm = installCalmMode(pi as unknown as ExtensionAPI, {
     loadPresentation: async () => moduleForFakeRows(),
     intervalMs: 10_000,
+    preferences: { load: async () => false, save: async () => {} },
   });
   // SAFETY: The fixture supplies only the ExtensionContext fields consumed by Calm.
   const context = {
     mode: "tui",
     ui,
+    isIdle: () => true,
+    sessionManager: pi.session,
   } as unknown as ExtensionContext;
   await pi.events.get("session_start")?.({}, context);
   const tool = new FakeToolRow("workgraph_note");
@@ -262,7 +288,7 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   const widgetFactory = ui.widgets.at(-1)?.[1];
   assert.ok(widgetFactory);
   const widget = widgetFactory({ requestRender() {} }, ui.theme);
-  assert.equal(widget.render(80).length, 1);
+  assert.equal(widget.render(80).length, 3);
   assert.match(widget.render(80)[0] ?? "", /Workgraph/);
   assert.ok(ui.workingVisibility.includes(false));
   calm.setActiveWorkers(0);
@@ -270,11 +296,12 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
   assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
-  assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
+  assert.equal(widget.render(80).length, 1);
   assert.equal(ui.statuses.at(-1)?.[1], undefined);
-  assert.ok(ui.workingVisibility.includes(true));
-  assert.equal(ui.indicators.at(-1), undefined);
+  assert.equal(ui.workingVisibility.at(-1), false);
   await pi.events.get("session_shutdown")?.({}, context);
+  assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
+  assert.equal(ui.workingVisibility.at(-1), true);
   assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
 });
 
@@ -285,12 +312,110 @@ void test("missing internal seam leaves rows visible and reports a diagnostic", 
     loadPresentation: async () => {
       throw new Error("unsupported Pi seam");
     },
+    preferences: { load: async () => false, save: async () => {} },
   });
   // SAFETY: The fixture supplies only the ExtensionContext fields consumed by Calm.
-  const context = { mode: "tui", ui } as unknown as ExtensionContext;
+  const context = {
+    mode: "tui",
+    ui,
+    isIdle: () => true,
+    sessionManager: pi.session,
+  } as unknown as ExtensionContext;
   await pi.events.get("session_start")?.({}, context);
   await Promise.resolve();
   await pi.commands.get("calm")?.("", context);
   assert.ok(ui.notifications.some((message) => message.includes("Rows remain visible")));
   calm.setActiveWorkers(0);
+});
+
+void test("saved default affects new sessions, while local choice survives reload and resume", async () => {
+  const pi = fakePi();
+  const ui = fakeUi();
+  let defaultOn = false;
+  let saves = 0;
+  installCalmMode(pi as unknown as ExtensionAPI, {
+    loadPresentation: async () => moduleForFakeRows(),
+    preferences: {
+      load: async () => defaultOn,
+      save: async (on) => {
+        defaultOn = on;
+        saves += 1;
+      },
+    },
+    intervalMs: 10_000,
+  });
+  const context = {
+    mode: "tui",
+    ui,
+    isIdle: () => true,
+    sessionManager: pi.session,
+  } as unknown as ExtensionContext;
+  const row = new FakeToolRow("read");
+  const start = () => pi.events.get("session_start")?.({}, context);
+  const shutdown = () => pi.events.get("session_shutdown")?.({}, context);
+  const command = (args: string) => pi.commands.get("calm")?.(args, context);
+  try {
+    await start();
+    await command("default on");
+    assert.equal(defaultOn, true);
+    assert.notDeepEqual(row.render(80), []); // Existing session unchanged.
+    await shutdown();
+    await start();
+    assert.notDeepEqual(row.render(80), []); // Frozen startup choice survives reload.
+    await command("");
+    assert.deepEqual(row.render(80), []);
+    await shutdown();
+    await start();
+    assert.deepEqual(row.render(80), []); // Local override restored from actual session entries.
+    await command("");
+    assert.equal(saves, 1); // Debug toggle never writes global default.
+    await command("default maybe");
+    assert.equal(saves, 1);
+    await shutdown();
+    pi.session.newSession();
+    await start();
+    assert.deepEqual(row.render(80), []); // New session follows saved default.
+    await command("default off");
+    assert.deepEqual(row.render(80), []); // Changing default never flips current state.
+  } finally {
+    await shutdown();
+  }
+});
+
+void test("activity uses compact mode outside Calm and freezes for a genuine UI prompt", async () => {
+  const pi = fakePi();
+  const ui = fakeUi();
+  const calm = installCalmMode(pi as unknown as ExtensionAPI, {
+    loadPresentation: async () => moduleForFakeRows(),
+    preferences: { load: async () => false, save: async () => {} },
+    intervalMs: 10_000,
+  });
+  const context = {
+    mode: "tui",
+    ui,
+    isIdle: () => true,
+    sessionManager: pi.session,
+  } as unknown as ExtensionContext;
+  try {
+    await pi.events.get("session_start")?.({}, context);
+    await pi.events.get("agent_start")?.({}, context);
+    const factory = ui.widgets.at(-1)?.[1];
+    assert.ok(factory);
+    const widget = factory({ requestRender() {} }, ui.theme);
+    assert.equal(widget.render(80).length, 1);
+    assert.equal(ui.workingVisibility.at(-1), false);
+    await pi.commands.get("calm")?.("", context);
+    assert.equal(widget.render(80).length, 3);
+    await pi.events.get("ui_prompt_start")?.({}, context);
+    assert.match(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /awaiting input/);
+    await pi.events.get("ui_prompt_end")?.({}, context);
+    calm.setActiveWorkers(2);
+    await pi.events.get("agent_settled")?.({}, context);
+    assert.match(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /2 workers active/);
+    assert.doesNotMatch(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /coordinating/);
+    calm.setActiveWorkers(0);
+    assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
+  } finally {
+    await pi.events.get("session_shutdown")?.({}, context);
+  }
 });

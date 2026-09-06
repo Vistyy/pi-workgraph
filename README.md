@@ -19,14 +19,20 @@ Composition still requires a clean destination at the maintained-application bou
 
 ### Coordinator Calm
 
-The coordinator extension registers `/calm` as an off-by-default, presentation-only toggle for operational tool rows and Workgraph notification rows.
-Calm activity renders a compact animated connected-node constellation with gently traveling highlights, theme-aware colors, and a stable narrow-terminal fallback.
-It does not change the session, model context, exports, tool execution, or worker tabs.
+The coordinator extension registers `/calm` to toggle hiding operational tool rows and Workgraph notification rows for the current session.
+`/calm default on` or `/calm default off` saves the startup preference for new coordinator sessions without changing any existing session.
+The default is initially off and is stored atomically in `workgraph/calm-default` beneath Pi's agent directory (normally `~/.pi/agent`, respecting `PI_CODING_AGENT_DIR`).
+Each session retains its own choice across reload and resume; new and forked sessions start from the saved default.
+The preference is session metadata, not a model message, and does not modify conversation content, tool execution, or worker tabs.
+Calm shows a full-width signal garden with gently traveling light; non-Calm shows the same factual activity in a compact line with tools still visible.
+Both replace the ordinary working row instead of stacking another spinner above it.
+The garden is decorative, not a progress bar or a one-flower-per-worker map, and narrows to the compact view in small terminals.
 The default hidden tool-name list covers Pi builtins, installed search tools, Workgraph tools, and `herdr_rename`.
 Override it with `PI_WORKGRAPH_CALM_HIDDEN_TOOLS=tool_a,tool_b` before starting Pi.
 The internal adapter targets Pi's exported `ToolExecutionComponent` and `CustomMessageComponent` render seams, so it is compatibility-limited to Pi versions exposing those classes.
 If the seam is unavailable or changes shape, Calm stays visible and emits a warning rather than hiding content or changing execution.
-Calm activity shows a minimal indicator while the coordinator is working or active workers remain, and returns to a clean idle state after settlement or shutdown.
+Activity labels distinguish coordinating, active worker counts, and genuine blocking extension UI prompts awaiting input; an unanswered response note alone does not imply that work is blocked.
+The display clears when no activity remains, and shutdown restores Pi's ordinary working indicator.
 The coordinator gate prevents the extension from loading in worker sessions.
 First delegation creates a workstream automatically; `workgraph_begin` is optional.
 Workers run in visible Herdr tabs with ordinary Pi package/configuration loading and fresh context.
