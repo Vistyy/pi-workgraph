@@ -1,9 +1,8 @@
-import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import { runProcess } from "./process.js";
 
-const OUTPUT_LIMIT = 50 * 1024;
+export { runProcess } from "./process.js";
 
 export interface RepositoryInfo {
   root: string;
@@ -518,94 +517,6 @@ export class GitRepository {
         "Exact clean worktree and branch were removed, or were already absent.",
     };
   }
-}
-
-interface ProcessResult {
-  exitCode: number;
-  stdout: string;
-  stdoutTruncated: boolean;
-  stdoutDigest?: string;
-  stderr: string;
-  timedOut: boolean;
-}
-
-export async function runProcess(
-  command: string,
-  args: string[],
-  options: {
-    cwd: string;
-    timeoutMs: number;
-    env?: NodeJS.ProcessEnv;
-    signal?: AbortSignal;
-    digestStdout?: boolean;
-  },
-): Promise<ProcessResult> {
-  return new Promise<ProcessResult>((resolvePromise, reject) => {
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: options.env,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stdoutBytes = 0;
-    const digest = options.digestStdout ? createHash("sha256") : undefined;
-    let stderr = "";
-    let timedOut = false;
-    let settled = false;
-    const append = (current: string, chunk: Buffer): string => {
-      const next = current + chunk.toString();
-      return Buffer.byteLength(next) <= OUTPUT_LIMIT
-        ? next
-        : next.slice(-OUTPUT_LIMIT);
-    };
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdoutBytes += chunk.length;
-      digest?.update(chunk);
-      stdout = append(stdout, chunk);
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr = append(stderr, chunk);
-    });
-
-    const stop = (): void => {
-      child.kill("SIGTERM");
-      const killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
-      killTimer.unref();
-    };
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      stop();
-    }, options.timeoutMs);
-    timeout.unref();
-    const onAbort = (): void => stop();
-    options.signal?.addEventListener("abort", onAbort, { once: true });
-
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      options.signal?.removeEventListener("abort", onAbort);
-      reject(error);
-    });
-    child.on("close", (code, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      options.signal?.removeEventListener("abort", onAbort);
-      if (signal && !timedOut && options.signal?.aborted) {
-        stderr = `${stderr}\nAborted by signal ${signal}.`.trim();
-      }
-      resolvePromise({
-        exitCode: code ?? 1,
-        stdout: stdout.trim(),
-        stdoutTruncated: stdoutBytes > OUTPUT_LIMIT,
-        ...(digest ? { stdoutDigest: digest.digest("hex") } : {}),
-        stderr: stderr.trim(),
-        timedOut,
-      });
-    });
-  });
 }
 
 async function gitText(

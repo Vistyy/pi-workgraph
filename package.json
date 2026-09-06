@@ -28,8 +28,9 @@
   "scripts": {
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "quality": "biome check --error-on-warnings && node --import tsx scripts/check-assertions.ts",
-    "check": "pnpm typecheck && pnpm quality && pnpm test",
+    "postinstall": "pnpm exec effect-tsgo patch --oxlint --no-typescript",
+    "quality": "pnpm exec biome check --error-on-warnings .; biome_status=$?; pnpm exec oxlint --config oxlint.config.ts .; oxlint_status=$?; test $biome_status -eq 0 -a $oxlint_status -eq 0",
+    "check": "pnpm quality && pnpm test",
     "smoke:herdr": "node --import tsx scripts/herdr-smoke.ts",
     "smoke:coordinator": "node --import tsx scripts/coordinator-smoke.ts",
     "smoke:natural": "node --import tsx scripts/natural-coordinator-smoke.ts"
@@ -44,6 +45,7 @@
     ]
   },
   "dependencies": {
+    "effect": "4.0.0-rc.112",
     "tsx": "^4.23.0"
   },
   "peerDependencies": {
@@ -52,11 +54,15 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@biomejs/biome": "^2.5.12",
+    "@biomejs/biome": "2.5.12",
     "@earendil-works/pi-ai": "0.84.4",
     "@earendil-works/pi-coding-agent": "0.84.4",
+    "@effect/tsgo": "0.41.0",
+    "@syzom/typescript-quality": "0.2.0",
     "@types/node": "^24.0.0",
+    "oxlint": "1.81.0",
+    "oxlint-tsgolint": "7.0.2001",
     "typebox": "^1.0.0",
-    "typescript": "^5.9.0"
+    "typescript": "7.0.2"
   }
 }

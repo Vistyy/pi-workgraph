@@ -1,6 +1,6 @@
-import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
+import { runProcess } from "./process.js";
 import type {
   CoordinatorRuntimeIdentity,
   ThinkingLevel,
@@ -954,47 +954,20 @@ function herdrError(args: string[], result: CommandResult): Error {
   return new Error(`herdr ${args.slice(0, 2).join(" ")} failed: ${message}`);
 }
 
-function spawnCommand(
+async function spawnCommand(
   command: string,
   args: string[],
   timeoutMs: number,
 ): Promise<CommandResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-    }, timeoutMs);
-    timeout.unref();
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      resolve({
-        code: code ?? 1,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        timedOut,
-      });
-    });
+  const result = await runProcess(command, args, {
+    cwd: process.cwd(),
+    timeoutMs,
+    outputLimit: false,
   });
+  return {
+    code: result.exitCode,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    timedOut: result.timedOut,
+  };
 }

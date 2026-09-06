@@ -1,4 +1,7 @@
 allowBuilds:
   "@google/genai": true
   esbuild: true
+  msgpackr-extract: true
   protobufjs: true
+minimumReleaseAgeExclude:
+  - '@syzom/typescript-quality@0.2.0'

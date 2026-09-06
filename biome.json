@@ -1,5 +1,6 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.5.12/schema.json",
+  "extends": ["@syzom/typescript-quality/biome"],
   "files": {
     "includes": [
       "src/**",
@@ -7,15 +8,8 @@
       "test/**",
       "scripts/**",
       "bin/**",
+      "oxlint.config.ts",
       "*.json"
     ]
-  },
-  "formatter": { "indentStyle": "space", "indentWidth": 2 },
-  "linter": {
-    "rules": {
-      "preset": "recommended",
-      "suspicious": { "noExplicitAny": "error" },
-      "style": { "noNonNullAssertion": "off" }
-    }
   }
 }

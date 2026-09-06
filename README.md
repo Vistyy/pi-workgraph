@@ -118,18 +118,25 @@ An explicit base revision is exact Git evidence; an exact-revision review must i
 ## Development and live verification
 
 ```bash
+pnpm install --frozen-lockfile
 pnpm check
 pnpm pack --dry-run
 pnpm smoke:herdr
 pnpm smoke:coordinator
 ```
 
+The pinned install runs `pnpm exec effect-tsgo patch --oxlint --no-typescript` as a repeatable postinstall step.
+The optional `msgpackr-extract` native build is explicitly allowed in `pnpm-workspace.yaml`; Effect still works with its JavaScript fallback when the optional native package is unavailable.
+`pnpm check` is also the GitHub Actions check entry point and runs shared Biome, the root-spread Effect Oxlint preset, and all deterministic tests.
+Oxlint owns the full TypeScript-aware check for this source selection, so the standalone `pnpm typecheck` command remains available for transitional compiler diagnostics but is not duplicated in `pnpm check`.
+The first quality adoption intentionally reports existing migration diagnostics from unmigrated product, smoke, and test code; no paths or rule severities are suppressed to hide that debt.
+
 A natural-use verification request should state the desired outcome, constraints, and uncertainty to resolve without naming Workgraph tools, worker counts, or model panels.
 The runnable `pnpm smoke:natural` fixture asks the coordinator to resolve whether a disposable parser probe is justified and, only if it is, make one authorized small change, then checks native request settlement, the actual direct or delegated strategy, exact bytes, retained outputs when present, and cleanup.
 This natural procedure is evidence of caller usability, while the deterministic smoke remains a protocol check of identity, retention, composition, and cleanup boundaries.
-`pnpm check` owns full TypeScript checking, Biome formatting/recommended lint, targeted assertion checks, and deterministic tests.
-The assertion check uses the already-installed TypeScript parser to reject type laundering through `unknown` and assertions to `never`, while permitting legitimate unknown inputs, ordinary narrowing, and `as const`.
-Non-null assertions are not blanket-banned; their correctness depends on the enforced boundary.
+`pnpm check` owns shared Biome, the Effect-aware Oxlint type and lint checks, and deterministic tests.
+The shared anti-slop rules reject assertions to `never` and chained assertions, including locally resolved aliases, through the actual Oxlint command.
+Non-null assertions are now part of the shared blocking policy and remaining violations are reported as migration work rather than hidden by a local override.
 
 Run live scenarios only from a Herdr-managed pane, against a clean committed candidate when the scenario itself requires composition.
 Shared research is separately expected to start with local tracked or untracked changes and leave those bytes untouched after native worker closure and retry.
