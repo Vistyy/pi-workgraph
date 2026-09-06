@@ -6,7 +6,16 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "types": ["node"],
+    "allowJs": true,
+    "checkJs": true,
     "skipLibCheck": true
   },
-  "include": ["extensions/**/*.ts", "src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"]
+  "include": [
+    "extensions/**/*.ts",
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "scripts/**/*.ts",
+    "bin/**/*.mjs",
+    "oxlint.config.ts"
+  ]
 }
