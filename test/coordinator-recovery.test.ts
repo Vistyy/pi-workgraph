@@ -320,7 +320,7 @@ async function retainNotApplied(
     (
       await f.pi.call("workgraph_control", {
         action: "retain_not_applied",
-        attemptId: attempt.id,
+        attempt: attempt.id,
         integratedRevision,
         reason,
       })
@@ -339,7 +339,7 @@ async function retainNotApplied(
   );
   assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
   assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-  await f.pi.call("workgraph_status", {});
+  await f.pi.call("workgraph_inspect", { section: "overview" });
   assert.equal(
     await f.repository.head(),
     integratedRevision,
@@ -384,7 +384,7 @@ test("registered shared recovery closes an absent worker without touching dirty 
       (
         await f.pi.call("workgraph_control", {
           action: "recover",
-          attemptId: attempt.id,
+          attempt: attempt.id,
           reason:
             "Exact native worker tab is absent; shared project bytes remain owned by the user",
         })
@@ -406,7 +406,7 @@ test("registered recover resumes Git cleanup after durable native worker closure
       (
         await f.pi.call("workgraph_control", {
           action: "recover",
-          attemptId: attempt.id,
+          attempt: attempt.id,
           reason: "Known fixture obstruction was removed",
         })
       ).details,
@@ -429,7 +429,7 @@ test("registered recover accepts an exactly attributed worktree and branch alrea
       (
         await f.pi.call("workgraph_control", {
           action: "recover",
-          attemptId: attempt.id,
+          attempt: attempt.id,
           reason: "Exact Git cleanup completed before bookkeeping",
         })
       ).details,
@@ -454,19 +454,21 @@ test("registered recover safely retries a transient Git composition failure and 
     true,
   );
   try {
-    const blockedView = (await f.pi.call("workgraph_status", {})).details as {
-      view: { attention: { items: Array<{ detail: string }> } };
+    const blockedView = (
+      await f.pi.call("workgraph_inspect", { section: "overview" })
+    ).details as {
+      inspection: { attention: Array<{ blocker: string }> };
     };
-    assert.equal(blockedView.view.attention.items.length, 1);
+    assert.equal(blockedView.inspection.attention.length, 1);
     assert.match(
-      blockedView.view.attention.items[0]!.detail,
+      blockedView.inspection.attention[0]!.blocker,
       /Git working tree/,
     );
     const state = resultState(
       (
         await f.pi.call("workgraph_control", {
           action: "recover",
-          attemptId: attempt.id,
+          attempt: attempt.id,
           reason: "Inspected conflicting commit was removed before retry",
         })
       ).details,
@@ -490,7 +492,7 @@ test("registered recover safely retries a transient Git composition failure and 
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(await f.repository.head(), composition.revision);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "worker\n");
-    await f.pi.call("workgraph_status", {});
+    await f.pi.call("workgraph_inspect", { section: "overview" });
     assert.equal(
       await f.repository.head(),
       composition.revision,
@@ -514,7 +516,7 @@ test("registered recovery reconciles a proven-absent worker before blocked compo
       (
         await f.pi.call("workgraph_control", {
           action: "recover",
-          attemptId: attempt.id,
+          attempt: attempt.id,
           reason: "Exact native worker tab is already absent",
         })
       ).details,
@@ -530,7 +532,7 @@ test("registered recovery reconciles a proven-absent worker before blocked compo
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     const recoveredHead = await f.repository.head();
-    await f.pi.call("workgraph_status", {});
+    await f.pi.call("workgraph_inspect", { section: "overview" });
     assert.equal(await f.repository.head(), recoveredHead, "must not reapply");
   } finally {
     await f.dispose();
@@ -573,34 +575,23 @@ test("registered retain_not_applied preserves integrated bytes and exact unresol
       "Integrated commit is authoritative; worker proposal remains retained",
     );
     assert.equal(composition?.integratedRevision, integratedRevision);
-    const againResponse = await f.pi.call("workgraph_status", {});
+    const againResponse = await f.pi.call("workgraph_inspect", {
+      section: "overview",
+    });
     const again = resultState(againResponse.details);
     assert.equal(again.attempts[0]?.composition?.state, "retained_not_applied");
     const againView = againResponse.details as {
-      view: {
-        results: {
-          items: Array<{
-            retainedNotApplied?: Array<{ reason?: string }>;
-          }>;
-        };
+      inspection: {
+        tasks: Array<{ id: string; attempts: Array<{ result?: string }> }>;
       };
     };
-    assert.equal(
-      againView.view.results.items[0]?.retainedNotApplied?.[0]?.reason,
-      "Integrated commit is authoritative; worker proposal remains retained",
-    );
+    assert.equal(againView.inspection.tasks[0]?.id, "change");
     assert.equal(await f.repository.head(), integratedRevision);
-    const accounting = [
+    const unresolved = [
       {
-        kind: "unresolved_assignment" as const,
-        assignmentId: "change",
+        task: "change",
         reason:
           "The conflicting worker proposal was intentionally not applied.",
-      },
-      {
-        kind: "unresolved_attempt" as const,
-        attemptId: attempt.id,
-        reason: "The worker proposal was retained instead of composed.",
       },
     ];
     const completed = resultState(
@@ -609,7 +600,7 @@ test("registered retain_not_applied preserves integrated bytes and exact unresol
           conclusion: "Integrated change retained; proposal is unresolved.",
           evidence: [{ label: "HEAD", observation: integratedRevision }],
           limitations: ["Proposal was not applied."],
-          accounting,
+          unresolved,
         })
       ).details,
     );
@@ -628,7 +619,7 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
     await assert.rejects(
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
-        attemptId: attempt.id,
+        attempt: attempt.id,
         integratedRevision,
         reason: "Do not recover a working worker",
       }),
@@ -641,7 +632,7 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
     await assert.rejects(
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
-        attemptId: attempt.id,
+        attempt: attempt.id,
         integratedRevision,
         reason: "Do not recover a mismatched worker",
       }),
@@ -656,7 +647,7 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
     await assert.rejects(
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
-        attemptId: attempt.id,
+        attempt: attempt.id,
         integratedRevision,
         reason: "A missing pane with a present tab is ambiguous",
       }),
@@ -670,7 +661,7 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
     await assert.rejects(
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
-        attemptId: attempt.id,
+        attempt: attempt.id,
         integratedRevision,
         reason: "An ambiguous transport failure is not absence proof",
       }),
@@ -685,7 +676,7 @@ test("registered recovery rejects live workers and preserves dirty or mismatched
     await assert.rejects(
       f.pi.call("workgraph_control", {
         action: "retain_not_applied",
-        attemptId: attempt.id,
+        attempt: attempt.id,
         integratedRevision,
         reason: "Dirty worktree remains for inspection",
       }),
@@ -712,7 +703,7 @@ test("registered recovery refuses to mutate after its fenced ownership disappear
     await assert.rejects(
       f.pi.call("workgraph_control", {
         action: "recover",
-        attemptId: attempt.id,
+        attempt: attempt.id,
         reason: "Absent ownership must not mutate retained resources",
       }),
       /no lease|live lease|owner/i,
@@ -757,35 +748,32 @@ test("registered result and status views retain first presentation and bounded a
     await f.store.deliveryAttempt("view-result", "wake-1", "wake failed once");
     await f.store.deliveryAttempt("view-result", "wake-2", "wake failed twice");
     await f.attachPublic();
-    await f.pi.call("workgraph_result", {
-      resultId: "view-result",
-      section: "evidence",
-      limit: 1,
+    await f.pi.call("workgraph_inspect", {
+      result: "view-result",
+      section: "report",
+      maxChars: 1_000,
     });
-    const first = resultState((await f.pi.call("workgraph_status", {})).details)
-      .deliveries[0]!;
-    assert.ok(first.deliveredAt);
-    await f.pi.call("workgraph_result", {
-      resultId: "view-result",
-      section: "evidence",
-      limit: 1,
+    const first = resultState(
+      (await f.pi.call("workgraph_inspect", { section: "overview" })).details,
+    ).deliveries[0]!;
+    assert.equal(first.deliveredAt, undefined);
+    await f.pi.call("workgraph_inspect", {
+      result: "view-result",
+      section: "report",
+      maxChars: 1_000,
     });
     const second = resultState(
-      (await f.pi.call("workgraph_status", {})).details,
+      (await f.pi.call("workgraph_inspect", { section: "overview" })).details,
     ).deliveries[0]!;
     assert.equal(second.deliveredAt, first.deliveredAt);
     assert.equal(second.failureHistory?.length, 2);
-    const status = await f.pi.call("workgraph_status", { offset: 0, limit: 1 });
-    const view = (
-      status.details as {
-        view: {
-          results: { items: unknown[]; total: number; remaining: number };
-        };
-      }
-    ).view;
-    assert.equal(view.results.items.length, 1);
-    assert.equal(view.results.total, 1);
-    assert.equal(view.results.remaining, 0);
+    const status = await f.pi.call("workgraph_inspect", {
+      section: "outcome",
+      result: "view-result",
+    });
+    const view = (status.details as { inspection: { result: string } })
+      .inspection;
+    assert.equal(view.result, "view-result");
   } finally {
     await f.dispose();
   }

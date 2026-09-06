@@ -214,7 +214,13 @@ try {
       (entry) =>
         entry.type === "message" &&
         entry.message.role === "toolResult" &&
-        entry.message.toolName === "workgraph_begin",
+        [
+          "workgraph_begin",
+          "workgraph_status",
+          "workgraph_result",
+          "workgraph_acknowledge",
+          "workgraph_disposition",
+        ].includes(entry.message.toolName),
     ),
   );
   assert.equal(

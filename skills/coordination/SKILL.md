@@ -26,8 +26,12 @@ Record changed scope as a new intent before delegating changed requirements; his
 ## Returned work and recovery
 
 Judge execution settlement, report validity, transport receipt, and semantic judgment separately.
-Use directly returned reports or focused status results in coordinator reasoning.
-Acknowledge evidence after a failed notification only when an explicit durable receipt is useful, and record disposition only when explicit semantic judgment is useful; neither is an everyday completion ritual.
+Use the bounded outcome in a normal result notification for ordinary decisions.
+Use `workgraph_inspect` only when uncertainty, a blocker, repeated attempts, or truncation requires it.
+Its sections are `overview`, `task`, `outcome`, `evidence`, `report`, and `recovery`.
+Outcome and report reads are character-bounded and return a lossless `next` handle for every remaining character, including untyped or malformed content.
+Recorded settlement, cleanup, native, and Git facts are attributed as durable evidence, never presented as a fresh live observation.
+Do not perform routine status/result polling or acknowledgement/disposition ceremony.
 Pending notifications retry on reattachment, not every polling cycle; the same result identifier can recur after an interrupted delivery.
 Do not blindly resubmit an uncertain worker prompt.
 Inspect the retained native session and exact resource identities before deciding whether an operation needs recovery.

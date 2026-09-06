@@ -46,7 +46,7 @@ test("accepted historical research closes its original scope after intent change
         { label: "Baseline", observation: "Evidence predates the new intent" },
       ],
       limitations: [],
-      accounting: [],
+      reasons: [],
     });
     assert.deepEqual(state.completion?.accounting, []);
   } finally {
@@ -112,11 +112,11 @@ test("accepting a failed report or uncomposed stale implementation as evidence d
           { label: "Result", observation: "The assignment is not fulfilled" },
         ],
         limitations: [],
-        accounting: [],
+        reasons: [],
       };
       await assert.rejects(
         store.complete(completion),
-        /Completion accounting|unresolved assignments/,
+        /Completion requires exactly one reason per unresolved semantic task/,
       );
       const state = await store.complete({
         ...completion,
@@ -125,21 +125,11 @@ test("accepting a failed report or uncomposed stale implementation as evidence d
             ? "The read failed"
             : "The stale change was never composed",
         ],
-        accounting: [
+        reasons: [
           {
-            kind: "unresolved_assignment",
-            assignmentId: "work",
-            reason: "The assignment is unresolved.",
+            taskId: "work",
+            reason: "The assignment and its result are unresolved.",
           },
-          ...(capability === "research"
-            ? [
-                {
-                  kind: "unresolved_result" as const,
-                  resultId: "result",
-                  reason: "The result is failed or stale.",
-                },
-              ]
-            : []),
         ],
       });
       assert.deepEqual(
@@ -418,16 +408,10 @@ test("workstream keeps worker validity, disposition, limitations, and stale resu
         },
       ],
       limitations: ["The revised constraint has no accepted result yet."],
-      accounting: [
+      reasons: [
         {
-          kind: "unresolved_assignment",
-          assignmentId: "research",
-          reason: "The revised assignment is unresolved.",
-        },
-        {
-          kind: "unresolved_result",
-          resultId: "stale-result",
-          reason: "The stale result is not usable.",
+          taskId: "research",
+          reason: "The revised assignment and stale result are unresolved.",
         },
       ],
     });
@@ -552,9 +536,9 @@ test("every independent attempt remains accounted for regardless of result arriv
             { label: "comparison", observation: "Both attempts retained" },
           ],
           limitations: ["The failed attempt remains unresolved."],
-          accounting: [],
+          reasons: [],
         }),
-        /Completion accounting|unresolved attempts|unresolved results/,
+        /Completion requires exactly one reason per unresolved semantic task/,
       );
       const failed = state.attempts.find((attempt) =>
         attempt.id.endsWith(order.indexOf("failed").toString()),
@@ -568,21 +552,10 @@ test("every independent attempt remains accounted for regardless of result arriv
           { label: "comparison", observation: "Both attempts retained" },
         ],
         limitations: ["The failed attempt remains unresolved."],
-        accounting: [
+        reasons: [
           {
-            kind: "unresolved_assignment",
-            assignmentId: "comparison",
-            reason: "One attempt failed.",
-          },
-          {
-            kind: "unresolved_attempt",
-            attemptId: failed.id,
-            reason: "The attempt failed.",
-          },
-          {
-            kind: "unresolved_result",
-            resultId: failedResult.id,
-            reason: "The result failed.",
+            taskId: "comparison",
+            reason: "One independent attempt and its result failed.",
           },
         ],
       });

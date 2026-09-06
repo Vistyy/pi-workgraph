@@ -19,10 +19,6 @@ function record(value: unknown): Record<string, unknown> {
   assert.ok(value && typeof value === "object" && !Array.isArray(value));
   return value as Record<string, unknown>;
 }
-function records(value: unknown): Record<string, unknown>[] {
-  assert.ok(Array.isArray(value));
-  return value.map(record);
-}
 
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-coordinator-"));
@@ -52,6 +48,25 @@ async function fixture() {
       await rm(parent, { recursive: true, force: true });
     },
   };
+}
+
+async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
+  const repository = await GitRepository.open(f.root);
+  const created = await WorkstreamStore.create({
+    id: "empty-fixture",
+    purpose: "Fixture workstream",
+    projectRoot: f.root,
+    gitCommonDir: repository.commonDir,
+    coordinator: {
+      sessionId: f.session.getSessionId(),
+      sessionFile: f.session.getSessionFile()!,
+    },
+  });
+  f.session.appendCustomEntry("pi-workgraph-workstream", {
+    path: created.store.path,
+  });
+  await f.runner.emit({ type: "session_start", reason: "new" });
+  return created.state;
 }
 
 test("registered capability tools create work implicitly and retain only human input as authority across reload", async () => {
@@ -94,7 +109,7 @@ test("registered capability tools create work implicitly and retain only human i
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
     await f.runner.emit({ type: "session_start", reason: "reload" });
     const reloaded = resultState(
-      (await f.call("workgraph_status", {})).details,
+      (await f.call("workgraph_inspect", { section: "overview" })).details,
     );
     assert.equal(reloaded.lifecycle.state, "suspended");
     assert.equal(reloaded.inputs.length, 1);
@@ -118,9 +133,7 @@ test("failed registered adoption preserves the attached runtime lease; same-targ
     join(f.parent, "agent", "workgraph", "registry.sqlite"),
   );
   try {
-    const a = resultState(
-      (await f.call("workgraph_begin", { purpose: "Current work" })).details,
-    );
+    const a = await emptyWorkstream(f);
     const repository = await GitRepository.open(f.root);
     const otherOwner = {
       sessionId: "other",
@@ -148,7 +161,9 @@ test("failed registered adoption preserves the attached runtime lease; same-targ
       /runtime owner/,
     );
     assert.equal(
-      resultState((await f.call("workgraph_status", {})).details).id,
+      resultState(
+        (await f.call("workgraph_inspect", { section: "overview" })).details,
+      ).id,
       a.id,
     );
     assert.throws(() => registry.acquire(a.id, a.coordinator), /runtime owner/);
@@ -193,7 +208,7 @@ test("mutation responses stay action-focused while retaining handles, models, an
     const firstDetails = record(first.details);
     const firstView = record(firstDetails.view);
     const firstAffected = record(firstView.affected);
-    const firstAssignment = record(firstAffected.assignment);
+    const firstAssignment = record(firstAffected.task);
     const firstAttempt = record(firstAffected.attempt);
     const firstModels = record(firstAttempt.models);
     const firstGuide = record(firstModels.guide);
@@ -219,17 +234,17 @@ test("mutation responses stay action-focused while retaining handles, models, an
         expectedEvidence: ["bytes"],
       });
     }
-    const later = await f.call("workgraph_begin", {
-      purpose: "Focused fixture",
+    const later = await f.call("workgraph_inspect", {
+      section: "overview",
     });
     const laterText =
       later.content[0] && "text" in later.content[0]
         ? later.content[0].text
         : "";
     assert.ok(laterText.length < firstText.length + 2_000);
-    const laterView = record(record(later.details).view);
-    assert.equal(record(laterView.counts).assignments, 13);
-    assert.equal(record(laterView.attention).count, 0);
+    const laterView = record(record(later.details).inspection);
+    assert.equal((laterView.tasks as unknown[]).length, 13);
+    assert.deepEqual(laterView.attention, []);
   } finally {
     await f.dispose();
   }
@@ -238,13 +253,7 @@ test("mutation responses stay action-focused while retaining handles, models, an
 test("registered status stays compact and focused result retrieval projects bounded sections", async () => {
   const f = await fixture();
   try {
-    const initial = resultState(
-      (
-        await f.call("workgraph_begin", {
-          purpose: "Inspect retained evidence",
-        })
-      ).details,
-    );
+    const initial = await emptyWorkstream(f);
     const owner = {
       sessionId: f.session.getSessionId(),
       sessionFile: f.session.getSessionFile()!,
@@ -278,53 +287,62 @@ test("registered status stays compact and focused result retrieval projects boun
         })),
       },
     });
-    const status = await f.call("workgraph_status", {});
+    const status = await f.call("workgraph_inspect", { section: "overview" });
     const statusContent = status.content[0];
     const statusText =
       statusContent && "text" in statusContent ? statusContent.text : "";
-    assert.match(statusText, /large-result-1/);
+    assert.match(statusText, /large-result/);
     assert.doesNotMatch(statusText, /observation-0/);
     assert.equal(statusText.includes(longObjective), false);
     assert.ok(statusText.length < 8_000);
-    const defaultResult = await f.call("workgraph_result", {
-      resultId: "large-result-1",
+    const defaultResult = await f.call("workgraph_inspect", {
+      section: "outcome",
+      result: "large-result-1",
+      maxChars: 100,
     });
-    const defaultView = record(record(defaultResult.details).result);
-    assert.equal(defaultView.evidence, undefined);
-    assert.equal(defaultView.findings, undefined);
-    assert.equal(defaultView.evidenceCount, 6);
-    assert.equal(defaultView.findingsCount, 4);
-    assert.deepEqual(defaultView.accounting, []);
+    const defaultView = record(record(defaultResult.details).inspection);
+    const defaultContent = record(defaultView.content);
+    assert.equal(defaultContent.truncated, true);
+    assert.ok(
+      Number(defaultContent.totalChars) > Number(defaultContent.returnedChars),
+    );
+    assert.equal(
+      record(defaultView.settlement).workerReport &&
+        typeof record(defaultView.settlement).workerReport,
+      "object",
+    );
     assert.match(
       defaultResult.content[0] && "text" in defaultResult.content[0]
         ? defaultResult.content[0].text
         : "",
-      /section evidence or findings/,
+      /large-result-1/,
     );
-    const evidence = await f.call("workgraph_result", {
-      resultId: "large-result-1",
+    const evidence = await f.call("workgraph_inspect", {
       section: "evidence",
+      result: "large-result-1",
       offset: 2,
-      limit: 2,
+      maxChars: 100,
     });
     const evidenceDetails = record(evidence.details);
-    const evidenceView = record(evidenceDetails.result);
-    const evidencePage = record(evidenceView.evidence);
-    assert.equal(records(evidencePage.items).length, 2);
-    assert.equal(record(records(evidencePage.items)[0]).label, "evidence-2");
-    assert.equal(evidencePage.remaining, 2);
-    assert.equal(evidencePage.nextOffset, 4);
-    const findings = await f.call("workgraph_result", {
-      resultId: "large-result-1",
-      section: "findings",
-      limit: 1,
+    const evidenceView = record(evidenceDetails.inspection);
+    const evidenceContent = record(evidenceView.content);
+    assert.equal(evidenceContent.offset, 2);
+    assert.equal(evidenceContent.truncated, true);
+    assert.ok(record(evidenceContent.next));
+    const findings = await f.call("workgraph_inspect", {
+      section: "evidence",
+      result: "large-result-1",
+      offset: 0,
+      maxChars: 100,
     });
-    const findingsView = record(record(findings.details).result);
-    const findingsPage = record(findingsView.findings);
-    assert.equal(record(records(findingsPage.items)[0]).title, "finding-0");
-    assert.equal(findingsView.evidence, undefined);
-    const state = resultState((await f.call("workgraph_status", {})).details);
-    assert.equal(state.deliveries[0]?.state, "delivered");
+    const findingsView = record(record(findings.details).inspection);
+    const findingsContent = record(findingsView.content);
+    assert.equal(findingsContent.offset, 0);
+    assert.equal(findingsContent.truncated, true);
+    const state = resultState(
+      (await f.call("workgraph_inspect", { section: "overview" })).details,
+    );
+    assert.equal(state.deliveries.length, 0);
     const completed = resultState(
       (
         await f.call("workgraph_complete", {
@@ -336,7 +354,7 @@ test("registered status stays compact and focused result retrieval projects boun
             },
           ],
           limitations: [],
-          accounting: [],
+          unresolved: [],
         })
       ).details,
     );
@@ -411,7 +429,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
       );
       assert.deepEqual(await readFile(state.statePath), before);
       await assert.rejects(
-        f.call("workgraph_status", {}),
+        f.call("workgraph_inspect", { section: "overview" }),
         /No attached workstream/,
       );
     } finally {
@@ -442,7 +460,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
       );
       assert.deepEqual(await readFile(state.statePath), before);
       await assert.rejects(
-        f.call("workgraph_status", {}),
+        f.call("workgraph_inspect", { section: "overview" }),
         /No attached workstream/,
       );
     } finally {
@@ -491,7 +509,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
         label,
       );
       await assert.rejects(
-        f.call("workgraph_status", {}),
+        f.call("workgraph_inspect", { section: "overview" }),
         /No attached workstream/,
         label,
       );
@@ -509,7 +527,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
       });
       await f.runner.emit({ type: "session_start", reason: "reload" });
       const attached = resultState(
-        (await f.call("workgraph_status", {})).details,
+        (await f.call("workgraph_inspect", { section: "overview" })).details,
       );
       assert.equal(attached.id, "current-active");
       assert.equal(attached.lifecycle.state, "active");
@@ -534,7 +552,7 @@ test("registered session_start safely inspects retained and pointed workstreams"
       });
       await f.runner.emit({ type: "session_start", reason: "reload" });
       await assert.rejects(
-        f.call("workgraph_status", {}),
+        f.call("workgraph_inspect", { section: "overview" }),
         /No attached workstream/,
       );
     } finally {

@@ -162,6 +162,8 @@ const ArtifactSchema = Type.Object(
 );
 const ResultBase = {
   id: NonEmptyStringSchema,
+  /** Stable UUID retained for recovery and compatibility; semantic ids are the normal handle. */
+  uuidAlias: Type.Optional(NonEmptyStringSchema),
   assignmentId: NonEmptyStringSchema,
   assignmentIntentVersion: Type.Integer({ minimum: 0 }),
   artifacts: Type.Array(ArtifactSchema),
@@ -263,6 +265,8 @@ const AttemptPlacementSchema = Type.Union([
 const AttemptSchema = Type.Object(
   {
     id: NonEmptyStringSchema,
+    /** Stable UUID retained for recovery and compatibility; semantic ids are the normal handle. */
+    uuidAlias: Type.Optional(NonEmptyStringSchema),
     assignmentId: NonEmptyStringSchema,
     state: StringEnum([
       "queued",
@@ -820,12 +824,14 @@ export class WorkstreamStore {
     attempts:
       | {
           id: string;
+          uuidAlias?: string;
           models: NonNullable<WorkAttempt["models"]>;
           continuationOf?: string;
           baseRevision?: string;
         }
       | Array<{
           id: string;
+          uuidAlias?: string;
           models: NonNullable<WorkAttempt["models"]>;
           continuationOf?: string;
           baseRevision?: string;
@@ -1567,9 +1573,8 @@ export class WorkstreamStore {
     conclusion: string;
     evidence: Static<typeof EvidenceSchema>[];
     limitations: string[];
-    unresolvedAttemptIds?: string[];
-    unresolvedResultIds?: string[];
-    accounting: CompletionAccounting[];
+    /** One reason per unresolved semantic task; mechanical entries are derived below. */
+    reasons: Array<{ taskId: string; reason: string }>;
     now?: Date;
   }): Promise<WorkstreamState> {
     requireText(input.conclusion, "Completion conclusion");
@@ -1595,28 +1600,44 @@ export class WorkstreamStore {
         );
       }
       const expectedAccounting = completionAccounting(draft);
-      const suppliedAccounting = validateAccounting(input.accounting);
-      const expectedKeys = expectedAccounting.map(accountingKey);
-      const suppliedKeys = suppliedAccounting.map(accountingKey);
+      const expectedTasks = [
+        ...new Set(
+          expectedAccounting
+            .map((entry) => accountingTaskId(draft, entry))
+            .filter((taskId): taskId is string => taskId !== undefined),
+        ),
+      ];
+      const reasonKeys = input.reasons.map((item) => item.taskId);
       if (
-        suppliedKeys.length !== new Set(suppliedKeys).size ||
-        suppliedKeys.some((key) => !expectedKeys.includes(key)) ||
-        expectedKeys.some((key) => !suppliedKeys.includes(key))
+        reasonKeys.length !== new Set(reasonKeys).size ||
+        input.reasons.some(
+          (item) =>
+            !draft.assignments.some(
+              (assignment) => assignment.id === item.taskId,
+            ) || !item.reason.trim(),
+        ) ||
+        expectedTasks.some((taskId) => !reasonKeys.includes(taskId)) ||
+        reasonKeys.some((taskId) => !expectedTasks.includes(taskId))
       )
         throw new Error(
-          `Completion accounting must exactly identify unresolved assignments, attempts, results or delivery: ${expectedKeys.join(", ") || "none"}.`,
+          `Completion requires exactly one reason per unresolved semantic task: ${expectedTasks.join(", ") || "none"}.`,
         );
+      const reasonByTask = new Map(
+        input.reasons.map((item) => [item.taskId, item.reason.trim()]),
+      );
+      // Every mechanical unresolved entry inherits the reason of its semantic task.
+      const resolvedAccounting = expectedAccounting.map((entry) => ({
+        ...entry,
+        reason:
+          reasonByTask.get(accountingTaskId(draft, entry) ?? "") ??
+          entry.reason,
+      }));
       const completedAt = (input.now ?? now).toISOString();
       draft.completion = {
         conclusion: input.conclusion.trim(),
         evidence: structuredClone(input.evidence),
         limitations: input.limitations.map((item) => item.trim()),
-        accounting: expectedAccounting.map(
-          (expected) =>
-            suppliedAccounting.find(
-              (supplied) => accountingKey(supplied) === accountingKey(expected),
-            )!,
-        ),
+        accounting: resolvedAccounting,
         completedAt,
       };
       draft.lifecycle = {
@@ -2183,26 +2204,16 @@ function completionAccounting(state: WorkstreamState): CompletionAccounting[] {
   return accounting;
 }
 
-function validateAccounting(
-  accounting: CompletionAccounting[],
-): CompletionAccounting[] {
-  if (!Array.isArray(accounting))
-    throw new Error("Completion accounting is required.");
-  if (
-    !accounting.every((item) => Value.Check(CompletionAccountingSchema, item))
-  )
-    throw new Error(
-      "Completion accounting entries require an identified reason.",
-    );
-  return accounting.map((item) => ({ ...item, reason: item.reason.trim() }));
-}
-
-function accountingKey(item: CompletionAccounting): string {
-  return item.kind === "unresolved_assignment"
-    ? `${item.kind}:${item.assignmentId}`
-    : item.kind === "unresolved_attempt"
-      ? `${item.kind}:${item.attemptId}`
-      : `${item.kind}:${item.resultId}`;
+function accountingTaskId(
+  state: WorkstreamState,
+  item: CompletionAccounting,
+): string | undefined {
+  if (item.kind === "unresolved_assignment") return item.assignmentId;
+  if (item.kind === "unresolved_attempt")
+    return state.attempts.find((attempt) => attempt.id === item.attemptId)
+      ?.assignmentId;
+  return state.results.find((result) => result.id === item.resultId)
+    ?.assignmentId;
 }
 
 function sameValue(left: unknown, right: unknown): boolean {

@@ -36,10 +36,7 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 | `workgraph_implement` | Delegate one bounded maintained slice with acceptance requirements and human-backed intent. Independent slices may share an exact base revision. |
 | `workgraph_review` | Independently inspect a retained result, artifact, exact revision, or comparison of retained results for a specified concern. |
 | `workgraph_intent` | Record changed scope against an actual retained human input receipt. |
-| `workgraph_status` | Inspect the detailed bounded view of assignments, selected models and reasons, findings, evidence, uncertainty, delivery, and resource recovery. |
-| `workgraph_result` | Retrieve one retained result; defaults to a summary with evidence/findings counts and recovery handles, while `section: evidence` or `findings` returns complete individual items. |
-| `workgraph_acknowledge` | Optionally record that evidence was actually read after a transport interruption. It is not required for ordinary result use. |
-| `workgraph_disposition` | Optionally record explicit coordinator judgment of retained evidence. Presentation and validity do not imply acceptance. |
+| `workgraph_inspect` | Unified bounded inspection of overview, semantic tasks, outcomes/evidence, and exact recovery; large or untyped content has lossless continuation handles. |
 | `workgraph_control` | Suspend/resume work or cancel/steer a specific live attempt. |
 | `workgraph_adopt` | Attach retained work without forking the conversation or implicitly resuming suspension. |
 | `workgraph_fork` | Explicitly fork the coordinator conversation into a new no-focus Herdr workspace; workers remain tabs in their owning workspace. |
@@ -49,10 +46,11 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 The coordinator interprets what a human request authorizes and chooses which independent contributions are meaningful.
 Research, experiments, implementation slices, comparison, review, and integration are optional capabilities rather than a prescribed route.
 Routine mutation responses show the action outcome, workstream lifecycle, aggregate counts, affected assignment/attempt/result handles, and selected model provenance without replaying unrelated history.
-Detailed `workgraph_status` remains the bounded inspection path for assignments, results, delivery, judgment, accounting, and recovery history.
-`workgraph_result` defaults to a summary only; use its `evidence` or `findings` sections to retrieve complete individual items, with count and continuation metadata preserved.
-Focused result retrieval retains substantive findings, evidence, uncertainty, and recovery attention.
-The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic approval oracle.
+`workgraph_inspect` is the only normal inspection surface: use `section: overview` for remaining work, `task` for a semantic task, `outcome` or `evidence` for retained content, and `recovery` for exact resource and settlement evidence.
+Notifications include a bounded actionable outcome, including evidence, limitations, applied versus merely reported revisions, blockers, and uncertainty.
+Use the returned `next` handle to retrieve every remaining character of typed, untyped, malformed, or large report content without silently selecting an ambiguous repeated attempt.
+The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic acceptance oracle.
+Completion derives mechanical unresolved accounting and accepts one explicit reason per unresolved semantic task only; it refuses live or blocked resources and never automatically accepts evidence.
 Extension notifications and worker reports do not grant authority.
 New constraints leave historical evidence intact and tied to its original scope, while stale maintained output cannot compose into the current intent.
 An experiment retains its named artifacts before scratch files are discarded; its code is never automatically composed.
@@ -89,13 +87,18 @@ Suspension stops new launches and composition, while observations, evidence rete
 Result notifications have stable identifiers and can recur after an interrupted delivery; this is not an exactly-once transport.
 The runtime records successful enqueue as delivery, but Pi exposes no supported selective cancellation or presentation/inspection receipt for one queued follow-up.
 The notice therefore describes retained-result availability, not new outstanding work; it may appear after inspection or workstream completion and must not cause reprocessing or reopening solely because it surfaced.
-After a notification failure, read the result through status or reattach; acknowledgment remains available as an explicit receipt but is not needed to use the result.
+After a notification failure, inspect the result through `workgraph_inspect` or reattach; notification recurrence is not new work and does not require acknowledgement or disposition.
 The runtime does not repeatedly wake the coordinator on every poll.
-Completion always refuses unfinished or blocked owned work and requires one exact structured accounting entry with an explicit reason for every unresolved assignment, attempt, result, and undelivered result; unknown or extra accounting identities are rejected. A blocked boundary is recoverable only through the guarded coordinator recovery operation after exact native and Git inspection. A conflicting implementation may be explicitly retained-not-applied under an owned reachable ref and reason, but is not reported as composed.
-Routine completion does not require acknowledgment or disposition; focused presentation is the transport receipt and those remain separate optional facts.
+Completion always refuses unfinished or blocked owned work and derives exact structured accounting for unresolved assignments, attempts, results, and undelivered results from current state.
+The coordinator supplies one explicit reason by semantic task for actual unresolved exceptions; unknown or missing reasons are rejected.
+A blocked boundary is recoverable only through the guarded coordinator recovery operation after exact native and Git inspection.
+A conflicting implementation may be explicitly retained-not-applied under an owned reachable ref and reason, but is not reported as composed.
+Routine completion does not require acknowledgement or disposition; focused inspection is an optional transport receipt, while semantic acceptance remains a separate coordinator judgment.
 Blocked work is preserved for inspection rather than force-deleted.
 
-`workgraph_control` supports guarded `recover` for an inspected transient cleanup or composition failure, and `retain_not_applied` with an exact integrated revision and reason for a deliberately un-applied conflicting commit. Repeated result reads preserve the first delivery timestamp and retain failed-wake history. Status and result views are bounded, count their history, provide continuation offsets, and expose accounting and retained-not-applied reasons.
+`workgraph_control` supports guarded `recover` for an inspected transient cleanup or composition failure, and `retain_not_applied` with an exact integrated revision and reason for a deliberately un-applied conflicting commit.
+Use a semantic task handle for control; repeated attempts require an explicit attempt handle and never silently select one.
+Repeated inspections preserve delivery provenance and expose exact native, resource, cleanup, Git, applied-versus-reported revision, blocker, and uncertainty evidence.
 
 The CLI provides read-only state inspection and explicit conversation forking:
 

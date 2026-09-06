@@ -203,7 +203,8 @@ export class WorkstreamRuntime {
         const executor =
           options.executor ?? policy.roles["implementation.executor"];
         return this.store.enqueue(input, {
-          id: `attempt-${randomUUID()}`,
+          id: attemptIdFor(input.id, 1),
+          uuidAlias: randomUUID(),
           models: {
             guide: explicit?.target ?? guide,
             executor,
@@ -238,7 +239,8 @@ export class WorkstreamRuntime {
       return this.store.enqueue(
         input,
         selection.selected.map((target, index) => ({
-          id: `attempt-${randomUUID()}`,
+          id: attemptIdFor(input.id, index + 1),
+          uuidAlias: randomUUID(),
           models: {
             guide: target,
             source: selection.source,
@@ -589,12 +591,17 @@ export class WorkstreamRuntime {
   ): Promise<void> {
     const sessionFile = required(attempt.sessionFile, "session");
     const generation = { runId: state.id, nodeId: attempt.id };
-    const resultId = `result-${attempt.id}`;
+    const resultNumber =
+      state.attempts
+        .filter((item) => item.assignmentId === assignment.id)
+        .indexOf(attempt) + 1;
+    const resultId = outcomeIdFor(assignment.id, resultNumber);
     const existing = state.results.find((item) => item.id === resultId);
     const read = readWorkgraphReportResult(sessionFile, generation);
     if (!existing) {
       const base = {
         id: resultId,
+        uuidAlias: randomUUID(),
         assignmentId: assignment.id,
         assignmentIntentVersion: assignment.intentVersion,
       };
@@ -1088,6 +1095,12 @@ function within(root: string, path: string): boolean {
     !part.startsWith(`..${sep}`) &&
     !part.startsWith(sep)
   );
+}
+function attemptIdFor(assignmentId: string, ordinal: number): string {
+  return `${assignmentId}-attempt-${ordinal}`;
+}
+function outcomeIdFor(assignmentId: string, ordinal: number): string {
+  return `${assignmentId}-outcome-${ordinal}`;
 }
 function modeFor(assignment: WorkAssignment) {
   return assignment.capability === "implement"

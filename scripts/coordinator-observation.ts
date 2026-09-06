@@ -19,7 +19,7 @@ Then delegate maintained implementation id ${CAPABILITY_SCENARIO_IDS.updateValue
 Immediately after queueing implementation, before waiting for its result, queue read-only research id ${CAPABILITY_SCENARIO_IDS.concurrentReadme} to read the README marker, demonstrating interleaving.
 After maintained composition, delegate independent review id ${CAPABILITY_SCENARIO_IDS.exactRevisionReview} of that exact retained revision, concerned with scope, exact bytes, absence of probe.txt and node verify.mjs.
 You may run read-only verification yourself but do not edit the fixture directly. Do not delegate extra workers or change model policy.
-Handle result notifications automatically and inspect execution, findings, evidence, uncertainty, and cleanup. After queueing useful independent work, end your turn to receive notifications; do not poll status, run waits for workers, or wait inside shell commands. Status inspection for an actual result or attention is appropriate.
+Handle result notifications automatically and inspect execution, findings, evidence, uncertainty, and cleanup through workgraph_inspect only when a blocker, repeated attempt, uncertainty, or truncation requires it. After queueing useful independent work, end your turn to receive notifications; do not poll, run waits for workers, or wait inside shell commands.
 Independently verify retained probe.txt is BEFORE followed by a newline, maintained value.txt is after followed by a newline, only value.txt changed, node verify.mjs passes, and all owned attempts/resources settled and cleaned.
 Complete with concrete evidence and honest limitations only after those conditions hold. Report a blocker instead of claiming success if a required boundary is unavailable.`;
 }

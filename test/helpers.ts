@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { ExtensionActions } from "@earendil-works/pi-coding-agent";
 import {
@@ -176,7 +177,13 @@ export async function extensionFixture(
 }
 
 export function resultState(details: unknown) {
-  assert.ok(details && typeof details === "object" && "workstream" in details);
-  assert.ok(Value.Check(WorkstreamStateSchema, details.workstream));
-  return details.workstream;
+  assert.ok(details && typeof details === "object");
+  const record = details as { workstream?: unknown; statePath?: unknown };
+  const state =
+    record.workstream ??
+    (typeof record.statePath === "string"
+      ? JSON.parse(readFileSync(record.statePath, "utf8"))
+      : undefined);
+  assert.ok(Value.Check(WorkstreamStateSchema, state));
+  return state;
 }

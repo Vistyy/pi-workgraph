@@ -2,10 +2,12 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
+import { type InspectSection, inspectView } from "./agent-facing.js";
 import { GitRepository } from "./git.js";
 import { HerdrCliRuntime } from "./herdr.js";
 import { forkConversationSession } from "./pi-process.js";
 import { defaultRegistryPath } from "./registry.js";
+import { WorkstreamStore } from "./workstream.js";
 
 export async function runCli(
   argv: readonly string[],
@@ -16,30 +18,42 @@ export async function runCli(
     return { command: "help", result: usage() };
   const options = parseOptions(rest);
   if (command === "status") {
-    let statePath = options.get("state");
-    if (!statePath) {
-      const id = options.get("run-id");
-      if (!id) throw new Error("Provide --state PATH or --run-id ID.");
-      const registry = new DatabaseSync(
-        options.get("registry") ?? defaultRegistryPath(env.PI_CODING_AGENT_DIR),
-        { readOnly: true },
-      );
-      try {
-        const row = registry
-          .prepare("SELECT state_path FROM runs WHERE run_id=?")
-          .get(id);
-        if (typeof row?.state_path !== "string")
-          throw new Error(`Unknown Workgraph ${id}.`);
-        statePath = row.state_path;
-      } finally {
-        registry.close();
-      }
-    }
-    // Inspection deliberately does not interpret, migrate or mutate historical state.
+    const statePath = await resolveStatePath(options, env);
+    // Status deliberately preserves uninterpreted historical JSON.
     const state: unknown = JSON.parse(
       await readFile(resolve(statePath), "utf8"),
     );
     return { command, statePath, state };
+  }
+  if (command === "inspect") {
+    const statePath = await resolveStatePath(options, env);
+    const state = await WorkstreamStore.inspect(resolve(statePath));
+    const section = options.get("section") ?? "overview";
+    if (
+      ![
+        "overview",
+        "task",
+        "outcome",
+        "evidence",
+        "recovery",
+        "report",
+      ].includes(section)
+    )
+      throw new Error(`Invalid inspection section ${section}.`);
+    const task = options.get("task");
+    const attempt = options.get("attempt");
+    const result = options.get("result");
+    const offset = options.get("offset");
+    const maxChars = options.get("max-chars");
+    const view = inspectView(state, {
+      section: section as InspectSection,
+      ...(task ? { task } : {}),
+      ...(attempt ? { attempt } : {}),
+      ...(result ? { result } : {}),
+      ...(offset ? { offset: parseInteger(offset, "offset") } : {}),
+      ...(maxChars ? { maxChars: parseInteger(maxChars, "max-chars") } : {}),
+    });
+    return { command, statePath, view };
   }
   if (command === "fork") {
     const parentSessionFile =
@@ -71,6 +85,37 @@ export async function runCli(
   throw new Error(`Unsupported command ${command}. ${usage()}`);
 }
 
+async function resolveStatePath(
+  options: Map<string, string>,
+  env: NodeJS.ProcessEnv,
+): Promise<string> {
+  const statePath = options.get("state");
+  if (statePath) return statePath;
+  const id = options.get("run-id");
+  if (!id) throw new Error("Provide --state PATH or --run-id ID.");
+  const registry = new DatabaseSync(
+    options.get("registry") ?? defaultRegistryPath(env.PI_CODING_AGENT_DIR),
+    { readOnly: true },
+  );
+  try {
+    const row = registry
+      .prepare("SELECT state_path FROM runs WHERE run_id=?")
+      .get(id);
+    if (typeof row?.state_path !== "string")
+      throw new Error(`Unknown Workgraph ${id}.`);
+    return row.state_path;
+  } finally {
+    registry.close();
+  }
+}
+
+function parseInteger(value: string, name: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0)
+    throw new Error(`Invalid non-negative integer for --${name}.`);
+  return parsed;
+}
+
 function parseOptions(args: readonly string[]): Map<string, string> {
   const options = new Map<string, string>();
   const supported = [
@@ -80,6 +125,12 @@ function parseOptions(args: readonly string[]): Map<string, string> {
     "parent-session-file",
     "target-cwd",
     "entry-id",
+    "section",
+    "task",
+    "attempt",
+    "result",
+    "offset",
+    "max-chars",
   ];
   for (let index = 0; index < args.length; index += 2) {
     const key = args[index]?.slice(2);
@@ -100,9 +151,10 @@ function parseOptions(args: readonly string[]): Map<string, string> {
 
 function usage(): string {
   return [
+    "pi-workgraph inspect --state PATH | --run-id ID [--registry PATH] [--section SECTION] [--task ID] [--attempt ID] [--result ID] [--offset N] [--max-chars N]",
     "pi-workgraph status --state PATH | --run-id ID [--registry PATH]",
     "pi-workgraph fork --parent-session-file PATH --target-cwd PATH [--entry-id ID]",
-    "Status reads current or historical JSON without migration. Workstream mutation belongs to coordinator tools.",
+    "Inspect is the bounded semantic view; status reads uninterpreted historical JSON without migration. Workstream mutation belongs to coordinator tools.",
   ].join("\n");
 }
 
