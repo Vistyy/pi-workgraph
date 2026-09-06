@@ -291,6 +291,7 @@ function validateAttempts(
 function validateAttemptFields(attempt: WorkAttempt): void {
   validateAttemptResultPair(attempt);
   validateAttemptIdentity(attempt);
+  validateAttemptCleanup(attempt);
   if (attempt.state === "queued") {
     validateUnlaunchedAttempt(attempt, "Queued");
     return;
@@ -360,6 +361,7 @@ function validateLaunchedAttempt(attempt: WorkAttempt): void {
     throw new InvalidWorkstreamStateError(
       `Attempt ${attempt.id} state ${attempt.state} requires retained launch preparation.`,
     );
+  validateSubmissionCheckpoint(attempt);
   if (attempt.state === "running") validateRunningAttempt(attempt);
   if (attempt.state === "settled" && (attempt.sessionFile === undefined || !hasResult))
     throw new InvalidWorkstreamStateError(
@@ -375,13 +377,38 @@ function validateLaunchedAttempt(attempt: WorkAttempt): void {
     );
 }
 
-function validateRunningAttempt(attempt: WorkAttempt): void {
+function validateSubmissionCheckpoint(attempt: WorkAttempt): void {
+  if (attempt.submission === "not_sent") return;
+  if (attempt.sessionFile === undefined)
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} sent checkpoint has no retained session.`,
+    );
   if (
-    attempt.sessionFile === undefined ||
-    (attempt.submission !== "submitted" && attempt.submission !== "started")
+    (attempt.submission === "submitted" || attempt.submission === "started") &&
+    attempt.state === "starting"
   )
     throw new InvalidWorkstreamStateError(
+      `Starting attempt ${attempt.id} contains a submitted launch checkpoint.`,
+    );
+}
+
+function validateRunningAttempt(attempt: WorkAttempt): void {
+  if (attempt.submission !== "submitted" && attempt.submission !== "started")
+    throw new InvalidWorkstreamStateError(
       `Running attempt ${attempt.id} has not retained a submitted session.`,
+    );
+}
+
+function validateAttemptCleanup(attempt: WorkAttempt): void {
+  const cleanup = attempt.cleanup;
+  if (cleanup === undefined) return;
+  if ((cleanup.state === "blocked") !== (cleanup.error !== undefined))
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} cleanup blocker does not match its state.`,
+    );
+  if (cleanup.state === "completed" && !cleanup.workerClosed)
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} completed cleanup has no closed worker.`,
     );
 }
 

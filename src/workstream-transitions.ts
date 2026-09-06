@@ -154,7 +154,8 @@ export function accountingIdentity(item: CompletionAccounting): string {
 export function hasActiveOrUncleanAttempt(attempt: WorkAttempt): boolean {
   return (
     ["queued", "starting", "running", "cancel_requested"].includes(attempt.state) ||
-    (attempt.placement !== undefined && attempt.cleanup?.state !== "completed")
+    (attempt.placement !== undefined &&
+      (attempt.cleanup?.state !== "completed" || attempt.cleanup.workerClosed !== true))
   );
 }
 
@@ -190,8 +191,9 @@ function resultUnresolved(state: WorkstreamState, resultId: string): boolean {
   const result = state.results.find((candidate) => candidate.id === resultId);
   // Judgment cannot repair failed, invalid, absent, or untyped evidence.
   if (result?.validity !== "typed" || result.report.status !== "completed") return true;
-  const latest = state.dispositions.findLast((disposition) => disposition.resultId === resultId);
-  return latest !== undefined && latest.status !== "accepted";
+  return state.dispositions.some(
+    (disposition) => disposition.resultId === resultId && disposition.status !== "accepted",
+  );
 }
 
 function sameValue<T>(left: T, right: T): boolean {

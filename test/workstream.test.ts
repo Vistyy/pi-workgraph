@@ -666,7 +666,7 @@ void test("workstream serializes receipt writes and rejects corrupt or foreign h
   }
 });
 
-void test("latest appended disposition governs successful evidence without curing invalid evidence", async () => {
+void test("historical disposition semantics preserve unresolved judgments without curing invalid evidence", async () => {
   const { parent, store } = await fixture();
   try {
     await store.assign({
@@ -692,15 +692,27 @@ void test("latest appended disposition governs successful evidence without curin
     await store.disposition({
       resultId: "result",
       status: "accepted",
-      reason: "The latest review resolved that gap.",
+      reason: "A later review accepted the retained evidence.",
     });
     const completed = await store.complete({
-      conclusion: "The latest judgment accepts the successful evidence.",
-      evidence: [{ label: "result", observation: "The completed report was accepted." }],
-      limitations: [],
-      reasons: [],
+      conclusion: "The historical rejection remains unresolved under version 4 semantics.",
+      evidence: [{ label: "result", observation: "The completed report was retained." }],
+      limitations: ["The historical rejection remains part of the authoritative judgment."],
+      reasons: [
+        {
+          taskId: "research",
+          reason: "The assignment and result retain a non-accepted disposition.",
+        },
+      ],
     });
-    assert.deepEqual(completed.completion?.accounting, []);
+    assert.deepEqual(
+      completed.completion?.accounting.map((item) => item.kind),
+      ["unresolved_assignment", "unresolved_result"],
+    );
+    const persisted = await readFile(store.path, "utf8");
+    const inspected = await WorkstreamStore.inspect(store.path);
+    assert.deepEqual(inspected.completion, completed.completion);
+    assert.equal(await readFile(store.path, "utf8"), persisted);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
