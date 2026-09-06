@@ -47,7 +47,8 @@ The coordinator interprets what a human request authorizes and chooses which ind
 Research, experiments, implementation slices, comparison, review, and integration are optional capabilities rather than a prescribed route.
 Routine mutation responses show the action outcome, workstream lifecycle, aggregate counts, affected assignment/attempt/result handles, and selected model provenance without replaying unrelated history.
 `workgraph_inspect` is the only normal inspection surface: use `section: overview` for remaining work, `task` for a semantic task, `outcome` or `evidence` for retained content, and `recovery` for exact resource and settlement evidence.
-Notifications include a bounded actionable outcome, including evidence, limitations, applied versus merely reported revisions, blockers, and uncertainty.
+Notifications include a bounded actionable outcome, including evidence, limitations, applied versus merely reported revisions, blockers, uncertainty, and retained artifact locations.
+When artifact details are truncated, follow the `retainedArtifacts.next` handle to recover them in full.
 Use the returned `next` handle to retrieve every remaining character of typed, untyped, malformed, or large report content without silently selecting an ambiguous repeated attempt.
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic acceptance oracle.
 Completion derives mechanical unresolved accounting and accepts one explicit reason per unresolved semantic task only; it refuses live or blocked resources and never automatically accepts evidence.
@@ -93,7 +94,7 @@ Completion always refuses unfinished or blocked owned work and derives exact str
 The coordinator supplies one explicit reason by semantic task for actual unresolved exceptions; unknown or missing reasons are rejected.
 A blocked boundary is recoverable only through the guarded coordinator recovery operation after exact native and Git inspection.
 A conflicting implementation may be explicitly retained-not-applied under an owned reachable ref and reason, but is not reported as composed.
-Routine completion does not require acknowledgement or disposition; focused inspection is an optional transport receipt, while semantic acceptance remains a separate coordinator judgment.
+Routine completion does not require acknowledgement or disposition; inspection is read-only and semantic acceptance remains a separate coordinator judgment.
 Blocked work is preserved for inspection rather than force-deleted.
 
 `workgraph_control` supports guarded `recover` for an inspected transient cleanup or composition failure, and `retain_not_applied` with an exact integrated revision and reason for a deliberately un-applied conflicting commit.

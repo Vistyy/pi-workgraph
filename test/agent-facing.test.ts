@@ -3,7 +3,11 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { inspectView, resultNotification } from "../src/agent-facing.js";
+import {
+  inspectView,
+  resolveAttemptHandle,
+  resultNotification,
+} from "../src/agent-facing.js";
 import { WorkstreamStore } from "../src/workstream.js";
 
 const coordinator = {
@@ -163,12 +167,28 @@ test("prelaunch recovery does not claim native settlement", async () => {
       view.recordedFacts.nativeOrGitStateFromTerminalStateAlone,
       false,
     );
+    const state = await store.load();
+    state.attempts[0]!.error = "Inspect uncertain launch before retrying.";
+    state.assignments.push({ ...state.assignments[0]!, id: "other" });
+    state.attempts.push({
+      ...attempt,
+      id: "other-attempt",
+      assignmentId: "other",
+    });
+    const recovery = inspectView(state, {
+      section: "recovery",
+      attempt: attempt.id,
+    }) as { guardedAction: { attempt: string } };
+    assert.equal(
+      resolveAttemptHandle(state, recovery.guardedAction.attempt).id,
+      attempt.id,
+    );
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
 });
 
-test("large delivery errors stay bounded in notifications", async () => {
+test("large delivery errors and retained artifacts stay bounded with lossless artifact access", async () => {
   const { parent, store } = await fixture();
   try {
     await store.assign({
@@ -179,8 +199,18 @@ test("large delivery errors stay bounded in notifications", async () => {
       intentVersion: 0,
       expectedEvidence: ["bytes"],
     });
+    const artifacts = [
+      {
+        id: "probe",
+        kind: "path" as const,
+        reference: "/retained/probe.txt",
+        retention: "retained" as const,
+        summary: "artifact detail ".repeat(1_000),
+      },
+    ];
     await store.retainResult({
       id: "delivery-result",
+      artifacts,
       assignmentId: "delivery",
       assignmentIntentVersion: 0,
       validity: "typed",
@@ -198,6 +228,30 @@ test("large delivery errors stay bounded in notifications", async () => {
     const notice = resultNotification(await store.load(), "delivery-result");
     assert.ok(notice.length < 12_000);
     assert.equal(notice.includes(largeError), false);
+    assert.ok(notice.includes(artifacts[0]!.reference));
+    const state = await store.load();
+    let offset = 0;
+    let recovered = "";
+    for (;;) {
+      const view = inspectView(state, {
+        section: "outcome",
+        result: "delivery-result",
+        offset,
+        maxChars: 1_000,
+      }) as {
+        retainedArtifacts: {
+          text: string;
+          next?: { section: string; result: string; offset: number };
+        };
+      };
+      recovered += view.retainedArtifacts.text;
+      const next = view.retainedArtifacts.next;
+      if (!next) break;
+      assert.equal(next.section, "outcome");
+      assert.equal(next.result, "delivery-result");
+      offset = next.offset;
+    }
+    assert.deepEqual(JSON.parse(recovered), artifacts);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

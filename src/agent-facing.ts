@@ -699,8 +699,7 @@ function recoveryView(
     guardedAction: blocker
       ? {
           tool: "workgraph_control",
-          taskPreview: compactText(task.id, 120),
-          attempt: attemptHandle(state, attempt),
+          attempt: attempt.id,
           actions: ["recover", "retain_not_applied"],
         }
       : undefined,
@@ -748,6 +747,16 @@ export function inspectView(
       observedAt: outcome.observedAt,
       report: reportPreview(outcome),
       settlement: settlement(state, outcome),
+      ...(outcome.artifacts.length
+        ? {
+            retainedArtifacts: boundedText(
+              JSON.stringify(outcome.artifacts, null, 2),
+              request.offset ?? 0,
+              request.maxChars ?? DEFAULT_CHARS,
+              { section: "outcome", result: outcome.id },
+            ),
+          }
+        : {}),
       fullReport: { section: "report", result: outcome.id },
       fullEvidence: { section: "evidence", result: outcome.id },
     };
