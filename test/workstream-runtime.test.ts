@@ -862,11 +862,15 @@ await test("artifact retry reconciles interrupted copies and refuses missing, un
     await active.recoverAttempt({
       attemptId: missingAttempt.id,
       action: "retry",
-      reason: "Reconcile an exact copy whose post-effect checkpoint was interrupted.",
+      reason: "Preserve an unmarked legacy target while retaining an owned payload.",
     });
     state = await f.store.load();
+    const retained = state.results[0]?.artifacts[0];
     assert.equal(state.attempts[0]?.artifactRetention?.state, "completed");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.ok(retained);
+    assert.notEqual(retained.reference, target);
+    assert.equal(await readFile(retained.reference, "utf8"), "checkpointed evidence\n");
     assert.equal(await readFile(target, "utf8"), "checkpointed evidence\n");
 
     await active.queue(input("escaping-probe", ["../foreign.txt"]));

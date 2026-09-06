@@ -1,7 +1,7 @@
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The existing Promise store API requires direct host filesystem reads at this external I/O boundary.
 import { readFile } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Cross-reference path checks use the canonical host path implementation.
-import { resolve } from "node:path";
+import { relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -335,13 +335,7 @@ function validateArtifactRetention(state: WorkstreamState, attempt: WorkAttempt)
     );
   if (retention.state === "completed") {
     validateArtifactsForAssignment(assignment, result.artifacts, "typed");
-    if (
-      result.artifacts.some(
-        (artifact) =>
-          artifact.kind !== "path" ||
-          resolve(artifact.reference) !== resolve(retention.destinationRoot, artifact.id),
-      )
-    )
+    if (result.artifacts.some((artifact) => !isRetainedArtifactReference(retention, artifact)))
       throw new InvalidWorkstreamStateError(
         `Attempt ${attempt.id} retained artifacts have foreign references.`,
       );
@@ -350,6 +344,27 @@ function validateArtifactRetention(state: WorkstreamState, attempt: WorkAttempt)
     throw new InvalidWorkstreamStateError(
       `Attempt ${attempt.id} cleanup began before required artifact retention completed.`,
     );
+}
+
+function isRetainedArtifactReference(
+  retention: NonNullable<WorkAttempt["artifactRetention"]>,
+  artifact: RetainedArtifact,
+): boolean {
+  if (artifact.kind !== "path") return false;
+  const reference = resolve(artifact.reference);
+  // Completed historical states used the destination path before owned payloads
+  // became public directly through the atomic state checkpoint.
+  if (reference === resolve(retention.destinationRoot, artifact.id)) return true;
+  const stagingRoot = resolve(retention.stagingRoot);
+  const part = relative(stagingRoot, reference);
+  if (part === "" || part === ".." || part.startsWith(`..${sep}`) || part.startsWith(sep))
+    return false;
+  const [container] = part.split(sep);
+  return (
+    container !== undefined &&
+    /^[0-9a-f]{64}\.payload$/.test(container) &&
+    reference === resolve(stagingRoot, container, artifact.id)
+  );
 }
 
 function validateAttemptPlacement(state: WorkstreamState, attempt: WorkAttempt): void {

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- These regressions exercise the production Node artifact boundary with real bytes.
-import { lstat, readdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Retained artifact path assertions use host path semantics.
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import test from "node:test";
 import { type ArtifactRetentionIo, nodeArtifactRetentionIo } from "../src/workstream-runtime.js";
 import { artifactFixture } from "./artifact-fixture.js";
@@ -42,7 +42,6 @@ void test("owned partial staging from an interrupted copy is quarantined and reb
         await writeFile(target, "partial\n");
         throw new Error("copy interrupted after partial bytes");
       },
-      publish: (input) => nodeArtifactRetentionIo.publish(input),
     };
     const first = f.runtime(interrupted);
     let state = await first.reconcile();
@@ -71,6 +70,45 @@ void test("owned partial staging from an interrupted copy is quarantined and reb
   }
 });
 
+void test("a complete owned payload reconciles after its copy response is lost", async () => {
+  const f = await artifactFixture();
+  try {
+    let copies = 0;
+    let loseResponse = true;
+    const interrupted: ArtifactRetentionIo = {
+      copy: (input) => {
+        copies++;
+        return nodeArtifactRetentionIo.copy(input).then(() => {
+          if (loseResponse) {
+            loseResponse = false;
+            throw new Error("copy response lost after complete owned payload");
+          }
+        });
+      },
+    };
+    const first = f.runtime(interrupted);
+    let state = await first.reconcile();
+    assert.equal(state.attempts[0]?.artifactRetention?.state, "blocked");
+    assert.equal(copies, 1);
+    await first.stop();
+
+    const retry = f.runtime(interrupted);
+    state = await retry.recoverAttempt({
+      attemptId: f.attemptId,
+      action: "retry",
+      reason: "Reconcile the complete marker-owned payload without copying it again.",
+    });
+    assert.equal(state.attempts[0]?.artifactRetention?.state, "completed");
+    assert.equal(copies, 1);
+    assert.equal(
+      await readFile(state.results[0]?.artifacts[0]?.reference ?? "", "utf8"),
+      "retained evidence\n",
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("unsafe, unproven, and raced paths are preserved rather than removed or overwritten", async () => {
   const unproven = await artifactFixture();
   try {
@@ -81,7 +119,6 @@ void test("unsafe, unproven, and raced paths are preserved rather than removed o
         await writeFile(target, "partial without durable ownership\n");
         throw new Error("copy interrupted");
       },
-      publish: (input) => nodeArtifactRetentionIo.publish(input),
     };
     const first = unproven.runtime(interrupted);
     let state = await first.reconcile();
@@ -112,7 +149,6 @@ void test("unsafe, unproven, and raced paths are preserved rather than removed o
         await symlink(source, target);
         throw new Error("copy interrupted with unsafe staging");
       },
-      publish: (input) => nodeArtifactRetentionIo.publish(input),
     };
     const runtime = unsafe.runtime(symlinked);
     await runtime.reconcile();
@@ -131,29 +167,93 @@ void test("unsafe, unproven, and raced paths are preserved rather than removed o
   const raced = await artifactFixture();
   try {
     let target = "";
-    const racingPublisher: ArtifactRetentionIo = {
-      copy: (input) => nodeArtifactRetentionIo.copy(input),
-      publish: async (input) => {
-        target = input.target;
+    const racingCopy: ArtifactRetentionIo = {
+      copy: async (input) => {
+        await nodeArtifactRetentionIo.copy(input);
+        const state = await raced.store.load();
+        const destination = state.attempts[0]?.artifactRetention?.destinationRoot ?? "";
+        await mkdir(destination, { recursive: true });
+        target = join(destination, "probe.txt");
         await writeFile(target, "foreign bytes\n");
-        await nodeArtifactRetentionIo.publish(input);
       },
     };
-    const runtime = raced.runtime(racingPublisher);
-    await runtime.reconcile();
-    let state = await raced.store.load();
-    assert.equal(state.attempts[0]?.artifactRetention?.state, "blocked");
-    assert.equal(await readFile(target, "utf8"), "foreign bytes\n");
-    await runtime.recoverAttempt({
-      attemptId: raced.attemptId,
-      action: "retry",
-      reason: "Inspect the raced destination without overwriting it.",
-    });
-    state = await raced.store.load();
-    assert.equal(state.attempts[0]?.artifactRetention?.state, "blocked");
+    const runtime = raced.runtime(racingCopy);
+    const state = await runtime.reconcile();
+    const artifact = state.results[0]?.artifacts[0];
+    assert.equal(state.attempts[0]?.artifactRetention?.state, "completed");
+    assert.ok(artifact);
+    assert.notEqual(artifact.reference, target);
+    assert.match(artifact.reference, /artifact-staging/);
+    assert.equal(await readFile(artifact.reference, "utf8"), "retained evidence\n");
     assert.equal(await readFile(target, "utf8"), "foreign bytes\n");
   } finally {
     await raced.dispose();
+  }
+});
+
+void test("file and directory payloads publish atomically despite a lost checkpoint response", async () => {
+  for (const kind of ["file", "directory"] as const) {
+    const f = await artifactFixture();
+    try {
+      const source = join(f.sourceRoot, "probe.txt");
+      if (kind === "directory") {
+        await unlink(source);
+        await mkdir(source);
+        await writeFile(join(source, "evidence.txt"), "directory evidence\n");
+      }
+
+      let copies = 0;
+      const countedCopy: ArtifactRetentionIo = {
+        copy: (input) => {
+          copies++;
+          return nodeArtifactRetentionIo.copy(input);
+        },
+      };
+      const finish = f.store.finishArtifactRetention.bind(f.store);
+      let loseResponse = true;
+      f.store.finishArtifactRetention = (...input) =>
+        finish(...input).then((state) => {
+          if (loseResponse) {
+            loseResponse = false;
+            throw new Error("checkpoint response lost after atomic state replacement");
+          }
+          return state;
+        });
+
+      const first = f.runtime(countedCopy);
+      await first.reconcile();
+      assert.equal(loseResponse, false);
+      let state = await f.store.load();
+      const retention = state.attempts[0]?.artifactRetention;
+      const artifact = state.results[0]?.artifacts[0];
+      assert.equal(retention?.state, "completed");
+      assert.ok(artifact);
+      assert.equal(basename(artifact.reference), "probe.txt");
+      assert.equal(copies, 1);
+      await assert.rejects(readFile(join(retention?.destinationRoot ?? "", "probe.txt")), /ENOENT/);
+      if (kind === "file")
+        assert.equal(await readFile(artifact.reference, "utf8"), "retained evidence\n");
+      else
+        assert.equal(
+          await readFile(join(artifact.reference, "evidence.txt"), "utf8"),
+          "directory evidence\n",
+        );
+
+      await first.stop();
+      const retry = f.runtime(countedCopy);
+      state = await retry.reconcile();
+      assert.equal(state.attempts[0]?.artifactRetention?.state, "completed");
+      assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+      assert.equal(state.results[0]?.artifacts[0]?.reference, artifact.reference);
+      assert.equal(copies, 1);
+      assert.equal(
+        (await readdir(retention?.stagingRoot ?? "")).filter((name) => name.endsWith(".payload"))
+          .length,
+        1,
+      );
+    } finally {
+      await f.dispose();
+    }
   }
 });
 
@@ -171,7 +271,6 @@ void test("intent and lease loss after copy fence publication at the actual boun
           constraints: ["Do not publish the old probe."],
         });
       },
-      publish: (publish) => nodeArtifactRetentionIo.publish(publish),
     };
     const runtime = stale.runtime(losingIntent);
     await runtime.reconcile();
@@ -190,7 +289,6 @@ void test("intent and lease loss after copy fence publication at the actual boun
         await nodeArtifactRetentionIo.copy(copy);
         lostLease.registry.db.prepare("DELETE FROM leases WHERE run_id=?").run("artifact-recovery");
       },
-      publish: (publish) => nodeArtifactRetentionIo.publish(publish),
     };
     const runtime = lostLease.runtime(losingLease);
     await assert.rejects(runtime.reconcile(), /lease|owner/i);

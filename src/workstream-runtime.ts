@@ -73,7 +73,6 @@ export interface QueueOptions {
 }
 export interface ArtifactRetentionIo {
   copy(input: { source: string; target: string; sourceRoot: string }): Promise<void>;
-  publish(input: { source: string; target: string; stagingRoot: string }): Promise<void>;
 }
 
 export const nodeArtifactRetentionIo: ArtifactRetentionIo = {
@@ -83,13 +82,6 @@ export const nodeArtifactRetentionIo: ArtifactRetentionIo = {
       force: false,
       errorOnExist: true,
       filter: (path) => assertSafeArtifactPath(path, sourceRoot),
-    }),
-  publish: ({ source, target, stagingRoot }) =>
-    artifactFs.cp(source, target, {
-      recursive: true,
-      force: false,
-      errorOnExist: true,
-      filter: (path) => assertSafeArtifactPath(path, stagingRoot),
     }),
 };
 
@@ -1323,9 +1315,8 @@ export class WorkstreamRuntime {
             throw new Error("Artifact must name a non-metadata path within the experiment.");
         });
         const source = resolve(retention.sourceRoot, name);
-        const target = resolve(retention.destinationRoot, name);
         yield* this.runtimeSync("validate experiment artifact paths", () => {
-          if (!within(retention.sourceRoot, source) || !within(retention.destinationRoot, target))
+          if (!within(retention.sourceRoot, source))
             throw new Error(`Experiment artifact escapes its retained boundary: ${name}.`);
         });
         const sourceFingerprint = yield* this.dependency(
@@ -1336,21 +1327,20 @@ export class WorkstreamRuntime {
         const stagingKey = createHash("sha256")
           .update(`${name}\0${sourceFingerprint}`)
           .digest("hex");
-        const staging = join(retention.stagingRoot, `${stagingKey}.payload`);
+        const payloadRoot = join(retention.stagingRoot, `${stagingKey}.payload`);
+        const staging = resolve(payloadRoot, name);
         const marker = join(retention.stagingRoot, `${stagingKey}.owner.json`);
         const ownership = stagingOwnership(retention, name, sourceFingerprint);
-        yield* this.dependency("runtime", "create artifact destination", () =>
-          prepareArtifactDirectory(retention.destinationRoot, dirname(target)),
-        );
+        yield* this.runtimeSync("validate artifact payload path", () => {
+          if (!within(payloadRoot, staging))
+            throw new Error(`Experiment artifact escapes its owned payload: ${name}.`);
+        });
         yield* this.dependency("runtime", "create artifact staging", () =>
-          prepareArtifactDirectory(retention.stagingRoot, dirname(staging)),
+          prepareArtifactDirectory(retention.stagingRoot, retention.stagingRoot),
         );
         yield* this.guardArtifactRetentionMutation(retention, name, sourceFingerprint);
-        if (yield* this.reconcileRetainedTarget(retention, name, target, sourceFingerprint))
-          return retainedArtifact(name, target);
-
         yield* this.dependency("runtime", "claim artifact staging", () =>
-          claimArtifactStaging(marker, staging, ownership),
+          claimArtifactStaging(marker, payloadRoot, ownership),
         );
         if (yield* this.pathExists(staging)) {
           const stagedFingerprint = yield* this.dependency(
@@ -1360,17 +1350,20 @@ export class WorkstreamRuntime {
           );
           if (stagedFingerprint !== sourceFingerprint) {
             yield* this.dependency("runtime", "verify owned partial artifact staging", () =>
-              verifyOwnedArtifactStaging(marker, staging, retention.stagingRoot, ownership),
+              verifyOwnedArtifactStaging(marker, payloadRoot, retention.stagingRoot, ownership),
             );
             yield* this.guardArtifactRetentionMutation(retention, name, sourceFingerprint);
             yield* this.dependency("runtime", "quarantine partial artifact staging", () =>
-              quarantineOwnedArtifactStaging(marker, staging, ownership),
+              quarantineOwnedArtifactStaging(marker, payloadRoot, ownership),
             );
           }
         }
         if (!(yield* this.pathExists(staging))) {
           yield* this.guardArtifactRetentionMutation(retention, name, sourceFingerprint);
-          yield* this.dependency("runtime", "copy experiment artifact to staging", () =>
+          yield* this.dependency("runtime", "prepare owned artifact payload", () =>
+            prepareArtifactDirectory(retention.stagingRoot, dirname(staging)),
+          );
+          yield* this.dependency("runtime", "copy experiment artifact to owned payload", () =>
             this.artifactRetentionIo.copy({
               source,
               target: staging,
@@ -1387,29 +1380,9 @@ export class WorkstreamRuntime {
         });
 
         yield* this.guardArtifactRetentionMutation(retention, name, sourceFingerprint);
-        if (yield* this.reconcileRetainedTarget(retention, name, target, sourceFingerprint))
-          return retainedArtifact(name, target);
-        yield* this.dependency("runtime", "publish retained artifact", () =>
-          this.artifactRetentionIo.publish({
-            source: staging,
-            target,
-            stagingRoot: retention.stagingRoot,
-          }),
-        ).pipe(
-          Effect.catch((error) =>
-            this.reconcilePublicationFailure(retention, name, target, sourceFingerprint, error),
-          ),
-        );
-        const publishedFingerprint = yield* this.dependency(
-          "runtime",
-          "verify published artifact",
-          () => artifactFingerprint(target, retention.destinationRoot),
-        );
-        yield* this.runtimeSync("confirm published artifact", () => {
-          if (publishedFingerprint !== sourceFingerprint)
-            throw new Error(`Published artifact does not match its source: ${name}.`);
-        });
-        return retainedArtifact(name, target);
+        // The store's atomic state replacement is the publication boundary. Until that
+        // checkpoint references this verified, source-bound payload, it remains internal.
+        return retainedArtifact(name, staging);
       }.bind(this),
     );
   }
@@ -1444,41 +1417,6 @@ export class WorkstreamRuntime {
         yield* this.validateArtifactRetentionCheckpoint(state, attempt, expected);
         yield* this.ownershipEffect();
       }.bind(this),
-    );
-  }
-
-  private reconcileRetainedTarget(
-    retention: ArtifactRetention,
-    name: string,
-    target: string,
-    sourceFingerprint: string,
-  ): Effect.Effect<boolean, RuntimeError> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        if (!(yield* this.pathExists(target))) return false;
-        const retainedFingerprint = yield* this.dependency(
-          "runtime",
-          "inspect retained artifact target",
-          () => artifactFingerprint(target, retention.destinationRoot),
-        );
-        return yield* this.runtimeSync("compare retained artifact", () => {
-          if (retainedFingerprint !== sourceFingerprint)
-            throw new Error(`Retained artifact conflicts with its exact source: ${name}.`);
-          return true;
-        });
-      }.bind(this),
-    );
-  }
-
-  private reconcilePublicationFailure(
-    retention: ArtifactRetention,
-    name: string,
-    target: string,
-    sourceFingerprint: string,
-    original: RuntimeError,
-  ): Effect.Effect<void, RuntimeError> {
-    return this.reconcileRetainedTarget(retention, name, target, sourceFingerprint).pipe(
-      Effect.flatMap((reconciled) => (reconciled ? Effect.void : Effect.fail(original))),
     );
   }
 
@@ -2284,35 +2222,35 @@ async function claimArtifactStaging(
   }
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- Recursive verification proves the partial payload is owned and contains no unsafe path before the final mutation fence.
+// oxlint-disable-next-line effecttsgo/async-function -- Recursive verification proves the partial container is marker-owned and contains no unsafe path before repair.
 async function verifyOwnedArtifactStaging(
   marker: string,
-  staging: string,
+  payloadRoot: string,
   stagingRoot: string,
   ownership: string,
 ): Promise<void> {
   await assertArtifactStagingMarker(marker, ownership);
-  await artifactFingerprint(staging, stagingRoot);
+  await artifactFingerprint(payloadRoot, stagingRoot);
 }
 
 // oxlint-disable-next-line effecttsgo/async-function -- The caller freshly rechecks lease, intent, and source after recursive verification and immediately before this bounded rename.
 async function quarantineOwnedArtifactStaging(
   marker: string,
-  staging: string,
+  payloadRoot: string,
   ownership: string,
 ): Promise<void> {
   await assertArtifactStagingMarker(marker, ownership);
-  const status = await artifactFs.lstat(staging);
-  if (status.isSymbolicLink() || (!status.isFile() && !status.isDirectory()))
-    throw new Error(`Artifact staging payload is unsafe: ${staging}.`);
-  const quarantine = `${staging}.quarantine-${randomUUID()}`;
+  const status = await artifactFs.lstat(payloadRoot);
+  if (status.isSymbolicLink() || !status.isDirectory())
+    throw new Error(`Artifact staging payload is unsafe: ${payloadRoot}.`);
+  const quarantine = `${payloadRoot}.quarantine-${randomUUID()}`;
   try {
     await artifactFs.lstat(quarantine);
     throw new Error(`Artifact staging quarantine unexpectedly exists: ${quarantine}.`);
   } catch (cause) {
     if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
   }
-  await artifactFs.rename(staging, quarantine);
+  await artifactFs.rename(payloadRoot, quarantine);
 }
 
 // oxlint-disable-next-line effecttsgo/async-function -- Marker lstat and byte comparison must stay adjacent to reject symlink or foreign ownership claims.
