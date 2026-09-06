@@ -1,6 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { access, cp, lstat, mkdir, realpath } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import {
+  Cause,
+  Clock,
+  Data,
+  Deferred,
+  Effect,
+  Exit,
+  Layer,
+  ManagedRuntime,
+  Queue,
+  Schedule,
+} from "effect";
 import type { GitRepository, WorktreePlacement } from "./git.js";
 import {
   herdrWorkerName,
@@ -50,21 +62,50 @@ export interface RuntimeOwnership {
   owner?: LeaseOwner;
   priorOwnerLiveness?: "alive" | "dead" | "unknown";
   policy?: ModelPolicy;
+  /** Test-only clock injection; production uses Effect's live Clock service. */
+  clock?: Clock.Clock;
 }
 
-/** One serialized execution owner, backed by the repository registry's fenced lease. */
+export class RuntimeDependencyError extends Data.TaggedError(
+  "RuntimeDependencyError",
+)<{
+  readonly dependency: "store" | "git" | "herdr" | "pi" | "runtime";
+  readonly operation: string;
+  readonly cause: unknown;
+}> {
+  override get message(): string {
+    return asError(this.cause).message;
+  }
+}
+
+class RuntimeStoppedError extends Data.TaggedError("RuntimeStoppedError")<{
+  readonly message: string;
+}> {}
+
+type RuntimeError = RuntimeDependencyError | RuntimeStoppedError;
+type OperationRequest =
+  | {
+      readonly _tag: "Operation";
+      readonly effect: Effect.Effect<unknown, RuntimeError>;
+      readonly reply: Deferred.Deferred<unknown, RuntimeError>;
+    }
+  | { readonly _tag: "Stop" };
+
+/** One scoped, serialized execution owner backed by the registry's fenced lease. */
 export class WorkstreamRuntime {
-  private timer: ReturnType<typeof setInterval> | undefined;
-  private heartbeat: ReturnType<typeof setInterval> | undefined;
-  private tail: Promise<unknown> = Promise.resolve();
-  private stopped = false;
-  private polling = false;
-  private reconciliationError: string | undefined;
   private lease: Lease | undefined;
   private readonly deliveryOwner = randomUUID();
   private readonly registry: WorkgraphRegistry;
   private readonly ownsRegistry: boolean;
-  private readonly ready: Promise<void>;
+  private readonly operations = Effect.runSync(
+    Queue.unbounded<OperationRequest>(),
+  );
+  private readonly ready = Deferred.makeUnsafe<void, RuntimeError>();
+  private readonly startRequested = Deferred.makeUnsafe<void>();
+  private readonly applicationExit = Deferred.makeUnsafe<
+    Exit.Exit<void, RuntimeError>
+  >();
+  private readonly effectRuntime: ManagedRuntime.ManagedRuntime<Clock.Clock, never>;
   private policy: ModelPolicy | undefined;
 
   constructor(
@@ -81,96 +122,270 @@ export class WorkstreamRuntime {
   ) {
     this.registry = ownership.registry ?? new WorkgraphRegistry();
     this.ownsRegistry = ownership.registry === undefined;
-    this.ready = this.claim(ownership);
-    void this.ready.catch(() => undefined); // Calls await readiness and receive the original error.
+    this.policy = ownership.policy;
+    // SAFETY: the live Effect runtime supplies its default Clock; tests may replace it with the explicit clock.
+    const layer = (ownership.clock
+      ? Layer.succeed(Clock.Clock, ownership.clock)
+      : Layer.empty) as Layer.Layer<Clock.Clock>;
+    this.effectRuntime = ManagedRuntime.make(layer);
+    this.effectRuntime.runFork(this.application(ownership));
   }
 
-  private async claim(options: RuntimeOwnership): Promise<void> {
-    const state = await this.store.load();
-    this.registry.indexWorkstream({
-      ...state,
-      runId: state.id,
-      lifecycle: state.lifecycle.state,
-    });
-    const owner = options.owner ?? state.coordinator;
-    this.lease = this.registry.acquire(
-      state.id,
-      owner,
-      new Date(),
-      options.priorOwnerLiveness ?? "unknown",
+  private application(
+    options: RuntimeOwnership,
+  ): Effect.Effect<void, RuntimeError> {
+    const owned = Effect.scoped(
+      Effect.gen(function* (this: WorkstreamRuntime) {
+        yield* Effect.acquireRelease(
+          this.claimEffect(options),
+          () => this.releaseEffect(),
+        );
+        yield* Deferred.succeed(this.ready, undefined);
+        yield* Effect.forkScoped(this.heartbeatLoop());
+        yield* Effect.forkScoped(
+          Deferred.await(this.startRequested).pipe(
+            Effect.andThen(this.reconciliationLoop()),
+          ),
+        );
+        yield* this.operationLoop();
+      }.bind(this)),
     );
-    this.store.bindMutationGuard(() => this.assertOwnership());
-    if (
-      owner.sessionId !== state.coordinator.sessionId ||
-      owner.sessionFile !== state.coordinator.sessionFile
-    ) {
-      await this.store.adopt(owner);
-    }
-    this.policy = options.policy;
-    this.heartbeat = setInterval(() => {
-      try {
-        this.assertOwnership();
-        if (this.lease) this.lease = this.registry.renew(this.lease);
-      } catch (error) {
-        this.stopped = true;
-        if (this.timer) clearInterval(this.timer);
-        if (this.heartbeat) clearInterval(this.heartbeat);
-        this.onError(asError(error));
-      }
-    }, 5_000);
-    this.heartbeat.unref();
+    return owned.pipe(
+      Effect.onExit((exit) =>
+        Deferred.done(this.ready, exit).pipe(
+          Effect.andThen(Deferred.succeed(this.applicationExit, exit)),
+          Effect.asVoid,
+        ),
+      ),
+    );
+  }
+
+  private claimEffect(
+    options: RuntimeOwnership,
+  ): Effect.Effect<void, RuntimeDependencyError> {
+    return Effect.gen(function* (this: WorkstreamRuntime) {
+      const state = yield* this.dependency(
+        "store",
+        "load for lease claim",
+        () => this.store.load(),
+      );
+      yield* Effect.try({
+        try: () => {
+          this.registry.indexWorkstream({
+            ...state,
+            runId: state.id,
+            lifecycle: state.lifecycle.state,
+          });
+          const owner = options.owner ?? state.coordinator;
+          this.lease = this.registry.acquire(
+            state.id,
+            owner,
+            new Date(),
+            options.priorOwnerLiveness ?? "unknown",
+          );
+          this.store.bindMutationGuard(() => this.assertOwnership());
+          return owner;
+        },
+        catch: (cause) =>
+          new RuntimeDependencyError({
+            dependency: "runtime",
+            operation: "claim registry lease",
+            cause,
+          }),
+      }).pipe(
+        Effect.flatMap((owner) =>
+          owner.sessionId !== state.coordinator.sessionId ||
+          owner.sessionFile !== state.coordinator.sessionFile
+            ? this.dependency("store", "adopt coordinator", () =>
+                this.store.adopt(owner),
+              )
+            : Effect.void,
+        ),
+      );
+    }.bind(this));
+  }
+
+  private releaseEffect(): Effect.Effect<void> {
+    return Effect.sync(() => {
+      if (this.lease) this.registry.release(this.lease);
+      this.lease = undefined;
+      if (this.ownsRegistry) this.registry.close();
+    });
+  }
+
+  private dependency<A>(
+    dependency: RuntimeDependencyError["dependency"],
+    operation: string,
+    run: () => PromiseLike<A>,
+  ): Effect.Effect<A, RuntimeDependencyError> {
+    return Effect.uninterruptible(
+      Effect.tryPromise({
+        try: run,
+        catch: (cause) =>
+          cause instanceof RuntimeDependencyError
+            ? cause
+            : new RuntimeDependencyError({ dependency, operation, cause }),
+      }),
+    );
   }
 
   private assertOwnership(): void {
-    if (this.stopped || !this.lease)
-      throw new Error("Workstream runtime is stopped or has no lease.");
+    if (!this.lease)
+      throw new RuntimeStoppedError({
+        message: "Workstream runtime is stopped or has no lease.",
+      });
     this.registry.assertLease(this.lease);
   }
 
-  async perform<T>(operation: () => Promise<T>): Promise<T> {
-    const next = this.tail.then(async () => {
-      await this.ready;
-      this.assertOwnership();
-      return operation();
+  private ownershipEffect(): Effect.Effect<void, RuntimeError> {
+    return Effect.try({
+      try: () => this.assertOwnership(),
+      catch: (cause) =>
+        cause instanceof RuntimeStoppedError
+          ? cause
+          : new RuntimeDependencyError({
+              dependency: "runtime",
+              operation: "assert registry lease",
+              cause,
+            }),
     });
-    this.tail = next.catch(() => undefined);
-    return next;
+  }
+
+  private operationLoop(): Effect.Effect<void, never> {
+    return Effect.suspend(() =>
+      Queue.take(this.operations).pipe(
+        Effect.flatMap((request) => {
+          if (request._tag === "Stop") return Effect.void;
+          return Effect.exit(request.effect).pipe(
+            Effect.flatMap((exit) => Deferred.done(request.reply, exit)),
+            Effect.andThen(this.operationLoop()),
+          );
+        }),
+      ),
+    );
+  }
+
+  private submit<T>(
+    effect: Effect.Effect<T, RuntimeError>,
+  ): Effect.Effect<T, RuntimeError> {
+    return Effect.gen(function* (this: WorkstreamRuntime) {
+      yield* Deferred.await(this.ready);
+      const reply = yield* Deferred.make<T, RuntimeError>();
+      // SAFETY: OperationRequest stores heterogeneous deferred results; the paired effect and reply are created in this submit call.
+      yield* Queue.offer(this.operations, {
+        _tag: "Operation",
+        effect: this.ownershipEffect().pipe(Effect.andThen(effect)),
+        reply: reply as Deferred.Deferred<unknown, RuntimeError>,
+      });
+      return yield* Effect.raceFirst(
+        Deferred.await(reply),
+        Deferred.await(this.applicationExit).pipe(
+          Effect.flatMap((exit) =>
+            Exit.isFailure(exit)
+              ? Effect.failCause(exit.cause)
+              : Effect.fail(
+                  new RuntimeStoppedError({
+                    message: "Workstream runtime is stopped.",
+                  }),
+                ),
+          ),
+        ),
+      );
+    }.bind(this));
+  }
+
+  private heartbeatLoop(): Effect.Effect<void, RuntimeError> {
+    const heartbeat = Effect.sync(() => {
+      this.assertOwnership();
+      const lease = this.lease;
+      if (!lease) throw new Error("Heartbeat has no lease.");
+      this.lease = this.registry.renew(lease);
+    }).pipe(
+      Effect.mapError(
+        (cause) =>
+          new RuntimeDependencyError({
+            dependency: "runtime",
+            operation: "renew registry lease",
+            cause,
+          }),
+      ),
+    );
+    return heartbeat.pipe(
+      Effect.repeat(Schedule.spaced("5 seconds")),
+      Effect.asVoid,
+      Effect.catchCauseIf(
+        (cause) => !Cause.hasInterruptsOnly(cause),
+        (cause) =>
+          Effect.sync(() => this.onError(asError(Cause.squash(cause)))).pipe(
+            Effect.andThen(Queue.offer(this.operations, { _tag: "Stop" })),
+            Effect.asVoid,
+          ),
+      ),
+    );
+  }
+
+  private reconciliationLoop(): Effect.Effect<void, RuntimeError> {
+    return Effect.sleep("1 second").pipe(
+      Effect.andThen(
+        this.submit(
+          this.dependency("runtime", "reconcile workstream", () =>
+            this.reconcileOperation(),
+          ),
+        ),
+      ),
+      Effect.tap(() => Effect.sync(() => (this.reconciliationError = undefined))),
+      Effect.catchCauseIf(
+        (cause) => !Cause.hasInterruptsOnly(cause),
+        (cause) => {
+          const error = asError(Cause.squash(cause));
+          const detail = error.message;
+          return Effect.sync(() => {
+            if (detail !== this.reconciliationError) {
+              this.reconciliationError = detail;
+              this.onError(error);
+            }
+          });
+        },
+      ),
+      Effect.repeat(Schedule.forever),
+      Effect.asVoid,
+    );
+  }
+
+  private reconciliationError: string | undefined;
+
+  async perform<T>(operation: () => Promise<T>): Promise<T> {
+    return this.runPromise(
+      this.submit(this.dependency("pi", "host operation", operation)),
+    );
   }
 
   start(): void {
-    if (this.timer || this.stopped) return;
-    this.timer = setInterval(() => {
-      if (this.polling) return;
-      this.polling = true;
-      void this.reconcile()
-        .then(() => {
-          this.reconciliationError = undefined;
-        })
-        .catch((error) => {
-          const detail = asError(error).message;
-          if (detail !== this.reconciliationError) {
-            this.reconciliationError = detail;
-            this.onError(asError(error));
-          }
-        })
-        .finally(() => {
-          this.polling = false;
-        });
-    }, 1_000);
-    this.timer.unref();
+    Deferred.doneUnsafe(this.startRequested, Effect.succeed(undefined));
   }
 
   async stop(): Promise<void> {
-    if (this.stopped && !this.lease) return;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = undefined;
-    await this.tail;
-    await this.ready.catch(() => undefined);
-    if (this.heartbeat) clearInterval(this.heartbeat);
-    if (this.lease) this.registry.release(this.lease);
-    this.lease = undefined;
-    this.stopped = true;
-    if (this.ownsRegistry) this.registry.close();
+    if (this.effectRuntime.scope.state._tag === "Closed") return;
+    await this.runPromise(
+      Deferred.await(this.ready).pipe(
+        Effect.matchEffect({
+          onFailure: () => Effect.void,
+          onSuccess: () => Queue.offer(this.operations, { _tag: "Stop" }),
+        }),
+        Effect.andThen(Deferred.await(this.applicationExit)),
+        Effect.asVoid,
+      ),
+    ).catch(() => undefined);
+    await this.effectRuntime.dispose();
+  }
+
+  private async runPromise<T, E>(effect: Effect.Effect<T, E>): Promise<T> {
+    if (this.effectRuntime.scope.state._tag === "Closed")
+      throw new RuntimeStoppedError({ message: "Workstream runtime is stopped." });
+    const exit = await this.effectRuntime.runPromiseExit(effect);
+    if (Exit.isSuccess(exit)) return exit.value;
+    const error = Cause.squash(exit.cause);
+    throw error instanceof Error ? error : new Error(String(error));
   }
 
   async queue(
@@ -277,8 +492,7 @@ export class WorkstreamRuntime {
     return requested ? this.repository.resolveRevision(requested) : undefined;
   }
 
-  async reconcile(): Promise<WorkstreamState> {
-    return this.perform(async () => {
+  private async reconcileOperation(): Promise<WorkstreamState> {
       let state = await this.store.load();
       if (!["active", "suspended"].includes(state.lifecycle.state))
         return state;
@@ -335,7 +549,16 @@ export class WorkstreamRuntime {
         }
       }
       return this.store.load();
-    });
+  }
+
+  async reconcile(): Promise<WorkstreamState> {
+    return this.runPromise(
+      this.submit(
+        this.dependency("runtime", "reconcile workstream", () =>
+          this.reconcileOperation(),
+        ),
+      ),
+    );
   }
 
   private async advance(id: string): Promise<void> {
@@ -552,8 +775,8 @@ export class WorkstreamRuntime {
         PI_WORKGRAPH_RUN_ID: state.id,
         PI_WORKGRAPH_NODE_ID: attempt.id,
         ...(baseRevision ? { PI_WORKGRAPH_BASE_COMMIT: baseRevision } : {}),
-        ...(process.env.PI_CODING_AGENT_DIR
-          ? { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR }
+        ...(process.env["PI_CODING_AGENT_DIR"]
+          ? { PI_CODING_AGENT_DIR: process.env["PI_CODING_AGENT_DIR"] }
           : {}),
         ...(assignment.artifactIntent === "disposable_experiment"
           ? { PI_WORKGRAPH_EXPERIMENT: "1" }

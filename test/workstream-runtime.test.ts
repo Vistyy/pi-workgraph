@@ -10,6 +10,8 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Effect } from "effect";
+import { TestClock } from "effect/testing";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { GitRepository, runProcess } from "../src/git.js";
 import {
@@ -1101,6 +1103,45 @@ test("failed notification is not retried by polling and manual observed receipt 
         .state,
       "completed",
     );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("Effect-owned fibers use deterministic cadence and stop before releasing the lease", async () => {
+  const f = await fixture();
+  const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+  try {
+    const active = f.runtime(undefined, { clock });
+    await active.queue(research("clocked"));
+    active.start();
+    await Effect.runPromise(clock.adjust("999 millis"));
+    assert.equal(f.workers.requests.length, 0);
+    await Effect.runPromise(clock.adjust("1 millis"));
+    await active.perform(async () => undefined);
+    assert.equal(f.workers.requests.length, 1);
+    await active.stop();
+    await assert.rejects(active.perform(async () => undefined), /stopped|lease/i);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("heartbeat ownership loss reports once and interrupts scoped reconciliation", async () => {
+  const f = await fixture();
+  const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+  try {
+    const active = f.runtime(undefined, { clock });
+    active.start();
+    await active.perform(async () => undefined);
+    f.registry.db
+      .prepare("DELETE FROM leases WHERE run_id=?")
+      .run("ws-fixture");
+    await Effect.runPromise(clock.adjust("5 seconds"));
+    assert.equal(f.errors.length, 1);
+    assert.match(f.errors[0] ?? "", /lease|owner/i);
+    await active.stop();
+    assert.equal(f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"), undefined);
   } finally {
     await f.dispose();
   }

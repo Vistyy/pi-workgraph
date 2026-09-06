@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { Effect, Semaphore } from "effect";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -57,15 +58,20 @@ const ModelOptions = {
 };
 
 export default function workgraphCoordinator(pi: ExtensionAPI): void {
-  if (process.env.PI_WORKGRAPH_MODE) return;
+  if (process.env["PI_WORKGRAPH_MODE"]) return;
   let runtime: WorkstreamRuntime | undefined;
   let pending: Static<typeof InputReceipt>[] = [];
-  let tail: Promise<unknown> = Promise.resolve();
-  const serial = <T>(operation: () => Promise<T>): Promise<T> => {
-    const next = tail.then(operation, operation);
-    tail = next.catch(() => undefined);
-    return next;
-  };
+  const hostSemaphore = Semaphore.makeUnsafe(1);
+  const serial = <T>(operation: () => Promise<T>): Promise<T> =>
+    Effect.runPromise(
+      hostSemaphore.withPermit(
+        Effect.tryPromise({
+          try: operation,
+          catch: (cause) =>
+            cause instanceof Error ? cause : new Error(String(cause)),
+        }),
+      ),
+    );
   const owner = (ctx: ExtensionContext): SessionIdentity => {
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (!sessionFile)
@@ -105,7 +111,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       new GitRepository(state.projectRoot, state.gitCommonDir),
       new HerdrCliRuntime(),
       {
-        workspaceId: process.env.HERDR_WORKSPACE_ID ?? "",
+        workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "",
       },
       (resultId, latest) => {
         if (ctx.sessionManager.getSessionId() !== latest.coordinator.sessionId)
@@ -303,8 +309,9 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     });
   });
   pi.on("session_shutdown", async () => {
-    await tail;
-    await runtime?.stop();
+    await serial(async () => {
+      await runtime?.stop();
+    });
   });
   pi.on("before_agent_start", async () => ({
     message: {
