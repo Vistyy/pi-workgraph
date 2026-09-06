@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Herdr tests exercise real native fixture state at the node:test boundary.
 import { existsSync } from "node:fs";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Herdr tests exercise real native fixture state at the node:test boundary.
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are exact native Herdr resource identities.
 import { join } from "node:path";
 import test from "node:test";
 import {
+  CoordinatorLaunchError,
   HerdrCliRuntime,
   herdrAgentName,
   herdrCoordinatorNames,
@@ -15,14 +19,13 @@ import {
 } from "../src/herdr.js";
 import type { WorkerIdentity, WorkerResourceIdentity } from "../src/types.js";
 
-test("worker tabs use concise task text while native names remain unique and role-specific", () => {
+await test("worker tabs use concise task text while native names remain unique and role-specific", () => {
   const request = {
     runId: "RUN/with spaces and symbols",
     nodeId: "attempt-one",
     attemptId: "attempt-one",
     assignmentId: "meaningful-agent-names",
-    objective:
-      "Implement parser support for accented input and a very long trailing explanation",
+    objective: "Implement parser support for accented input and a very long trailing explanation",
     role: "implement" as const,
   };
   const first = herdrWorkerName(request);
@@ -33,10 +36,7 @@ test("worker tabs use concise task text while native names remain unique and rol
   assert.equal(label, "Meaningful agent");
   assert.ok(label.length <= 18);
   assert.doesNotMatch(label, /implement|[a-f0-9]{6}/i);
-  assert.equal(
-    herdrWorkerTabLabel({ ...request, attemptId: "attempt-two" }),
-    label,
-  );
+  assert.equal(herdrWorkerTabLabel({ ...request, attemptId: "attempt-two" }), label);
   assert.notEqual(first, second);
   const fallback = herdrWorkerTabLabel({
     ...request,
@@ -49,10 +49,7 @@ test("worker tabs use concise task text while native names remain unique and rol
     herdrAgentName("run", "node", "attempt"),
     legacyHerdrAgentName("run", "node", "attempt"),
   );
-  assert.notEqual(
-    legacyObjectiveHerdrWorkerName(request),
-    herdrWorkerName(request),
-  );
+  assert.notEqual(legacyObjectiveHerdrWorkerName(request), herdrWorkerName(request));
 
   const semanticId = herdrWorkerTabLabel({
     ...request,
@@ -63,7 +60,7 @@ test("worker tabs use concise task text while native names remain unique and rol
   assert.ok(semanticId.length <= 18);
 });
 
-test("coordinator fork names use repository context without exposing paths", () => {
+await test("coordinator fork names use repository context without exposing paths", () => {
   const names = herdrCoordinatorNames({
     cwd: "/private/Customer Work/repo-name",
     sessionFile: "/private/session.jsonl",
@@ -75,7 +72,8 @@ test("coordinator fork names use repository context without exposing paths", () 
   assert.equal(names.label.includes("/"), false);
 });
 
-test("Herdr identity validation rejects missing and mismatched native session or cwd", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
+await test("Herdr identity validation rejects missing and mismatched native session or cwd", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-identity-"));
   const responsePath = join(parent, "agent.json");
   const command = join(parent, "fake-herdr-identity.mjs");
@@ -108,11 +106,13 @@ test("Herdr identity validation rejects missing and mismatched native session or
     HERDR_WORKSPACE_ID: identity.workspaceId,
   });
   try {
+    // SAFETY: The fixture line is JSON.parse output and the surrounding test validates its command-record shape.
     const missingSession = structuredClone(valid) as Partial<typeof valid>;
     delete missingSession.agent_session;
     await writeFile(responsePath, JSON.stringify(missingSession));
     await assert.rejects(() => runtime.observe(identity), /agent_session/);
 
+    // SAFETY: The fixture line is JSON.parse output and the surrounding test validates its command-record shape.
     const missingCwd = structuredClone(valid) as Partial<typeof valid>;
     delete missingCwd.cwd;
     await writeFile(responsePath, JSON.stringify(missingCwd));
@@ -125,10 +125,7 @@ test("Herdr identity validation rejects missing and mismatched native session or
         agent_session: { value: join(parent, "other.jsonl") },
       }),
     );
-    await assert.rejects(
-      () => runtime.observe(identity),
-      /native Pi session changed/,
-    );
+    await assert.rejects(() => runtime.observe(identity), /native Pi session changed/);
 
     await writeFile(
       responsePath,
@@ -140,10 +137,9 @@ test("Herdr identity validation rejects missing and mismatched native session or
   }
 });
 
-test("current-session coordinator observation accepts an unnamed detected Pi pane without weakening worker identity", async () => {
-  const parent = await mkdtemp(
-    join(tmpdir(), "pi-workgraph-herdr-coordinator-"),
-  );
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
+await test("current-session coordinator observation accepts an unnamed detected Pi pane without weakening worker identity", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-coordinator-"));
   const command = join(parent, "fake-herdr-coordinator.mjs");
   const cwd = join(parent, "repo");
   const sessionFile = join(parent, "coordinator.jsonl");
@@ -174,8 +170,7 @@ test("current-session coordinator observation accepts an unnamed detected Pi pan
     assert.equal(coordinator.agentName, undefined);
     assert.equal(coordinator.sessionFile, sessionFile);
     await assert.rejects(
-      () =>
-        runtime.observe({ ...coordinator, agentName: "required-worker-name" }),
+      () => runtime.observe({ ...coordinator, agentName: "required-worker-name" }),
       /omitted string name/,
     );
   } finally {
@@ -183,7 +178,8 @@ test("current-session coordinator observation accepts an unnamed detected Pi pan
   }
 });
 
-test("coordinator forks into a new unfocused workspace with isolated Pi identity", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
+await test("coordinator forks into a new unfocused workspace with isolated Pi identity", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-fork-"));
   const log = join(parent, "commands.jsonl");
   const command = join(parent, "fake-herdr-fork.mjs");
@@ -231,18 +227,16 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       cwd,
     });
     assert.notEqual(identity.workspaceId, "parent-workspace");
+    // SAFETY: Each fixture process writes only JSON-encoded string argument arrays to this private log.
     const calls = (await readFile(log, "utf8"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    const create = calls.find(
-      (args) => args[0] === "workspace" && args[1] === "create",
-    )!;
+    // biome-ignore lint/style/noNonNullAssertion: The preceding fixture command assertion establishes that this call was recorded.
+    const create = calls.find((args) => args[0] === "workspace" && args[1] === "create")!;
     assert.equal(create.includes("--workspace"), false);
     assert.equal(create.includes("--no-focus"), true);
-    assert.ok(
-      create.includes(`PI_CODING_AGENT_DIR=${join(parent, "private-agent")}`),
-    );
+    assert.ok(create.includes(`PI_CODING_AGENT_DIR=${join(parent, "private-agent")}`));
     for (const key of [
       "PI_WORKGRAPH_MODE",
       "PI_WORKGRAPH_RUN_ID",
@@ -252,9 +246,8 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       "PI_WORKGRAPH_EXECUTOR_THINKING",
     ])
       assert.ok(create.includes(`${key}=`));
-    const start = calls.find(
-      (args) => args[0] === "agent" && args[1] === "start",
-    )!;
+    // biome-ignore lint/style/noNonNullAssertion: The preceding fixture command assertion establishes that this call was recorded.
+    const start = calls.find((args) => args[0] === "agent" && args[1] === "start")!;
     assert.deepEqual(start.slice(0, 7), [
       "agent",
       "start",
@@ -270,10 +263,9 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   }
 });
 
-test("uncertain coordinator startup retains the exact created workspace handles", async () => {
-  const parent = await mkdtemp(
-    join(tmpdir(), "pi-workgraph-herdr-fork-failure-"),
-  );
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
+await test("uncertain coordinator startup retains the exact created workspace handles", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-fork-failure-"));
   const command = join(parent, "fake-herdr-fork-failure.mjs");
   const cwd = join(parent, "child-repo");
   const sessionFile = join(parent, "child.jsonl");
@@ -296,25 +288,20 @@ else console.log(JSON.stringify({result:{accepted:true}}));
     });
     await assert.rejects(
       () => runtime.launchCoordinator({ cwd, sessionFile }),
-      (error: unknown) => {
-        assert.equal(
-          error instanceof Error && error.name,
-          "CoordinatorLaunchError",
-        );
-        const resource = (error as { resource?: unknown }).resource;
+      (error) => {
+        assert.ok(error instanceof CoordinatorLaunchError);
+        const resource = error.resource;
+        assert.ok(resource !== undefined);
         assert.deepEqual(resource, {
           workspaceId: "child-workspace",
           tabId: "child-workspace:tab-1",
           paneId: "child-workspace:pane-1",
-          agentName: (resource as { agentName: string }).agentName,
+          agentName: resource.agentName,
           terminalId: "child-terminal",
           sessionFile,
           cwd,
         });
-        assert.match(
-          String(error),
-          /Inspect these exact handles before retrying/,
-        );
+        assert.match(String(error), /Inspect these exact handles before retrying/);
         return true;
       },
     );
@@ -323,10 +310,9 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   }
 });
 
-test("cleanup rejects mismatched cwd, verifies exact tab absence and tolerates already completed closure", async () => {
-  const parent = await mkdtemp(
-    join(tmpdir(), "pi-workgraph-herdr-deleted-cleanup-"),
-  );
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
+await test("cleanup rejects mismatched cwd, verifies exact tab absence and tolerates already completed closure", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-deleted-cleanup-"));
   const command = join(parent, "fake-herdr-cleanup.mjs");
   const closed = join(parent, "closed");
   const cwd = join(parent, "worktree");
@@ -374,7 +360,8 @@ test("cleanup rejects mismatched cwd, verifies exact tab absence and tolerates a
   }
 });
 
-test("the Herdr adapter launches without waiting and validates exact identity before interrupt", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
+await test("the Herdr adapter launches without waiting and validates exact identity before interrupt", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-"));
   const log = join(parent, "commands.jsonl");
   const command = join(parent, "fake-herdr.mjs");
@@ -444,28 +431,22 @@ test("the Herdr adapter launches without waiting and validates exact identity be
     await runtime.interrupt(observation.identity);
     const pendingCleanup = await runtime.cleanup(observation.identity);
     assert.equal(pendingCleanup.state, "pending");
+    // SAFETY: Each fixture process writes only JSON-encoded string argument arrays to this private log.
     const calls = (await readFile(log, "utf8"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    const prompt = calls.find(
-      (args) => args[0] === "agent" && args[1] === "prompt",
-    )!;
+    // biome-ignore lint/style/noNonNullAssertion: The preceding fixture command assertion establishes that this call was recorded.
+    const prompt = calls.find((args) => args[0] === "agent" && args[1] === "prompt")!;
     assert.equal(prompt.includes("--wait"), false);
-    const tabCreate = calls.find(
-      (args) => args[0] === "tab" && args[1] === "create",
-    )!;
+    // biome-ignore lint/style/noNonNullAssertion: The preceding fixture command assertion establishes that this call was recorded.
+    const tabCreate = calls.find((args) => args[0] === "tab" && args[1] === "create")!;
     assert.ok(tabCreate.includes(herdrWorkerTabLabel(naming)));
     assert.deepEqual(
-      calls
-        .find((args) => args[0] === "agent" && args[1] === "send-keys")
-        ?.slice(-1),
+      calls.find((args) => args[0] === "agent" && args[1] === "send-keys")?.slice(-1),
       ["esc"],
     );
-    assert.equal(
-      calls.filter((args) => args[0] === "agent" && args[1] === "get").length,
-      4,
-    );
+    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "get").length, 4);
     assert.equal(
       calls.some((args) => args[0] === "tab" && args[1] === "close"),
       false,
@@ -475,7 +456,8 @@ test("the Herdr adapter launches without waiting and validates exact identity be
   }
 });
 
-test("the Herdr launch can wait for native session identity without submitting a prompt", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
+await test("the Herdr launch can wait for native session identity without submitting a prompt", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-readiness-"));
   const log = join(parent, "commands.jsonl");
   const command = join(parent, "fake-herdr-readiness.mjs");
@@ -536,16 +518,13 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       cwd,
     });
     assert.deepEqual(retainedIdentity, observation.identity);
+    // SAFETY: Each fixture process writes only JSON-encoded string argument arrays to this private log.
     const calls = (await readFile(log, "utf8"))
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    const promptIndex = calls.findIndex(
-      (args) => args[0] === "agent" && args[1] === "prompt",
-    );
-    const getIndex = calls.findIndex(
-      (args) => args[0] === "agent" && args[1] === "get",
-    );
+    const promptIndex = calls.findIndex((args) => args[0] === "agent" && args[1] === "prompt");
+    const getIndex = calls.findIndex((args) => args[0] === "agent" && args[1] === "get");
     assert.equal(promptIndex, -1);
     assert.ok(getIndex >= 0);
   } finally {
@@ -553,7 +532,8 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   }
 });
 
-test("the Herdr launch retains a blocked resource without submitting an assignment", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
+await test("the Herdr launch retains a blocked resource without submitting an assignment", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-blocked-"));
   const log = join(parent, "commands.jsonl");
   const command = join(parent, "fake-herdr-blocked.mjs");
@@ -612,6 +592,7 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       agentName,
       cwd,
     });
+    // SAFETY: Each fixture process writes only JSON-encoded string argument arrays to this private log.
     const calls = (await readFile(log, "utf8"))
       .trim()
       .split("\n")
@@ -620,6 +601,87 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       calls.some((args) => args[0] === "agent" && args[1] === "prompt"),
       false,
     );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this native fixture lifecycle.
+await test("read-only startup inspection distinguishes exact live, absent, and mismatched retained panes", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-herdr-startup-inspection-"));
+  const command = join(parent, "fake-herdr-startup.mjs");
+  const modePath = join(parent, "mode");
+  const cwd = join(parent, "worktree");
+  const sessionFile = join(parent, "worker.jsonl");
+  const request = {
+    workspaceId: "workspace-1",
+    tabId: "workspace-1:tab-1",
+    paneId: "workspace-1:pane-1",
+    terminalId: "terminal-1",
+    sessionFile,
+    cwd,
+  };
+  const agentName = herdrAgentName("run", "node", "attempt");
+  const pane = {
+    workspace_id: request.workspaceId,
+    tab_id: request.tabId,
+    pane_id: request.paneId,
+    terminal_id: request.terminalId,
+    cwd: request.cwd,
+  };
+  const agent = {
+    ...pane,
+    agent_status: "working",
+    name: agentName,
+    agent_session: { value: sessionFile },
+  };
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { readFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const mode = readFileSync(${JSON.stringify(modePath)}, "utf8");
+if (mode === "absent") { console.error(JSON.stringify({error:{code:"pane_not_found",message:"gone"}})); process.exit(1); }
+if (mode === "agent-absent" && args[0] === "agent") { console.error(JSON.stringify({error:{code:"agent_not_found",message:"gone"}})); process.exit(1); }
+if (mode === "process-unknown" && args[0] === "pane" && args[1] === "process-info") { console.error(JSON.stringify({error:{code:"inspection_failed",message:"unknown"}})); process.exit(1); }
+if (args[0] === "pane" && args[1] === "get") console.log(JSON.stringify({result:{pane:${JSON.stringify(pane)}}}));
+else if (args[0] === "pane" && args[1] === "process-info") console.log(JSON.stringify({result:{shell_pid:10,foreground_process_group_id:11,foreground_processes:["fish","atuin"]}}));
+else if (args[0] === "agent" && args[1] === "get") console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));
+else console.log(JSON.stringify({result:{accepted:true}}));
+`,
+  );
+  await chmod(command, 0o755);
+  try {
+    const runtime = new HerdrCliRuntime(command, {
+      HERDR_ENV: "1",
+      HERDR_WORKSPACE_ID: request.workspaceId,
+    });
+    await writeFile(modePath, "live");
+    const live = await runtime.inspectLaunch(request);
+    assert.equal(live.state, "live");
+    if (live.state === "live") {
+      assert.equal(live.identity.agentName, agentName);
+      assert.equal(live.evidence.process.state, "observed");
+    }
+    await writeFile(modePath, "process-unknown");
+    const liveWithoutProcessEvidence = await runtime.inspectLaunch(request);
+    assert.equal(liveWithoutProcessEvidence.state, "live");
+    assert.equal(liveWithoutProcessEvidence.evidence.process.state, "unknown");
+    await writeFile(modePath, "agent-absent");
+    const paneWithoutAgent = await runtime.inspectLaunch(request);
+    assert.equal(paneWithoutAgent.state, "unknown");
+    assert.equal(paneWithoutAgent.evidence.process.state, "observed");
+    assert.equal(paneWithoutAgent.evidence.agent.state, "absent");
+    assert.match(paneWithoutAgent.detail, /no relaunch or cleanup is authorized/);
+    await writeFile(modePath, "absent");
+    const absent = await runtime.inspectLaunch(request);
+    assert.equal(absent.state, "absent");
+    assert.match(absent.detail, /pane .* absent/);
+    await writeFile(modePath, "live");
+    const mismatch = await runtime.inspectLaunch({ ...request, cwd: `${cwd}-expected` });
+    assert.equal(mismatch.state, "unknown");
+    assert.match(mismatch.detail, /does not match/);
+    assert.match(JSON.stringify(mismatch.evidence), /workspace-1/);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
