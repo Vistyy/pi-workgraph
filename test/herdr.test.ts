@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Herdr tests exercise real native fixture state at the node:test boundary.
 import { existsSync } from "node:fs";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Herdr tests exercise real native fixture state at the node:test boundary.
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are exact native Herdr resource identities.
 import { join } from "node:path";
 import test from "node:test";
-import { Effect } from "effect";
+import { Deferred, Effect } from "effect";
 import {
   CoordinatorLaunchError,
   HERDR_PROTOCOL_OUTPUT_LIMIT,
@@ -19,6 +19,9 @@ import {
   herdrWorkerTabLabel,
   legacyHerdrAgentName,
   legacyObjectiveHerdrWorkerName,
+  PromiseCheckpointError,
+  WorkerLaunchError,
+  WorkerLaunchPlacementError,
 } from "../src/herdr.js";
 import type { WorkerIdentity, WorkerResourceIdentity } from "../src/types.js";
 
@@ -832,6 +835,9 @@ const mode = readFileSync(${JSON.stringify(mode)}, "utf8");
 if (mode === "overflow") {
   process.stdout.write(" ".repeat(${HERDR_PROTOCOL_OUTPUT_LIMIT + 128}) + JSON.stringify({error:{code:"pane_not_found",message:"gone"}}));
   process.exitCode = 1;
+} else if (mode === "stderr-overflow") {
+  process.stderr.write(" ".repeat(${HERDR_PROTOCOL_OUTPUT_LIMIT + 128}) + JSON.stringify({error:{code:"pane_not_found",message:"gone"}}));
+  process.exitCode = 1;
 } else {
   process.stdout.write("{malformed");
 }
@@ -849,7 +855,18 @@ if (mode === "overflow") {
       (error) => {
         assert.ok(error instanceof HerdrProtocolError);
         assert.equal(error.reason, "overflow");
-        assert.match(error.message, /no truncated JSON was decoded/);
+        assert.match(error.message, /no truncated stdout or stderr was decoded/);
+        return true;
+      },
+    );
+
+    await writeFile(mode, "stderr-overflow");
+    await assert.rejects(
+      () => Effect.runPromise(runtime.effects.inspect(identity)),
+      (error) => {
+        assert.ok(error instanceof HerdrProtocolError);
+        assert.equal(error.reason, "overflow");
+        assert.match(error.message, /no truncated stdout or stderr was decoded/);
         return true;
       },
     );
@@ -916,18 +933,10 @@ else if (args[0] === "agent" && args[1] === "get") {
         cwd,
         sessionFile,
         env: {},
-        onTab() {
-          callbacks.push("tab");
-        },
-        onResource() {
-          callbacks.push("resource");
-        },
-        onIdentity() {
-          callbacks.push("identity");
-        },
-        onSubmitted() {
-          callbacks.push("submitted");
-        },
+        onTab: () => Effect.sync(() => callbacks.push("tab")).pipe(Effect.asVoid),
+        onResource: () => Effect.sync(() => callbacks.push("resource")).pipe(Effect.asVoid),
+        onIdentity: () => Effect.sync(() => callbacks.push("identity")).pipe(Effect.asVoid),
+        onSubmitted: () => Effect.sync(() => callbacks.push("submitted")).pipe(Effect.asVoid),
       }),
       { signal: controller.signal },
     );
@@ -941,6 +950,261 @@ else if (args[0] === "agent" && args[1] === "get") {
     await rm(parent, { recursive: true, force: true });
   }
 });
+
+await test("launch rejects conflicting returned placement without adopting or prompting it", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-herdr-placement-"));
+  const command = join(parent, "fake-herdr-placement.mjs");
+  const log = join(parent, "commands.jsonl");
+  const cwd = join(parent, "worktree");
+  const foreign = {
+    workspace_id: "foreign-workspace",
+    tab_id: "foreign-workspace:tab-9",
+    pane_id: "foreign-workspace:pane-9",
+    terminal_id: "foreign-terminal",
+    agent_status: "idle",
+    name: herdrAgentName("run", "node", "attempt"),
+    cwd: join(parent, "foreign-worktree"),
+  };
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+if (args[0] === "tab") console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-1"}}}));
+else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:${JSON.stringify(foreign)}}}));
+else console.log(JSON.stringify({result:{accepted:true}}));
+`,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, {
+    HERDR_ENV: "1",
+    HERDR_WORKSPACE_ID: "workspace-1",
+  });
+  let adopted = false;
+  try {
+    await assert.rejects(
+      () =>
+        runtime.launch({
+          workspaceId: "workspace-1",
+          runId: "run",
+          nodeId: "node",
+          attemptId: "attempt",
+          cwd,
+          sessionFile: join(parent, "worker.jsonl"),
+          prompt: "must not be sent",
+          env: {},
+          onResource() {
+            adopted = true;
+          },
+        }),
+      (error) => {
+        assert.ok(error instanceof HerdrProtocolError);
+        assert.equal(error.reason, "identity");
+        assert.ok(error.cause instanceof WorkerLaunchPlacementError);
+        assert.equal(error.cause.expected.workspaceId, "workspace-1");
+        assert.equal(error.cause.expected.paneId, "workspace-1:pane-1");
+        assert.equal(error.cause.observed.workspaceId, "foreign-workspace");
+        assert.equal(error.cause.observed.paneId, "foreign-workspace:pane-9");
+        assert.match(error.message, /not adopted or cleaned up/);
+        return true;
+      },
+    );
+    assert.equal(adopted, false);
+    const calls = await commandLog(log);
+    assert.equal(
+      calls.some((args) => args[0] === "agent" && args[1] === "get"),
+      false,
+    );
+    assert.equal(
+      calls.some((args) => args[0] === "agent" && args[1] === "prompt"),
+      false,
+    );
+    assert.equal(
+      calls.some((args) => args[0] === "tab" && args[1] === "close"),
+      false,
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+await test("onTab failure reports the exact created pane and prevents agent start", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-herdr-tab-checkpoint-"));
+  const command = join(parent, "fake-herdr-tab-checkpoint.mjs");
+  const log = join(parent, "commands.jsonl");
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-created"}}}));
+`,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, {
+    HERDR_ENV: "1",
+    HERDR_WORKSPACE_ID: "workspace-1",
+  });
+  try {
+    await assert.rejects(
+      () =>
+        runtime.launch({
+          workspaceId: "workspace-1",
+          runId: "run",
+          nodeId: "node",
+          attemptId: "attempt",
+          cwd: parent,
+          sessionFile: join(parent, "worker.jsonl"),
+          env: {},
+          onTab() {
+            throw new Error("durable pane write failed");
+          },
+        }),
+      (error) => {
+        assert.ok(error instanceof WorkerLaunchError);
+        assert.equal(error.phase, "onTab");
+        assert.deepEqual(error.locator, {
+          workspaceId: "workspace-1",
+          paneId: "workspace-1:pane-created",
+        });
+        assert.equal(error.resource, undefined);
+        assert.ok(error.cause instanceof PromiseCheckpointError);
+        assert.match(String(error.cause.cause), /durable pane write failed/);
+        return true;
+      },
+    );
+    const calls = await commandLog(log);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0]?.slice(0, 2), ["tab", "create"]);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+await test("cancellation waits for every Effect checkpoint and starts no later operation", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-herdr-checkpoint-cancel-"));
+  const command = join(parent, "fake-herdr-checkpoints.mjs");
+  const log = join(parent, "commands.jsonl");
+  const durable = join(parent, "durable.jsonl");
+  const cwd = join(parent, "worktree");
+  const sessionFile = join(parent, "worker.jsonl");
+  const agentName = herdrAgentName("run", "node", "attempt");
+  const agent = {
+    workspace_id: "workspace-1",
+    tab_id: "workspace-1:tab-1",
+    pane_id: "workspace-1:pane-1",
+    terminal_id: "terminal-1",
+    agent_status: "idle",
+    name: agentName,
+    cwd,
+    agent_session: { value: sessionFile },
+  };
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args = process.argv.slice(2);
+appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
+if (args[0] === "tab") console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-1"}}}));
+else if (args[0] === "agent" && (args[1] === "start" || args[1] === "get")) console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));
+else console.log(JSON.stringify({result:{accepted:true}}));
+`,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, {
+    HERDR_ENV: "1",
+    HERDR_WORKSPACE_ID: "workspace-1",
+  });
+  const phases = ["onTab", "onResource", "onIdentity", "onSubmitted"] as const;
+  try {
+    for (const phase of phases) {
+      await writeFile(log, "");
+      await writeFile(durable, "");
+      const entered = await Effect.runPromise(Deferred.make<void>());
+      const release = await Effect.runPromise(Deferred.make<void>());
+      const reached: string[] = [];
+      const checkpoint = (name: (typeof phases)[number]) =>
+        name === phase
+          ? Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+              yield* Effect.tryPromise(() => appendFile(durable, `${name}:settled\\n`));
+              reached.push(name);
+            })
+          : Effect.sync(() => {
+              reached.push(name);
+            });
+      const controller = new AbortController();
+      const running = Effect.runPromise(
+        runtime.effects.launch({
+          workspaceId: "workspace-1",
+          runId: "run",
+          nodeId: "node",
+          attemptId: "attempt",
+          cwd,
+          sessionFile,
+          prompt: "Continue.",
+          env: {},
+          onTab: () => checkpoint("onTab"),
+          onResource: () => checkpoint("onResource"),
+          onIdentity: () => checkpoint("onIdentity"),
+          onSubmitted: () => checkpoint("onSubmitted"),
+        }),
+        { signal: controller.signal },
+      );
+      await Effect.runPromise(Deferred.await(entered));
+      controller.abort();
+      const premature = await Promise.race([
+        running.then(
+          () => "settled",
+          () => "settled",
+        ),
+        Effect.runPromise(Effect.sleep(25)).then(() => "pending"),
+      ]);
+      assert.equal(premature, "pending", `${phase} must finish before cancellation returns`);
+      await Effect.runPromise(Deferred.succeed(release, undefined));
+      await assert.rejects(running);
+      assert.equal(await readFile(durable, "utf8"), `${phase}:settled\\n`);
+      assert.equal(reached.includes(phase), true);
+      const calls = await commandLog(log);
+      if (phase === "onTab")
+        assert.equal(
+          calls.some((args) => args[0] === "agent" && args[1] === "start"),
+          false,
+        );
+      if (phase === "onResource")
+        assert.equal(
+          calls.some((args) => args[0] === "agent" && args[1] === "get"),
+          false,
+        );
+      if (phase === "onIdentity")
+        assert.equal(
+          calls.some((args) => args[0] === "agent" && args[1] === "prompt"),
+          false,
+        );
+      if (phase === "onSubmitted")
+        assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "prompt").length, 1);
+      const callCount = calls.length;
+      await Effect.runPromise(Effect.sleep(25));
+      assert.equal((await commandLog(log)).length, callCount, `${phase} launched detached work`);
+      assert.equal(await readFile(durable, "utf8"), `${phase}:settled\\n`);
+    }
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+async function commandLog(path: string): Promise<string[][]> {
+  const text = await readFile(path, "utf8");
+  if (!text.trim()) return [];
+  // SAFETY: The fixture child writes one JSON-encoded string argument array per line.
+  return text
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line) as string[]);
+}
 
 async function waitForPath(path: string): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt += 1) {

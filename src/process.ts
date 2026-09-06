@@ -12,6 +12,7 @@ export interface ProcessResult {
   stdoutTruncated: boolean;
   stdoutDigest?: string;
   stderr: string;
+  stderrTruncated: boolean;
   timedOut: boolean;
 }
 
@@ -108,6 +109,7 @@ export function processEffect(
         stdout: stdout.text,
         stdoutTruncated: stdout.truncated,
         stderr: stderr.text,
+        stderrTruncated: stderr.truncated,
         timedOut,
       };
       if (owned.stdout.digest !== undefined) {

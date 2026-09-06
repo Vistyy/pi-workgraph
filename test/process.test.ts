@@ -24,6 +24,7 @@ void test("the Effect process owner returns normal output through its native API
     stdout: "hello",
     stdoutTruncated: false,
     stderr: "",
+    stderrTruncated: false,
     timedOut: false,
   });
 });
@@ -85,6 +86,7 @@ void test("malformed bytes stay within the display byte limit and preserve the r
   assert.equal(result.stdout, "");
   assert.equal(result.stderr, "");
   assert.equal(result.stdoutTruncated, true);
+  assert.equal(result.stderrTruncated, true);
   assert.ok(Buffer.byteLength(result.stdout) <= 1);
   assert.ok(Buffer.byteLength(result.stderr) <= 1);
   assert.equal(
@@ -109,6 +111,7 @@ void test("decoded malformed suffixes are bounded for both output streams", asyn
   assert.equal(result.stdout, "😀");
   assert.equal(result.stderr, "(€");
   assert.equal(result.stdoutTruncated, true);
+  assert.equal(result.stderrTruncated, true);
   assert.ok(Buffer.byteLength(result.stdout) <= 6);
   assert.ok(Buffer.byteLength(result.stderr) <= 6);
 });
