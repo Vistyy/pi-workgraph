@@ -1,6 +1,7 @@
 {
   "name": "@vistyy/pi-workgraph",
   "version": "0.1.0",
+  "packageManager": "pnpm@11.25.0",
   "type": "module",
   "description": "Conversational, durable local work coordination for Pi.",
   "engines": {
@@ -28,9 +29,9 @@
   "scripts": {
     "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "postinstall": "pnpm exec effect-tsgo patch --oxlint --no-typescript",
-    "quality": "pnpm exec biome check --error-on-warnings .; biome_status=$?; pnpm exec oxlint --config oxlint.config.ts .; oxlint_status=$?; test $biome_status -eq 0 -a $oxlint_status -eq 0",
-    "check": "pnpm quality && pnpm test",
+    "quality:prepare": "effect-tsgo patch --oxlint --no-typescript",
+    "quality": "pnpm run quality:prepare && biome check --error-on-warnings . && oxlint --config oxlint.config.ts .",
+    "check": "pnpm run quality && pnpm run test",
     "smoke:herdr": "node --import tsx scripts/herdr-smoke.ts",
     "smoke:coordinator": "node --import tsx scripts/coordinator-smoke.ts",
     "smoke:natural": "node --import tsx scripts/natural-coordinator-smoke.ts"

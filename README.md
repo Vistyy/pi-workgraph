@@ -125,9 +125,11 @@ pnpm smoke:herdr
 pnpm smoke:coordinator
 ```
 
-The pinned install runs `pnpm exec effect-tsgo patch --oxlint --no-typescript` as a repeatable postinstall step.
+The root `packageManager` field pins pnpm to `11.25.0`; local development and GitHub Actions use that same pin.
+Development quality preparation runs `effect-tsgo patch --oxlint --no-typescript` as the first step of `pnpm quality` and `pnpm check` after devDependencies are installed.
+It is not a published-package install requirement.
 The optional `msgpackr-extract` native build is explicitly allowed in `pnpm-workspace.yaml`; Effect still works with its JavaScript fallback when the optional native package is unavailable.
-`pnpm check` is also the GitHub Actions check entry point and runs shared Biome, the root-spread Effect Oxlint preset, and all deterministic tests.
+`pnpm check` is also the GitHub Actions check entry point and runs quality preparation, shared Biome, the root-spread Effect Oxlint preset, and all deterministic tests.
 Oxlint owns the full TypeScript-aware check for this source selection, so the standalone `pnpm typecheck` command remains available for transitional compiler diagnostics but is not duplicated in `pnpm check`.
 The first quality adoption intentionally reports existing migration diagnostics from unmigrated product, smoke, and test code; no paths or rule severities are suppressed to hide that debt.
 
