@@ -1,9 +1,4 @@
-import type {
-  WorkAssignment,
-  WorkAttempt,
-  WorkResult,
-  WorkstreamState,
-} from "./workstream.js";
+import type { WorkAssignment, WorkAttempt, WorkResult, WorkstreamState } from "./workstream.js";
 
 const DEFAULT_CHARS = 3_000;
 const MAX_CHARS = 8_000;
@@ -11,13 +6,7 @@ const DEFAULT_ITEMS = 10;
 const MAX_ITEMS = 20;
 const PREVIEW_CHARS = 180;
 
-export type InspectSection =
-  | "overview"
-  | "task"
-  | "outcome"
-  | "evidence"
-  | "recovery"
-  | "report";
+export type InspectSection = "overview" | "task" | "outcome" | "evidence" | "recovery" | "report";
 
 export interface InspectRequest {
   section: InspectSection;
@@ -39,6 +28,40 @@ export interface ActionProjectionOptions {
   outcome?: string;
 }
 
+interface RetrievalTarget {
+  section: InspectSection;
+  task?: string;
+  attempt?: string;
+  result?: string;
+}
+
+interface BoundedTextProjection {
+  text: string;
+  encoding: "utf16-code-units";
+  offset: number;
+  returnedChars: number;
+  totalChars: number;
+  truncated: boolean;
+  next?: RetrievalTarget & { offset: number; maxChars: number };
+}
+
+interface ItemPageProjection<T> {
+  items: T[];
+  itemOffset: number;
+  returnedItems: number;
+  totalItems: number;
+  truncated: boolean;
+  next?: RetrievalTarget & { itemOffset: number; maxItems: number };
+}
+
+interface Selection {
+  task: WorkAssignment | undefined;
+  attempt: WorkAttempt | undefined;
+  outcome: WorkResult | undefined;
+  taskAttempts: WorkAttempt[];
+  taskOutcomes: WorkResult[];
+}
+
 export function compactText(value: string, max = PREVIEW_CHARS): string {
   const text = value.replace(/\s+/g, " ").trim();
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
@@ -46,9 +69,7 @@ export function compactText(value: string, max = PREVIEW_CHARS): string {
 
 function attemptOrdinal(state: WorkstreamState, attempt: WorkAttempt): number {
   return (
-    state.attempts
-      .filter((item) => item.assignmentId === attempt.assignmentId)
-      .indexOf(attempt) + 1
+    state.attempts.filter((item) => item.assignmentId === attempt.assignmentId).indexOf(attempt) + 1
   );
 }
 
@@ -57,14 +78,10 @@ function attemptHandle(state: WorkstreamState, attempt: WorkAttempt): string {
 }
 
 function outcomeOrdinal(state: WorkstreamState, result: WorkResult): number {
-  const owner = state.attempts.find(
-    (attempt) => attempt.resultId === result.id,
-  );
-  if (owner) return attemptOrdinal(state, owner);
+  const owner = state.attempts.find((attempt) => attempt.resultId === result.id);
+  if (owner !== undefined) return attemptOrdinal(state, owner);
   return (
-    state.results
-      .filter((item) => item.assignmentId === result.assignmentId)
-      .indexOf(result) + 1
+    state.results.filter((item) => item.assignmentId === result.assignmentId).indexOf(result) + 1
   );
 }
 
@@ -72,11 +89,7 @@ function outcomeHandle(state: WorkstreamState, result: WorkResult): string {
   return `outcome-${outcomeOrdinal(state, result)}`;
 }
 
-function attemptMatches(
-  state: WorkstreamState,
-  attempt: WorkAttempt,
-  handle: string,
-): boolean {
+function attemptMatches(state: WorkstreamState, attempt: WorkAttempt, handle: string): boolean {
   return (
     attempt.id === handle ||
     attempt.uuidAlias === handle ||
@@ -91,100 +104,144 @@ export function resolveAttemptHandle(
 ): WorkAttempt {
   const matches = state.attempts.filter(
     (attempt) =>
-      (!taskId || attempt.assignmentId === taskId) &&
+      (taskId === undefined || attempt.assignmentId === taskId) &&
       attemptMatches(state, attempt, handle),
   );
-  if (matches.length === 0)
+  const match = matches.at(0);
+  if (match === undefined)
     throw new Error(
-      `Unknown attempt ${compactText(handle)}${taskId ? ` for task ${compactText(taskId)}` : ""}.`,
+      `Unknown attempt ${compactText(handle)}${taskId !== undefined ? ` for task ${compactText(taskId)}` : ""}.`,
     );
   if (matches.length > 1)
     throw new Error(
       `Ambiguous attempt ${compactText(handle)}; also provide task, or use one exact storage id: ${matches.map((item) => item.id).join(", ")}.`,
     );
-  return matches[0]!;
+  return match;
 }
 
-function resultMatches(
-  state: WorkstreamState,
-  result: WorkResult,
-  handle: string,
-): boolean {
+function resultMatches(state: WorkstreamState, result: WorkResult, handle: string): boolean {
   return (
-    result.id === handle ||
-    result.uuidAlias === handle ||
-    outcomeHandle(state, result) === handle
+    result.id === handle || result.uuidAlias === handle || outcomeHandle(state, result) === handle
   );
 }
 
-function resolveResultHandle(
-  state: WorkstreamState,
-  handle: string,
-  taskId?: string,
-): WorkResult {
+function resolveResultHandle(state: WorkstreamState, handle: string, taskId?: string): WorkResult {
   const matches = state.results.filter(
     (result) =>
-      (!taskId || result.assignmentId === taskId) &&
+      (taskId === undefined || result.assignmentId === taskId) &&
       resultMatches(state, result, handle),
   );
-  if (matches.length === 0)
+  const match = matches.at(0);
+  if (match === undefined)
     throw new Error(
-      `Unknown outcome ${compactText(handle)}${taskId ? ` for task ${compactText(taskId)}` : ""}.`,
+      `Unknown outcome ${compactText(handle)}${taskId !== undefined ? ` for task ${compactText(taskId)}` : ""}.`,
     );
   if (matches.length > 1)
     throw new Error(
       `Ambiguous outcome ${compactText(handle)}; also provide task, or use one exact storage id: ${matches.map((item) => item.id).join(", ")}.`,
     );
-  return matches[0]!;
+  return match;
 }
 
 function taskById(state: WorkstreamState, id: string): WorkAssignment {
   const task = state.assignments.find((item) => item.id === id);
-  if (!task) throw new Error(`Unknown task ${compactText(id)}.`);
+  if (task === undefined) throw new Error(`Unknown task ${compactText(id)}.`);
   return task;
 }
 
-function resolveSelection(state: WorkstreamState, request: InspectRequest) {
-  let task = request.task ? taskById(state, request.task) : undefined;
-  const attempt = request.attempt
-    ? resolveAttemptHandle(state, request.attempt, task?.id)
-    : undefined;
-  if (attempt) task ??= taskById(state, attempt.assignmentId);
-  let outcome = request.result
-    ? resolveResultHandle(state, request.result, task?.id)
-    : undefined;
-  if (outcome) task ??= taskById(state, outcome.assignmentId);
-  if (attempt && outcome && attempt.resultId !== outcome.id)
+function resultById(state: WorkstreamState, id: string): WorkResult | undefined {
+  return state.results.find((item) => item.id === id);
+}
+
+function selectedTask(
+  state: WorkstreamState,
+  request: InspectRequest,
+  attempt: WorkAttempt | undefined,
+  outcome: WorkResult | undefined,
+): WorkAssignment | undefined {
+  if (request.task !== undefined) return taskById(state, request.task);
+  if (attempt !== undefined) return taskById(state, attempt.assignmentId);
+  if (outcome !== undefined) return taskById(state, outcome.assignmentId);
+  return undefined;
+}
+
+function assertCompatibleSelection(
+  state: WorkstreamState,
+  attempt: WorkAttempt | undefined,
+  outcome: WorkResult | undefined,
+): void {
+  if (attempt === undefined || outcome === undefined || attempt.resultId === outcome.id) return;
+  if (attempt.resultId === undefined)
     throw new Error(
-      attempt.resultId
-        ? `Attempt ${attemptHandle(state, attempt)} retained ${outcomeHandle(state, state.results.find((item) => item.id === attempt.resultId)!)}, not ${outcomeHandle(state, outcome)}.`
-        : `Attempt ${attemptHandle(state, attempt)} has no retained outcome; it cannot select ${outcomeHandle(state, outcome)}.`,
+      `Attempt ${attemptHandle(state, attempt)} has no retained outcome; it cannot select ${outcomeHandle(state, outcome)}.`,
     );
-  const taskAttempts = task
-    ? state.attempts.filter((item) => item.assignmentId === task.id)
-    : [];
-  if (!request.attempt && !outcome && taskAttempts.length === 1) {
-    const only = taskAttempts[0]!;
-    if (only.resultId)
-      outcome = state.results.find((item) => item.id === only.resultId);
+  const retained = resultById(state, attempt.resultId);
+  const retainedIdentity =
+    retained === undefined ? attempt.resultId : outcomeHandle(state, retained);
+  throw new Error(
+    `Attempt ${attemptHandle(state, attempt)} retained ${retainedIdentity}, not ${outcomeHandle(state, outcome)}.`,
+  );
+}
+
+function implicitOutcome(
+  state: WorkstreamState,
+  request: InspectRequest,
+  attempt: WorkAttempt | undefined,
+  outcome: WorkResult | undefined,
+  taskAttempts: WorkAttempt[],
+  taskOutcomes: WorkResult[],
+): WorkResult | undefined {
+  if (outcome !== undefined) return outcome;
+  if (attempt !== undefined && request.result === undefined && attempt.resultId !== undefined)
+    return resultById(state, attempt.resultId);
+  if (request.attempt !== undefined) return undefined;
+  const onlyAttempt = taskAttempts.length === 1 ? taskAttempts.at(0) : undefined;
+  if (onlyAttempt?.resultId !== undefined) {
+    const result = resultById(state, onlyAttempt.resultId);
+    if (result !== undefined) return result;
   }
-  if (attempt && !request.result && attempt.resultId)
-    outcome = state.results.find((item) => item.id === attempt.resultId);
-  if (!request.attempt && !outcome && task) {
-    const outcomes = state.results.filter(
-      (item) => item.assignmentId === task.id,
-    );
-    if (outcomes.length === 1) outcome = outcomes[0];
-  }
-  return { task, attempt, outcome, taskAttempts };
+  return taskOutcomes.length === 1 ? taskOutcomes.at(0) : undefined;
+}
+
+function resolveSelection(state: WorkstreamState, request: InspectRequest): Selection {
+  const requestedTask = request.task === undefined ? undefined : taskById(state, request.task);
+  const attempt =
+    request.attempt === undefined
+      ? undefined
+      : resolveAttemptHandle(state, request.attempt, requestedTask?.id);
+  const requestedOutcome =
+    request.result === undefined
+      ? undefined
+      : resolveResultHandle(state, request.result, requestedTask?.id);
+  const task = selectedTask(state, request, attempt, requestedOutcome);
+  assertCompatibleSelection(state, attempt, requestedOutcome);
+  const taskAttempts =
+    task === undefined ? [] : state.attempts.filter((item) => item.assignmentId === task.id);
+  const taskOutcomes =
+    task === undefined ? [] : state.results.filter((item) => item.assignmentId === task.id);
+  const outcome = implicitOutcome(
+    state,
+    request,
+    attempt,
+    requestedOutcome,
+    taskAttempts,
+    taskOutcomes,
+  );
+  return {
+    task,
+    attempt,
+    outcome,
+    taskAttempts,
+    taskOutcomes,
+  };
 }
 
 function requireUnambiguousAttempt(
   state: WorkstreamState,
-  selection: ReturnType<typeof resolveSelection>,
+  selection: Selection,
 ): WorkAttempt | undefined {
-  if (selection.attempt) return selection.attempt;
-  if (selection.taskAttempts.length <= 1) return selection.taskAttempts[0];
+  if (selection.attempt !== undefined) return selection.attempt;
+  if (selection.taskAttempts.length <= 1) return selection.taskAttempts.at(0);
   throw new Error(
     `Task ${compactText(selection.task?.id ?? "")} has repeated attempts; specify one of: ${selection.taskAttempts.map((item) => attemptHandle(state, item)).join(", ")}.`,
   );
@@ -192,58 +249,47 @@ function requireUnambiguousAttempt(
 
 function requireUnambiguousOutcome(
   state: WorkstreamState,
-  selection: ReturnType<typeof resolveSelection>,
+  selection: Selection,
 ): WorkResult | undefined {
-  if (selection.outcome) return selection.outcome;
-  if (selection.attempt) return undefined;
-  const outcomes = selection.task
-    ? state.results.filter((item) => item.assignmentId === selection.task?.id)
-    : [];
-  if (outcomes.length <= 1) return outcomes[0];
+  if (selection.outcome !== undefined) return selection.outcome;
+  if (selection.attempt !== undefined) return undefined;
+  if (selection.taskOutcomes.length <= 1) return selection.taskOutcomes.at(0);
   throw new Error(
-    `Task ${compactText(selection.task?.id ?? "")} has repeated outcomes; specify one of: ${outcomes.map((item) => outcomeHandle(state, item)).join(", ")}.`,
+    `Task ${compactText(selection.task?.id ?? "")} has repeated outcomes; specify one of: ${selection.taskOutcomes.map((item) => outcomeHandle(state, item)).join(", ")}.`,
   );
 }
 
 function reportStatus(result: WorkResult) {
   if (result.validity !== "typed") return { validity: result.validity };
-  return {
+  const status = {
     validity: result.validity,
     kind: result.report.kind,
     status: result.report.status,
-    ...(result.report.kind === "implementation" &&
-    result.report.status === "completed"
-      ? {
-          outcome: result.report.outcome,
-          ...(result.report.outcome === "no_change"
-            ? { inspectedRevision: result.report.revision }
-            : { reportedCommit: result.report.commit }),
-        }
-      : {}),
   };
+  if (result.report.kind !== "implementation" || result.report.status !== "completed")
+    return status;
+  if (result.report.outcome === "no_change")
+    return { ...status, outcome: result.report.outcome, inspectedRevision: result.report.revision };
+  return { ...status, outcome: result.report.outcome, reportedCommit: result.report.commit };
 }
 
 function reportPreview(result: WorkResult) {
   if (result.validity !== "typed")
     return {
       ...reportStatus(result),
-      detail: compactText(
-        result.validity === "untyped" ? result.text : result.detail,
-      ),
+      detail: compactText(result.validity === "untyped" ? result.text : result.detail),
     };
   const report = result.report;
   return {
     ...reportStatus(result),
     summary: compactText(report.summary, 320),
-    uncertainty: report.uncertainty
-      ?.slice(0, 3)
-      .map((item) => compactText(item)),
+    uncertainty: report.uncertainty?.slice(0, 3).map((item) => compactText(item)),
     evidence: report.evidence.slice(0, 3).map((item) => ({
       label: compactText(item.label, 120),
       observation: compactText(item.observation, 280),
       class: item.class,
-      command: item.command ? compactText(item.command, 160) : undefined,
-      artifact: item.artifact ? compactText(item.artifact, 160) : undefined,
+      command: item.command === undefined ? undefined : compactText(item.command, 160),
+      artifact: item.artifact === undefined ? undefined : compactText(item.artifact, 160),
     })),
     findings: report.findings.slice(0, 3).map((item) => ({
       severity: item.severity,
@@ -261,17 +307,58 @@ function reportPreview(result: WorkResult) {
 
 function deliveryPreview(state: WorkstreamState, result: WorkResult) {
   const delivery = state.deliveries.find((item) => item.resultId === result.id);
-  if (!delivery) return { state: "not_requested" };
+  if (delivery === undefined) return { state: "not_requested" as const };
   return {
     state: delivery.state,
     requestedAt: delivery.requestedAt,
-    attemptedBy: delivery.attemptedBy
-      ? compactText(delivery.attemptedBy, 120)
-      : undefined,
+    attemptedBy:
+      delivery.attemptedBy === undefined ? undefined : compactText(delivery.attemptedBy, 120),
     deliveredAt: delivery.deliveredAt,
     acknowledgedAt: delivery.acknowledgedAt,
-    error: delivery.error ? compactText(delivery.error, 280) : undefined,
+    error: delivery.error === undefined ? undefined : compactText(delivery.error, 280),
     failureCount: delivery.failureHistory?.length ?? 0,
+  };
+}
+
+function applicationProjection(attempt: WorkAttempt | undefined, result: WorkResult) {
+  const composition = attempt?.composition;
+  if (composition?.state === "composed")
+    return {
+      state: "applied" as const,
+      revision: composition.revision,
+      reportedCommit: composition.commit,
+    };
+  if (composition?.state === "retained_not_applied")
+    return {
+      state: "retained_not_applied" as const,
+      reportedCommit: composition.commit,
+      integratedRevision: composition.integratedRevision,
+      retainedRef: compactText(composition.retainedRef ?? "", 180),
+      reason: compactText(composition.reason ?? "", 280),
+    };
+  if (composition !== undefined)
+    return {
+      state: composition.state,
+      reportedCommit: composition.commit,
+      blocker: composition.error === undefined ? undefined : compactText(composition.error, 280),
+    };
+  const report = result.validity === "typed" ? result.report : undefined;
+  if (
+    report?.kind === "implementation" &&
+    report.status === "completed" &&
+    report.outcome === "changed"
+  )
+    return { state: "reported_not_applied" as const, reportedCommit: report.commit };
+  return { state: "not_applicable" as const };
+}
+
+function cleanupProjection(attempt: WorkAttempt | undefined) {
+  const cleanup = attempt?.cleanup;
+  if (cleanup === undefined) return { state: "not_recorded" as const };
+  return {
+    state: cleanup.state,
+    workerClosed: cleanup.workerClosed,
+    blocker: cleanup.error === undefined ? undefined : compactText(cleanup.error, 280),
   };
 }
 
@@ -282,198 +369,121 @@ function settlement(state: WorkstreamState, result: WorkResult) {
       ? result.report.findings
           .filter((finding) => finding.severity === "blocker")
           .slice(0, 3)
-          .map((finding) =>
-            compactText(`${finding.title}: ${finding.detail}`, 280),
-          )
+          .map((finding) => compactText(`${finding.title}: ${finding.detail}`, 280))
       : [];
-  if (attempt?.error) blockers.push(compactText(attempt.error, 280));
+  if (attempt?.error !== undefined) blockers.push(compactText(attempt.error, 280));
+  const blockerCount =
+    (result.validity === "typed"
+      ? result.report.findings.filter((finding) => finding.severity === "blocker").length
+      : 0) + (attempt?.error === undefined ? 0 : 1);
   return {
     workerReport: reportStatus(result),
     blockers,
-    blockerCount:
-      (result.validity === "typed"
-        ? result.report.findings.filter(
-            (finding) => finding.severity === "blocker",
-          ).length
-        : 0) + (attempt?.error ? 1 : 0),
-    application:
-      attempt?.composition?.state === "composed"
-        ? {
-            state: "applied",
-            revision: attempt.composition.revision,
-            reportedCommit: attempt.composition.commit,
-          }
-        : attempt?.composition?.state === "retained_not_applied"
-          ? {
-              state: "retained_not_applied",
-              reportedCommit: attempt.composition.commit,
-              integratedRevision: attempt.composition.integratedRevision,
-              retainedRef: compactText(
-                attempt.composition.retainedRef ?? "",
-                180,
-              ),
-              reason: compactText(attempt.composition.reason ?? "", 280),
-            }
-          : attempt?.composition
-            ? {
-                state: attempt.composition.state,
-                reportedCommit: attempt.composition.commit,
-                blocker: attempt.composition.error
-                  ? compactText(attempt.composition.error, 280)
-                  : undefined,
-              }
-            : result.validity === "typed" &&
-                result.report.kind === "implementation" &&
-                result.report.status === "completed" &&
-                result.report.outcome === "changed"
-              ? {
-                  state: "reported_not_applied",
-                  reportedCommit: result.report.commit,
-                }
-              : { state: "not_applicable" },
-    cleanup: attempt?.cleanup
-      ? {
-          state: attempt.cleanup.state,
-          workerClosed: attempt.cleanup.workerClosed,
-          blocker: attempt.cleanup.error
-            ? compactText(attempt.cleanup.error, 280)
-            : undefined,
-        }
-      : { state: "not_recorded" },
+    blockerCount,
+    application: applicationProjection(attempt, result),
+    cleanup: cleanupProjection(attempt),
     delivery: deliveryPreview(state, result),
-    ...(attempt
-      ? {
-          recovery: {
+    recovery:
+      attempt === undefined
+        ? undefined
+        : {
             section: "recovery" as const,
             attempt: attempt.id,
           },
-        }
-      : {}),
   };
 }
 
 function itemPage<T, U>(
   items: T[],
   request: InspectRequest,
-  retrieval: Record<string, unknown>,
+  retrieval: RetrievalTarget,
   project: (item: T) => U,
-) {
+): ItemPageProjection<U> {
   const offset = request.itemOffset ?? 0;
-  const limit = Math.min(
-    MAX_ITEMS,
-    Math.max(1, request.maxItems ?? DEFAULT_ITEMS),
-  );
+  const limit = Math.min(MAX_ITEMS, Math.max(1, request.maxItems ?? DEFAULT_ITEMS));
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > items.length)
     throw new Error(`Item offset must be between 0 and ${items.length}.`);
   const selected = items.slice(offset, offset + limit).map(project);
   const nextOffset = offset + selected.length;
-  return {
+  const page: ItemPageProjection<U> = {
     items: selected,
     itemOffset: offset,
     returnedItems: selected.length,
     totalItems: items.length,
     truncated: nextOffset < items.length,
-    ...(nextOffset < items.length
-      ? {
-          next: {
-            ...retrieval,
-            itemOffset: nextOffset,
-            maxItems: limit,
-          },
-        }
-      : {}),
   };
+  if (nextOffset < items.length)
+    page.next = { ...retrieval, itemOffset: nextOffset, maxItems: limit };
+  return page;
 }
 
 function attemptPreview(state: WorkstreamState, attempt: WorkAttempt) {
-  const result = attempt.resultId
-    ? state.results.find((item) => item.id === attempt.resultId)
-    : undefined;
+  const result = attempt.resultId === undefined ? undefined : resultById(state, attempt.resultId);
   return {
     handle: attemptHandle(state, attempt),
     state: attempt.state,
-    outcome: result ? outcomeHandle(state, result) : undefined,
-    blocker: attempt.error ? compactText(attempt.error, 280) : undefined,
+    outcome: result === undefined ? undefined : outcomeHandle(state, result),
+    blocker: attempt.error === undefined ? undefined : compactText(attempt.error, 280),
     recovery: { section: "recovery" as const, attempt: attempt.id },
   };
 }
 
-function taskPreview(state: WorkstreamState, assignment: WorkAssignment) {
-  const attempts = state.attempts.filter(
-    (attempt) => attempt.assignmentId === assignment.id,
-  );
+function taskPreview(state: WorkstreamState, assignment: WorkAssignment, attempts?: WorkAttempt[]) {
+  const ownedAttempts =
+    attempts ?? state.attempts.filter((attempt) => attempt.assignmentId === assignment.id);
+  const latestAttempt = ownedAttempts.at(-1);
   return {
     idPreview: compactText(assignment.id, 120),
     capability: assignment.capability,
     objective: compactText(assignment.objective),
     intentVersion: assignment.intentVersion,
-    attemptCount: attempts.length,
-    latestAttempt: attempts.length
-      ? attemptPreview(state, attempts.at(-1)!)
-      : undefined,
+    attemptCount: ownedAttempts.length,
+    latestAttempt: latestAttempt === undefined ? undefined : attemptPreview(state, latestAttempt),
   };
 }
 
-function taskView(
-  state: WorkstreamState,
-  assignment: WorkAssignment,
-  request: InspectRequest,
-) {
-  const attempts = state.attempts.filter(
-    (attempt) => attempt.assignmentId === assignment.id,
-  );
-  const retrievalAttempt = attempts[0]?.id;
+function taskRetrievalTarget(assignment: WorkAssignment, attempts: WorkAttempt[]): RetrievalTarget {
+  const retrievalAttempt = attempts.at(0);
+  if (retrievalAttempt !== undefined) return { section: "task", attempt: retrievalAttempt.id };
+  return { section: "task", task: assignment.id };
+}
+
+function taskView(state: WorkstreamState, assignment: WorkAssignment, request: InspectRequest) {
+  const attempts = state.attempts.filter((attempt) => attempt.assignmentId === assignment.id);
+  const retrieval = taskRetrievalTarget(assignment, attempts);
   return {
-    ...taskPreview(state, assignment),
+    ...taskPreview(state, assignment, attempts),
     taskIdentity: boundedText(
       assignment.id,
       request.offset ?? 0,
       request.maxChars ?? DEFAULT_CHARS,
-      {
-        section: "task",
-        ...(retrievalAttempt
-          ? { attempt: retrievalAttempt }
-          : { task: assignment.id }),
-      },
+      retrieval,
     ),
-    attempts: itemPage(
-      attempts,
-      request,
-      {
-        section: "task",
-        ...(retrievalAttempt
-          ? { attempt: retrievalAttempt }
-          : { task: assignment.id }),
-      },
-      (attempt) => attemptPreview(state, attempt),
-    ),
+    attempts: itemPage(attempts, request, retrieval, (attempt) => attemptPreview(state, attempt)),
   };
 }
 
 function attention(state: WorkstreamState) {
   return state.attempts.flatMap((attempt) => {
-    const blocker =
-      attempt.error ?? attempt.composition?.error ?? attempt.cleanup?.error;
-    return blocker
-      ? [
-          {
-            taskPreview: compactText(attempt.assignmentId, 120),
-            attempt: attemptHandle(state, attempt),
-            blocker: compactText(blocker, 280),
-            recovery: { section: "recovery" as const, attempt: attempt.id },
-          },
-        ]
-      : [];
+    const blocker = attempt.error ?? attempt.composition?.error ?? attempt.cleanup?.error;
+    if (blocker === undefined) return [];
+    return [
+      {
+        taskPreview: compactText(attempt.assignmentId, 120),
+        attempt: attemptHandle(state, attempt),
+        blocker: compactText(blocker, 280),
+        recovery: { section: "recovery" as const, attempt: attempt.id },
+      },
+    ];
   });
 }
 
 function overview(state: WorkstreamState, request: InspectRequest) {
   const active = state.attempts.filter((attempt) =>
-    ["queued", "starting", "running", "cancel_requested"].includes(
-      attempt.state,
-    ),
+    ["queued", "starting", "running", "cancel_requested"].includes(attempt.state),
   );
   const taskRetrieval = { section: "overview" as const };
+  const attentionItems = attention(state);
   return {
     workstream: {
       id: state.id,
@@ -487,10 +497,9 @@ function overview(state: WorkstreamState, request: InspectRequest) {
       attempts: state.attempts.length,
       active: active.length,
       outcomes: state.results.length,
-      blockers: attention(state).length,
-      pendingNotifications: state.deliveries.filter(
-        (delivery) => delivery.state === "pending",
-      ).length,
+      blockers: attentionItems.length,
+      pendingNotifications: state.deliveries.filter((delivery) => delivery.state === "pending")
+        .length,
     },
     taskIndex: boundedText(
       JSON.stringify(state.assignments.map((item) => item.id)),
@@ -498,13 +507,11 @@ function overview(state: WorkstreamState, request: InspectRequest) {
       request.maxChars ?? DEFAULT_CHARS,
       taskRetrieval,
     ),
-    tasks: itemPage(state.assignments, request, taskRetrieval, (item) =>
-      taskPreview(state, item),
-    ),
+    tasks: itemPage(state.assignments, request, taskRetrieval, (item) => taskPreview(state, item)),
     attention: {
-      items: attention(state).slice(0, 5),
-      totalItems: attention(state).length,
-      truncated: attention(state).length > 5,
+      items: attentionItems.slice(0, 5),
+      totalItems: attentionItems.length,
+      truncated: attentionItems.length > 5,
     },
     remainingWork: {
       items: active.slice(0, 10).map((attempt) => ({
@@ -516,22 +523,19 @@ function overview(state: WorkstreamState, request: InspectRequest) {
       totalItems: active.length,
       truncated: active.length > 10,
     },
-    completion: state.completion
-      ? {
-          completedAt: state.completion.completedAt,
-          unresolvedCount: state.completion.accounting.length,
-        }
-      : undefined,
+    completion:
+      state.completion === undefined
+        ? undefined
+        : {
+            completedAt: state.completion.completedAt,
+            unresolvedCount: state.completion.accounting.length,
+          },
   };
 }
 
-function reportText(result: WorkResult, section: "evidence" | "report") {
+function reportText(result: WorkResult, section: "evidence" | "report"): string {
   if (result.validity === "typed")
-    return JSON.stringify(
-      section === "evidence" ? result.report.evidence : result.report,
-      null,
-      2,
-    );
+    return JSON.stringify(section === "evidence" ? result.report.evidence : result.report, null, 2);
   return result.validity === "untyped" ? result.text : result.detail;
 }
 
@@ -539,54 +543,105 @@ function boundedText(
   text: string,
   offset: number,
   maxChars: number,
-  retrieval: Record<string, unknown>,
-) {
+  retrieval: RetrievalTarget,
+): BoundedTextProjection {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > text.length)
     throw new Error(`Offset must be between 0 and ${text.length}.`);
   const limit = Math.min(MAX_CHARS, Math.max(1, maxChars));
   const value = text.slice(offset, offset + limit);
   const nextOffset = offset + value.length;
-  return {
+  const projection: BoundedTextProjection = {
     text: value,
     encoding: "utf16-code-units",
     offset,
     returnedChars: value.length,
     totalChars: text.length,
     truncated: nextOffset < text.length,
-    ...(nextOffset < text.length
-      ? { next: { ...retrieval, offset: nextOffset, maxChars: limit } }
-      : {}),
   };
+  if (nextOffset < text.length)
+    projection.next = { ...retrieval, offset: nextOffset, maxChars: limit };
+  return projection;
 }
 
 function projectedModels(attempt: WorkAttempt) {
-  const selected = attempt.models
-    ? {
-        source: attempt.models.source,
-        guide: {
-          model: compactText(attempt.models.guide.model, 160),
-          thinking: attempt.models.guide.thinking,
-        },
-        executor: attempt.models.executor
-          ? {
-              model: compactText(attempt.models.executor.model, 160),
-              thinking: attempt.models.executor.thinking,
-            }
-          : undefined,
-        overrideReason: attempt.models.overrideReason
-          ? compactText(attempt.models.overrideReason, 240)
-          : undefined,
-      }
-    : undefined;
+  const models = attempt.models;
+  const selected =
+    models === undefined
+      ? undefined
+      : {
+          source: models.source,
+          guide: {
+            model: compactText(models.guide.model, 160),
+            thinking: models.guide.thinking,
+          },
+          executor:
+            models.executor === undefined
+              ? undefined
+              : {
+                  model: compactText(models.executor.model, 160),
+                  thinking: models.executor.thinking,
+                },
+          overrideReason:
+            models.overrideReason === undefined
+              ? undefined
+              : compactText(models.overrideReason, 240),
+        };
   return {
     selected,
     observed: attempt.effectiveModels?.slice(0, 4).map((item) => ({
       model: compactText(item.model, 160),
-      thinking: item.thinking ? compactText(item.thinking, 80) : undefined,
+      thinking: item.thinking === undefined ? undefined : compactText(item.thinking, 80),
       source: item.source,
     })),
     observedCount: attempt.effectiveModels?.length ?? 0,
   };
+}
+
+function launchFact(attempt: WorkAttempt) {
+  const neverLaunched =
+    attempt.launchPane === undefined &&
+    attempt.resource === undefined &&
+    attempt.worker === undefined &&
+    attempt.sessionFile === undefined &&
+    (attempt.submission === undefined || attempt.submission === "not_sent");
+  if (neverLaunched) return "never_launched" as const;
+  return {
+    launchPaneRecorded: attempt.launchPane !== undefined,
+    resourceRecorded: attempt.resource !== undefined,
+    workerIdentityRecorded: attempt.worker !== undefined,
+    sessionFileRecorded: attempt.sessionFile !== undefined,
+    submission: attempt.submission,
+  };
+}
+
+function recordedComposition(attempt: WorkAttempt) {
+  const composition = attempt.composition;
+  if (composition === undefined) return { state: "not_recorded" as const };
+  return {
+    state: composition.state,
+    revision: composition.revision,
+    commit: composition.commit,
+    blocker: composition.error === undefined ? undefined : compactText(composition.error, 280),
+  };
+}
+
+function recordedCleanup(attempt: WorkAttempt) {
+  const cleanup = attempt.cleanup;
+  if (cleanup === undefined) return { state: "not_recorded" as const };
+  return {
+    state: cleanup.state,
+    workerClosed: cleanup.workerClosed,
+    blocker: cleanup.error === undefined ? undefined : compactText(cleanup.error, 280),
+  };
+}
+
+function recordedDelivery(state: WorkstreamState, attempt: WorkAttempt) {
+  if (attempt.resultId === undefined) return { state: "not_recorded" as const };
+  const result = resultById(state, attempt.resultId);
+  if (result === undefined) return { state: "not_recorded" as const };
+  const delivery = state.deliveries.find((item) => item.resultId === result.id);
+  if (delivery === undefined) return { state: "not_recorded" as const };
+  return deliveryPreview(state, result);
 }
 
 function recoveryView(
@@ -595,20 +650,8 @@ function recoveryView(
   attempt: WorkAttempt | undefined,
   request: InspectRequest,
 ) {
-  if (!task || !attempt)
+  if (task === undefined || attempt === undefined)
     throw new Error("Recovery inspection requires a task or attempt handle.");
-  const delivery = attempt.resultId
-    ? state.deliveries.find((item) => item.resultId === attempt.resultId)
-    : undefined;
-  const neverLaunched =
-    !attempt.launchPane &&
-    !attempt.resource &&
-    !attempt.worker &&
-    !attempt.sessionFile &&
-    (!attempt.submission || attempt.submission === "not_sent");
-  const runtimeSettlementRecorded = Boolean(
-    attempt.resultId && attempt.sessionFile && attempt.effectiveModels,
-  );
   const exactRecord = {
     storageAttemptId: attempt.id,
     legacyUuidAlias: attempt.uuidAlias,
@@ -624,10 +667,18 @@ function recoveryView(
     attentionHistory: attempt.attentionHistory,
     models: attempt.models,
     effectiveModels: attempt.effectiveModels,
-    delivery,
+    delivery: state.deliveries.find((item) => item.resultId === attempt.resultId),
   };
-  const blocker =
-    attempt.error ?? attempt.composition?.error ?? attempt.cleanup?.error;
+  const blocker = attempt.error ?? attempt.composition?.error ?? attempt.cleanup?.error;
+  const runtimeSettlementRecorded =
+    attempt.resultId !== undefined &&
+    attempt.sessionFile !== undefined &&
+    attempt.effectiveModels !== undefined;
+  const uncertainty = [
+    "This view reports durable recorded evidence, not a fresh Herdr, filesystem, or Git observation.",
+  ];
+  if (blocker !== undefined)
+    uncertainty.push("A guarded recovery must re-check the exact live boundary before mutation.");
   return {
     taskPreview: compactText(task.id, 120),
     attempt: {
@@ -635,50 +686,19 @@ function recoveryView(
       storageId: attempt.id,
       state: attempt.state,
     },
-    blocker: blocker ? compactText(blocker, 320) : undefined,
+    blocker: blocker === undefined ? undefined : compactText(blocker, 320),
     recordedFacts: {
-      attribution: "recorded_workstream_v4",
+      attribution: "recorded_workstream_v4" as const,
       recordedAt: attempt.updatedAt,
       freshLiveObservation: false,
-      launch: neverLaunched
-        ? "never_launched"
-        : {
-            launchPaneRecorded: Boolean(attempt.launchPane),
-            resourceRecorded: Boolean(attempt.resource),
-            workerIdentityRecorded: Boolean(attempt.worker),
-            sessionFileRecorded: Boolean(attempt.sessionFile),
-            submission: attempt.submission,
-          },
+      launch: launchFact(attempt),
       runtimeSettlement: runtimeSettlementRecorded
-        ? "recorded_after_runtime_native_marker_check"
-        : "not_recorded",
+        ? ("recorded_after_runtime_native_marker_check" as const)
+        : ("not_recorded" as const),
       nativeOrGitStateFromTerminalStateAlone: false,
-      composition: attempt.composition
-        ? {
-            state: attempt.composition.state,
-            revision: attempt.composition.revision,
-            commit: attempt.composition.commit,
-            blocker: attempt.composition.error
-              ? compactText(attempt.composition.error, 280)
-              : undefined,
-          }
-        : { state: "not_recorded" },
-      cleanup: attempt.cleanup
-        ? {
-            state: attempt.cleanup.state,
-            workerClosed: attempt.cleanup.workerClosed,
-            blocker: attempt.cleanup.error
-              ? compactText(attempt.cleanup.error, 280)
-              : undefined,
-          }
-        : { state: "not_recorded" },
-      delivery:
-        delivery && attempt.resultId
-          ? deliveryPreview(
-              state,
-              state.results.find((item) => item.id === attempt.resultId)!,
-            )
-          : { state: "not_recorded" },
+      composition: recordedComposition(attempt),
+      cleanup: recordedCleanup(attempt),
+      delivery: recordedDelivery(state, attempt),
       models: projectedModels(attempt),
       attentionCount: attempt.attentionHistory?.length ?? 0,
     },
@@ -688,36 +708,116 @@ function recoveryView(
       request.maxChars ?? DEFAULT_CHARS,
       { section: "recovery", attempt: attempt.id },
     ),
-    uncertainty: [
-      "This view reports durable recorded evidence, not a fresh Herdr, filesystem, or Git observation.",
-      ...(blocker
-        ? [
-            "A guarded recovery must re-check the exact live boundary before mutation.",
-          ]
-        : []),
-    ],
-    guardedAction: blocker
-      ? {
-          tool: "workgraph_control",
-          attempt: attempt.id,
-          actions: ["recover", "retain_not_applied"],
-        }
-      : undefined,
+    uncertainty,
+    guardedAction:
+      blocker === undefined
+        ? undefined
+        : {
+            tool: "workgraph_control" as const,
+            attempt: attempt.id,
+            actions: ["recover", "retain_not_applied"] as const,
+          },
   };
 }
 
+function pendingView(state: WorkstreamState, selection: Selection) {
+  const task = selection.task;
+  if (task === undefined) throw new Error("Pending outcome projection requires a task.");
+  return {
+    taskPreview: compactText(task.id, 120),
+    state: "pending" as const,
+    attempt: selection.attempt === undefined ? undefined : attemptPreview(state, selection.attempt),
+    attempts:
+      selection.attempt === undefined
+        ? selection.taskAttempts.slice(0, 5).map((item) => attemptPreview(state, item))
+        : undefined,
+    attemptCount: selection.taskAttempts.length,
+  };
+}
+
+function outcomeView(state: WorkstreamState, outcome: WorkResult, request: InspectRequest) {
+  const base = {
+    taskPreview: compactText(outcome.assignmentId, 120),
+    result: outcomeHandle(state, outcome),
+    observedAt: outcome.observedAt,
+    report: reportPreview(outcome),
+    settlement: settlement(state, outcome),
+    fullReport: { section: "report" as const, result: outcome.id },
+    fullEvidence: { section: "evidence" as const, result: outcome.id },
+  };
+  if (outcome.artifacts.length === 0) return base;
+  return {
+    ...base,
+    retainedArtifacts: boundedText(
+      JSON.stringify(outcome.artifacts, null, 2),
+      request.offset ?? 0,
+      request.maxChars ?? DEFAULT_CHARS,
+      { section: "outcome", result: outcome.id },
+    ),
+  };
+}
+
+function reportView(
+  state: WorkstreamState,
+  outcome: WorkResult,
+  request: InspectRequest,
+  section: "evidence" | "report",
+) {
+  return {
+    taskPreview: compactText(outcome.assignmentId, 120),
+    result: outcomeHandle(state, outcome),
+    observedAt: outcome.observedAt,
+    settlement: settlement(state, outcome),
+    content: boundedText(
+      reportText(outcome, section),
+      request.offset ?? 0,
+      request.maxChars ?? DEFAULT_CHARS,
+      { section, result: outcome.id },
+    ),
+  };
+}
+
+type OverviewView = ReturnType<typeof overview>;
+type TaskView = ReturnType<typeof taskView>;
+type RecoveryView = ReturnType<typeof recoveryView>;
+type PendingView = ReturnType<typeof pendingView>;
+type OutcomeView = ReturnType<typeof outcomeView>;
+type ReportView = ReturnType<typeof reportView>;
+export type InspectView =
+  | OverviewView
+  | TaskView
+  | RecoveryView
+  | PendingView
+  | OutcomeView
+  | ReportView;
+
 export function inspectView(
   state: WorkstreamState,
-  request: InspectRequest,
-): Record<string, unknown> {
+  request: InspectRequest & { section: "overview" },
+): OverviewView;
+export function inspectView(
+  state: WorkstreamState,
+  request: InspectRequest & { section: "task" },
+): TaskView;
+export function inspectView(
+  state: WorkstreamState,
+  request: InspectRequest & { section: "recovery" },
+): RecoveryView;
+export function inspectView(
+  state: WorkstreamState,
+  request: InspectRequest & { section: "outcome" },
+): PendingView | OutcomeView;
+export function inspectView(
+  state: WorkstreamState,
+  request: InspectRequest & { section: "evidence" | "report" },
+): PendingView | ReportView;
+export function inspectView(state: WorkstreamState, request: InspectRequest): InspectView;
+export function inspectView(state: WorkstreamState, request: InspectRequest): InspectView {
   if (request.section === "overview") return overview(state, request);
   const selection = resolveSelection(state, request);
-  if (!selection.task)
-    throw new Error(
-      `${request.section} inspection requires a task, attempt, or result handle.`,
-    );
-  if (request.section === "task")
-    return taskView(state, selection.task, request);
+  if (selection.task === undefined)
+    throw new Error(`${request.section} inspection requires a task, attempt, or result handle.`);
+  if (request.section === "task") return taskView(state, selection.task, request);
   if (request.section === "recovery")
     return recoveryView(
       state,
@@ -726,74 +826,33 @@ export function inspectView(
       request,
     );
   const outcome = requireUnambiguousOutcome(state, selection);
-  if (!outcome)
-    return {
-      taskPreview: compactText(selection.task.id, 120),
-      state: "pending",
-      attempt: selection.attempt
-        ? attemptPreview(state, selection.attempt)
-        : undefined,
-      attempts: selection.attempt
-        ? undefined
-        : selection.taskAttempts
-            .slice(0, 5)
-            .map((item) => attemptPreview(state, item)),
-      attemptCount: selection.taskAttempts.length,
-    };
-  if (request.section === "outcome")
-    return {
-      taskPreview: compactText(outcome.assignmentId, 120),
-      result: outcomeHandle(state, outcome),
-      observedAt: outcome.observedAt,
-      report: reportPreview(outcome),
-      settlement: settlement(state, outcome),
-      ...(outcome.artifacts.length
-        ? {
-            retainedArtifacts: boundedText(
-              JSON.stringify(outcome.artifacts, null, 2),
-              request.offset ?? 0,
-              request.maxChars ?? DEFAULT_CHARS,
-              { section: "outcome", result: outcome.id },
-            ),
-          }
-        : {}),
-      fullReport: { section: "report", result: outcome.id },
-      fullEvidence: { section: "evidence", result: outcome.id },
-    };
-  return {
-    taskPreview: compactText(outcome.assignmentId, 120),
-    result: outcomeHandle(state, outcome),
-    observedAt: outcome.observedAt,
-    settlement: settlement(state, outcome),
-    content: boundedText(
-      reportText(outcome, request.section),
-      request.offset ?? 0,
-      request.maxChars ?? DEFAULT_CHARS,
-      { section: request.section, result: outcome.id },
-    ),
-  };
+  if (outcome === undefined) return pendingView(state, selection);
+  if (request.section === "outcome") return outcomeView(state, outcome, request);
+  if (request.section === "evidence" || request.section === "report")
+    return reportView(state, outcome, request, request.section);
+  throw new Error("Unsupported inspection section.");
 }
 
-export function actionView(
-  state: WorkstreamState,
-  options: ActionProjectionOptions,
-): Record<string, unknown> {
-  const affectedTask = options.assignmentId
-    ? state.assignments.find((item) => item.id === options.assignmentId)
-    : undefined;
-  const affectedAttempt = options.attemptId
-    ? state.attempts.find(
-        (item) =>
-          item.id === options.attemptId || item.uuidAlias === options.attemptId,
-      )
-    : affectedTask
-      ? state.attempts.findLast((item) => item.assignmentId === affectedTask.id)
-      : undefined;
-  const affectedResult = options.resultId
-    ? state.results.find((item) => item.id === options.resultId)
-    : affectedAttempt?.resultId
-      ? state.results.find((item) => item.id === affectedAttempt.resultId)
-      : undefined;
+export function actionView(state: WorkstreamState, options: ActionProjectionOptions) {
+  const affectedTask =
+    options.assignmentId === undefined
+      ? undefined
+      : state.assignments.find((item) => item.id === options.assignmentId);
+  const affectedAttempt =
+    options.attemptId !== undefined
+      ? state.attempts.find(
+          (item) => item.id === options.attemptId || item.uuidAlias === options.attemptId,
+        )
+      : affectedTask === undefined
+        ? undefined
+        : state.attempts.findLast((item) => item.assignmentId === affectedTask.id);
+  const affectedResult =
+    options.resultId !== undefined
+      ? state.results.find((item) => item.id === options.resultId)
+      : affectedAttempt?.resultId === undefined
+        ? undefined
+        : resultById(state, affectedAttempt.resultId);
+  const attentionItems = attention(state);
   return {
     workstream: {
       id: state.id,
@@ -802,39 +861,38 @@ export function actionView(
     },
     action: {
       name: compactText(options.action, 120),
-      outcome: options.outcome ? compactText(options.outcome, 120) : undefined,
-      message: options.message ? compactText(options.message, 280) : undefined,
+      outcome: options.outcome === undefined ? undefined : compactText(options.outcome, 120),
+      message: options.message === undefined ? undefined : compactText(options.message, 280),
     },
     affected: {
-      task: affectedTask ? taskPreview(state, affectedTask) : undefined,
-      attempt: affectedAttempt
-        ? {
-            ...attemptPreview(state, affectedAttempt),
-            models: projectedModels(affectedAttempt),
-          }
-        : undefined,
-      result: affectedResult
-        ? {
-            handle: outcomeHandle(state, affectedResult),
-            report: reportPreview(affectedResult),
-            settlement: settlement(state, affectedResult),
-          }
-        : undefined,
+      task: affectedTask === undefined ? undefined : taskPreview(state, affectedTask),
+      attempt:
+        affectedAttempt === undefined
+          ? undefined
+          : {
+              ...attemptPreview(state, affectedAttempt),
+              models: projectedModels(affectedAttempt),
+            },
+      result:
+        affectedResult === undefined
+          ? undefined
+          : {
+              handle: outcomeHandle(state, affectedResult),
+              report: reportPreview(affectedResult),
+              settlement: settlement(state, affectedResult),
+            },
     },
     attention: {
-      items: attention(state).slice(0, 5),
-      totalItems: attention(state).length,
-      truncated: attention(state).length > 5,
+      items: attentionItems.slice(0, 5),
+      totalItems: attentionItems.length,
+      truncated: attentionItems.length > 5,
     },
   };
 }
 
-export function resultNotification(
-  state: WorkstreamState,
-  resultId: string,
-): string {
-  const result = state.results.find((item) => item.id === resultId);
-  if (!result) throw new Error(`Unknown outcome ${compactText(resultId)}.`);
+export function resultNotification(state: WorkstreamState, resultId: string): string {
+  const result = resultById(state, resultId);
+  if (result === undefined) throw new Error(`Unknown outcome ${compactText(resultId)}.`);
   const view = inspectView(state, { section: "outcome", result: resultId });
   return [
     `[WORKGRAPH OUTCOME] Task ${compactText(result.assignmentId, 120)} produced ${outcomeHandle(state, result)}.`,
