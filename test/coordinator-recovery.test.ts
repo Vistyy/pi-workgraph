@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
 import { Type } from "typebox";
 import { GitRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
@@ -152,11 +153,11 @@ if (args[0] === "tab" && args[1] === "create") {
       HERDR_WORKSPACE_ID: workspaceId,
     }),
     { workspaceId },
-    () => {},
-    () => {},
+    () => Effect.void,
+    () => Effect.void,
     { registry, policy: DEFAULT_MODEL_POLICY },
   );
-  await runtime.perform(() => Promise.resolve());
+  await Effect.runPromise(runtime.effects.submit(Effect.void));
 
   async function setTransport(change: TransportChange) {
     const current = decodeTestValue(
@@ -167,19 +168,23 @@ if (args[0] === "tab" && args[1] === "create") {
   }
 
   async function authorize() {
-    return runtime.perform(async () => {
-      const recorded = await store.recordInputEvent({
-        ...owner,
-        source: "interactive",
-        text: "Implement and recover the disposable fixture change.",
-      });
-      await store.reviseIntent({
-        authorityReceiptId: recorded.receipt.id,
-        statement: "Implement the fixture change",
-        constraints: [],
-      });
-      return { receiptId: recorded.receipt.id, intentVersion: 1 };
-    });
+    return Effect.runPromise(
+      runtime.effects.submit(
+        Effect.gen(function* () {
+          const recorded = yield* store.effects.recordInputEvent({
+            ...owner,
+            source: "interactive",
+            text: "Implement and recover the disposable fixture change.",
+          });
+          yield* store.effects.reviseIntent({
+            authorityReceiptId: recorded.receipt.id,
+            statement: "Implement the fixture change",
+            constraints: [],
+          });
+          return { receiptId: recorded.receipt.id, intentVersion: 1 };
+        }),
+      ),
+    );
   }
 
   async function settle(report: WorkerReport) {
@@ -798,15 +803,17 @@ void test("failed proposal retention resumes after durable ref and state checkpo
       assert.equal(proposal.commit, workerCommit);
       const retainedRef = await f.repository.retainCommit("ws-recovery", attempt.id, workerCommit);
       if (window === "checkpoint")
-        await f.runtime.perform(() =>
-          f.store.retainFailedProposalNotApplied({
-            id: attempt.id,
-            commit: workerCommit,
-            expectedHead: integratedRevision,
-            reason: "Retain the failed proposal across an interrupted cleanup",
-            retainedRef,
-            integratedRevision,
-          }),
+        await Effect.runPromise(
+          f.runtime.effects.submit(
+            f.store.effects.retainFailedProposalNotApplied({
+              id: attempt.id,
+              commit: workerCommit,
+              expectedHead: integratedRevision,
+              reason: "Retain the failed proposal across an interrupted cleanup",
+              retainedRef,
+              integratedRevision,
+            }),
+          ),
         );
       await f.attachPublic();
       const state = resultState(

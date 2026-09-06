@@ -4,6 +4,7 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import type { RuntimeError } from "./workstream-runtime.js";
 
 export const HUMAN_INPUT_ENTRY = "pi-workgraph-human-input";
 const NOTE_STATE_ENTRY = "pi-workgraph-coordinator-note-state";
@@ -130,8 +131,9 @@ type ApplyResult = { state: CoordinatorNoteState; affected: string[]; message: s
 
 type InstallOptions = {
   owner(ctx: ExtensionContext): SessionOwner;
-  serialize<T>(run: () => Promise<T>): Promise<T>;
-  onHumanInput?(receipt: HumanInputReceipt): Promise<void>;
+  run<T, E>(effect: Effect.Effect<T, E>, signal?: AbortSignal): Promise<T>;
+  serialize<T, E>(effect: Effect.Effect<T, E>): Effect.Effect<T, E>;
+  onHumanInput?(receipt: HumanInputReceipt): Effect.Effect<void, RuntimeError>;
 };
 
 export function installCoordinatorNotes(
@@ -179,39 +181,48 @@ export function installCoordinatorNotes(
     if ((event.source !== "interactive" && event.source !== "rpc") || event.text.trim() === "")
       return;
     const source = event.source;
-    return options.serialize(() => {
-      const receipt: HumanInputReceipt = {
-        id: randomUUID(),
-        ...options.owner(ctx),
-        source,
-        text: event.text,
-      };
-      pi.appendEntry(HUMAN_INPUT_ENTRY, receipt);
-      const entryId = ctx.sessionManager.getLeafId();
-      if (entryId === null)
-        throw new Error("Human input receipt was not persisted in the session.");
-      receipts.push({ ...receipt, entryId });
-      refreshOrder(ctx);
-      return Promise.resolve(options.onHumanInput?.(receipt)).then(() => undefined);
-    });
+    return options.run(
+      options.serialize(
+        Effect.gen(function* () {
+          const receipt: HumanInputReceipt = {
+            id: randomUUID(),
+            ...options.owner(ctx),
+            source,
+            text: event.text,
+          };
+          pi.appendEntry(HUMAN_INPUT_ENTRY, receipt);
+          const entryId = ctx.sessionManager.getLeafId();
+          if (entryId === null)
+            throw new Error("Human input receipt was not persisted in the session.");
+          receipts.push({ ...receipt, entryId });
+          refreshOrder(ctx);
+          if (options.onHumanInput !== undefined) yield* options.onHumanInput(receipt);
+        }),
+      ),
+      ctx.signal,
+    );
   });
 
-  pi.on("session_start", (_event, ctx) => {
-    restore(ctx);
-  });
-  pi.on("session_tree", (_event, ctx) => {
-    restore(ctx);
-  });
+  pi.on("session_start", (_event, ctx) =>
+    options.run(options.serialize(Effect.sync(() => restore(ctx))), ctx.signal),
+  );
+  pi.on("session_tree", (_event, ctx) =>
+    options.run(options.serialize(Effect.sync(() => restore(ctx))), ctx.signal),
+  );
 
   pi.on("turn_end", (event, ctx) => {
     if (!isVisibleFinalAnswer(event.message) || state.drafts.length === 0) return;
     const answer = event.message;
-    return options.serialize(() => {
-      const source = visibleSource(answer, ctx);
-      state = presentDrafts(state, source);
-      persist(ctx);
-      return Promise.resolve();
-    });
+    return options.run(
+      options.serialize(
+        Effect.sync(() => {
+          const source = visibleSource(answer, ctx);
+          state = presentDrafts(state, source);
+          persist(ctx);
+        }),
+      ),
+      ctx.signal,
+    );
   });
 
   pi.on("before_agent_start", (_event, ctx) => {
@@ -239,20 +250,25 @@ export function installCoordinatorNotes(
     parameters: Type.Object({
       changes: Type.Array(NoteChangeSchema, { minItems: 1 }),
     }),
-    execute(toolCallId, params, _signal, _update, ctx) {
-      return options.serialize(() => {
-        const next = applyChanges(state, params.changes, toolCallId, receipts, entryOrder);
-        state = next.state;
-        persist(ctx);
-        return Promise.resolve({
-          content: [{ type: "text" as const, text: next.message }],
-          details: {
-            affected: next.affected,
-            pending: state.notes.filter((note) => note.status === "pending").length,
-            drafted: state.drafts.length,
-          },
-        });
-      });
+    execute(toolCallId, params, signal, _update, ctx) {
+      return options.run(
+        options.serialize(
+          Effect.sync(() => {
+            const next = applyChanges(state, params.changes, toolCallId, receipts, entryOrder);
+            state = next.state;
+            persist(ctx);
+            return {
+              content: [{ type: "text" as const, text: next.message }],
+              details: {
+                affected: next.affected,
+                pending: state.notes.filter((note) => note.status === "pending").length,
+                drafted: state.drafts.length,
+              },
+            };
+          }),
+        ),
+        signal,
+      );
     },
   });
 

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Data, Effect, Semaphore } from "effect";
+import { Effect, type FileSystem, type Path, Semaphore } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -13,22 +13,34 @@ import {
 } from "../src/agent-facing.js";
 import { installCalmMode, isCoordinatorScope, updateCalmWorkers } from "../src/calm.js";
 import { installCoordinatorNotes } from "../src/coordinator-notes.js";
-import { GitRepository } from "../src/git.js";
+import { GitRepository, inspectRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import {
-  loadModelPolicy,
+  loadModelPolicyEffect,
   MODEL_ROLES,
+  type ModelPolicy,
   modelPolicyPath,
   SelectionRequestSchema as Selection,
-  setModelPool,
-  setModelRole,
+  setModelPoolEffect,
+  setModelRoleEffect,
   ModelTargetSchema as Target,
   ThinkingSchema as Thinking,
 } from "../src/model-policy.js";
-import { forkConversationSession } from "../src/pi-process.js";
+import { liveLayer } from "../src/node-platform.js";
+import { forkConversationSessionEffect } from "../src/pi-process.js";
 import { EvidenceSchema } from "../src/report-schema.js";
-import { type SessionIdentity, type WorkstreamState, WorkstreamStore } from "../src/workstream.js";
-import { type QueueOptions, WorkstreamRuntime } from "../src/workstream-runtime.js";
+import {
+  type SessionIdentity,
+  type WorkstreamState,
+  WorkstreamStore,
+  WorkstreamStoreEffects,
+} from "../src/workstream.js";
+import {
+  type QueueOptions,
+  type RuntimeError,
+  WorkstreamRuntime,
+} from "../src/workstream-runtime.js";
+import { RuntimeHostError } from "../src/workstream-runtime-services.js";
 
 const POINTER = "pi-workgraph-workstream";
 const INPUT = "pi-workgraph-human-input";
@@ -41,16 +53,8 @@ const InputReceipt = Type.Object({
   source: StringEnum(["interactive", "rpc"] as const),
   text: Type.String(),
 });
-class CoordinatorOperationError extends Data.TaggedError("CoordinatorOperationError")<{
-  readonly operation: string;
-  readonly cause: unknown;
-}> {
-  override get message(): string {
-    return this.cause instanceof Error ? this.cause.message : String(this.cause);
-  }
-}
-
-type CoordinatorEffect<T> = Effect.Effect<T, CoordinatorOperationError>;
+type HostServices = FileSystem.FileSystem | Path.Path;
+type CoordinatorEffect<T, E = RuntimeError, R = HostServices> = Effect.Effect<T, E, R>;
 
 const ModelOptions = {
   selection: Type.Optional(Selection),
@@ -67,13 +71,15 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   let runtime: WorkstreamRuntime | undefined;
   let pending: Static<typeof InputReceipt>[] = [];
   const hostSemaphore = Semaphore.makeUnsafe(1);
-  const host = <T>(operation: string, run: () => PromiseLike<T>): CoordinatorEffect<T> =>
-    Effect.tryPromise({
+  const sdk = <T>(operation: string, run: () => T): Effect.Effect<T, RuntimeHostError> =>
+    Effect.try({
       try: run,
-      catch: (cause) => new CoordinatorOperationError({ operation, cause }),
+      catch: (cause) => new RuntimeHostError({ operation, cause }),
     });
-  const serial = <T, E>(operation: Effect.Effect<T, E>): Promise<T> =>
-    Effect.runPromise(hostSemaphore.withPermit(operation));
+  const runCallback = <T, E>(
+    operation: CoordinatorEffect<T, E>,
+    signal?: AbortSignal,
+  ): Promise<T> => Effect.runPromise(operation.pipe(Effect.provide(liveLayer)), { signal });
   const owner = (ctx: ExtensionContext): SessionIdentity => {
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (sessionFile === undefined || sessionFile === "")
@@ -87,14 +93,18 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       );
     return runtime;
   };
-  const remember = (state: WorkstreamState, ctx: ExtensionContext): WorkstreamState => {
-    const active = state.attempts.filter((item) =>
-      ["running", "starting"].includes(item.state),
-    ).length;
-    ctx.ui.setStatus("workgraph", `WG ${state.lifecycle.state} - ${active} active`);
-    updateCalmWorkers(calm, state);
-    return state;
-  };
+  const remember = (
+    state: WorkstreamState,
+    ctx: ExtensionContext,
+  ): Effect.Effect<WorkstreamState, RuntimeHostError> =>
+    sdk("publish coordinator state", () => {
+      const active = state.attempts.filter((item) =>
+        ["running", "starting"].includes(item.state),
+      ).length;
+      ctx.ui.setStatus("workgraph", `WG ${state.lifecycle.state} - ${active} active`);
+      updateCalmWorkers(calm, state);
+      return state;
+    });
   const attachEffect = (
     ctx: ExtensionContext,
     target: WorkstreamStore,
@@ -102,89 +112,89 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   ): CoordinatorEffect<WorkstreamRuntime> => {
     const attached = runtime;
     if (attached?.store.path === target.path)
-      return host("confirm attached runtime", () => attached.perform(() => Promise.resolve())).pipe(
-        Effect.as(attached),
-      );
+      return attached.effects.submit(Effect.void).pipe(Effect.as(attached));
     return Effect.gen(function* () {
       const previous = runtime;
-      const state = yield* host("load attachment target", () => target.load());
+      const state = yield* target.effects.load();
       const { HERDR_WORKSPACE_ID: workspaceId } = process.env;
       const next = new WorkstreamRuntime(
         target,
         new GitRepository(state.projectRoot, state.gitCommonDir),
         new HerdrCliRuntime(),
         { workspaceId: workspaceId ?? "" },
-        (resultId, latest) => {
-          if (ctx.sessionManager.getSessionId() !== latest.coordinator.sessionId)
-            throw new Error("Coordinator session changed before result delivery.");
-          pi.sendMessage(
-            {
-              customType: POINTER,
-              content: resultNotification(latest, resultId),
-              display: true,
-              details: { resultId, statePath: latest.statePath },
-            },
-            { triggerTurn: true, deliverAs: "followUp" },
-          );
-        },
-        (error) => {
-          ctx.ui.notify(`Workgraph: ${error.message}`, "warning");
-          pi.sendMessage(
-            {
-              customType: "pi-workgraph-attention",
-              content: `Workgraph requires reconciliation: ${error.message}. Use workgraph_inspect for retained evidence; this notification does not authorize new scope.`,
-              display: true,
-            },
-            { triggerTurn: true, deliverAs: "followUp" },
-          );
-        },
+        (resultId, latest) =>
+          sdk("deliver workstream result", () => {
+            if (ctx.sessionManager.getSessionId() !== latest.coordinator.sessionId)
+              throw new Error("Coordinator session changed before result delivery.");
+            pi.sendMessage(
+              {
+                customType: POINTER,
+                content: resultNotification(latest, resultId),
+                display: true,
+                details: { resultId, statePath: latest.statePath },
+              },
+              { triggerTurn: true, deliverAs: "followUp" },
+            );
+          }),
+        (error) =>
+          sdk("report workstream error", () => {
+            ctx.ui.notify(`Workgraph: ${error.message}`, "warning");
+            pi.sendMessage(
+              {
+                customType: "pi-workgraph-attention",
+                content: `Workgraph requires reconciliation: ${error.message}. Use workgraph_inspect for retained evidence; this notification does not authorize new scope.`,
+                display: true,
+              },
+              { triggerTurn: true, deliverAs: "followUp" },
+            );
+          }),
         {
           owner: owner(ctx),
           priorOwnerLiveness,
-          onState: (latest) => updateCalmWorkers(calm, latest),
+          onState: (latest) =>
+            sdk("publish workstream state", () => updateCalmWorkers(calm, latest)),
+          onStopped: () =>
+            hostSemaphore.withPermit(
+              sdk("clear stopped runtime pointer", () => {
+                if (runtime === next) runtime = undefined;
+              }),
+            ),
         },
       );
-      const activate = host("activate attached runtime", () =>
-        next.perform(() => Promise.resolve()),
-      );
-      yield* activate.pipe(
-        Effect.catch((error) =>
-          host("stop failed attachment", () => next.stop()).pipe(
-            Effect.andThen(Effect.fail(error)),
-          ),
-        ),
-      );
-      if (previous !== undefined) yield* host("stop previous runtime", () => previous.stop());
+      yield* next.effects
+        .submit(Effect.void)
+        .pipe(Effect.catch((error) => next.effects.stop.pipe(Effect.andThen(Effect.fail(error)))));
+      if (previous !== undefined) yield* previous.effects.stop;
       runtime = next;
       next.start();
       return next;
     });
   };
   const importInputsEffect = (active: WorkstreamRuntime): CoordinatorEffect<void> =>
-    host("import retained human inputs", () =>
-      active.perform(() =>
-        pending.reduce<Promise<void>>(
-          (recorded, receipt) =>
-            recorded.then(() => active.store.recordInputEvent(receipt).then(() => undefined)),
-          Promise.resolve(),
+    hostSemaphore.withPermit(Effect.sync(() => [...pending])).pipe(
+      Effect.flatMap((receipts) =>
+        active.effects.submit(
+          Effect.forEach(receipts, (receipt) => active.store.effects.recordInputEvent(receipt), {
+            discard: true,
+          }),
         ),
       ),
     );
   installCoordinatorNotes(pi, {
     owner,
-    serialize: (run) => serial(host("update coordinator notes", run)),
-    onHumanInput: (receipt) => {
-      pending.push(receipt);
-      const active = runtime;
-      if (active === undefined) return Promise.resolve();
-      return active.store
-        .load()
-        .then((state) =>
-          state.lifecycle.state === "active" || state.lifecycle.state === "suspended"
-            ? active.perform(() => active.store.recordInputEvent(receipt).then(() => undefined))
-            : undefined,
-        );
-    },
+    run: runCallback,
+    serialize: (operation) => hostSemaphore.withPermit(operation),
+    onHumanInput: (receipt) =>
+      Effect.gen(function* () {
+        pending.push(receipt);
+        const active = runtime;
+        if (active === undefined) return;
+        const state = yield* active.effects.submit(active.store.effects.load());
+        if (state.lifecycle.state === "active" || state.lifecycle.state === "suspended")
+          yield* active.effects.submit(
+            active.store.effects.recordInputEvent(receipt).pipe(Effect.asVoid),
+          );
+      }),
   });
   const ensureEffect = (
     ctx: ExtensionContext,
@@ -192,31 +202,26 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   ): CoordinatorEffect<WorkstreamRuntime> =>
     Effect.gen(function* () {
       if (runtime !== undefined) {
-        const state = yield* host(
-          "load current workstream",
-          () => runtime?.store.load() ?? Promise.reject(),
-        );
+        const state = yield* runtime.effects.submit(runtime.store.effects.load());
         if (state.lifecycle.state === "suspended")
           throw new Error("Workstream is suspended; resume explicitly before delegating.");
         if (state.lifecycle.state === "active") return runtime;
-        yield* host("stop terminal runtime", () => runtime?.stop() ?? Promise.resolve());
+        yield* runtime.effects.stop;
         runtime = undefined;
       }
-      const repository = yield* host("inspect coordinator repository", () =>
-        GitRepository.inspect(ctx.cwd),
-      );
-      const created = yield* host("create workstream", () =>
-        WorkstreamStore.create({
-          id: `ws-${randomUUID()}`,
-          purpose,
-          projectRoot: repository.root,
-          gitCommonDir: repository.commonDir,
-          coordinator: owner(ctx),
-        }),
-      );
-      const active = yield* attachEffect(ctx, created.store);
+      const repository = yield* inspectRepository(ctx.cwd);
+      const created = yield* WorkstreamStoreEffects.create({
+        id: `ws-${randomUUID()}`,
+        purpose,
+        projectRoot: repository.root,
+        gitCommonDir: repository.commonDir,
+        coordinator: owner(ctx),
+      });
+      const active = yield* attachEffect(ctx, WorkstreamStore.open(created.store.path, owner(ctx)));
       yield* importInputsEffect(active);
-      pi.appendEntry(POINTER, { path: created.store.path });
+      yield* sdk("retain workstream pointer", () =>
+        pi.appendEntry(POINTER, { path: created.store.path }),
+      );
       return active;
     });
   const authorizeStore = (
@@ -225,17 +230,15 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     receiptId?: string,
   ): CoordinatorEffect<AuthorizationSelection> =>
     Effect.gen(function* () {
-      let state = yield* host("load authorization state", () => active.store.load());
+      let state = yield* active.store.effects.load();
       let intent = requiredValue(state.intents.at(-1), "workstream intent");
       const selected = selectWorkstreamAuthority(state, receiptId);
       if (intent.version === 0) {
-        state = yield* host("establish authorization intent", () =>
-          active.store.reviseIntent({
-            authorityReceiptId: selected.receiptId,
-            statement,
-            constraints: intent.constraints,
-          }),
-        );
+        state = yield* active.store.effects.reviseIntent({
+          authorityReceiptId: selected.receiptId,
+          statement,
+          constraints: intent.constraints,
+        });
         intent = requiredValue(state.intents.at(-1), "established workstream intent");
       }
       const authority = {
@@ -251,9 +254,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     statement: string,
     receiptId?: string,
   ): CoordinatorEffect<AuthorizationSelection> =>
-    host("authorize workstream mutation", () =>
-      active.perform(() => Effect.runPromise(authorizeStore(active, statement, receiptId))),
-    );
+    active.effects.submit(authorizeStore(active, statement, receiptId));
 
   const reattach = (
     ctx: ExtensionContext,
@@ -261,13 +262,13 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     path: string,
   ): CoordinatorEffect<void> =>
     Effect.gen(function* () {
-      const inspection = yield* host("inspect retained workstream", () =>
-        WorkstreamStore.inspectForReattachment(path),
-      );
+      const inspection = yield* WorkstreamStoreEffects.inspectForReattachment(path);
       if (inspection.kind === "retained_terminal") {
-        ctx.ui.notify(
-          `Workstream reattachment skipped: ${inspection.lifecycle.state} older history ${inspection.id} was preserved and not attached.`,
-          "info",
+        yield* sdk("report retained terminal workstream", () =>
+          ctx.ui.notify(
+            `Workstream reattachment skipped: ${inspection.lifecycle.state} older history ${inspection.id} was preserved and not attached.`,
+            "info",
+          ),
         );
         return;
       }
@@ -279,13 +280,13 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         return;
       const active = yield* attachEffect(ctx, WorkstreamStore.open(path, identity));
       yield* importInputsEffect(active);
-      const state = yield* host("load reattached workstream", () => active.store.load());
-      remember(state, ctx);
+      const state = yield* active.effects.submit(active.store.effects.load());
+      yield* remember(state, ctx);
     }).pipe(
       Effect.catch((error) =>
-        Effect.sync(() =>
+        sdk("report reattachment failure", () =>
           ctx.ui.notify(
-            `Workstream reattachment skipped for ${path}: ${error.message}. Inspect the retained pointer and state, then reconcile explicitly.`,
+            `Workstream reattachment skipped for ${path}: ${failureMessage(error)}. Inspect the retained pointer and state, then reconcile explicitly.`,
             "warning",
           ),
         ),
@@ -293,10 +294,10 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     );
 
   pi.on("session_start", (_event, ctx) =>
-    serial(
+    runCallback(
       Effect.gen(function* () {
         const active = runtime;
-        if (active !== undefined) yield* host("stop prior session runtime", () => active.stop());
+        if (active !== undefined) yield* active.effects.stop;
         runtime = undefined;
         const identity = owner(ctx);
         const entries = ctx.sessionManager.getBranch();
@@ -315,9 +316,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         const data = pointer?.type === "custom" ? pointer.data : undefined;
         if (!Value.Check(WorkstreamPointer, data)) {
           if (pointer !== undefined)
-            ctx.ui.notify(
-              "Workstream reattachment skipped: the retained pointer is malformed; inspect its session entry and repair it explicitly.",
-              "warning",
+            yield* sdk("report malformed workstream pointer", () =>
+              ctx.ui.notify(
+                "Workstream reattachment skipped: the retained pointer is malformed; inspect its session entry and repair it explicitly.",
+                "warning",
+              ),
             );
           return;
         }
@@ -327,9 +330,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   );
   pi.on("session_shutdown", () => {
     const active = runtime;
-    return serial(
-      active === undefined ? Effect.void : host("stop coordinator runtime", () => active.stop()),
-    );
+    return runCallback(active === undefined ? Effect.void : active.effects.stop);
   });
   pi.on("before_agent_start", () => ({
     message: {
@@ -359,12 +360,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       pool: Type.Optional(Type.Array(Target, { minItems: 1 })),
       models: Type.Optional(Type.Array(Type.String())),
     }),
-    execute(_id, params, _signal, _update, ctx) {
-      return serial(
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
         Effect.gen(function* () {
           validateModelRequest(params.action, params.role, params.target, params.pool);
           if (params.action === "rates") {
-            const policy = yield* host("load model policy rates", loadModelPolicy);
+            const policy = yield* loadModelPolicyEffect();
             const models = params.models ?? policy.workerPool.map((target) => target.model);
             const rates = modelRates(models, ctx);
             return {
@@ -375,8 +376,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           const authority = isPersistentModelMutation(params.action)
             ? selectSessionAuthority(pending, params.authorityReceiptId)
             : undefined;
-          const policy = yield* host("update model policy", () =>
-            resolveModelPolicy(params.action, params.role, params.target, params.pool),
+          const policy = yield* resolveModelPolicyEffect(
+            params.action,
+            params.role,
+            params.target,
+            params.pool,
           );
           return {
             content: [
@@ -391,6 +395,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             details: { path: modelPolicyPath(), policy, rates: [], authority },
           };
         }),
+        signal,
       );
     },
   });
@@ -424,8 +429,8 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         }),
       ),
     }),
-    execute(_id, params, _signal, _update, ctx) {
-      return serial(
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
         Effect.gen(function* () {
           const active = yield* ensureEffect(ctx, params.question);
           const authority =
@@ -436,13 +441,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
                   params.question,
                   params.experiment.authorityReceiptId,
                 );
-          const stateBefore = yield* host("load research intent", () => active.store.load());
+          const stateBefore = yield* active.effects.submit(active.store.effects.load());
           const intent = stateBefore.intents.at(-1);
           if (intent === undefined) throw new Error("Missing intent.");
           const assignment = researchAssignment(params, intent.version, authority?.authority);
-          const state = yield* host("queue research", () =>
-            active.queue(assignment, queueOptions(params)),
-          );
+          const state = yield* active.effects.queue(assignment, queueOptions(params));
           const projection: Parameters<typeof actionView>[1] = {
             action: "workgraph_research",
             assignmentId: params.id,
@@ -452,10 +455,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             projection.authorityContext = projectAuthorityContext(authority);
           return mutationResult(
             `Queued ${params.id}; submission and execution are observed asynchronously.`,
-            remember(state, ctx),
+            yield* remember(state, ctx),
             projection,
           );
         }),
+        signal,
       );
     },
   });
@@ -471,18 +475,17 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       statement: Type.String(),
       constraints: Type.Array(Type.String()),
     }),
-    execute(_id, params, _signal, _update, ctx) {
-      return serial(
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
         Effect.gen(function* () {
           const active = current();
-          const state = yield* host("revise workstream intent", () =>
-            active.perform(() => active.store.reviseIntent(params)),
-          );
-          return mutationResult("Recorded intent revision.", remember(state, ctx), {
+          const state = yield* active.effects.submit(active.store.effects.reviseIntent(params));
+          return mutationResult("Recorded intent revision.", yield* remember(state, ctx), {
             action: "workgraph_intent",
             outcome: "recorded",
           });
         }),
+        signal,
       );
     },
   });
@@ -506,8 +509,8 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       executor: Type.Optional(Target),
       modelReason: Type.Optional(Type.String()),
     }),
-    execute(_id, params, _signal, _update, ctx) {
-      return serial(
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
         Effect.gen(function* () {
           const active = yield* ensureEffect(ctx, params.objective);
           const authorization = yield* authorizeEffect(
@@ -515,27 +518,30 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             params.objective,
             params.authorityReceiptId,
           );
-          const state = yield* host("queue implementation", () =>
-            active.queue(
-              {
-                id: params.id,
-                capability: "implement",
-                artifactIntent: "maintained_change",
-                objective: params.objective,
-                intentVersion: authorization.authority.intentVersion,
-                authority: authorization.authority,
-                acceptance: params.acceptance,
-              },
-              implementationQueueOptions(params),
-            ),
+          const state = yield* active.effects.queue(
+            {
+              id: params.id,
+              capability: "implement",
+              artifactIntent: "maintained_change",
+              objective: params.objective,
+              intentVersion: authorization.authority.intentVersion,
+              authority: authorization.authority,
+              acceptance: params.acceptance,
+            },
+            implementationQueueOptions(params),
           );
-          return mutationResult(`Queued maintained change ${params.id}.`, remember(state, ctx), {
-            action: "workgraph_implement",
-            assignmentId: params.id,
-            outcome: "queued",
-            authorityContext: projectAuthorityContext(authorization),
-          });
+          return mutationResult(
+            `Queued maintained change ${params.id}.`,
+            yield* remember(state, ctx),
+            {
+              action: "workgraph_implement",
+              assignmentId: params.id,
+              outcome: "queued",
+              authorityContext: projectAuthorityContext(authorization),
+            },
+          );
         }),
+        signal,
       );
     },
   });
@@ -567,33 +573,32 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       ]),
       ...ModelOptions,
     }),
-    execute(_id, params, _signal, _update, ctx) {
-      return serial(
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
         Effect.gen(function* () {
           const active = yield* ensureEffect(ctx, params.objective);
-          const before = yield* host("load review intent", () => active.store.load());
+          const before = yield* active.effects.submit(active.store.effects.load());
           const intent = before.intents.at(-1);
           if (intent === undefined) throw new Error("Missing intent.");
-          const state = yield* host("queue review", () =>
-            active.queue(
-              {
-                id: params.id,
-                capability: "review",
-                artifactIntent: "evidence_only",
-                objective: params.objective,
-                intentVersion: intent.version,
-                subject: params.subject,
-                concern: params.concern,
-              },
-              queueOptions(params),
-            ),
+          const state = yield* active.effects.queue(
+            {
+              id: params.id,
+              capability: "review",
+              artifactIntent: "evidence_only",
+              objective: params.objective,
+              intentVersion: intent.version,
+              subject: params.subject,
+              concern: params.concern,
+            },
+            queueOptions(params),
           );
-          return mutationResult(`Queued review ${params.id}.`, remember(state, ctx), {
+          return mutationResult(`Queued review ${params.id}.`, yield* remember(state, ctx), {
             action: "workgraph_review",
             assignmentId: params.id,
             outcome: "queued",
           });
         }),
+        signal,
       );
     },
   });
@@ -624,16 +629,18 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       itemOffset: Type.Optional(Type.Integer({ minimum: 0 })),
       maxItems: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
     }),
-    execute(_id, params) {
-      return serial(
+    execute(_id, params, signal) {
+      return runCallback(
         Effect.gen(function* () {
-          const state = yield* host("load inspection state", () => current().store.load());
+          const active = current();
+          const state = yield* active.effects.submit(active.store.effects.load());
           const view = inspectView(state, { ...params, section: params.section });
           return {
             content: [{ type: "text" as const, text: formatInspection(view) }],
             details: { inspection: view, statePath: state.statePath },
           };
         }),
+        signal,
       );
     },
   });
@@ -656,15 +663,15 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       attempt: Type.Optional(Type.String()),
       integratedRevision: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
     }),
-    execute(_id, params, _signal, _update, ctx) {
-      return serial(
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
         Effect.gen(function* () {
           const active = current();
           const affectedAttemptId = isAttemptControl(params.action)
-            ? yield* controlAttemptEffect(active, params, host)
-            : yield* lifecycleControlEffect(active, params, host);
+            ? yield* controlAttemptEffect(active, params)
+            : yield* lifecycleControlEffect(active, params);
           const message = controlMessage(params.action);
-          const state = yield* host("load controlled workstream", () => active.store.load());
+          const state = yield* active.effects.submit(active.store.effects.load());
           const projection: Parameters<typeof actionView>[1] = {
             action: `workgraph_control:${params.action}`,
             message,
@@ -673,8 +680,9 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           if (params.task !== undefined && params.task !== "")
             projection.assignmentId = params.task;
           if (affectedAttemptId !== undefined) projection.attemptId = affectedAttemptId;
-          return mutationResult(message, remember(state, ctx), projection);
+          return mutationResult(message, yield* remember(state, ctx), projection);
         }),
+        signal,
       );
     },
   });
@@ -684,31 +692,32 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     description:
       "Attach a retained workstream only after expired prior ownership is authoritatively dead. Preserve suspension and original human receipts.",
     parameters: Type.Object({ statePath: Type.String() }),
-    execute(_id, params, _signal, _update, ctx) {
-      return serial(
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
         Effect.gen(function* () {
-          const state = yield* host("inspect adoptable workstream", () =>
-            WorkstreamStore.inspect(params.statePath),
-          );
-          const repository = yield* host("inspect adopting repository", () =>
-            GitRepository.inspect(ctx.cwd),
-          );
+          const state = yield* WorkstreamStoreEffects.inspect(params.statePath);
+          const repository = yield* inspectRepository(ctx.cwd);
           if (repository.commonDir !== state.gitCommonDir)
             throw new Error("The retained workstream belongs to another repository.");
           const herdr = new HerdrCliRuntime();
-          const liveness = yield* host("inspect prior coordinator liveness", () =>
-            herdr.coordinatorLiveness(state.coordinator.sessionFile),
-          );
+          const liveness = yield* herdr.effects.coordinatorLiveness(state.coordinator.sessionFile);
           const target = WorkstreamStore.open(params.statePath, state.coordinator);
           const active = yield* attachEffect(ctx, target, liveness);
-          pi.appendEntry(POINTER, { path: target.path });
+          yield* sdk("retain adopted workstream pointer", () =>
+            pi.appendEntry(POINTER, { path: target.path }),
+          );
           yield* importInputsEffect(active);
-          const adopted = yield* host("load adopted workstream", () => active.store.load());
-          return mutationResult("Adopted without changing lifecycle.", remember(adopted, ctx), {
-            action: "workgraph_adopt",
-            outcome: "adopted",
-          });
+          const adopted = yield* active.effects.submit(active.store.effects.load());
+          return mutationResult(
+            "Adopted without changing lifecycle.",
+            yield* remember(adopted, ctx),
+            {
+              action: "workgraph_adopt",
+              outcome: "adopted",
+            },
+          );
         }),
+        signal,
       );
     },
   });
@@ -718,19 +727,18 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     description:
       "Explicitly fork the coordinator conversation into a new no-focus Herdr workspace; workers remain tabs in that coordinator workspace, not a worker continuation or workstream adoption.",
     parameters: Type.Object({ targetCwd: Type.String() }),
-    execute(_id, params, _signal, _update, ctx) {
-      return serial(
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
         Effect.gen(function* () {
-          const sessionFile = yield* host("fork coordinator session", () =>
-            forkConversationSession({
-              parentSessionFile: owner(ctx).sessionFile,
-              targetCwd: params.targetCwd,
-            }),
-          );
+          const sessionFile = yield* forkConversationSessionEffect({
+            parentSessionFile: owner(ctx).sessionFile,
+            targetCwd: params.targetCwd,
+          });
           const herdr = new HerdrCliRuntime();
-          const identity = yield* host("launch forked coordinator", () =>
-            herdr.launchCoordinator({ cwd: params.targetCwd, sessionFile }),
-          );
+          const identity = yield* herdr.effects.launchCoordinator({
+            cwd: params.targetCwd,
+            sessionFile,
+          });
           return {
             content: [
               {
@@ -741,6 +749,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             details: identity,
           };
         }),
+        signal,
       );
     },
   });
@@ -760,34 +769,32 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         }),
       ),
     }),
-    execute(_id, params, _signal, _update, ctx) {
-      return serial(
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
         Effect.gen(function* () {
           const active = current();
-          const state = yield* host("complete workstream", () =>
-            active.perform(() =>
-              active.store.complete({
-                ...params,
-                reasons: params.unresolved.map((item) => ({
-                  taskId: item.task,
-                  reason: item.reason,
-                })),
-              }),
-            ),
+          const state = yield* active.effects.submit(
+            active.store.effects.complete({
+              ...params,
+              reasons: params.unresolved.map((item) => ({
+                taskId: item.task,
+                reason: item.reason,
+              })),
+            }),
           );
-          yield* host("stop completed runtime", () => active.stop());
+          yield* active.effects.stop;
           runtime = undefined;
-          return mutationResult("Completed workstream.", remember(state, ctx), {
+          return mutationResult("Completed workstream.", yield* remember(state, ctx), {
             action: "workgraph_complete",
             outcome: "completed",
           });
         }),
+        signal,
       );
     },
   });
 }
 
-type HostBoundary = <T>(operation: string, run: () => PromiseLike<T>) => CoordinatorEffect<T>;
 type ControlAction = "suspend" | "resume" | "cancel" | "steer" | "recover" | "retain_not_applied";
 type ControlParams = {
   action: ControlAction;
@@ -936,22 +943,25 @@ function validateModelRequest(
     throw new Error("Setting the worker pool requires an ordered pool.");
 }
 
-function resolveModelPolicy(
+function resolveModelPolicyEffect(
   action: "get" | "set" | "set_pool" | "rates",
   role: (typeof MODEL_ROLES)[number] | undefined,
   target: Static<typeof Target> | undefined,
   pool: Static<typeof Target>[] | undefined,
 ) {
   if (action === "set")
-    return setModelRole(requiredValue(role, "model role"), requiredValue(target, "model target"));
-  if (action === "set_pool") return setModelPool(requiredValue(pool, "model pool"));
-  return loadModelPolicy();
+    return setModelRoleEffect(
+      requiredValue(role, "model role"),
+      requiredValue(target, "model target"),
+    );
+  if (action === "set_pool") return setModelPoolEffect(requiredValue(pool, "model pool"));
+  return loadModelPolicyEffect();
 }
 
 function formatRates(rates: ReturnType<typeof modelRates>): string {
   return JSON.stringify({ rates }, null, 2);
 }
-function formatPolicy(policy: Awaited<ReturnType<typeof loadModelPolicy>>): string {
+function formatPolicy(policy: ModelPolicy): string {
   return JSON.stringify({ path: modelPolicyPath(), policy }, null, 2);
 }
 function formatInspection(view: InspectView): string {
@@ -992,14 +1002,12 @@ function isAttemptControl(action: ControlAction): boolean {
 function controlAttemptEffect(
   active: WorkstreamRuntime,
   params: ControlParams,
-  host: HostBoundary,
-): CoordinatorEffect<string> {
+): Effect.Effect<string, RuntimeError> {
   return Effect.gen(function* () {
-    const state = yield* host("load controlled attempt", () => active.store.load());
+    const state = yield* active.effects.submit(active.store.effects.load());
     const attemptId = resolveControlAttempt(state, params.task, params.attempt);
-    if (params.action === "cancel") yield* host("cancel attempt", () => active.cancel(attemptId));
-    else if (params.action === "steer")
-      yield* host("steer attempt", () => active.steer(attemptId, params.reason));
+    if (params.action === "cancel") yield* active.effects.cancel(attemptId);
+    else if (params.action === "steer") yield* active.effects.steer(attemptId, params.reason);
     else {
       const recovery: Parameters<WorkstreamRuntime["recoverAttempt"]>[0] = {
         attemptId,
@@ -1008,7 +1016,7 @@ function controlAttemptEffect(
       };
       if (params.integratedRevision !== undefined)
         recovery.integratedRevision = params.integratedRevision;
-      yield* host("recover attempt", () => active.recoverAttempt(recovery));
+      yield* active.effects.recoverAttempt(recovery);
     }
     return attemptId;
   });
@@ -1017,16 +1025,15 @@ function controlAttemptEffect(
 function lifecycleControlEffect(
   active: WorkstreamRuntime,
   params: ControlParams,
-  host: HostBoundary,
-): CoordinatorEffect<undefined> {
-  return host("set workstream lifecycle", () =>
-    active.perform(() =>
-      active.store.setLifecycle({
+): Effect.Effect<undefined, RuntimeError> {
+  return active.effects
+    .submit(
+      active.store.effects.setLifecycle({
         state: params.action === "suspend" ? "suspended" : "active",
         reason: params.reason,
       }),
-    ),
-  ).pipe(Effect.as(undefined));
+    )
+    .pipe(Effect.as(undefined));
 }
 
 function controlMessage(action: ControlAction): string {
@@ -1043,6 +1050,23 @@ function controlOutcome(action: ControlAction): "submitted" | "inspected" | "rec
 function requiredValue<T>(value: T | undefined, label: string): T {
   if (value === undefined) throw new Error(`Missing ${label}.`);
   return value;
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Reattachment failures join typed Effect and native filesystem causes; this diagnostic walks only Error cause chains and does not authorize a retry.
+function failureMessage(failure: unknown): string {
+  const messages: string[] = [];
+  let current: unknown = failure;
+  const seen = new Set<unknown>();
+  while (current !== undefined && current !== null && !seen.has(current)) {
+    seen.add(current);
+    if (current instanceof Error && current.message !== "") messages.push(current.message);
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- A raw string is the only non-Error cause representation retained by supported native failures.
+    else if (typeof current === "string" && current !== "") messages.push(current);
+    // SAFETY: Object membership is checked before reading the standard Error cause field.
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- See SAFETY above.
+    current = typeof current === "object" && "cause" in current ? current.cause : undefined;
+  }
+  return [...new Set(messages)].join(": ") || String(failure);
 }
 
 function result(

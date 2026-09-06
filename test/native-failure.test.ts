@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
 import { resultNotification } from "../src/agent-facing.js";
 import { GitRepository } from "../src/git.js";
 import {
@@ -153,10 +154,11 @@ await test("absent native failures project sanitized actionable notifications wi
       repository,
       new NativeFailureWorker(),
       { workspaceId: "fixture-workspace" },
-      (resultId, state) => {
-        notifications.push(resultNotification(state, resultId));
-      },
-      assert.fail,
+      (resultId, state) =>
+        Effect.sync(() => {
+          notifications.push(resultNotification(state, resultId));
+        }),
+      (error) => Effect.sync(() => assert.fail(error.message)),
       { registry, policy: DEFAULT_MODEL_POLICY },
     );
     for (const id of ["rate-limit", "abort", "generic", "fallback", "untyped", "typed"])

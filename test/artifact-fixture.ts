@@ -223,8 +223,8 @@ export async function artifactFixture(
         repository,
         workers,
         { workspaceId: "w1" },
-        () => undefined,
-        () => undefined,
+        () => Effect.void,
+        () => Effect.void,
         ownership,
       );
       runtimes.push(runtime);

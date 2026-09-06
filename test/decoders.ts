@@ -35,7 +35,8 @@ type FixtureVariable =
   | "PI_WORKGRAPH_MODE"
   | "PI_WORKGRAPH_NODE_ID"
   | "PI_WORKGRAPH_RUN_ID"
-  | "PI_WORKGRAPH_HERDR_BIN";
+  | "PI_WORKGRAPH_HERDR_BIN"
+  | "PATH";
 
 type FixtureEnvironment = Partial<Record<FixtureVariable, string | null>>;
 

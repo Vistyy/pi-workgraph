@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Coordinator integration fixtures use real host storage.
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are real Git and session identities.
 import { join } from "node:path";
 import test from "node:test";
+import { Effect } from "effect";
 import { Type } from "typebox";
 import { GitRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
@@ -333,6 +334,48 @@ void test("registered delegation keeps established scope until explicit intent r
   }
 });
 
+void test("registered AbortSignal interrupts native coordinator work", async () => {
+  const f = await fixture();
+  let previousEnvironment: NodeJS.ProcessEnv | undefined;
+  try {
+    const bin = join(f.parent, "blocking-bin");
+    const pidPath = join(f.parent, "blocking-git.pid");
+    await mkdir(bin);
+    const executable = join(bin, "git");
+    await writeFile(
+      executable,
+      `#!/bin/sh\necho $$ > ${JSON.stringify(pidPath)}\ntrap 'exit 130' TERM INT\nwhile :; do sleep 1; done\n`,
+    );
+    await chmod(executable, 0o755);
+    previousEnvironment = configureFixtureEnvironment({ PATH: `${bin}:/usr/bin:/bin` });
+    const controller = new AbortController();
+    const running = f.call(
+      "workgraph_research",
+      {
+        id: "cancel-native-inspection",
+        question: "Cancel the native repository inspection",
+        expectedEvidence: ["No detached process"],
+      },
+      controller.signal,
+    );
+    for (let index = 0; index < 100; index++) {
+      try {
+        await readFile(pidPath);
+        break;
+      } catch {
+        await Effect.runPromise(Effect.sleep("10 millis"));
+      }
+    }
+    const pid = Number.parseInt(await readFile(pidPath, "utf8"), 10);
+    controller.abort();
+    await assert.rejects(running, /abort|interrupt/i);
+    assert.throws(() => process.kill(pid, 0), /ESRCH/);
+  } finally {
+    if (previousEnvironment !== undefined) restoreFixtureEnvironment(previousEnvironment);
+    await f.dispose();
+  }
+});
+
 void test("failed registered adoption preserves the attached runtime lease; same-target attachment reuses it", async () => {
   const f = await fixture();
   let competing: WorkstreamRuntime | undefined;
@@ -356,11 +399,11 @@ void test("failed registered adoption preserves the attached runtime lease; same
       repository,
       new HerdrCliRuntime(),
       { workspaceId: "" },
-      () => {},
-      () => {},
+      () => Effect.void,
+      () => Effect.void,
       { registry },
     );
-    await competing.perform(() => Promise.resolve());
+    await Effect.runPromise(competing.effects.submit(Effect.void));
     await assert.rejects(f.call("workgraph_adopt", { statePath: store.path }), /runtime owner/);
     assert.equal(
       resultState((await f.call("workgraph_inspect", { section: "overview" })).details).id,

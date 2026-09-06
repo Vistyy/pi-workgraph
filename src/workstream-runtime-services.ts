@@ -113,18 +113,12 @@ export class PiObservationError extends Data.TaggedError("PiObservationError")<{
 
 export class RuntimeStore extends Context.Service<
   RuntimeStore,
-  {
-    readonly facade: WorkstreamStore;
-    readonly effects: WorkstreamStoreEffects;
-  }
+  { readonly effects: WorkstreamStoreEffects }
 >()("@vistyy/pi-workgraph/RuntimeStore") {}
 
 export class RuntimeGit extends Context.Service<
   RuntimeGit,
-  {
-    readonly repository: GitRepository;
-    readonly effects: GitRepositoryEffects;
-  }
+  { readonly effects: GitRepositoryEffects }
 >()("@vistyy/pi-workgraph/RuntimeGit") {}
 
 export class RuntimeHerdr extends Context.Service<RuntimeHerdr, RuntimeWorkerPort>()(
@@ -181,19 +175,16 @@ export interface RuntimeLayerOptions {
     | Layer.Layer<ArtifactStore, never, FileSystem.FileSystem | Path.Path>
     | undefined;
   readonly clock?: Clock.Clock | undefined;
-  readonly onResult: (id: string, state: WorkstreamState) => void | Promise<void>;
-  readonly onState: (state: WorkstreamState) => void;
-  readonly onError: (error: Error) => void;
+  readonly onResult: (id: string, state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
+  readonly onState: (state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
+  readonly onError: (error: Error) => Effect.Effect<void, RuntimeHostError>;
 }
 
 export function makeRuntimeLayer(options: RuntimeLayerOptions) {
   const base = Layer.mergeAll(
     liveLayer,
-    Layer.succeed(RuntimeStore, { facade: options.store, effects: options.store.effects }),
-    Layer.succeed(RuntimeGit, {
-      repository: options.repository,
-      effects: options.repository.effects,
-    }),
+    Layer.succeed(RuntimeStore, { effects: options.store.effects }),
+    Layer.succeed(RuntimeGit, { effects: options.repository.effects }),
     Layer.succeed(RuntimeHerdr, options.workers),
     Layer.succeed(RuntimePolicy, {
       policy:
@@ -304,22 +295,19 @@ function finalizer(operation: string, run: () => void): Effect.Effect<void> {
 }
 
 function hostService(options: RuntimeLayerOptions): RuntimeHost["Service"] {
+  const host = (
+    operation: string,
+    effect: Effect.Effect<void, RuntimeHostError>,
+  ): Effect.Effect<void, RuntimeHostError> =>
+    effect.pipe(
+      Effect.mapError((cause) =>
+        cause instanceof RuntimeHostError ? cause : new RuntimeHostError({ operation, cause }),
+      ),
+    );
   return {
-    deliver: (id, state) =>
-      Effect.tryPromise({
-        try: () => Promise.resolve(options.onResult(id, state)),
-        catch: (cause) => new RuntimeHostError({ operation: "deliver result", cause }),
-      }),
-    state: (state) =>
-      Effect.try({
-        try: () => options.onState(state),
-        catch: (cause) => new RuntimeHostError({ operation: "publish state", cause }),
-      }),
-    error: (error) =>
-      Effect.try({
-        try: () => options.onError(error),
-        catch: (cause) => new RuntimeHostError({ operation: "report error", cause }),
-      }),
+    deliver: (id, state) => host("deliver result", options.onResult(id, state)),
+    state: (state) => host("publish state", options.onState(state)),
+    error: (error) => host("report error", options.onError(error)),
   };
 }
 

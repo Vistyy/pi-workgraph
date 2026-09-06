@@ -526,13 +526,13 @@ void test("legacy pending and blocked cleanup preserve ignored required output a
       );
       if (cleanupState === "pending") {
         await assert.rejects(
-          runtime.perform(() => f.store.markWorkerClosed(f.attemptId)),
+          Effect.runPromise(runtime.effects.submit(f.store.effects.markWorkerClosed(f.attemptId))),
           /no independently retained report and source checkpoint/,
         );
         await runtime.reconcile();
       } else {
         await assert.rejects(
-          runtime.perform(() => f.store.retryCleanup(f.attemptId)),
+          Effect.runPromise(runtime.effects.submit(f.store.effects.retryCleanup(f.attemptId))),
           /no independently retained report and source checkpoint/,
         );
       }

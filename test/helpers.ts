@@ -160,13 +160,13 @@ export async function extensionFixture(
     selected,
     registry,
     // oxlint-disable-next-line anti-slop/no-unknown-parameters, effecttsgo/async-function -- Raw input intentionally enters through Pi's registered tool boundary and is decoded against that exact registration schema before execute performs authority validation.
-    async call(toolName: string, params: unknown) {
+    async call(toolName: string, params: unknown, signal?: AbortSignal) {
       const tool = runner.getToolDefinition(toolName);
       assert.ok(tool !== undefined, `Missing registered tool ${toolName}`);
       assert.ok(Value.Check(tool.parameters, params), `Invalid fixture input to ${toolName}`);
       // SAFETY: Pi's registered definition erases its concrete schema generic, but Value.Check above validates this value against the exact runtime schema.
       const decoded = Value.Decode(tool.parameters, params);
-      return tool.execute("fixture", decoded, undefined, undefined, runner.createContext());
+      return tool.execute("fixture", decoded, signal, undefined, runner.createContext());
     },
     // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
     async close() {

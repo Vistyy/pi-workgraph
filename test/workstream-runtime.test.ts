@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { Deferred, Effect } from "effect";
+import { Deferred, Effect, Layer } from "effect";
 import { TestClock } from "effect/testing";
+import { ArtifactStore } from "../src/artifact-store.js";
 import { GitRepository, runProcess } from "../src/git.js";
 import {
   type HerdrInspection,
@@ -20,7 +21,8 @@ import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { type Lease, WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity, WorkerReport } from "../src/types.js";
 import { type WorkstreamState, WorkstreamStore } from "../src/workstream.js";
-import { WorkstreamRuntime } from "../src/workstream-runtime.js";
+import { type RuntimeEffect, WorkstreamRuntime } from "../src/workstream-runtime.js";
+import { RuntimeHostError } from "../src/workstream-runtime-services.js";
 import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
 import { required } from "./decoders.js";
 import { promiseWorkerEffects } from "./runtime-worker-port.js";
@@ -230,9 +232,12 @@ async function fixture() {
   const errors: string[] = [];
   const runtimes: WorkstreamRuntime[] = [];
   function runtime(
-    onResult: (id: string, state: WorkstreamState) => Promise<void> = async (id) => {
-      delivered.push(id);
-    },
+    onResult: (id: string, state: WorkstreamState) => Effect.Effect<void, RuntimeHostError> = (
+      id,
+    ) =>
+      Effect.sync(() => {
+        delivered.push(id);
+      }),
     options: ConstructorParameters<typeof WorkstreamRuntime>[6] = {},
   ) {
     const value = new WorkstreamRuntime(
@@ -241,33 +246,39 @@ async function fixture() {
       workers,
       { workspaceId: "w1" },
       onResult,
-      (error) => {
-        errors.push(error.message);
-      },
+      (error) =>
+        Effect.sync(() => {
+          errors.push(error.message);
+        }),
       { registry, policy: DEFAULT_MODEL_POLICY, ...options },
     );
     runtimes.push(value);
     return value;
   }
   async function authority(active: WorkstreamRuntime) {
-    return active.perform(async () => {
-      const recorded = await store.recordInputEvent({
-        ...owner,
-        source: "interactive",
-        text: "Implement value.txt and run bounded disposable experiments in this repository.",
-      });
-      await store.reviseIntent({
-        authorityReceiptId: recorded.receipt.id,
-        statement: "Change fixture safely",
-        constraints: [],
-      });
-      return { receiptId: recorded.receipt.id, intentVersion: 1 };
-    });
+    return submit(
+      active,
+      Effect.gen(function* () {
+        const recorded = yield* store.effects.recordInputEvent({
+          ...owner,
+          source: "interactive",
+          text: "Implement value.txt and run bounded disposable experiments in this repository.",
+        });
+        yield* store.effects.reviseIntent({
+          authorityReceiptId: recorded.receipt.id,
+          statement: "Change fixture safely",
+          constraints: [],
+        });
+        return { receiptId: recorded.receipt.id, intentVersion: 1 };
+      }),
+    );
   }
-  async function dispose() {
-    for (const active of runtimes) await active.stop();
+  async function dispose(ignoreStopErrors = false) {
+    const stopped = await Promise.allSettled(runtimes.map((active) => active.stop()));
     registry.close();
     await rm(parent, { recursive: true, force: true });
+    if (!ignoreStopErrors && stopped.some((result) => result.status === "rejected"))
+      throw new Error("Runtime stop failed during fixture disposal.");
   }
   return {
     root,
@@ -285,6 +296,10 @@ async function fixture() {
     dispose,
   };
 }
+function submit<A, E>(active: WorkstreamRuntime, effect: RuntimeEffect<A, E>): Promise<A> {
+  return Effect.runPromise(active.effects.submit(effect));
+}
+
 const research = (id: string, intentVersion = 0) => ({
   id,
   capability: "research" as const,
@@ -338,9 +353,14 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
 await test("new runtime drives fresh research through native evidence, durable retryable delivery and exact Git cleanup", async () => {
   const f = await fixture();
   try {
-    const first = f.runtime(async () => {
-      throw new Error("notification interrupted");
-    });
+    const first = f.runtime(() =>
+      Effect.fail(
+        new RuntimeHostError({
+          operation: "fixture notification",
+          cause: new Error("notification interrupted"),
+        }),
+      ),
+    );
     await first.queue(research("inspect"));
     await first.reconcile();
     const request = f.workers.requests[0];
@@ -367,7 +387,7 @@ await test("new runtime drives fresh research through native evidence, durable r
     assert.equal(state.deliveries[0]?.state, "delivered");
     assert.deepEqual(f.delivered, [state.results[0]?.id]);
     const deliveredResult = required(state.results[0], "delivered result");
-    await next.perform(() => f.store.acknowledge(deliveredResult.id, "Read evidence"));
+    await submit(next, f.store.effects.acknowledge(deliveredResult.id, "Read evidence"));
     await next.reconcile();
     assert.equal(f.delivered.length, 1);
     assert.equal(f.workers.cleanupCount, 1);
@@ -418,10 +438,15 @@ await test("shared research sees dirty tracked and untracked files and leaves th
 await test("cleaned history has constant reconciliation reads while error clearing and pending delivery remain independent", async (t) => {
   const f = await fixture();
   try {
-    const active = f.runtime(async () => {
-      throw new Error("interrupted notification");
-    });
-    await active.perform(async () => undefined);
+    const active = f.runtime(() =>
+      Effect.fail(
+        new RuntimeHostError({
+          operation: "fixture notification",
+          cause: new Error("interrupted notification"),
+        }),
+      ),
+    );
+    await submit(active, Effect.void);
     const reads = t.mock.method(f.store.effects, "load");
     await active.reconcile();
     const emptyReads = reads.mock.callCount();
@@ -438,7 +463,7 @@ await test("cleaned history has constant reconciliation reads while error cleari
       "Cleaned attempts must not add per-attempt durable loads",
     );
     const id = required(state.attempts[0], "cleaned attempt").id;
-    await active.perform(() => f.store.recordAttention(id, "retained stale attention"));
+    await submit(active, f.store.effects.recordAttention(id, "retained stale attention"));
     const updates = t.mock.method(f.store.effects, "clearAttention");
     state = await active.reconcile();
     assert.equal(updates.mock.callCount(), 1);
@@ -891,8 +916,9 @@ await test("artifact retry reconciles interrupted copies and refuses missing, un
       /non-metadata path|retained boundary/,
     );
     assert.equal(escapingAttempt.cleanup, undefined);
-    await active.perform(() =>
-      f.store.reviseIntent({
+    await submit(
+      active,
+      f.store.effects.reviseIntent({
         authorityReceiptId: authority.receiptId,
         statement: "A newer experiment constraint supersedes retries.",
         constraints: ["Do not retry historical artifact retention."],
@@ -1017,8 +1043,9 @@ await test("wrong-mode and stale maintained results remain retained without comp
     };
     await active.queue(input("stale"));
     await active.reconcile();
-    await active.perform(() =>
-      f.store.reviseIntent({
+    await submit(
+      active,
+      f.store.effects.reviseIntent({
         authorityReceiptId: authority.receiptId,
         statement: "New constraints",
         constraints: ["Do not apply old value"],
@@ -1030,8 +1057,9 @@ await test("wrong-mode and stale maintained results remain retained without comp
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
     assert.equal(f.workers.cleanupCount, 0);
     await assert.rejects(
-      active.perform(() =>
-        f.store.complete({
+      submit(
+        active,
+        f.store.effects.complete({
           conclusion: "done",
           evidence: [{ label: "limit", observation: "Not done" }],
           limitations: ["stale"],
@@ -1147,7 +1175,10 @@ await test("exclusive lease fences same-session duplicates and dead-owner adopti
     const duplicate = f.runtime();
     await assert.rejects(duplicate.reconcile(), /already has a runtime owner/);
     await duplicate.stop();
-    await first.perform(() => f.store.setLifecycle({ state: "suspended", reason: "Keep stopped" }));
+    await submit(
+      first,
+      f.store.effects.setLifecycle({ state: "suspended", reason: "Keep stopped" }),
+    );
     f.registry.db
       .prepare("UPDATE leases SET expires_at=? WHERE run_id=?")
       .run("2000-01-01T00:00:00.000Z", "ws-fixture");
@@ -1205,17 +1236,23 @@ await test("failed notification is not retried by polling and manual observed re
   const f = await fixture();
   try {
     let notifications = 0;
-    const active = f.runtime(async () => {
+    const active = f.runtime(() => {
       notifications++;
-      throw new Error("uncertain transport");
+      return Effect.fail(
+        new RuntimeHostError({
+          operation: "fixture notification",
+          cause: new Error("uncertain transport"),
+        }),
+      );
     });
     await active.queue(research("read"));
     await active.reconcile();
     const state = await active.reconcile();
     const result = state.results[0];
     assert.ok(result);
-    await active.perform(() =>
-      f.store.disposition({
+    await submit(
+      active,
+      f.store.effects.disposition({
         resultId: result.id,
         status: "accepted",
         reason: "Read the exact retained evidence through status",
@@ -1228,21 +1265,22 @@ await test("failed notification is not retried by polling and manual observed re
       reasons: [],
     };
     await assert.rejects(
-      active.perform(() => f.store.complete(completion)),
+      submit(active, f.store.effects.complete(completion)),
       /Completion requires exactly one reason per unresolved semantic task|Pending result delivery/,
     );
     await active.reconcile();
     await active.reconcile();
     assert.equal(notifications, 1);
-    await active.perform(() =>
-      f.store.acknowledge(result.id, "Read the retained report through status"),
+    await submit(
+      active,
+      f.store.effects.acknowledge(result.id, "Read the retained report through status"),
     );
     const acknowledged = await active.reconcile();
     assert.equal(acknowledged.deliveries[0]?.state, "acknowledged");
     assert.equal(acknowledged.deliveries[0]?.deliveredAt, undefined);
     assert.equal(notifications, 1);
     assert.equal(
-      (await active.perform(() => f.store.complete(completion))).lifecycle.state,
+      (await submit(active, f.store.effects.complete(completion))).lifecycle.state,
       "completed",
     );
   } finally {
@@ -1269,10 +1307,7 @@ await test("partial adoption failure releases the acquired lease before runtime 
         sessionFile: join(f.parent, "adopting-session.jsonl"),
       },
     });
-    await assert.rejects(
-      failed.perform(async () => undefined),
-      /adoption failure/,
-    );
+    await assert.rejects(submit(failed, Effect.void), /adoption failure/);
     assert.equal(adopt.mock.callCount(), 1);
     assert.equal(
       f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
@@ -1294,15 +1329,58 @@ await test("Effect-owned fibers use deterministic cadence and stop before releas
     await Effect.runPromise(clock.adjust("999 millis"));
     assert.equal(f.workers.requests.length, 0);
     await Effect.runPromise(clock.adjust("1 millis"));
-    await active.perform(async () => undefined);
+    await submit(active, Effect.void);
     assert.equal(f.workers.requests.length, 1);
     await active.stop();
-    await assert.rejects(
-      active.perform(async () => undefined),
-      /stopped|lease/i,
-    );
+    await assert.rejects(submit(active, Effect.void), /stopped|lease/i);
   } finally {
     await f.dispose();
+  }
+});
+
+await test("fatal heartbeat failure disposes the lease and artifact scope before immediate reattachment", async (t) => {
+  const f = await fixture();
+  const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+  await Effect.runPromise(clock.setTime(nativeLeaseTimestamp()));
+  let artifactReleased = false;
+  const artifactStoreLayer = Layer.merge(
+    ArtifactStore.layer,
+    Layer.effectDiscard(
+      Effect.acquireRelease(Effect.void, () =>
+        Effect.sync(() => {
+          artifactReleased = true;
+        }),
+      ),
+    ),
+  );
+  try {
+    const active = f.runtime(undefined, { clock, artifactStoreLayer });
+    active.start();
+    await submit(active, Effect.void);
+    const renew = t.mock.method(f.registry, "renew", () => {
+      throw new Error("fixture renewal failed before changing lease");
+    });
+    await Effect.runPromise(clock.adjust("5 seconds"));
+    for (let index = 0; index < 100; index++) {
+      if (
+        artifactReleased &&
+        f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture") === undefined
+      )
+        break;
+      await Effect.runPromise(Effect.yieldNow);
+    }
+    assert.equal(artifactReleased, true);
+    assert.equal(
+      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
+      undefined,
+    );
+    assert.match(f.errors.join("\n"), /renewal failed before changing lease/);
+    renew.mock.restore();
+    const reattached = f.runtime();
+    const state = await reattached.reconcile();
+    assert.equal(state.id, "ws-fixture");
+  } finally {
+    await f.dispose(true);
   }
 });
 
@@ -1313,7 +1391,7 @@ await test("heartbeat ownership loss reports once and interrupts scoped reconcil
   try {
     const active = f.runtime(undefined, { clock });
     active.start();
-    await active.perform(async () => undefined);
+    await submit(active, Effect.void);
     f.registry.db.prepare("DELETE FROM leases WHERE run_id=?").run("ws-fixture");
     await Effect.runPromise(clock.adjust("5 seconds"));
     assert.equal(f.errors.length, 1);
@@ -1328,11 +1406,54 @@ await test("heartbeat ownership loss reports once and interrupts scoped reconcil
   }
 });
 
+await test("Effect submissions cancel queued work immediately and await running interruption", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    await submit(active, Effect.void);
+    const entered = Deferred.makeUnsafe<void>();
+    const interrupted = Deferred.makeUnsafe<void>();
+    let queuedMutationRan = false;
+    const runningController = new AbortController();
+    const running = Effect.runPromise(
+      active.effects.submit(
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined).pipe(Effect.asVoid)),
+        ),
+      ),
+      { signal: runningController.signal },
+    );
+    await Effect.runPromise(Deferred.await(entered));
+
+    const queuedController = new AbortController();
+    const queued = Effect.runPromise(
+      active.effects.submit(
+        Effect.sync(() => {
+          queuedMutationRan = true;
+        }),
+      ),
+      { signal: queuedController.signal },
+    );
+    queuedController.abort();
+    await assert.rejects(queued, /abort|interrupt/i);
+    assert.equal(queuedMutationRan, false);
+
+    runningController.abort();
+    await assert.rejects(running, /abort|interrupt/i);
+    await Effect.runPromise(Deferred.await(interrupted));
+    await submit(active, Effect.void);
+    assert.equal(queuedMutationRan, false);
+  } finally {
+    await f.dispose();
+  }
+});
+
 await test("stop interrupts a suspended store operation and fails queued replies before releasing the lease", async (t) => {
   const f = await fixture();
   try {
     const active = f.runtime();
-    await active.perform(async () => undefined);
+    await submit(active, Effect.void);
     const entered = Deferred.makeUnsafe<void>();
     t.mock.method(f.store.effects, "load", () =>
       Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
@@ -1380,7 +1501,7 @@ await test("stop interrupts a suspended native observation without waiting behin
 await test("stop surfaces registry release failures after attempting the exact release", async (t) => {
   const f = await fixture();
   const active = f.runtime();
-  await active.perform(async () => undefined);
+  await submit(active, Effect.void);
   const release = f.registry.release.bind(f.registry);
   t.mock.method(f.registry, "release", (lease: Lease) => {
     release(lease);
