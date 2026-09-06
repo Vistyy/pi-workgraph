@@ -1,12 +1,25 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Disposable Git tests use real filesystem boundaries.
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Disposable Git tests use real path identities.
 import { join } from "node:path";
 import test from "node:test";
-import { GitRepository, runProcess } from "../src/git.js";
+import { Effect } from "effect";
+import { GitParseError, GitRepository, parseWorktreeList, runProcess } from "../src/git.js";
 import { git } from "./helpers.js";
+
+async function waitForFile(path: string): Promise<string> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try {
+      return await readFile(path, "utf8");
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+      await Effect.runPromise(Effect.sleep("10 millis"));
+    }
+  }
+  throw new Error(`Timed out waiting for ${path}.`);
+}
 
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-git-"));
@@ -22,6 +35,61 @@ async function fixture() {
   const repository = await GitRepository.open(root);
   return { parent, root, repository, base: await repository.head() };
 }
+
+void test("the effects port is the primary typed repository interface", async () => {
+  const f = await fixture();
+  try {
+    assert.equal(await Effect.runPromise(f.repository.effects.head()), f.base);
+    assert.equal(await Effect.runPromise(f.repository.effects.status()), "");
+    assert.equal(await f.repository.head(), f.base);
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("malformed Git worktree output fails with the declared parse tag", async () => {
+  const malformed = "branch refs/heads/missing-worktree\0\0";
+  const failure = await Effect.runPromise(Effect.flip(parseWorktreeList(malformed)));
+  assert.ok(failure instanceof GitParseError);
+  assert.equal(failure._tag, "GitParseError");
+  assert.match(failure.message, /Invalid git worktree record/);
+  assert.equal(failure.output, malformed);
+
+  assert.deepEqual(
+    await Effect.runPromise(
+      parseWorktreeList(
+        "worktree /tmp/path-with\na-newline\0HEAD 0123456789abcdef\0branch refs/heads/main\0\0",
+      ),
+    ),
+    [{ path: "/tmp/path-with\na-newline", branch: "main" }],
+  );
+});
+
+void test("interrupting a long read-only Git effect waits for the Git child to close", async () => {
+  const f = await fixture();
+  const hook = join(f.parent, "fsmonitor-hook");
+  const started = join(f.parent, "fsmonitor-started");
+  const closed = join(f.parent, "git-closed");
+  try {
+    await writeFile(
+      hook,
+      `#!/bin/sh\nparent="$PPID"\nprintf '%s' "$parent" > ${JSON.stringify(started)}\nwhile kill -0 "$parent" 2>/dev/null; do sleep 0.02; done\nprintf closed > ${JSON.stringify(closed)}\n`,
+    );
+    await chmod(hook, 0o755);
+    await git(f.root, "config", "core.fsmonitor", hook);
+
+    const controller = new AbortController();
+    const running = Effect.runPromise(f.repository.effects.status(), {
+      signal: controller.signal,
+    });
+    assert.match(await waitForFile(started), /^[0-9]+$/);
+    controller.abort();
+    await assert.rejects(running);
+    assert.equal(await waitForFile(closed), "closed");
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
 
 void test("Git placements preserve unknown data; cleanup requires exact clean identity and is idempotent", async () => {
   const f = await fixture();
