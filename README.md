@@ -48,6 +48,7 @@ Research, experiments, implementation slices, comparison, review, and integratio
 Routine mutation responses show the action outcome, workstream lifecycle, aggregate counts, affected assignment/attempt/result handles, and selected model provenance without replaying unrelated history.
 `workgraph_inspect` is the only normal inspection surface: use `section: overview` for remaining work, `task` for a semantic task, `outcome` or `evidence` for retained content, and `recovery` for exact resource and settlement evidence.
 Notifications include a bounded actionable outcome, including evidence, limitations, applied versus merely reported revisions, blockers, uncertainty, and retained artifact locations.
+When a current attempt settles without a typed or untyped report, the retained absent result may identify a provider rate limit, native abort, or native provider error from current-generation native metadata without copying the raw provider error text into workstream state or notifications.
 When artifact details are truncated, follow the `retainedArtifacts.next` handle to recover them in full.
 Use the returned `next` handle to retrieve every remaining character of typed, untyped, malformed, or large report content without silently selecting an ambiguous repeated attempt.
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic acceptance oracle.
@@ -115,30 +116,38 @@ The active runtime uses workstream format version 4; earlier versions are not si
 Default shared research evidence describes live working files rather than an immutable committed snapshot.
 An explicit base revision is exact Git evidence; an exact-revision review must inspect that commit with Git rather than treating current working files as the revision.
 
+## Runtime and persistence ownership
+
+Effect `4.0.0-rc.112` is a runtime dependency used for structured lifecycle, concurrency, timing, configuration, and typed failures.
+`WorkstreamRuntime` owns one scoped Effect `ManagedRuntime`, its serialized operation queue, lease lifetime, heartbeat, reconciliation fibers, and shutdown.
+The `processEffect` adapter owns child acquisition, bounded output, timeout, interruption, and release, while `runProcess` preserves the outward Promise contract used by Git and Herdr callers.
+`WorkstreamStore` owns validated workstream files, serializes mutations with an Effect semaphore, and publishes updates by atomic replacement; `WorkgraphRegistry` remains the SQLite owner of the workstream index and fenced leases.
+Promise-returning Pi, Herdr, Git, and store APIs are compatibility boundaries around those owners rather than a second lifecycle system.
+
 ## Development and live verification
 
 ```bash
 pnpm install --frozen-lockfile
 pnpm check
+pnpm typecheck
 pnpm pack --dry-run
 pnpm smoke:herdr
 pnpm smoke:coordinator
 ```
 
-The root `packageManager` field pins pnpm to `11.25.0`; local development and GitHub Actions use that same pin.
-Development quality preparation runs `effect-tsgo patch --oxlint --no-typescript` as the first step of `pnpm quality` and `pnpm check` after devDependencies are installed.
-It is not a published-package install requirement.
+The root `packageManager` field and lockfile pin pnpm to `11.25.0`; local development and GitHub Actions use that same pin.
+The project pins `@syzom/typescript-quality` to `0.2.0` and extends its shared Biome, base TypeScript, and root-spread Effect Oxlint configurations while retaining project-owned source selection and exceptions.
+Development quality preparation runs `effect-tsgo patch --oxlint --no-typescript` as the first step of `pnpm quality` and `pnpm check` after devDependencies are installed, not as a published-package install requirement.
 The optional `msgpackr-extract` native build is explicitly allowed in `pnpm-workspace.yaml`; Effect still works with its JavaScript fallback when the optional native package is unavailable.
-`pnpm check` is also the GitHub Actions check entry point and runs quality preparation, shared Biome, the root-spread Effect Oxlint preset, and all deterministic tests.
-Oxlint owns the full TypeScript-aware check for this source selection, so the standalone `pnpm typecheck` command remains available for transitional compiler diagnostics but is not duplicated in `pnpm check`.
-The first quality adoption intentionally reports existing migration diagnostics from unmigrated product, smoke, and test code; no paths or rule severities are suppressed to hide that debt.
+`pnpm check` is the GitHub Actions entry point and runs quality preparation, Biome with warnings rejected, the type-aware Oxlint configuration, and every deterministic `node:test` test.
+Oxlint owns the full TypeScript-aware check for this source selection, while `pnpm typecheck` remains an independent `tsc --noEmit` diagnostic and is not duplicated in `pnpm check`.
+Only `effecttsgo/async-function` is disabled for `test/**/*.test.ts`, where `node:test` callbacks and fake Promise adapters must preserve framework contracts; every other shared and Effect rule remains enabled.
+The shared blocking policy rejects non-null assertions, assertions to `never`, and chained assertions through the configured Biome and Oxlint checks.
 
 A natural-use verification request should state the desired outcome, constraints, and uncertainty to resolve without naming Workgraph tools, worker counts, or model panels.
 The runnable `pnpm smoke:natural` fixture asks the coordinator to resolve whether a disposable parser probe is justified and, only if it is, make one authorized small change, then checks native request settlement, the actual direct or delegated strategy, exact bytes, retained outputs when present, and cleanup.
 This natural procedure is evidence of caller usability, while the deterministic smoke remains a protocol check of identity, retention, composition, and cleanup boundaries.
-`pnpm check` owns shared Biome, the Effect-aware Oxlint type and lint checks, and deterministic tests.
-The shared anti-slop rules reject assertions to `never` and chained assertions, including locally resolved aliases, through the actual Oxlint command.
-Non-null assertions are now part of the shared blocking policy and remaining violations are reported as migration work rather than hidden by a local override.
+`pnpm pack --dry-run` verifies the published file list but not dependency resolution or executable startup in an installed consumer; [VERIFICATION.md](VERIFICATION.md) gives the disposable packed-consumer check.
 
 Run live scenarios only from a Herdr-managed pane, against a clean committed candidate when the scenario itself requires composition.
 Shared research is separately expected to start with local tracked or untracked changes and leave those bytes untouched after native worker closure and retry.

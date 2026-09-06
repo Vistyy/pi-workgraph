@@ -92,7 +92,6 @@ await test("fresh worker context, explicit continuation, native generation marke
   }
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
 await test("native failure observation is current-generation, latest-message, and category only", async () => {
   const root = await mkdtemp(join(tmpdir(), "workgraph-native-failure-"));
   const first = { runId: "native-fixture", nodeId: "first" };

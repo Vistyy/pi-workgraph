@@ -27,7 +27,6 @@ const RAW_SECRET = "Bearer fixture-secret at https://provider.example/private";
 class NativeFailureWorker implements VisibleWorkerRuntime {
   readonly available = true;
 
-  // oxlint-disable-next-line effecttsgo/async-function -- The fixture implements the Promise-facing worker transport contract.
   async launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
     const identity: WorkerIdentity = {
       workspaceId: request.workspaceId,
@@ -95,22 +94,18 @@ class NativeFailureWorker implements VisibleWorkerRuntime {
     return this.observation(identity);
   }
 
-  // oxlint-disable-next-line effecttsgo/async-function -- The fixture implements the Promise-facing worker transport contract.
   async inspect(identity: WorkerIdentity): Promise<HerdrInspection> {
     return this.observation(identity);
   }
 
-  // oxlint-disable-next-line effecttsgo/async-function -- The fixture implements the Promise-facing worker transport contract.
   async observe(identity: WorkerIdentity): Promise<HerdrObservation> {
     return this.observation(identity);
   }
 
-  // oxlint-disable-next-line effecttsgo/async-function -- The fixture implements the Promise-facing worker transport contract.
   async interrupt(identity: WorkerIdentity): Promise<HerdrObservation> {
     return this.observation(identity);
   }
 
-  // oxlint-disable-next-line effecttsgo/async-function -- The fixture implements the Promise-facing worker transport contract.
   async cleanup(identity: WorkerIdentity) {
     return {
       state: "completed" as const,
@@ -125,7 +120,6 @@ class NativeFailureWorker implements VisibleWorkerRuntime {
   }
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this runtime integration callback.
 await test("absent native failures project sanitized actionable notifications without affecting typed reports", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-native-runtime-"));
   let runtime: WorkstreamRuntime | undefined;

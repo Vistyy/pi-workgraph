@@ -40,6 +40,14 @@ Preserve genuine authority, input and model provenance, exact resource ownership
 Represent uncertainty explicitly, especially when an operation may have taken effect despite an interrupted response.
 Recovery should inspect authoritative state before retrying and should retain conflicting or blocked work when safe automatic settlement is not justified.
 
+### Keep lifecycle ownership explicit
+
+Effect 4 provides one structured lifecycle and concurrency model for the active coordination runtime rather than a parallel public workflow interface.
+The workstream runtime owns its scoped registry and lease, serialized operations, background fibers, and shutdown.
+The process adapter owns each child from acquisition through timeout, interruption, and release, with a Promise adapter only at host-facing boundaries.
+The workstream store owns serialized atomic state-file mutation, while the registry owns only the durable index and fenced lease records.
+These boundaries keep resource lifetime and persistence responsibility with the component that can verify their postconditions.
+
 ### Evolve one cohesive system
 
 Prefer the smallest maintainable design with cohesive ownership boundaries.
