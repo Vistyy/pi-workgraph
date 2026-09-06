@@ -16,6 +16,17 @@ pi -e /absolute/path/to/pi-workgraph
 
 Start from the project directory and ask the coordinator to delegate the needed work.
 Composition still requires a clean destination at the maintained-application boundary.
+
+### Coordinator Calm
+
+The coordinator extension registers `/calm` as an off-by-default, presentation-only toggle for operational tool rows and Workgraph notification rows.
+It does not change the session, model context, exports, tool execution, or worker tabs.
+The default hidden tool-name list covers Pi builtins, installed search tools, Workgraph tools, and `herdr_rename`.
+Override it with `PI_WORKGRAPH_CALM_HIDDEN_TOOLS=tool_a,tool_b` before starting Pi.
+The internal adapter targets Pi's exported `ToolExecutionComponent` and `CustomMessageComponent` render seams, so it is compatibility-limited to Pi versions exposing those classes.
+If the seam is unavailable or changes shape, Calm stays visible and emits a warning rather than hiding content or changing execution.
+Calm activity shows a minimal indicator while the coordinator is working or active workers remain, and returns to a clean idle state after settlement or shutdown.
+The coordinator gate prevents the extension from loading in worker sessions.
 First delegation creates a workstream automatically; `workgraph_begin` is optional.
 Workers run in visible Herdr tabs with ordinary Pi package/configuration loading and fresh context.
 Worker tab labels show only bounded task text - at most 18 display characters, with readable word-boundary shortening when possible.

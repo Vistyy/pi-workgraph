@@ -11,6 +11,7 @@ import {
   resolveAttemptHandle,
   resultNotification,
 } from "../src/agent-facing.js";
+import { installCalmMode, isCoordinatorScope, updateCalmWorkers } from "../src/calm.js";
 import { GitRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import {
@@ -60,8 +61,8 @@ const ModelOptions = {
 };
 
 export default function workgraphCoordinator(pi: ExtensionAPI): void {
-  const { PI_WORKGRAPH_MODE: workgraphMode } = process.env;
-  if (workgraphMode !== undefined && workgraphMode !== "") return;
+  if (!isCoordinatorScope(process.env)) return;
+  const calm = installCalmMode(pi);
   let runtime: WorkstreamRuntime | undefined;
   let pending: Static<typeof InputReceipt>[] = [];
   const hostSemaphore = Semaphore.makeUnsafe(1);
@@ -86,10 +87,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     return runtime;
   };
   const remember = (state: WorkstreamState, ctx: ExtensionContext): WorkstreamState => {
-    ctx.ui.setStatus(
-      "workgraph",
-      `WG ${state.lifecycle.state} - ${state.attempts.filter((item) => ["running", "starting"].includes(item.state)).length} active`,
-    );
+    const active = state.attempts.filter((item) =>
+      ["running", "starting"].includes(item.state),
+    ).length;
+    ctx.ui.setStatus("workgraph", `WG ${state.lifecycle.state} - ${active} active`);
+    updateCalmWorkers(calm, state);
     return state;
   };
   const attachEffect = (
@@ -135,7 +137,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             { triggerTurn: true, deliverAs: "followUp" },
           );
         },
-        { owner: owner(ctx), priorOwnerLiveness },
+        {
+          owner: owner(ctx),
+          priorOwnerLiveness,
+          onState: (latest) => updateCalmWorkers(calm, latest),
+        },
       );
       const activate = host("activate attached runtime", () =>
         next.perform(() => Promise.resolve()),

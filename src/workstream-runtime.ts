@@ -94,6 +94,8 @@ export interface RuntimeOwnership {
   artifactRetentionIo?: ArtifactRetentionIo;
   /** Test-only clock injection; production uses Effect's live Clock service. */
   clock?: Clock.Clock;
+  /** Presentation/status observer for the latest reconciled state. */
+  onState?: (state: WorkstreamState) => void;
 }
 
 export class RuntimeDependencyError extends Data.TaggedError("RuntimeDependencyError")<{
@@ -129,6 +131,7 @@ export class WorkstreamRuntime {
   private readonly effectRuntime = ManagedRuntime.make(Layer.empty);
   private readonly artifactRetentionIo: ArtifactRetentionIo;
   private policy: ModelPolicy | undefined;
+  private readonly onState: (state: WorkstreamState) => void;
 
   constructor(
     readonly store: WorkstreamStore,
@@ -140,6 +143,7 @@ export class WorkstreamRuntime {
     ownership: RuntimeOwnership = {},
   ) {
     this.policy = ownership.policy;
+    this.onState = ownership.onState ?? (() => undefined);
     this.artifactRetentionIo = ownership.artifactRetentionIo ?? nodeArtifactRetentionIo;
     const application = ownership.clock
       ? Effect.provideService(this.application(ownership), Clock.Clock, ownership.clock)
@@ -539,7 +543,11 @@ export class WorkstreamRuntime {
           yield* Effect.forEach(state.deliveries, (delivery) => this.reconcileDelivery(delivery), {
             discard: true,
           });
-        return yield* this.dependency("store", "load reconciled state", () => this.store.load());
+        const reconciled = yield* this.dependency("store", "load reconciled state", () =>
+          this.store.load(),
+        );
+        yield* Effect.sync(() => this.onState(reconciled));
+        return reconciled;
       }.bind(this),
     );
   }

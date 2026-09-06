@@ -1,0 +1,466 @@
+// SAFETY: Pi's bundled runtime is inspected read-only to locate its actual presentation module.
+// oxlint-disable-next-line effecttsgo/node-builtin-import
+import { readdir, readFile } from "node:fs/promises";
+// SAFETY: These paths locate the read-only installed Pi bundle; no installed file is modified.
+// oxlint-disable-next-line effecttsgo/node-builtin-import
+import { dirname, join } from "node:path";
+// SAFETY: This converts the discovered installed module path to an import URL only.
+import { pathToFileURL } from "node:url";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ExtensionUIContext,
+} from "@earendil-works/pi-coding-agent";
+
+// SAFETY: This module is the narrowly guarded internal Pi rendering compatibility boundary.
+// Its unknown/reflection checks parse runtime exports and instances so a changed seam falls back visibly.
+// oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-runtime-typeof, anti-slop/no-reflect-get
+
+export const DEFAULT_CALM_HIDDEN_TOOLS = [
+  "bash",
+  "edit",
+  "find",
+  "grep",
+  "ls",
+  "powershell",
+  "read",
+  "write",
+  "fetch_content",
+  "get_search_content",
+  "source_check",
+  "web_search",
+  "workgraph_models",
+  "workgraph_research",
+  "workgraph_intent",
+  "workgraph_implement",
+  "workgraph_review",
+  "workgraph_inspect",
+  "workgraph_control",
+  "workgraph_adopt",
+  "workgraph_fork",
+  "workgraph_complete",
+  "workgraph_todo",
+  "workgraph_report",
+  "herdr_rename",
+] as const;
+
+export const CALM_OPERATIONAL_MESSAGE_TYPES = [
+  "pi-workgraph-workstream",
+  "pi-workgraph-attention",
+] as const;
+
+const CALM_STATUS_FRAMES = ["·", "•", "●", "•"] as const;
+const CALM_INTERVAL_MS = 400;
+const PATCH_OWNER = Symbol.for("@vistyy/pi-workgraph/calm-presentation");
+
+type Render = (width: number) => string[];
+type CalmMouseEvent = {
+  readonly [key: string]: string | number | boolean | undefined;
+};
+type MouseHandler = (event: CalmMouseEvent) => CalmMouseEvent | undefined;
+type PresentationInstance = {
+  render: Render;
+  handleMouse: MouseHandler | undefined;
+};
+type PresentationPrototype = PresentationInstance & {
+  readonly [PATCH_OWNER]?: Render;
+};
+type PresentationConstructor = {
+  prototype: PresentationPrototype;
+};
+export interface CalmPresentationModule {
+  readonly ToolExecutionComponent: PresentationConstructor;
+  readonly CustomMessageComponent: PresentationConstructor;
+}
+
+export interface CalmPresentationState {
+  on: boolean;
+  readonly hiddenTools: ReadonlySet<string>;
+  readonly hiddenMessageTypes: ReadonlySet<string>;
+}
+
+export interface CalmActivityState {
+  readonly coordinatorActive: boolean;
+  readonly activeWorkers: number;
+}
+
+export interface CalmMode {
+  setActiveWorkers(count: number): void;
+}
+
+type Detach = () => void;
+type Diagnostic = (message: string) => void;
+type PresentationLoader = () => Promise<unknown>;
+
+export function isCoordinatorScope(env: { readonly PI_WORKGRAPH_MODE?: string }): boolean {
+  return env.PI_WORKGRAPH_MODE === undefined || env.PI_WORKGRAPH_MODE === "";
+}
+
+export function parseCalmHiddenTools(raw: string | undefined): string[] {
+  if (raw === undefined || raw.trim() === "") return [...DEFAULT_CALM_HIDDEN_TOOLS];
+  return [
+    ...new Set(
+      raw
+        .split(",")
+        .map((name) => name.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+export function isCalmActivityActive(state: CalmActivityState): boolean {
+  return state.coordinatorActive || state.activeWorkers > 0;
+}
+
+export function calmStatus(state: CalmActivityState, frame: number): string {
+  const marker = isCalmActivityActive(state)
+    ? CALM_STATUS_FRAMES[frame % CALM_STATUS_FRAMES.length]
+    : CALM_STATUS_FRAMES[0];
+  const workers =
+    state.activeWorkers === 0
+      ? ""
+      : ` - ${state.activeWorkers} active worker${state.activeWorkers === 1 ? "" : "s"}`;
+  return `${marker} calm${workers}`;
+}
+
+export function attachCalmPresentation(
+  module: CalmPresentationModule,
+  state: CalmPresentationState,
+  diagnostic: Diagnostic,
+): Detach {
+  const detachTool = patchPrototype(
+    module.ToolExecutionComponent.prototype,
+    "tool rows",
+    (component) => readStringProperty(component, "toolName"),
+    (name) => state.hiddenTools.has(name),
+    state,
+    diagnostic,
+  );
+  try {
+    const detachMessage = patchPrototype(
+      module.CustomMessageComponent.prototype,
+      "custom messages",
+      (component) => readStringProperty(readProperty(component, "message"), "customType"),
+      (name) => state.hiddenMessageTypes.has(name),
+      state,
+      diagnostic,
+    );
+    return () => {
+      detachMessage();
+      detachTool();
+    };
+  } catch (error) {
+    detachTool();
+    throw error;
+  }
+}
+
+export function installCalmMode(
+  pi: ExtensionAPI,
+  options: {
+    readonly hiddenTools?: readonly string[];
+    readonly loadPresentation?: PresentationLoader;
+    readonly intervalMs?: number;
+  } = {},
+): CalmMode {
+  const state: CalmPresentationState = {
+    on: false,
+    hiddenTools: new Set(
+      options.hiddenTools ??
+        parseCalmHiddenTools(readEnvironmentVariable("PI_WORKGRAPH_CALM_HIDDEN_TOOLS")),
+    ),
+    hiddenMessageTypes: new Set(CALM_OPERATIONAL_MESSAGE_TYPES),
+  };
+  const loadPresentation = options.loadPresentation ?? loadPiPresentation;
+  const intervalMs = options.intervalMs ?? CALM_INTERVAL_MS;
+  let ui: ExtensionUIContext | undefined;
+  let detach: Detach | undefined;
+  let adapterReady = false;
+  let coordinatorActive = false;
+  let activeWorkers = 0;
+  let frame = 0;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  let generation = 0;
+  const diagnosed = new Set<string>();
+
+  const activity = (): CalmActivityState => ({ coordinatorActive, activeWorkers });
+  const stopTimer = (): void => {
+    if (timer !== undefined) clearInterval(timer);
+    timer = undefined;
+  };
+  const renderStatus = (): void => {
+    if (!state.on || ui === undefined) return;
+    ui.setStatus("calm", calmStatus(activity(), frame));
+  };
+  const syncTimer = (): void => {
+    if (!state.on || !isCalmActivityActive(activity())) {
+      stopTimer();
+      return;
+    }
+    if (timer !== undefined) return;
+    // SAFETY: This timer only drives presentation animation and is cleared by stopTimer/shutdown.
+    // oxlint-disable-next-line effecttsgo/global-timers
+    timer = setInterval(() => {
+      frame = (frame + 1) % CALM_STATUS_FRAMES.length;
+      renderStatus();
+    }, intervalMs);
+  };
+  const syncChrome = (): void => {
+    if (ui === undefined) return;
+    if (!state.on) {
+      stopTimer();
+      ui.setStatus("calm", undefined);
+      ui.setWorkingIndicator();
+      return;
+    }
+    ui.setWorkingIndicator({ frames: [...CALM_STATUS_FRAMES], intervalMs });
+    renderStatus();
+    syncTimer();
+  };
+  const diagnose = (message: string): void => {
+    if (diagnosed.has(message)) return;
+    diagnosed.add(message);
+    queueMicrotask(() =>
+      ui?.notify(`Calm unavailable: ${message} Rows remain visible.`, "warning"),
+    );
+  };
+  const detachPresentation = (): void => {
+    detach?.();
+    detach = undefined;
+    adapterReady = false;
+  };
+  const shutdown = (): void => {
+    generation += 1;
+    const wasOn = state.on;
+    state.on = false;
+    stopTimer();
+    detachPresentation();
+    if (wasOn && ui !== undefined) {
+      ui.setStatus("calm", undefined);
+      ui.setWorkingIndicator();
+    }
+    ui = undefined;
+    coordinatorActive = false;
+    activeWorkers = 0;
+    frame = 0;
+  };
+
+  pi.on("session_start", (_event, ctx) => {
+    shutdown();
+    ui = ctx.ui;
+    if (ctx.mode !== "tui") return;
+    const currentGeneration = generation;
+    return loadPresentation()
+      .then((loaded) => {
+        if (currentGeneration !== generation) return;
+        const presentation = decodePresentationModule(loaded);
+        if (presentation === undefined)
+          throw new Error("this Pi version does not expose the expected component classes.");
+        detach = attachCalmPresentation(presentation, state, diagnose);
+        adapterReady = true;
+      })
+      .catch((error: unknown) => {
+        if (currentGeneration !== generation) return;
+        detachPresentation();
+        diagnose(errorMessage(error));
+      });
+  });
+  pi.on("agent_start", () => {
+    coordinatorActive = true;
+    renderStatus();
+    syncTimer();
+  });
+  pi.on("agent_settled", () => {
+    coordinatorActive = false;
+    frame = 0;
+    renderStatus();
+    syncTimer();
+  });
+  pi.on("session_shutdown", () => shutdown());
+
+  pi.registerCommand("calm", {
+    description: "Toggle quiet coordinator presentation for operational tool and Workgraph rows",
+    handler: (_args, ctx) =>
+      Promise.resolve().then(() => {
+        if (!state.on && (!adapterReady || ctx.mode !== "tui")) {
+          ctx.ui.notify(
+            "Calm is unavailable in this session; operational rows remain visible.",
+            "warning",
+          );
+          return;
+        }
+        state.on = !state.on;
+        frame = 0;
+        syncChrome();
+        ctx.ui.notify(
+          `Calm ${state.on ? "on" : "off"} (${state.hiddenTools.size} tool names).`,
+          "info",
+        );
+      }),
+  });
+
+  return {
+    setActiveWorkers(count: number): void {
+      activeWorkers = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+      renderStatus();
+      syncTimer();
+    },
+  };
+}
+
+function patchPrototype(
+  prototype: PresentationPrototype,
+  label: string,
+  readName: (component: unknown) => string | undefined,
+  shouldHideName: (name: string) => boolean,
+  state: CalmPresentationState,
+  diagnostic: Diagnostic,
+): Detach {
+  if (typeof prototype?.render !== "function")
+    throw new Error(`the Pi ${label} render seam is missing.`);
+  if (readProperty(prototype, PATCH_OWNER) !== undefined)
+    throw new Error(`the Pi ${label} render seam is already adapted.`);
+  const originalRender = prototype.render;
+  const originalRenderDescriptor = Object.getOwnPropertyDescriptor(prototype, "render");
+  const originalMouse = prototype.handleMouse;
+  const originalMouseDescriptor = Object.getOwnPropertyDescriptor(prototype, "handleMouse");
+  let metadataWarning = false;
+  const hidden = (component: unknown): boolean => {
+    if (!state.on) return false;
+    const name = readName(component);
+    if (name !== undefined) return shouldHideName(name);
+    if (!metadataWarning) {
+      metadataWarning = true;
+      diagnostic(`the Pi ${label} metadata seam changed.`);
+    }
+    return false;
+  };
+  const wrappedRender: Render = function (this: PresentationInstance, width): string[] {
+    try {
+      if (hidden(this)) return [];
+    } catch (error) {
+      diagnostic(`the Pi ${label} filter failed: ${errorMessage(error)}.`);
+    }
+    return originalRender.call(this, width);
+  };
+  const wrappedMouse: MouseHandler | undefined =
+    originalMouse === undefined
+      ? undefined
+      : function (this: PresentationInstance, event): CalmMouseEvent | undefined {
+          try {
+            if (hidden(this)) return undefined;
+          } catch (error) {
+            diagnostic(`the Pi ${label} mouse filter failed: ${errorMessage(error)}.`);
+          }
+          return originalMouse.call(this, event);
+        };
+
+  const restore = (): void => {
+    if (originalRenderDescriptor === undefined) Reflect.deleteProperty(prototype, "render");
+    else Object.defineProperty(prototype, "render", originalRenderDescriptor);
+    if (wrappedMouse !== undefined) {
+      if (originalMouseDescriptor === undefined) Reflect.deleteProperty(prototype, "handleMouse");
+      else Object.defineProperty(prototype, "handleMouse", originalMouseDescriptor);
+    }
+    Reflect.deleteProperty(prototype, PATCH_OWNER);
+  };
+  try {
+    prototype.render = wrappedRender;
+    if (wrappedMouse !== undefined) prototype.handleMouse = wrappedMouse;
+    Object.defineProperty(prototype, PATCH_OWNER, {
+      configurable: true,
+      value: wrappedRender,
+    });
+  } catch (error) {
+    restore();
+    throw error;
+  }
+  let attached = true;
+  return () => {
+    if (!attached) return;
+    attached = false;
+    if (prototype.render !== wrappedRender)
+      diagnostic(`the Pi ${label} render seam changed before cleanup.`);
+    if (wrappedMouse !== undefined && prototype.handleMouse !== wrappedMouse)
+      diagnostic(`the Pi ${label} mouse seam changed before cleanup.`);
+    restore();
+  };
+}
+
+function decodePresentationModule(value: unknown): CalmPresentationModule | undefined {
+  const tool = readProperty(value, "ToolExecutionComponent");
+  const custom = readProperty(value, "CustomMessageComponent");
+  if (!isPresentationConstructor(tool) || !isPresentationConstructor(custom)) return undefined;
+  return { ToolExecutionComponent: tool, CustomMessageComponent: custom };
+}
+
+function isPresentationConstructor(value: unknown): value is PresentationConstructor {
+  if (typeof value !== "function") return false;
+  const prototype = readProperty(value, "prototype");
+  return readProperty(prototype, "render") instanceof Function;
+}
+
+function readProperty(value: unknown, key: PropertyKey): unknown {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null)
+    return undefined;
+  return Reflect.get(value, key);
+}
+
+function readStringProperty(value: unknown, key: PropertyKey): string | undefined {
+  const property = readProperty(value, key);
+  return typeof property === "string" ? property : undefined;
+}
+
+function readEnvironmentVariable(name: string): string | undefined {
+  const value = Reflect.get(process.env, name);
+  return typeof value === "string" ? value : undefined;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export function activeWorkerCount(state: {
+  readonly attempts: readonly { readonly state: string }[];
+}): number {
+  return state.attempts.filter(
+    (attempt) => attempt.state === "running" || attempt.state === "starting",
+  ).length;
+}
+
+export function updateCalmWorkers(
+  calm: CalmMode,
+  state: Parameters<typeof activeWorkerCount>[0],
+): void {
+  calm.setActiveWorkers(activeWorkerCount(state));
+}
+
+function loadPiPresentation(): Promise<unknown> {
+  const entrypoint = process.argv[1];
+  if (entrypoint === undefined || entrypoint === "")
+    return import("@earendil-works/pi-coding-agent");
+  const chunks = join(dirname(entrypoint), "chunks");
+  return readdir(chunks, { withFileTypes: true })
+    .then((entries) =>
+      Promise.all(
+        entries
+          .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+          .map((entry) => {
+            const path = join(chunks, entry.name);
+            return readFile(path, "utf8").then((source) => ({ path, source }));
+          }),
+      ),
+    )
+    .then((candidates) => {
+      const match = candidates.find(
+        ({ source }) =>
+          source.includes("ToolExecutionComponent") && source.includes("CustomMessageComponent"),
+      );
+      return match === undefined
+        ? import("@earendil-works/pi-coding-agent")
+        : import(pathToFileURL(match.path).href);
+    })
+    .catch(() => import("@earendil-works/pi-coding-agent"));
+}
+
+export type CalmContext = Pick<ExtensionContext, "mode" | "ui">;
