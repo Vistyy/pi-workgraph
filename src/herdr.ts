@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { Effect } from "effect";
 import {
+  decodeAgent,
   decodeAgentResponse,
   decodeCoordinatorAgentResponse,
   decodeCoordinatorSnapshotResponse,
@@ -400,6 +401,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       ...(request.compatibleAgentNames ?? []),
     ]);
     const matches = agents.filter((candidate) => {
+      if (candidate.name === undefined) return false;
       const sessionFile = candidate.agent_session?.value;
       const resource = request.resource;
       const resourceMatches = resource
@@ -424,7 +426,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       throw new Error(`Herdr recovery found ${matches.length} workers for ${request.agentName}.`);
     const match = matches[0];
     if (match === undefined) return undefined;
-    const current = parseAgent(match);
+    const current = parseAgent(decodeAgent(match));
     const resource = request.resource ?? resourceOf(current);
     assertResource(resource, current);
     if (current.sessionFile === undefined)

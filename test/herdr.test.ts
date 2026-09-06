@@ -176,6 +176,74 @@ await test("current-session coordinator observation accepts an unnamed detected 
   }
 });
 
+await test("exact worker recover succeeds despite unrelated unnamed snapshot entry", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-recover-"));
+  const responsePath = join(parent, "snapshot.json");
+  const command = join(parent, "fake-herdr-recover.mjs");
+  const identity: WorkerIdentity = {
+    workspaceId: "workspace-1",
+    tabId: "workspace-1:tab-1",
+    paneId: "workspace-1:pane-1",
+    terminalId: "terminal-1",
+    agentName: "owned-worker",
+    sessionFile: join(parent, "worker.jsonl"),
+    cwd: join(parent, "worktree"),
+  };
+  const exactWorker = {
+    workspace_id: identity.workspaceId,
+    tab_id: identity.tabId,
+    pane_id: identity.paneId,
+    terminal_id: identity.terminalId,
+    agent_status: "working",
+    name: identity.agentName,
+    cwd: identity.cwd,
+    agent_session: { value: identity.sessionFile },
+  };
+  const unrelatedUnnamed = {
+    workspace_id: "wW4",
+    tab_id: "wW4:t1",
+    pane_id: "wW4:p1",
+    terminal_id: "unrelated-terminal",
+    agent_status: "idle",
+    cwd: parent,
+  };
+  await writeFile(
+    command,
+    `#!/usr/bin/env node\nimport { readFileSync } from "node:fs";\nconst agents = JSON.parse(readFileSync(${JSON.stringify(responsePath)}, "utf8"));\nconsole.log(JSON.stringify({result:{snapshot:{agents}}}));\n`,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, {
+    HERDR_ENV: "1",
+    HERDR_WORKSPACE_ID: identity.workspaceId,
+  });
+  const request = {
+    workspaceId: identity.workspaceId,
+    agentName: identity.agentName,
+    sessionFile: identity.sessionFile,
+    cwd: identity.cwd,
+  };
+  try {
+    await writeFile(responsePath, JSON.stringify([unrelatedUnnamed, exactWorker]));
+    const recovered = await runtime.recover(request);
+    assert.deepEqual(recovered?.identity, identity);
+    assert.equal(recovered?.status, "working");
+
+    await writeFile(
+      responsePath,
+      JSON.stringify([unrelatedUnnamed, { ...exactWorker, name: "foreign-worker" }]),
+    );
+    assert.equal(await runtime.recover(request), undefined);
+
+    // SAFETY: This intentionally incomplete protocol fixture verifies that a matching worker is not converted without exact identity fields.
+    const malformedWorker = structuredClone(exactWorker) as Partial<typeof exactWorker>;
+    delete malformedWorker.terminal_id;
+    await writeFile(responsePath, JSON.stringify([unrelatedUnnamed, malformedWorker]));
+    await assert.rejects(() => runtime.recover(request), /snapshot response omitted valid agents/);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 await test("coordinator forks into a new unfocused workspace with isolated Pi identity", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-fork-"));
   const log = join(parent, "commands.jsonl");

@@ -9,15 +9,22 @@ export const AgentStatusSchema = Type.Union([
   Type.Literal("unknown"),
 ]);
 const AgentSessionSchema = Type.Object({ value: Type.String({ minLength: 1 }) });
-const AgentSchema = Type.Object({
+const AgentObservationProperties = {
   workspace_id: Type.String({ minLength: 1 }),
   tab_id: Type.String({ minLength: 1 }),
   pane_id: Type.String({ minLength: 1 }),
   terminal_id: Type.String({ minLength: 1 }),
   agent_status: AgentStatusSchema,
-  name: Type.String({ minLength: 1 }),
   cwd: Type.String({ minLength: 1 }),
   agent_session: Type.Optional(AgentSessionSchema),
+};
+const AgentSchema = Type.Object({
+  ...AgentObservationProperties,
+  name: Type.String({ minLength: 1 }),
+});
+const SnapshotAgentSchema = Type.Object({
+  ...AgentObservationProperties,
+  name: Type.Optional(Type.String({ minLength: 1 })),
 });
 const CoordinatorAgentSchema = Type.Object({
   workspace_id: Type.String({ minLength: 1 }),
@@ -53,7 +60,7 @@ const CoordinatorAgentResponseSchema = Type.Object({
   result: Type.Object({ agent: CoordinatorAgentSchema }),
 });
 const SnapshotResponseSchema = Type.Object({
-  result: Type.Object({ snapshot: Type.Object({ agents: Type.Array(AgentSchema) }) }),
+  result: Type.Object({ snapshot: Type.Object({ agents: Type.Array(SnapshotAgentSchema) }) }),
 });
 const CoordinatorSnapshotResponseSchema = Type.Object({
   result: Type.Object({
@@ -95,6 +102,7 @@ const ErrorResponseSchema = Type.Object({
 });
 
 type DecodedAgent = Static<typeof AgentSchema>;
+type DecodedSnapshotAgent = Static<typeof SnapshotAgentSchema>;
 type DecodedCoordinatorAgent = Static<typeof CoordinatorAgentSchema>;
 type DecodedPane = Static<typeof PaneSchema>;
 type DecodedProcessInfo = Static<typeof ProcessInfoSchema>;
@@ -171,7 +179,7 @@ export function decodeCoordinatorSnapshotResponse(value: unknown): readonly (str
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This named decoder validates the complete Herdr worker snapshot response.
-export function decodeSnapshotResponse(value: unknown): readonly DecodedAgent[] {
+export function decodeSnapshotResponse(value: unknown): readonly DecodedSnapshotAgent[] {
   if (!Value.Check(SnapshotResponseSchema, value))
     throw new Error("Herdr snapshot response omitted valid agents.");
   return Value.Decode(SnapshotResponseSchema, value).result.snapshot.agents;
