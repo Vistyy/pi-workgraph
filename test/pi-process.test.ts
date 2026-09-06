@@ -1,17 +1,22 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- This is a real native SessionManager filesystem boundary test.
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Native temporary paths are part of the SessionManager test boundary.
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
+import { liveLayer } from "../src/node-platform.js";
 import {
   createWorkerSession,
+  createWorkerSessionEffect,
   effectiveModelObservations,
+  forkConversationSessionEffect,
   hasNativeAgentSettled,
   hasNativeAgentStarted,
   observeNativeFailure,
+  PiSessionError,
   readTerminalText,
   readWorkgraphReportResult,
 } from "../src/pi-process.js";
@@ -87,6 +92,52 @@ await test("fresh worker context, explicit continuation, native generation marke
     assert.equal(hasNativeAgentSettled(continuation, next.runId, next.nodeId), false);
     assert.equal(readWorkgraphReportResult(continuation, next).invalid, false);
     assert.equal(readWorkgraphReportResult(continuation, next).report, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+await test("session Effects distinguish provider persistence failures from native lineage failures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "workgraph-session-errors-"));
+  const generation = { runId: "failure-fixture", nodeId: "first" };
+  try {
+    const blockedSessionDir = join(root, "not-a-directory");
+    await writeFile(blockedSessionDir, "fixture");
+    const providerFailure = await Effect.runPromise(
+      Effect.flip(
+        Effect.provide(
+          createWorkerSessionEffect({
+            ...generation,
+            targetCwd: root,
+            sessionDir: blockedSessionDir,
+            objective: "Cannot persist",
+            mode: "research",
+          }),
+          liveLayer,
+        ),
+      ),
+    );
+    assert.equal(providerFailure._tag, "PlatformError");
+
+    const parentFile = await createWorkerSession({
+      ...generation,
+      targetCwd: root,
+      sessionDir: join(root, "sessions"),
+      objective: "Create parent",
+      mode: "research",
+    });
+    const nativeFailure = await Effect.runPromise(
+      Effect.flip(
+        forkConversationSessionEffect({
+          parentSessionFile: parentFile,
+          targetCwd: root,
+          entryId: "missing-entry",
+        }),
+      ),
+    );
+    assert.ok(nativeFailure instanceof PiSessionError);
+    assert.equal(nativeFailure.operation, "validate-entry");
+    assert.match(nativeFailure.message, /Unknown conversation entry/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

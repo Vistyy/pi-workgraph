@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This adapter preserves the host's Promise-based atomic file contract.
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Native paths are part of the public configuration API.
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Data, Effect, FileSystem, Path } from "effect";
+import type { PlatformError } from "effect/PlatformError";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import { runNodePlatformPromise } from "./node-platform.js";
 
 export const MODEL_ROLES = [
   "research",
@@ -52,6 +53,17 @@ export interface ModelPolicy {
   version: 3;
   roles: Record<ModelRole, ModelTarget>;
   workerPool: ModelTarget[];
+}
+
+export type ModelPolicyOperation = "parse" | "decode" | "temporary-path";
+
+export class ModelPolicyError extends Data.TaggedError("ModelPolicyError")<{
+  readonly operation: ModelPolicyOperation;
+  readonly path: string;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {
+  override readonly name = "Error";
 }
 
 const RESEARCH_TARGET: ModelTarget = {
@@ -145,26 +157,62 @@ function applyConfiguredRoles(policy: ModelPolicyInput, result: ModelPolicy): vo
   }
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- Public host callers and native file I/O use Promise interoperability.
-export async function loadModelPolicy(path = modelPolicyPath()): Promise<ModelPolicy> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await readFile(path, "utf8"));
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT")
-      return structuredClone(DEFAULT_MODEL_POLICY);
-    if (error instanceof SyntaxError) throw new Error("Invalid Workgraph model policy JSON.");
-    throw error;
-  }
-  const policy = decodeModelPolicyInput(parsed);
-  const result = structuredClone(DEFAULT_MODEL_POLICY);
-  applyConfiguredRoles(policy, result);
-  if (policy.version === 3 && policy.workerPool !== undefined) {
-    if (!Value.Check(WorkerPoolSchema, policy.workerPool))
-      throw new Error("Invalid Workgraph worker pool.");
-    result.workerPool = Value.Decode(WorkerPoolSchema, policy.workerPool);
-  }
-  return result;
+export function loadModelPolicyEffect(
+  path = modelPolicyPath(),
+): Effect.Effect<ModelPolicy, ModelPolicyError | PlatformError, FileSystem.FileSystem> {
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const contents = yield* fileSystem.readFileString(path).pipe(
+      Effect.catchIf(
+        (error) => error.reason._tag === "NotFound",
+        () => Effect.void,
+      ),
+    );
+    if (contents === undefined) return structuredClone(DEFAULT_MODEL_POLICY);
+    const parsed = yield* Effect.try({
+      // oxlint-disable-next-line anti-slop/no-unknown-returns, effecttsgo/prefer-schema-over-json -- The established TypeBox decoder immediately validates this external JSON value.
+      try: (): unknown => JSON.parse(contents),
+      catch: () =>
+        new ModelPolicyError({
+          operation: "parse",
+          path,
+          message: "Invalid Workgraph model policy JSON.",
+        }),
+    });
+    return yield* decodeModelPolicyEffect(parsed, path);
+  });
+}
+
+/** Promise facade for current Pi host callers. */
+export function loadModelPolicy(path = modelPolicyPath()): Promise<ModelPolicy> {
+  return runNodePlatformPromise(loadModelPolicyEffect(path));
+}
+
+function decodeModelPolicyEffect(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This boundary immediately validates the parsed JSON with the established TypeBox schema.
+  parsed: unknown,
+  path: string,
+): Effect.Effect<ModelPolicy, ModelPolicyError> {
+  return Effect.try({
+    try: () => {
+      const policy = decodeModelPolicyInput(parsed);
+      const result = structuredClone(DEFAULT_MODEL_POLICY);
+      applyConfiguredRoles(policy, result);
+      if (policy.version === 3 && policy.workerPool !== undefined) {
+        if (!Value.Check(WorkerPoolSchema, policy.workerPool))
+          throw new Error("Invalid Workgraph worker pool.");
+        result.workerPool = Value.Decode(WorkerPoolSchema, policy.workerPool);
+      }
+      return result;
+    },
+    catch: (cause) =>
+      new ModelPolicyError({
+        operation: "decode",
+        path,
+        message: cause instanceof Error ? cause.message : "Invalid Workgraph model policy.",
+        cause,
+      }),
+  });
 }
 
 export function resolveSelection(
@@ -243,42 +291,83 @@ function uniqueTargets(targets: ModelTarget[]): ModelTarget[] {
   });
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- Public host callers and native file I/O use Promise interoperability.
-export async function setModelPool(
+export function setModelPoolEffect(
   pool: ModelTarget[],
   path = modelPolicyPath(),
-): Promise<ModelPolicy> {
-  if (!Value.Check(WorkerPoolSchema, pool)) throw new Error("Invalid model pool.");
-  const policy = await loadModelPolicy(path);
-  policy.workerPool = structuredClone(pool);
-  return writeModelPolicy(policy, path);
+): Effect.Effect<ModelPolicy, ModelPolicyError | PlatformError, FileSystem.FileSystem | Path.Path> {
+  return Effect.gen(function* () {
+    if (!Value.Check(WorkerPoolSchema, pool))
+      return yield* new ModelPolicyError({
+        operation: "decode",
+        path,
+        message: "Invalid model pool.",
+      });
+    const policy = yield* loadModelPolicyEffect(path);
+    policy.workerPool = structuredClone(pool);
+    return yield* writeModelPolicyEffect(policy, path);
+  });
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- Public host callers and native file I/O use Promise interoperability.
-export async function setModelRole(
+/** Promise facade for current Pi host callers. */
+export function setModelPool(pool: ModelTarget[], path = modelPolicyPath()): Promise<ModelPolicy> {
+  return runNodePlatformPromise(setModelPoolEffect(pool, path));
+}
+
+export function setModelRoleEffect(
+  role: ModelRole,
+  target: ModelTarget,
+  path = modelPolicyPath(),
+): Effect.Effect<ModelPolicy, ModelPolicyError | PlatformError, FileSystem.FileSystem | Path.Path> {
+  return Effect.gen(function* () {
+    if (!MODEL_ROLES.includes(role) || !Value.Check(ModelTargetSchema, target))
+      return yield* new ModelPolicyError({
+        operation: "decode",
+        path,
+        message: "Invalid model role or target.",
+      });
+    const policy = yield* loadModelPolicyEffect(path);
+    policy.roles[role] = Value.Decode(ModelTargetSchema, target);
+    return yield* writeModelPolicyEffect(policy, path);
+  });
+}
+
+/** Promise facade for current Pi host callers. */
+export function setModelRole(
   role: ModelRole,
   target: ModelTarget,
   path = modelPolicyPath(),
 ): Promise<ModelPolicy> {
-  if (!MODEL_ROLES.includes(role) || !Value.Check(ModelTargetSchema, target))
-    throw new Error("Invalid model role or target.");
-  const policy = await loadModelPolicy(path);
-  policy.roles[role] = Value.Decode(ModelTargetSchema, target);
-  return writeModelPolicy(policy, path);
+  return runNodePlatformPromise(setModelRoleEffect(role, target, path));
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- Atomic native file replacement is deliberately owned by this Promise adapter.
-async function writeModelPolicy(pathPolicy: ModelPolicy, path: string): Promise<ModelPolicy> {
-  await mkdir(dirname(path), { recursive: true });
-  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temporaryPath, `${JSON.stringify(pathPolicy, null, 2)}\n`, {
-      encoding: "utf8",
-      mode: 0o600,
+function writeModelPolicyEffect(
+  pathPolicy: ModelPolicy,
+  path: string,
+): Effect.Effect<ModelPolicy, ModelPolicyError | PlatformError, FileSystem.FileSystem | Path.Path> {
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const paths = yield* Path.Path;
+    yield* fileSystem.makeDirectory(paths.dirname(path), { recursive: true });
+    const temporaryPath = yield* Effect.try({
+      try: () => `${path}.${process.pid}.${randomUUID()}.tmp`,
+      catch: (cause) =>
+        new ModelPolicyError({
+          operation: "temporary-path",
+          path,
+          message: "Could not create a temporary model policy path.",
+          cause,
+        }),
     });
-    await rename(temporaryPath, path);
-  } finally {
-    await rm(temporaryPath, { force: true });
-  }
-  return pathPolicy;
+    const replace = Effect.gen(function* () {
+      // oxlint-disable-next-line effecttsgo/prefer-schema-over-json -- The established TypeBox-owned policy is serialized in its existing human-readable format.
+      yield* fileSystem.writeFileString(temporaryPath, `${JSON.stringify(pathPolicy, null, 2)}\n`, {
+        mode: 0o600,
+      });
+      yield* fileSystem.rename(temporaryPath, path);
+    });
+    const replacement = yield* Effect.exit(replace);
+    yield* fileSystem.remove(temporaryPath, { force: true });
+    yield* replacement;
+    return pathPolicy;
+  });
 }

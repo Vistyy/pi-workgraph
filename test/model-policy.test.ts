@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- This test verifies the native atomic policy-file boundary.
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Native temporary paths are part of the policy-file test boundary.
 import { join } from "node:path";
 import test from "node:test";
+import { Effect } from "effect";
 import {
   DEFAULT_MODEL_POLICY,
   loadModelPolicy,
+  loadModelPolicyEffect,
+  ModelPolicyError,
   resolveSelection,
   setModelRole,
 } from "../src/model-policy.js";
+import { liveLayer } from "../src/node-platform.js";
 
 await test("policy defaults, read-only legacy mapping and explicit current-role writes use isolated paths", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-models-"));
@@ -51,6 +55,7 @@ await test("policy defaults, read-only legacy mapping and explicit current-role 
     assert.equal(mapped.roles["implementation.executor"].model, "fixture/executor");
     assert.equal(await readFile(path, "utf8"), legacy);
     await setModelRole("review", { model: "fixture/new", thinking: "max" }, path);
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
     assert.equal((await loadModelPolicy(path)).roles.review.model, "fixture/new");
     assert.equal((await loadModelPolicy(path)).roles.research.model, "fixture/research");
     await assert.rejects(
@@ -63,6 +68,27 @@ await test("policy defaults, read-only legacy mapping and explicit current-role 
     await assert.rejects(loadModelPolicy(path), /^Error: Invalid Workgraph model policy JSON\.$/);
     await writeFile(path, '{"version":2,"roles":{"review":{"model":"p/m","thinking":"invalid"}}}');
     await assert.rejects(loadModelPolicy(path), /Invalid model target/);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+await test("policy Effect classifies malformed data separately from provider failures", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-policy-errors-"));
+  const malformed = join(parent, "malformed.json");
+  try {
+    await writeFile(malformed, '{"credential":"not-retained"');
+    const parseFailure = await Effect.runPromise(
+      Effect.flip(Effect.provide(loadModelPolicyEffect(malformed), liveLayer)),
+    );
+    assert.ok(parseFailure instanceof ModelPolicyError);
+    assert.equal(parseFailure.operation, "parse");
+    assert.equal(parseFailure.message.includes("not-retained"), false);
+
+    const providerFailure = await Effect.runPromise(
+      Effect.flip(Effect.provide(loadModelPolicyEffect(parent), liveLayer)),
+    );
+    assert.equal(providerFailure._tag, "PlatformError");
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

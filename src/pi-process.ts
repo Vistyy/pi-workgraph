@@ -1,8 +1,9 @@
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- SessionManager persistence uses the host's native Promise-based filesystem.
-import { mkdir } from "node:fs/promises";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Data, Effect, FileSystem } from "effect";
+import type { PlatformError } from "effect/PlatformError";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import { runNodePlatformPromise } from "./node-platform.js";
 import { isWorkerReport } from "./report-schema.js";
 import type { WorkerMode, WorkerReport } from "./types.js";
 
@@ -20,80 +21,155 @@ type EffectiveModel = Static<typeof EffectiveModelSchema>;
 export type NativeFailureCategory = "provider-rate-limit" | "native-abort" | "native-error";
 const PROVIDER_RATE_LIMIT_PATTERN = /(?:\b429\b|rate[\s_-]*limit|too many requests)/i;
 
-// oxlint-disable-next-line effecttsgo/async-function -- Public Pi host callers require Promise interoperability.
-export async function forkConversationSession(request: {
+export type PiSessionOperation =
+  | "open-parent"
+  | "validate-entry"
+  | "fork"
+  | "branch"
+  | "create"
+  | "append-objective"
+  | "persist-new-session"
+  | "resolve-session-file";
+
+export class PiSessionError extends Data.TaggedError("PiSessionError")<{
+  readonly operation: PiSessionOperation;
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+type ForkConversationRequest = {
   parentSessionFile: string;
   targetCwd: string;
   entryId?: string;
-}): Promise<string> {
-  const parent = SessionManager.open(request.parentSessionFile);
-  if (request.entryId !== undefined && !parent.getEntry(request.entryId))
-    throw new Error(`Unknown conversation entry: ${request.entryId}`);
-  const child = SessionManager.forkFrom(request.parentSessionFile, request.targetCwd);
-  if (request.entryId !== undefined) child.branch(request.entryId);
-  const file = child.getSessionFile();
-  if (file === undefined)
-    throw new Error("Forked coordinator session did not produce a session file.");
-  return file;
+};
+
+export function forkConversationSessionEffect(
+  request: ForkConversationRequest,
+): Effect.Effect<string, PiSessionError> {
+  return Effect.gen(function* () {
+    const parent = yield* nativeSession("open-parent", () =>
+      SessionManager.open(request.parentSessionFile),
+    );
+    const { entryId } = request;
+    if (entryId !== undefined) {
+      const entry = yield* nativeSession("validate-entry", () => parent.getEntry(entryId));
+      if (!entry)
+        return yield* new PiSessionError({
+          operation: "validate-entry",
+          message: `Unknown conversation entry: ${entryId}`,
+        });
+    }
+    const child = yield* nativeSession("fork", () =>
+      SessionManager.forkFrom(request.parentSessionFile, request.targetCwd),
+    );
+    if (entryId !== undefined) yield* nativeSession("branch", () => child.branch(entryId));
+    const file = yield* nativeSession("resolve-session-file", () => child.getSessionFile());
+    if (file === undefined)
+      return yield* new PiSessionError({
+        operation: "resolve-session-file",
+        message: "Forked coordinator session did not produce a session file.",
+      });
+    return file;
+  });
 }
 
+/** Promise facade for current Pi host callers. */
+export function forkConversationSession(request: ForkConversationRequest): Promise<string> {
+  return runNodePlatformPromise(forkConversationSessionEffect(request));
+}
+
+type CreateWorkerRequest = Generation & {
+  targetCwd: string;
+  sessionDir: string;
+  objective: string;
+  mode: WorkerMode;
+  continuationSessionFile?: string;
+};
+
 /** Workers are fresh by default. Continuation explicitly names an earlier worker session. */
-// oxlint-disable-next-line effecttsgo/async-function -- Public Pi host callers and native session persistence require Promise interoperability.
-export async function createWorkerSession(
-  request: Generation & {
-    targetCwd: string;
-    sessionDir: string;
-    objective: string;
-    mode: WorkerMode;
-    continuationSessionFile?: string;
-  },
-): Promise<string> {
-  await mkdir(request.sessionDir, { recursive: true });
-  const child =
-    request.continuationSessionFile !== undefined
-      ? SessionManager.forkFrom(
-          request.continuationSessionFile,
-          request.targetCwd,
-          request.sessionDir,
-        )
-      : SessionManager.create(request.targetCwd, request.sessionDir);
-  child.appendCustomMessageEntry(
-    "pi-workgraph-objective",
-    [
-      `[WORKGRAPH ${request.mode.toUpperCase()} OBJECTIVE]`,
-      `Workstream: ${request.runId}`,
-      `Attempt: ${request.nodeId}`,
-      "",
-      request.objective.trim(),
-    ].join("\n"),
-    true,
-    { runId: request.runId, nodeId: request.nodeId, mode: request.mode },
-  );
-  if (request.continuationSessionFile === undefined) {
-    // Pi defers a new session's disk flush until its first assistant message.
-    // This local persistence marker is excluded from worker evidence/model observations.
-    child.appendMessage({
-      role: "assistant",
-      content: [{ type: "text", text: "Workgraph assignment loaded." }],
-      api: "openai-responses",
-      provider: "workgraph",
-      model: "workgraph",
-      usage: {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        totalTokens: 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-      },
-      stopReason: "stop",
-      // oxlint-disable-next-line effecttsgo/global-date -- Pi's native persisted message contract requires an epoch timestamp.
-      timestamp: Date.now(),
-    });
-  }
-  const file = child.getSessionFile();
-  if (file === undefined) throw new Error("Worker session did not produce a session file.");
-  return file;
+export function createWorkerSessionEffect(
+  request: CreateWorkerRequest,
+): Effect.Effect<string, PiSessionError | PlatformError, FileSystem.FileSystem> {
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    yield* fileSystem.makeDirectory(request.sessionDir, { recursive: true });
+    const child = yield* nativeSession(
+      request.continuationSessionFile === undefined ? "create" : "fork",
+      () =>
+        request.continuationSessionFile !== undefined
+          ? SessionManager.forkFrom(
+              request.continuationSessionFile,
+              request.targetCwd,
+              request.sessionDir,
+            )
+          : SessionManager.create(request.targetCwd, request.sessionDir),
+    );
+    yield* nativeSession("append-objective", () =>
+      child.appendCustomMessageEntry(
+        "pi-workgraph-objective",
+        [
+          `[WORKGRAPH ${request.mode.toUpperCase()} OBJECTIVE]`,
+          `Workstream: ${request.runId}`,
+          `Attempt: ${request.nodeId}`,
+          "",
+          request.objective.trim(),
+        ].join("\n"),
+        true,
+        { runId: request.runId, nodeId: request.nodeId, mode: request.mode },
+      ),
+    );
+    if (request.continuationSessionFile === undefined) {
+      // Pi defers a new session's disk flush until its first assistant message.
+      // This local persistence marker is excluded from worker evidence/model observations.
+      yield* nativeSession("persist-new-session", () =>
+        child.appendMessage({
+          role: "assistant",
+          content: [{ type: "text", text: "Workgraph assignment loaded." }],
+          api: "openai-responses",
+          provider: "workgraph",
+          model: "workgraph",
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          // oxlint-disable-next-line effecttsgo/global-date -- Pi's native persisted message contract requires an epoch timestamp.
+          timestamp: Date.now(),
+        }),
+      );
+    }
+    const file = yield* nativeSession("resolve-session-file", () => child.getSessionFile());
+    if (file === undefined)
+      return yield* new PiSessionError({
+        operation: "resolve-session-file",
+        message: "Worker session did not produce a session file.",
+      });
+    return file;
+  });
+}
+
+/** Promise facade for current Pi host callers. */
+export function createWorkerSession(request: CreateWorkerRequest): Promise<string> {
+  return runNodePlatformPromise(createWorkerSessionEffect(request));
+}
+
+function nativeSession<A>(
+  operation: PiSessionOperation,
+  run: () => A,
+): Effect.Effect<A, PiSessionError> {
+  return Effect.try({
+    try: run,
+    catch: (cause) =>
+      new PiSessionError({
+        operation,
+        message: `Pi SessionManager ${operation} failed.`,
+        cause,
+      }),
+  });
 }
 
 export interface WorkgraphReportRead {
