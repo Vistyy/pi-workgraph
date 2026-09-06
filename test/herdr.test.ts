@@ -654,6 +654,17 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       assert.equal(live.identity.agentName, agentName);
       assert.equal(live.evidence.process.state, "observed");
     }
+    const launchPaneOnly = await runtime.inspectLaunch({
+      workspaceId: request.workspaceId,
+      paneId: request.paneId,
+      sessionFile: request.sessionFile,
+      cwd: request.cwd,
+    });
+    assert.equal(launchPaneOnly.state, "live");
+    if (launchPaneOnly.state === "live") {
+      assert.equal(launchPaneOnly.identity.tabId, request.tabId);
+      assert.equal(launchPaneOnly.identity.terminalId, request.terminalId);
+    }
     await writeFile(modePath, "process-unknown");
     const liveWithoutProcessEvidence = await runtime.inspectLaunch(request);
     assert.equal(liveWithoutProcessEvidence.state, "live");

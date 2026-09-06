@@ -30,6 +30,8 @@ const transportStateSchema = Type.Object({
   closed: Type.Boolean(),
   paneGone: Type.Optional(Type.Boolean()),
   tabGone: Type.Optional(Type.Boolean()),
+  agentGone: Type.Optional(Type.Boolean()),
+  startupFailure: Type.Optional(Type.Boolean()),
   errorCode: Type.Optional(Type.String()),
   mismatchedCwd: Type.Optional(Type.String()),
 });
@@ -38,6 +40,8 @@ type TransportChange = {
   closed?: boolean;
   paneGone?: boolean;
   tabGone?: boolean;
+  agentGone?: boolean;
+  startupFailure?: boolean;
   errorCode?: string | undefined;
   mismatchedCwd?: string | undefined;
 };
@@ -90,10 +94,17 @@ if (args[0] === "tab" && args[1] === "create") {
   state.name = args[2];
   state.sessionFile = value("--session");
   save();
+  if (state.startupFailure) fail("startup_failed");
   console.log(JSON.stringify({result:{agent:{workspace_id:"recovery-workspace",tab_id:"recovery-workspace:tab-1",pane_id:"recovery-workspace:pane-1",terminal_id:"terminal-1",agent_status:state.status,name:state.name,cwd:state.cwd,agent_session:{value:state.sessionFile}}}}));
 } else if (args[0] === "agent" && args[1] === "get") {
   if (state.closed || state.paneGone) fail(state.errorCode || "pane_not_found");
+  if (state.agentGone) fail("agent_not_found");
   console.log(JSON.stringify({result:{agent:{workspace_id:"recovery-workspace",tab_id:"recovery-workspace:tab-1",pane_id:"recovery-workspace:pane-1",terminal_id:"terminal-1",agent_status:state.status,name:state.name,cwd:state.mismatchedCwd || state.cwd,agent_session:{value:state.sessionFile}}}}));
+} else if (args[0] === "pane" && args[1] === "get") {
+  if (state.closed || state.paneGone) fail("pane_not_found");
+  console.log(JSON.stringify({result:{pane:{workspace_id:"recovery-workspace",tab_id:"recovery-workspace:tab-1",pane_id:"recovery-workspace:pane-1",terminal_id:"terminal-1",cwd:state.cwd}}}));
+} else if (args[0] === "pane" && args[1] === "process-info") {
+  console.log(JSON.stringify({result:{shell_pid:10,foreground_process_group_id:11,foreground_processes:["fish","pi"]}}));
 } else if (args[0] === "tab" && args[1] === "close") {
   state.closed = true;
   save();
@@ -279,6 +290,71 @@ async function prepareBlockedComposition(integrated: boolean, dirtyRoot = false)
   if (dirtyRoot) await rm(join(f.root, "transient-root.txt"));
   await f.attachPublic();
   return { f, attempt, workerCommit, integratedRevision };
+}
+
+async function prepareFailedProposal(attach = true) {
+  const f = await recoveryFixture();
+  const authority = await f.authorize();
+  await f.runtime.queue({
+    id: "failed-change",
+    capability: "implement",
+    artifactIntent: "maintained_change",
+    objective: "Attempt the value change",
+    intentVersion: authority.intentVersion,
+    authority,
+    acceptance: ["Retain exact failed proposal evidence"],
+  });
+  await f.runtime.reconcile();
+  let state = await f.store.load();
+  const attempt = required(state.attempts[0], "failed implementation attempt");
+  const worktreePath = required(attempt.worktreePath, "failed implementation worktree");
+  await writeFile(join(worktreePath, "value.txt"), "partial proposal\n");
+  await git(worktreePath, "add", ".");
+  await git(worktreePath, "commit", "-m", "Failed partial proposal");
+  const workerCommit = await git(worktreePath, "rev-parse", "HEAD");
+  const report: WorkerReport = {
+    kind: "implementation",
+    status: "failed",
+    summary: "Implementation failed after producing an inspectable partial proposal",
+    evidence: [{ label: "partial", observation: workerCommit }],
+    findings: [],
+  };
+  await f.settle(report);
+  state = await f.runtime.reconcile();
+  assert.equal(state.results[0]?.validity, "typed");
+  assert.deepEqual(state.results[0]?.report, report);
+  assert.equal(state.attempts[0]?.composition, undefined);
+  assert.equal(state.attempts[0]?.cleanup, undefined);
+  if (attach) await f.attachPublic();
+  return { f, attempt, workerCommit, report };
+}
+
+async function prepareIdentitylessCancelledLaunch() {
+  const f = await recoveryFixture();
+  const authority = await f.authorize();
+  await f.setTransport({ startupFailure: true });
+  await f.runtime.queue({
+    id: "cancelled-startup",
+    capability: "implement",
+    artifactIntent: "maintained_change",
+    objective: "Start then cancel before submission",
+    intentVersion: authority.intentVersion,
+    authority,
+    acceptance: ["No objective is submitted after cancellation"],
+  });
+  let state = await f.runtime.reconcile();
+  const attempt = required(state.attempts[0], "identity-less startup attempt");
+  assert.equal(attempt.state, "starting");
+  assert.equal(attempt.submission, "not_sent");
+  assert.ok(attempt.launchPane);
+  assert.notEqual(attempt.sessionFile, undefined);
+  assert.equal(attempt.resource, undefined);
+  assert.equal(attempt.worker, undefined);
+  await f.runtime.cancel(attempt.id);
+  state = await f.store.load();
+  assert.equal(state.attempts[0]?.state, "cancel_requested");
+  await f.attachPublic();
+  return { f, attempt };
 }
 
 async function prepareBlockedCleanup(removeBeforeRecovery: boolean) {
@@ -605,6 +681,202 @@ void test("registered retain_not_applied preserves integrated bytes and exact un
       ).details,
     );
     assert.equal(completed.lifecycle.state, "completed");
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("registered retain_not_applied checkpoints a failed proposal and immutable failed report before repeatable cleanup", async () => {
+  const { f, attempt, workerCommit, report } = await prepareFailedProposal();
+  try {
+    const integratedRevision = await f.repository.head();
+    const recover = () =>
+      f.pi.call("workgraph_control", {
+        action: "retain_not_applied",
+        attempt: attempt.id,
+        integratedRevision,
+        reason: "Retain the exact failed partial proposal without applying it",
+      });
+    let state = resultState((await recover()).details);
+    const retained = required(state.attempts[0]?.composition, "retained failed proposal");
+    assert.equal(retained.state, "retained_not_applied");
+    assert.equal(retained.commit, workerCommit);
+    assert.equal(retained.integratedRevision, integratedRevision);
+    assert.equal(
+      await git(f.root, "rev-parse", required(retained.retainedRef, "failed proposal ref")),
+      workerCommit,
+    );
+    assert.equal(await f.repository.head(), integratedRevision);
+    const result = required(state.results[0], "retained failed result");
+    assert.equal(result.validity, "typed");
+    if (result.validity !== "typed") throw new Error("Expected a typed failed result.");
+    assert.deepEqual(result.report, report);
+    assert.deepEqual(result.artifacts, [
+      {
+        id: "failed-proposal",
+        kind: "revision",
+        reference: workerCommit,
+        retention: "retained",
+        summary: `Failed implementation proposal retained at ${retained.retainedRef}; it was not applied.`,
+      },
+    ]);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(existsSync(required(attempt.worktreePath, "failed proposal worktree")), false);
+    await assert.rejects(git(f.root, "show-ref", "--verify", `refs/heads/${attempt.branch}`));
+
+    state = resultState((await recover()).details);
+    assert.equal(state.attempts[0]?.composition?.state, "retained_not_applied");
+    const repeatedResult = required(state.results[0], "repeated retained failed result");
+    if (repeatedResult.validity !== "typed") throw new Error("Expected a typed failed result.");
+    assert.deepEqual(repeatedResult.report, report);
+    assert.equal(await f.repository.head(), integratedRevision);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("failed proposal recovery preserves dirty, branch-mismatched, and ref-mismatched resources", async () => {
+  for (const mismatch of ["dirty", "branch", "ref"] as const) {
+    const { f, attempt, report } = await prepareFailedProposal();
+    try {
+      const worktreePath = required(attempt.worktreePath, "failed proposal worktree");
+      const retainedRef = `refs/workgraph-retained/ws-recovery/${attempt.id}`;
+      if (mismatch === "dirty") await writeFile(join(worktreePath, "unattributed.txt"), "dirty\n");
+      else if (mismatch === "branch")
+        await git(worktreePath, "switch", "-c", "foreign-proposal-branch");
+      else
+        await git(
+          f.root,
+          "update-ref",
+          retainedRef,
+          required(attempt.baseRevision, "failed proposal base"),
+        );
+      await assert.rejects(
+        f.pi.call("workgraph_control", {
+          action: "retain_not_applied",
+          attempt: attempt.id,
+          integratedRevision: await f.repository.head(),
+          reason: `Preserve ${mismatch} failed proposal resources`,
+        }),
+        mismatch === "dirty"
+          ? /Git working tree is not clean/
+          : mismatch === "branch"
+            ? /requires the recorded isolated worktree/
+            : /points to a different commit/,
+      );
+      const state = await f.store.load();
+      assert.equal(state.attempts[0]?.composition, undefined);
+      assert.equal(state.attempts[0]?.cleanup, undefined);
+      const result = required(state.results[0], "preserved failed result");
+      if (result.validity !== "typed") throw new Error("Expected a typed failed result.");
+      assert.deepEqual(result.report, report);
+      assert.equal(existsSync(worktreePath), true);
+      if (mismatch === "ref")
+        assert.equal(
+          await git(f.root, "rev-parse", retainedRef),
+          required(attempt.baseRevision, "failed proposal base"),
+        );
+      else await assert.rejects(git(f.root, "show-ref", "--verify", retainedRef));
+    } finally {
+      await f.dispose();
+    }
+  }
+});
+
+void test("failed proposal retention resumes after durable ref and state checkpoint windows", async () => {
+  for (const window of ["ref", "checkpoint"] as const) {
+    const { f, attempt, workerCommit, report } = await prepareFailedProposal(false);
+    try {
+      const integratedRevision = await f.repository.head();
+      const placement = required(attempt.placement, "failed proposal placement");
+      if (placement.kind !== "isolated_worktree") throw new Error("Expected isolated placement.");
+      const proposal = await f.repository.validateWorkerCommit({
+        path: placement.path,
+        branch: placement.branch,
+        baseCommit: required(attempt.baseRevision, "failed proposal base"),
+      });
+      assert.equal(proposal.commit, workerCommit);
+      const retainedRef = await f.repository.retainCommit("ws-recovery", attempt.id, workerCommit);
+      if (window === "checkpoint")
+        await f.runtime.perform(() =>
+          f.store.retainFailedProposalNotApplied({
+            id: attempt.id,
+            commit: workerCommit,
+            expectedHead: integratedRevision,
+            reason: "Retain the failed proposal across an interrupted cleanup",
+            retainedRef,
+            integratedRevision,
+          }),
+        );
+      await f.attachPublic();
+      const state = resultState(
+        (
+          await f.pi.call("workgraph_control", {
+            action: "retain_not_applied",
+            attempt: attempt.id,
+            integratedRevision,
+            reason: "Retain the failed proposal across an interrupted cleanup",
+          })
+        ).details,
+      );
+      assert.equal(state.attempts[0]?.composition?.state, "retained_not_applied");
+      assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+      assert.equal(await git(f.root, "rev-parse", retainedRef), workerCommit);
+      const result = required(state.results[0], "recovered checkpoint result");
+      if (result.validity !== "typed") throw new Error("Expected a typed failed result.");
+      assert.deepEqual(result.report, report);
+    } finally {
+      await f.dispose();
+    }
+  }
+});
+
+void test("cancelled identity-less unsent launch releases only after authoritative pane absence and repeats safely", async () => {
+  const { f, attempt } = await prepareIdentitylessCancelledLaunch();
+  try {
+    await f.setTransport({ paneGone: true });
+    const recover = () =>
+      f.pi.call("workgraph_control", {
+        action: "recover",
+        attempt: attempt.id,
+        reason: "The exact retained startup pane is authoritatively absent",
+      });
+    let state = resultState((await recover()).details);
+    assert.equal(state.attempts[0]?.state, "cancelled");
+    assert.equal(state.attempts[0]?.submission, "not_sent");
+    assert.equal(state.attempts[0]?.worker, undefined);
+    assert.equal(state.results[0]?.validity, "absent");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(existsSync(required(attempt.worktreePath, "cancelled startup worktree")), false);
+
+    state = resultState((await recover()).details);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.results.length, 1);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("cancelled identity-less unsent launch keeps agent-not-found uncertainty and live resources", async () => {
+  const { f, attempt } = await prepareIdentitylessCancelledLaunch();
+  try {
+    const request = () =>
+      f.pi.call("workgraph_control", {
+        action: "recover",
+        attempt: attempt.id,
+        reason: "Do not infer process death from native agent lookup alone",
+      });
+    await f.setTransport({ agentGone: true });
+    await assert.rejects(request(), /inspection is unknown/);
+    await f.setTransport({ agentGone: false });
+    await assert.rejects(request(), /inspection is live/);
+    const state = await f.store.load();
+    assert.equal(state.attempts[0]?.state, "cancel_requested");
+    assert.equal(state.attempts[0]?.worker, undefined);
+    assert.equal(state.attempts[0]?.resultId, undefined);
+    assert.equal(state.attempts[0]?.cleanup, undefined);
+    assert.equal(existsSync(required(attempt.worktreePath, "retained startup worktree")), true);
   } finally {
     await f.dispose();
   }

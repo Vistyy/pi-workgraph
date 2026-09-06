@@ -23,6 +23,7 @@ import {
   legacyHerdrAgentName,
   legacyObjectiveHerdrWorkerName,
   type VisibleWorkerRuntime,
+  type WorkerLaunchInspectionRequest,
   type WorkerLaunchRequest,
   type WorkerRecoveryRequest,
 } from "./herdr.js";
@@ -1533,11 +1534,7 @@ export class WorkstreamRuntime {
   }): Effect.Effect<WorkstreamState, RuntimeError> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        yield* this.runtimeSync("validate recovery request", () => {
-          if (input.reason.trim() === "") throw new Error("Recovery reason is required.");
-          if (input.action === "retain_not_applied" && input.integratedRevision === undefined)
-            throw new Error("Retained-not-applied recovery requires the integrated revision.");
-        });
+        yield* this.runtimeSync("validate recovery request", () => validateRecoveryInput(input));
         const state = yield* this.dependency("store", "load recovery state", () =>
           this.store.load(),
         );
@@ -1546,25 +1543,44 @@ export class WorkstreamRuntime {
           if (isLegacyArtifactRetentionFailure(state, attempt))
             throw new Error(legacyArtifactRetentionLimitation());
         });
-        if (attempt.artifactRetention?.state === "pending")
-          yield* this.recoverPendingArtifactRetention(state, attempt);
-        else if (attempt.artifactRetention?.state === "blocked")
-          yield* this.recoverBlockedArtifactRetention(state, attempt);
-        else if (attempt.composition?.state === "blocked")
-          yield* this.recoverBlockedComposition(state, attempt, input);
-        else if (attempt.cleanup?.state === "blocked") yield* this.recoverBlockedCleanup(attempt);
-        else if (attempt.artifactRetention?.state === "completed" && input.action === "retry") {
-          yield* this.advanceRetainedResult(
-            attempt.id,
-            findAssignment(state, attempt.assignmentId),
-          );
-        } else
-          yield* this.runtimeSync("validate recovery boundary", () => {
-            throw new Error(`Attempt ${attempt.id} has no blocked recovery boundary.`);
-          });
+        yield* this.recoverBoundary(state, attempt, input);
         return yield* this.dependency("store", "load recovered state", () => this.store.load());
       }.bind(this),
     );
+  }
+
+  private recoverBoundary(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    input: {
+      action: "retry" | "retain_not_applied";
+      reason: string;
+      integratedRevision?: string;
+    },
+  ): Effect.Effect<void, RuntimeError> {
+    if (attempt.artifactRetention?.state === "pending")
+      return this.recoverPendingArtifactRetention(state, attempt);
+    if (attempt.artifactRetention?.state === "blocked")
+      return this.recoverBlockedArtifactRetention(state, attempt);
+    if (isIdentitylessCancelledLaunch(attempt))
+      return this.recoverIdentitylessCancelledLaunch(
+        state,
+        attempt,
+        findAssignment(state, attempt.assignmentId),
+        input.action,
+      );
+    if (attempt.composition?.state === "blocked")
+      return this.recoverBlockedComposition(state, attempt, input);
+    if (attempt.composition?.state === "retained_not_applied")
+      return this.recoverRetainedNotApplied(state, attempt, input);
+    if (attempt.cleanup?.state === "blocked") return this.recoverBlockedCleanup(attempt);
+    if (isFailedImplementationProposal(state, attempt))
+      return this.recoverFailedImplementationProposal(state, attempt, input);
+    if (attempt.artifactRetention?.state === "completed" && input.action === "retry")
+      return this.advanceRetainedResult(attempt.id, findAssignment(state, attempt.assignmentId));
+    return this.runtimeSync("validate recovery boundary", () => {
+      throw new Error(`Attempt ${attempt.id} has no blocked recovery boundary.`);
+    });
   }
 
   private recoverPendingArtifactRetention(
@@ -1632,6 +1648,245 @@ export class WorkstreamRuntime {
         const assignment = findAssignment(latest, attempt.assignmentId);
         yield* this.beginCleanupIfNeeded(retainedAttempt, assignment);
         yield* this.cleanup(attempt.id);
+      }.bind(this),
+    );
+  }
+
+  private recoverIdentitylessCancelledLaunch(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: WorkAssignment,
+    action: "retry" | "retain_not_applied",
+  ): Effect.Effect<void, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        if (action !== "retry")
+          return yield* this.runtimeSync("validate cancelled launch recovery", () => {
+            throw new Error("Identity-less cancelled launch recovery only supports recover.");
+          });
+        if (this.workers.inspectLaunch === undefined)
+          return yield* this.runtimeSync("validate launch inspection support", () => {
+            throw new Error("Worker transport cannot inspect the retained startup pane.");
+          });
+        const request = yield* this.runtimeSync("prepare cancelled launch inspection", () =>
+          identitylessLaunchInspectionRequest(attempt),
+        );
+        const inspection = yield* this.dependency(
+          "herdr",
+          "inspect cancelled launch",
+          () =>
+            this.workers.inspectLaunch?.(request) ??
+            Promise.reject(new Error("Worker transport cannot inspect the retained startup pane.")),
+        );
+        if (inspection.state !== "absent")
+          return yield* this.runtimeSync("validate cancelled launch absence", () => {
+            throw new Error(
+              `Cancelled launch inspection is ${inspection.state}; leave retained resources intact. ${inspection.detail}`,
+            );
+          });
+        yield* this.ownershipEffect();
+        yield* this.settleAbsentCancelledLaunch(state, attempt, assignment);
+      }.bind(this),
+    );
+  }
+
+  private settleAbsentCancelledLaunch(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: WorkAssignment,
+  ): Effect.Effect<void, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        if (attempt.resultId === undefined) yield* this.retain(state, attempt, assignment);
+        let current = findAttempt(
+          yield* this.dependency("store", "load cancelled launch recovery", () =>
+            this.store.load(),
+          ),
+          attempt.id,
+        );
+        if (current.cleanup?.state === "completed") return;
+        if (current.cleanup?.state === "blocked") {
+          yield* this.dependency("store", "retry cancelled launch cleanup", () =>
+            this.store.retryCleanup(attempt.id),
+          );
+          current = findAttempt(
+            yield* this.dependency("store", "reload cancelled launch cleanup", () =>
+              this.store.load(),
+            ),
+            attempt.id,
+          );
+        }
+        if (current.cleanup === undefined) {
+          yield* this.beginCleanupIfNeeded(current, assignment);
+          current = findAttempt(
+            yield* this.dependency("store", "load cancelled launch cleanup intent", () =>
+              this.store.load(),
+            ),
+            attempt.id,
+          );
+        }
+        if (current.cleanup?.state === "pending" && !current.cleanup.workerClosed)
+          yield* this.dependency("store", "record absent cancelled launch", () =>
+            this.store.markWorkerClosed(attempt.id),
+          );
+        yield* this.cleanup(attempt.id);
+      }.bind(this),
+    );
+  }
+
+  private recoverFailedImplementationProposal(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    input: {
+      action: "retry" | "retain_not_applied";
+      reason: string;
+      integratedRevision?: string;
+    },
+  ): Effect.Effect<void, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        if (input.action !== "retain_not_applied")
+          return yield* this.runtimeSync("validate failed proposal recovery", () => {
+            throw new Error(
+              "A failed implementation proposal can only be explicitly retained_not_applied.",
+            );
+          });
+        yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
+        yield* this.dependency("git", "assert clean recovery repository", () =>
+          this.repository.assertClean(),
+        );
+        const proposal = yield* this.dependency("git", "validate failed worker proposal", () =>
+          this.repository.validateWorkerCommit(placementOf(attempt)),
+        );
+        const integratedRevision = yield* this.resolveIntegratedHead(
+          required(input.integratedRevision, "integrated revision"),
+        );
+        yield* this.ownershipEffect();
+        const retainedRef = yield* this.dependency("git", "retain failed worker proposal", () =>
+          this.repository.retainCommit(state.id, attempt.id, proposal.commit),
+        );
+        yield* this.ownershipEffect();
+        yield* this.dependency("store", "checkpoint failed unapplied proposal", () =>
+          this.store.retainFailedProposalNotApplied({
+            id: attempt.id,
+            commit: proposal.commit,
+            expectedHead: integratedRevision,
+            reason: input.reason,
+            retainedRef,
+            integratedRevision,
+          }),
+        );
+        const latest = yield* this.dependency("store", "load retained failed proposal", () =>
+          this.store.load(),
+        );
+        yield* this.resumeRetainedNotAppliedCleanup(state.id, findAttempt(latest, attempt.id));
+      }.bind(this),
+    );
+  }
+
+  private recoverRetainedNotApplied(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    input: {
+      action: "retry" | "retain_not_applied";
+      reason: string;
+      integratedRevision?: string;
+    },
+  ): Effect.Effect<void, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const composition = required(attempt.composition, "retained composition");
+        if (input.action === "retain_not_applied") {
+          const requested = yield* this.dependency(
+            "git",
+            "resolve retained integrated revision",
+            () =>
+              this.repository.resolveRevision(
+                required(input.integratedRevision, "integrated revision"),
+              ),
+          );
+          yield* this.runtimeSync("validate retained integrated revision", () => {
+            if (requested !== composition.integratedRevision)
+              throw new Error(
+                `Retained integrated revision is ${composition.integratedRevision}, not ${requested}.`,
+              );
+          });
+        }
+        yield* this.resumeRetainedNotAppliedCleanup(state.id, attempt);
+      }.bind(this),
+    );
+  }
+
+  private resumeRetainedNotAppliedCleanup(
+    workstreamId: string,
+    attempt: WorkAttempt,
+  ): Effect.Effect<void, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const composition = required(attempt.composition, "retained composition");
+        if (attempt.cleanup?.state !== "completed" && attempt.cleanup?.workerClosed !== true)
+          yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
+        yield* this.ownershipEffect();
+        const retainedRef = yield* this.dependency("git", "verify retained worker commit", () =>
+          this.repository.retainCommit(workstreamId, attempt.id, composition.commit),
+        );
+        yield* this.ownershipEffect();
+        yield* this.runtimeSync("validate retained commit provenance", () => {
+          if (composition.retainedRef !== retainedRef)
+            throw new Error(
+              `Retained ref provenance changed from ${composition.retainedRef} to ${retainedRef}.`,
+            );
+        });
+        if (attempt.cleanup?.state === "completed") return;
+        if (attempt.cleanup?.state === "blocked")
+          yield* this.dependency("store", "retry retained proposal cleanup", () =>
+            this.store.retryCleanup(attempt.id),
+          );
+        let latest = yield* this.dependency("store", "load retained proposal cleanup", () =>
+          this.store.load(),
+        );
+        let current = findAttempt(latest, attempt.id);
+        if (current.cleanup === undefined) {
+          const expectedHead = yield* this.dependency("git", "read retained proposal head", () =>
+            this.repository.head(placementOf(current).path),
+          );
+          yield* this.runtimeSync("validate retained proposal head", () => {
+            if (expectedHead !== composition.commit)
+              throw new Error(
+                `Retained proposal worktree HEAD is ${expectedHead}, expected ${composition.commit}.`,
+              );
+          });
+          yield* this.dependency("store", "begin retained proposal cleanup", () =>
+            this.store.beginCleanup({ id: attempt.id, expectedHead, discard: false }),
+          );
+          latest = yield* this.dependency("store", "reload retained proposal cleanup", () =>
+            this.store.load(),
+          );
+          current = findAttempt(latest, attempt.id);
+        }
+        if (current.cleanup?.state === "pending") yield* this.cleanup(attempt.id);
+      }.bind(this),
+    );
+  }
+
+  private resolveIntegratedHead(requested: string): Effect.Effect<string, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const integratedRevision = yield* this.dependency(
+          "git",
+          "resolve integrated revision",
+          () => this.repository.resolveRevision(requested),
+        );
+        const currentHead = yield* this.dependency("git", "read integrated head", () =>
+          this.repository.head(),
+        );
+        yield* this.runtimeSync("validate integrated revision", () => {
+          if (currentHead !== integratedRevision)
+            throw new Error(
+              `Integrated revision is ${integratedRevision}, but repository HEAD is ${currentHead}.`,
+            );
+        });
+        return integratedRevision;
       }.bind(this),
     );
   }
@@ -1936,6 +2191,15 @@ function selectedAttempts(
   });
 }
 
+function validateRecoveryInput(input: {
+  action: "retry" | "retain_not_applied";
+  reason: string;
+  integratedRevision?: string;
+}): void {
+  if (input.reason.trim() === "") throw new Error("Recovery reason is required.");
+  if (input.action === "retain_not_applied" && input.integratedRevision === undefined)
+    throw new Error("Retained-not-applied recovery requires the integrated revision.");
+}
 function blockedDetail(attempt: WorkAttempt): string | undefined {
   if (attempt.composition?.state === "blocked") return attempt.composition.error;
   if (attempt.cleanup?.state === "blocked") return attempt.cleanup.error;
@@ -1953,6 +2217,45 @@ function hasRetainedSession(attempt: WorkAttempt): boolean {
       attempt.state === "running" ||
       attempt.state === "cancel_requested") &&
     attempt.sessionFile !== undefined
+  );
+}
+function isIdentitylessCancelledLaunch(attempt: WorkAttempt): boolean {
+  return (
+    (attempt.state === "cancel_requested" || attempt.state === "cancelled") &&
+    attempt.submission === "not_sent" &&
+    attempt.launchPane !== undefined &&
+    attempt.sessionFile !== undefined &&
+    attempt.worker === undefined
+  );
+}
+function identitylessLaunchInspectionRequest(attempt: WorkAttempt): WorkerLaunchInspectionRequest {
+  const launchPane = required(attempt.launchPane, "retained launch pane");
+  const request: WorkerLaunchInspectionRequest = {
+    workspaceId: launchPane.workspaceId,
+    paneId: launchPane.paneId,
+    sessionFile: required(attempt.sessionFile, "session file"),
+    cwd: required(attempt.placement, "attempt placement").path,
+  };
+  if (attempt.resource === undefined) return request;
+  if (
+    attempt.resource.workspaceId !== launchPane.workspaceId ||
+    attempt.resource.paneId !== launchPane.paneId
+  )
+    throw new Error("Retained launch pane and resource identities do not match.");
+  request.tabId = attempt.resource.tabId;
+  request.terminalId = attempt.resource.terminalId;
+  return request;
+}
+function isFailedImplementationProposal(state: WorkstreamState, attempt: WorkAttempt): boolean {
+  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
+  const result = state.results.find((item) => item.id === attempt.resultId);
+  return (
+    attempt.composition === undefined &&
+    assignment?.capability === "implement" &&
+    assignment.artifactIntent === "maintained_change" &&
+    result?.validity === "typed" &&
+    result.report.kind === "implementation" &&
+    result.report.status === "failed"
   );
 }
 function workerRecoveryRequest(

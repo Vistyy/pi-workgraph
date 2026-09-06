@@ -86,9 +86,11 @@ export interface WorkerRecoveryRequest {
 /** Exact retained handles for startup inspection before a native agent identity exists. */
 export interface WorkerLaunchInspectionRequest {
   workspaceId: string;
-  tabId: string;
+  /** Present when startup advanced far enough to retain the full native resource. */
+  tabId?: string;
   paneId: string;
-  terminalId: string;
+  /** Present when startup advanced far enough to retain the full native resource. */
+  terminalId?: string;
   sessionFile: string;
   cwd: string;
 }
@@ -461,7 +463,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
     }
 
     evidence.process = await this.inspectLaunchProcess(request.paneId);
-    return this.inspectLaunchAgent(request, evidence);
+    return this.inspectLaunchAgent(request, pane, evidence);
   }
 
   // oxlint-disable-next-line effecttsgo/async-function -- Herdr process inspection crosses the native CLI Promise boundary.
@@ -493,6 +495,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
   // oxlint-disable-next-line effecttsgo/async-function -- Herdr agent inspection crosses the native CLI Promise boundary.
   private async inspectLaunchAgent(
     request: WorkerLaunchInspectionRequest,
+    pane: WorkerPaneObservation,
     evidence: WorkerLaunchInspectionEvidence,
   ): Promise<WorkerLaunchInspection> {
     const result = await spawnCommand(this.command, ["agent", "get", request.paneId], 30_000);
@@ -502,7 +505,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       const current = parseAgent(
         decodeCommandResponse(result, ["agent", "get"], decodeAgentResponse),
       );
-      if (!sameLaunchAgent(request, current)) {
+      if (!sameLaunchAgent(request, pane, current)) {
         evidence.agent = {
           state: "unknown",
           detail: "Herdr native agent identity does not match the retained startup resource.",
@@ -510,10 +513,10 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
         return { state: "unknown", evidence, detail: evidence.agent.detail };
       }
       const identity: WorkerIdentity = {
-        workspaceId: request.workspaceId,
-        tabId: request.tabId,
-        paneId: request.paneId,
-        terminalId: request.terminalId,
+        workspaceId: current.workspaceId,
+        tabId: current.tabId,
+        paneId: current.paneId,
+        terminalId: current.terminalId,
         agentName: current.name,
         sessionFile: request.sessionFile,
         cwd: request.cwd,
@@ -811,13 +814,17 @@ function unavailableLaunchAgent(
   };
 }
 
-function sameLaunchAgent(request: WorkerLaunchInspectionRequest, current: ParsedAgent): boolean {
+function sameLaunchAgent(
+  request: WorkerLaunchInspectionRequest,
+  pane: WorkerPaneObservation,
+  current: ParsedAgent,
+): boolean {
   return (
-    current.workspaceId === request.workspaceId &&
-    current.tabId === request.tabId &&
-    current.paneId === request.paneId &&
-    current.terminalId === request.terminalId &&
-    current.cwd === request.cwd &&
+    current.workspaceId === pane.workspaceId &&
+    current.tabId === pane.tabId &&
+    current.paneId === pane.paneId &&
+    current.terminalId === pane.terminalId &&
+    current.cwd === pane.cwd &&
     current.sessionFile === request.sessionFile
   );
 }
@@ -828,9 +835,9 @@ function samePaneResource(
 ): boolean {
   return (
     pane.workspaceId === request.workspaceId &&
-    pane.tabId === request.tabId &&
+    (request.tabId === undefined || pane.tabId === request.tabId) &&
     pane.paneId === request.paneId &&
-    pane.terminalId === request.terminalId &&
+    (request.terminalId === undefined || pane.terminalId === request.terminalId) &&
     pane.cwd === request.cwd
   );
 }

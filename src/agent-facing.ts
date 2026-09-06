@@ -338,14 +338,23 @@ function applicationProjection(attempt: WorkAttempt | undefined, result: WorkRes
       revision: composition.revision,
       reportedCommit: composition.commit,
     };
-  if (composition?.state === "retained_not_applied")
+  if (composition?.state === "retained_not_applied") {
+    const report = result.validity === "typed" ? result.report : undefined;
+    const commitAttribution =
+      report?.kind === "implementation" &&
+      report.status === "completed" &&
+      report.outcome === "changed" &&
+      report.commit === composition.commit
+        ? { reportedCommit: composition.commit }
+        : { validatedProposalCommit: composition.commit };
     return {
       state: "retained_not_applied" as const,
-      reportedCommit: composition.commit,
+      ...commitAttribution,
       integratedRevision: composition.integratedRevision,
       retainedRef: compactText(composition.retainedRef ?? "", 180),
       reason: compactText(composition.reason ?? "", 280),
     };
+  }
   if (composition !== undefined)
     return {
       state: composition.state,

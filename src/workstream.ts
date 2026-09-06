@@ -691,6 +691,63 @@ export class WorkstreamStore {
     );
   }
 
+  retainFailedProposalNotApplied(input: {
+    id: string;
+    commit: string;
+    expectedHead: string;
+    reason: string;
+    retainedRef: string;
+    integratedRevision: string;
+    now?: Date;
+  }): Promise<WorkstreamState> {
+    requireText(input.commit, "Failed proposal commit");
+    requireText(input.expectedHead, "Failed proposal expected HEAD");
+    requireText(input.reason, "Failed proposal retention reason");
+    requireText(input.retainedRef, "Failed proposal retained ref");
+    requireText(input.integratedRevision, "Integrated revision");
+    return this.changeAttempt(
+      input.id,
+      (attempt, draft) => {
+        if (attempt.composition !== undefined)
+          throw new Error(`Composition for ${input.id} is already recorded.`);
+        const assignment = requireAssignment(draft, attempt.assignmentId);
+        const result = draft.results.find((item) => item.id === attempt.resultId);
+        if (
+          assignment.capability !== "implement" ||
+          assignment.artifactIntent !== "maintained_change" ||
+          result?.validity !== "typed" ||
+          result.report.kind !== "implementation" ||
+          result.report.status !== "failed"
+        )
+          throw new Error(
+            `Attempt ${input.id} has no typed failed implementation proposal to retain.`,
+          );
+        if (result.artifacts.length > 0)
+          throw new Error(`Result ${result.id} already has retained artifacts.`);
+        const commit = input.commit.trim();
+        const retainedRef = input.retainedRef.trim();
+        attempt.composition = {
+          state: "retained_not_applied",
+          commit,
+          expectedHead: input.expectedHead.trim(),
+          reason: input.reason.trim(),
+          retainedRef,
+          integratedRevision: input.integratedRevision.trim(),
+        };
+        result.artifacts = [
+          {
+            id: "failed-proposal",
+            kind: "revision",
+            reference: commit,
+            retention: "retained",
+            summary: `Failed implementation proposal retained at ${retainedRef}; it was not applied.`,
+          },
+        ];
+      },
+      input.now,
+    );
+  }
+
   retainCompositionNotApplied(input: {
     id: string;
     reason: string;

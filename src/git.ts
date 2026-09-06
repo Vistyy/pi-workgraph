@@ -166,30 +166,7 @@ export class GitRepository {
     const root = this.root;
     return runGitPromise(
       Effect.gen(function* () {
-        const records = parseWorktreeList(
-          yield* gitText(root, ["worktree", "list", "--porcelain"], true),
-        );
-        const registered = records.find(
-          (worktree) => resolve(worktree.path) === resolve(placement.path),
-        );
-        if (registered === undefined || registered.branch !== placement.branch) {
-          return yield* fail(
-            `No-change validation requires the recorded isolated worktree ${placement.path} on ${placement.branch}.`,
-          );
-        }
-        if (
-          (yield* filesystemPromise(() => realpath(placement.path))) !== resolve(placement.path)
-        ) {
-          return yield* fail("No-change validation found a relocated worktree.");
-        }
-        const actualRoot = yield* gitText(placement.path, ["rev-parse", "--show-toplevel"]);
-        if (resolve(actualRoot) !== resolve(placement.path)) {
-          return yield* fail("No-change validation found a changed worktree root.");
-        }
-        const actualBranch = yield* gitText(placement.path, ["symbolic-ref", "--short", "HEAD"]);
-        if (actualBranch !== placement.branch) {
-          return yield* fail("No-change validation found a changed worktree branch.");
-        }
+        yield* validatePlacementIdentity(root, placement, "No-change validation");
         const status = yield* gitText(
           placement.path,
           ["status", "--porcelain", "--untracked-files=all"],
@@ -219,8 +196,10 @@ export class GitRepository {
     placement: WorktreePlacement,
     reportedCommit?: string,
   ): Promise<ValidatedCommit> {
+    const root = this.root;
     return runGitPromise(
       Effect.gen(function* () {
+        yield* validatePlacementIdentity(root, placement, "Worker commit validation");
         yield* assertClean(placement.path);
         const commit = yield* gitText(placement.path, ["rev-parse", "HEAD"]);
         if (reportedCommit !== undefined && reportedCommit !== commit) {
@@ -487,6 +466,35 @@ function worktreeIdentity(
 
 function worktreeRecords(root: string): GitEffect<WorktreeRecord[]> {
   return Effect.map(gitText(root, ["worktree", "list", "--porcelain"], true), parseWorktreeList);
+}
+
+function validatePlacementIdentity(
+  root: string,
+  placement: WorktreePlacement,
+  operation: string,
+): GitEffect<void> {
+  return Effect.gen(function* () {
+    const records = yield* worktreeRecords(root);
+    const registered = records.find(
+      (worktree) => resolve(worktree.path) === resolve(placement.path),
+    );
+    if (registered === undefined || registered.branch !== placement.branch) {
+      return yield* fail(
+        `${operation} requires the recorded isolated worktree ${placement.path} on ${placement.branch}.`,
+      );
+    }
+    if ((yield* filesystemPromise(() => realpath(placement.path))) !== resolve(placement.path)) {
+      return yield* fail(`${operation} found a relocated worktree.`);
+    }
+    const actualRoot = yield* gitText(placement.path, ["rev-parse", "--show-toplevel"]);
+    if (resolve(actualRoot) !== resolve(placement.path)) {
+      return yield* fail(`${operation} found a changed worktree root.`);
+    }
+    const actualBranch = yield* gitText(placement.path, ["symbolic-ref", "--short", "HEAD"]);
+    if (actualBranch !== placement.branch) {
+      return yield* fail(`${operation} found a changed worktree branch.`);
+    }
+  });
 }
 
 function registeredPlacement(
