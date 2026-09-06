@@ -413,7 +413,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           authorityReceiptId: Type.Optional(Type.String()),
           permittedEffects: Type.Array(Type.String(), { minItems: 1 }),
           stopCondition: Type.String(),
-          retain: Type.Array(Type.String()),
+          retain: Type.Array(
+            Type.String({
+              description:
+                "Path relative to the experiment worktree, for example artifacts/probe.json; filenames may contain spaces.",
+            }),
+          ),
         }),
       ),
     }),

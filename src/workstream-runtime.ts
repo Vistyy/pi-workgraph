@@ -5,12 +5,14 @@ import {
   Cause,
   Clock,
   Data,
+  DateTime,
   Deferred,
   Effect,
   Exit,
   Layer,
   ManagedRuntime,
   Queue,
+  Ref,
   Schedule,
 } from "effect";
 import type { GitRepository, WorktreePlacement } from "./git.js";
@@ -84,19 +86,15 @@ class RuntimeStoppedError extends Data.TaggedError("RuntimeStoppedError")<{
 
 type RuntimeError = RuntimeDependencyError | RuntimeStoppedError;
 type OperationRequest =
-  | {
-      readonly _tag: "Operation";
-      readonly effect: Effect.Effect<unknown, RuntimeError>;
-      readonly reply: Deferred.Deferred<unknown, RuntimeError>;
-    }
+  | { readonly _tag: "Operation"; readonly run: Effect.Effect<void, never> }
   | { readonly _tag: "Stop" };
+type RuntimeLifecycle = "open" | "stopping" | "stopped";
 
 /** One scoped, serialized execution owner backed by the registry's fenced lease. */
 export class WorkstreamRuntime {
   private lease: Lease | undefined;
   private readonly deliveryOwner = randomUUID();
-  private readonly registry: WorkgraphRegistry;
-  private readonly ownsRegistry: boolean;
+  private registry: WorkgraphRegistry | undefined;
   private readonly operations = Effect.runSync(
     Queue.unbounded<OperationRequest>(),
   );
@@ -105,7 +103,8 @@ export class WorkstreamRuntime {
   private readonly applicationExit = Deferred.makeUnsafe<
     Exit.Exit<void, RuntimeError>
   >();
-  private readonly effectRuntime: ManagedRuntime.ManagedRuntime<Clock.Clock, never>;
+  private readonly lifecycle = Ref.makeUnsafe<RuntimeLifecycle>("open");
+  private readonly effectRuntime = ManagedRuntime.make(Layer.empty);
   private policy: ModelPolicy | undefined;
 
   constructor(
@@ -120,15 +119,15 @@ export class WorkstreamRuntime {
     readonly onError: (error: Error) => void,
     ownership: RuntimeOwnership = {},
   ) {
-    this.registry = ownership.registry ?? new WorkgraphRegistry();
-    this.ownsRegistry = ownership.registry === undefined;
     this.policy = ownership.policy;
-    // SAFETY: the live Effect runtime supplies its default Clock; tests may replace it with the explicit clock.
-    const layer = (ownership.clock
-      ? Layer.succeed(Clock.Clock, ownership.clock)
-      : Layer.empty) as Layer.Layer<Clock.Clock>;
-    this.effectRuntime = ManagedRuntime.make(layer);
-    this.effectRuntime.runFork(this.application(ownership));
+    const application = ownership.clock
+      ? Effect.provideService(
+          this.application(ownership),
+          Clock.Clock,
+          ownership.clock,
+        )
+      : this.application(ownership);
+    this.effectRuntime.runFork(application);
   }
 
   private application(
@@ -136,10 +135,18 @@ export class WorkstreamRuntime {
   ): Effect.Effect<void, RuntimeError> {
     const owned = Effect.scoped(
       Effect.gen(function* (this: WorkstreamRuntime) {
-        yield* Effect.acquireRelease(
-          this.claimEffect(options),
-          () => this.releaseEffect(),
+        const registry = yield* Effect.acquireRelease(
+          this.openRegistryEffect(options.registry),
+          (opened) => this.closeRegistryEffect(opened, options.registry),
         );
+        this.registry = registry;
+        const lease = yield* Effect.acquireRelease(
+          this.claimLeaseEffect(registry, options),
+          (claimed) => this.releaseLeaseEffect(registry, claimed),
+        );
+        this.lease = lease;
+        this.store.bindMutationGuard(() => this.assertOwnership());
+        yield* this.adoptCoordinatorEffect(options);
         yield* Deferred.succeed(this.ready, undefined);
         yield* Effect.forkScoped(this.heartbeatLoop());
         yield* Effect.forkScoped(
@@ -153,6 +160,7 @@ export class WorkstreamRuntime {
     return owned.pipe(
       Effect.onExit((exit) =>
         Deferred.done(this.ready, exit).pipe(
+          Effect.andThen(Ref.set(this.lifecycle, "stopped")),
           Effect.andThen(Deferred.succeed(this.applicationExit, exit)),
           Effect.asVoid,
         ),
@@ -160,56 +168,96 @@ export class WorkstreamRuntime {
     );
   }
 
-  private claimEffect(
+  private openRegistryEffect(
+    provided: WorkgraphRegistry | undefined,
+  ): Effect.Effect<WorkgraphRegistry, RuntimeDependencyError> {
+    return provided
+      ? Effect.succeed(provided)
+      : this.runtimeSync("open workstream registry", () =>
+          new WorkgraphRegistry(),
+        );
+  }
+
+  private closeRegistryEffect(
+    registry: WorkgraphRegistry,
+    provided: WorkgraphRegistry | undefined,
+  ): Effect.Effect<void> {
+    return Effect.sync(() => {
+      this.registry = undefined;
+      if (provided === undefined) registry.close();
+    });
+  }
+
+  private claimLeaseEffect(
+    registry: WorkgraphRegistry,
     options: RuntimeOwnership,
-  ): Effect.Effect<void, RuntimeDependencyError> {
+  ): Effect.Effect<Lease, RuntimeDependencyError> {
     return Effect.gen(function* (this: WorkstreamRuntime) {
       const state = yield* this.dependency(
         "store",
         "load for lease claim",
         () => this.store.load(),
       );
-      yield* Effect.try({
-        try: () => {
-          this.registry.indexWorkstream({
-            ...state,
-            runId: state.id,
-            lifecycle: state.lifecycle.state,
-          });
-          const owner = options.owner ?? state.coordinator;
-          this.lease = this.registry.acquire(
-            state.id,
-            owner,
-            new Date(),
-            options.priorOwnerLiveness ?? "unknown",
-          );
-          this.store.bindMutationGuard(() => this.assertOwnership());
-          return owner;
-        },
-        catch: (cause) =>
-          new RuntimeDependencyError({
-            dependency: "runtime",
-            operation: "claim registry lease",
-            cause,
-          }),
-      }).pipe(
-        Effect.flatMap((owner) =>
-          owner.sessionId !== state.coordinator.sessionId ||
-          owner.sessionFile !== state.coordinator.sessionFile
-            ? this.dependency("store", "adopt coordinator", () =>
-                this.store.adopt(owner),
-              )
-            : Effect.void,
+      yield* this.runtimeSync("index workstream", () =>
+        registry.indexWorkstream({
+          ...state,
+          runId: state.id,
+          lifecycle: state.lifecycle.state,
+        }),
+      );
+      const now = yield* DateTime.nowAsDate;
+      return yield* this.runtimeSync("claim registry lease", () =>
+        registry.acquire(
+          state.id,
+          options.owner ?? state.coordinator,
+          now,
+          options.priorOwnerLiveness ?? "unknown",
         ),
       );
     }.bind(this));
   }
 
-  private releaseEffect(): Effect.Effect<void> {
+  private releaseLeaseEffect(
+    registry: WorkgraphRegistry,
+    lease: Lease,
+  ): Effect.Effect<void> {
     return Effect.sync(() => {
-      if (this.lease) this.registry.release(this.lease);
+      registry.release(lease);
       this.lease = undefined;
-      if (this.ownsRegistry) this.registry.close();
+    });
+  }
+
+  private adoptCoordinatorEffect(
+    options: RuntimeOwnership,
+  ): Effect.Effect<void, RuntimeDependencyError> {
+    return Effect.gen(function* (this: WorkstreamRuntime) {
+      const state = yield* this.dependency("store", "load coordinator", () =>
+        this.store.load(),
+      );
+      const owner = options.owner ?? state.coordinator;
+      if (
+        owner.sessionId !== state.coordinator.sessionId ||
+        owner.sessionFile !== state.coordinator.sessionFile
+      ) {
+        yield* this.dependency("store", "adopt coordinator", () =>
+          this.store.adopt(owner),
+        );
+      }
+    }.bind(this));
+  }
+
+  private runtimeSync<A>(
+    operation: string,
+    run: () => A,
+  ): Effect.Effect<A, RuntimeDependencyError> {
+    return Effect.try({
+      try: run,
+      catch: (cause) =>
+        new RuntimeDependencyError({
+          dependency: "runtime",
+          operation,
+          cause,
+        }),
     });
   }
 
@@ -230,11 +278,12 @@ export class WorkstreamRuntime {
   }
 
   private assertOwnership(): void {
-    if (!this.lease)
+    const registry = this.registry;
+    if (!this.lease || !registry)
       throw new RuntimeStoppedError({
         message: "Workstream runtime is stopped or has no lease.",
       });
-    this.registry.assertLease(this.lease);
+    registry.assertLease(this.lease);
   }
 
   private ownershipEffect(): Effect.Effect<void, RuntimeError> {
@@ -254,13 +303,11 @@ export class WorkstreamRuntime {
   private operationLoop(): Effect.Effect<void, never> {
     return Effect.suspend(() =>
       Queue.take(this.operations).pipe(
-        Effect.flatMap((request) => {
-          if (request._tag === "Stop") return Effect.void;
-          return Effect.exit(request.effect).pipe(
-            Effect.flatMap((exit) => Deferred.done(request.reply, exit)),
-            Effect.andThen(this.operationLoop()),
-          );
-        }),
+        Effect.flatMap((request) =>
+          request._tag === "Stop"
+            ? Effect.void
+            : request.run.pipe(Effect.andThen(this.operationLoop())),
+        ),
       ),
     );
   }
@@ -270,13 +317,15 @@ export class WorkstreamRuntime {
   ): Effect.Effect<T, RuntimeError> {
     return Effect.gen(function* (this: WorkstreamRuntime) {
       yield* Deferred.await(this.ready);
+      yield* this.acceptingEffect();
       const reply = yield* Deferred.make<T, RuntimeError>();
-      // SAFETY: OperationRequest stores heterogeneous deferred results; the paired effect and reply are created in this submit call.
-      yield* Queue.offer(this.operations, {
-        _tag: "Operation",
-        effect: this.ownershipEffect().pipe(Effect.andThen(effect)),
-        reply: reply as Deferred.Deferred<unknown, RuntimeError>,
-      });
+      const run = Effect.exit(
+        this.ownershipEffect().pipe(Effect.andThen(effect)),
+      ).pipe(
+        Effect.flatMap((exit) => Deferred.done(reply, exit)),
+        Effect.asVoid,
+      );
+      yield* Queue.offer(this.operations, { _tag: "Operation", run });
       return yield* Effect.raceFirst(
         Deferred.await(reply),
         Deferred.await(this.applicationExit).pipe(
@@ -294,22 +343,34 @@ export class WorkstreamRuntime {
     }.bind(this));
   }
 
-  private heartbeatLoop(): Effect.Effect<void, RuntimeError> {
-    const heartbeat = Effect.sync(() => {
-      this.assertOwnership();
-      const lease = this.lease;
-      if (!lease) throw new Error("Heartbeat has no lease.");
-      this.lease = this.registry.renew(lease);
-    }).pipe(
-      Effect.mapError(
-        (cause) =>
-          new RuntimeDependencyError({
-            dependency: "runtime",
-            operation: "renew registry lease",
-            cause,
-          }),
-      ),
+  private acceptingEffect(): Effect.Effect<void, RuntimeStoppedError> {
+    return Effect.flatMap(Ref.get(this.lifecycle), (state) =>
+      state === "open"
+        ? Effect.void
+        : Effect.fail(
+            new RuntimeStoppedError({
+              message: "Workstream runtime is stopped.",
+            }),
+        ),
     );
+  }
+
+  private heartbeatLoop(): Effect.Effect<void, RuntimeError> {
+    const heartbeat = Effect.try({
+      try: () => {
+        this.assertOwnership();
+        const lease = this.lease;
+        const registry = this.registry;
+        if (!lease || !registry) throw new Error("Heartbeat has no lease.");
+        this.lease = registry.renew(lease);
+      },
+      catch: (cause) =>
+        new RuntimeDependencyError({
+          dependency: "runtime",
+          operation: "renew registry lease",
+          cause,
+        }),
+    });
     return heartbeat.pipe(
       Effect.repeat(Schedule.spaced("5 seconds")),
       Effect.asVoid,
@@ -365,22 +426,30 @@ export class WorkstreamRuntime {
   }
 
   async stop(): Promise<void> {
-    if (this.effectRuntime.scope.state._tag === "Closed") return;
-    await this.runPromise(
-      Deferred.await(this.ready).pipe(
-        Effect.matchEffect({
-          onFailure: () => Effect.void,
-          onSuccess: () => Queue.offer(this.operations, { _tag: "Stop" }),
-        }),
-        Effect.andThen(Deferred.await(this.applicationExit)),
-        Effect.asVoid,
-      ),
-    ).catch(() => undefined);
+    const previous = Effect.runSync(
+      Ref.modify(this.lifecycle, (state) => [
+        state,
+        state === "open" ? "stopping" : state,
+      ] as const),
+    );
+    if (previous === "stopped") return;
+    if (previous === "open")
+      await this.runPromise(
+        Deferred.await(this.ready).pipe(
+          Effect.matchEffect({
+            onFailure: () => Effect.void,
+            onSuccess: () => Queue.offer(this.operations, { _tag: "Stop" }),
+          }),
+          Effect.andThen(Deferred.await(this.applicationExit)),
+          Effect.asVoid,
+        ),
+      ).catch(() => undefined);
+    else await this.runPromise(Deferred.await(this.applicationExit)).catch(() => undefined);
     await this.effectRuntime.dispose();
   }
 
   private async runPromise<T, E>(effect: Effect.Effect<T, E>): Promise<T> {
-    if (this.effectRuntime.scope.state._tag === "Closed")
+    if (Ref.getUnsafe(this.lifecycle) === "stopped")
       throw new RuntimeStoppedError({ message: "Workstream runtime is stopped." });
     const exit = await this.effectRuntime.runPromiseExit(effect);
     if (Exit.isSuccess(exit)) return exit.value;

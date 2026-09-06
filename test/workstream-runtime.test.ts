@@ -1108,9 +1108,33 @@ test("failed notification is not retried by polling and manual observed receipt 
   }
 });
 
+test("partial adoption failure releases the acquired lease before runtime failure", async (t) => {
+  const f = await fixture();
+  try {
+    const adopt = t.mock.method(f.store, "adopt", async () => {
+      throw new Error("fixture adoption failure");
+    });
+    const failed = f.runtime(undefined, {
+      owner: {
+        sessionId: "adopting-owner",
+        sessionFile: join(f.parent, "adopting-session.jsonl"),
+      },
+    });
+    await assert.rejects(failed.perform(async () => undefined), /adoption failure/);
+    assert.equal(adopt.mock.callCount(), 1);
+    assert.equal(
+      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
+      undefined,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("Effect-owned fibers use deterministic cadence and stop before releasing the lease", async () => {
   const f = await fixture();
   const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+  await Effect.runPromise(clock.setTime(Date.now()));
   try {
     const active = f.runtime(undefined, { clock });
     await active.queue(research("clocked"));
@@ -1130,6 +1154,7 @@ test("Effect-owned fibers use deterministic cadence and stop before releasing th
 test("heartbeat ownership loss reports once and interrupts scoped reconciliation", async () => {
   const f = await fixture();
   const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+  await Effect.runPromise(clock.setTime(Date.now()));
   try {
     const active = f.runtime(undefined, { clock });
     active.start();
