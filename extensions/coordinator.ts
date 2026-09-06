@@ -12,6 +12,7 @@ import {
   resultNotification,
 } from "../src/agent-facing.js";
 import { installCalmMode, isCoordinatorScope, updateCalmWorkers } from "../src/calm.js";
+import { installCoordinatorNotes } from "../src/coordinator-notes.js";
 import { GitRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import {
@@ -169,6 +170,22 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         ),
       ),
     );
+  installCoordinatorNotes(pi, {
+    owner,
+    serialize: (run) => serial(host("update coordinator notes", run)),
+    onHumanInput: (receipt) => {
+      pending.push(receipt);
+      const active = runtime;
+      if (active === undefined) return Promise.resolve();
+      return active.store
+        .load()
+        .then((state) =>
+          state.lifecycle.state === "active" || state.lifecycle.state === "suspended"
+            ? active.perform(() => active.store.recordInputEvent(receipt).then(() => undefined))
+            : undefined,
+        );
+    },
+  });
   const ensureEffect = (
     ctx: ExtensionContext,
     purpose: string,
@@ -275,30 +292,6 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       ),
     );
 
-  pi.on("input", (event, ctx) => {
-    if ((event.source !== "interactive" && event.source !== "rpc") || event.text.trim() === "")
-      return;
-    const receipt = {
-      id: randomUUID(),
-      ...owner(ctx),
-      source: event.source,
-      text: event.text,
-    };
-    // This receipt exists even when delegation has not created a workstream yet.
-    pi.appendEntry(INPUT, receipt);
-    return serial(
-      Effect.gen(function* () {
-        pending.push(receipt);
-        const active = runtime;
-        if (active === undefined) return;
-        const state = yield* host("load input workstream", () => active.store.load());
-        if (state.lifecycle.state === "active" || state.lifecycle.state === "suspended")
-          yield* host("record human input", () =>
-            active.perform(() => active.store.recordInputEvent(receipt).then(() => undefined)),
-          );
-      }),
-    );
-  });
   pi.on("session_start", (_event, ctx) =>
     serial(
       Effect.gen(function* () {

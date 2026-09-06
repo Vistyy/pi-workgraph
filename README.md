@@ -54,6 +54,7 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 | `workgraph_fork` | Explicitly fork the coordinator conversation into a new no-focus Herdr workspace; workers remain tabs in their owning workspace. |
 | `workgraph_complete` | Record a conclusion, evidence, and limitations after workers and owned resources settle. |
 | `workgraph_models` | Inspect or explicitly change model defaults. |
+| `workgraph_note` | Record, update, supersede, or resolve one batch of session-owned compact reminders for substantive human-facing answers, requested outcomes, or status awaiting a later human response. |
 
 The coordinator interprets what a human request authorizes and chooses which independent contributions are meaningful.
 Research, experiments, implementation slices, comparison, review, and integration are optional capabilities rather than a prescribed route.
@@ -74,6 +75,14 @@ Use the returned `next` handle to retrieve every remaining character of typed, u
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic acceptance oracle.
 Completion derives mechanical unresolved accounting and accepts one explicit reason per unresolved semantic task only; it refuses live or blocked resources and never automatically accepts evidence.
 Extension notifications and worker reports do not grant authority.
+The coordinator also keeps session-owned response notes independently of Calm and WorkstreamStore state.
+The single `workgraph_note` tool records or updates a substantive answer, requested outcome, or status only when the coordinator judges that a later human response may matter; it is not a notebook, inbox, read detector, supervisor, delivery acknowledgment, disposition, or authority mutation.
+A finalized visible assistant answer is recorded as presentation provenance when practical, while a drafted note explicitly does not prove that its answer was shown.
+Only a later genuine interactive or RPC input receipt can ground resolution, and the model must cite the addressed note ids and explain its semantic interpretation.
+Unrelated or partial replies leave other notes pending, operational notifications never clear notes, and superseding status retains unresolved substance and provenance without arbitrary silent caps or loss.
+Reload, resume, branch navigation, and compaction preserve the session-owned unresolved state; completed workstreams do not clear it, and note state never blocks `workgraph_complete`.
+The hidden context contains compact reminder lines rather than repeated full answers.
+Whether a reply addresses a note remains semantic model judgment with explicit limits: visibility, delivery, idle state, and a tool call cannot establish that a human read or acknowledged an answer, and ambiguous courtesy does not require clarification merely for bookkeeping.
 An explicit semantic scope revision leaves historical evidence intact and tied to its original intent, while stale maintained output cannot compose into the current intent.
 An experiment retains its named artifacts before scratch files are discarded; its code is never automatically composed.
 
