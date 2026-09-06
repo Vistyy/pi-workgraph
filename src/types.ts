@@ -1,7 +1,12 @@
 import type { Static } from "typebox";
-import type { ImplementationReportSchema, WorkerReportSchema } from "./report-schema.js";
+import type {
+  ImplementationReportSchema,
+  WorkerReportInputSchema,
+  WorkerReportSchema,
+} from "./report-schema.js";
 
 export type WorkerReport = Static<typeof WorkerReportSchema>;
+export type WorkerReportInput = Static<typeof WorkerReportInputSchema>;
 export type ImplementationReport = Static<typeof ImplementationReportSchema>;
 export type WorkerMode = WorkerReport["kind"];
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";

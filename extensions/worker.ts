@@ -1,10 +1,15 @@
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { Config, ConfigProvider, DateTime, Effect } from "effect";
+import { Config, ConfigProvider, Data, DateTime, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { ThinkingSchema } from "../src/model-policy.js";
-import { isWorkerReport, reportSchemaForMode } from "../src/report-schema.js";
-import type { ImplementationReport, WorkerMode, WorkerReport } from "../src/types.js";
+import { isWorkerReportInput, reportSchemaForMode } from "../src/report-schema.js";
+import type {
+  ImplementationReport,
+  WorkerMode,
+  WorkerReport,
+  WorkerReportInput,
+} from "../src/types.js";
 
 const WorkerEnvironmentConfig = Config.all({
   mode: Config.string("PI_WORKGRAPH_MODE").pipe(Config.withDefault("")),
@@ -32,6 +37,21 @@ const AttemptStateSchema = Type.Object({
 
 type AttemptState = Static<typeof AttemptStateSchema>;
 
+class WorkerContractError extends Data.TaggedError("WorkerContractError")<{
+  readonly message: string;
+}> {}
+
+class WorkerHostError extends Data.TaggedError("WorkerHostError")<{
+  readonly message: string;
+  readonly operation: "exec" | "setModel";
+}> {}
+
+class WorkerGitError extends Data.TaggedError("WorkerGitError")<{
+  readonly message: string;
+}> {}
+
+type WorkerExpectedError = WorkerContractError | WorkerHostError | WorkerGitError;
+
 interface WorkerTerminalState {
   readonly todos: readonly string[];
   readonly todoRecorded?: boolean | undefined;
@@ -56,8 +76,8 @@ interface WorkerReportExecutionState {
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
   const environment = Effect.runSync(WorkerEnvironmentConfig.parse(ConfigProvider.fromEnv()));
-  const mode = readMode(environment.mode);
-  if (mode === undefined) return;
+  const mode = Effect.runSync(readMode(environment.mode));
+  if (mode === null) return;
   const { runId, nodeId, executorModel, executorThinking, baseCommit } = environment;
   const generation = { runId, nodeId };
   const continued = environment.implementationStart === "executor";
@@ -118,9 +138,11 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     }),
     execute(_id, params) {
       return Effect.runPromise(
-        Effect.sync(() => {
+        Effect.gen(function* () {
           if (mode !== "implementation" || phase !== "guide")
-            throw new Error("Local Prewalk TODOs belong before the first implementation edit.");
+            return yield* contractFailure(
+              "Local Prewalk TODOs belong before the first implementation edit.",
+            );
           todos = params.items;
           pi.appendEntry("pi-workgraph-worker-state", {
             ...generation,
@@ -168,11 +190,11 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   pi.on("tool_execution_end", (event, ctx) => {
     if (mode !== "implementation" || phase !== "guide") return;
     const directEdit = !event.isError && (event.toolName === "edit" || event.toolName === "write");
-    if (!directEdit) {
-      if (!baseCommit) return;
-      // Any tool can mutate or commit. Observe Git, not shell-command spelling.
-      return Effect.runPromise(
-        Effect.gen(function* () {
+    const operation = directEdit
+      ? transitionToExecutor(pi, ctx)
+      : Effect.gen(function* () {
+          if (!baseCommit) return;
+          // Any tool can mutate or commit. Observe Git, not shell-command spelling.
           const status = yield* gitEffect(
             pi,
             ctx.cwd,
@@ -185,13 +207,9 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
           )
             return;
           yield* transitionToExecutor(pi, ctx);
-        }).pipe(Effect.catchCause((cause) => Effect.sync(() => recordSwitchFailure(pi, cause)))),
-      );
-    }
+        });
     return Effect.runPromise(
-      transitionToExecutor(pi, ctx).pipe(
-        Effect.catchCause((cause) => Effect.sync(() => recordSwitchFailure(pi, cause))),
-      ),
+      operation.pipe(Effect.catch((error) => Effect.sync(() => recordSwitchFailure(pi, error)))),
     );
   });
 
@@ -201,16 +219,25 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   ) {
     return Effect.gen(function* () {
       const slash = executorModel.indexOf("/");
-      if (slash <= 0) throw new Error(`Invalid executor model: ${executorModel}`);
+      if (slash <= 0) return yield* contractFailure(`Invalid executor model: ${executorModel}`);
       const model = ctx.modelRegistry.find(
         executorModel.slice(0, slash),
         executorModel.slice(slash + 1),
       );
-      if (model === undefined) throw new Error(`Executor model is unavailable: ${executorModel}`);
-      if (!(yield* Effect.promise(() => extension.setModel(model))))
-        throw new Error(`Executor model has no usable credentials: ${executorModel}`);
+      if (model === undefined)
+        return yield* contractFailure(`Executor model is unavailable: ${executorModel}`);
+      const selected = yield* Effect.tryPromise({
+        try: () => extension.setModel(model),
+        catch: () =>
+          new WorkerHostError({
+            operation: "setModel",
+            message: `Pi could not select executor model: ${executorModel}`,
+          }),
+      });
+      if (!selected)
+        return yield* contractFailure(`Executor model has no usable credentials: ${executorModel}`);
       if (!Value.Check(ThinkingSchema, executorThinking))
-        throw new Error(`Invalid executor thinking: ${executorThinking}`);
+        return yield* contractFailure(`Invalid executor thinking: ${executorThinking}`);
       extension.setThinkingLevel(executorThinking);
       phase = "executor";
       switchError = undefined;
@@ -226,8 +253,8 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     });
   }
 
-  function recordSwitchFailure(extension: ExtensionAPI, cause: unknown): void {
-    switchError = String(cause);
+  function recordSwitchFailure(extension: ExtensionAPI, error: WorkerExpectedError): void {
+    switchError = error.message;
     extension.appendEntry("pi-workgraph-worker-state", {
       ...generation,
       phase,
@@ -270,37 +297,24 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     const attempt = latestAttemptState(ctx.sessionManager.getBranch());
     if (attempt !== undefined) reattachAttemptState(attempt);
   });
-  pi.on("agent_start", (_event, ctx) =>
-    Effect.runPromise(
-      Effect.gen(function* () {
-        if (ctx.model)
-          pi.appendEntry("pi-workgraph-effective-model", {
-            ...generation,
-            model: `${ctx.model.provider}/${ctx.model.id}`,
-            thinking: pi.getThinkingLevel(),
-          });
-        pi.appendEntry("pi-workgraph-agent-running", {
-          ...generation,
-          startedAt: DateTime.formatIso(yield* DateTime.now),
-        });
-      }),
-    ),
-  );
-  pi.on("agent_settled", () =>
-    Effect.runPromise(
-      DateTime.now.pipe(
-        Effect.tap((now) =>
-          Effect.sync(() => {
-            pi.appendEntry("pi-workgraph-agent-settled", {
-              ...generation,
-              settledAt: DateTime.formatIso(now),
-            });
-          }),
-        ),
-        Effect.asVoid,
-      ),
-    ),
-  );
+  pi.on("agent_start", (_event, ctx) => {
+    if (ctx.model)
+      pi.appendEntry("pi-workgraph-effective-model", {
+        ...generation,
+        model: `${ctx.model.provider}/${ctx.model.id}`,
+        thinking: pi.getThinkingLevel(),
+      });
+    pi.appendEntry("pi-workgraph-agent-running", {
+      ...generation,
+      startedAt: DateTime.formatIso(DateTime.nowUnsafe()),
+    });
+  });
+  pi.on("agent_settled", () => {
+    pi.appendEntry("pi-workgraph-agent-settled", {
+      ...generation,
+      settledAt: DateTime.formatIso(DateTime.nowUnsafe()),
+    });
+  });
   pi.on("context", (event) => {
     if (mode !== "implementation" || phase !== "executor") return;
     return {
@@ -344,12 +358,12 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
 function handleWorkerReport(
   pi: ExtensionAPI,
   cwd: string,
-  params: WorkerReport,
+  params: WorkerReportInput,
   execution: WorkerReportExecutionState,
 ) {
   return Effect.gen(function* () {
-    if (!isWorkerReport(params) || params.kind !== execution.mode)
-      throw new Error(`Report must satisfy the ${execution.mode} contract.`);
+    if (!isWorkerReportInput(params) || params.kind !== execution.mode)
+      return yield* contractFailure(`Report must satisfy the ${execution.mode} contract.`);
     if (params.kind !== "implementation" || params.status !== "completed") {
       // Read-only is an instruction and authority boundary, not a filesystem sandbox.
       // Shared research and review deliberately observe the live project cwd, including
@@ -374,11 +388,12 @@ function noChangeImplementationReport(
   execution: WorkerReportExecutionState,
 ) {
   return Effect.gen(function* () {
-    if (execution.baseCommit.length === 0) throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
+    if (execution.baseCommit.length === 0)
+      return yield* contractFailure("PI_WORKGRAPH_BASE_COMMIT is required.");
     yield* requireCleanWorktree(pi, cwd, "No-change implementation requires a clean worktree:");
     const revision = yield* gitEffect(pi, cwd, ["rev-parse", "HEAD"]);
     if (report.revision !== revision || revision !== execution.baseCommit)
-      throw new Error(
+      return yield* contractFailure(
         `No-change implementation must report the unchanged base revision ${execution.baseCommit}.`,
       );
     return terminalReport(report, {
@@ -401,14 +416,17 @@ function changedImplementationReport(
 ) {
   return Effect.gen(function* () {
     if (execution.phase !== "executor")
-      throw new Error("Completed changed implementation requires the first-edit model transition.");
+      return yield* contractFailure(
+        "Completed changed implementation requires the first-edit model transition.",
+      );
     if (execution.switchError !== undefined)
-      throw new Error(`Executor model transition failed: ${execution.switchError}`);
+      return yield* contractFailure(`Executor model transition failed: ${execution.switchError}`);
     if (!execution.hasExecutorMessage())
-      throw new Error(
+      return yield* contractFailure(
         "Completed changed implementation requires an actual executor assistant message after this attempt's transition/start. Continue with the executor before reporting.",
       );
-    if (execution.baseCommit.length === 0) throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
+    if (execution.baseCommit.length === 0)
+      return yield* contractFailure("PI_WORKGRAPH_BASE_COMMIT is required.");
     const provenance = yield* changedCommitProvenance(pi, cwd, execution.baseCommit);
     return terminalReport(
       { ...report, ...provenance },
@@ -439,7 +457,7 @@ function changedCommitProvenance(pi: ExtensionAPI, cwd: string, baseCommit: stri
       parent !== baseCommit ||
       extraParents.length > 0
     )
-      throw new Error(
+      return yield* contractFailure(
         "A completed changed implementation requires exactly one direct commit on the supplied base.",
       );
     const changedText = yield* gitEffect(
@@ -466,7 +484,7 @@ function requireCleanWorktree(pi: ExtensionAPI, cwd: string, errorPrefix: string
       ["status", "--porcelain", "--untracked-files=all"],
       true,
     );
-    if (status.length > 0) throw new Error(`${errorPrefix}\n${status}`);
+    if (status.length > 0) return yield* contractFailure(`${errorPrefix}\n${status}`);
   });
 }
 
@@ -495,17 +513,34 @@ function executorInstructions(): string {
 }
 function gitEffect(pi: ExtensionAPI, cwd: string, args: string[], allowEmpty = false) {
   return Effect.gen(function* () {
-    const result = yield* Effect.promise(() => pi.exec("git", ["-C", cwd, ...args]));
+    const result = yield* Effect.tryPromise({
+      try: () => pi.exec("git", ["-C", cwd, ...args]),
+      catch: () =>
+        new WorkerHostError({
+          operation: "exec",
+          message: `Pi could not execute git ${args.join(" ")}.`,
+        }),
+    });
     if (result.code !== 0)
-      throw new Error(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
+      return yield* gitFailure(`git ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
     const output = result.stdout.trim();
     if (!allowEmpty && output.length === 0)
-      throw new Error(`git ${args.join(" ")} returned no output.`);
+      return yield* gitFailure(`git ${args.join(" ")} returned no output.`);
     return output;
   });
 }
-function readMode(value: string): WorkerMode | undefined {
-  if (value.length === 0) return undefined;
-  if (value === "research" || value === "review" || value === "implementation") return value;
-  throw new Error(`Invalid PI_WORKGRAPH_MODE: ${value}`);
+
+function contractFailure(message: string) {
+  return Effect.fail(new WorkerContractError({ message }));
+}
+
+function gitFailure(message: string) {
+  return Effect.fail(new WorkerGitError({ message }));
+}
+
+function readMode(value: string) {
+  if (value.length === 0) return Effect.succeed<WorkerMode | null>(null);
+  if (value === "research" || value === "review" || value === "implementation")
+    return Effect.succeed<WorkerMode | null>(value);
+  return contractFailure(`Invalid PI_WORKGRAPH_MODE: ${value}`);
 }

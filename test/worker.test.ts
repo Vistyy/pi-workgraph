@@ -7,6 +7,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { Value } from "typebox/value";
 import {
   configureFixtureEnvironment,
   decodeTestValue,
@@ -50,7 +51,7 @@ function assistant(session: SessionManager, model = "gpt-4o") {
   });
 }
 
-async function fixture(mode: "implementation" | "review", continued = false) {
+async function fixture(mode: "implementation" | "research" | "review", continued = false) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
   const root = join(parent, "repo");
   await mkdir(root);
@@ -103,7 +104,10 @@ void test("registered worker observes a non-edit mutation, switches locally, rep
     });
     assistant(f.session);
     await f.runner.emit({ type: "session_start", reason: "startup" });
-    await assert.rejects(f.call("workgraph_report", report), /first-edit model transition/);
+    await assert.rejects(f.call("workgraph_report", report), {
+      _tag: "WorkerContractError",
+      message: "Completed changed implementation requires the first-edit model transition.",
+    });
     await f.runner.emit({ type: "agent_start" });
     await f.runner.emit({
       type: "tool_execution_end",
@@ -214,6 +218,46 @@ void test("continued implementation requires this attempt's native start and lat
     await assert.rejects(f.call("workgraph_report", report), /clean worktree/);
   } finally {
     await f.dispose();
+  }
+});
+
+void test("registered report boundary rejects top-level and nested undeclared fields in every mode", async () => {
+  for (const mode of ["research", "review", "implementation"] as const) {
+    const f = await fixture(mode);
+    try {
+      const tool = f.runner.getToolDefinition("workgraph_report");
+      assert.ok(tool !== undefined);
+      const report = {
+        kind: mode,
+        status: "failed",
+        summary: "Boundary regression",
+        evidence: [{ label: "Boundary", observation: "Observed" }],
+        findings: [
+          {
+            severity: "info",
+            title: "No concern",
+            detail: "No actionable concern was found.",
+            envelopeImpact: "none",
+          },
+        ],
+      };
+      for (const invalid of [
+        { ...report, authorization: "Bearer retained-secret" },
+        {
+          ...report,
+          evidence: [{ ...report.evidence[0], rawProviderError: "credential-bearing failure" }],
+        },
+        {
+          ...report,
+          findings: [{ ...report.findings[0], apiKey: "retained-secret" }],
+        },
+      ]) {
+        assert.equal(Value.Check(tool.parameters, invalid), false, `${mode} accepted extra input`);
+        await assert.rejects(f.call("workgraph_report", invalid), /Invalid fixture input/);
+      }
+    } finally {
+      await f.dispose();
+    }
   }
 });
 
