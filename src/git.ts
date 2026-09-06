@@ -534,7 +534,7 @@ export class GitRepository {
   }
 }
 
-function inspectRepository(cwd: string): GitEffect<RepositoryInfo> {
+export function inspectRepository(cwd: string): GitEffect<RepositoryInfo> {
   const git = makeGitClient(liveGitProcessRunner);
   return Effect.gen(function* () {
     const root = yield* git.text(cwd, ["rev-parse", "--show-toplevel"]);
@@ -550,7 +550,7 @@ function inspectRepository(cwd: string): GitEffect<RepositoryInfo> {
   });
 }
 
-function openRepository(cwd: string): GitEffect<GitRepository> {
+export function openRepository(cwd: string): GitEffect<GitRepository> {
   return Effect.map(inspectRepository(cwd), (info) => new GitRepository(info.root, info.commonDir));
 }
 

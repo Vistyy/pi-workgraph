@@ -1,18 +1,26 @@
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
-import { readFile } from "node:fs/promises";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Entrypoint detection is the executable host boundary.
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { Config, ConfigProvider, Effect, Option } from "effect";
+import { Config, ConfigProvider, Data, Effect, FileSystem, Option, Path } from "effect";
+import type { ConfigError } from "effect/Config";
+import type { PlatformError } from "effect/PlatformError";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { type InspectRequest, type InspectSection, inspectView } from "./agent-facing.js";
-import { GitRepository } from "./git.js";
-import { HerdrCliRuntime } from "./herdr.js";
-import { forkConversationSession } from "./pi-process.js";
+import { type InspectView, inspectView } from "./agent-facing.js";
+import { CliInputError, type CliRequest, parseCliRequest, usage } from "./cli-parse.js";
+import { type GitFailure, inspectRepository } from "./git.js";
+import {
+  type CoordinatorLaunchError,
+  HerdrCliRuntime,
+  type HerdrEffects,
+  type HerdrProtocolError,
+} from "./herdr.js";
+import { liveLayer } from "./node-platform.js";
+import { forkConversationSessionEffect, type PiSessionError } from "./pi-process.js";
 import { defaultRegistryPath } from "./registry.js";
-import { WorkstreamStore } from "./workstream.js";
+import type { WorkerIdentity } from "./types.js";
+import { WorkstreamStoreEffects, type WorkstreamStoreError } from "./workstream.js";
 
 const StatePathRowSchema = Type.Object({ state_path: Type.String() });
 const CliEnvironmentConfig = Config.all({
@@ -21,166 +29,206 @@ const CliEnvironmentConfig = Config.all({
   agentDir: Config.string("PI_CODING_AGENT_DIR").pipe(Config.option),
 });
 
-// biome-ignore-start lint/complexity/noExcessiveCognitiveComplexity: CLI dispatch keeps each public mode's validation visible at this executable boundary.
-// oxlint-disable-next-line effecttsgo/async-function -- This exact Node CLI boundary preserves Promise interoperability for callers.
-export async function runCli(argv: readonly string[], env: NodeJS.ProcessEnv = process.env) {
-  const [command, ...rest] = argv;
-  if (command === undefined || ["help", "--help", "-h"].includes(command))
-    return { command: "help", result: usage() };
-  const options = parseOptions(rest);
-  const environment = Effect.runSync(CliEnvironmentConfig.parse(ConfigProvider.fromEnvRecord(env)));
-  if (command === "status") {
-    const statePath = await resolveStatePath(options, Option.getOrUndefined(environment.agentDir));
-    // Status deliberately preserves uninterpreted historical JSON.
-    // SAFETY: status intentionally preserves arbitrary historical JSON without migration.
-    const state: unknown = JSON.parse(await readUtf8(resolve(statePath)));
-    return { command, statePath, state };
-  }
-  if (command === "inspect") {
-    const statePath = await resolveStatePath(options, Option.getOrUndefined(environment.agentDir));
-    const state = await WorkstreamStore.inspect(resolve(statePath));
-    const section = options.get("section") ?? "overview";
-    if (!["overview", "task", "outcome", "evidence", "recovery", "report"].includes(section))
-      throw new Error(`Invalid inspection section ${section}.`);
-    const task = options.get("task");
-    const attempt = options.get("attempt");
-    const result = options.get("result");
-    const offset = options.get("offset");
-    const maxChars = options.get("max-chars");
-    const itemOffset = options.get("item-offset");
-    const maxItems = options.get("max-items");
-    // SAFETY: the preceding allow-list establishes section as an InspectSection.
-    const request: InspectRequest = { section: section as InspectSection };
-    if (task !== undefined) request.task = task;
-    if (attempt !== undefined) request.attempt = attempt;
-    if (result !== undefined) request.result = result;
-    if (offset !== undefined) request.offset = parseInteger(offset, "offset");
-    if (maxChars !== undefined) request.maxChars = parseInteger(maxChars, "max-chars");
-    if (itemOffset !== undefined) request.itemOffset = parseInteger(itemOffset, "item-offset");
-    if (maxItems !== undefined) request.maxItems = parseInteger(maxItems, "max-items");
-    const view = inspectView(state, request);
-    return { command, statePath, view };
-  }
-  if (command === "fork") {
+interface CliEnvironment {
+  readonly sessionFile: Option.Option<string>;
+  readonly herdrBin: string;
+  readonly agentDir: Option.Option<string>;
+}
+
+type StateRequest = Extract<CliRequest, { command: "status" | "inspect" }>;
+type ForkRequest = Parameters<typeof forkConversationSessionEffect>[0];
+type CliFailure =
+  | ConfigError
+  | CliInputError
+  | CliOperationError
+  | PlatformError
+  | WorkstreamStoreError
+  | GitFailure
+  | PiSessionError
+  | CoordinatorLaunchError
+  | HerdrProtocolError;
+type CliEffect<A> = Effect.Effect<A, CliFailure, FileSystem.FileSystem | Path.Path>;
+
+export type CliResult =
+  | { command: "help"; result: string }
+  | { command: "status"; statePath: string; state: unknown }
+  | { command: "inspect"; statePath: string; view: InspectView }
+  | { command: "fork"; sessionFile: string; identity: WorkerIdentity };
+
+export interface NativeHerdr {
+  readonly available: boolean;
+  readonly effects: Pick<HerdrEffects, "launchCoordinator">;
+}
+
+export type NativeHerdrFactory = (command: string, env: NodeJS.ProcessEnv) => NativeHerdr;
+
+export class CliOperationError extends Data.TaggedError("CliOperationError")<{
+  readonly message: string;
+  readonly cause: unknown;
+}> {}
+
+const makeNativeHerdr: NativeHerdrFactory = (command, env) => new HerdrCliRuntime(command, env);
+
+/** The single Effect-to-Promise boundary for programmatic and executable CLI hosts. */
+export function runCli(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+  nativeHerdr: NativeHerdrFactory = makeNativeHerdr,
+): Promise<CliResult> {
+  return Effect.runPromise(cliEffect(argv, env, nativeHerdr).pipe(Effect.provide(liveLayer)));
+}
+
+function cliEffect(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+  nativeHerdr: NativeHerdrFactory,
+): Effect.Effect<CliResult, CliFailure, FileSystem.FileSystem | Path.Path> {
+  return parseEffect(argv).pipe(
+    Effect.flatMap((request) => {
+      if (request.command === "help") return Effect.succeed({ command: "help", result: usage() });
+      return CliEnvironmentConfig.parse(ConfigProvider.fromEnvRecord(env)).pipe(
+        Effect.flatMap((environment) => commandEffect(request, environment, env, nativeHerdr)),
+      );
+    }),
+  );
+}
+
+function commandEffect(
+  request: Exclude<CliRequest, { command: "help" }>,
+  environment: CliEnvironment,
+  env: NodeJS.ProcessEnv,
+  nativeHerdr: NativeHerdrFactory,
+): CliEffect<CliResult> {
+  if (request.command === "status") return statusEffect(request, environment);
+  if (request.command === "inspect") return inspectEffect(request, environment);
+  return forkEffect(request, environment, env, nativeHerdr);
+}
+
+function statusEffect(
+  request: Extract<CliRequest, { command: "status" }>,
+  environment: CliEnvironment,
+): CliEffect<Extract<CliResult, { command: "status" }>> {
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const paths = yield* Path.Path;
+    const statePath = yield* resolveStatePath(request, environment);
+    const text = yield* fileSystem.readFileString(paths.resolve(statePath));
+    // Status deliberately preserves uninterpreted historical JSON without migration.
+    // oxlint-disable-next-line anti-slop/no-unknown-returns -- This command intentionally returns historical JSON without schema interpretation or migration.
+    const state = yield* operationEffect((): unknown => JSON.parse(text));
+    return { command: request.command, statePath, state };
+  });
+}
+
+function inspectEffect(
+  request: Extract<CliRequest, { command: "inspect" }>,
+  environment: CliEnvironment,
+): CliEffect<Extract<CliResult, { command: "inspect" }>> {
+  return Effect.gen(function* () {
+    const paths = yield* Path.Path;
+    const statePath = yield* resolveStatePath(request, environment);
+    const state = yield* WorkstreamStoreEffects.inspect(paths.resolve(statePath));
+    const view = yield* operationEffect(() => inspectView(state, request.inspection));
+    return { command: request.command, statePath, view };
+  });
+}
+
+function forkEffect(
+  request: Extract<CliRequest, { command: "fork" }>,
+  environment: CliEnvironment,
+  env: NodeJS.ProcessEnv,
+  makeHerdr: NativeHerdrFactory,
+): CliEffect<Extract<CliResult, { command: "fork" }>> {
+  return Effect.gen(function* () {
+    const paths = yield* Path.Path;
     const parentSessionFile =
-      options.get("parent-session-file") ?? Option.getOrUndefined(environment.sessionFile);
+      request.parentSessionFile ?? Option.getOrUndefined(environment.sessionFile);
     if (parentSessionFile === undefined || parentSessionFile.length === 0)
-      throw new Error("Fork requires --parent-session-file or PI_SESSION_FILE.");
-    const targetCwd = resolve(options.get("target-cwd") ?? process.cwd());
-    await GitRepository.inspect(targetCwd);
-    const runtime = new HerdrCliRuntime(environment.herdrBin, env);
-    if (!runtime.available)
-      throw new Error("Herdr is unavailable. No hidden fallback was started.");
-    const entryId = options.get("entry-id");
-    const forkOptions: Parameters<typeof forkConversationSession>[0] = {
-      parentSessionFile,
-      targetCwd,
-    };
-    if (entryId !== undefined) forkOptions.entryId = entryId;
-    const sessionFile = await forkConversationSession(forkOptions);
-    const identity = await runtime.launchCoordinator({
+      return yield* new CliInputError({
+        message: "Fork requires --parent-session-file or PI_SESSION_FILE.",
+      });
+    const targetCwd = paths.resolve(request.targetCwd ?? process.cwd());
+    yield* inspectRepository(targetCwd);
+    const herdr = makeHerdr(environment.herdrBin, env);
+    if (!herdr.available)
+      return yield* new CliInputError({
+        message: "Herdr is unavailable. No hidden fallback was started.",
+      });
+    const forkRequest: ForkRequest = { parentSessionFile, targetCwd };
+    if (request.entryId !== undefined) forkRequest.entryId = request.entryId;
+    const sessionFile = yield* forkConversationSessionEffect(forkRequest);
+    const identity: WorkerIdentity = yield* herdr.effects.launchCoordinator({
       cwd: targetCwd,
       sessionFile,
     });
-    return { command, sessionFile, identity };
-  }
-  throw new Error(`Unsupported command ${command}. ${usage()}`);
-}
-// biome-ignore-end lint/complexity/noExcessiveCognitiveComplexity: End CLI dispatch boundary.
-
-// oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
-async function resolveStatePath(
-  options: Map<string, string>,
-  agentDir: string | undefined,
-): Promise<string> {
-  const statePath = options.get("state");
-  if (statePath !== undefined && statePath.length > 0) return statePath;
-  const id = options.get("run-id");
-  if (id === undefined || id.length === 0) throw new Error("Provide --state PATH or --run-id ID.");
-  const registry = new DatabaseSync(options.get("registry") ?? defaultRegistryPath(agentDir), {
-    readOnly: true,
+    return { command: request.command, sessionFile, identity };
   });
-  try {
-    const row: unknown = registry.prepare("SELECT state_path FROM runs WHERE run_id=?").get(id);
-    if (!Value.Check(StatePathRowSchema, row)) throw new Error(`Unknown Workgraph ${id}.`);
-    return Value.Decode(StatePathRowSchema, row).state_path;
-  } finally {
-    registry.close();
-  }
 }
 
-function parseInteger(value: string, name: string): number {
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 0)
-    throw new Error(`Invalid non-negative integer for --${name}.`);
-  return parsed;
+function resolveStatePath(
+  request: StateRequest,
+  environment: CliEnvironment,
+): Effect.Effect<string, CliInputError | CliOperationError> {
+  const { state, runId, registry } = request.selection;
+  if (state !== undefined && state.length > 0) return Effect.succeed(state);
+  if (runId === undefined || runId.length === 0)
+    return Effect.fail(new CliInputError({ message: "Provide --state PATH or --run-id ID." }));
+  return lookupStatePath(
+    registry ?? defaultRegistryPath(Option.getOrUndefined(environment.agentDir)),
+    runId,
+  );
 }
 
-function parseOptions(args: readonly string[]): Map<string, string> {
-  const options = new Map<string, string>();
-  const supported = [
-    "state",
-    "run-id",
-    "registry",
-    "parent-session-file",
-    "target-cwd",
-    "entry-id",
-    "section",
-    "task",
-    "attempt",
-    "result",
-    "offset",
-    "max-chars",
-    "item-offset",
-    "max-items",
-  ];
-  for (let index = 0; index < args.length; index += 2) {
-    const token = args[index];
-    const key = token?.slice(2);
-    const value = args[index + 1];
-    if (
-      token === undefined ||
-      !token.startsWith("--") ||
-      key === undefined ||
-      key.length === 0 ||
-      !supported.includes(key) ||
-      value === undefined ||
-      value.length === 0 ||
-      value.startsWith("--") ||
-      options.has(key)
-    )
-      throw new Error(`Invalid option: ${token ?? "undefined"}`);
-    options.set(key, value);
-  }
-  return options;
+function lookupStatePath(
+  registryPath: string,
+  runId: string,
+): Effect.Effect<string, CliInputError | CliOperationError> {
+  return operationEffect(() => {
+    const registry = new DatabaseSync(registryPath, { readOnly: true });
+    try {
+      return registry.prepare("SELECT state_path FROM runs WHERE run_id=?").get(runId);
+    } finally {
+      registry.close();
+    }
+  }).pipe(
+    Effect.flatMap((row) =>
+      Value.Check(StatePathRowSchema, row)
+        ? Effect.succeed(Value.Decode(StatePathRowSchema, row).state_path)
+        : Effect.fail(new CliInputError({ message: `Unknown Workgraph ${runId}.` })),
+    ),
+  );
 }
 
-function readUtf8(path: string): Promise<string> {
-  return Effect.runPromise(Effect.promise(() => readFile(path, "utf8")));
+function parseEffect(argv: readonly string[]): Effect.Effect<CliRequest, CliInputError> {
+  return Effect.try({
+    try: () => parseCliRequest(argv),
+    catch: (cause) =>
+      cause instanceof CliInputError ? cause : new CliInputError({ message: errorMessage(cause) }),
+  });
 }
 
-function usage(): string {
-  return [
-    "pi-workgraph inspect --state PATH | --run-id ID [--registry PATH] [--section SECTION] [--task ID] [--attempt ID] [--result ID] [--offset N] [--max-chars N] [--item-offset N] [--max-items N]",
-    "pi-workgraph status --state PATH | --run-id ID [--registry PATH]",
-    "pi-workgraph fork --parent-session-file PATH --target-cwd PATH [--entry-id ID]",
-    "Inspect is the bounded semantic view; status reads uninterpreted historical JSON without migration. Workstream mutation belongs to coordinator tools.",
-  ].join("\n");
+function operationEffect<A>(run: () => A): Effect.Effect<A, CliOperationError> {
+  return Effect.try({
+    try: run,
+    catch: (cause) => new CliOperationError({ message: errorMessage(cause), cause }),
+  });
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
-async function main(): Promise<void> {
-  try {
-    process.stdout.write(
-      `${JSON.stringify({ ok: true, ...(await runCli(process.argv.slice(2))) })}\n`,
-    );
-  } catch (error) {
-    process.stderr.write(
-      `${JSON.stringify({ ok: false, error: error instanceof Error ? error.message : String(error) })}\n`,
-    );
-    process.exitCode = 1;
-  }
+function errorMessage(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }
+
+function main(): void {
+  void runCli(process.argv.slice(2)).then(
+    (result) => process.stdout.write(`${JSON.stringify({ ok: true, ...result })}\n`),
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Promise rejection is parsed into the stable JSON error message at this executable host boundary.
+    (error: unknown) => {
+      process.stderr.write(`${JSON.stringify({ ok: false, error: errorMessage(error) })}\n`);
+      process.exitCode = 1;
+    },
+  );
+}
+
 const entrypoint = process.argv[1];
 if (entrypoint !== undefined && resolve(entrypoint) === resolve(fileURLToPath(import.meta.url)))
-  void main();
+  main();
