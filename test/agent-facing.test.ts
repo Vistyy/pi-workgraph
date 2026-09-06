@@ -238,6 +238,53 @@ void test("settlement exposes blocked artifact retention without changing worker
   assert.ok(recovery.guardedAction);
 });
 
+void test("pre-settlement retained reports expose their exact pending or blocked retention checkpoint", () => {
+  const experiment: WorkAssignment = {
+    id: "pre-settlement-experiment",
+    capability: "research",
+    artifactIntent: "disposable_experiment",
+    objective: "Retain probe output",
+    intentVersion: 0,
+    authority: { receiptId: "human", intentVersion: 1 },
+    permittedEffects: ["Write probe output"],
+    stopCondition: "One output",
+    expectedEvidence: ["probe.txt"],
+    artifactPolicy: { retain: ["probe.txt"], discardOthers: true },
+    createdAt: timestamp,
+  };
+  for (const retentionState of ["pending", "blocked"] as const) {
+    const result = typedResult(
+      `pre-settlement-${retentionState}`,
+      experiment.id,
+      researchReport("Probe done"),
+    );
+    const workerAttempt = attempt(`attempt-${retentionState}`, experiment.id, "running");
+    workerAttempt.artifactRetention = {
+      state: retentionState,
+      resultId: result.id,
+      assignmentIntentVersion: 0,
+      sourceRoot: "/tmp/probe-worktree",
+      sourceIdentity: "b".repeat(64),
+      expectedHead: "a".repeat(40),
+      destinationRoot: `/tmp/state/artifacts/${result.id}`,
+      stagingRoot: `/tmp/state/artifact-staging/${result.id}`,
+      required: ["probe.txt"],
+    };
+    if (retentionState === "blocked") workerAttempt.artifactRetention.error = "Copy interrupted.";
+    const current = state([experiment], [workerAttempt], [result]);
+    const outcome = inspectView(current, {
+      section: "outcome",
+      attempt: workerAttempt.id,
+      result: result.id,
+    });
+    assert.equal("settlement" in outcome, true);
+    if (!("settlement" in outcome)) continue;
+    assert.equal(outcome.settlement.artifactRetention.state, retentionState);
+    assert.equal(outcome.settlement.artifactRetention.required, 1);
+    assert.equal(outcome.settlement.recovery?.attempt, workerAttempt.id);
+  }
+});
+
 void test("typed report kinds and untyped or malformed reports remain inspectable", () => {
   const reports: WorkerReport[] = [
     researchReport("Research"),

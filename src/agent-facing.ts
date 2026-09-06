@@ -77,8 +77,15 @@ function attemptHandle(state: WorkstreamState, attempt: WorkAttempt): string {
   return `attempt-${attemptOrdinal(state, attempt)}`;
 }
 
+function resultOwnerAttempt(state: WorkstreamState, result: WorkResult): WorkAttempt | undefined {
+  return state.attempts.find(
+    (attempt) =>
+      attempt.resultId === result.id || attempt.artifactRetention?.resultId === result.id,
+  );
+}
+
 function outcomeOrdinal(state: WorkstreamState, result: WorkResult): number {
-  const owner = state.attempts.find((attempt) => attempt.resultId === result.id);
+  const owner = resultOwnerAttempt(state, result);
   if (owner !== undefined) return attemptOrdinal(state, owner);
   return (
     state.results.filter((item) => item.assignmentId === result.assignmentId).indexOf(result) + 1
@@ -170,14 +177,15 @@ function assertCompatibleSelection(
   attempt: WorkAttempt | undefined,
   outcome: WorkResult | undefined,
 ): void {
-  if (attempt === undefined || outcome === undefined || attempt.resultId === outcome.id) return;
-  if (attempt.resultId === undefined)
+  const retainedResultId = attempt?.resultId ?? attempt?.artifactRetention?.resultId;
+  if (attempt === undefined || outcome === undefined || retainedResultId === outcome.id) return;
+  if (retainedResultId === undefined)
     throw new Error(
       `Attempt ${attemptHandle(state, attempt)} has no retained outcome; it cannot select ${outcomeHandle(state, outcome)}.`,
     );
-  const retained = resultById(state, attempt.resultId);
+  const retained = resultById(state, retainedResultId);
   const retainedIdentity =
-    retained === undefined ? attempt.resultId : outcomeHandle(state, retained);
+    retained === undefined ? retainedResultId : outcomeHandle(state, retained);
   throw new Error(
     `Attempt ${attemptHandle(state, attempt)} retained ${retainedIdentity}, not ${outcomeHandle(state, outcome)}.`,
   );
@@ -192,12 +200,14 @@ function implicitOutcome(
   taskOutcomes: WorkResult[],
 ): WorkResult | undefined {
   if (outcome !== undefined) return outcome;
-  if (attempt !== undefined && request.result === undefined && attempt.resultId !== undefined)
-    return resultById(state, attempt.resultId);
+  const retainedResultId = attempt?.resultId ?? attempt?.artifactRetention?.resultId;
+  if (attempt !== undefined && request.result === undefined && retainedResultId !== undefined)
+    return resultById(state, retainedResultId);
   if (request.attempt !== undefined) return undefined;
   const onlyAttempt = taskAttempts.length === 1 ? taskAttempts.at(0) : undefined;
-  if (onlyAttempt?.resultId !== undefined) {
-    const result = resultById(state, onlyAttempt.resultId);
+  const onlyAttemptResultId = onlyAttempt?.resultId ?? onlyAttempt?.artifactRetention?.resultId;
+  if (onlyAttemptResultId !== undefined) {
+    const result = resultById(state, onlyAttemptResultId);
     if (result !== undefined) return result;
   }
   return taskOutcomes.length === 1 ? taskOutcomes.at(0) : undefined;
@@ -374,7 +384,7 @@ function cleanupProjection(attempt: WorkAttempt | undefined) {
 }
 
 function settlement(state: WorkstreamState, result: WorkResult) {
-  const attempt = state.attempts.find((item) => item.resultId === result.id);
+  const attempt = resultOwnerAttempt(state, result);
   const blockers =
     result.validity === "typed"
       ? result.report.findings
@@ -430,7 +440,8 @@ function itemPage<T, U>(
 }
 
 function attemptPreview(state: WorkstreamState, attempt: WorkAttempt) {
-  const result = attempt.resultId === undefined ? undefined : resultById(state, attempt.resultId);
+  const retainedResultId = attempt.resultId ?? attempt.artifactRetention?.resultId;
+  const result = retainedResultId === undefined ? undefined : resultById(state, retainedResultId);
   return {
     handle: attemptHandle(state, attempt),
     state: attempt.state,
@@ -652,8 +663,9 @@ function recordedCleanup(attempt: WorkAttempt) {
 }
 
 function recordedDelivery(state: WorkstreamState, attempt: WorkAttempt) {
-  if (attempt.resultId === undefined) return { state: "not_recorded" as const };
-  const result = resultById(state, attempt.resultId);
+  const retainedResultId = attempt.resultId ?? attempt.artifactRetention?.resultId;
+  if (retainedResultId === undefined) return { state: "not_recorded" as const };
+  const result = resultById(state, retainedResultId);
   if (result === undefined) return { state: "not_recorded" as const };
   const delivery = state.deliveries.find((item) => item.resultId === result.id);
   if (delivery === undefined) return { state: "not_recorded" as const };

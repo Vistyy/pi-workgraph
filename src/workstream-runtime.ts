@@ -53,6 +53,10 @@ import type {
   WorkstreamState,
   WorkstreamStore,
 } from "./workstream.js";
+import {
+  isLegacyArtifactRetentionFailure,
+  legacyArtifactRetentionLimitation,
+} from "./workstream.js";
 
 export interface WorkstreamLaunch {
   workspaceId: string;
@@ -67,11 +71,34 @@ export interface QueueOptions {
   continuationOf?: string;
   baseRevision?: string;
 }
+export interface ArtifactRetentionIo {
+  copy(input: { source: string; target: string; sourceRoot: string }): Promise<void>;
+  publish(input: { source: string; target: string; stagingRoot: string }): Promise<void>;
+}
+
+export const nodeArtifactRetentionIo: ArtifactRetentionIo = {
+  copy: ({ source, target, sourceRoot }) =>
+    artifactFs.cp(source, target, {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+      filter: (path) => assertSafeArtifactPath(path, sourceRoot),
+    }),
+  publish: ({ source, target, stagingRoot }) =>
+    artifactFs.cp(source, target, {
+      recursive: true,
+      force: false,
+      errorOnExist: true,
+      filter: (path) => assertSafeArtifactPath(path, stagingRoot),
+    }),
+};
+
 export interface RuntimeOwnership {
   registry?: WorkgraphRegistry;
   owner?: LeaseOwner;
   priorOwnerLiveness?: "alive" | "dead" | "unknown";
   policy?: ModelPolicy;
+  artifactRetentionIo?: ArtifactRetentionIo;
   /** Test-only clock injection; production uses Effect's live Clock service. */
   clock?: Clock.Clock;
 }
@@ -107,6 +134,7 @@ export class WorkstreamRuntime {
   private readonly applicationExit = Deferred.makeUnsafe<Exit.Exit<void, RuntimeError>>();
   private readonly lifecycle = Ref.makeUnsafe<RuntimeLifecycle>("open");
   private readonly effectRuntime = ManagedRuntime.make(Layer.empty);
+  private readonly artifactRetentionIo: ArtifactRetentionIo;
   private policy: ModelPolicy | undefined;
 
   constructor(
@@ -119,6 +147,7 @@ export class WorkstreamRuntime {
     ownership: RuntimeOwnership = {},
   ) {
     this.policy = ownership.policy;
+    this.artifactRetentionIo = ownership.artifactRetentionIo ?? nodeArtifactRetentionIo;
     const application = ownership.clock
       ? Effect.provideService(this.application(ownership), Clock.Clock, ownership.clock)
       : this.application(ownership);
@@ -755,6 +784,13 @@ export class WorkstreamRuntime {
           this.store.load(),
         );
         let attempt = findAttempt(state, id);
+        if (attempt.artifactRetention?.state === "pending") {
+          yield* this.resumePendingArtifactRetention(state, attempt);
+          state = yield* this.dependency("store", "reload resumed artifact retention", () =>
+            this.store.load(),
+          );
+          attempt = findAttempt(state, id);
+        }
         if (attempt.resultId === undefined) return;
         const result = state.results.find((item) => item.id === attempt.resultId);
         if (result === undefined)
@@ -1188,21 +1224,19 @@ export class WorkstreamRuntime {
     if (retention?.state !== "pending") return Effect.void;
     const operation = Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const assignment = findAssignment(state, attempt.assignmentId);
-        yield* this.runtimeSync("validate artifact retention intent", () => {
-          if (
-            assignment.artifactIntent !== "disposable_experiment" ||
-            state.intents.at(-1)?.version !== retention.assignmentIntentVersion
-          )
-            throw new Error(
-              "Required artifact retention is blocked because its assignment intent is no longer current.",
-            );
-        });
+        yield* this.validateArtifactRetentionCheckpoint(state, attempt);
         yield* this.verifyArtifactRetentionSource(attempt, retention);
         yield* this.ownershipEffect();
         const artifacts = yield* Effect.forEach(retention.required, (name) =>
           this.retainExperimentArtifact(retention, name),
         );
+        const latest = yield* this.dependency("store", "reload artifact retention completion", () =>
+          this.store.load(),
+        );
+        const latestAttempt = findAttemptByRetention(latest, retention.resultId);
+        yield* this.validateArtifactRetentionCheckpoint(latest, latestAttempt, retention);
+        yield* this.verifyArtifactRetentionSource(latestAttempt, retention);
+        yield* this.ownershipEffect();
         yield* this.dependency("store", "complete artifact retention", () =>
           this.store.finishArtifactRetention(attempt.id, artifacts),
         );
@@ -1215,6 +1249,27 @@ export class WorkstreamRuntime {
         ),
       ),
     );
+  }
+
+  private validateArtifactRetentionCheckpoint(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    expected?: ArtifactRetention,
+  ): Effect.Effect<ArtifactRetention, RuntimeError> {
+    return this.runtimeSync("validate artifact retention intent", () => {
+      const retention = required(attempt.artifactRetention, "artifact retention");
+      const assignment = findAssignment(state, attempt.assignmentId);
+      if (
+        retention.state !== "pending" ||
+        assignment.artifactIntent !== "disposable_experiment" ||
+        state.intents.at(-1)?.version !== retention.assignmentIntentVersion ||
+        (expected !== undefined && !sameRetentionCheckpoint(retention, expected))
+      )
+        throw new Error(
+          "Required artifact retention is blocked because its checkpoint or assignment intent is no longer current.",
+        );
+      return retention;
+    });
   }
 
   private verifyArtifactRetentionSource(
@@ -1278,56 +1333,72 @@ export class WorkstreamRuntime {
           "fingerprint experiment artifact",
           () => artifactFingerprint(source, retention.sourceRoot),
         );
-        const staging = join(
-          retention.stagingRoot,
-          createHash("sha256").update(`${name}\0${sourceFingerprint}`).digest("hex"),
-        );
+        const stagingKey = createHash("sha256")
+          .update(`${name}\0${sourceFingerprint}`)
+          .digest("hex");
+        const staging = join(retention.stagingRoot, `${stagingKey}.payload`);
+        const marker = join(retention.stagingRoot, `${stagingKey}.owner.json`);
+        const ownership = stagingOwnership(retention, name, sourceFingerprint);
         yield* this.dependency("runtime", "create artifact destination", () =>
           prepareArtifactDirectory(retention.destinationRoot, dirname(target)),
         );
         yield* this.dependency("runtime", "create artifact staging", () =>
           prepareArtifactDirectory(retention.stagingRoot, dirname(staging)),
         );
-        const targetExists = yield* this.pathExists(target);
-        if (targetExists) {
-          const retainedFingerprint = yield* this.dependency(
-            "runtime",
-            "verify retained artifact",
-            () => artifactFingerprint(target, retention.destinationRoot),
-          );
-          yield* this.runtimeSync("compare retained artifact", () => {
-            if (retainedFingerprint !== sourceFingerprint)
-              throw new Error(`Retained artifact conflicts with its exact source: ${name}.`);
-          });
+        yield* this.guardArtifactRetentionMutation(retention, name, sourceFingerprint);
+        if (yield* this.reconcileRetainedTarget(retention, name, target, sourceFingerprint))
           return retainedArtifact(name, target);
+
+        yield* this.dependency("runtime", "claim artifact staging", () =>
+          claimArtifactStaging(marker, staging, ownership),
+        );
+        if (yield* this.pathExists(staging)) {
+          const stagedFingerprint = yield* this.dependency(
+            "runtime",
+            "inspect existing artifact staging",
+            () => artifactFingerprint(staging, retention.stagingRoot),
+          );
+          if (stagedFingerprint !== sourceFingerprint) {
+            yield* this.dependency("runtime", "verify owned partial artifact staging", () =>
+              verifyOwnedArtifactStaging(marker, staging, retention.stagingRoot, ownership),
+            );
+            yield* this.guardArtifactRetentionMutation(retention, name, sourceFingerprint);
+            yield* this.dependency("runtime", "quarantine partial artifact staging", () =>
+              quarantineOwnedArtifactStaging(marker, staging, ownership),
+            );
+          }
         }
-        const stagingExists = yield* this.pathExists(staging);
-        if (!stagingExists)
+        if (!(yield* this.pathExists(staging))) {
+          yield* this.guardArtifactRetentionMutation(retention, name, sourceFingerprint);
           yield* this.dependency("runtime", "copy experiment artifact to staging", () =>
-            artifactFs.cp(source, staging, {
-              recursive: true,
-              force: false,
-              errorOnExist: true,
-              filter: (path) => assertSafeArtifactPath(path, retention.sourceRoot),
+            this.artifactRetentionIo.copy({
+              source,
+              target: staging,
+              sourceRoot: retention.sourceRoot,
             }),
           );
+        }
         const stagedFingerprint = yield* this.dependency("runtime", "verify staged artifact", () =>
           artifactFingerprint(staging, retention.stagingRoot),
         );
-        const currentSourceFingerprint = yield* this.dependency(
-          "runtime",
-          "recheck experiment artifact",
-          () => artifactFingerprint(source, retention.sourceRoot),
-        );
         yield* this.runtimeSync("compare staged artifact", () => {
-          if (
-            stagedFingerprint !== sourceFingerprint ||
-            currentSourceFingerprint !== sourceFingerprint
-          )
+          if (stagedFingerprint !== sourceFingerprint)
             throw new Error(`Experiment artifact changed while being retained: ${name}.`);
         });
+
+        yield* this.guardArtifactRetentionMutation(retention, name, sourceFingerprint);
+        if (yield* this.reconcileRetainedTarget(retention, name, target, sourceFingerprint))
+          return retainedArtifact(name, target);
         yield* this.dependency("runtime", "publish retained artifact", () =>
-          artifactFs.rename(staging, target),
+          this.artifactRetentionIo.publish({
+            source: staging,
+            target,
+            stagingRoot: retention.stagingRoot,
+          }),
+        ).pipe(
+          Effect.catch((error) =>
+            this.reconcilePublicationFailure(retention, name, target, sourceFingerprint, error),
+          ),
         );
         const publishedFingerprint = yield* this.dependency(
           "runtime",
@@ -1340,6 +1411,74 @@ export class WorkstreamRuntime {
         });
         return retainedArtifact(name, target);
       }.bind(this),
+    );
+  }
+
+  private guardArtifactRetentionMutation(
+    expected: ArtifactRetention,
+    name: string,
+    sourceFingerprint: string,
+  ): Effect.Effect<void, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        yield* this.ownershipEffect();
+        let state = yield* this.dependency("store", "reload artifact retention fence", () =>
+          this.store.load(),
+        );
+        let attempt = findAttemptByRetention(state, expected.resultId);
+        const retention = yield* this.validateArtifactRetentionCheckpoint(state, attempt, expected);
+        yield* this.verifyArtifactRetentionSource(attempt, retention);
+        const currentFingerprint = yield* this.dependency(
+          "runtime",
+          "recheck experiment artifact at mutation fence",
+          () => artifactFingerprint(resolve(retention.sourceRoot, name), retention.sourceRoot),
+        );
+        yield* this.runtimeSync("validate experiment artifact mutation fence", () => {
+          if (currentFingerprint !== sourceFingerprint)
+            throw new Error(`Experiment artifact changed while being retained: ${name}.`);
+        });
+        state = yield* this.dependency("store", "confirm artifact retention fence", () =>
+          this.store.load(),
+        );
+        attempt = findAttemptByRetention(state, expected.resultId);
+        yield* this.validateArtifactRetentionCheckpoint(state, attempt, expected);
+        yield* this.ownershipEffect();
+      }.bind(this),
+    );
+  }
+
+  private reconcileRetainedTarget(
+    retention: ArtifactRetention,
+    name: string,
+    target: string,
+    sourceFingerprint: string,
+  ): Effect.Effect<boolean, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        if (!(yield* this.pathExists(target))) return false;
+        const retainedFingerprint = yield* this.dependency(
+          "runtime",
+          "inspect retained artifact target",
+          () => artifactFingerprint(target, retention.destinationRoot),
+        );
+        return yield* this.runtimeSync("compare retained artifact", () => {
+          if (retainedFingerprint !== sourceFingerprint)
+            throw new Error(`Retained artifact conflicts with its exact source: ${name}.`);
+          return true;
+        });
+      }.bind(this),
+    );
+  }
+
+  private reconcilePublicationFailure(
+    retention: ArtifactRetention,
+    name: string,
+    target: string,
+    sourceFingerprint: string,
+    original: RuntimeError,
+  ): Effect.Effect<void, RuntimeError> {
+    return this.reconcileRetainedTarget(retention, name, target, sourceFingerprint).pipe(
+      Effect.flatMap((reconciled) => (reconciled ? Effect.void : Effect.fail(original))),
     );
   }
 
@@ -1364,6 +1503,7 @@ export class WorkstreamRuntime {
           this.store.load(),
         );
         const attempt = findAttempt(state, id);
+        if (isLegacyArtifactRetentionFailure(state, attempt)) return;
         const cleanup = attempt.cleanup;
         if (
           cleanup?.state !== "pending" ||
@@ -1464,19 +1604,18 @@ export class WorkstreamRuntime {
           this.store.load(),
         );
         const attempt = findAttempt(state, input.attemptId);
-        if (attempt.artifactRetention?.state === "blocked")
+        yield* this.runtimeSync("validate legacy retention recovery", () => {
+          if (isLegacyArtifactRetentionFailure(state, attempt))
+            throw new Error(legacyArtifactRetentionLimitation());
+        });
+        if (attempt.artifactRetention?.state === "pending")
+          yield* this.recoverPendingArtifactRetention(state, attempt);
+        else if (attempt.artifactRetention?.state === "blocked")
           yield* this.recoverBlockedArtifactRetention(state, attempt);
         else if (attempt.composition?.state === "blocked")
           yield* this.recoverBlockedComposition(state, attempt, input);
-        else if (attempt.cleanup?.state === "blocked") {
-          yield* this.runtimeSync("validate legacy retention recovery", () => {
-            if (isLegacyArtifactRetentionFailure(state, attempt))
-              throw new Error(
-                "Legacy artifact-retention failure has no independently retained report and source checkpoint; preserve it for inspection rather than inventing validity or retrying cleanup.",
-              );
-          });
-          yield* this.recoverBlockedCleanup(attempt);
-        } else if (attempt.artifactRetention?.state === "completed" && input.action === "retry") {
+        else if (attempt.cleanup?.state === "blocked") yield* this.recoverBlockedCleanup(attempt);
+        else if (attempt.artifactRetention?.state === "completed" && input.action === "retry") {
           yield* this.advanceRetainedResult(
             attempt.id,
             findAssignment(state, attempt.assignmentId),
@@ -1486,6 +1625,38 @@ export class WorkstreamRuntime {
             throw new Error(`Attempt ${attempt.id} has no blocked recovery boundary.`);
           });
         return yield* this.dependency("store", "load recovered state", () => this.store.load());
+      }.bind(this),
+    );
+  }
+
+  private recoverPendingArtifactRetention(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+  ): Effect.Effect<void, RuntimeError> {
+    return this.resumePendingArtifactRetention(state, attempt).pipe(
+      Effect.andThen(
+        this.dependency("store", "load pending artifact recovery", () => this.store.load()),
+      ),
+      Effect.flatMap((latest) => {
+        const retainedAttempt = findAttempt(latest, attempt.id);
+        if (retainedAttempt.resultId === undefined) return Effect.void;
+        return this.advanceRetainedResult(
+          retainedAttempt.id,
+          findAssignment(latest, retainedAttempt.assignmentId),
+        );
+      }),
+    );
+  }
+
+  private resumePendingArtifactRetention(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+  ): Effect.Effect<void, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
+        yield* this.validateArtifactRetentionCheckpoint(state, attempt);
+        yield* this.advanceArtifactRetention(state, attempt);
       }.bind(this),
     );
   }
@@ -2028,21 +2199,28 @@ function findAssignment(state: WorkstreamState, id: string): WorkAssignment {
     `assignment ${id}`,
   );
 }
+function findAttemptByRetention(state: WorkstreamState, resultId: string): WorkAttempt {
+  return required(
+    state.attempts.find((item) => item.artifactRetention?.resultId === resultId),
+    `artifact retention for result ${resultId}`,
+  );
+}
+function sameRetentionCheckpoint(left: ArtifactRetention, right: ArtifactRetention): boolean {
+  return (
+    left.resultId === right.resultId &&
+    left.assignmentIntentVersion === right.assignmentIntentVersion &&
+    left.sourceRoot === right.sourceRoot &&
+    left.sourceIdentity === right.sourceIdentity &&
+    left.expectedHead === right.expectedHead &&
+    left.destinationRoot === right.destinationRoot &&
+    left.stagingRoot === right.stagingRoot &&
+    JSON.stringify(left.required) === JSON.stringify(right.required)
+  );
+}
 function required<T>(value: T | undefined, label: string): T {
   if (value === undefined) throw new Error(`Missing ${label}.`);
   return value;
 }
-function isLegacyArtifactRetentionFailure(state: WorkstreamState, attempt: WorkAttempt): boolean {
-  if (attempt.artifactRetention !== undefined || attempt.resultId === undefined) return false;
-  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
-  const result = state.results.find((item) => item.id === attempt.resultId);
-  return (
-    assignment?.artifactIntent === "disposable_experiment" &&
-    result?.validity === "invalid" &&
-    result.detail.startsWith("Artifact retention failed:")
-  );
-}
-
 // oxlint-disable-next-line effecttsgo/async-function -- The Git worktree marker is read inside a runtime dependency checkpoint.
 async function worktreeSourceIdentity(root: string): Promise<string> {
   const marker = join(root, ".git");
@@ -2062,6 +2240,88 @@ function retainedArtifact(name: string, target: string): RetainedArtifact {
     retention: "retained",
     summary: "Retained from authorized disposable experiment before cleanup.",
   };
+}
+
+function stagingOwnership(
+  retention: ArtifactRetention,
+  name: string,
+  sourceFingerprint: string,
+): string {
+  return `${JSON.stringify({
+    format: "pi-workgraph-artifact-staging",
+    version: 1,
+    resultId: retention.resultId,
+    sourceIdentity: retention.sourceIdentity,
+    expectedHead: retention.expectedHead,
+    name,
+    sourceFingerprint,
+  })}\n`;
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Exact marker bytes establish whether an interrupted staging payload is owned before any repair.
+async function claimArtifactStaging(
+  marker: string,
+  staging: string,
+  ownership: string,
+): Promise<void> {
+  try {
+    await assertArtifactStagingMarker(marker, ownership);
+    return;
+  } catch (cause) {
+    if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
+  }
+  try {
+    await artifactFs.lstat(staging);
+    throw new Error(`Unproven artifact staging payload is preserved: ${staging}.`);
+  } catch (cause) {
+    if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
+  }
+  try {
+    await artifactFs.writeFile(marker, ownership, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  } catch (cause) {
+    if (!(cause instanceof Error && "code" in cause && cause.code === "EEXIST")) throw cause;
+    await assertArtifactStagingMarker(marker, ownership);
+  }
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Recursive verification proves the partial payload is owned and contains no unsafe path before the final mutation fence.
+async function verifyOwnedArtifactStaging(
+  marker: string,
+  staging: string,
+  stagingRoot: string,
+  ownership: string,
+): Promise<void> {
+  await assertArtifactStagingMarker(marker, ownership);
+  await artifactFingerprint(staging, stagingRoot);
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- The caller freshly rechecks lease, intent, and source after recursive verification and immediately before this bounded rename.
+async function quarantineOwnedArtifactStaging(
+  marker: string,
+  staging: string,
+  ownership: string,
+): Promise<void> {
+  await assertArtifactStagingMarker(marker, ownership);
+  const status = await artifactFs.lstat(staging);
+  if (status.isSymbolicLink() || (!status.isFile() && !status.isDirectory()))
+    throw new Error(`Artifact staging payload is unsafe: ${staging}.`);
+  const quarantine = `${staging}.quarantine-${randomUUID()}`;
+  try {
+    await artifactFs.lstat(quarantine);
+    throw new Error(`Artifact staging quarantine unexpectedly exists: ${quarantine}.`);
+  } catch (cause) {
+    if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
+  }
+  await artifactFs.rename(staging, quarantine);
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Marker lstat and byte comparison must stay adjacent to reject symlink or foreign ownership claims.
+async function assertArtifactStagingMarker(marker: string, ownership: string): Promise<void> {
+  const status = await artifactFs.lstat(marker);
+  if (!status.isFile() || status.isSymbolicLink())
+    throw new Error(`Artifact staging ownership marker is unsafe: ${marker}.`);
+  if ((await artifactFs.readFile(marker, "utf8")) !== ownership)
+    throw new Error(`Artifact staging ownership is unproven: ${marker}.`);
 }
 
 // oxlint-disable-next-line effecttsgo/async-function -- This bounded filesystem helper runs inside the runtime dependency checkpoint.

@@ -774,7 +774,9 @@ export class WorkstreamStore {
   markWorkerClosed(id: string, now?: Date): Promise<WorkstreamState> {
     return this.changeAttempt(
       id,
-      (attempt) => {
+      (attempt, draft) => {
+        if (isLegacyArtifactRetentionFailure(draft, attempt))
+          throw new Error(legacyArtifactRetentionLimitation());
         if (attempt.cleanup?.state === "completed") return;
         if (attempt.cleanup?.state !== "pending")
           throw new Error(`Cleanup for ${id} is not pending.`);
@@ -851,7 +853,9 @@ export class WorkstreamStore {
   retryCleanup(id: string, now?: Date): Promise<WorkstreamState> {
     return this.changeAttempt(
       id,
-      (attempt) => {
+      (attempt, draft) => {
+        if (isLegacyArtifactRetentionFailure(draft, attempt))
+          throw new Error(legacyArtifactRetentionLimitation());
         const cleanup = attempt.cleanup;
         if (cleanup === undefined || cleanup.state !== "blocked")
           throw new Error(`Cleanup for ${id} is not blocked.`);
@@ -865,7 +869,9 @@ export class WorkstreamStore {
   finishCleanup(id: string, now?: Date): Promise<WorkstreamState> {
     return this.changeAttempt(
       id,
-      (attempt) => {
+      (attempt, draft) => {
+        if (isLegacyArtifactRetentionFailure(draft, attempt))
+          throw new Error(legacyArtifactRetentionLimitation());
         if (attempt.cleanup?.state === "completed") return;
         if (attempt.cleanup?.state !== "pending" || !attempt.cleanup.workerClosed)
           throw new Error(`Cleanup for ${id} requires a closed worker.`);
@@ -1268,6 +1274,24 @@ function describeJsonValue(value: JsonValue | undefined): string {
   if (value === null) return "null";
   if (value === undefined) return "undefined";
   return Array.isArray(value) ? "[array]" : "[object]";
+}
+
+export function isLegacyArtifactRetentionFailure(
+  state: WorkstreamState,
+  attempt: WorkAttempt,
+): boolean {
+  if (attempt.artifactRetention !== undefined || attempt.resultId === undefined) return false;
+  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
+  const result = state.results.find((item) => item.id === attempt.resultId);
+  return (
+    assignment?.artifactIntent === "disposable_experiment" &&
+    result?.validity === "invalid" &&
+    result.detail.startsWith("Artifact retention failed:")
+  );
+}
+
+export function legacyArtifactRetentionLimitation(): string {
+  return "Legacy artifact-retention failure has no independently retained report and source checkpoint; preserve it for inspection rather than inventing validity or retrying cleanup.";
 }
 
 function beginCleanupTransition(
