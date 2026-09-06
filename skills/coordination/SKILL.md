@@ -11,6 +11,17 @@ Independent repeated research or candidate work, a comparison review over retain
 First delegation creates a workstream; research can proceed before maintained implementation is authorized and alongside implementation or review.
 Use a separate coordinator conversation for unrelated work.
 
+## Review expectations
+
+Prefer independent review for nontrivial maintained changes, with review effort proportionate to the consequences, complexity, and uncertainty of the work.
+Correctness is the first priority, but working code is not the only goal: also consider simplicity, types that express the intended constraints, readability, and ease of maintenance.
+Look for unnecessary machinery and opportunities to simplify, not speculative abstractions or cosmetic churn.
+Choose the review timing, concerns, and number of reviewers that add useful independent judgment; these expectations are not a mandatory stage or a fixed checklist for every reviewer.
+Small, low-risk changes may need only direct inspection and existing checks.
+Give reviewers explicit concerns rather than relying on them to infer the desired quality bar.
+Separate assignments can provide different lenses; repeated attempts on one assignment provide independent views of the same concern, even when they use different models.
+Judge findings by their evidence and practical value; zero findings is valid.
+
 ## Assignment boundaries
 
 Distinguish read-only research, explicitly authorized disposable experiments, and maintained changes.
