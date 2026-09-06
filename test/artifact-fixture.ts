@@ -6,6 +6,8 @@ import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promi
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Disposable Git worktree fixtures require host path semantics.
 import { dirname, join } from "node:path";
+import { Effect, Layer } from "effect";
+import { ArtifactStore } from "../src/artifact-store.js";
 import { GitRepository, runProcess } from "../src/git.js";
 import type {
   HerdrInspection,
@@ -17,11 +19,7 @@ import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity, WorkerReport } from "../src/types.js";
 import { WorkstreamStore } from "../src/workstream.js";
-import {
-  type ArtifactRetentionIo,
-  type RuntimeOwnership,
-  WorkstreamRuntime,
-} from "../src/workstream-runtime.js";
+import { type RuntimeOwnership, WorkstreamRuntime } from "../src/workstream-runtime.js";
 
 const report: WorkerReport = {
   kind: "research",
@@ -78,8 +76,17 @@ export interface ArtifactFixture {
   attemptId: string;
   resultId: string;
   sourceRoot: string;
-  runtime(io?: ArtifactRetentionIo): WorkstreamRuntime;
+  runtime(artifactStoreLayer?: Layer.Layer<ArtifactStore>): WorkstreamRuntime;
   dispose(): Promise<void>;
+}
+
+export function transformArtifactStore(
+  transform: (store: ArtifactStore["Service"]) => ArtifactStore["Service"],
+): Layer.Layer<ArtifactStore> {
+  return Layer.effect(
+    ArtifactStore,
+    ArtifactStore.use((store) => Effect.succeed(ArtifactStore.of(transform(store)))),
+  ).pipe(Layer.provide(ArtifactStore.layerLive));
 }
 
 export async function artifactFixture(
@@ -206,9 +213,9 @@ export async function artifactFixture(
     attemptId,
     resultId,
     sourceRoot: placement.path,
-    runtime(io) {
+    runtime(artifactStoreLayer) {
       const ownership: RuntimeOwnership = { registry, policy: DEFAULT_MODEL_POLICY };
-      if (io !== undefined) ownership.artifactRetentionIo = io;
+      if (artifactStoreLayer !== undefined) ownership.artifactStoreLayer = artifactStoreLayer;
       const runtime = new WorkstreamRuntime(
         store,
         repository,
