@@ -134,7 +134,9 @@ void test("calm policy defaults cover builtins, search tools, and Workgraph tool
   assert.ok(hidden.includes("bash"));
   assert.ok(hidden.includes("web_search"));
   assert.ok(hidden.includes("workgraph_report"));
+  assert.ok(hidden.includes("workgraph_note"));
   assert.deepEqual(parseCalmHiddenTools(" read,read, custom "), ["read", "custom"]);
+  assert.ok(!parseCalmHiddenTools(" read,read, custom ").includes("workgraph_note"));
   assert.deepEqual(parseCalmHiddenTools(" , "), []);
 });
 
@@ -224,11 +226,10 @@ void test("constellation frames are themed, compact, and width-safe", () => {
   assert.notEqual(calmWorkingIndicatorFrames(theme)[0], calmWorkingIndicatorFrames(theme)[1]);
 });
 
-void test("coordinator calm command is off by default and uses the guarded adapter", async () => {
+void test("coordinator calm command defaults to hiding workgraph notes and restores them when off", async () => {
   const pi = fakePi();
   const ui = fakeUi();
   const calm = installCalmMode(pi as unknown as ExtensionAPI, {
-    hiddenTools: ["read"],
     loadPresentation: async () => moduleForFakeRows(),
     intervalMs: 10_000,
   });
@@ -238,8 +239,8 @@ void test("coordinator calm command is off by default and uses the guarded adapt
     ui,
   } as unknown as ExtensionContext;
   await pi.events.get("session_start")?.({}, context);
-  const tool = new FakeToolRow("read");
-  assert.deepEqual(tool.render(80), ["tool:read:80"]);
+  const tool = new FakeToolRow("workgraph_note");
+  assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
   calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
   assert.deepEqual(tool.render(80), []);
@@ -254,11 +255,11 @@ void test("coordinator calm command is off by default and uses the guarded adapt
   assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
   calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
-  assert.deepEqual(tool.render(80), ["tool:read:80"]);
+  assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
   assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
   assert.equal(ui.statuses.at(-1)?.[1], undefined);
   await pi.events.get("session_shutdown")?.({}, context);
-  assert.deepEqual(tool.render(80), ["tool:read:80"]);
+  assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
 });
 
 void test("missing internal seam leaves rows visible and reports a diagnostic", async () => {

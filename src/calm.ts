@@ -29,6 +29,7 @@ export const DEFAULT_CALM_HIDDEN_TOOLS = [
   "get_search_content",
   "source_check",
   "web_search",
+  "workgraph_note",
   "workgraph_models",
   "workgraph_research",
   "workgraph_intent",
