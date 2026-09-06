@@ -6,7 +6,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
-import { GitParseError, GitRepository, parseWorktreeList, runProcess } from "../src/git.js";
+import {
+  GitParseError,
+  type GitProcessRequest,
+  type GitProcessRunner,
+  GitRepository,
+  GitStateUncertainError,
+  parseWorktreeList,
+  runProcess,
+} from "../src/git.js";
+import { ProcessExecutionError, type ProcessResult, processEffect } from "../src/process.js";
 import { git } from "./helpers.js";
 
 async function waitForFile(path: string): Promise<string> {
@@ -34,6 +43,53 @@ async function fixture() {
   await git(root, "commit", "--allow-empty", "-m", "Assigned base");
   const repository = await GitRepository.open(root);
   return { parent, root, repository, base: await repository.head() };
+}
+
+function processResult(
+  overrides: Partial<Pick<ProcessResult, "exitCode" | "stderr" | "stdout" | "timedOut">>,
+): ProcessResult {
+  return {
+    exitCode: overrides.exitCode ?? 0,
+    stderr: overrides.stderr ?? "",
+    stdout: overrides.stdout ?? "",
+    stdoutTruncated: false,
+    timedOut: overrides.timedOut ?? false,
+  };
+}
+
+function liveProcess(request: GitProcessRequest) {
+  return processEffect("git", ["-C", request.cwd, ...request.args], {
+    cwd: request.cwd,
+    timeoutMs: request.timeoutMs,
+    digestStdout: request.digestStdout,
+  });
+}
+
+function interceptProcess(
+  intercept: (request: GitProcessRequest) => ReturnType<GitProcessRunner> | undefined,
+): GitProcessRunner {
+  return (request) => intercept(request) ?? liveProcess(request);
+}
+
+function processUnavailable(request: GitProcessRequest, message: string): ProcessExecutionError {
+  return new ProcessExecutionError({
+    command: "git",
+    args: ["-C", request.cwd, ...request.args],
+    cause: new Error(message),
+  });
+}
+
+async function conflictFixture() {
+  const f = await fixture();
+  const placement = await f.repository.createWorktree("run", "worker", f.base);
+  await writeFile(join(placement.path, "data.txt"), "worker\n");
+  await git(placement.path, "add", ".");
+  await git(placement.path, "commit", "-m", "Worker conflict");
+  const commit = await f.repository.head(placement.path);
+  await writeFile(join(f.root, "data.txt"), "coordinator\n");
+  await git(f.root, "add", ".");
+  await git(f.root, "commit", "-m", "Coordinator conflict");
+  return { ...f, commit, expectedHead: await f.repository.head() };
 }
 
 void test("the effects port is the primary typed repository interface", async () => {
@@ -127,6 +183,191 @@ void test("Git placements preserve unknown data; cleanup requires exact clean id
     assert.equal((await f.repository.cleanupWorktree(placement, commit)).state, "completed");
     assert.equal((await f.repository.cleanupWorktree(placement, commit)).state, "completed");
     assert.equal(await readFile(join(unknown, "mine.txt"), "utf8"), "unattributed bytes");
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("a real cherry-pick conflict is aborted only after ownership checks and reaches a clean HEAD", async () => {
+  const f = await conflictFixture();
+  try {
+    await assert.rejects(
+      () => f.repository.compose(f.commit, f.expectedHead),
+      /Cherry-pick conflict/,
+    );
+    assert.equal(await f.repository.head(), f.expectedHead);
+    assert.equal(await f.repository.status(), "");
+    const cherryPickState = await runProcess(
+      "git",
+      ["-C", f.root, "rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"],
+      { cwd: f.root, timeoutMs: 30_000 },
+    );
+    assert.equal(cherryPickState.timedOut, false);
+    assert.equal(cherryPickState.exitCode, 1);
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("an unavailable HEAD after a real cherry-pick conflict prevents abort and retains both diagnostics", async () => {
+  const f = await conflictFixture();
+  let headObservations = 0;
+  let aborts = 0;
+  const repository = new GitRepository(
+    f.root,
+    f.repository.commonDir,
+    interceptProcess((request) => {
+      if (request.args.join("\0") === "rev-parse\0HEAD") {
+        headObservations += 1;
+        if (headObservations === 2) {
+          return Effect.fail(processUnavailable(request, "HEAD observation unavailable"));
+        }
+      }
+      if (request.args.join("\0") === "cherry-pick\0--abort") aborts += 1;
+      return undefined;
+    }),
+  );
+  try {
+    const failure = await Effect.runPromise(
+      Effect.flip(repository.effects.compose(f.commit, f.expectedHead)),
+    );
+    assert.ok(failure instanceof GitStateUncertainError);
+    assert.match(failure.message, /resulting HEAD is unavailable/);
+    assert.match(failure.operationDiagnostic, /Cherry-pick conflict or failure/);
+    assert.match(failure.operationDiagnostic, /exit code 1/);
+    assert.match(failure.followupDiagnostic, /HEAD observation unavailable/);
+    assert.equal(aborts, 0);
+    assert.equal(await git(f.root, "rev-parse", "CHERRY_PICK_HEAD"), f.commit);
+    assert.notEqual(await git(f.root, "status", "--porcelain"), "");
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("real cherry-pick conflicts retain nonzero, timed-out, and spawn rollback failures", async () => {
+  const rollbackFailures = [
+    {
+      name: "nonzero",
+      run: () => Effect.succeed(processResult({ exitCode: 7, stderr: "abort rejected" })),
+      expected: /abort rejected/,
+    },
+    {
+      name: "timeout",
+      run: () => Effect.succeed(processResult({ exitCode: 1, timedOut: true })),
+      expected: /timed out before a reliable result/,
+    },
+    {
+      name: "spawn",
+      run: (request: GitProcessRequest) =>
+        Effect.fail(processUnavailable(request, "abort executable unavailable")),
+      expected: /abort executable unavailable/,
+    },
+  ] as const;
+
+  for (const rollbackFailure of rollbackFailures) {
+    const f = await conflictFixture();
+    const repository = new GitRepository(
+      f.root,
+      f.repository.commonDir,
+      interceptProcess((request) =>
+        request.args.join("\0") === "cherry-pick\0--abort"
+          ? rollbackFailure.run(request)
+          : undefined,
+      ),
+    );
+    try {
+      const failure = await Effect.runPromise(
+        Effect.flip(repository.effects.compose(f.commit, f.expectedHead)),
+      );
+      assert.ok(
+        failure instanceof GitStateUncertainError,
+        `${rollbackFailure.name} rollback was not typed as uncertain`,
+      );
+      assert.match(failure.operationDiagnostic, /Cherry-pick conflict or failure/);
+      assert.match(failure.followupDiagnostic, rollbackFailure.expected);
+      assert.equal(await git(f.root, "rev-parse", "CHERRY_PICK_HEAD"), f.commit);
+    } finally {
+      await rm(f.parent, { recursive: true, force: true });
+    }
+  }
+});
+
+void test("timed-out and unavailable ref observations never remove a real worker worktree or branch", async () => {
+  const observationFailures = [
+    {
+      name: "timeout",
+      run: () => Effect.succeed(processResult({ exitCode: 1, timedOut: true })),
+      expected: /timed out before a reliable result/,
+    },
+    {
+      name: "unavailable",
+      run: (request: GitProcessRequest) =>
+        Effect.fail(processUnavailable(request, "ref observation unavailable")),
+      expected: /ref observation unavailable/,
+    },
+  ] as const;
+
+  for (const observationFailure of observationFailures) {
+    const f = await fixture();
+    const placement = await f.repository.createWorktree("run", "worker", f.base);
+    const branchRef = `refs/heads/${placement.branch}`;
+    const repository = new GitRepository(
+      f.root,
+      f.repository.commonDir,
+      interceptProcess((request) =>
+        request.args.join("\0") === `rev-parse\0--verify\0--quiet\0${branchRef}`
+          ? observationFailure.run(request)
+          : undefined,
+      ),
+    );
+    try {
+      const failure = await Effect.runPromise(
+        Effect.flip(repository.effects.cleanupWorktree(placement, f.base)),
+      );
+      if (failure instanceof ProcessExecutionError) {
+        const cause =
+          failure.cause instanceof Error ? failure.cause.message : String(failure.cause);
+        assert.match(cause, observationFailure.expected);
+      } else {
+        assert.match(failure.message, observationFailure.expected);
+      }
+      assert.equal(await git(f.root, "rev-parse", branchRef), f.base);
+      assert.match(
+        await git(f.root, "worktree", "list", "--porcelain"),
+        new RegExp(placement.path),
+      );
+    } finally {
+      await rm(f.parent, { recursive: true, force: true });
+    }
+  }
+});
+
+void test("cleanup independently rechecks the exact branch after worktree registration disappears", async () => {
+  const f = await fixture();
+  const placement = await f.repository.createWorktree("run", "worker", f.base);
+  const branchRef = `refs/heads/${placement.branch}`;
+  let refInspections = 0;
+  const repository = new GitRepository(
+    f.root,
+    f.repository.commonDir,
+    interceptProcess((request) => {
+      if (request.args.join("\0") !== `rev-parse\0--verify\0--quiet\0${branchRef}`) {
+        return undefined;
+      }
+      refInspections += 1;
+      return refInspections === 1 ? Effect.succeed(processResult({ exitCode: 1 })) : undefined;
+    }),
+  );
+  try {
+    await assert.rejects(
+      () => repository.cleanupWorktree(placement, f.base),
+      /Cleanup branch postcondition failed/,
+    );
+    assert.equal(await git(f.root, "rev-parse", branchRef), f.base);
+    assert.doesNotMatch(
+      await git(f.root, "worktree", "list", "--porcelain"),
+      new RegExp(placement.path),
+    );
   } finally {
     await rm(f.parent, { recursive: true, force: true });
   }
