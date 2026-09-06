@@ -1,4 +1,3 @@
-/* oxlint-disable effecttsgo/async-function -- Node test callbacks exercise the runtime's Promise API and concrete interruption windows. */
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- These regressions exercise the production Node artifact boundary with real bytes.
 import { lstat, readdir, readFile, symlink, unlink, writeFile } from "node:fs/promises";
