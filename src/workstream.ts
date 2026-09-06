@@ -1968,7 +1968,7 @@ function addAssignment(
   input: AssignmentInput & { now?: Date },
   now: Date,
 ): void {
-  validateId(input.id, "Assignment id");
+  requireText(input.id, "Assignment id");
   requireText(input.objective, "Assignment objective");
   requireActive(draft);
   if (draft.assignments.some((item) => item.id === input.id))

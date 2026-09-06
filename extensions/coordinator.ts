@@ -10,6 +10,7 @@ import {
   actionView,
   type InspectSection,
   inspectView,
+  resolveAttemptHandle,
   resultNotification,
 } from "../src/agent-facing.js";
 import { GitRepository } from "../src/git.js";
@@ -608,6 +609,8 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       result: Type.Optional(Type.String()),
       offset: Type.Optional(Type.Integer({ minimum: 0 })),
       maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: 8_000 })),
+      itemOffset: Type.Optional(Type.Integer({ minimum: 0 })),
+      maxItems: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
     }),
     async execute(_id, params) {
       return serial(async () => {
@@ -649,6 +652,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     async execute(_id, params, _signal, _update, ctx) {
       return serial(async () => {
         const active = current();
+        let affectedAttemptId: string | undefined;
         if (
           params.action === "cancel" ||
           params.action === "steer" ||
@@ -661,6 +665,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             params.task,
             params.attempt,
           );
+          affectedAttemptId = attemptId;
           if (params.action === "cancel") await active.cancel(attemptId);
           else if (params.action === "steer")
             await active.steer(attemptId, params.reason);
@@ -694,7 +699,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           {
             action: `workgraph_control:${params.action}`,
             ...(params.task ? { assignmentId: params.task } : {}),
-            ...(params.attempt ? { attemptId: params.attempt } : {}),
+            ...(affectedAttemptId ? { attemptId: affectedAttemptId } : {}),
             message,
             outcome:
               params.action === "steer"
@@ -836,23 +841,18 @@ function resolveControlAttempt(
   task: string | undefined,
   handle: string | undefined,
 ): string {
-  const matches = state.attempts.filter((attempt) =>
-    handle
-      ? (attempt.id === handle || attempt.uuidAlias === handle) &&
-        (!task || attempt.assignmentId === task)
-      : task
-        ? attempt.assignmentId === task
-        : false,
-  );
   if (!task && !handle)
     throw new Error(
       "Control requires a semantic task; repeated attempts must also specify attempt.",
     );
-  if (matches.length === 0)
-    throw new Error(`Unknown task or attempt ${handle ?? task}.`);
+  if (handle) return resolveAttemptHandle(state, handle, task).id;
+  const matches = state.attempts.filter(
+    (attempt) => attempt.assignmentId === task,
+  );
+  if (matches.length === 0) throw new Error(`Unknown task ${task}.`);
   if (matches.length > 1)
     throw new Error(
-      `Task ${task ?? matches[0]!.assignmentId} has repeated attempts; specify attempt as one of: ${matches.map((item) => item.id).join(", ")}.`,
+      `Task ${task} has repeated attempts; specify attempt as one of: ${matches.map((item) => item.id).join(", ")}.`,
     );
   return matches[0]!.id;
 }

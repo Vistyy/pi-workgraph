@@ -625,6 +625,49 @@ test("advanced isolated trees cannot settle a successful no-change implementatio
   }
 });
 
+test("arbitrary semantic task ids use opaque filesystem identities", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const authority = await f.authority(active);
+    const semanticId =
+      "Fix Value With Spaces and a deliberately long task name";
+    f.workers.onWork = async (request) => {
+      if (request.env.PI_WORKGRAPH_MODE !== "implementation")
+        throw new Error("Expected implementation worker");
+      await writeFile(join(request.cwd, "value.txt"), "opaque\n");
+      await git(request.cwd, "add", ".");
+      await git(request.cwd, "commit", "-m", "opaque task id");
+      return {
+        kind: "implementation",
+        status: "completed",
+        outcome: "changed",
+        summary: "Changed value",
+        commit: await git(request.cwd, "rev-parse", "HEAD"),
+        evidence: [],
+        findings: [],
+      };
+    };
+    await active.queue({
+      id: semanticId,
+      capability: "implement",
+      artifactIntent: "maintained_change",
+      objective: "Change value with an arbitrary semantic id",
+      intentVersion: 1,
+      authority,
+      acceptance: ["value is opaque"],
+    });
+    await active.reconcile();
+    const state = await active.reconcile();
+    assert.equal(state.assignments[0]?.id, semanticId);
+    assert.match(state.attempts[0]?.id ?? "", /^attempt-[0-9a-f-]{36}$/);
+    assert.notEqual(state.attempts[0]?.id, semanticId);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("maintained changes use guide/executor policy and review checks the requested earlier revision", async () => {
   const f = await fixture();
   try {

@@ -211,9 +211,9 @@ test("mutation responses stay action-focused while retaining handles, models, an
     const firstAssignment = record(firstAffected.task);
     const firstAttempt = record(firstAffected.attempt);
     const firstModels = record(firstAttempt.models);
-    const firstGuide = record(firstModels.guide);
+    const firstGuide = record(record(firstModels.selected).guide);
     assert.equal(record(firstView.action).name, "workgraph_research");
-    assert.equal(firstAssignment.id, "focused-research");
+    assert.equal(firstAssignment.idPreview, "focused-research");
     assert.equal(firstGuide.model, "fixture/research");
     assert.match(firstText, /focused-research/);
     assert.doesNotMatch(firstText, /"assignments":\s*\[/);
@@ -241,10 +241,11 @@ test("mutation responses stay action-focused while retaining handles, models, an
       later.content[0] && "text" in later.content[0]
         ? later.content[0].text
         : "";
-    assert.ok(laterText.length < firstText.length + 2_000);
+    assert.ok(laterText.length < 8_000);
+    assert.match(laterText, /Unrelated history 0/);
     const laterView = record(record(later.details).inspection);
-    assert.equal((laterView.tasks as unknown[]).length, 13);
-    assert.deepEqual(laterView.attention, []);
+    assert.equal(record(laterView.tasks).totalItems, 13);
+    assert.deepEqual(record(laterView.attention).items, []);
   } finally {
     await f.dispose();
   }
@@ -301,16 +302,10 @@ test("registered status stays compact and focused result retrieval projects boun
       maxChars: 100,
     });
     const defaultView = record(record(defaultResult.details).inspection);
-    const defaultContent = record(defaultView.content);
-    assert.equal(defaultContent.truncated, true);
-    assert.ok(
-      Number(defaultContent.totalChars) > Number(defaultContent.returnedChars),
-    );
-    assert.equal(
-      record(defaultView.settlement).workerReport &&
-        typeof record(defaultView.settlement).workerReport,
-      "object",
-    );
+    const defaultReport = record(defaultView.report);
+    assert.equal(defaultReport.summary, "A bounded summary");
+    assert.ok(record(defaultView.fullReport));
+    assert.ok(record(defaultView.fullEvidence));
     assert.match(
       defaultResult.content[0] && "text" in defaultResult.content[0]
         ? defaultResult.content[0].text

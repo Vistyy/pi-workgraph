@@ -45,6 +45,8 @@ export async function runCli(
     const result = options.get("result");
     const offset = options.get("offset");
     const maxChars = options.get("max-chars");
+    const itemOffset = options.get("item-offset");
+    const maxItems = options.get("max-items");
     const view = inspectView(state, {
       section: section as InspectSection,
       ...(task ? { task } : {}),
@@ -52,6 +54,10 @@ export async function runCli(
       ...(result ? { result } : {}),
       ...(offset ? { offset: parseInteger(offset, "offset") } : {}),
       ...(maxChars ? { maxChars: parseInteger(maxChars, "max-chars") } : {}),
+      ...(itemOffset
+        ? { itemOffset: parseInteger(itemOffset, "item-offset") }
+        : {}),
+      ...(maxItems ? { maxItems: parseInteger(maxItems, "max-items") } : {}),
     });
     return { command, statePath, view };
   }
@@ -131,6 +137,8 @@ function parseOptions(args: readonly string[]): Map<string, string> {
     "result",
     "offset",
     "max-chars",
+    "item-offset",
+    "max-items",
   ];
   for (let index = 0; index < args.length; index += 2) {
     const key = args[index]?.slice(2);
@@ -151,7 +159,7 @@ function parseOptions(args: readonly string[]): Map<string, string> {
 
 function usage(): string {
   return [
-    "pi-workgraph inspect --state PATH | --run-id ID [--registry PATH] [--section SECTION] [--task ID] [--attempt ID] [--result ID] [--offset N] [--max-chars N]",
+    "pi-workgraph inspect --state PATH | --run-id ID [--registry PATH] [--section SECTION] [--task ID] [--attempt ID] [--result ID] [--offset N] [--max-chars N] [--item-offset N] [--max-items N]",
     "pi-workgraph status --state PATH | --run-id ID [--registry PATH]",
     "pi-workgraph fork --parent-session-file PATH --target-cwd PATH [--entry-id ID]",
     "Inspect is the bounded semantic view; status reads uninterpreted historical JSON without migration. Workstream mutation belongs to coordinator tools.",

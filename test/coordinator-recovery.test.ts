@@ -457,11 +457,11 @@ test("registered recover safely retries a transient Git composition failure and 
     const blockedView = (
       await f.pi.call("workgraph_inspect", { section: "overview" })
     ).details as {
-      inspection: { attention: Array<{ blocker: string }> };
+      inspection: { attention: { items: Array<{ blocker: string }> } };
     };
-    assert.equal(blockedView.inspection.attention.length, 1);
+    assert.equal(blockedView.inspection.attention.items.length, 1);
     assert.match(
-      blockedView.inspection.attention[0]!.blocker,
+      blockedView.inspection.attention.items[0]!.blocker,
       /Git working tree/,
     );
     const state = resultState(
@@ -582,10 +582,15 @@ test("registered retain_not_applied preserves integrated bytes and exact unresol
     assert.equal(again.attempts[0]?.composition?.state, "retained_not_applied");
     const againView = againResponse.details as {
       inspection: {
-        tasks: Array<{ id: string; attempts: Array<{ result?: string }> }>;
+        tasks: {
+          items: Array<{
+            idPreview: string;
+            attempts: Array<{ outcome?: string }>;
+          }>;
+        };
       };
     };
-    assert.equal(againView.inspection.tasks[0]?.id, "change");
+    assert.equal(againView.inspection.tasks.items[0]?.idPreview, "change");
     assert.equal(await f.repository.head(), integratedRevision);
     const unresolved = [
       {
@@ -773,7 +778,7 @@ test("registered result and status views retain first presentation and bounded a
     });
     const view = (status.details as { inspection: { result: string } })
       .inspection;
-    assert.equal(view.result, "view-result");
+    assert.equal(view.result, "outcome-1");
   } finally {
     await f.dispose();
   }
