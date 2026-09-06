@@ -69,6 +69,48 @@ test("bounded output retains a valid UTF-8 suffix within the byte limit", async 
   assert.ok(Buffer.byteLength(result.stdout) <= 7);
 });
 
+test("malformed bytes stay within the display byte limit and preserve the raw digest", async () => {
+  const result = await runProcess(
+    node,
+    ["-e", "process.stdout.write(Buffer.from([0xff])); process.stderr.write(Buffer.from([0xfe]))"],
+    {
+      cwd,
+      timeoutMs: 1_000,
+      digestStdout: true,
+      outputLimit: 1,
+    },
+  );
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "");
+  assert.equal(result.stdoutTruncated, true);
+  assert.ok(Buffer.byteLength(result.stdout) <= 1);
+  assert.ok(Buffer.byteLength(result.stderr) <= 1);
+  assert.equal(
+    result.stdoutDigest,
+    createHash("sha256")
+      .update(Buffer.from([0xff]))
+      .digest("hex"),
+  );
+});
+
+test("decoded malformed suffixes are bounded for both output streams", async () => {
+  const stdout = Buffer.from([0x41, 0xff, 0xf0, 0x9f, 0x98, 0x80]);
+  const stderr = Buffer.from([0xc3, 0x28, 0xe2, 0x82, 0xac]);
+  const result = await runProcess(
+    node,
+    [
+      "-e",
+      `process.stdout.write(Buffer.from([${[...stdout]}])); process.stderr.write(Buffer.from([${[...stderr]}]))`,
+    ],
+    { cwd, timeoutMs: 1_000, outputLimit: 6 },
+  );
+  assert.equal(result.stdout, "😀");
+  assert.equal(result.stderr, "(€");
+  assert.equal(result.stdoutTruncated, true);
+  assert.ok(Buffer.byteLength(result.stdout) <= 6);
+  assert.ok(Buffer.byteLength(result.stderr) <= 6);
+});
+
 test("interrupting the Effect waits for the owned process to close", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-process-"));
   const marker = join(directory, "closed");

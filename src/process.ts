@@ -41,6 +41,11 @@ interface OutputCapture {
   retainedBytes: number;
 }
 
+interface CapturedText {
+  readonly text: string;
+  readonly truncated: boolean;
+}
+
 interface ProcessClose {
   readonly code: number | null;
   readonly signal: NodeJS.Signals | null;
@@ -96,12 +101,13 @@ export function processEffect(
         return yield* processError(close.error);
       }
 
+      const stdout = captureText(owned.stdout);
+      const stderr = captureText(owned.stderr);
       const result: ProcessResult = {
         exitCode: close.code ?? 1,
-        stdout: captureText(owned.stdout),
-        stdoutTruncated:
-          owned.stdout.limit !== undefined && owned.stdout.totalBytes > owned.stdout.limit,
-        stderr: captureText(owned.stderr),
+        stdout: stdout.text,
+        stdoutTruncated: stdout.truncated,
+        stderr: stderr.text,
         timedOut,
       };
       if (owned.stdout.digest !== undefined) {
@@ -255,10 +261,19 @@ function appendCapture(capture: OutputCapture, chunk: Buffer): void {
   }
 }
 
-function captureText(capture: OutputCapture): string {
+function captureText(capture: OutputCapture): CapturedText {
   const bytes = Buffer.concat(capture.chunks, capture.retainedBytes);
-  const bounded = capture.limit === undefined ? bytes : validUtf8Suffix(bytes);
-  return bounded.toString("utf8").trim();
+  if (capture.limit === undefined) {
+    return { text: bytes.toString("utf8").trim(), truncated: false };
+  }
+
+  const validSuffix = validUtf8Suffix(bytes);
+  const decoded = boundUtf8Text(validSuffix.toString("utf8"), capture.limit);
+  return {
+    text: decoded.text.trim(),
+    truncated:
+      capture.totalBytes > bytes.length || validSuffix.length < bytes.length || decoded.truncated,
+  };
 }
 
 function validUtf8Suffix(bytes: Buffer): Buffer {
@@ -269,4 +284,17 @@ function validUtf8Suffix(bytes: Buffer): Buffer {
     start += 1;
   }
   return bytes.subarray(start);
+}
+
+function boundUtf8Text(text: string, limit: number): CapturedText {
+  let start = 0;
+  let byteLength = Buffer.byteLength(text);
+  while (byteLength > limit && start < text.length) {
+    const codePoint = text.codePointAt(start);
+    if (codePoint === undefined) break;
+    const character = String.fromCodePoint(codePoint);
+    byteLength -= Buffer.byteLength(character);
+    start += character.length;
+  }
+  return { text: text.slice(start), truncated: start > 0 };
 }
