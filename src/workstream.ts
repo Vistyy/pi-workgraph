@@ -1,12 +1,18 @@
 import { randomUUID } from "node:crypto";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Atomic replacement and file mode require the host Node filesystem Promise API at this compatibility boundary.
-import { mkdir, rename, rm, writeFile } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Workstream paths are pure host paths and do not require an Effect service.
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { DateTime, Effect, Semaphore } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { EvidenceSchema } from "./report-schema.js";
+import {
+  AtomicWorkstreamFile,
+  claimWorkstreamDirectory,
+  domainEffect,
+  removeWorkstreamDirectory,
+  type StoreEffect,
+  type WorkstreamStoreError,
+} from "./workstream-persistence.js";
 import {
   type ArtifactRetention,
   AssignmentSchema,
@@ -36,20 +42,25 @@ import {
   WorkstreamStoreOperationError,
 } from "./workstream-state.js";
 import {
+  accountingTaskId,
+  deriveCompletionAccounting,
+  hasActiveOrUncleanAttempt,
+  recordInputTransition,
+  startAttemptTransition,
+  transitionWorkstreamState,
+} from "./workstream-transitions.js";
+import {
   decodeState,
   isActiveHistoricalState,
   isKnownHistoricalWorkstreamVersion,
   type JsonObject,
   type JsonValue,
-  readState,
-  readStateValue,
   requireText,
   retainedTerminalInspection,
   validateArtifactsForAssignment,
   validateAuthority,
   validateId,
   validateSession,
-  validateState,
   validateStoredPath,
   validateSubject,
 } from "./workstream-validation.js";
@@ -65,11 +76,13 @@ export type {
   ResultSubject,
   RetainedArtifact,
   SessionIdentity,
+  StoreEffect,
   WorkAssignment,
   WorkAttempt,
   WorkResult,
   WorkstreamReattachmentInspection,
   WorkstreamState,
+  WorkstreamStoreError,
 };
 export {
   InvalidWorkstreamStateError,
@@ -84,32 +97,42 @@ type ResultInput = OmitEach<WorkResult, "observedAt" | "artifacts"> & {
   artifacts?: RetainedArtifact[];
 };
 
-export class WorkstreamStore {
+export class WorkstreamStoreEffects {
   private readonly writeSemaphore = Semaphore.makeUnsafe(1);
 
   private mutationGuard: (() => void) | undefined;
 
+  private readonly file: AtomicWorkstreamFile;
+
   private constructor(
     readonly path: string,
     private owner: SessionIdentity,
-  ) {}
+  ) {
+    this.file = new AtomicWorkstreamFile(path, () => this.mutationGuard);
+  }
 
   bindMutationGuard(guard: () => void): void {
     this.mutationGuard = guard;
   }
 
-  adopt(owner: SessionIdentity): Promise<WorkstreamState> {
-    validateSession(owner);
-    return this.update(
-      (draft) => {
-        draft.coordinator = { ...owner };
-      },
-      undefined,
-      ["active", "suspended"],
-    ).then((state) => {
-      this.owner = { ...owner };
-      return state;
-    });
+  adopt(owner: SessionIdentity): StoreEffect<WorkstreamState> {
+    return this.prepared(
+      () => validateSession(owner),
+      () =>
+        this.update(
+          (draft) => {
+            draft.coordinator = { ...owner };
+          },
+          undefined,
+          ["active", "suspended"],
+        ).pipe(
+          Effect.tap(() =>
+            domainEffect(() => {
+              this.owner = { ...owner };
+            }),
+          ),
+        ),
+    );
   }
 
   static pathFor(gitCommonDir: string, id: string): string {
@@ -124,68 +147,85 @@ export class WorkstreamStore {
     gitCommonDir: string;
     coordinator: SessionIdentity;
     now?: Date;
-  }): Promise<{ store: WorkstreamStore; state: WorkstreamState }> {
-    validateId(input.id, "Workstream id");
-    requireText(input.purpose, "Workstream purpose");
-    requireText(input.projectRoot, "Project root");
-    requireText(input.gitCommonDir, "Git common directory");
-    validateSession(input.coordinator);
-    const path = WorkstreamStore.pathFor(input.gitCommonDir, input.id);
-    return mkdir(dirname(dirname(path)), { recursive: true })
-      .then(() => mkdir(dirname(path)))
-      .then(() => {
-        const now = (input.now ?? currentDate()).toISOString();
-        const state: WorkstreamState = {
-          format: WORKSTREAM_FORMAT,
-          version: WORKSTREAM_STATE_VERSION,
-          revision: 0,
-          id: input.id,
-          purpose: input.purpose.trim(),
-          projectRoot: input.projectRoot,
-          gitCommonDir: input.gitCommonDir,
-          statePath: path,
-          coordinator: { ...input.coordinator },
-          lifecycle: {
-            state: "active",
-            changedAt: now,
-            reason: "Workstream created.",
+  }): StoreEffect<{ store: WorkstreamStoreEffects; state: WorkstreamState }> {
+    return domainEffect(() => {
+      validateId(input.id, "Workstream id");
+      requireText(input.purpose, "Workstream purpose");
+      requireText(input.projectRoot, "Project root");
+      requireText(input.gitCommonDir, "Git common directory");
+      validateSession(input.coordinator);
+      const path = WorkstreamStoreEffects.pathFor(input.gitCommonDir, input.id);
+      const now = (input.now ?? currentDate()).toISOString();
+      const state: WorkstreamState = {
+        format: WORKSTREAM_FORMAT,
+        version: WORKSTREAM_STATE_VERSION,
+        revision: 0,
+        id: input.id,
+        purpose: input.purpose.trim(),
+        projectRoot: input.projectRoot,
+        gitCommonDir: input.gitCommonDir,
+        statePath: path,
+        coordinator: { ...input.coordinator },
+        lifecycle: {
+          state: "active",
+          changedAt: now,
+          reason: "Workstream created.",
+        },
+        inputs: [],
+        intents: [
+          {
+            version: 0,
+            statement: input.purpose.trim(),
+            constraints: [],
+            authorityReceiptIds: [],
+            recordedAt: now,
           },
-          inputs: [],
-          intents: [
-            {
-              version: 0,
-              statement: input.purpose.trim(),
-              constraints: [],
-              authorityReceiptIds: [],
-              recordedAt: now,
-            },
-          ],
-          assignments: [],
-          results: [],
-          dispositions: [],
-          attempts: [],
-          deliveries: [],
-          createdAt: now,
-          updatedAt: now,
-        };
-        const store = new WorkstreamStore(path, input.coordinator);
-        return store.write(state).then(
-          () => ({ store, state: structuredClone(state) }),
-          (error) =>
-            rm(dirname(path), { recursive: true, force: true }).then(() => {
-              throw error;
-            }),
-        );
-      });
+        ],
+        assignments: [],
+        results: [],
+        dispositions: [],
+        attempts: [],
+        deliveries: [],
+        createdAt: now,
+        updatedAt: now,
+      };
+      return { path, state, store: new WorkstreamStoreEffects(path, input.coordinator) };
+    }).pipe(
+      Effect.flatMap(({ path, state, store }) =>
+        claimWorkstreamDirectory(path).pipe(
+          Effect.andThen(
+            store.write(state).pipe(
+              Effect.catch((error) =>
+                removeWorkstreamDirectory(path).pipe(
+                  Effect.matchEffect({
+                    onFailure: (cleanupError) =>
+                      Effect.fail(
+                        new WorkstreamStoreOperationError({
+                          code: "workstream_store_operation_failed",
+                          message: "Workstream creation and cleanup both failed.",
+                          cause: new AggregateError([error, cleanupError]),
+                        }),
+                      ),
+                    onSuccess: () => Effect.fail(error),
+                  }),
+                ),
+              ),
+            ),
+          ),
+          Effect.as({ store, state: structuredClone(state) }),
+        ),
+      ),
+    );
   }
 
-  static open(path: string, owner: SessionIdentity): WorkstreamStore {
+  static open(path: string, owner: SessionIdentity): WorkstreamStoreEffects {
     validateSession(owner);
-    return new WorkstreamStore(resolve(path), owner);
+    return new WorkstreamStoreEffects(resolve(path), owner);
   }
 
-  static inspect(path: string): Promise<WorkstreamState> {
-    return readState(resolve(path));
+  static inspect(path: string): StoreEffect<WorkstreamState> {
+    const resolvedPath = resolve(path);
+    return new AtomicWorkstreamFile(resolvedPath, () => undefined).readState();
   }
 
   /**
@@ -193,18 +233,21 @@ export class WorkstreamStore {
    * A canonical terminal envelope from a known workstream version may be retained
    * without applying the current mutable schema or adopting its ownership.
    */
-  static inspectForReattachment(path: string): Promise<WorkstreamReattachmentInspection> {
+  static inspectForReattachment(path: string): StoreEffect<WorkstreamReattachmentInspection> {
     const resolvedPath = resolve(path);
-    return readStateValue(resolvedPath).then((value) =>
-      inspectReattachmentValue(value, resolvedPath),
-    );
+    return new AtomicWorkstreamFile(resolvedPath, () => undefined)
+      .readObject()
+      .pipe(
+        Effect.flatMap((value) =>
+          domainEffect(() => inspectReattachmentValue(value, resolvedPath)),
+        ),
+      );
   }
 
-  load(): Promise<WorkstreamState> {
-    return readState(this.path).then((state) => {
-      this.assertOwner(state);
-      return state;
-    });
+  load(): StoreEffect<WorkstreamState> {
+    return this.file
+      .readState()
+      .pipe(Effect.tap((state) => domainEffect(() => this.assertOwner(state))));
   }
 
   recordInputEvent(input: {
@@ -214,77 +257,70 @@ export class WorkstreamStore {
     source: HumanInputSource;
     text: string;
     now?: Date;
-  }): Promise<{ state: WorkstreamState; receipt: HumanInputReceipt }> {
-    if (input.source === "extension")
-      return Promise.reject(new Error("Extension-generated input cannot create human authority."));
-    const source: HumanInputReceipt["source"] = input.source;
-    validateSession(input);
-    requireText(input.text, "Human input");
+  }): StoreEffect<{ state: WorkstreamState; receipt: HumanInputReceipt }> {
     let receipt: HumanInputReceipt | undefined;
-    return this.update(
-      (draft, now) => {
-        if (
-          input.sessionId !== this.owner.sessionId ||
-          input.sessionFile !== this.owner.sessionFile
-        )
-          throw new Error("Input receipt belongs to another session.");
-        const previous =
-          input.id === undefined ? undefined : draft.inputs.find((item) => item.id === input.id);
-        if (previous) {
-          if (
-            previous.text !== input.text.trim() ||
-            previous.source !== source ||
-            previous.sessionId !== input.sessionId
-          )
-            throw new Error("Conflicting input receipt.");
-          receipt = previous;
-          return;
-        }
-        receipt = {
-          id: input.id ?? randomUUID(),
-          sessionId: input.sessionId,
-          sessionFile: input.sessionFile,
-          source,
-          text: input.text.trim(),
-          receivedAt: (input.now ?? now).toISOString(),
-        };
-        const recorded = receipt;
-        if (recorded === undefined) throw new Error("Human input receipt was not recorded.");
-        draft.inputs.push(recorded);
+    return this.prepared(
+      () => {
+        if (input.source === "extension")
+          throw new Error("Extension-generated input cannot create human authority.");
+        validateSession(input);
+        requireText(input.text, "Human input");
+        return { id: input.id ?? randomUUID(), source: input.source };
       },
-      input.now,
-      ["active", "suspended"],
-    ).then((state) => {
-      if (!receipt) throw new Error("Human input receipt was not recorded.");
-      return { state, receipt };
-    });
+      (prepared) =>
+        this.update(
+          (draft, now) => {
+            receipt = recordInputTransition(draft, {
+              id: prepared.id,
+              owner: input,
+              source: prepared.source,
+              text: input.text,
+              receivedAt: (input.now ?? now).toISOString(),
+            });
+          },
+          input.now,
+          ["active", "suspended"],
+        ).pipe(
+          Effect.flatMap((state) =>
+            domainEffect(() => {
+              if (!receipt) throw new Error("Human input receipt was not recorded.");
+              return { state, receipt };
+            }),
+          ),
+        ),
+    );
   }
 
   setLifecycle(input: {
     state: "active" | "suspended" | "abandoned" | "archived";
     reason: string;
     now?: Date;
-  }): Promise<WorkstreamState> {
-    requireText(input.reason, "Lifecycle reason");
-    return this.update(
-      (draft, now) => {
-        const from = draft.lifecycle.state;
-        const allowed =
-          from === "active"
-            ? ["suspended", "abandoned", "archived"]
-            : from === "suspended"
-              ? ["active", "abandoned", "archived"]
-              : [];
-        if (!allowed.includes(input.state))
-          throw new Error(`Cannot transition workstream lifecycle from ${from} to ${input.state}.`);
-        draft.lifecycle = {
-          state: input.state,
-          changedAt: (input.now ?? now).toISOString(),
-          reason: input.reason.trim(),
-        };
-      },
-      input.now,
-      ["active", "suspended"],
+  }): StoreEffect<WorkstreamState> {
+    return this.prepared(
+      () => requireText(input.reason, "Lifecycle reason"),
+      () =>
+        this.update(
+          (draft, now) => {
+            const from = draft.lifecycle.state;
+            const allowed =
+              from === "active"
+                ? ["suspended", "abandoned", "archived"]
+                : from === "suspended"
+                  ? ["active", "abandoned", "archived"]
+                  : [];
+            if (!allowed.includes(input.state))
+              throw new Error(
+                `Cannot transition workstream lifecycle from ${from} to ${input.state}.`,
+              );
+            draft.lifecycle = {
+              state: input.state,
+              changedAt: (input.now ?? now).toISOString(),
+              reason: input.reason.trim(),
+            };
+          },
+          input.now,
+          ["active", "suspended"],
+        ),
     );
   }
 
@@ -293,23 +329,28 @@ export class WorkstreamStore {
     statement: string;
     constraints: string[];
     now?: Date;
-  }): Promise<WorkstreamState> {
-    requireText(input.statement, "Intent statement");
-    requireTexts(input.constraints, "Intent constraints");
-    return this.update((draft, now) => {
-      requireReceipt(draft, input.authorityReceiptId);
-      const current = currentIntent(draft);
-      draft.intents.push({
-        version: current.version + 1,
-        statement: input.statement.trim(),
-        constraints: input.constraints.map((item) => item.trim()),
-        authorityReceiptIds: [input.authorityReceiptId],
-        recordedAt: (input.now ?? now).toISOString(),
-      });
-    }, input.now);
+  }): StoreEffect<WorkstreamState> {
+    return this.prepared(
+      () => {
+        requireText(input.statement, "Intent statement");
+        requireTexts(input.constraints, "Intent constraints");
+      },
+      () =>
+        this.update((draft, now) => {
+          requireReceipt(draft, input.authorityReceiptId);
+          const current = currentIntent(draft);
+          draft.intents.push({
+            version: current.version + 1,
+            statement: input.statement.trim(),
+            constraints: input.constraints.map((item) => item.trim()),
+            authorityReceiptIds: [input.authorityReceiptId],
+            recordedAt: (input.now ?? now).toISOString(),
+          });
+        }, input.now),
+    );
   }
 
-  assign(input: AssignmentInput & { now?: Date }): Promise<WorkstreamState> {
+  assign(input: AssignmentInput & { now?: Date }): StoreEffect<WorkstreamState> {
     return this.update((draft, now) => addAssignment(draft, input, now), input.now);
   }
 
@@ -330,7 +371,7 @@ export class WorkstreamStore {
           continuationOf?: string;
           baseRevision?: string;
         }>,
-  ): Promise<WorkstreamState> {
+  ): StoreEffect<WorkstreamState> {
     return this.update((draft, now) => {
       addAssignment(draft, input, now);
       const entries = Array.isArray(attempts) ? attempts : [attempts];
@@ -363,25 +404,30 @@ export class WorkstreamStore {
     });
   }
 
-  retainResult(input: ResultInput & { now?: Date }): Promise<WorkstreamState> {
-    validateId(input.id, "Result id");
-    return this.update(
-      (draft, now) => {
-        const assignment = requireAssignment(draft, input.assignmentId);
-        const { now: _now, artifacts = [], ...fields } = input;
-        validateArtifactsForAssignment(
-          assignment,
-          artifacts,
-          input.validity === "typed" && input.report.status === "completed" ? "typed" : "absent",
-        );
-        retainResultTransition(draft, {
-          ...fields,
-          artifacts,
-          observedAt: (input.now ?? now).toISOString(),
-        });
-      },
-      input.now,
-      ["active", "suspended"],
+  retainResult(input: ResultInput & { now?: Date }): StoreEffect<WorkstreamState> {
+    return this.prepared(
+      () => validateId(input.id, "Result id"),
+      () =>
+        this.update(
+          (draft, now) => {
+            const assignment = requireAssignment(draft, input.assignmentId);
+            const { now: _now, artifacts = [], ...fields } = input;
+            validateArtifactsForAssignment(
+              assignment,
+              artifacts,
+              input.validity === "typed" && input.report.status === "completed"
+                ? "typed"
+                : "absent",
+            );
+            retainResultTransition(draft, {
+              ...fields,
+              artifacts,
+              observedAt: (input.now ?? now).toISOString(),
+            });
+          },
+          input.now,
+          ["active", "suspended"],
+        ),
     );
   }
 
@@ -398,44 +444,49 @@ export class WorkstreamStore {
     stagingRoot: string;
     required: string[];
     now?: Date;
-  }): Promise<WorkstreamState> {
-    validateId(input.id, "Result id");
-    return this.update(
-      (draft, now) => {
-        const attempt = draft.attempts.find((item) => item.id === input.attemptId);
-        if (!attempt) throw new Error(`Unknown attempt ${input.attemptId}.`);
-        const assignment = requireAssignment(draft, input.assignmentId);
-        if (
-          assignment.artifactIntent !== "disposable_experiment" ||
-          attempt.assignmentId !== assignment.id ||
-          input.assignmentIntentVersion !== assignment.intentVersion ||
-          input.report.status !== "completed" ||
-          !sameValue(input.required, assignment.artifactPolicy.retain)
-        )
-          throw new Error("Pending artifact retention does not match its experiment assignment.");
-        retainResultTransition(draft, {
-          id: input.id,
-          assignmentId: input.assignmentId,
-          assignmentIntentVersion: input.assignmentIntentVersion,
-          validity: "typed",
-          report: structuredClone(input.report),
-          artifacts: [],
-          observedAt: (input.now ?? now).toISOString(),
-        });
-        attempt.artifactRetention = {
-          state: "pending",
-          resultId: input.id,
-          assignmentIntentVersion: input.assignmentIntentVersion,
-          sourceRoot: input.sourceRoot,
-          sourceIdentity: input.sourceIdentity,
-          expectedHead: input.expectedHead,
-          destinationRoot: input.destinationRoot,
-          stagingRoot: input.stagingRoot,
-          required: [...input.required],
-        };
-      },
-      input.now,
-      ["active", "suspended"],
+  }): StoreEffect<WorkstreamState> {
+    return this.prepared(
+      () => validateId(input.id, "Result id"),
+      () =>
+        this.update(
+          (draft, now) => {
+            const attempt = draft.attempts.find((item) => item.id === input.attemptId);
+            if (!attempt) throw new Error(`Unknown attempt ${input.attemptId}.`);
+            const assignment = requireAssignment(draft, input.assignmentId);
+            if (
+              assignment.artifactIntent !== "disposable_experiment" ||
+              attempt.assignmentId !== assignment.id ||
+              input.assignmentIntentVersion !== assignment.intentVersion ||
+              input.report.status !== "completed" ||
+              !sameValue(input.required, assignment.artifactPolicy.retain)
+            )
+              throw new Error(
+                "Pending artifact retention does not match its experiment assignment.",
+              );
+            retainResultTransition(draft, {
+              id: input.id,
+              assignmentId: input.assignmentId,
+              assignmentIntentVersion: input.assignmentIntentVersion,
+              validity: "typed",
+              report: structuredClone(input.report),
+              artifacts: [],
+              observedAt: (input.now ?? now).toISOString(),
+            });
+            attempt.artifactRetention = {
+              state: "pending",
+              resultId: input.id,
+              assignmentIntentVersion: input.assignmentIntentVersion,
+              sourceRoot: input.sourceRoot,
+              sourceIdentity: input.sourceIdentity,
+              expectedHead: input.expectedHead,
+              destinationRoot: input.destinationRoot,
+              stagingRoot: input.stagingRoot,
+              required: [...input.required],
+            };
+          },
+          input.now,
+          ["active", "suspended"],
+        ),
     );
   }
 
@@ -446,47 +497,33 @@ export class WorkstreamStore {
     branch?: string;
     baseRevision?: string;
     now?: Date;
-  }): Promise<WorkstreamState> {
-    const placement = input.placement ?? {
-      kind: "isolated_worktree" as const,
-      path: requireTextValue(input.worktreePath, "worktree"),
-      branch: requireTextValue(input.branch, "branch"),
-    };
-    return this.changeAttempt(
-      input.id,
-      (attempt) => {
-        if (attempt.state === "starting") {
-          if (
-            sameValue(attempt.placement, placement) &&
-            attempt.baseRevision === input.baseRevision
-          )
-            return;
-          throw new Error(`Attempt ${input.id} has contradictory launch placement.`);
-        }
-        if (attempt.state !== "queued")
-          throw new Error(`Attempt ${input.id} is not awaiting launch.`);
-        attempt.state = "starting";
-        attempt.placement = structuredClone(placement);
-        if (placement.kind === "isolated_worktree") {
-          attempt.worktreePath = placement.path;
-          attempt.branch = placement.branch;
-        } else {
-          delete attempt.worktreePath;
-          delete attempt.branch;
-        }
-        if (input.baseRevision !== undefined) attempt.baseRevision = input.baseRevision;
-        else delete attempt.baseRevision;
-        attempt.submission = "not_sent";
-      },
-      input.now,
+  }): StoreEffect<WorkstreamState> {
+    return this.prepared(
+      () =>
+        input.placement ?? {
+          kind: "isolated_worktree" as const,
+          path: requireTextValue(input.worktreePath, "worktree"),
+          branch: requireTextValue(input.branch, "branch"),
+        },
+      (placement) =>
+        this.changeAttempt(
+          input.id,
+          (attempt) =>
+            startAttemptTransition(attempt, {
+              id: input.id,
+              placement,
+              baseRevision: input.baseRevision,
+            }),
+          input.now,
+        ),
     );
   }
 
-  recordSessionFile(id: string, sessionFile: string, now?: Date): Promise<WorkstreamState> {
-    requireText(sessionFile, "Worker session file");
+  recordSessionFile(id: string, sessionFile: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
+        requireText(sessionFile, "Worker session file");
         if (attempt.sessionFile !== undefined) {
           if (attempt.sessionFile === sessionFile) return;
           throw new Error(`Attempt ${id} has contradictory session identity.`);
@@ -502,7 +539,7 @@ export class WorkstreamStore {
     id: string,
     launchPane: NonNullable<WorkAttempt["launchPane"]>,
     now?: Date,
-  ): Promise<WorkstreamState> {
+  ): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -522,7 +559,7 @@ export class WorkstreamStore {
     id: string,
     resource: NonNullable<WorkAttempt["resource"]>,
     now?: Date,
-  ): Promise<WorkstreamState> {
+  ): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -542,7 +579,7 @@ export class WorkstreamStore {
     id: string,
     worker: NonNullable<WorkAttempt["worker"]>,
     now?: Date,
-  ): Promise<WorkstreamState> {
+  ): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -564,7 +601,7 @@ export class WorkstreamStore {
     id: string,
     state: NonNullable<WorkAttempt["submission"]>,
     now?: Date,
-  ): Promise<WorkstreamState> {
+  ): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -590,7 +627,7 @@ export class WorkstreamStore {
     resultId: string;
     effectiveModels: NonNullable<WorkAttempt["effectiveModels"]>;
     now?: Date;
-  }): Promise<WorkstreamState> {
+  }): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       input.id,
       (attempt, draft) => {
@@ -616,11 +653,11 @@ export class WorkstreamStore {
     );
   }
 
-  recordAttention(id: string, detail: string, now?: Date): Promise<WorkstreamState> {
-    requireText(detail, "Attention detail");
+  recordAttention(id: string, detail: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt, _draft, current) => {
+        requireText(detail, "Attention detail");
         if (attempt.error === detail) return;
         attempt.error = detail;
         attempt.attentionHistory ??= [];
@@ -633,7 +670,7 @@ export class WorkstreamStore {
     );
   }
 
-  clearAttention(id: string, now?: Date): Promise<WorkstreamState> {
+  clearAttention(id: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -648,7 +685,7 @@ export class WorkstreamStore {
     commit: string;
     expectedHead: string;
     now?: Date;
-  }): Promise<WorkstreamState> {
+  }): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       input.id,
       (attempt) => {
@@ -671,7 +708,7 @@ export class WorkstreamStore {
     );
   }
 
-  retryComposition(id: string, now?: Date, retainedRef?: string): Promise<WorkstreamState> {
+  retryComposition(id: string, now?: Date, retainedRef?: string): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -699,15 +736,15 @@ export class WorkstreamStore {
     retainedRef: string;
     integratedRevision: string;
     now?: Date;
-  }): Promise<WorkstreamState> {
-    requireText(input.commit, "Failed proposal commit");
-    requireText(input.expectedHead, "Failed proposal expected HEAD");
-    requireText(input.reason, "Failed proposal retention reason");
-    requireText(input.retainedRef, "Failed proposal retained ref");
-    requireText(input.integratedRevision, "Integrated revision");
+  }): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       input.id,
       (attempt, draft) => {
+        requireText(input.commit, "Failed proposal commit");
+        requireText(input.expectedHead, "Failed proposal expected HEAD");
+        requireText(input.reason, "Failed proposal retention reason");
+        requireText(input.retainedRef, "Failed proposal retained ref");
+        requireText(input.integratedRevision, "Integrated revision");
         if (attempt.composition !== undefined)
           throw new Error(`Composition for ${input.id} is already recorded.`);
         const assignment = requireAssignment(draft, attempt.assignmentId);
@@ -754,13 +791,13 @@ export class WorkstreamStore {
     retainedRef: string;
     integratedRevision: string;
     now?: Date;
-  }): Promise<WorkstreamState> {
-    requireText(input.reason, "Retained-not-applied reason");
-    requireText(input.retainedRef, "Retained commit ref");
-    requireText(input.integratedRevision, "Integrated revision");
+  }): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       input.id,
       (attempt) => {
+        requireText(input.reason, "Retained-not-applied reason");
+        requireText(input.retainedRef, "Retained commit ref");
+        requireText(input.integratedRevision, "Integrated revision");
         const composition = attempt.composition;
         if (composition?.state !== "blocked")
           throw new Error(`Composition for ${input.id} is not blocked.`);
@@ -776,7 +813,7 @@ export class WorkstreamStore {
     );
   }
 
-  finishComposition(id: string, revision: string, now?: Date): Promise<WorkstreamState> {
+  finishComposition(id: string, revision: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -793,11 +830,11 @@ export class WorkstreamStore {
     );
   }
 
-  blockComposition(id: string, error: string, now?: Date): Promise<WorkstreamState> {
-    requireText(error, "Composition error");
+  blockComposition(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
+        requireText(error, "Composition error");
         const composition = attempt.composition;
         if (composition?.state === "blocked") {
           if (composition.error === error.trim()) return;
@@ -820,7 +857,7 @@ export class WorkstreamStore {
     expectedHead?: string;
     discard: boolean;
     now?: Date;
-  }): Promise<WorkstreamState> {
+  }): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       input.id,
       (attempt) => beginCleanupTransition(attempt, input),
@@ -828,7 +865,7 @@ export class WorkstreamStore {
     );
   }
 
-  markWorkerClosed(id: string, now?: Date): Promise<WorkstreamState> {
+  markWorkerClosed(id: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt, draft) => {
@@ -844,7 +881,7 @@ export class WorkstreamStore {
     );
   }
 
-  retryArtifactRetention(id: string, now?: Date): Promise<WorkstreamState> {
+  retryArtifactRetention(id: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -862,7 +899,7 @@ export class WorkstreamStore {
     id: string,
     artifacts: RetainedArtifact[],
     now?: Date,
-  ): Promise<WorkstreamState> {
+  ): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt, draft) => {
@@ -886,11 +923,11 @@ export class WorkstreamStore {
     );
   }
 
-  blockArtifactRetention(id: string, error: string, now?: Date): Promise<WorkstreamState> {
-    requireText(error, "Artifact retention error");
+  blockArtifactRetention(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
+        requireText(error, "Artifact retention error");
         const retention = attempt.artifactRetention;
         if (retention === undefined || retention.state === "completed")
           throw new Error(`Artifact retention for ${id} is not blockable.`);
@@ -907,7 +944,7 @@ export class WorkstreamStore {
     );
   }
 
-  retryCleanup(id: string, now?: Date): Promise<WorkstreamState> {
+  retryCleanup(id: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt, draft) => {
@@ -923,7 +960,7 @@ export class WorkstreamStore {
     );
   }
 
-  finishCleanup(id: string, now?: Date): Promise<WorkstreamState> {
+  finishCleanup(id: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt, draft) => {
@@ -938,11 +975,11 @@ export class WorkstreamStore {
     );
   }
 
-  blockCleanup(id: string, error: string, now?: Date): Promise<WorkstreamState> {
-    requireText(error, "Cleanup error");
+  blockCleanup(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
+        requireText(error, "Cleanup error");
         if (!attempt.cleanup) throw new Error(`Cleanup for ${id} is not recorded.`);
         if (attempt.cleanup.state === "completed")
           throw new Error(`Cleanup for ${id} is already completed.`);
@@ -965,11 +1002,11 @@ export class WorkstreamStore {
     text: string,
     state: "uncertain" | "submitted",
     now?: Date,
-  ): Promise<WorkstreamState> {
-    requireText(text, "Steering instruction");
+  ): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
+        requireText(text, "Steering instruction");
         if (!attempt.worker) throw new Error("Steering requires a worker identity.");
         if (state === "submitted" && attempt.steering?.state !== "uncertain")
           throw new Error("Submitted steering requires an uncertain submission record.");
@@ -979,7 +1016,7 @@ export class WorkstreamStore {
     );
   }
 
-  cancelAttempt(id: string, now?: Date): Promise<WorkstreamState> {
+  cancelAttempt(id: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
@@ -999,7 +1036,7 @@ export class WorkstreamStore {
     id: string,
     mutator: (attempt: WorkAttempt, draft: WorkstreamState, now: Date) => void,
     suppliedNow?: Date,
-  ): Promise<WorkstreamState> {
+  ): StoreEffect<WorkstreamState> {
     return this.update(
       (draft, now) => {
         const attempt = draft.attempts.find((candidate) => candidate.id === id);
@@ -1012,7 +1049,7 @@ export class WorkstreamStore {
     );
   }
 
-  requestDelivery(resultId: string, now?: Date): Promise<WorkstreamState> {
+  requestDelivery(resultId: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.update(
       (draft, current) => {
         if (!draft.results.some((result) => result.id === resultId))
@@ -1030,7 +1067,7 @@ export class WorkstreamStore {
     );
   }
 
-  deliveryAttempt(resultId: string, owner: string, error?: string): Promise<WorkstreamState> {
+  deliveryAttempt(resultId: string, owner: string, error?: string): StoreEffect<WorkstreamState> {
     return this.update(
       (draft, now) => {
         const delivery = draft.deliveries.find((item) => item.resultId === resultId);
@@ -1051,7 +1088,10 @@ export class WorkstreamStore {
     );
   }
 
-  addResultArtifacts(resultId: string, artifacts: RetainedArtifact[]): Promise<WorkstreamState> {
+  addResultArtifacts(
+    resultId: string,
+    artifacts: RetainedArtifact[],
+  ): StoreEffect<WorkstreamState> {
     return this.update(
       (draft) => {
         const result = draft.results.find((item) => item.id === resultId);
@@ -1073,7 +1113,7 @@ export class WorkstreamStore {
    * Pi provides no queued-follow-up presentation receipt; this shared delivery
    * state alone proves neither queued presentation nor coordinator inspection.
    */
-  markDelivered(resultId: string, now?: Date): Promise<WorkstreamState> {
+  markDelivered(resultId: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.update(
       (draft, current) => {
         const delivery = draft.deliveries.find((candidate) => candidate.resultId === resultId);
@@ -1088,10 +1128,10 @@ export class WorkstreamStore {
     );
   }
 
-  acknowledge(resultId: string, acknowledgment: string, now?: Date): Promise<WorkstreamState> {
-    requireText(acknowledgment, "Acknowledgment");
+  acknowledge(resultId: string, acknowledgment: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.update(
       (draft, current) => {
+        requireText(acknowledgment, "Acknowledgment");
         const delivery = draft.deliveries.find((candidate) => candidate.resultId === resultId);
         if (!delivery) throw new Error(`Unknown delivery ${resultId}.`);
         if (delivery.state === "acknowledged") return;
@@ -1112,9 +1152,9 @@ export class WorkstreamStore {
     status: ResultDisposition["status"];
     reason: string;
     now?: Date;
-  }): Promise<WorkstreamState> {
-    requireText(input.reason, "Disposition reason");
+  }): StoreEffect<WorkstreamState> {
     return this.update((draft, now) => {
+      requireText(input.reason, "Disposition reason");
       requireActive(draft);
       if (!draft.results.some((result) => result.id === input.resultId))
         throw new Error(`Unknown result ${input.resultId}.`);
@@ -1134,28 +1174,22 @@ export class WorkstreamStore {
     /** One reason per unresolved semantic task; mechanical entries are derived below. */
     reasons: Array<{ taskId: string; reason: string }>;
     now?: Date;
-  }): Promise<WorkstreamState> {
-    requireText(input.conclusion, "Completion conclusion");
-    if (
-      input.evidence.length === 0 ||
-      !input.evidence.every((item) => Value.Check(EvidenceSchema, item))
-    )
-      throw new Error("Completion requires valid evidence.");
-    requireTexts(input.limitations, "Completion limitations");
+  }): StoreEffect<WorkstreamState> {
     return this.update((draft, now) => {
-      requireActive(draft);
+      requireText(input.conclusion, "Completion conclusion");
       if (
-        draft.attempts.some(
-          (attempt) =>
-            ["queued", "starting", "running", "cancel_requested"].includes(attempt.state) ||
-            (attempt.placement !== undefined && attempt.cleanup?.state !== "completed"),
-        )
-      ) {
+        input.evidence.length === 0 ||
+        !input.evidence.every((item) => Value.Check(EvidenceSchema, item))
+      )
+        throw new Error("Completion requires valid evidence.");
+      requireTexts(input.limitations, "Completion limitations");
+      requireActive(draft);
+      if (draft.attempts.some(hasActiveOrUncleanAttempt)) {
         throw new Error(
           "Complete only after workers and owned resources have settled and cleaned up.",
         );
       }
-      const expectedAccounting = completionAccounting(draft);
+      const expectedAccounting = deriveCompletionAccounting(draft);
       const expectedTasks = [
         ...new Set(
           expectedAccounting
@@ -1209,43 +1243,47 @@ export class WorkstreamStore {
     return result.assignmentIntentVersion === currentIntent(state).version;
   }
 
+  private prepared<Preparation, Success>(
+    prepare: () => Preparation,
+    operation: (prepared: Preparation) => StoreEffect<Success>,
+  ): StoreEffect<Success> {
+    return domainEffect(prepare).pipe(Effect.flatMap(operation));
+  }
+
   private update(
     mutator: (draft: WorkstreamState, now: Date) => void,
     suppliedNow?: Date,
     allowedLifecycleStates: WorkstreamState["lifecycle"]["state"][] = ["active"],
-  ): Promise<WorkstreamState> {
-    const operation = this.writeSemaphore.withPermit(
-      Effect.tryPromise({
-        try: () => this.performUpdate(mutator, suppliedNow, allowedLifecycleStates),
-        catch: (cause) =>
-          new WorkstreamStoreOperationError({
-            code: "workstream_store_operation_failed",
-            message: "Workstream store operation failed.",
-            cause,
-          }),
-      }),
+  ): StoreEffect<WorkstreamState> {
+    return this.writeSemaphore.withPermit(
+      this.performUpdate(mutator, suppliedNow, allowedLifecycleStates),
     );
-    return runStorePromise(operation);
   }
 
   private performUpdate(
     mutator: (draft: WorkstreamState, now: Date) => void,
     suppliedNow: Date | undefined,
     allowedLifecycleStates: WorkstreamState["lifecycle"]["state"][],
-  ): Promise<WorkstreamState> {
-    this.mutationGuard?.();
-    return readState(this.path).then((current) => {
-      this.assertOwner(current);
-      if (!allowedLifecycleStates.includes(current.lifecycle.state))
-        throw new Error(`Workstream is ${current.lifecycle.state}.`);
-      const draft = structuredClone(current);
-      const now = suppliedNow ?? currentDate();
-      mutator(draft, now);
-      if (sameValue(draft, current)) return structuredClone(current);
-      draft.revision = current.revision + 1;
-      draft.updatedAt = now.toISOString();
-      return this.write(draft).then(() => structuredClone(draft));
-    });
+  ): StoreEffect<WorkstreamState> {
+    return domainEffect(() => this.mutationGuard?.()).pipe(
+      Effect.andThen(this.file.readState()),
+      Effect.flatMap((current) =>
+        domainEffect(() => {
+          this.assertOwner(current);
+          if (!allowedLifecycleStates.includes(current.lifecycle.state))
+            throw new Error(`Workstream is ${current.lifecycle.state}.`);
+          return transitionWorkstreamState(current, mutator, suppliedNow ?? currentDate());
+        }).pipe(Effect.flatMap((draft) => this.persistTransition(current, draft))),
+      ),
+    );
+  }
+
+  private persistTransition(
+    current: WorkstreamState,
+    draft: WorkstreamState,
+  ): StoreEffect<WorkstreamState> {
+    if (draft.revision === current.revision) return Effect.succeed(draft);
+    return this.write(draft).pipe(Effect.as(structuredClone(draft)));
   }
 
   private assertOwner(state: WorkstreamState): void {
@@ -1257,27 +1295,131 @@ export class WorkstreamStore {
     }
   }
 
-  private write(state: WorkstreamState): Promise<void> {
-    validateState(state);
-    const temporaryPath = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-    return mkdir(dirname(this.path), { recursive: true }).then(() =>
-      writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, {
-        encoding: "utf8",
-        mode: 0o600,
-      })
-        .then(() => {
-          this.mutationGuard?.();
-          return rename(temporaryPath, this.path);
-        })
-        .then(
-          (result) => rm(temporaryPath, { force: true }).then(() => result),
-          (error) =>
-            rm(temporaryPath, { force: true }).then(() => {
-              throw error;
-            }),
-        ),
-    );
+  private write(state: WorkstreamState): StoreEffect<void> {
+    return this.file.writeState(state);
   }
+}
+
+type EffectOperationKeys = {
+  [Key in keyof WorkstreamStoreEffects]: WorkstreamStoreEffects[Key] extends (
+    ...args: never[]
+  ) => StoreEffect<unknown>
+    ? Key
+    : never;
+}[keyof WorkstreamStoreEffects];
+
+type PromiseOperation<Operation> = Operation extends (
+  ...args: infer Args
+) => Effect.Effect<infer Success, infer _Error, infer _Requirements>
+  ? (...args: Args) => Promise<Success>
+  : never;
+
+type WorkstreamPromiseOperations = {
+  [Key in EffectOperationKeys]: PromiseOperation<WorkstreamStoreEffects[Key]>;
+};
+
+export type WorkstreamStore = WorkstreamPromiseOperations &
+  Pick<
+    WorkstreamStoreEffects,
+    "path" | "bindMutationGuard" | "isAssignmentCurrent" | "isResultCurrent"
+  > & {
+    /** Primary typed store port. Promise methods on this facade are temporary outward adapters. */
+    readonly effects: WorkstreamStoreEffects;
+  };
+
+type CreateInput = Parameters<typeof WorkstreamStoreEffects.create>[0];
+
+interface WorkstreamStoreStatic {
+  pathFor(gitCommonDir: string, id: string): string;
+  create(input: CreateInput): Promise<{ store: WorkstreamStore; state: WorkstreamState }>;
+  open(path: string, owner: SessionIdentity): WorkstreamStore;
+  inspect(path: string): Promise<WorkstreamState>;
+  inspectForReattachment(path: string): Promise<WorkstreamReattachmentInspection>;
+}
+
+export const WorkstreamStore: WorkstreamStoreStatic = {
+  pathFor: (gitCommonDir, id) => WorkstreamStoreEffects.pathFor(gitCommonDir, id),
+  create: (input) =>
+    runStorePromise(WorkstreamStoreEffects.create(input)).then(({ store, state }) => ({
+      store: promiseFacade(store),
+      state,
+    })),
+  open: (path, owner) => promiseFacade(WorkstreamStoreEffects.open(path, owner)),
+  inspect: (path) => runStorePromise(WorkstreamStoreEffects.inspect(path)),
+  inspectForReattachment: (path) =>
+    runStorePromise(WorkstreamStoreEffects.inspectForReattachment(path)),
+};
+
+function promiseFacade(effects: WorkstreamStoreEffects): WorkstreamStore {
+  return {
+    effects,
+    path: effects.path,
+    bindMutationGuard: (guard) => effects.bindMutationGuard(guard),
+    isAssignmentCurrent: (state, assignmentId) => effects.isAssignmentCurrent(state, assignmentId),
+    isResultCurrent: (state, resultId) => effects.isResultCurrent(state, resultId),
+    adopt: promiseOperation((...args) => effects.adopt(...args)),
+    load: promiseOperation((...args) => effects.load(...args)),
+    recordInputEvent: promiseOperation((...args) => effects.recordInputEvent(...args)),
+    setLifecycle: promiseOperation((...args) => effects.setLifecycle(...args)),
+    reviseIntent: promiseOperation((...args) => effects.reviseIntent(...args)),
+    assign: promiseOperation((...args) => effects.assign(...args)),
+    enqueue: promiseOperation((...args) => effects.enqueue(...args)),
+    retainResult: promiseOperation((...args) => effects.retainResult(...args)),
+    retainResultPendingArtifacts: promiseOperation((...args) =>
+      effects.retainResultPendingArtifacts(...args),
+    ),
+    startAttempt: promiseOperation((...args) => effects.startAttempt(...args)),
+    recordSessionFile: promiseOperation((...args) => effects.recordSessionFile(...args)),
+    recordLaunchPane: promiseOperation((...args) => effects.recordLaunchPane(...args)),
+    recordResource: promiseOperation((...args) => effects.recordResource(...args)),
+    recordWorker: promiseOperation((...args) => effects.recordWorker(...args)),
+    markSubmission: promiseOperation((...args) => effects.markSubmission(...args)),
+    settleAttempt: promiseOperation((...args) => effects.settleAttempt(...args)),
+    recordAttention: promiseOperation((...args) => effects.recordAttention(...args)),
+    clearAttention: promiseOperation((...args) => effects.clearAttention(...args)),
+    beginComposition: promiseOperation((...args) => effects.beginComposition(...args)),
+    retryComposition: promiseOperation((...args) => effects.retryComposition(...args)),
+    retainFailedProposalNotApplied: promiseOperation((...args) =>
+      effects.retainFailedProposalNotApplied(...args),
+    ),
+    retainCompositionNotApplied: promiseOperation((...args) =>
+      effects.retainCompositionNotApplied(...args),
+    ),
+    finishComposition: promiseOperation((...args) => effects.finishComposition(...args)),
+    blockComposition: promiseOperation((...args) => effects.blockComposition(...args)),
+    beginCleanup: promiseOperation((...args) => effects.beginCleanup(...args)),
+    markWorkerClosed: promiseOperation((...args) => effects.markWorkerClosed(...args)),
+    retryArtifactRetention: promiseOperation((...args) => effects.retryArtifactRetention(...args)),
+    finishArtifactRetention: promiseOperation((...args) =>
+      effects.finishArtifactRetention(...args),
+    ),
+    blockArtifactRetention: promiseOperation((...args) => effects.blockArtifactRetention(...args)),
+    retryCleanup: promiseOperation((...args) => effects.retryCleanup(...args)),
+    finishCleanup: promiseOperation((...args) => effects.finishCleanup(...args)),
+    blockCleanup: promiseOperation((...args) => effects.blockCleanup(...args)),
+    recordSteering: promiseOperation((...args) => effects.recordSteering(...args)),
+    cancelAttempt: promiseOperation((...args) => effects.cancelAttempt(...args)),
+    requestDelivery: promiseOperation((...args) => effects.requestDelivery(...args)),
+    deliveryAttempt: promiseOperation((...args) => effects.deliveryAttempt(...args)),
+    addResultArtifacts: promiseOperation((...args) => effects.addResultArtifacts(...args)),
+    markDelivered: promiseOperation((...args) => effects.markDelivered(...args)),
+    acknowledge: promiseOperation((...args) => effects.acknowledge(...args)),
+    disposition: promiseOperation((...args) => effects.disposition(...args)),
+    complete: promiseOperation((...args) => effects.complete(...args)),
+  };
+}
+
+function promiseOperation<Args extends readonly unknown[], Success>(
+  operation: (...args: Args) => StoreEffect<Success>,
+): (...args: Args) => Promise<Success> {
+  return (...args) => runStorePromise(operation(...args));
+}
+
+function runStorePromise<A>(operation: StoreEffect<A>): Promise<A> {
+  return Effect.runPromise(operation).catch((failure) => {
+    if (failure instanceof WorkstreamStoreOperationError) throw failure.cause;
+    throw failure;
+  });
 }
 
 function inspectReattachmentValue(
@@ -1297,15 +1439,9 @@ function inspectCurrentReattachment(
   value: JsonObject,
   resolvedPath: string,
 ): WorkstreamReattachmentInspection {
-  try {
-    const state = decodeState(value);
-    validateStoredPath(state, resolvedPath);
-    return { kind: "current", state: structuredClone(state) };
-  } catch (error) {
-    const retained = retainedTerminalInspection(value, resolvedPath);
-    if (retained) return retained;
-    throw error;
-  }
+  const state = decodeState(value);
+  validateStoredPath(state, resolvedPath);
+  return { kind: "current", state: structuredClone(state) };
 }
 
 function inspectHistoricalReattachment(
@@ -1392,13 +1528,6 @@ function retainResultTransition(draft: WorkstreamState, result: WorkResult): voi
   draft.results.push(result);
 }
 
-function runStorePromise<A, E>(operation: Effect.Effect<A, E>): Promise<A> {
-  return Effect.runPromise(operation).catch((failure) => {
-    if (failure instanceof WorkstreamStoreOperationError) throw failure.cause;
-    throw failure;
-  });
-}
-
 function currentDate(): Date {
   return DateTime.toDate(DateTime.nowUnsafe());
 }
@@ -1418,8 +1547,11 @@ function addAssignment(
     throw new Error(
       `Intent version ${input.intentVersion} is stale; current version is ${current.version}.`,
     );
-  if (input.artifactIntent === "disposable_experiment" || input.capability === "implement")
+  if (input.artifactIntent === "disposable_experiment" || input.capability === "implement") {
     requireAuthority(draft, input.authority);
+    if (input.authority.intentVersion !== input.intentVersion)
+      throw new Error("Assignment authority intent does not match the assignment intent.");
+  }
   if (input.capability === "review") requireSubject(draft, input.subject);
   const { now: suppliedNow, ...fields } = input;
   const assignment = {
@@ -1464,80 +1596,6 @@ function requireSubject(state: WorkstreamState, subject: ResultSubject): void {
   if (!Value.Check(ResultSubjectSchema, subject))
     throw new Error("Review requires an identified subject.");
   validateSubject(state, subject);
-}
-
-function assignmentResolved(state: WorkstreamState, assignment: WorkAssignment): boolean {
-  // Resolution closes this assignment's original scope, not the current intent.
-  // Every requested attempt is an independent contribution; no later success hides a failure.
-  const attempts = state.attempts.filter((attempt) => attempt.assignmentId === assignment.id);
-  if (attempts.length > 0) return attempts.every((attempt) => attemptResolved(state, attempt));
-  if (assignment.capability === "implement") return false;
-  const results = state.results.filter((result) => result.assignmentId === assignment.id);
-  return results.length > 0 && results.every((result) => !resultUnresolved(state, result.id));
-}
-
-function attemptResolved(state: WorkstreamState, attempt: WorkAttempt): boolean {
-  const result =
-    attempt.resultId === undefined
-      ? undefined
-      : state.results.find((candidate) => candidate.id === attempt.resultId);
-  if (result === undefined || resultUnresolved(state, result.id)) return false;
-  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
-  return (
-    result.validity === "typed" &&
-    result.report.status === "completed" &&
-    (assignment?.capability !== "implement" ||
-      attempt.composition?.state === "composed" ||
-      (result.report.kind === "implementation" && result.report.outcome === "no_change"))
-  );
-}
-
-function resultUnresolved(state: WorkstreamState, resultId: string): boolean {
-  const result = state.results.find((candidate) => candidate.id === resultId);
-  if (result?.validity !== "typed" || result.report.status !== "completed") return true;
-  return state.dispositions.some(
-    (disposition) => disposition.resultId === resultId && disposition.status !== "accepted",
-  );
-}
-
-function completionAccounting(state: WorkstreamState): CompletionAccounting[] {
-  const accounting: CompletionAccounting[] = [];
-  for (const assignment of state.assignments)
-    if (!assignmentResolved(state, assignment))
-      accounting.push({
-        kind: "unresolved_assignment",
-        assignmentId: assignment.id,
-        reason: "Unresolved assignment requires coordinator accounting.",
-      });
-  for (const attempt of state.attempts)
-    if (!attemptResolved(state, attempt))
-      accounting.push({
-        kind: "unresolved_attempt",
-        attemptId: attempt.id,
-        reason: "Unresolved attempt requires coordinator accounting.",
-      });
-  for (const result of state.results)
-    if (resultUnresolved(state, result.id))
-      accounting.push({
-        kind: "unresolved_result",
-        resultId: result.id,
-        reason: "Unresolved result requires coordinator accounting.",
-      });
-  for (const delivery of state.deliveries)
-    if (delivery.state === "pending")
-      accounting.push({
-        kind: "undelivered_result",
-        resultId: delivery.resultId,
-        reason: "Undelivered result requires coordinator accounting.",
-      });
-  return accounting;
-}
-
-function accountingTaskId(state: WorkstreamState, item: CompletionAccounting): string | undefined {
-  if (item.kind === "unresolved_assignment") return item.assignmentId;
-  if (item.kind === "unresolved_attempt")
-    return state.attempts.find((attempt) => attempt.id === item.attemptId)?.assignmentId;
-  return state.results.find((result) => result.id === item.resultId)?.assignmentId;
 }
 
 function sameValue<T>(left: T, right: T): boolean {

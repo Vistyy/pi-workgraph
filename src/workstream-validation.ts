@@ -1,11 +1,10 @@
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- The existing Promise store API requires direct host filesystem reads at this external I/O boundary.
-import { readFile } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Cross-reference path checks use the canonical host path implementation.
 import { relative, resolve, sep } from "node:path";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
   type AuthorityReference,
+  type CompletionAccounting,
   InvalidWorkstreamStateError,
   pathForWorkstream,
   type ResultSubject,
@@ -13,8 +12,6 @@ import {
   RetainedTerminalEnvelopeSchema,
   type SessionIdentity,
   UnsupportedWorkstreamStateError,
-  WORKSTREAM_FORMAT,
-  WORKSTREAM_STATE_VERSION,
   type WorkAssignment,
   type WorkAttempt,
   type WorkResult,
@@ -22,6 +19,12 @@ import {
   type WorkstreamState,
   WorkstreamStateSchema,
 } from "./workstream-state.js";
+import {
+  accountingIdentity,
+  accountingTaskId,
+  deriveCompletionAccounting,
+  hasActiveOrUncleanAttempt,
+} from "./workstream-transitions.js";
 
 type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
@@ -79,28 +82,6 @@ function schemaDiagnostic(value: JsonObject): string {
   if (!issue) return "Invalid workstream state.";
   const path = issue.instancePath || "/";
   return `Invalid workstream state at ${path.slice(0, 120)}: ${issue.message.slice(0, 120)}.`;
-}
-
-export function readState(path: string): Promise<WorkstreamState> {
-  return readSupportedStateValue(path).then((value) => {
-    const state = decodeState(value);
-    validateStoredPath(state, path);
-    return state;
-  });
-}
-
-export function readSupportedStateValue(path: string): Promise<JsonObject> {
-  return readStateValue(path).then((value) => {
-    const format = value.format;
-    const version = value.version;
-    if (format !== WORKSTREAM_FORMAT || version !== WORKSTREAM_STATE_VERSION)
-      throw new UnsupportedWorkstreamStateError(format, version);
-    return value;
-  });
-}
-
-export function readStateValue(path: string): Promise<JsonObject> {
-  return readFile(path, "utf8").then(parsePersistedObject);
 }
 
 export function retainedTerminalInspection(
@@ -182,6 +163,10 @@ export function validateState(state: WorkstreamState): void {
   validateAttempts(state, assignmentIds, resultIds);
   validateDeliveries(state, resultIds);
   validateCompletion(state, assignmentIds, resultIds);
+  if (state.lifecycle.state === "completed" && state.attempts.some(hasActiveOrUncleanAttempt))
+    throw new InvalidWorkstreamStateError(
+      "Completed workstream retains an active attempt or unclean owned resource.",
+    );
   if (state.lifecycle.state === "completed" && !state.completion)
     throw new InvalidWorkstreamStateError("Completed workstream has no completion record.");
   if (state.completion && state.lifecycle.state !== "completed")
@@ -217,8 +202,13 @@ function validateAssignments(state: WorkstreamState): Set<string> {
     if (
       assignment.artifactIntent === "disposable_experiment" ||
       assignment.capability === "implement"
-    )
+    ) {
       validateAuthority(state, assignment.authority);
+      if (assignment.authority.intentVersion !== assignment.intentVersion)
+        throw new InvalidWorkstreamStateError(
+          `Assignment ${assignment.id} authority belongs to another intent.`,
+        );
+    }
     if (assignment.capability === "review") validateSubject(state, assignment.subject);
   }
   return assignmentIds;
@@ -280,6 +270,7 @@ function validateAttempts(
   );
   for (const attempt of state.attempts) {
     validateAttemptPlacement(state, attempt);
+    validateAttemptFields(attempt);
     if (!assignmentIds.has(attempt.assignmentId))
       throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} references unknown assignment.`);
     if (attempt.resultId !== undefined && !resultIds.has(attempt.resultId))
@@ -295,6 +286,107 @@ function validateAttempts(
       throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} has an empty model selection.`);
     validateArtifactRetention(state, attempt);
   }
+}
+
+function validateAttemptFields(attempt: WorkAttempt): void {
+  validateAttemptResultPair(attempt);
+  validateAttemptIdentity(attempt);
+  if (attempt.state === "queued") {
+    validateUnlaunchedAttempt(attempt, "Queued");
+    return;
+  }
+  if (attempt.state === "cancelled" && attempt.placement === undefined) {
+    validateUnlaunchedAttempt(attempt, "Unlaunched cancelled");
+    return;
+  }
+  validateLaunchedAttempt(attempt);
+}
+
+function validateAttemptResultPair(attempt: WorkAttempt): void {
+  if ((attempt.resultId !== undefined) !== (attempt.effectiveModels !== undefined))
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} result and effective models must be recorded together.`,
+    );
+}
+
+function validateAttemptIdentity(attempt: WorkAttempt): void {
+  const placement = attempt.placement;
+  if (
+    attempt.worker !== undefined &&
+    (attempt.sessionFile === undefined ||
+      attempt.worker.sessionFile !== attempt.sessionFile ||
+      placement === undefined ||
+      resolve(attempt.worker.cwd) !== resolve(placement.path))
+  )
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} worker identity does not match its retained launch.`,
+    );
+  if (attempt.resource !== undefined && placement === undefined)
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} resource has no retained placement.`,
+    );
+  if (attempt.launchPane !== undefined && placement === undefined)
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} launch pane has no retained placement.`,
+    );
+}
+
+function validateUnlaunchedAttempt(attempt: WorkAttempt, label: string): void {
+  if (hasLaunchOrTerminalFields(attempt))
+    throw new InvalidWorkstreamStateError(
+      `${label} attempt ${attempt.id} contains live or terminal fields.`,
+    );
+}
+
+function hasLaunchOrTerminalFields(attempt: WorkAttempt): boolean {
+  return (
+    attempt.placement !== undefined ||
+    attempt.sessionFile !== undefined ||
+    attempt.submission !== undefined ||
+    attempt.launchPane !== undefined ||
+    attempt.resource !== undefined ||
+    attempt.worker !== undefined ||
+    attempt.resultId !== undefined ||
+    attempt.steering !== undefined ||
+    attempt.composition !== undefined ||
+    attempt.cleanup !== undefined ||
+    attempt.artifactRetention !== undefined
+  );
+}
+
+function validateLaunchedAttempt(attempt: WorkAttempt): void {
+  const hasResult = attempt.resultId !== undefined;
+  if (attempt.placement === undefined || attempt.submission === undefined)
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} state ${attempt.state} requires retained launch preparation.`,
+    );
+  if (attempt.state === "running") validateRunningAttempt(attempt);
+  if (attempt.state === "settled" && (attempt.sessionFile === undefined || !hasResult))
+    throw new InvalidWorkstreamStateError(
+      `Settled attempt ${attempt.id} lacks settlement evidence.`,
+    );
+  if (isActiveAttemptState(attempt.state) && hasResult)
+    throw new InvalidWorkstreamStateError(
+      `Active attempt ${attempt.id} contains terminal result evidence.`,
+    );
+  if (attempt.composition !== undefined && (attempt.state !== "settled" || !hasResult))
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} composition is outside a settled result.`,
+    );
+}
+
+function validateRunningAttempt(attempt: WorkAttempt): void {
+  if (
+    attempt.sessionFile === undefined ||
+    (attempt.submission !== "submitted" && attempt.submission !== "started")
+  )
+    throw new InvalidWorkstreamStateError(
+      `Running attempt ${attempt.id} has not retained a submitted session.`,
+    );
+}
+
+function isActiveAttemptState(state: WorkAttempt["state"]): boolean {
+  return state === "starting" || state === "running" || state === "cancel_requested";
 }
 
 function validateArtifactRetention(state: WorkstreamState, attempt: WorkAttempt): void {
@@ -408,30 +500,56 @@ function validateCompletion(
   resultIds: Set<string>,
 ): void {
   if (!state.completion) return;
+  for (const item of state.completion.accounting)
+    validateCompletionReference(state, item, assignmentIds, resultIds);
+
+  const expected = deriveCompletionAccounting(state);
+  const actualIdentities = state.completion.accounting.map(accountingIdentity);
+  const expectedIdentities = expected.map(accountingIdentity);
+  if (JSON.stringify(actualIdentities) !== JSON.stringify(expectedIdentities))
+    throw new InvalidWorkstreamStateError(
+      "Completion accounting does not exactly match derived unresolved records.",
+    );
+
+  const reasonByTask = new Map<string, string>();
   for (const item of state.completion.accounting) {
-    if (item.kind === "unresolved_assignment" && !assignmentIds.has(item.assignmentId))
+    const taskId = accountingTaskId(state, item);
+    if (taskId === undefined) continue;
+    const previous = reasonByTask.get(taskId);
+    if (previous !== undefined && previous !== item.reason)
       throw new InvalidWorkstreamStateError(
-        `Completion references unknown assignment ${item.assignmentId}.`,
+        `Completion accounting has conflicting reasons for task ${taskId}.`,
       );
-    if (
-      item.kind === "unresolved_attempt" &&
-      !state.attempts.some((attempt) => attempt.id === item.attemptId)
-    )
-      throw new InvalidWorkstreamStateError(
-        `Completion references unknown attempt ${item.attemptId}.`,
-      );
-    if (item.kind === "unresolved_result" && !resultIds.has(item.resultId))
-      throw new InvalidWorkstreamStateError(
-        `Completion references unknown result ${item.resultId}.`,
-      );
-    if (
-      item.kind === "undelivered_result" &&
-      !state.deliveries.some((delivery) => delivery.resultId === item.resultId)
-    )
-      throw new InvalidWorkstreamStateError(
-        `Completion references unknown delivery ${item.resultId}.`,
-      );
+    reasonByTask.set(taskId, item.reason);
   }
+}
+
+function validateCompletionReference(
+  state: WorkstreamState,
+  item: CompletionAccounting,
+  assignmentIds: Set<string>,
+  resultIds: Set<string>,
+): void {
+  if (item.kind === "unresolved_assignment" && !assignmentIds.has(item.assignmentId))
+    throw new InvalidWorkstreamStateError(
+      `Completion references unknown assignment ${item.assignmentId}.`,
+    );
+  if (
+    item.kind === "unresolved_attempt" &&
+    !state.attempts.some((attempt) => attempt.id === item.attemptId)
+  )
+    throw new InvalidWorkstreamStateError(
+      `Completion references unknown attempt ${item.attemptId}.`,
+    );
+  if (item.kind === "unresolved_result" && !resultIds.has(item.resultId))
+    throw new InvalidWorkstreamStateError(`Completion references unknown result ${item.resultId}.`);
+  if (
+    item.kind === "undelivered_result" &&
+    !state.deliveries.some((delivery) => delivery.resultId === item.resultId)
+  )
+    throw new InvalidWorkstreamStateError(
+      `Completion references unknown delivery ${item.resultId}.`,
+    );
 }
 
 export function validateArtifactsForAssignment(

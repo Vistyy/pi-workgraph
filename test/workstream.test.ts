@@ -1,19 +1,21 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixtures intentionally use real host storage at the node:test boundary.
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are host filesystem identities.
 import { join } from "node:path";
 import test from "node:test";
-import { DateTime } from "effect";
+import { DateTime, Effect } from "effect";
 import {
   type AuthorityReference,
   type HumanInputReceipt,
   InvalidWorkstreamStateError,
   type SessionIdentity,
   UnsupportedWorkstreamStateError,
+  type WorkstreamState,
   WorkstreamStore,
 } from "../src/workstream.js";
+import { deriveCompletionAccounting } from "../src/workstream-transitions.js";
 import { parsePersistedObject } from "../src/workstream-validation.js";
 import { researchReport } from "./helpers.js";
 
@@ -662,3 +664,286 @@ void test("workstream serializes receipt writes and rejects corrupt or foreign h
     await rm(parent, { recursive: true, force: true });
   }
 });
+
+void test("latest appended disposition governs successful evidence without curing invalid evidence", async () => {
+  const { parent, store } = await fixture();
+  try {
+    await store.assign({
+      id: "research",
+      capability: "research",
+      artifactIntent: "evidence_only",
+      objective: "Read the retained bytes.",
+      intentVersion: 0,
+      expectedEvidence: ["Retained bytes."],
+    });
+    await store.retainResult({
+      id: "result",
+      assignmentId: "research",
+      assignmentIntentVersion: 0,
+      validity: "typed",
+      report: researchReport("The bytes were retained."),
+    });
+    await store.disposition({
+      resultId: "result",
+      status: "rejected",
+      reason: "The first review found a gap.",
+    });
+    await store.disposition({
+      resultId: "result",
+      status: "accepted",
+      reason: "The latest review resolved that gap.",
+    });
+    const completed = await store.complete({
+      conclusion: "The latest judgment accepts the successful evidence.",
+      evidence: [{ label: "result", observation: "The completed report was accepted." }],
+      limitations: [],
+      reasons: [],
+    });
+    assert.deepEqual(completed.completion?.accounting, []);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+
+  const invalidFixture = await fixture();
+  try {
+    await invalidFixture.store.assign({
+      id: "research",
+      capability: "research",
+      artifactIntent: "evidence_only",
+      objective: "Read the retained bytes.",
+      intentVersion: 0,
+      expectedEvidence: ["Retained bytes."],
+    });
+    await invalidFixture.store.retainResult({
+      id: "result",
+      assignmentId: "research",
+      assignmentIntentVersion: 0,
+      validity: "invalid",
+      detail: "The report did not satisfy its schema.",
+    });
+    await invalidFixture.store.disposition({
+      resultId: "result",
+      status: "accepted",
+      reason: "The prose was useful but remains invalid evidence.",
+    });
+    await assert.rejects(
+      invalidFixture.store.complete({
+        conclusion: "Invalid evidence remains unresolved.",
+        evidence: [{ label: "result", observation: "The retained result is invalid." }],
+        limitations: ["No valid report was retained."],
+        reasons: [],
+      }),
+      /exactly one reason per unresolved semantic task/,
+    );
+  } finally {
+    await rm(invalidFixture.parent, { recursive: true, force: true });
+  }
+});
+
+void test("persisted authority, attempt, completion, and current terminal corruption are rejected", async () => {
+  const authorityFixture = await fixture();
+  try {
+    const { receipt, authority } = await recordedAuthority(authorityFixture.store);
+    await authorityFixture.store.assign({
+      id: "implementation",
+      capability: "implement",
+      artifactIntent: "maintained_change",
+      objective: "Apply the approved correction.",
+      intentVersion: authority.intentVersion,
+      authority,
+      acceptance: ["The correction is retained."],
+    });
+    await authorityFixture.store.reviseIntent({
+      authorityReceiptId: receipt.id,
+      statement: "A later approved correction.",
+      constraints: ["Retain the earlier assignment in history."],
+    });
+    const state = await authorityFixture.store.load();
+    const assignment = state.assignments[0];
+    assert.ok(assignment?.capability === "implement");
+    assignment.authority.intentVersion = 2;
+    await persistFixtureState(authorityFixture.store.path, state);
+    await assert.rejects(
+      WorkstreamStore.inspect(authorityFixture.store.path),
+      /authority belongs to another intent/,
+    );
+  } finally {
+    await rm(authorityFixture.parent, { recursive: true, force: true });
+  }
+
+  const attemptFixture = await fixture();
+  try {
+    await attemptFixture.store.enqueue(
+      {
+        id: "research",
+        capability: "research",
+        artifactIntent: "evidence_only",
+        objective: "Read the fixture.",
+        intentVersion: 0,
+        expectedEvidence: ["Fixture bytes."],
+      },
+      {
+        id: "attempt",
+        models: {
+          guide: { model: "fixture/research", thinking: "low" },
+          source: "policy",
+        },
+      },
+    );
+    const malformed = await attemptFixture.store.load();
+    const queued = malformed.attempts[0];
+    assert.ok(queued);
+    queued.sessionFile = "/tmp/impossible-session.jsonl";
+    await persistFixtureState(attemptFixture.store.path, malformed);
+    await assert.rejects(
+      WorkstreamStore.inspect(attemptFixture.store.path),
+      /Queued attempt attempt contains live or terminal fields/,
+    );
+  } finally {
+    await rm(attemptFixture.parent, { recursive: true, force: true });
+  }
+
+  const terminalFixture = await fixture();
+  try {
+    await terminalFixture.store.enqueue(
+      {
+        id: "research",
+        capability: "research",
+        artifactIntent: "evidence_only",
+        objective: "Read the fixture.",
+        intentVersion: 0,
+        expectedEvidence: ["Fixture bytes."],
+      },
+      {
+        id: "attempt",
+        models: {
+          guide: { model: "fixture/research", thinking: "low" },
+          source: "policy",
+        },
+      },
+    );
+    const terminal = await terminalFixture.store.load();
+    const completedAt = dateAt(10_000).toISOString();
+    terminal.lifecycle = { state: "completed", changedAt: completedAt, reason: "Malformed." };
+    terminal.completion = {
+      conclusion: "Malformed terminal state.",
+      evidence: [{ label: "fixture", observation: "A queued attempt remains." }],
+      limitations: ["The attempt remains live."],
+      accounting: deriveCompletionAccounting(terminal).map((item) => ({
+        ...item,
+        reason: "The queued assignment and attempt remain unresolved.",
+      })),
+      completedAt,
+    };
+    await persistFixtureState(terminalFixture.store.path, terminal);
+    await assert.rejects(
+      WorkstreamStore.inspect(terminalFixture.store.path),
+      /active attempt or unclean owned resource/,
+    );
+  } finally {
+    await rm(terminalFixture.parent, { recursive: true, force: true });
+  }
+
+  const accountingFixture = await fixture();
+  try {
+    await accountingFixture.store.assign({
+      id: "research",
+      capability: "research",
+      artifactIntent: "evidence_only",
+      objective: "Read the fixture.",
+      intentVersion: 0,
+      expectedEvidence: ["Fixture bytes."],
+    });
+    await accountingFixture.store.retainResult({
+      id: "result",
+      assignmentId: "research",
+      assignmentIntentVersion: 0,
+      validity: "typed",
+      report: researchReport("The fixture was read."),
+    });
+    const completed = await accountingFixture.store.complete({
+      conclusion: "The assignment is resolved.",
+      evidence: [{ label: "fixture", observation: "The report completed." }],
+      limitations: [],
+      reasons: [],
+    });
+    assert.ok(completed.completion);
+    completed.completion.accounting.push({
+      kind: "unresolved_assignment",
+      assignmentId: "research",
+      reason: "Invented unresolved accounting.",
+    });
+    await persistFixtureState(accountingFixture.store.path, completed);
+    await assert.rejects(
+      WorkstreamStore.inspect(accountingFixture.store.path),
+      /does not exactly match derived unresolved records/,
+    );
+
+    const currentText = await readFile(accountingFixture.store.path, "utf8");
+    await writeFile(
+      accountingFixture.store.path,
+      currentText.replace('"purpose": "Determine the safe fixture change.",', ""),
+    );
+    await assert.rejects(
+      WorkstreamStore.inspectForReattachment(accountingFixture.store.path),
+      InvalidWorkstreamStateError,
+    );
+
+    await writeFile(
+      accountingFixture.store.path,
+      currentText
+        .replace('"version": 4', '"version": 3')
+        .replace('"purpose": "Determine the safe fixture change.",', ""),
+    );
+    const historical = await WorkstreamStore.inspectForReattachment(accountingFixture.store.path);
+    assert.equal(historical.kind, "retained_terminal");
+  } finally {
+    await rm(accountingFixture.parent, { recursive: true, force: true });
+  }
+});
+
+void test("Effect store port fences both reads and renames and cleans unique 0600 temp state", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const initial = await Effect.runPromise(store.effects.load());
+    assert.equal(initial.revision, 0);
+
+    const aborted = new AbortController();
+    aborted.abort();
+    await assert.rejects(
+      Effect.runPromise(
+        store.effects.recordInputEvent({
+          ...coordinator,
+          source: "interactive",
+          text: "This interrupted write must not be retained.",
+        }),
+        { signal: aborted.signal },
+      ),
+    );
+    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+
+    let guardCalls = 0;
+    store.bindMutationGuard(() => {
+      guardCalls += 1;
+      if (guardCalls === 2) throw new Error("lease fence changed before rename");
+    });
+    await assert.rejects(
+      store.recordInputEvent({
+        ...coordinator,
+        source: "interactive",
+        text: "This fenced write must not be retained.",
+      }),
+      /lease fence changed before rename/,
+    );
+    assert.equal(guardCalls, 2);
+    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+    assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
+    assert.equal((await stat(store.path)).mode & 0o777, 0o600);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+function persistFixtureState(path: string, state: WorkstreamState): Promise<void> {
+  return writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
+}
