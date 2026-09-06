@@ -577,6 +577,29 @@ test("every independent attempt remains accounted for regardless of result arriv
   }
 });
 
+test("malformed state diagnostics identify a bounded field path without echoing payloads", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const original = await readFile(store.path, "utf8");
+    await writeFile(
+      store.path,
+      original.replace(
+        '"purpose": "Determine the safe fixture change."',
+        '"purpose": "credential=redacted-secret"',
+      ).replace('"revision": 0', '"revision": "invalid"'),
+    );
+    await assert.rejects(
+      WorkstreamStore.inspect(store.path),
+      (error: unknown) =>
+        error instanceof InvalidWorkstreamStateError &&
+        error.message.includes("/revision") &&
+        !error.message.includes("credential=redacted-secret"),
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("workstream serializes receipt writes and rejects corrupt or foreign history without rewriting it", async () => {
   const { parent, store } = await fixture();
   try {
