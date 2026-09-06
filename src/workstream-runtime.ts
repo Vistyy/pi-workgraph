@@ -37,6 +37,8 @@ import {
   effectiveModelObservations,
   hasNativeAgentSettled,
   hasNativeAgentStarted,
+  type NativeFailureCategory,
+  observeNativeFailure,
   readTerminalText,
   readWorkgraphReportResult,
 } from "./pi-process.js";
@@ -938,14 +940,21 @@ export class WorkstreamRuntime {
         const text = yield* this.runtimeSync("read terminal worker text", () =>
           readTerminalText(sessionFile, generation),
         );
-        yield* this.dependency("store", "retain untyped worker result", () =>
-          text === undefined || text === ""
-            ? this.store.retainResult({
-                ...base,
-                validity: "absent",
-                detail: "Pi settled without a current-attempt report.",
-              })
-            : this.store.retainResult({ ...base, validity: "untyped", text }),
+        if (text !== undefined && text !== "") {
+          yield* this.dependency("store", "retain untyped worker result", () =>
+            this.store.retainResult({ ...base, validity: "untyped", text }),
+          );
+          return;
+        }
+        const nativeFailure = yield* this.runtimeSync("observe native worker failure", () =>
+          observeNativeFailure(sessionFile, generation),
+        );
+        yield* this.dependency("store", "retain absent worker result", () =>
+          this.store.retainResult({
+            ...base,
+            validity: "absent",
+            detail: absentResultDetail(nativeFailure),
+          }),
         );
       }.bind(this),
     );
@@ -2140,6 +2149,19 @@ function within(root: string, path: string): boolean {
   const part = relative(resolve(root), resolve(path));
   return part !== "" && part !== ".." && !part.startsWith(`..${sep}`) && !part.startsWith(sep);
 }
+function absentResultDetail(failure: NativeFailureCategory | undefined): string {
+  switch (failure) {
+    case undefined:
+      return "Pi settled without a current-attempt report.";
+    case "provider-rate-limit":
+      return "Pi settled without a current-attempt report after a provider rate limit.";
+    case "native-abort":
+      return "Pi settled without a current-attempt report after the native turn was aborted.";
+    case "native-error":
+      return "Pi settled without a current-attempt report after a native provider error.";
+  }
+}
+
 function modeFor(assignment: WorkAssignment) {
   return assignment.capability === "implement"
     ? "implementation"

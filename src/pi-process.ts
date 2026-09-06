@@ -17,6 +17,8 @@ const EffectiveModelSchema = Type.Intersect([
   Type.Object({ model: Type.String({ minLength: 1 }), thinking: Type.String({ minLength: 1 }) }),
 ]);
 type EffectiveModel = Static<typeof EffectiveModelSchema>;
+export type NativeFailureCategory = "provider-rate-limit" | "native-abort" | "native-error";
+const PROVIDER_RATE_LIMIT_PATTERN = /(?:\b429\b|rate[\s_-]*limit|too many requests)/i;
 
 // oxlint-disable-next-line effecttsgo/async-function -- Public Pi host callers require Promise interoperability.
 export async function forkConversationSession(request: {
@@ -223,6 +225,26 @@ export function effectiveModelObservations(sessionFile: string, generation: Gene
       return [{ model: data.model, thinking: data.thinking, source: "selection" }];
     },
   );
+}
+
+export function observeNativeFailure(
+  sessionFile: string,
+  generation: Generation,
+): NativeFailureCategory | undefined {
+  try {
+    for (const message of attemptMessages(sessionFile, generation).reverse()) {
+      if (message.role !== "assistant" || message.provider === "workgraph") continue;
+      if (message.stopReason === "aborted") return "native-abort";
+      if (message.stopReason !== "error") return undefined;
+      return message.errorMessage !== undefined &&
+        PROVIDER_RATE_LIMIT_PATTERN.test(message.errorMessage)
+        ? "provider-rate-limit"
+        : "native-error";
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function readTerminalText(sessionFile: string, generation: Generation): string | undefined {

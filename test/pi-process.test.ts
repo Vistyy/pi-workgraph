@@ -11,6 +11,7 @@ import {
   effectiveModelObservations,
   hasNativeAgentSettled,
   hasNativeAgentStarted,
+  observeNativeFailure,
   readTerminalText,
   readWorkgraphReportResult,
 } from "../src/pi-process.js";
@@ -87,6 +88,103 @@ await test("fresh worker context, explicit continuation, native generation marke
     assert.equal(hasNativeAgentSettled(continuation, next.runId, next.nodeId), false);
     assert.equal(readWorkgraphReportResult(continuation, next).invalid, false);
     assert.equal(readWorkgraphReportResult(continuation, next).report, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns and awaits this Promise callback.
+await test("native failure observation is current-generation, latest-message, and category only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "workgraph-native-failure-"));
+  const first = { runId: "native-fixture", nodeId: "first" };
+  try {
+    const file = await createWorkerSession({
+      ...first,
+      targetCwd: root,
+      sessionDir: join(root, "sessions"),
+      objective: "Observe native metadata",
+      mode: "research",
+    });
+    const session = SessionManager.open(file);
+    session.appendMessage({
+      role: "assistant",
+      content: [],
+      api: "openai-responses",
+      provider: "fixture-provider",
+      model: "fixture",
+      usage,
+      stopReason: "error",
+      errorMessage:
+        "HTTP 429 Too Many Requests at https://provider.example/private with Bearer RAW_SECRET",
+      timestamp: 1,
+    });
+    assert.equal(observeNativeFailure(file, first), "provider-rate-limit");
+
+    session.appendMessage({
+      role: "assistant",
+      content: [],
+      api: "openai-responses",
+      provider: "fixture-provider",
+      model: "fixture",
+      usage,
+      stopReason: "stop",
+      timestamp: 2,
+    });
+    assert.equal(observeNativeFailure(file, first), undefined);
+
+    session.appendMessage({
+      role: "assistant",
+      content: [],
+      api: "openai-responses",
+      provider: "fixture-provider",
+      model: "fixture",
+      usage,
+      stopReason: "error",
+      errorMessage: "Connection exposed credential RAW_SECRET and arbitrary provider body",
+      timestamp: 3,
+    });
+    const generic = observeNativeFailure(file, first);
+    assert.equal(generic, "native-error");
+    assert.equal(JSON.stringify(generic).includes("RAW_SECRET"), false);
+
+    session.appendMessage({
+      role: "assistant",
+      content: [],
+      api: "openai-responses",
+      provider: "workgraph",
+      model: "synthetic",
+      usage,
+      stopReason: "aborted",
+      errorMessage: "RAW_SYNTHETIC_SECRET",
+      timestamp: 4,
+    });
+    assert.equal(observeNativeFailure(file, first), "native-error");
+
+    const next = { ...first, nodeId: "second" };
+    const continuation = await createWorkerSession({
+      ...next,
+      targetCwd: root,
+      sessionDir: join(root, "sessions"),
+      objective: "Observe only this generation",
+      mode: "research",
+      continuationSessionFile: file,
+    });
+    assert.equal(observeNativeFailure(continuation, next), undefined);
+    const continued = SessionManager.open(continuation);
+    continued.appendMessage({
+      role: "assistant",
+      content: [],
+      api: "openai-responses",
+      provider: "fixture-provider",
+      model: "fixture",
+      usage,
+      stopReason: "aborted",
+      errorMessage: "Request aborted at https://private.example/?token=RAW_SECRET",
+      timestamp: 5,
+    });
+    const aborted = observeNativeFailure(continuation, next);
+    assert.equal(aborted, "native-abort");
+    assert.equal(JSON.stringify(aborted).includes("RAW_SECRET"), false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
