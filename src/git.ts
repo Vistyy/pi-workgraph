@@ -38,6 +38,13 @@ interface WorktreeRecord {
   branch?: string;
 }
 
+interface WorktreeIdentity {
+  worktreeRoot: string;
+  placement: WorktreePlacement;
+}
+
+type RefInspection = { state: "absent" } | { state: "present"; head: string };
+
 class GitOperationError extends Data.TaggedError("GitOperationError")<{
   readonly message: string;
 }> {}
@@ -101,35 +108,24 @@ export class GitRepository {
   retainCommit(runId: string, attemptId: string, commit: string): Promise<string> {
     const root = this.root;
     return runGitPromise(
-      // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: This Git ref operation sequences identity, race, and postcondition fencing at one safety boundary.
       Effect.gen(function* () {
-        if (!validIdentity(runId) || !validIdentity(attemptId)) {
-          return yield* fail("Invalid retained commit identity.");
-        }
+        const ref = yield* retainedRef(runId, attemptId);
         const resolved = yield* resolveRevision(root, commit);
-        const ref = `refs/workgraph-retained/${runId}/${attemptId}`;
-        const existing = yield* gitProcess(root, ["rev-parse", "--verify", "--quiet", ref]);
-        if (existing.exitCode === 0) {
+        const existing = yield* inspectRef(
+          root,
+          ref,
+          () => `Could not inspect retained ref ${ref}.`,
+        );
+        if (existing.state === "present") {
           const current = yield* gitText(root, ["rev-parse", ref]);
           if (current !== resolved) {
             return yield* fail(`Retained ref ${ref} points to a different commit.`);
           }
           return ref;
         }
-        if (existing.exitCode !== 1) {
-          return yield* fail(`Could not inspect retained ref ${ref}.`);
-        }
 
         const update = yield* gitProcess(root, ["update-ref", ref, resolved, ""]);
-        if (update.exitCode !== 0) {
-          const raced = yield* gitProcess(root, ["rev-parse", "--verify", "--quiet", ref]);
-          if (raced.exitCode !== 0 || raced.stdout !== resolved) {
-            return yield* fail(`Could not retain commit ${resolved}: ${diagnostic(update)}`);
-          }
-        }
-        if ((yield* gitText(root, ["rev-parse", ref])) !== resolved) {
-          return yield* fail(`Retained ref ${ref} did not reach ${resolved}.`);
-        }
+        yield* verifyRetainedRef(root, ref, resolved, update);
         return ref;
       }),
     );
@@ -142,93 +138,23 @@ export class GitRepository {
   createWorktree(runId: string, nodeId: string, baseCommit: string): Promise<WorktreePlacement> {
     const root = this.root;
     return runGitPromise(
-      // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: This Git worktree operation must keep identity, branch, path, and creation checks ordered.
       Effect.gen(function* () {
-        if (!validIdentity(runId) || !validIdentity(nodeId)) {
-          return yield* fail("Invalid worktree identity.");
-        }
+        const identity = yield* worktreeIdentity(root, runId, nodeId, baseCommit);
         const resolvedBase = yield* resolveRevision(root, baseCommit);
         if (resolvedBase !== baseCommit) {
           return yield* fail("Worktree base must be an exact commit id.");
         }
-        const worktreeRoot = join(dirname(root), ".pi-workgraph-worktrees", basename(root), runId);
-        const path = join(worktreeRoot, nodeId);
-        const branch = `pi-workgraph/${runId}/${nodeId}`;
-        yield* filesystemPromise(() => mkdir(worktreeRoot, { recursive: true }));
+        yield* filesystemPromise(() => mkdir(identity.worktreeRoot, { recursive: true }));
 
-        const worktrees = parseWorktreeList(
-          yield* gitText(root, ["worktree", "list", "--porcelain"], true),
-        );
-        const registered = worktrees.find(
-          (worktree) => worktree.branch === branch || resolve(worktree.path) === resolve(path),
-        );
+        const records = yield* worktreeRecords(root);
+        const registered = yield* registeredPlacement(records, identity, nodeId);
         if (registered !== undefined) {
-          if (registered.branch !== branch || resolve(registered.path) !== resolve(path)) {
-            return yield* fail(
-              `Worktree identity collision for ${nodeId}: ${registered.path} on ${registered.branch ?? "detached HEAD"}.`,
-            );
-          }
-          const existingHead = yield* gitText(path, ["rev-parse", "HEAD"]);
-          const existingStatus = yield* gitText(
-            path,
-            ["status", "--porcelain", "--untracked-files=all"],
-            true,
-          );
-          const fencedHead = yield* gitText(path, ["rev-parse", "HEAD"]);
-          if (
-            existingHead === baseCommit &&
-            fencedHead === existingHead &&
-            existingStatus.length === 0
-          ) {
-            return { path, branch, baseCommit };
-          }
-          return yield* fail(
-            `Existing worktree ${path} contains uncertain state at ${fencedHead}; inspect it before retrying.`,
-          );
+          yield* verifyExistingPlacement(identity);
+          return identity.placement;
         }
 
-        const branchRef = `refs/heads/${branch}`;
-        const branchExists = yield* gitProcess(root, [
-          "rev-parse",
-          "--verify",
-          "--quiet",
-          branchRef,
-        ]);
-        if (branchExists.exitCode === 0) {
-          const existingHead = yield* gitText(root, ["rev-parse", branchRef]);
-          if (existingHead !== baseCommit) {
-            return yield* fail(
-              `Existing worker branch ${branch} contains uncertain state at ${existingHead}; inspect it before retrying.`,
-            );
-          }
-        } else if (branchExists.exitCode !== 1) {
-          return yield* fail(
-            `Could not inspect worker branch ${branch}: ${diagnostic(branchExists)}`,
-          );
-        }
-
-        if (yield* pathExists(path)) {
-          return yield* fail(
-            `Unregistered worktree path ${path} exists; inspect it before retrying.`,
-          );
-        }
-        if (branchExists.exitCode === 0) {
-          const fencedBranchHead = yield* gitText(root, ["rev-parse", branchRef]);
-          if (fencedBranchHead !== baseCommit) {
-            return yield* fail(
-              `Existing worker branch ${branch} contains uncertain state at ${fencedBranchHead}; inspect it before retrying.`,
-            );
-          }
-        }
-        const args =
-          branchExists.exitCode === 0
-            ? ["worktree", "add", path, branch]
-            : ["worktree", "add", "-b", branch, path, baseCommit];
-        const result = yield* gitProcess(root, args, 60_000);
-        if (result.exitCode !== 0) {
-          return yield* fail(`Could not create worktree ${nodeId}: ${diagnostic(result)}`);
-        }
-        return { path, branch, baseCommit };
+        yield* createUnregisteredWorktree(root, identity, nodeId);
+        return identity.placement;
       }),
     );
   }
@@ -464,92 +390,17 @@ export class GitRepository {
   ): Promise<WorktreeCleanupResult> {
     const root = this.root;
     return runGitPromise(
-      // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Cleanup is a deliberately ordered Git identity and dirty-resource refusal boundary.
       Effect.gen(function* () {
-        const records = parseWorktreeList(
-          yield* gitText(root, ["worktree", "list", "--porcelain"], true),
-        );
-        const registered = records.find(
-          (worktree) => resolve(worktree.path) === resolve(placement.path),
-        );
-        const branchAtAnotherPath = records.find(
-          (worktree) =>
-            worktree.branch === placement.branch &&
-            resolve(worktree.path) !== resolve(placement.path),
-        );
-        if (branchAtAnotherPath !== undefined) {
-          return yield* fail(
-            `Refusing cleanup: branch ${placement.branch} is registered at ${branchAtAnotherPath.path}, not ${placement.path}.`,
-          );
-        }
+        const registered = yield* cleanupRegistration(yield* worktreeRecords(root), placement);
         const branchRef = `refs/heads/${placement.branch}`;
-        const branchExists = yield* gitProcess(root, [
-          "rev-parse",
-          "--verify",
-          "--quiet",
+        const branch = yield* inspectRef(
+          root,
           branchRef,
-        ]);
-        if (registered !== undefined) {
-          if (registered.branch !== placement.branch) {
-            return yield* fail(
-              `Refusing cleanup: ${placement.path} is registered on ${registered.branch ?? "detached HEAD"}, not ${placement.branch}.`,
-            );
-          }
-          const head = yield* gitText(placement.path, ["rev-parse", "HEAD"]);
-          const status = yield* gitText(
-            placement.path,
-            ["status", "--porcelain", "--untracked-files=all"],
-            true,
-          );
-          const fencedHead = yield* gitText(placement.path, ["rev-parse", "HEAD"]);
-          if (head !== expectedHead || fencedHead !== expectedHead) {
-            return yield* fail(
-              `Refusing cleanup: ${placement.path} HEAD is ${fencedHead}, expected ${expectedHead}.`,
-            );
-          }
-          if (status.length > 0) {
-            return yield* fail(`Refusing cleanup of dirty worktree ${placement.path}: ${status}`);
-          }
-          const result = yield* gitProcess(root, ["worktree", "remove", placement.path], 60_000);
-          if (result.exitCode !== 0) {
-            return yield* fail(
-              `Could not remove worktree ${placement.path}: ${diagnostic(result)}`,
-            );
-          }
-        }
-        if (branchExists.exitCode === 0) {
-          const branchHead = yield* gitText(root, ["rev-parse", branchRef]);
-          if (branchHead !== expectedHead) {
-            return yield* fail(
-              `Refusing cleanup: branch ${placement.branch} points to ${branchHead}, expected ${expectedHead}.`,
-            );
-          }
-          const branchResult = yield* gitProcess(root, [
-            "update-ref",
-            "-d",
-            branchRef,
-            expectedHead,
-          ]);
-          if (branchResult.exitCode !== 0) {
-            return yield* fail(
-              `Could not remove worker branch ${placement.branch}: ${diagnostic(branchResult)}`,
-            );
-          }
-        } else if (branchExists.exitCode !== 1) {
-          return yield* fail(
-            `Could not inspect worker branch ${placement.branch}: ${diagnostic(branchExists)}`,
-          );
-        }
-        const remaining = parseWorktreeList(
-          yield* gitText(root, ["worktree", "list", "--porcelain"], true),
-        ).find(
-          (worktree) =>
-            resolve(worktree.path) === resolve(placement.path) ||
-            worktree.branch === placement.branch,
+          (result) => `Could not inspect worker branch ${placement.branch}: ${diagnostic(result)}`,
         );
-        if (remaining !== undefined) {
-          return yield* fail(`Cleanup postcondition failed for ${placement.path}.`);
-        }
+        yield* removeRegisteredWorktree(root, placement, expectedHead, registered);
+        yield* removeWorkerBranch(root, placement.branch, branchRef, expectedHead, branch);
+        yield* requirePlacementAbsent(root, placement);
         return {
           state: "completed" as const,
           path: placement.path,
@@ -565,6 +416,254 @@ export class GitRepository {
 /** The single outward conversion boundary preserving GitRepository's Promise API. */
 function runGitPromise<A>(operation: GitEffect<A>): Promise<A> {
   return Effect.runPromise(operation);
+}
+
+function retainedRef(runId: string, attemptId: string): GitEffect<string> {
+  if (!validIdentity(runId) || !validIdentity(attemptId)) {
+    return fail("Invalid retained commit identity.");
+  }
+  return Effect.succeed(`refs/workgraph-retained/${runId}/${attemptId}`);
+}
+
+function inspectRef(
+  root: string,
+  ref: string,
+  inspectionFailure: (result: ProcessResult) => string,
+): GitEffect<RefInspection> {
+  return Effect.gen(function* () {
+    const result = yield* gitProcess(root, ["rev-parse", "--verify", "--quiet", ref]);
+    if (result.exitCode === 0) {
+      return { state: "present" as const, head: result.stdout };
+    }
+    if (result.exitCode === 1) return { state: "absent" as const };
+    return yield* fail(inspectionFailure(result));
+  });
+}
+
+function verifyRetainedRef(
+  root: string,
+  ref: string,
+  resolved: string,
+  update: ProcessResult,
+): GitEffect<void> {
+  return Effect.gen(function* () {
+    if (update.exitCode !== 0) {
+      const raced = yield* inspectRef(
+        root,
+        ref,
+        () => `Could not retain commit ${resolved}: ${diagnostic(update)}`,
+      );
+      if (raced.state === "absent" || raced.head !== resolved) {
+        return yield* fail(`Could not retain commit ${resolved}: ${diagnostic(update)}`);
+      }
+      return;
+    }
+    const current = yield* gitText(root, ["rev-parse", ref]);
+    if (current !== resolved) {
+      return yield* fail(`Retained ref ${ref} did not reach ${resolved}.`);
+    }
+  });
+}
+
+function worktreeIdentity(
+  root: string,
+  runId: string,
+  nodeId: string,
+  baseCommit: string,
+): GitEffect<WorktreeIdentity> {
+  if (!validIdentity(runId) || !validIdentity(nodeId)) {
+    return fail("Invalid worktree identity.");
+  }
+  const worktreeRoot = join(dirname(root), ".pi-workgraph-worktrees", basename(root), runId);
+  return Effect.succeed({
+    worktreeRoot,
+    placement: {
+      path: join(worktreeRoot, nodeId),
+      branch: `pi-workgraph/${runId}/${nodeId}`,
+      baseCommit,
+    },
+  });
+}
+
+function worktreeRecords(root: string): GitEffect<WorktreeRecord[]> {
+  return Effect.map(gitText(root, ["worktree", "list", "--porcelain"], true), parseWorktreeList);
+}
+
+function registeredPlacement(
+  records: WorktreeRecord[],
+  identity: WorktreeIdentity,
+  nodeId: string,
+): GitEffect<WorktreeRecord | undefined> {
+  const { branch, path } = identity.placement;
+  const registered = records.find(
+    (worktree) => worktree.branch === branch || resolve(worktree.path) === resolve(path),
+  );
+  if (
+    registered !== undefined &&
+    (registered.branch !== branch || resolve(registered.path) !== resolve(path))
+  ) {
+    return fail(
+      `Worktree identity collision for ${nodeId}: ${registered.path} on ${registered.branch ?? "detached HEAD"}.`,
+    );
+  }
+  return Effect.succeed(registered);
+}
+
+function verifyExistingPlacement(identity: WorktreeIdentity): GitEffect<void> {
+  const { baseCommit, path } = identity.placement;
+  return Effect.gen(function* () {
+    const existingHead = yield* gitText(path, ["rev-parse", "HEAD"]);
+    const existingStatus = yield* gitText(
+      path,
+      ["status", "--porcelain", "--untracked-files=all"],
+      true,
+    );
+    const fencedHead = yield* gitText(path, ["rev-parse", "HEAD"]);
+    if (existingHead !== baseCommit || fencedHead !== existingHead || existingStatus.length > 0) {
+      return yield* fail(
+        `Existing worktree ${path} contains uncertain state at ${fencedHead}; inspect it before retrying.`,
+      );
+    }
+  });
+}
+
+function inspectWorkerBranch(
+  root: string,
+  branchRef: string,
+  branch: string,
+  baseCommit: string,
+): GitEffect<RefInspection> {
+  return Effect.gen(function* () {
+    const inspection = yield* inspectRef(
+      root,
+      branchRef,
+      (result) => `Could not inspect worker branch ${branch}: ${diagnostic(result)}`,
+    );
+    if (inspection.state === "absent") return inspection;
+    const current = yield* gitText(root, ["rev-parse", branchRef]);
+    if (current !== baseCommit) {
+      return yield* fail(
+        `Existing worker branch ${branch} contains uncertain state at ${current}; inspect it before retrying.`,
+      );
+    }
+    return { state: "present", head: current };
+  });
+}
+
+function createUnregisteredWorktree(
+  root: string,
+  identity: WorktreeIdentity,
+  nodeId: string,
+): GitEffect<void> {
+  const { baseCommit, branch, path } = identity.placement;
+  const branchRef = `refs/heads/${branch}`;
+  return Effect.gen(function* () {
+    const branchInspection = yield* inspectWorkerBranch(root, branchRef, branch, baseCommit);
+    if (yield* pathExists(path)) {
+      return yield* fail(`Unregistered worktree path ${path} exists; inspect it before retrying.`);
+    }
+    if (branchInspection.state === "present") {
+      const fencedHead = yield* gitText(root, ["rev-parse", branchRef]);
+      if (fencedHead !== baseCommit) {
+        return yield* fail(
+          `Existing worker branch ${branch} contains uncertain state at ${fencedHead}; inspect it before retrying.`,
+        );
+      }
+    }
+    const args =
+      branchInspection.state === "present"
+        ? ["worktree", "add", path, branch]
+        : ["worktree", "add", "-b", branch, path, baseCommit];
+    const result = yield* gitProcess(root, args, 60_000);
+    if (result.exitCode !== 0) {
+      return yield* fail(`Could not create worktree ${nodeId}: ${diagnostic(result)}`);
+    }
+  });
+}
+
+function cleanupRegistration(
+  records: WorktreeRecord[],
+  placement: WorktreePlacement,
+): GitEffect<WorktreeRecord | undefined> {
+  const registered = records.find((worktree) => resolve(worktree.path) === resolve(placement.path));
+  const branchAtAnotherPath = records.find(
+    (worktree) =>
+      worktree.branch === placement.branch && resolve(worktree.path) !== resolve(placement.path),
+  );
+  return branchAtAnotherPath === undefined
+    ? Effect.succeed(registered)
+    : fail(
+        `Refusing cleanup: branch ${placement.branch} is registered at ${branchAtAnotherPath.path}, not ${placement.path}.`,
+      );
+}
+
+function removeRegisteredWorktree(
+  root: string,
+  placement: WorktreePlacement,
+  expectedHead: string,
+  registered: WorktreeRecord | undefined,
+): GitEffect<void> {
+  if (registered === undefined) return Effect.void;
+  return Effect.gen(function* () {
+    if (registered.branch !== placement.branch) {
+      return yield* fail(
+        `Refusing cleanup: ${placement.path} is registered on ${registered.branch ?? "detached HEAD"}, not ${placement.branch}.`,
+      );
+    }
+    const head = yield* gitText(placement.path, ["rev-parse", "HEAD"]);
+    const status = yield* gitText(
+      placement.path,
+      ["status", "--porcelain", "--untracked-files=all"],
+      true,
+    );
+    const fencedHead = yield* gitText(placement.path, ["rev-parse", "HEAD"]);
+    if (head !== expectedHead || fencedHead !== expectedHead) {
+      return yield* fail(
+        `Refusing cleanup: ${placement.path} HEAD is ${fencedHead}, expected ${expectedHead}.`,
+      );
+    }
+    if (status.length > 0) {
+      return yield* fail(`Refusing cleanup of dirty worktree ${placement.path}: ${status}`);
+    }
+    const result = yield* gitProcess(root, ["worktree", "remove", placement.path], 60_000);
+    if (result.exitCode !== 0) {
+      return yield* fail(`Could not remove worktree ${placement.path}: ${diagnostic(result)}`);
+    }
+  });
+}
+
+function removeWorkerBranch(
+  root: string,
+  branch: string,
+  branchRef: string,
+  expectedHead: string,
+  inspection: RefInspection,
+): GitEffect<void> {
+  if (inspection.state === "absent") return Effect.void;
+  return Effect.gen(function* () {
+    const branchHead = yield* gitText(root, ["rev-parse", branchRef]);
+    if (branchHead !== expectedHead) {
+      return yield* fail(
+        `Refusing cleanup: branch ${branch} points to ${branchHead}, expected ${expectedHead}.`,
+      );
+    }
+    const result = yield* gitProcess(root, ["update-ref", "-d", branchRef, expectedHead]);
+    if (result.exitCode !== 0) {
+      return yield* fail(`Could not remove worker branch ${branch}: ${diagnostic(result)}`);
+    }
+  });
+}
+
+function requirePlacementAbsent(root: string, placement: WorktreePlacement): GitEffect<void> {
+  return Effect.flatMap(worktreeRecords(root), (records) => {
+    const remaining = records.find(
+      (worktree) =>
+        resolve(worktree.path) === resolve(placement.path) || worktree.branch === placement.branch,
+    );
+    return remaining === undefined
+      ? Effect.void
+      : fail(`Cleanup postcondition failed for ${placement.path}.`);
+  });
 }
 
 function resolveRevision(root: string, revision: string): GitEffect<string> {
