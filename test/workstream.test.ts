@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are host filesystem identities.
 import { join } from "node:path";
 import test from "node:test";
-import { DateTime, Effect } from "effect";
+import { DateTime, Deferred, Effect, FileSystem, Path, PlatformError } from "effect";
+import { liveLayer } from "../src/node-platform.js";
 import {
   type AuthorityReference,
   type HumanInputReceipt,
@@ -905,18 +906,21 @@ void test("persisted authority, attempt, completion, and current terminal corrup
 void test("Effect store port fences both reads and renames and cleans unique 0600 temp state", async () => {
   const { parent, store } = await fixture();
   try {
-    const initial = await Effect.runPromise(store.effects.load());
+    const initial = await runLiveStoreEffect(store.effects.load());
     assert.equal(initial.revision, 0);
 
     const aborted = new AbortController();
     aborted.abort();
     await assert.rejects(
       Effect.runPromise(
-        store.effects.recordInputEvent({
-          ...coordinator,
-          source: "interactive",
-          text: "This interrupted write must not be retained.",
-        }),
+        Effect.provide(
+          store.effects.recordInputEvent({
+            ...coordinator,
+            source: "interactive",
+            text: "This interrupted write must not be retained.",
+          }),
+          liveLayer,
+        ),
         { signal: aborted.signal },
       ),
     );
@@ -943,6 +947,205 @@ void test("Effect store port fences both reads and renames and cleans unique 060
     await rm(parent, { recursive: true, force: true });
   }
 });
+
+void test("interruption during temporary preparation waits for native release and leaves no delayed file", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const fileSystem = await liveFileSystem();
+    const writeGate = Deferred.makeUnsafe<void>();
+    const writeObserved = Deferred.makeUnsafe<string>();
+    let observedTemporaryPath: string | undefined;
+    let handleReleased = false;
+    const delayedFileSystem: FileSystem.FileSystem = {
+      ...fileSystem,
+      open: (path, options) =>
+        Effect.gen(function* () {
+          yield* Effect.addFinalizer(() =>
+            Effect.sync(() => {
+              handleReleased = true;
+            }),
+          );
+          const file = yield* fileSystem.open(path, options);
+          if (options?.flag !== "wx") return file;
+          return {
+            [FileSystem.FileTypeId]: FileSystem.FileTypeId,
+            get stat() {
+              return file.stat;
+            },
+            seek: (offset, from) => file.seek(offset, from),
+            get sync() {
+              return file.sync;
+            },
+            read: (buffer) => file.read(buffer),
+            readAlloc: (size) => file.readAlloc(size),
+            truncate: (length) => file.truncate(length),
+            write: (buffer) => file.write(buffer),
+            writeAll: (buffer) => {
+              observedTemporaryPath = path;
+              return Deferred.succeed(writeObserved, path).pipe(
+                Effect.andThen(Deferred.await(writeGate)),
+                Effect.andThen(file.writeAll(buffer)),
+              );
+            },
+          };
+        }),
+    };
+    const abort = new AbortController();
+    let settled = false;
+    const pending = runStoreEffect(
+      store.effects.recordInputEvent({
+        ...coordinator,
+        source: "interactive",
+        text: "This delayed write must be interrupted before publication.",
+      }),
+      delayedFileSystem,
+      abort.signal,
+    ).finally(() => {
+      settled = true;
+    });
+
+    assert.equal(await Effect.runPromise(Deferred.await(writeObserved)), observedTemporaryPath);
+    abort.abort();
+    await Effect.runPromise(Effect.sleep("20 millis"));
+    assert.equal(settled, false);
+    await Effect.runPromise(Deferred.succeed(writeGate, undefined));
+    await assert.rejects(pending);
+    await Effect.runPromise(Effect.sleep("20 millis"));
+
+    assert.equal(handleReleased, true);
+    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+    assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("each execution uses a unique temporary identity and preserves unowned collisions", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const fileSystem = await liveFileSystem();
+    const collisionPaths: string[] = [];
+    const collisionFileSystem: FileSystem.FileSystem = {
+      ...fileSystem,
+      open: (path, options) => {
+        if (options?.flag !== "wx") return fileSystem.open(path, options);
+        collisionPaths.push(path);
+        return fileSystem
+          .writeFileString(path, "unowned collision bytes", { mode: 0o600 })
+          .pipe(Effect.andThen(fileSystem.open(path, options)));
+      },
+    };
+    const operation = store.effects.recordInputEvent({
+      ...coordinator,
+      source: "interactive",
+      text: "This collision must not be retained.",
+    });
+
+    for (let execution = 0; execution < 2; execution += 1)
+      await assert.rejects(
+        runStoreEffect(operation, collisionFileSystem),
+        /exclusively acquire temporary workstream state/,
+      );
+    assert.equal(collisionPaths.length, 2);
+    assert.equal(new Set(collisionPaths).size, 2);
+    for (const collisionPath of collisionPaths)
+      assert.equal(await readFile(collisionPath, "utf8"), "unowned collision bytes");
+    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("temporary cleanup failure is observable without replacing the original state", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const fileSystem = await liveFileSystem();
+    const cleanupFailure = new Error("injected owned temporary cleanup failure");
+    const failingCleanupFileSystem: FileSystem.FileSystem = {
+      ...fileSystem,
+      remove: (path, options) =>
+        path.endsWith(".tmp")
+          ? Effect.fail(
+              PlatformError.systemError({
+                _tag: "PermissionDenied",
+                module: "FileSystem",
+                method: "remove",
+                pathOrDescriptor: path,
+                cause: cleanupFailure,
+                description: cleanupFailure.message,
+              }),
+            )
+          : fileSystem.remove(path, options),
+    };
+    let guardCalls = 0;
+    store.bindMutationGuard(() => {
+      guardCalls += 1;
+      if (guardCalls === 2) throw new Error("injected lease loss");
+    });
+
+    await assert.rejects(
+      runStoreEffect(
+        store.effects.recordInputEvent({
+          ...coordinator,
+          source: "interactive",
+          text: "This fenced write must expose cleanup failure.",
+        }),
+        failingCleanupFileSystem,
+      ),
+      (error: Error) => {
+        const details = failureDetails(error);
+        return (
+          details.includes("injected lease loss") &&
+          details.includes("remove owned temporary workstream state") &&
+          details.includes(cleanupFailure.message)
+        );
+      },
+    );
+    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+function runLiveStoreEffect<A, E>(
+  operation: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>,
+): Promise<A> {
+  return Effect.runPromise(Effect.provide(operation, liveLayer));
+}
+
+async function liveFileSystem(): Promise<FileSystem.FileSystem> {
+  return Effect.runPromise(Effect.provide(FileSystem.FileSystem, liveLayer));
+}
+
+async function livePath(): Promise<Path.Path> {
+  return Effect.runPromise(Effect.provide(Path.Path, liveLayer));
+}
+
+async function runStoreEffect<A, E>(
+  operation: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>,
+  fileSystem: FileSystem.FileSystem,
+  signal?: AbortSignal,
+): Promise<A> {
+  const paths = await livePath();
+  return Effect.runPromise(
+    Effect.provideService(
+      Effect.provideService(operation, FileSystem.FileSystem, fileSystem),
+      Path.Path,
+      paths,
+    ),
+    signal === undefined ? undefined : { signal },
+  );
+}
+
+function failureDetails(failure: Error): string {
+  const nested =
+    failure instanceof AggregateError
+      ? failure.errors.filter((item): item is Error => item instanceof Error).map(failureDetails)
+      : failure.cause instanceof Error
+        ? [failureDetails(failure.cause)]
+        : [];
+  return [failure.message, ...nested].join("\n");
+}
 
 function persistFixtureState(path: string, state: WorkstreamState): Promise<void> {
   return writeFile(path, `${JSON.stringify(state, null, 2)}\n`);

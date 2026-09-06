@@ -1,9 +1,6 @@
 import { randomUUID } from "node:crypto";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This module is the real Node atomic-file owner behind the Effect store port.
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Atomic-file ownership requires canonical host paths.
-import { dirname } from "node:path";
-import { Effect } from "effect";
+import { Cause, Effect, Exit, FileSystem, Path } from "effect";
+import type { PlatformError } from "effect/PlatformError";
 import {
   InvalidWorkstreamStateError,
   UnsupportedWorkstreamStateError,
@@ -25,7 +22,13 @@ export type WorkstreamStoreError =
   | UnsupportedWorkstreamStateError
   | WorkstreamStoreOperationError;
 
-export type StoreEffect<A> = Effect.Effect<A, WorkstreamStoreError>;
+export type WorkstreamStoreRequirements = FileSystem.FileSystem | Path.Path;
+
+export type StoreEffect<A, R = WorkstreamStoreRequirements> = Effect.Effect<
+  A,
+  WorkstreamStoreError,
+  R
+>;
 
 type MutationGuard = () => void;
 
@@ -51,72 +54,131 @@ export class AtomicWorkstreamFile {
   }
 
   readObject(): StoreEffect<JsonObject> {
-    return filesystemEffect("read workstream state", () => readFile(this.path, "utf8")).pipe(
-      Effect.flatMap((text) => domainEffect(() => parsePersistedObject(text))),
-    );
+    const statePath = this.path;
+    return Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const text = yield* filesystemEffect(
+        "read workstream state",
+        fileSystem.readFileString(statePath),
+      );
+      return yield* domainEffect(() => parsePersistedObject(text));
+    });
   }
 
   writeState(state: WorkstreamState): StoreEffect<void> {
-    const temporaryPath = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-    const prepareAndPublish = filesystemEffect("write temporary workstream state", () =>
-      writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      }),
-    ).pipe(
-      Effect.andThen(
-        Effect.uninterruptible(
-          domainEffect(() => this.mutationGuard()?.()).pipe(
-            Effect.andThen(
-              filesystemEffect("atomically replace workstream state", () =>
-                rename(temporaryPath, this.path),
-              ),
+    const statePath = this.path;
+    const mutationGuard = this.mutationGuard;
+    return Effect.gen(function* () {
+      yield* domainEffect(() => validateState(state));
+      const fileSystem = yield* FileSystem.FileSystem;
+      const paths = yield* Path.Path;
+      yield* filesystemEffect(
+        "prepare workstream directory",
+        fileSystem.makeDirectory(paths.dirname(statePath), { recursive: true }),
+      );
+
+      const temporaryPath = yield* domainEffect(
+        () => `${statePath}.${process.pid}.${randomUUID()}.tmp`,
+      );
+      // oxlint-disable-next-line effecttsgo/prefer-schema-over-json -- The established validated state schema is serialized in its existing human-readable format.
+      const contents = new TextEncoder().encode(`${JSON.stringify(state, null, 2)}\n`);
+      let acquired = false;
+      let published = false;
+
+      const prepare = Effect.scoped(
+        Effect.gen(function* () {
+          const file = yield* filesystemEffect(
+            "exclusively acquire temporary workstream state",
+            fileSystem.open(temporaryPath, { flag: "wx", mode: 0o600 }),
+          );
+          acquired = true;
+          yield* Effect.uninterruptible(
+            filesystemEffect("write temporary workstream state", file.writeAll(contents)).pipe(
+              Effect.andThen(filesystemEffect("sync temporary workstream state", file.sync)),
+            ),
+          );
+        }),
+      );
+
+      const publish = Effect.uninterruptible(
+        domainEffect(() => mutationGuard()?.()).pipe(
+          Effect.andThen(
+            filesystemEffect(
+              "atomically replace workstream state",
+              fileSystem.rename(temporaryPath, statePath),
             ),
           ),
+          Effect.tap(() =>
+            Effect.sync(() => {
+              published = true;
+            }),
+          ),
         ),
-      ),
-      Effect.ensuring(
-        filesystemEffect("remove temporary workstream state", () =>
-          rm(temporaryPath, { force: true }),
-        ).pipe(Effect.orDie),
-      ),
-    );
-    return domainEffect(() => validateState(state)).pipe(
-      Effect.andThen(
-        filesystemEffect("prepare workstream directory", () =>
-          mkdir(dirname(this.path), { recursive: true }),
-        ),
-      ),
-      Effect.andThen(prepareAndPublish),
-      Effect.asVoid,
-    );
+      );
+
+      yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const operationExit = yield* Effect.exit(restore(prepare.pipe(Effect.andThen(publish))));
+          if (acquired && !published) {
+            const cleanupExit = yield* Effect.exit(
+              filesystemEffect(
+                "remove owned temporary workstream state",
+                fileSystem.remove(temporaryPath, { force: true }),
+              ),
+            );
+            if (Exit.isFailure(operationExit) && Exit.isFailure(cleanupExit)) {
+              return yield* new WorkstreamStoreOperationError({
+                code: "workstream_store_operation_failed",
+                message: "Workstream state preparation and cleanup both failed.",
+                cause: new AggregateError([
+                  Cause.squash(operationExit.cause),
+                  Cause.squash(cleanupExit.cause),
+                ]),
+              });
+            }
+            yield* cleanupExit;
+          }
+          yield* operationExit;
+        }),
+      );
+    });
   }
 }
 
 export function claimWorkstreamDirectory(path: string): StoreEffect<void> {
-  return filesystemEffect("prepare workstream parent directory", () =>
-    mkdir(dirname(dirname(path)), { recursive: true }),
-  ).pipe(
-    Effect.andThen(filesystemEffect("claim workstream directory", () => mkdir(dirname(path)))),
-    Effect.asVoid,
-  );
-}
-
-export function removeWorkstreamDirectory(path: string): StoreEffect<void> {
-  return filesystemEffect("remove failed workstream directory", () =>
-    rm(dirname(path), { recursive: true, force: true }),
-  );
-}
-
-function filesystemEffect<A>(operation: string, run: () => Promise<A>): StoreEffect<A> {
-  return Effect.tryPromise({
-    try: run,
-    catch: (cause) => storeError(operation, cause),
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const paths = yield* Path.Path;
+    yield* filesystemEffect(
+      "prepare workstream parent directory",
+      fileSystem.makeDirectory(paths.dirname(paths.dirname(path)), { recursive: true }),
+    );
+    yield* filesystemEffect(
+      "claim workstream directory",
+      fileSystem.makeDirectory(paths.dirname(path)),
+    );
   });
 }
 
-export function domainEffect<A>(run: () => A): StoreEffect<A> {
+export function removeWorkstreamDirectory(path: string): StoreEffect<void> {
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const paths = yield* Path.Path;
+    yield* filesystemEffect(
+      "remove failed workstream directory",
+      fileSystem.remove(paths.dirname(path), { recursive: true, force: true }),
+    );
+  });
+}
+
+function filesystemEffect<A, R>(
+  operation: string,
+  effect: Effect.Effect<A, PlatformError, R>,
+): StoreEffect<A, R> {
+  return effect.pipe(Effect.mapError((cause) => storeError(operation, cause)));
+}
+
+export function domainEffect<A>(run: () => A): StoreEffect<A, never> {
   return Effect.try({
     try: run,
     catch: (cause) => storeError("apply workstream domain operation", cause),

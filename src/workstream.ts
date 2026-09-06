@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Workstream paths are pure host paths and do not require an Effect service.
 import { resolve } from "node:path";
-import { DateTime, Effect, Semaphore } from "effect";
+import { DateTime, Effect, PlatformError, Semaphore } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import { runNodePlatformPromise } from "./node-platform.js";
 import { EvidenceSchema } from "./report-schema.js";
 import {
   AtomicWorkstreamFile,
@@ -12,6 +13,7 @@ import {
   removeWorkstreamDirectory,
   type StoreEffect,
   type WorkstreamStoreError,
+  type WorkstreamStoreRequirements,
 } from "./workstream-persistence.js";
 import {
   type ArtifactRetention,
@@ -83,6 +85,7 @@ export type {
   WorkstreamReattachmentInspection,
   WorkstreamState,
   WorkstreamStoreError,
+  WorkstreamStoreRequirements,
 };
 export {
   InvalidWorkstreamStateError,
@@ -1416,8 +1419,12 @@ function promiseOperation<Args extends readonly unknown[], Success>(
 }
 
 function runStorePromise<A>(operation: StoreEffect<A>): Promise<A> {
-  return Effect.runPromise(operation).catch((failure) => {
-    if (failure instanceof WorkstreamStoreOperationError) throw failure.cause;
+  return runNodePlatformPromise(operation).catch((failure) => {
+    if (failure instanceof WorkstreamStoreOperationError) {
+      if (failure.cause instanceof PlatformError.PlatformError && "cause" in failure.cause.reason)
+        throw failure.cause.reason.cause;
+      throw failure.cause;
+    }
     throw failure;
   });
 }
