@@ -6,9 +6,7 @@ import type { WorkerMode, WorkerReport } from "./types.js";
 export const EvidenceSchema = Type.Object({
   label: Type.String(),
   observation: Type.String(),
-  class: Type.Optional(
-    StringEnum(["direct", "inference", "conflict", "unknown"] as const),
-  ),
+  class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
   command: Type.Optional(Type.String()),
   artifact: Type.Optional(Type.String()),
 });

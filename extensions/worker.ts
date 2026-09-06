@@ -43,6 +43,17 @@ interface WorkerTerminalState {
   readonly revision?: string | undefined;
 }
 
+interface WorkerReportExecutionState {
+  readonly mode: WorkerMode;
+  readonly phase: "guide" | "executor";
+  readonly todos: readonly string[];
+  readonly switchedAt?: string | undefined;
+  readonly switchError?: string | undefined;
+  readonly continued: boolean;
+  readonly baseCommit: string;
+  readonly hasExecutorMessage: () => boolean;
+}
+
 export default function workgraphWorker(pi: ExtensionAPI): void {
   const environment = Effect.runSync(WorkerEnvironmentConfig.parse(ConfigProvider.fromEnv()));
   const mode = readMode(environment.mode);
@@ -140,97 +151,15 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     parameters: reportSchemaForMode(mode),
     execute(_id, params, _signal, _update, ctx) {
       return Effect.runPromise(
-        Effect.gen(function* () {
-          if (!isWorkerReport(params) || params.kind !== mode)
-            throw new Error(`Report must satisfy the ${mode} contract.`);
-          if (params.kind === "implementation" && params.status === "completed") {
-            if (params.outcome === "no_change") {
-              if (baseCommit.length === 0) throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
-              const status = yield* gitEffect(
-                pi,
-                ctx.cwd,
-                ["status", "--porcelain", "--untracked-files=all"],
-                true,
-              );
-              if (status.length > 0)
-                throw new Error(`No-change implementation requires a clean worktree:\n${status}`);
-              const revision = yield* gitEffect(pi, ctx.cwd, ["rev-parse", "HEAD"]);
-              if (params.revision !== revision || revision !== baseCommit)
-                throw new Error(
-                  `No-change implementation must report the unchanged base revision ${baseCommit}.`,
-                );
-              return terminalReport(params, {
-                todos,
-                todoRecorded: todos.length > 0,
-                switchedAt,
-                continued,
-                outcome: "no_change",
-                baseCommit,
-                revision,
-              });
-            }
-            if (phase !== "executor")
-              throw new Error(
-                "Completed changed implementation requires the first-edit model transition.",
-              );
-            if (switchError !== undefined)
-              throw new Error(`Executor model transition failed: ${switchError}`);
-            if (!hasExecutorMessage(ctx.sessionManager.getBranch()))
-              throw new Error(
-                "Completed changed implementation requires an actual executor assistant message after this attempt's transition/start. Continue with the executor before reporting.",
-              );
-            if (baseCommit.length === 0) throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
-            const status = yield* gitEffect(
-              pi,
-              ctx.cwd,
-              ["status", "--porcelain", "--untracked-files=all"],
-              true,
-            );
-            if (status.length > 0)
-              throw new Error(`Commit and leave a clean worktree before reporting:\n${status}`);
-            const [commit, parent, ...extraParents] = (yield* gitEffect(pi, ctx.cwd, [
-              "rev-list",
-              "--parents",
-              "-n",
-              "1",
-              "HEAD",
-            ])).split(" ");
-            if (
-              commit === undefined ||
-              commit.length === 0 ||
-              parent !== baseCommit ||
-              extraParents.length > 0
-            )
-              throw new Error(
-                "A completed changed implementation requires exactly one direct commit on the supplied base.",
-              );
-            const changedText = yield* gitEffect(
-              pi,
-              ctx.cwd,
-              ["diff", "--name-only", "--no-renames", baseCommit, commit],
-              true,
-            );
-            const report: ImplementationReport = {
-              ...params,
-              commit,
-              changedFiles: changedText
-                .split("\n")
-                .filter((path) => path.length > 0)
-                .sort(),
-            };
-            return terminalReport(report, {
-              todos,
-              todoRecorded: todos.length > 0,
-              switchedAt,
-              continued,
-              outcome: "changed",
-            });
-          }
-          // Read-only is an instruction and authority boundary, not a filesystem sandbox.
-          // Shared research and review deliberately observe the live project cwd, including
-          // tracked and untracked local changes. Do not claim an immutable base unless the
-          // report records exact Git evidence for the requested revision.
-          return terminalReport(params, { todos, switchedAt, switchError });
+        handleWorkerReport(pi, ctx.cwd, params, {
+          mode,
+          phase,
+          todos,
+          switchedAt,
+          switchError,
+          continued,
+          baseCommit,
+          hasExecutorMessage: () => hasExecutorMessage(ctx.sessionManager.getBranch()),
         }),
       );
     },
@@ -321,17 +250,25 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         thinking: pi.getThinkingLevel(),
       });
   });
-  pi.on("session_start", (_event, ctx) => {
-    for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+  function latestAttemptState(entries: SessionEntry[]): AttemptState | undefined {
+    for (const entry of [...entries].reverse()) {
       if (entry.type !== "custom" || entry.customType !== "pi-workgraph-worker-state") continue;
       const attempt = decodeAttemptState(entry.data);
-      if (attempt === undefined || !belongsToAttempt(attempt)) continue;
-      if (attempt.todos !== undefined) todos = attempt.todos;
-      if (attempt.switchedAt !== undefined) switchedAt = attempt.switchedAt;
-      if (attempt.phase === "executor") phase = "executor";
-      if (attempt.switchError !== undefined) switchError = attempt.switchError;
-      break;
+      if (attempt !== undefined && belongsToAttempt(attempt)) return attempt;
     }
+    return undefined;
+  }
+
+  function reattachAttemptState(attempt: AttemptState): void {
+    if (attempt.todos !== undefined) todos = attempt.todos;
+    if (attempt.switchedAt !== undefined) switchedAt = attempt.switchedAt;
+    if (attempt.phase === "executor") phase = "executor";
+    if (attempt.switchError !== undefined) switchError = attempt.switchError;
+  }
+
+  pi.on("session_start", (_event, ctx) => {
+    const attempt = latestAttemptState(ctx.sessionManager.getBranch());
+    if (attempt !== undefined) reattachAttemptState(attempt);
   });
   pi.on("agent_start", (_event, ctx) =>
     Effect.runPromise(
@@ -352,12 +289,15 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   pi.on("agent_settled", () =>
     Effect.runPromise(
       DateTime.now.pipe(
-        Effect.map((now) => {
-          pi.appendEntry("pi-workgraph-agent-settled", {
-            ...generation,
-            settledAt: DateTime.formatIso(now),
-          });
-        }),
+        Effect.tap((now) =>
+          Effect.sync(() => {
+            pi.appendEntry("pi-workgraph-agent-settled", {
+              ...generation,
+              settledAt: DateTime.formatIso(now),
+            });
+          }),
+        ),
+        Effect.asVoid,
       ),
     ),
   );
@@ -399,6 +339,135 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       details: generation,
     },
   }));
+}
+
+function handleWorkerReport(
+  pi: ExtensionAPI,
+  cwd: string,
+  params: WorkerReport,
+  execution: WorkerReportExecutionState,
+) {
+  return Effect.gen(function* () {
+    if (!isWorkerReport(params) || params.kind !== execution.mode)
+      throw new Error(`Report must satisfy the ${execution.mode} contract.`);
+    if (params.kind !== "implementation" || params.status !== "completed") {
+      // Read-only is an instruction and authority boundary, not a filesystem sandbox.
+      // Shared research and review deliberately observe the live project cwd, including
+      // tracked and untracked local changes. Do not claim an immutable base unless the
+      // report records exact Git evidence for the requested revision.
+      return terminalReport(params, {
+        todos: execution.todos,
+        switchedAt: execution.switchedAt,
+        switchError: execution.switchError,
+      });
+    }
+    if (params.outcome === "no_change")
+      return yield* noChangeImplementationReport(pi, cwd, params, execution);
+    return yield* changedImplementationReport(pi, cwd, params, execution);
+  });
+}
+
+function noChangeImplementationReport(
+  pi: ExtensionAPI,
+  cwd: string,
+  report: Extract<ImplementationReport, { outcome: "no_change" }>,
+  execution: WorkerReportExecutionState,
+) {
+  return Effect.gen(function* () {
+    if (execution.baseCommit.length === 0) throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
+    yield* requireCleanWorktree(pi, cwd, "No-change implementation requires a clean worktree:");
+    const revision = yield* gitEffect(pi, cwd, ["rev-parse", "HEAD"]);
+    if (report.revision !== revision || revision !== execution.baseCommit)
+      throw new Error(
+        `No-change implementation must report the unchanged base revision ${execution.baseCommit}.`,
+      );
+    return terminalReport(report, {
+      todos: execution.todos,
+      todoRecorded: execution.todos.length > 0,
+      switchedAt: execution.switchedAt,
+      continued: execution.continued,
+      outcome: "no_change",
+      baseCommit: execution.baseCommit,
+      revision,
+    });
+  });
+}
+
+function changedImplementationReport(
+  pi: ExtensionAPI,
+  cwd: string,
+  report: Extract<ImplementationReport, { outcome: "changed" }>,
+  execution: WorkerReportExecutionState,
+) {
+  return Effect.gen(function* () {
+    if (execution.phase !== "executor")
+      throw new Error("Completed changed implementation requires the first-edit model transition.");
+    if (execution.switchError !== undefined)
+      throw new Error(`Executor model transition failed: ${execution.switchError}`);
+    if (!execution.hasExecutorMessage())
+      throw new Error(
+        "Completed changed implementation requires an actual executor assistant message after this attempt's transition/start. Continue with the executor before reporting.",
+      );
+    if (execution.baseCommit.length === 0) throw new Error("PI_WORKGRAPH_BASE_COMMIT is required.");
+    const provenance = yield* changedCommitProvenance(pi, cwd, execution.baseCommit);
+    return terminalReport(
+      { ...report, ...provenance },
+      {
+        todos: execution.todos,
+        todoRecorded: execution.todos.length > 0,
+        switchedAt: execution.switchedAt,
+        continued: execution.continued,
+        outcome: "changed",
+      },
+    );
+  });
+}
+
+function changedCommitProvenance(pi: ExtensionAPI, cwd: string, baseCommit: string) {
+  return Effect.gen(function* () {
+    yield* requireCleanWorktree(pi, cwd, "Commit and leave a clean worktree before reporting:");
+    const [commit, parent, ...extraParents] = (yield* gitEffect(pi, cwd, [
+      "rev-list",
+      "--parents",
+      "-n",
+      "1",
+      "HEAD",
+    ])).split(" ");
+    if (
+      commit === undefined ||
+      commit.length === 0 ||
+      parent !== baseCommit ||
+      extraParents.length > 0
+    )
+      throw new Error(
+        "A completed changed implementation requires exactly one direct commit on the supplied base.",
+      );
+    const changedText = yield* gitEffect(
+      pi,
+      cwd,
+      ["diff", "--name-only", "--no-renames", baseCommit, commit],
+      true,
+    );
+    return {
+      commit,
+      changedFiles: changedText
+        .split("\n")
+        .filter((path) => path.length > 0)
+        .sort(),
+    };
+  });
+}
+
+function requireCleanWorktree(pi: ExtensionAPI, cwd: string, errorPrefix: string) {
+  return Effect.gen(function* () {
+    const status = yield* gitEffect(
+      pi,
+      cwd,
+      ["status", "--porcelain", "--untracked-files=all"],
+      true,
+    );
+    if (status.length > 0) throw new Error(`${errorPrefix}\n${status}`);
+  });
 }
 
 function terminalReport(report: WorkerReport, state: WorkerTerminalState) {
