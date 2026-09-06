@@ -3,65 +3,77 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import {
   Cause,
-  Clock,
+  type Clock,
   Data,
-  DateTime,
   Deferred,
   Effect,
   Exit,
-  Layer,
+  Fiber,
+  type FileSystem,
   ManagedRuntime,
+  Option,
+  type Path,
   Queue,
   Ref,
   Schedule,
 } from "effect";
+import type { PlatformError } from "effect/PlatformError";
+import { ArtifactStore, type ArtifactStoreError } from "./artifact-store.js";
+import type { GitFailure, GitRepository, WorktreePlacement } from "./git.js";
 import {
-  ArtifactIoError,
-  ArtifactSafetyError,
-  ArtifactStore,
-  type ArtifactStoreError,
-  ArtifactValidationError,
-} from "./artifact-store.js";
-import type { GitRepository, WorktreePlacement } from "./git.js";
-import {
+  type HerdrProtocolError,
   herdrWorkerName,
   legacyHerdrAgentName,
   legacyObjectiveHerdrWorkerName,
-  type VisibleWorkerRuntime,
+  type WorkerLaunchEffectRequest,
   type WorkerLaunchInspectionRequest,
-  type WorkerLaunchRequest,
+  type WorkerLaunchReadinessError,
   type WorkerRecoveryRequest,
 } from "./herdr.js";
+import type { WorkerLaunchError } from "./herdr-launch.js";
 import {
-  loadModelPolicy,
   type ModelPolicy,
+  type ModelPolicyError,
   resolveSelection,
   type SelectionRequest,
 } from "./model-policy.js";
-import {
-  createWorkerSession,
-  effectiveModelObservations,
-  hasNativeAgentSettled,
-  hasNativeAgentStarted,
-  type NativeFailureCategory,
-  observeNativeFailure,
-  readTerminalText,
-  readWorkgraphReportResult,
+import type {
+  createWorkerSessionEffect,
+  NativeFailureCategory,
+  PiSessionError,
 } from "./pi-process.js";
-import { type Lease, type LeaseOwner, WorkgraphRegistry } from "./registry.js";
+import { LeaseDecisionRequiredError, type LeaseOwner, type WorkgraphRegistry } from "./registry.js";
 import type { ThinkingLevel } from "./types.js";
 import type {
   ArtifactRetention,
+  StoreEffect,
   WorkAssignment,
   WorkAttempt,
   WorkResult,
   WorkstreamState,
   WorkstreamStore,
+  WorkstreamStoreEffects,
+  WorkstreamStoreError,
 } from "./workstream.js";
 import {
   isLegacyArtifactRetentionFailure,
   legacyArtifactRetentionLimitation,
 } from "./workstream.js";
+import {
+  makeRuntimeLayer,
+  type PiObservationError,
+  RuntimeGit,
+  RuntimeHerdr,
+  RuntimeHost,
+  RuntimeHostError,
+  RuntimeLease,
+  RuntimePi,
+  RuntimePolicy,
+  RuntimeRegistryError,
+  RuntimeStore,
+  type RuntimeWorkerPort,
+} from "./workstream-runtime-services.js";
+import { WorkstreamStoreOperationError } from "./workstream-state.js";
 
 export interface WorkstreamLaunch {
   workspaceId: string;
@@ -81,16 +93,15 @@ export interface RuntimeOwnership {
   owner?: LeaseOwner;
   priorOwnerLiveness?: "alive" | "dead" | "unknown";
   policy?: ModelPolicy;
-  /** Fully provided artifact byte service layer; production uses ArtifactStore.layerLive. */
-  artifactStoreLayer?: Layer.Layer<ArtifactStore>;
+  /** Artifact byte service override; production composes ArtifactStore.layer with the runtime Node layer. */
+  artifactStoreLayer?: Parameters<typeof makeRuntimeLayer>[0]["artifactStoreLayer"];
   /** Test-only clock injection; production uses Effect's live Clock service. */
   clock?: Clock.Clock;
   /** Presentation/status observer for the latest reconciled state. */
   onState?: (state: WorkstreamState) => void;
 }
 
-export class RuntimeDependencyError extends Data.TaggedError("RuntimeDependencyError")<{
-  readonly dependency: "store" | "git" | "herdr" | "pi" | "runtime";
+export class RuntimeOperationError extends Data.TaggedError("RuntimeOperationError")<{
   readonly operation: string;
   readonly cause: unknown;
 }> {
@@ -99,262 +110,193 @@ export class RuntimeDependencyError extends Data.TaggedError("RuntimeDependencyE
   }
 }
 
-class RuntimeStoppedError extends Data.TaggedError("RuntimeStoppedError")<{
+export class RuntimeStoppedError extends Data.TaggedError("RuntimeStoppedError")<{
   readonly message: string;
 }> {}
 
-type RuntimeError = RuntimeDependencyError | RuntimeStoppedError;
-type OperationRequest =
-  | { readonly _tag: "Operation"; readonly run: Effect.Effect<void, never> }
-  | { readonly _tag: "Stop" };
+type RuntimeError =
+  | RuntimeOperationError
+  | RuntimeStoppedError
+  | WorkstreamStoreError
+  | GitFailure
+  | HerdrProtocolError
+  | WorkerLaunchReadinessError
+  | WorkerLaunchError<unknown>
+  | PiSessionError
+  | PiObservationError
+  | ModelPolicyError
+  | PlatformError
+  | ArtifactStoreError
+  | RuntimeHostError
+  | RuntimeRegistryError
+  | LeaseDecisionRequiredError;
+type RuntimeServices =
+  | RuntimeStore
+  | RuntimeGit
+  | RuntimeHerdr
+  | RuntimePolicy
+  | RuntimePi
+  | RuntimeHost
+  | RuntimeLease
+  | ArtifactStore
+  | FileSystem.FileSystem
+  | Path.Path;
+type RuntimeEffect<A, E = RuntimeError> = Effect.Effect<A, E, RuntimeServices>;
+type OperationRequest = {
+  readonly run: RuntimeEffect<void, never>;
+  readonly fail: RuntimeEffect<void, never>;
+};
 type RuntimeLifecycle = "open" | "stopping" | "stopped";
 
 /** One scoped, serialized execution owner backed by the registry's fenced lease. */
 export class WorkstreamRuntime {
-  private lease: Lease | undefined;
   private readonly deliveryOwner = randomUUID();
-  private registry: WorkgraphRegistry | undefined;
   private readonly operations = Effect.runSync(Queue.unbounded<OperationRequest>());
   private readonly ready = Deferred.makeUnsafe<void, RuntimeError>();
   private readonly startRequested = Deferred.makeUnsafe<void>();
+  private readonly fatal = Deferred.makeUnsafe<never, RuntimeError>();
   private readonly applicationExit = Deferred.makeUnsafe<Exit.Exit<void, RuntimeError>>();
   private readonly lifecycle = Ref.makeUnsafe<RuntimeLifecycle>("open");
-  private readonly effectRuntime = ManagedRuntime.make(Layer.empty);
-  private readonly artifactStoreLayer: Layer.Layer<ArtifactStore>;
-  private policy: ModelPolicy | undefined;
-  private readonly onState: (state: WorkstreamState) => void;
+  private readonly effectRuntime: ManagedRuntime.ManagedRuntime<RuntimeServices, RuntimeError>;
+  private readonly applicationFiber: Fiber.Fiber<void, RuntimeError>;
+  private stopRequest: Promise<void> | undefined;
 
   constructor(
     readonly store: WorkstreamStore,
     readonly repository: GitRepository,
-    readonly workers: VisibleWorkerRuntime,
+    readonly workers: RuntimeWorkerPort,
     readonly launch: WorkstreamLaunch,
     readonly onResult: (resultId: string, state: WorkstreamState) => void | Promise<void>,
     readonly onError: (error: Error) => void,
     ownership: RuntimeOwnership = {},
   ) {
-    this.policy = ownership.policy;
-    this.onState = ownership.onState ?? (() => undefined);
-    this.artifactStoreLayer = ownership.artifactStoreLayer ?? ArtifactStore.layerLive;
-    const application = ownership.clock
-      ? Effect.provideService(this.application(ownership), Clock.Clock, ownership.clock)
-      : this.application(ownership);
-    this.effectRuntime.runFork(application);
+    this.effectRuntime = ManagedRuntime.make(
+      makeRuntimeLayer({
+        store,
+        repository,
+        workers,
+        onResult,
+        onError,
+        onState: ownership.onState ?? (() => undefined),
+        ...ownership,
+      }),
+    );
+    this.applicationFiber = this.effectRuntime.runFork(this.application());
+    this.applicationFiber.addObserver((exit) => {
+      Deferred.doneUnsafe(
+        this.ready,
+        Exit.isFailure(exit) ? Effect.failCause(exit.cause) : Effect.void,
+      );
+      Deferred.doneUnsafe(this.applicationExit, Effect.succeed(exit));
+      Effect.runSync(Ref.set(this.lifecycle, "stopped"));
+    });
   }
 
-  private application(options: RuntimeOwnership): Effect.Effect<void, RuntimeError> {
-    const owned = Effect.scoped(
+  private application(): RuntimeEffect<void> {
+    return Effect.scoped(
       Effect.gen(
         function* (this: WorkstreamRuntime) {
-          const registry = yield* Effect.acquireRelease(
-            this.openRegistryEffect(options.registry),
-            (opened) => this.closeRegistryEffect(opened, options.registry),
-          );
-          this.registry = registry;
-          const lease = yield* Effect.acquireRelease(
-            this.claimLeaseEffect(registry, options),
-            (claimed) => this.releaseLeaseEffect(registry, claimed),
-          );
-          this.lease = lease;
-          this.store.bindMutationGuard(() => this.assertOwnership());
-          yield* this.adoptCoordinatorEffect(options);
+          yield* RuntimeLease;
           yield* Deferred.succeed(this.ready, undefined);
           yield* Effect.forkScoped(this.heartbeatLoop());
           yield* Effect.forkScoped(
             Deferred.await(this.startRequested).pipe(Effect.andThen(this.reconciliationLoop())),
           );
-          yield* this.operationLoop();
+          yield* Effect.raceFirst(this.operationLoop(), Deferred.await(this.fatal));
         }.bind(this),
       ),
-    );
-    return owned.pipe(
-      Effect.onExit((exit) =>
-        Deferred.done(this.ready, exit).pipe(
-          Effect.andThen(Ref.set(this.lifecycle, "stopped")),
-          Effect.andThen(Deferred.succeed(this.applicationExit, exit)),
-          Effect.asVoid,
-        ),
-      ),
-    );
+    ).pipe(Effect.ensuring(this.closeOperations()));
   }
 
-  private openRegistryEffect(
-    provided: WorkgraphRegistry | undefined,
-  ): Effect.Effect<WorkgraphRegistry, RuntimeDependencyError> {
-    return provided
-      ? Effect.succeed(provided)
-      : this.runtimeSync("open workstream registry", () => new WorkgraphRegistry());
-  }
-
-  private closeRegistryEffect(
-    registry: WorkgraphRegistry,
-    provided: WorkgraphRegistry | undefined,
-  ): Effect.Effect<void> {
-    return Effect.sync(() => {
-      this.registry = undefined;
-      if (provided === undefined) registry.close();
-    });
-  }
-
-  private claimLeaseEffect(
-    registry: WorkgraphRegistry,
-    options: RuntimeOwnership,
-  ): Effect.Effect<Lease, RuntimeDependencyError> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const state = yield* this.dependency("store", "load for lease claim", () =>
-          this.store.load(),
-        );
-        yield* this.runtimeSync("index workstream", () =>
-          registry.indexWorkstream({
-            ...state,
-            runId: state.id,
-            lifecycle: state.lifecycle.state,
-          }),
-        );
-        const now = yield* DateTime.nowAsDate;
-        return yield* this.runtimeSync("claim registry lease", () =>
-          registry.acquire(
-            state.id,
-            options.owner ?? state.coordinator,
-            now,
-            options.priorOwnerLiveness ?? "unknown",
-          ),
-        );
-      }.bind(this),
-    );
-  }
-
-  private releaseLeaseEffect(registry: WorkgraphRegistry, lease: Lease): Effect.Effect<void> {
-    return Effect.sync(() => {
-      registry.release(lease);
-      this.lease = undefined;
-    });
-  }
-
-  private adoptCoordinatorEffect(
-    options: RuntimeOwnership,
-  ): Effect.Effect<void, RuntimeDependencyError> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const state = yield* this.dependency("store", "load coordinator", () => this.store.load());
-        const owner = options.owner ?? state.coordinator;
-        if (
-          owner.sessionId !== state.coordinator.sessionId ||
-          owner.sessionFile !== state.coordinator.sessionFile
-        ) {
-          yield* this.dependency("store", "adopt coordinator", () => this.store.adopt(owner));
-        }
-      }.bind(this),
-    );
-  }
-
-  private runtimeSync<A>(
-    operation: string,
-    run: () => A,
-  ): Effect.Effect<A, RuntimeDependencyError> {
+  private runtimeSync<A>(operation: string, run: () => A): RuntimeEffect<A, RuntimeOperationError> {
     return Effect.try({
       try: run,
-      catch: (cause) =>
-        new RuntimeDependencyError({
-          dependency: "runtime",
-          operation,
-          cause,
-        }),
+      catch: (cause) => new RuntimeOperationError({ operation, cause }),
     });
   }
 
-  private dependency<A>(
-    dependency: RuntimeDependencyError["dependency"],
-    operation: string,
-    run: () => PromiseLike<A>,
-  ): Effect.Effect<A, RuntimeDependencyError> {
-    return Effect.uninterruptible(
-      Effect.tryPromise({
-        try: run,
-        catch: (cause) =>
-          cause instanceof RuntimeDependencyError
-            ? cause
-            : new RuntimeDependencyError({ dependency, operation, cause }),
-      }),
-    );
-  }
-
-  private artifactOperation<A>(
-    operation: Effect.Effect<A, ArtifactStoreError | RuntimeError, ArtifactStore>,
-  ): Effect.Effect<A, RuntimeError> {
-    return Effect.provide(operation, this.artifactStoreLayer).pipe(
+  private storeEffect<A>(
+    run: (store: WorkstreamStoreEffects) => StoreEffect<A>,
+  ): RuntimeEffect<A, WorkstreamStoreError | LeaseDecisionRequiredError> {
+    return Effect.flatMap(RuntimeStore, ({ effects }) => run(effects)).pipe(
       Effect.mapError((error) =>
-        error instanceof ArtifactIoError ||
-        error instanceof ArtifactSafetyError ||
-        error instanceof ArtifactValidationError
-          ? new RuntimeDependencyError({
-              dependency: "runtime",
-              operation: "retain artifact bytes",
-              cause: error,
-            })
+        error instanceof WorkstreamStoreOperationError &&
+        error.cause instanceof LeaseDecisionRequiredError
+          ? error.cause
           : error,
       ),
     );
   }
 
-  private assertOwnership(): void {
-    const registry = this.registry;
-    if (!this.lease || !registry)
-      throw new RuntimeStoppedError({
-        message: "Workstream runtime is stopped or has no lease.",
-      });
-    registry.assertLease(this.lease);
+  private gitEffect<A>(
+    run: (repository: RuntimeGit["Service"]["effects"]) => Effect.Effect<A, GitFailure>,
+  ): RuntimeEffect<A, GitFailure> {
+    return Effect.flatMap(RuntimeGit, ({ effects }) => run(effects));
   }
 
-  private ownershipEffect(): Effect.Effect<void, RuntimeError> {
-    return Effect.try({
-      try: () => this.assertOwnership(),
-      catch: (cause) =>
-        cause instanceof RuntimeStoppedError
-          ? cause
-          : new RuntimeDependencyError({
-              dependency: "runtime",
-              operation: "assert registry lease",
-              cause,
-            }),
-    });
+  private herdrEffect<A, E>(
+    run: (workers: RuntimeHerdr["Service"]["effects"]) => RuntimeEffect<A, E>,
+  ): RuntimeEffect<A, E> {
+    return Effect.flatMap(RuntimeHerdr, ({ effects }) => run(effects));
   }
 
-  private operationLoop(): Effect.Effect<void, never> {
+  private ownershipEffect(): RuntimeEffect<
+    void,
+    LeaseDecisionRequiredError | RuntimeRegistryError
+  > {
+    return Effect.flatMap(RuntimeLease, (lease) =>
+      Effect.try({
+        try: lease.assert,
+        catch: (cause) =>
+          cause instanceof LeaseDecisionRequiredError
+            ? cause
+            : new RuntimeRegistryError({ operation: "assert registry lease", cause }),
+      }),
+    );
+  }
+
+  private operationLoop(): RuntimeEffect<void, never> {
     return Effect.suspend(() =>
       Queue.take(this.operations).pipe(
-        Effect.flatMap((request) =>
-          request._tag === "Stop"
-            ? Effect.void
-            : request.run.pipe(Effect.andThen(this.operationLoop())),
-        ),
+        Effect.flatMap((request) => request.run.pipe(Effect.andThen(this.operationLoop()))),
       ),
     );
   }
 
-  private submit<T>(effect: Effect.Effect<T, RuntimeError>): Effect.Effect<T, RuntimeError> {
+  private closeOperations(): RuntimeEffect<void, never> {
+    const drain: RuntimeEffect<void, never> = Effect.suspend(() =>
+      Queue.poll(this.operations).pipe(
+        Effect.flatMap((request) =>
+          Option.isNone(request) ? Effect.void : request.value.fail.pipe(Effect.andThen(drain)),
+        ),
+      ),
+    );
+    return drain.pipe(Effect.andThen(Queue.shutdown(this.operations)), Effect.asVoid);
+  }
+
+  private submit<T>(effect: RuntimeEffect<T>): RuntimeEffect<T> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         yield* Deferred.await(this.ready);
         yield* this.acceptingEffect();
         const reply = yield* Deferred.make<T, RuntimeError>();
+        const stopped = new RuntimeStoppedError({ message: "Workstream runtime is stopped." });
         const run = Effect.exit(this.ownershipEffect().pipe(Effect.andThen(effect))).pipe(
           Effect.flatMap((exit) => Deferred.done(reply, exit)),
           Effect.asVoid,
         );
-        yield* Queue.offer(this.operations, { _tag: "Operation", run });
+        const offered = yield* Queue.offer(this.operations, {
+          run,
+          fail: Deferred.fail(reply, stopped).pipe(Effect.asVoid),
+        });
+        if (!offered) return yield* stopped;
         return yield* Effect.raceFirst(
           Deferred.await(reply),
           Deferred.await(this.applicationExit).pipe(
             Effect.flatMap((exit) =>
-              Exit.isFailure(exit)
+              Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
                 ? Effect.failCause(exit.cause)
-                : Effect.fail(
-                    new RuntimeStoppedError({
-                      message: "Workstream runtime is stopped.",
-                    }),
-                  ),
+                : Effect.fail(stopped),
             ),
           ),
         );
@@ -362,7 +304,7 @@ export class WorkstreamRuntime {
     );
   }
 
-  private acceptingEffect(): Effect.Effect<void, RuntimeStoppedError> {
+  private acceptingEffect(): RuntimeEffect<void, RuntimeStoppedError> {
     return Effect.flatMap(Ref.get(this.lifecycle), (state) =>
       state === "open"
         ? Effect.void
@@ -374,37 +316,31 @@ export class WorkstreamRuntime {
     );
   }
 
-  private heartbeatLoop(): Effect.Effect<void, RuntimeError> {
-    const heartbeat = Effect.try({
-      try: () => {
-        this.assertOwnership();
-        const lease = this.lease;
-        const registry = this.registry;
-        if (!lease || !registry) throw new Error("Heartbeat has no lease.");
-        this.lease = registry.renew(lease);
-      },
-      catch: (cause) =>
-        new RuntimeDependencyError({
-          dependency: "runtime",
-          operation: "renew registry lease",
-          cause,
-        }),
-    });
+  private heartbeatLoop(): RuntimeEffect<void> {
+    const heartbeat = Effect.flatMap(RuntimeLease, (lease) => lease.renew);
     return heartbeat.pipe(
       Effect.repeat(Schedule.spaced("5 seconds")),
       Effect.asVoid,
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),
-        (cause) =>
-          Effect.sync(() => {
-            const failure = Cause.squash(cause);
-            this.onError(failure instanceof Error ? failure : new Error(String(failure)));
-          }).pipe(Effect.andThen(Queue.offer(this.operations, { _tag: "Stop" })), Effect.asVoid),
+        (cause) => {
+          const failure = Cause.squash(cause);
+          const error = failure instanceof Error ? failure : new Error(String(failure));
+          const fatal =
+            failure instanceof LeaseDecisionRequiredError || failure instanceof RuntimeRegistryError
+              ? failure
+              : new RuntimeRegistryError({ operation: "renew registry lease", cause: failure });
+          return Effect.flatMap(RuntimeHost, (host) => host.error(error)).pipe(
+            Effect.ignore,
+            Effect.andThen(Deferred.fail(this.fatal, fatal)),
+            Effect.asVoid,
+          );
+        },
       ),
     );
   }
 
-  private reconciliationLoop(): Effect.Effect<void, RuntimeError> {
+  private reconciliationLoop(): RuntimeEffect<void> {
     return Effect.sleep("1 second").pipe(
       Effect.andThen(this.submit(this.reconcileOperation())),
       Effect.tap(() => Effect.sync(() => (this.reconciliationError = undefined))),
@@ -414,12 +350,9 @@ export class WorkstreamRuntime {
           const failure = Cause.squash(cause);
           const error = failure instanceof Error ? failure : new Error(String(failure));
           const detail = error.message;
-          return Effect.sync(() => {
-            if (detail !== this.reconciliationError) {
-              this.reconciliationError = detail;
-              this.onError(error);
-            }
-          });
+          if (detail === this.reconciliationError) return Effect.void;
+          this.reconciliationError = detail;
+          return Effect.flatMap(RuntimeHost, (host) => host.error(error)).pipe(Effect.ignore);
         },
       ),
       Effect.repeat(Schedule.forever),
@@ -429,9 +362,16 @@ export class WorkstreamRuntime {
 
   private reconciliationError: string | undefined;
 
-  /** Pi's extension contract is Promise-based; internal work enters through this typed Effect boundary. */
+  /** Pi's extension contract is Promise-based; this is the remaining outward host boundary. */
   perform<T>(operation: () => Promise<T>): Promise<T> {
-    return this.runPromise(this.submit(this.dependency("pi", "host operation", operation)));
+    return this.runPromise(
+      this.submit(
+        Effect.tryPromise({
+          try: operation,
+          catch: (cause) => new RuntimeHostError({ operation: "host operation", cause }),
+        }),
+      ),
+    );
   }
 
   start(): void {
@@ -439,30 +379,25 @@ export class WorkstreamRuntime {
   }
 
   stop(): Promise<void> {
-    const previous = Effect.runSync(
-      Ref.modify(
-        this.lifecycle,
-        (state) => [state, state === "open" ? "stopping" : state] as const,
-      ),
+    if (this.stopRequest !== undefined) return this.stopRequest;
+    Effect.runSync(Ref.update(this.lifecycle, (state) => (state === "open" ? "stopping" : state)));
+    const shutdown = Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        yield* Fiber.interrupt(this.applicationFiber);
+        yield* Fiber.await(this.applicationFiber);
+        yield* Effect.tryPromise({
+          try: () => this.effectRuntime.dispose(),
+          catch: (cause) =>
+            new RuntimeRegistryError({ operation: "dispose runtime services", cause }),
+        });
+        yield* Ref.set(this.lifecycle, "stopped");
+      }.bind(this),
     );
-    if (previous === "stopped") return Promise.resolve();
-    const waitForExit = Deferred.await(this.applicationExit).pipe(Effect.asVoid);
-    const shutdown =
-      previous === "open"
-        ? Deferred.await(this.ready).pipe(
-            Effect.matchEffect({
-              onFailure: () => Effect.void,
-              onSuccess: () => Queue.offer(this.operations, { _tag: "Stop" }),
-            }),
-            Effect.andThen(waitForExit),
-          )
-        : waitForExit;
-    return this.runPromise(shutdown)
-      .catch(() => undefined)
-      .then(() => this.effectRuntime.dispose());
+    this.stopRequest = Effect.runPromise(shutdown);
+    return this.stopRequest;
   }
 
-  private runPromise<T, E>(effect: Effect.Effect<T, E>): Promise<T> {
+  private runPromise<T, E>(effect: Effect.Effect<T, E, RuntimeServices>): Promise<T> {
     if (Ref.getUnsafe(this.lifecycle) === "stopped")
       return Promise.reject(new RuntimeStoppedError({ message: "Workstream runtime is stopped." }));
     return this.effectRuntime.runPromiseExit(effect).then((exit) => {
@@ -482,20 +417,17 @@ export class WorkstreamRuntime {
   private queueEffect(
     input: Parameters<WorkstreamStore["assign"]>[0],
     options: QueueOptions,
-  ): Effect.Effect<WorkstreamState, RuntimeError> {
+  ): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const policy =
-          this.policy ?? (yield* this.dependency("runtime", "load model policy", loadModelPolicy));
+        const policy = yield* (yield* RuntimePolicy).policy;
         const baseRevision = yield* this.resolveQueueBaseEffect(input, options);
         const attempts = yield* this.runtimeSync("prepare queued attempt", () =>
           input.capability === "implement"
             ? implementationAttempt(policy, options, baseRevision)
             : selectedAttempts(input.capability, policy, options, baseRevision),
         );
-        return yield* this.dependency("store", "enqueue assignment", () =>
-          this.store.enqueue(input, attempts),
-        );
+        return yield* this.storeEffect((store) => store.enqueue(input, attempts));
       }.bind(this),
     );
   }
@@ -503,7 +435,7 @@ export class WorkstreamRuntime {
   private resolveQueueBaseEffect(
     input: Parameters<WorkstreamStore["assign"]>[0],
     options: QueueOptions,
-  ): Effect.Effect<string | undefined, RuntimeError> {
+  ): RuntimeEffect<string | undefined> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const subjectRevision =
@@ -522,62 +454,48 @@ export class WorkstreamRuntime {
           input.capability === "implement" || input.artifactIntent === "disposable_experiment";
         const repositoryHead =
           options.baseRevision === undefined && subjectRevision === undefined && isolated
-            ? yield* this.dependency("git", "read queue base", () => this.repository.head())
+            ? yield* this.gitEffect((repository) => repository.head())
             : undefined;
         const requested = options.baseRevision ?? subjectRevision ?? repositoryHead;
         return requested === undefined
           ? undefined
-          : yield* this.dependency("git", "resolve queue base", () =>
-              this.repository.resolveRevision(requested),
-            );
+          : yield* this.gitEffect((repository) => repository.resolveRevision(requested));
       }.bind(this),
     );
   }
 
-  private reconcileOperation(): Effect.Effect<WorkstreamState, RuntimeError> {
+  private reconcileOperation(): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const initial = yield* this.dependency("store", "load reconciliation state", () =>
-          this.store.load(),
-        );
+        const initial = yield* this.storeEffect((store) => store.load());
         if (initial.lifecycle.state !== "active" && initial.lifecycle.state !== "suspended")
           return initial;
         yield* Effect.forEach(initial.attempts, (attempt) => this.reconcileAttempt(attempt), {
           discard: true,
         });
-        const state = yield* this.dependency("store", "load delivery state", () =>
-          this.store.load(),
-        );
+        const state = yield* this.storeEffect((store) => store.load());
         if (state.lifecycle.state === "active")
           yield* Effect.forEach(state.deliveries, (delivery) => this.reconcileDelivery(delivery), {
             discard: true,
           });
-        const reconciled = yield* this.dependency("store", "load reconciled state", () =>
-          this.store.load(),
-        );
-        yield* Effect.sync(() => this.onState(reconciled));
+        const reconciled = yield* this.storeEffect((store) => store.load());
+        yield* (yield* RuntimeHost).state(reconciled);
         return reconciled;
       }.bind(this),
     );
   }
 
-  private reconcileAttempt(
-    item: WorkstreamState["attempts"][number],
-  ): Effect.Effect<void, RuntimeError> {
+  private reconcileAttempt(item: WorkstreamState["attempts"][number]): RuntimeEffect<void> {
     const operation = Effect.gen(
       function* (this: WorkstreamRuntime) {
         // Cleanup is terminal; delivery is reconciled independently.
         if (item.cleanup?.state === "completed") {
           if (item.error !== undefined)
-            yield* this.dependency("store", "clear terminal attention", () =>
-              this.store.clearAttention(item.id),
-            );
+            yield* this.storeEffect((store) => store.clearAttention(item.id));
           return;
         }
         yield* this.advance(item.id);
-        const state = yield* this.dependency("store", "load advanced attempt", () =>
-          this.store.load(),
-        );
+        const state = yield* this.storeEffect((store) => store.load());
         const advanced = findAttempt(state, item.id);
         const blocked = blockedDetail(advanced);
         if (blocked !== undefined)
@@ -585,59 +503,43 @@ export class WorkstreamRuntime {
             throw new Error(blocked);
           });
         if (advanced.error !== undefined)
-          yield* this.dependency("store", "clear attempt attention", () =>
-            this.store.clearAttention(item.id),
-          );
+          yield* this.storeEffect((store) => store.clearAttention(item.id));
       }.bind(this),
     );
     return operation.pipe(Effect.catch((error) => this.recordAttemptFailure(item.id, error)));
   }
 
-  private recordAttemptFailure(id: string, error: RuntimeError): Effect.Effect<void, RuntimeError> {
+  private recordAttemptFailure(id: string, error: RuntimeError): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const latest = yield* this.dependency("store", "load failed attempt", () =>
-          this.store.load(),
-        );
+        const latest = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(latest, id);
         if (attempt.error === error.message) return;
-        yield* this.dependency("store", "record attempt attention", () =>
-          this.store.recordAttention(id, error.message),
-        );
-        yield* Effect.sync(() => this.onError(new Error(`Attempt ${id}: ${error.message}`)));
+        yield* this.storeEffect((store) => store.recordAttention(id, error.message));
+        yield* (yield* RuntimeHost).error(new Error(`Attempt ${id}: ${error.message}`));
       }.bind(this),
     );
   }
 
-  private reconcileDelivery(
-    delivery: WorkstreamState["deliveries"][number],
-  ): Effect.Effect<void, RuntimeError> {
+  private reconcileDelivery(delivery: WorkstreamState["deliveries"][number]): RuntimeEffect<void> {
     if (delivery.state !== "pending" || delivery.attemptedBy === this.deliveryOwner)
       return Effect.void;
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        yield* this.dependency("store", "record delivery attempt", () =>
-          this.store.deliveryAttempt(delivery.resultId, this.deliveryOwner),
+        yield* this.storeEffect((store) =>
+          store.deliveryAttempt(delivery.resultId, this.deliveryOwner),
         );
-        const latest = yield* this.dependency("store", "load result delivery payload", () =>
-          this.store.load(),
-        );
+        const latest = yield* this.storeEffect((store) => store.load());
         const deliveryEffect = this.ownershipEffect().pipe(
           Effect.andThen(
-            this.dependency("pi", "deliver retained result", () =>
-              Promise.resolve(this.onResult(delivery.resultId, latest)),
-            ),
+            Effect.flatMap(RuntimeHost, (host) => host.deliver(delivery.resultId, latest)),
           ),
-          Effect.andThen(
-            this.dependency("store", "mark result delivered", () =>
-              this.store.markDelivered(delivery.resultId),
-            ),
-          ),
+          Effect.andThen(this.storeEffect((store) => store.markDelivered(delivery.resultId))),
         );
         yield* deliveryEffect.pipe(
           Effect.catch((error) =>
-            this.dependency("store", "record delivery failure", () =>
-              this.store.deliveryAttempt(delivery.resultId, this.deliveryOwner, error.message),
+            this.storeEffect((store) =>
+              store.deliveryAttempt(delivery.resultId, this.deliveryOwner, error.message),
             ),
           ),
         );
@@ -649,12 +551,10 @@ export class WorkstreamRuntime {
     return this.runPromise(this.submit(this.reconcileOperation()));
   }
 
-  private advance(id: string): Effect.Effect<void, RuntimeError> {
+  private advance(id: string): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const state = yield* this.dependency("store", "load attempt to advance", () =>
-          this.store.load(),
-        );
+        const state = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(state, id);
         const assignment = findAssignment(state, attempt.assignmentId);
         if (attempt.cleanup?.state === "completed") return;
@@ -663,6 +563,12 @@ export class WorkstreamRuntime {
             yield* this.launchAttempt(state, attempt, assignment);
           return;
         }
+        if (attempt.state === "starting" && attempt.sessionFile === undefined)
+          return yield* this.runtimeSync("validate worker session checkpoint", () => {
+            throw new Error(
+              "Worker session creation did not reach its retained checkpoint. Herdr launch was not invoked; inspect the Pi session directory before retrying session creation.",
+            );
+          });
         if (hasRetainedSession(attempt)) yield* this.reconcileWorker(state, attempt, assignment);
         yield* this.advanceRetainedResult(id, assignment);
       }.bind(this),
@@ -673,7 +579,7 @@ export class WorkstreamRuntime {
     state: WorkstreamState,
     initial: WorkAttempt,
     assignment: WorkAssignment,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const attempt =
@@ -681,16 +587,13 @@ export class WorkstreamRuntime {
             ? yield* this.recoverWorker(state, initial, assignment)
             : initial;
         const worker = required(attempt.worker, "worker identity");
-        const observation = yield* this.dependency("herdr", "observe worker", () =>
-          this.workers.observe(worker),
-        );
-        const started = hasNativeAgentStarted(worker.sessionFile, state.id, attempt.id);
+        const observation = yield* this.herdrEffect((workers) => workers.observe(worker));
+        const pi = yield* RuntimePi;
+        const started = pi.started(worker.sessionFile, state.id, attempt.id);
         if (started && attempt.submission !== "started")
-          yield* this.dependency("store", "record native worker start", () =>
-            this.store.markSubmission(attempt.id, "started"),
-          );
+          yield* this.storeEffect((store) => store.markSubmission(attempt.id, "started"));
         if (yield* this.resumeUnsentWorker(state, attempt, observation.status, started)) return;
-        if (!hasNativeAgentSettled(worker.sessionFile, state.id, attempt.id)) {
+        if (!pi.settled(worker.sessionFile, state.id, attempt.id)) {
           yield* this.validateUnsettledWorker(attempt, observation.status, started);
           return;
         }
@@ -704,31 +607,19 @@ export class WorkstreamRuntime {
     state: WorkstreamState,
     attempt: WorkAttempt,
     assignment: WorkAssignment,
-  ): Effect.Effect<WorkAttempt, RuntimeError> {
+  ): RuntimeEffect<WorkAttempt> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        if (this.workers.recover === undefined)
-          return yield* this.runtimeSync("validate worker recovery", () => {
-            throw new Error("Worker transport cannot reconcile retained launch identity.");
-          });
         const request = workerRecoveryRequest(this.launch.workspaceId, state, attempt, assignment);
-        const recovered = yield* this.dependency(
-          "herdr",
-          "recover worker identity",
-          () => this.workers.recover?.(request) ?? Promise.resolve(undefined),
-        );
+        const recovered = yield* this.herdrEffect((workers) => workers.recover(request));
         if (recovered === undefined)
           return yield* this.runtimeSync("validate recovered worker", () => {
             throw new Error(
               "Retained launch has no proven live identity; inspect before replacing it.",
             );
           });
-        yield* this.dependency("store", "record recovered worker", () =>
-          this.store.recordWorker(attempt.id, recovered.identity),
-        );
-        const latest = yield* this.dependency("store", "reload recovered worker", () =>
-          this.store.load(),
-        );
+        yield* this.storeEffect((store) => store.recordWorker(attempt.id, recovered.identity));
+        const latest = yield* this.storeEffect((store) => store.load());
         return findAttempt(latest, attempt.id);
       }.bind(this),
     );
@@ -737,42 +628,32 @@ export class WorkstreamRuntime {
   private resumeUnsentWorker(
     state: WorkstreamState,
     attempt: WorkAttempt,
-    status: Awaited<ReturnType<VisibleWorkerRuntime["observe"]>>["status"],
+    status: "idle" | "working" | "blocked" | "done" | "unknown",
     started: boolean,
-  ): Effect.Effect<boolean, RuntimeError> {
+  ): RuntimeEffect<boolean> {
     if (attempt.submission !== "not_sent" || started || state.lifecycle.state !== "active")
       return Effect.succeed(false);
-    if (this.workers.steer === undefined || (status !== "idle" && status !== "done"))
+    if (status !== "idle" && status !== "done")
       return this.runtimeSync("validate retained submission", () => {
         throw new Error("Worker is not ready for the retained unsent objective.");
       });
     const worker = required(attempt.worker, "worker identity");
-    return this.dependency("store", "mark submission uncertain", () =>
-      this.store.markSubmission(attempt.id, "uncertain"),
-    ).pipe(
+    return this.storeEffect((store) => store.markSubmission(attempt.id, "uncertain")).pipe(
       Effect.andThen(
-        this.dependency(
-          "herdr",
-          "resume retained worker",
-          () =>
-            this.workers.steer?.(worker, "Continue the assigned Workgraph objective now.") ??
-            Promise.resolve(),
+        this.herdrEffect((workers) =>
+          workers.steer(worker, "Continue the assigned Workgraph objective now."),
         ),
       ),
-      Effect.andThen(
-        this.dependency("store", "mark submission sent", () =>
-          this.store.markSubmission(attempt.id, "submitted"),
-        ),
-      ),
+      Effect.andThen(this.storeEffect((store) => store.markSubmission(attempt.id, "submitted"))),
       Effect.as(true),
     );
   }
 
   private validateUnsettledWorker(
     attempt: WorkAttempt,
-    status: Awaited<ReturnType<VisibleWorkerRuntime["observe"]>>["status"],
+    status: "idle" | "working" | "blocked" | "done" | "unknown",
     started: boolean,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return this.runtimeSync("validate unsettled worker", () => {
       if (status === "blocked")
         throw new Error("Worker is blocked; inspect its visible session before proceeding.");
@@ -784,21 +665,14 @@ export class WorkstreamRuntime {
     });
   }
 
-  private advanceRetainedResult(
-    id: string,
-    assignment: WorkAssignment,
-  ): Effect.Effect<void, RuntimeError> {
+  private advanceRetainedResult(id: string, assignment: WorkAssignment): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        let state = yield* this.dependency("store", "load retained result", () =>
-          this.store.load(),
-        );
+        let state = yield* this.storeEffect((store) => store.load());
         let attempt = findAttempt(state, id);
         if (attempt.artifactRetention?.state === "pending") {
           yield* this.resumePendingArtifactRetention(state, attempt);
-          state = yield* this.dependency("store", "reload resumed artifact retention", () =>
-            this.store.load(),
-          );
+          state = yield* this.storeEffect((store) => store.load());
           attempt = findAttempt(state, id);
         }
         if (attempt.resultId === undefined) return;
@@ -808,9 +682,7 @@ export class WorkstreamRuntime {
             throw new Error("Retained attempt result is missing.");
           });
         if (!state.deliveries.some((delivery) => delivery.resultId === result.id))
-          yield* this.dependency("store", "request result delivery", () =>
-            this.store.requestDelivery(result.id),
-          );
+          yield* this.storeEffect((store) => store.requestDelivery(result.id));
         yield* this.runtimeSync("validate implementation result", () =>
           validateImplementationResult(assignment, result),
         );
@@ -818,7 +690,7 @@ export class WorkstreamRuntime {
           if (state.lifecycle.state !== "active") return;
           yield* this.compose(state, attempt, assignment);
         }
-        state = yield* this.dependency("store", "reload cleanup state", () => this.store.load());
+        state = yield* this.storeEffect((store) => store.load());
         attempt = findAttempt(state, id);
         yield* this.beginCleanupIfNeeded(attempt, assignment);
         yield* this.cleanup(id);
@@ -829,7 +701,7 @@ export class WorkstreamRuntime {
   private beginCleanupIfNeeded(
     attempt: WorkAttempt,
     assignment: WorkAssignment,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     if (
       attempt.cleanup !== undefined ||
       attempt.placement === undefined ||
@@ -843,12 +715,10 @@ export class WorkstreamRuntime {
           discard: assignment.artifactIntent === "disposable_experiment",
         };
         if (attempt.placement?.kind === "isolated_worktree")
-          input.expectedHead = yield* this.dependency("git", "read cleanup head", () =>
-            this.repository.head(attempt.placement?.path),
+          input.expectedHead = yield* this.gitEffect((repository) =>
+            repository.head(attempt.placement?.path),
           );
-        yield* this.dependency("store", "begin attempt cleanup", () =>
-          this.store.beginCleanup(input),
-        );
+        yield* this.storeEffect((store) => store.beginCleanup(input));
       }.bind(this),
     );
   }
@@ -857,7 +727,7 @@ export class WorkstreamRuntime {
     state: WorkstreamState,
     attempt: WorkAttempt,
     assignment: WorkAssignment,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const isolated =
@@ -865,8 +735,8 @@ export class WorkstreamRuntime {
           assignment.artifactIntent === "disposable_experiment";
         const baseRevision = attempt.baseRevision;
         const placement = isolated
-          ? yield* this.dependency("git", "create worker worktree", () =>
-              this.repository.createWorktree(
+          ? yield* this.gitEffect((repository) =>
+              repository.createWorktree(
                 state.id,
                 attempt.id,
                 required(baseRevision, "base revision"),
@@ -886,9 +756,7 @@ export class WorkstreamRuntime {
                 },
         };
         if (baseRevision !== undefined) start.baseRevision = baseRevision;
-        yield* this.dependency("store", "start worker attempt", () =>
-          this.store.startAttempt(start),
-        );
+        yield* this.storeEffect((store) => store.startAttempt(start));
         const sessionRequest = workerSessionRequest(
           state,
           attempt,
@@ -896,12 +764,9 @@ export class WorkstreamRuntime {
           workerCwd,
           baseRevision,
         );
-        const sessionFile = yield* this.dependency("pi", "create worker session", () =>
-          createWorkerSession(sessionRequest),
-        );
-        yield* this.dependency("store", "record worker session", () =>
-          this.store.recordSessionFile(attempt.id, sessionFile),
-        );
+        const pi = yield* RuntimePi;
+        const sessionFile = yield* pi.createSession(sessionRequest);
+        yield* this.storeEffect((store) => store.recordSessionFile(attempt.id, sessionFile));
         const models = required(attempt.models, "assignment models");
         yield* this.ownershipEffect();
         const request = workerLaunchRequest(
@@ -915,7 +780,7 @@ export class WorkstreamRuntime {
           baseRevision,
           this.store,
         );
-        yield* this.dependency("herdr", "launch worker", () => this.workers.launch(request));
+        yield* this.herdrEffect((workers) => workers.launch(request));
       }.bind(this),
     );
   }
@@ -924,7 +789,7 @@ export class WorkstreamRuntime {
     state: WorkstreamState,
     attempt: WorkAttempt,
     assignment: WorkAssignment,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const sessionFile = required(attempt.sessionFile, "session");
@@ -933,19 +798,13 @@ export class WorkstreamRuntime {
         const resultId = attempt.resultId ?? `result-${attempt.id}`;
         if (!state.results.some((item) => item.id === resultId))
           yield* this.retainNewResult(state, attempt, assignment, sessionFile, resultId);
-        const retainedState = yield* this.dependency("store", "reload artifact retention", () =>
-          this.store.load(),
-        );
+        const retainedState = yield* this.storeEffect((store) => store.load());
         yield* this.advanceArtifactRetention(retainedState, findAttempt(retainedState, attempt.id));
-        const effectiveModels = yield* this.runtimeSync("read effective model observations", () =>
-          effectiveModelObservations(sessionFile, generation),
+        const effectiveModels = yield* (yield* RuntimePi).models(sessionFile, generation);
+        yield* this.storeEffect((store) =>
+          store.settleAttempt({ id: attempt.id, resultId, effectiveModels }),
         );
-        yield* this.dependency("store", "settle worker attempt", () =>
-          this.store.settleAttempt({ id: attempt.id, resultId, effectiveModels }),
-        );
-        yield* this.dependency("store", "request retained result delivery", () =>
-          this.store.requestDelivery(resultId),
-        );
+        yield* this.storeEffect((store) => store.requestDelivery(resultId));
       }.bind(this),
     );
   }
@@ -956,13 +815,12 @@ export class WorkstreamRuntime {
     assignment: WorkAssignment,
     sessionFile: string,
     resultId: string,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const generation = { runId: state.id, nodeId: attempt.id };
-        const read = yield* this.runtimeSync("read worker report", () =>
-          readWorkgraphReportResult(sessionFile, generation),
-        );
+        const pi = yield* RuntimePi;
+        const read = yield* pi.readReport(sessionFile, generation);
         const base = {
           id: resultId,
           assignmentId: assignment.id,
@@ -973,8 +831,8 @@ export class WorkstreamRuntime {
           return;
         }
         if (read.report !== undefined || read.invalid || read.unreadable) {
-          yield* this.dependency("store", "retain invalid worker result", () =>
-            this.store.retainResult({
+          yield* this.storeEffect((store) =>
+            store.retainResult({
               ...base,
               validity: "invalid",
               detail:
@@ -983,20 +841,16 @@ export class WorkstreamRuntime {
           );
           return;
         }
-        const text = yield* this.runtimeSync("read terminal worker text", () =>
-          readTerminalText(sessionFile, generation),
-        );
+        const text = yield* pi.readText(sessionFile, generation);
         if (text !== undefined && text !== "") {
-          yield* this.dependency("store", "retain untyped worker result", () =>
-            this.store.retainResult({ ...base, validity: "untyped", text }),
+          yield* this.storeEffect((store) =>
+            store.retainResult({ ...base, validity: "untyped", text }),
           );
           return;
         }
-        const nativeFailure = yield* this.runtimeSync("observe native worker failure", () =>
-          observeNativeFailure(sessionFile, generation),
-        );
-        yield* this.dependency("store", "retain absent worker result", () =>
-          this.store.retainResult({
+        const nativeFailure = yield* pi.observeFailure(sessionFile, generation);
+        yield* this.storeEffect((store) =>
+          store.retainResult({
             ...base,
             validity: "absent",
             detail: absentResultDetail(nativeFailure),
@@ -1011,24 +865,22 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     assignment: WorkAssignment,
     base: { id: string; assignmentId: string; assignmentIntentVersion: number },
-    report: NonNullable<ReturnType<typeof readWorkgraphReportResult>["report"]>,
-  ): Effect.Effect<void, RuntimeError> {
+    report: WorkerReport,
+  ): RuntimeEffect<void> {
     if (isNoChangeImplementation(assignment, report))
-      return this.dependency("git", "validate no-change worker", () =>
-        this.repository.validateWorkerNoChange(placementOf(attempt), report.revision),
+      return this.gitEffect((repository) =>
+        repository.validateWorkerNoChange(placementOf(attempt), report.revision),
       ).pipe(
         Effect.andThen(
-          this.dependency("store", "retain typed worker result", () =>
-            this.store.retainResult({ ...base, validity: "typed", report }),
-          ),
+          this.storeEffect((store) => store.retainResult({ ...base, validity: "typed", report })),
         ),
         Effect.catch((error) => this.retainFailedNoChange(attempt, base, error)),
         Effect.asVoid,
       );
     if (assignment.artifactIntent === "disposable_experiment" && report.status === "completed")
       return this.checkpointArtifactRetention(state, attempt, assignment, base, report);
-    return this.dependency("store", "retain typed worker result", () =>
-      this.store.retainResult({ ...base, validity: "typed", report }),
+    return this.storeEffect((store) =>
+      store.retainResult({ ...base, validity: "typed", report }),
     ).pipe(Effect.asVoid);
   }
 
@@ -1037,22 +889,20 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     assignment: Extract<WorkAssignment, { artifactIntent: "disposable_experiment" }>,
     base: { id: string; assignmentId: string; assignmentIntentVersion: number },
-    report: NonNullable<ReturnType<typeof readWorkgraphReportResult>["report"]>,
-  ): Effect.Effect<void, RuntimeError> {
+    report: WorkerReport,
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const placement = required(
           attempt.placement?.kind === "isolated_worktree" ? attempt.placement.path : undefined,
           "experiment worktree",
         );
-        const { sourceRoot, sourceIdentity } = yield* this.artifactOperation(
-          ArtifactStore.use((store) => store.checkpointSource(placement)),
+        const { sourceRoot, sourceIdentity } = yield* ArtifactStore.use((store) =>
+          store.checkpointSource(placement),
         );
-        const expectedHead = yield* this.dependency("git", "checkpoint experiment head", () =>
-          this.repository.head(placement),
-        );
-        yield* this.dependency("store", "retain report and checkpoint artifacts", () =>
-          this.store.retainResultPendingArtifacts({
+        const expectedHead = yield* this.gitEffect((repository) => repository.head(placement));
+        yield* this.storeEffect((store) =>
+          store.retainResultPendingArtifacts({
             attemptId: attempt.id,
             ...base,
             report,
@@ -1072,11 +922,11 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     base: { id: string; assignmentId: string; assignmentIntentVersion: number },
     error: RuntimeError,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        yield* this.dependency("store", "retain failed no-change result", () =>
-          this.store.retainResult({
+        yield* this.storeEffect((store) =>
+          store.retainResult({
             ...base,
             validity: "invalid",
             detail: `No-change validation failed: ${error.message}`,
@@ -1087,15 +937,11 @@ export class WorkstreamRuntime {
           discard: false,
         };
         if (attempt.placement?.kind === "isolated_worktree")
-          cleanup.expectedHead = yield* this.dependency("git", "read failed validation head", () =>
-            this.repository.head(attempt.placement?.path),
+          cleanup.expectedHead = yield* this.gitEffect((repository) =>
+            repository.head(attempt.placement?.path),
           );
-        yield* this.dependency("store", "begin blocked validation cleanup", () =>
-          this.store.beginCleanup(cleanup),
-        );
-        yield* this.dependency("store", "block failed validation cleanup", () =>
-          this.store.blockCleanup(attempt.id, error.message),
-        );
+        yield* this.storeEffect((store) => store.beginCleanup(cleanup));
+        yield* this.storeEffect((store) => store.blockCleanup(attempt.id, error.message));
       }.bind(this),
     );
   }
@@ -1104,7 +950,7 @@ export class WorkstreamRuntime {
     state: WorkstreamState,
     attempt: WorkAttempt,
     assignment: WorkAssignment,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     if (attempt.composition?.state === "blocked") return Effect.void;
     if (attempt.composition?.state === "composed")
       return this.recordCompositionArtifact(
@@ -1118,7 +964,7 @@ export class WorkstreamRuntime {
       function* (this: WorkstreamRuntime) {
         const expectedHead =
           attempt.composition?.expectedHead ??
-          (yield* this.dependency("git", "read composition head", () => this.repository.head()));
+          (yield* this.gitEffect((repository) => repository.head()));
         const operation = this.applyComposition(attempt, assignment, commit, expectedHead);
         yield* operation.pipe(
           Effect.catch((error) => this.recoverComposition(attempt, commit, expectedHead, error)),
@@ -1132,39 +978,33 @@ export class WorkstreamRuntime {
     assignment: WorkAssignment,
     commit: string,
     expectedHead: string,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         if (attempt.composition === undefined) {
-          yield* this.dependency("git", "validate worker commit", () =>
-            this.repository.validateWorkerCommit(placementOf(attempt), commit),
+          yield* this.gitEffect((repository) =>
+            repository.validateWorkerCommit(placementOf(attempt), commit),
           );
-          yield* this.dependency("store", "begin composition", () =>
-            this.store.beginComposition({ id: attempt.id, commit, expectedHead }),
+          yield* this.storeEffect((store) =>
+            store.beginComposition({ id: attempt.id, commit, expectedHead }),
           );
         }
-        const state = yield* this.dependency("store", "load composition intent", () =>
-          this.store.load(),
-        );
+        const state = yield* this.storeEffect((store) => store.load());
         yield* this.runtimeSync("validate current composition intent", () => {
           if (!this.store.isAssignmentCurrent(state, assignment.id))
             throw new Error("Intent changed; retained implementation is stale and cannot compose.");
         });
         yield* this.ownershipEffect();
-        const recovery = yield* this.dependency("git", "inspect composition", () =>
-          this.repository.recoverComposition(expectedHead, {
+        const recovery = yield* this.gitEffect((repository) =>
+          repository.recoverComposition(expectedHead, {
             baseCommit: required(attempt.baseRevision, "base revision"),
             commit,
           }),
         );
         const revision =
           recovery?.head ??
-          (yield* this.dependency("git", "compose worker commit", () =>
-            this.repository.compose(commit, expectedHead),
-          ));
-        yield* this.dependency("store", "finish composition", () =>
-          this.store.finishComposition(attempt.id, revision),
-        );
+          (yield* this.gitEffect((repository) => repository.compose(commit, expectedHead)));
+        yield* this.storeEffect((store) => store.finishComposition(attempt.id, revision));
         yield* this.recordCompositionArtifact(attempt, revision, `Composed ${commit}.`);
       }.bind(this),
     );
@@ -1175,25 +1015,24 @@ export class WorkstreamRuntime {
     commit: string,
     expectedHead: string,
     originalError: RuntimeError,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     // A command or persistence error can occur after Git changed HEAD. Inspect before retry.
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const recovered = yield* this.dependency("git", "recover failed composition", () =>
-          this.repository.recoverComposition(expectedHead, {
+        const recovery = yield* this.gitEffect((repository) =>
+          repository.recoverComposition(expectedHead, {
             baseCommit: required(attempt.baseRevision, "base revision"),
             commit,
           }),
-        ).pipe(Effect.catch(() => Effect.void));
-        if (recovered === undefined) {
-          yield* this.dependency("store", "block failed composition", () =>
-            this.store.blockComposition(attempt.id, originalError.message),
+        ).pipe(Effect.option);
+        if (Option.isNone(recovery) || recovery.value === undefined) {
+          yield* this.storeEffect((store) =>
+            store.blockComposition(attempt.id, originalError.message),
           );
           return;
         }
-        yield* this.dependency("store", "finish recovered composition", () =>
-          this.store.finishComposition(attempt.id, recovered.head),
-        );
+        const recovered = recovery.value;
+        yield* this.storeEffect((store) => store.finishComposition(attempt.id, recovered.head));
         yield* this.recordCompositionArtifact(
           attempt,
           recovered.head,
@@ -1207,9 +1046,9 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     revision: string,
     summary: string,
-  ): Effect.Effect<void, RuntimeError> {
-    return this.dependency("store", "record composition artifact", () =>
-      this.store.addResultArtifacts(required(attempt.resultId, "result"), [
+  ): RuntimeEffect<void> {
+    return this.storeEffect((store) =>
+      store.addResultArtifacts(required(attempt.resultId, "result"), [
         {
           id: "maintained-revision",
           kind: "revision",
@@ -1224,7 +1063,7 @@ export class WorkstreamRuntime {
   private advanceArtifactRetention(
     state: WorkstreamState,
     attempt: WorkAttempt,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     const retention = attempt.artifactRetention;
     if (retention?.state !== "pending") return Effect.void;
     const operation = Effect.gen(
@@ -1233,31 +1072,23 @@ export class WorkstreamRuntime {
         yield* this.verifyArtifactRetentionSource(attempt, retention);
         yield* this.ownershipEffect();
         const artifacts = yield* Effect.forEach(retention.required, (name) =>
-          this.artifactOperation(
-            ArtifactStore.use((store) =>
-              store.retain({ retention, name }, ({ fingerprint }) =>
-                this.guardArtifactRetentionMutation(retention, name, fingerprint),
-              ),
+          ArtifactStore.use((store) =>
+            store.retain({ retention, name }, ({ fingerprint }) =>
+              this.guardArtifactRetentionMutation(retention, name, fingerprint),
             ),
           ),
         );
-        const latest = yield* this.dependency("store", "reload artifact retention completion", () =>
-          this.store.load(),
-        );
+        const latest = yield* this.storeEffect((store) => store.load());
         const latestAttempt = findAttemptByRetention(latest, retention.resultId);
         yield* this.validateArtifactRetentionCheckpoint(latest, latestAttempt, retention);
         yield* this.verifyArtifactRetentionSource(latestAttempt, retention);
         yield* this.ownershipEffect();
-        yield* this.dependency("store", "complete artifact retention", () =>
-          this.store.finishArtifactRetention(attempt.id, artifacts),
-        );
+        yield* this.storeEffect((store) => store.finishArtifactRetention(attempt.id, artifacts));
       }.bind(this),
     );
     return operation.pipe(
       Effect.catch((error) =>
-        this.dependency("store", "block artifact retention", () =>
-          this.store.blockArtifactRetention(attempt.id, error.message),
-        ),
+        this.storeEffect((store) => store.blockArtifactRetention(attempt.id, error.message)),
       ),
     );
   }
@@ -1266,7 +1097,7 @@ export class WorkstreamRuntime {
     state: WorkstreamState,
     attempt: WorkAttempt,
     expected?: ArtifactRetention,
-  ): Effect.Effect<ArtifactRetention, RuntimeError> {
+  ): RuntimeEffect<ArtifactRetention> {
     return this.runtimeSync("validate artifact retention intent", () => {
       const retention = required(attempt.artifactRetention, "artifact retention");
       const assignment = findAssignment(state, attempt.assignmentId);
@@ -1286,25 +1117,21 @@ export class WorkstreamRuntime {
   private verifyArtifactRetentionSource(
     attempt: WorkAttempt,
     retention: ArtifactRetention,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const placement = required(
           attempt.placement?.kind === "isolated_worktree" ? attempt.placement.path : undefined,
           "experiment worktree",
         );
-        yield* this.artifactOperation(
-          ArtifactStore.use((store) =>
-            store.verifySource({
-              placement,
-              sourceRoot: retention.sourceRoot,
-              sourceIdentity: retention.sourceIdentity,
-            }),
-          ),
+        yield* ArtifactStore.use((store) =>
+          store.verifySource({
+            placement,
+            sourceRoot: retention.sourceRoot,
+            sourceIdentity: retention.sourceIdentity,
+          }),
         );
-        const head = yield* this.dependency("git", "verify retained experiment head", () =>
-          this.repository.head(placement),
-        );
+        const head = yield* this.gitEffect((repository) => repository.head(placement));
         yield* this.runtimeSync("validate retained experiment identity", () => {
           if (
             head !== retention.expectedHead ||
@@ -1321,31 +1148,18 @@ export class WorkstreamRuntime {
     expected: ArtifactRetention,
     name: string,
     sourceFingerprint: string,
-  ): Effect.Effect<void, RuntimeError, ArtifactStore> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         yield* this.ownershipEffect();
-        let state = yield* this.dependency("store", "reload artifact retention fence", () =>
-          this.store.load(),
-        );
+        let state = yield* this.storeEffect((store) => store.load());
         let attempt = findAttemptByRetention(state, expected.resultId);
         const retention = yield* this.validateArtifactRetentionCheckpoint(state, attempt, expected);
         yield* this.verifyArtifactRetentionSource(attempt, retention);
         yield* ArtifactStore.use((store) =>
           store.verifyArtifact({ retention, name, fingerprint: sourceFingerprint }),
-        ).pipe(
-          Effect.mapError(
-            (cause) =>
-              new RuntimeDependencyError({
-                dependency: "runtime",
-                operation: "recheck experiment artifact at mutation fence",
-                cause,
-              }),
-          ),
         );
-        state = yield* this.dependency("store", "confirm artifact retention fence", () =>
-          this.store.load(),
-        );
+        state = yield* this.storeEffect((store) => store.load());
         attempt = findAttemptByRetention(state, expected.resultId);
         yield* this.validateArtifactRetentionCheckpoint(state, attempt, expected);
         yield* this.ownershipEffect();
@@ -1353,12 +1167,10 @@ export class WorkstreamRuntime {
     );
   }
 
-  private cleanup(id: string): Effect.Effect<void, RuntimeError> {
+  private cleanup(id: string): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const state = yield* this.dependency("store", "load cleanup state", () =>
-          this.store.load(),
-        );
+        const state = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(state, id);
         if (isLegacyArtifactRetentionFailure(state, attempt)) return;
         const cleanup = attempt.cleanup;
@@ -1372,9 +1184,7 @@ export class WorkstreamRuntime {
         const operation = this.cleanupAttempt(attempt, cleanup);
         yield* operation.pipe(
           Effect.catch((error) =>
-            this.dependency("store", "block attempt cleanup", () =>
-              this.store.blockCleanup(id, error.message),
-            ),
+            this.storeEffect((store) => store.blockCleanup(id, error.message)),
           ),
         );
       }.bind(this),
@@ -1384,29 +1194,23 @@ export class WorkstreamRuntime {
   private cleanupAttempt(
     attempt: WorkAttempt,
     cleanup: NonNullable<WorkAttempt["cleanup"]>,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         if (!cleanup.workerClosed) {
-          const result = yield* this.dependency("herdr", "cleanup worker", () =>
-            this.workers.cleanup === undefined
-              ? Promise.reject(new Error("Worker cleanup is not proven complete."))
-              : this.workers.cleanup(required(attempt.worker, "worker identity")),
+          const result = yield* this.herdrEffect((workers) =>
+            workers.cleanup(required(attempt.worker, "worker identity")),
           );
           if (result.state === "pending") return;
           if (result.state !== "completed")
             return yield* this.runtimeSync("validate worker cleanup result", () => {
               throw new Error(result.detail ?? "Worker cleanup is not proven complete.");
             });
-          yield* this.dependency("store", "mark worker closed", () =>
-            this.store.markWorkerClosed(attempt.id),
-          );
+          yield* this.storeEffect((store) => store.markWorkerClosed(attempt.id));
         }
         yield* this.ownershipEffect();
         yield* this.cleanupPlacement(attempt, cleanup);
-        yield* this.dependency("store", "finish attempt cleanup", () =>
-          this.store.finishCleanup(attempt.id),
-        );
+        yield* this.storeEffect((store) => store.finishCleanup(attempt.id));
       }.bind(this),
     );
   }
@@ -1414,7 +1218,7 @@ export class WorkstreamRuntime {
   private cleanupPlacement(
     attempt: WorkAttempt,
     cleanup: NonNullable<WorkAttempt["cleanup"]>,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     if (attempt.placement?.kind !== "isolated_worktree")
       return this.runtimeSync("validate shared cleanup", () => {
         if (cleanup.discard) throw new Error("Shared project cleanup cannot discard files.");
@@ -1422,15 +1226,11 @@ export class WorkstreamRuntime {
     const placement = placementOf(attempt);
     const expectedHead = required(cleanup.expectedHead, "expected worktree HEAD");
     const discard = cleanup.discard
-      ? this.dependency("git", "discard experiment", () =>
-          this.repository.discardExperiment(placement, expectedHead),
-        )
+      ? this.gitEffect((repository) => repository.discardExperiment(placement, expectedHead))
       : Effect.void;
     return discard.pipe(
       Effect.andThen(
-        this.dependency("git", "cleanup worktree", () =>
-          this.repository.cleanupWorktree(placement, expectedHead),
-        ),
+        this.gitEffect((repository) => repository.cleanupWorktree(placement, expectedHead)),
       ),
     );
   }
@@ -1449,20 +1249,18 @@ export class WorkstreamRuntime {
     action: "retry" | "retain_not_applied";
     reason: string;
     integratedRevision?: string;
-  }): Effect.Effect<WorkstreamState, RuntimeError> {
+  }): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         yield* this.runtimeSync("validate recovery request", () => validateRecoveryInput(input));
-        const state = yield* this.dependency("store", "load recovery state", () =>
-          this.store.load(),
-        );
+        const state = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(state, input.attemptId);
         yield* this.runtimeSync("validate legacy retention recovery", () => {
           if (isLegacyArtifactRetentionFailure(state, attempt))
             throw new Error(legacyArtifactRetentionLimitation());
         });
         yield* this.recoverBoundary(state, attempt, input);
-        return yield* this.dependency("store", "load recovered state", () => this.store.load());
+        return yield* this.storeEffect((store) => store.load());
       }.bind(this),
     );
   }
@@ -1475,7 +1273,7 @@ export class WorkstreamRuntime {
       reason: string;
       integratedRevision?: string;
     },
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     if (attempt.artifactRetention?.state === "pending")
       return this.recoverPendingArtifactRetention(state, attempt);
     if (attempt.artifactRetention?.state === "blocked")
@@ -1487,6 +1285,12 @@ export class WorkstreamRuntime {
         findAssignment(state, attempt.assignmentId),
         input.action,
       );
+    if (isUnlocatedCancelledLaunch(attempt))
+      return this.runtimeSync("validate unlocated cancelled launch", () => {
+        throw new Error(
+          "Cancelled launch has a retained session but no pane locator. Native tab creation remains uncertain after identity recovery found no worker; preserve the placement and inspect Herdr before cleanup.",
+        );
+      });
     if (attempt.composition?.state === "blocked")
       return this.recoverBlockedComposition(state, attempt, input);
     if (attempt.composition?.state === "retained_not_applied")
@@ -1504,11 +1308,9 @@ export class WorkstreamRuntime {
   private recoverPendingArtifactRetention(
     state: WorkstreamState,
     attempt: WorkAttempt,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return this.resumePendingArtifactRetention(state, attempt).pipe(
-      Effect.andThen(
-        this.dependency("store", "load pending artifact recovery", () => this.store.load()),
-      ),
+      Effect.andThen(this.storeEffect((store) => store.load())),
       Effect.flatMap((latest) => {
         const retainedAttempt = findAttempt(latest, attempt.id);
         if (retainedAttempt.resultId === undefined) return Effect.void;
@@ -1523,7 +1325,7 @@ export class WorkstreamRuntime {
   private resumePendingArtifactRetention(
     state: WorkstreamState,
     attempt: WorkAttempt,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
@@ -1536,7 +1338,7 @@ export class WorkstreamRuntime {
   private recoverBlockedArtifactRetention(
     state: WorkstreamState,
     attempt: WorkAttempt,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
@@ -1551,16 +1353,10 @@ export class WorkstreamRuntime {
           required(attempt.artifactRetention, "artifact retention"),
         );
         yield* this.ownershipEffect();
-        yield* this.dependency("store", "retry blocked artifact retention", () =>
-          this.store.retryArtifactRetention(attempt.id),
-        );
-        let latest = yield* this.dependency("store", "load retried artifact retention", () =>
-          this.store.load(),
-        );
+        yield* this.storeEffect((store) => store.retryArtifactRetention(attempt.id));
+        let latest = yield* this.storeEffect((store) => store.load());
         yield* this.advanceArtifactRetention(latest, findAttempt(latest, attempt.id));
-        latest = yield* this.dependency("store", "load retained artifacts", () =>
-          this.store.load(),
-        );
+        latest = yield* this.storeEffect((store) => store.load());
         const retainedAttempt = findAttempt(latest, attempt.id);
         if (retainedAttempt.artifactRetention?.state !== "completed") return;
         const assignment = findAssignment(latest, attempt.assignmentId);
@@ -1575,27 +1371,17 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     assignment: WorkAssignment,
     action: "retry" | "retain_not_applied",
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         if (action !== "retry")
           return yield* this.runtimeSync("validate cancelled launch recovery", () => {
             throw new Error("Identity-less cancelled launch recovery only supports recover.");
           });
-        if (this.workers.inspectLaunch === undefined)
-          return yield* this.runtimeSync("validate launch inspection support", () => {
-            throw new Error("Worker transport cannot inspect the retained startup pane.");
-          });
         const request = yield* this.runtimeSync("prepare cancelled launch inspection", () =>
           identitylessLaunchInspectionRequest(attempt),
         );
-        const inspection = yield* this.dependency(
-          "herdr",
-          "inspect cancelled launch",
-          () =>
-            this.workers.inspectLaunch?.(request) ??
-            Promise.reject(new Error("Worker transport cannot inspect the retained startup pane.")),
-        );
+        const inspection = yield* this.herdrEffect((workers) => workers.inspectLaunch(request));
         if (inspection.state !== "absent")
           return yield* this.runtimeSync("validate cancelled launch absence", () => {
             throw new Error(
@@ -1612,41 +1398,22 @@ export class WorkstreamRuntime {
     state: WorkstreamState,
     attempt: WorkAttempt,
     assignment: WorkAssignment,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         if (attempt.resultId === undefined) yield* this.retain(state, attempt, assignment);
-        let current = findAttempt(
-          yield* this.dependency("store", "load cancelled launch recovery", () =>
-            this.store.load(),
-          ),
-          attempt.id,
-        );
+        let current = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
         if (current.cleanup?.state === "completed") return;
         if (current.cleanup?.state === "blocked") {
-          yield* this.dependency("store", "retry cancelled launch cleanup", () =>
-            this.store.retryCleanup(attempt.id),
-          );
-          current = findAttempt(
-            yield* this.dependency("store", "reload cancelled launch cleanup", () =>
-              this.store.load(),
-            ),
-            attempt.id,
-          );
+          yield* this.storeEffect((store) => store.retryCleanup(attempt.id));
+          current = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
         }
         if (current.cleanup === undefined) {
           yield* this.beginCleanupIfNeeded(current, assignment);
-          current = findAttempt(
-            yield* this.dependency("store", "load cancelled launch cleanup intent", () =>
-              this.store.load(),
-            ),
-            attempt.id,
-          );
+          current = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
         }
         if (current.cleanup?.state === "pending" && !current.cleanup.workerClosed)
-          yield* this.dependency("store", "record absent cancelled launch", () =>
-            this.store.markWorkerClosed(attempt.id),
-          );
+          yield* this.storeEffect((store) => store.markWorkerClosed(attempt.id));
         yield* this.cleanup(attempt.id);
       }.bind(this),
     );
@@ -1660,7 +1427,7 @@ export class WorkstreamRuntime {
       reason: string;
       integratedRevision?: string;
     },
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         if (input.action !== "retain_not_applied")
@@ -1670,22 +1437,20 @@ export class WorkstreamRuntime {
             );
           });
         yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
-        yield* this.dependency("git", "assert clean recovery repository", () =>
-          this.repository.assertClean(),
-        );
-        const proposal = yield* this.dependency("git", "validate failed worker proposal", () =>
-          this.repository.validateWorkerCommit(placementOf(attempt)),
+        yield* this.gitEffect((repository) => repository.assertClean());
+        const proposal = yield* this.gitEffect((repository) =>
+          repository.validateWorkerCommit(placementOf(attempt)),
         );
         const integratedRevision = yield* this.resolveIntegratedHead(
           required(input.integratedRevision, "integrated revision"),
         );
         yield* this.ownershipEffect();
-        const retainedRef = yield* this.dependency("git", "retain failed worker proposal", () =>
-          this.repository.retainCommit(state.id, attempt.id, proposal.commit),
+        const retainedRef = yield* this.gitEffect((repository) =>
+          repository.retainCommit(state.id, attempt.id, proposal.commit),
         );
         yield* this.ownershipEffect();
-        yield* this.dependency("store", "checkpoint failed unapplied proposal", () =>
-          this.store.retainFailedProposalNotApplied({
+        yield* this.storeEffect((store) =>
+          store.retainFailedProposalNotApplied({
             id: attempt.id,
             commit: proposal.commit,
             expectedHead: integratedRevision,
@@ -1694,9 +1459,7 @@ export class WorkstreamRuntime {
             integratedRevision,
           }),
         );
-        const latest = yield* this.dependency("store", "load retained failed proposal", () =>
-          this.store.load(),
-        );
+        const latest = yield* this.storeEffect((store) => store.load());
         yield* this.resumeRetainedNotAppliedCleanup(state.id, findAttempt(latest, attempt.id));
       }.bind(this),
     );
@@ -1710,18 +1473,13 @@ export class WorkstreamRuntime {
       reason: string;
       integratedRevision?: string;
     },
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const composition = required(attempt.composition, "retained composition");
         if (input.action === "retain_not_applied") {
-          const requested = yield* this.dependency(
-            "git",
-            "resolve retained integrated revision",
-            () =>
-              this.repository.resolveRevision(
-                required(input.integratedRevision, "integrated revision"),
-              ),
+          const requested = yield* this.gitEffect((repository) =>
+            repository.resolveRevision(required(input.integratedRevision, "integrated revision")),
           );
           yield* this.runtimeSync("validate retained integrated revision", () => {
             if (requested !== composition.integratedRevision)
@@ -1738,15 +1496,15 @@ export class WorkstreamRuntime {
   private resumeRetainedNotAppliedCleanup(
     workstreamId: string,
     attempt: WorkAttempt,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const composition = required(attempt.composition, "retained composition");
         if (attempt.cleanup?.state !== "completed" && attempt.cleanup?.workerClosed !== true)
           yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
         yield* this.ownershipEffect();
-        const retainedRef = yield* this.dependency("git", "verify retained worker commit", () =>
-          this.repository.retainCommit(workstreamId, attempt.id, composition.commit),
+        const retainedRef = yield* this.gitEffect((repository) =>
+          repository.retainCommit(workstreamId, attempt.id, composition.commit),
         );
         yield* this.ownershipEffect();
         yield* this.runtimeSync("validate retained commit provenance", () => {
@@ -1757,16 +1515,12 @@ export class WorkstreamRuntime {
         });
         if (attempt.cleanup?.state === "completed") return;
         if (attempt.cleanup?.state === "blocked")
-          yield* this.dependency("store", "retry retained proposal cleanup", () =>
-            this.store.retryCleanup(attempt.id),
-          );
-        let latest = yield* this.dependency("store", "load retained proposal cleanup", () =>
-          this.store.load(),
-        );
+          yield* this.storeEffect((store) => store.retryCleanup(attempt.id));
+        let latest = yield* this.storeEffect((store) => store.load());
         let current = findAttempt(latest, attempt.id);
         if (current.cleanup === undefined) {
-          const expectedHead = yield* this.dependency("git", "read retained proposal head", () =>
-            this.repository.head(placementOf(current).path),
+          const expectedHead = yield* this.gitEffect((repository) =>
+            repository.head(placementOf(current).path),
           );
           yield* this.runtimeSync("validate retained proposal head", () => {
             if (expectedHead !== composition.commit)
@@ -1774,12 +1528,10 @@ export class WorkstreamRuntime {
                 `Retained proposal worktree HEAD is ${expectedHead}, expected ${composition.commit}.`,
               );
           });
-          yield* this.dependency("store", "begin retained proposal cleanup", () =>
-            this.store.beginCleanup({ id: attempt.id, expectedHead, discard: false }),
+          yield* this.storeEffect((store) =>
+            store.beginCleanup({ id: attempt.id, expectedHead, discard: false }),
           );
-          latest = yield* this.dependency("store", "reload retained proposal cleanup", () =>
-            this.store.load(),
-          );
+          latest = yield* this.storeEffect((store) => store.load());
           current = findAttempt(latest, attempt.id);
         }
         if (current.cleanup?.state === "pending") yield* this.cleanup(attempt.id);
@@ -1787,17 +1539,13 @@ export class WorkstreamRuntime {
     );
   }
 
-  private resolveIntegratedHead(requested: string): Effect.Effect<string, RuntimeError> {
+  private resolveIntegratedHead(requested: string): RuntimeEffect<string> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const integratedRevision = yield* this.dependency(
-          "git",
-          "resolve integrated revision",
-          () => this.repository.resolveRevision(requested),
+        const integratedRevision = yield* this.gitEffect((repository) =>
+          repository.resolveRevision(requested),
         );
-        const currentHead = yield* this.dependency("git", "read integrated head", () =>
-          this.repository.head(),
-        );
+        const currentHead = yield* this.gitEffect((repository) => repository.head());
         yield* this.runtimeSync("validate integrated revision", () => {
           if (currentHead !== integratedRevision)
             throw new Error(
@@ -1817,21 +1565,19 @@ export class WorkstreamRuntime {
       reason: string;
       integratedRevision?: string;
     },
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const composition = required(attempt.composition, "blocked composition");
         const worker = required(attempt.worker, "worker identity");
         yield* this.inspectRecoverableWorker(worker);
-        yield* this.dependency("git", "assert clean recovery repository", () =>
-          this.repository.assertClean(),
-        );
-        yield* this.dependency("git", "validate retained worker commit", () =>
-          this.repository.validateWorkerCommit(placementOf(attempt), composition.commit),
+        yield* this.gitEffect((repository) => repository.assertClean());
+        yield* this.gitEffect((repository) =>
+          repository.validateWorkerCommit(placementOf(attempt), composition.commit),
         );
         yield* this.ownershipEffect();
-        const retainedRef = yield* this.dependency("git", "retain worker commit", () =>
-          this.repository.retainCommit(state.id, attempt.id, composition.commit),
+        const retainedRef = yield* this.gitEffect((repository) =>
+          repository.retainCommit(state.id, attempt.id, composition.commit),
         );
         yield* this.runtimeSync("validate retained commit provenance", () => {
           if (composition.retainedRef !== undefined && composition.retainedRef !== retainedRef)
@@ -1854,17 +1600,15 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     assignment: WorkAssignment,
     retainedRef: string,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        yield* this.dependency("store", "retry blocked composition", () =>
-          this.store.retryComposition(attempt.id, undefined, retainedRef),
+        yield* this.storeEffect((store) =>
+          store.retryComposition(attempt.id, undefined, retainedRef),
         );
-        let state = yield* this.dependency("store", "load retried composition", () =>
-          this.store.load(),
-        );
+        let state = yield* this.storeEffect((store) => store.load());
         yield* this.compose(state, findAttempt(state, attempt.id), assignment);
-        state = yield* this.dependency("store", "load composed recovery", () => this.store.load());
+        state = yield* this.storeEffect((store) => store.load());
         yield* this.beginCleanupIfNeeded(findAttempt(state, attempt.id), assignment);
         yield* this.cleanup(attempt.id);
       }.bind(this),
@@ -1875,42 +1619,36 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     input: { reason: string; integratedRevision?: string },
     retainedRef: string,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const requested = required(input.integratedRevision, "integrated revision");
-        const integratedRevision = yield* this.dependency(
-          "git",
-          "resolve integrated revision",
-          () => this.repository.resolveRevision(requested),
+        const integratedRevision = yield* this.gitEffect((repository) =>
+          repository.resolveRevision(requested),
         );
-        const currentHead = yield* this.dependency("git", "read integrated head", () =>
-          this.repository.head(),
-        );
+        const currentHead = yield* this.gitEffect((repository) => repository.head());
         yield* this.runtimeSync("validate integrated revision", () => {
           if (currentHead !== integratedRevision)
             throw new Error(
               `Integrated revision is ${integratedRevision}, but repository HEAD is ${currentHead}.`,
             );
         });
-        yield* this.dependency("store", "retain unapplied composition", () =>
-          this.store.retainCompositionNotApplied({
+        yield* this.storeEffect((store) =>
+          store.retainCompositionNotApplied({
             id: attempt.id,
             reason: input.reason,
             retainedRef,
             integratedRevision,
           }),
         );
-        const state = yield* this.dependency("store", "load retained composition", () =>
-          this.store.load(),
-        );
+        const state = yield* this.storeEffect((store) => store.load());
         const latest = findAttempt(state, attempt.id);
         if (latest.cleanup === undefined) {
-          const expectedHead = yield* this.dependency("git", "read recovery worktree head", () =>
-            this.repository.head(placementOf(attempt).path),
+          const expectedHead = yield* this.gitEffect((repository) =>
+            repository.head(placementOf(attempt).path),
           );
-          yield* this.dependency("store", "begin retained recovery cleanup", () =>
-            this.store.beginCleanup({
+          yield* this.storeEffect((store) =>
+            store.beginCleanup({
               id: attempt.id,
               expectedHead,
               discard: false,
@@ -1922,14 +1660,12 @@ export class WorkstreamRuntime {
     );
   }
 
-  private recoverBlockedCleanup(attempt: WorkAttempt): Effect.Effect<void, RuntimeError> {
+  private recoverBlockedCleanup(attempt: WorkAttempt): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         if (attempt.cleanup?.workerClosed !== true)
           yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
-        yield* this.dependency("store", "retry blocked cleanup", () =>
-          this.store.retryCleanup(attempt.id),
-        );
+        yield* this.storeEffect((store) => store.retryCleanup(attempt.id));
         yield* this.cleanup(attempt.id);
       }.bind(this),
     );
@@ -1937,12 +1673,10 @@ export class WorkstreamRuntime {
 
   private inspectRecoverableWorker(
     worker: NonNullable<WorkAttempt["worker"]>,
-  ): Effect.Effect<void, RuntimeError> {
+  ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const inspection = yield* this.dependency("herdr", "inspect recovery worker", () =>
-          this.workers.inspect(worker),
-        );
+        const inspection = yield* this.herdrEffect((workers) => workers.inspect(worker));
         yield* this.runtimeSync("validate recovery inspection", () => {
           if (
             inspection.status !== "absent" &&
@@ -1961,33 +1695,26 @@ export class WorkstreamRuntime {
     return this.runPromise(this.submit(this.steerEffect(attemptId, instruction)));
   }
 
-  private steerEffect(attemptId: string, instruction: string): Effect.Effect<void, RuntimeError> {
+  private steerEffect(attemptId: string, instruction: string): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const state = yield* this.dependency("store", "load steerable attempt", () =>
-          this.store.load(),
-        );
+        const state = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(state, attemptId);
         yield* this.runtimeSync("validate steering request", () => {
           if (instruction.trim() === "") throw new Error("Steering instruction is required.");
           if (
             attempt.worker === undefined ||
-            (attempt.state !== "running" && attempt.state !== "starting") ||
-            this.workers.steer === undefined
+            (attempt.state !== "running" && attempt.state !== "starting")
           )
             throw new Error("Attempt has no steerable live worker.");
         });
         const worker = required(attempt.worker, "worker identity");
-        yield* this.dependency("store", "record uncertain steering", () =>
-          this.store.recordSteering(attemptId, instruction, "uncertain"),
+        yield* this.storeEffect((store) =>
+          store.recordSteering(attemptId, instruction, "uncertain"),
         );
-        yield* this.dependency(
-          "herdr",
-          "steer worker",
-          () => this.workers.steer?.(worker, instruction) ?? Promise.resolve(),
-        );
-        yield* this.dependency("store", "record submitted steering", () =>
-          this.store.recordSteering(attemptId, instruction, "submitted"),
+        yield* this.herdrEffect((workers) => workers.steer(worker, instruction));
+        yield* this.storeEffect((store) =>
+          store.recordSteering(attemptId, instruction, "submitted"),
         );
       }.bind(this),
     );
@@ -1997,25 +1724,48 @@ export class WorkstreamRuntime {
     return this.runPromise(this.submit(this.cancelEffect(attemptId)));
   }
 
-  private cancelEffect(attemptId: string): Effect.Effect<void, RuntimeError> {
+  private cancelEffect(attemptId: string): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const state = yield* this.dependency("store", "load cancellable attempt", () =>
-          this.store.load(),
-        );
+        const state = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(state, attemptId);
         if (attempt.state !== "queued")
           yield* this.runtimeSync("validate cancellation request", () => {
             if (attempt.state !== "running" && attempt.state !== "starting")
               throw new Error("Attempt is not active.");
           });
-        yield* this.dependency("store", "cancel attempt", () =>
-          this.store.cancelAttempt(attemptId),
-        );
-        if (attempt.state !== "queued" && attempt.worker !== undefined)
-          yield* this.dependency("herdr", "interrupt cancelled worker", () =>
-            this.workers.interrupt(required(attempt.worker, "worker identity")),
+        let worker = attempt.worker;
+        if (
+          attempt.state === "starting" &&
+          attempt.sessionFile !== undefined &&
+          attempt.launchPane === undefined &&
+          worker === undefined
+        ) {
+          const assignment = findAssignment(state, attempt.assignmentId);
+          const recovered = yield* this.herdrEffect((workers) =>
+            workers.recover(
+              workerRecoveryRequest(this.launch.workspaceId, state, attempt, assignment),
+            ),
           );
+          if (recovered !== undefined) {
+            yield* this.storeEffect((store) => store.recordWorker(attemptId, recovered.identity));
+            worker = recovered.identity;
+          }
+        }
+        yield* this.storeEffect((store) => store.cancelAttempt(attemptId));
+        if (attempt.state === "starting" && hasProvenNoNativeLaunch(attempt)) {
+          const cancelled = findAttempt(
+            yield* this.storeEffect((store) => store.load()),
+            attemptId,
+          );
+          const assignment = findAssignment(state, attempt.assignmentId);
+          yield* this.beginCleanupIfNeeded(cancelled, assignment);
+          yield* this.storeEffect((store) => store.markWorkerClosed(attemptId));
+          yield* this.cleanup(attemptId);
+          return;
+        }
+        if (attempt.state !== "queued" && worker !== undefined)
+          yield* this.herdrEffect((workers) => workers.interrupt(worker));
       }.bind(this),
     );
   }
@@ -2124,9 +1874,16 @@ function blockedDetail(attempt: WorkAttempt): string | undefined {
   return undefined;
 }
 function requiresLaunch(attempt: WorkAttempt): boolean {
+  return attempt.state === "queued";
+}
+
+/** A missing session checkpoint proves Herdr launch was never invoked by this sequence. */
+function hasProvenNoNativeLaunch(attempt: WorkAttempt): boolean {
   return (
-    attempt.state === "queued" ||
-    (attempt.state === "starting" && attempt.sessionFile === undefined)
+    attempt.sessionFile === undefined &&
+    attempt.launchPane === undefined &&
+    attempt.resource === undefined &&
+    attempt.worker === undefined
   );
 }
 function hasRetainedSession(attempt: WorkAttempt): boolean {
@@ -2142,6 +1899,15 @@ function isIdentitylessCancelledLaunch(attempt: WorkAttempt): boolean {
     (attempt.state === "cancel_requested" || attempt.state === "cancelled") &&
     attempt.submission === "not_sent" &&
     attempt.launchPane !== undefined &&
+    attempt.sessionFile !== undefined &&
+    attempt.worker === undefined
+  );
+}
+function isUnlocatedCancelledLaunch(attempt: WorkAttempt): boolean {
+  return (
+    (attempt.state === "cancel_requested" || attempt.state === "cancelled") &&
+    attempt.submission === "not_sent" &&
+    attempt.launchPane === undefined &&
     attempt.sessionFile !== undefined &&
     attempt.worker === undefined
   );
@@ -2239,8 +2005,8 @@ function workerSessionRequest(
   assignment: WorkAssignment,
   workerCwd: string,
   baseRevision: string | undefined,
-): Parameters<typeof createWorkerSession>[0] {
-  const request: Parameters<typeof createWorkerSession>[0] = {
+): Parameters<typeof createWorkerSessionEffect>[0] {
+  const request: Parameters<typeof createWorkerSessionEffect>[0] = {
     targetCwd: workerCwd,
     sessionDir: join(dirname(state.statePath), "sessions"),
     objective: objectiveFor(state, assignment, baseRevision),
@@ -2265,7 +2031,7 @@ function workerLaunchRequest(
   models: NonNullable<WorkAttempt["models"]>,
   baseRevision: string | undefined,
   store: WorkstreamStore,
-): WorkerLaunchRequest {
+): WorkerLaunchEffectRequest<WorkstreamStoreError, FileSystem.FileSystem | Path.Path> {
   const environment = new Map<string, string>([
     ["PI_WORKGRAPH_MODE", modeFor(assignment)],
     ["PI_WORKGRAPH_RUN_ID", state.id],
@@ -2297,14 +2063,14 @@ function workerLaunchRequest(
     model: models.guide.model,
     thinking: models.guide.thinking,
     env,
-    onTab: (pane) => store.recordLaunchPane(attempt.id, pane).then(() => undefined),
-    onResource: (resource) => store.recordResource(attempt.id, resource).then(() => undefined),
+    onTab: (pane) => store.effects.recordLaunchPane(attempt.id, pane).pipe(Effect.asVoid),
+    onResource: (resource) =>
+      store.effects.recordResource(attempt.id, resource).pipe(Effect.asVoid),
     onIdentity: (worker) =>
-      store
+      store.effects
         .recordWorker(attempt.id, worker)
-        .then(() => store.markSubmission(attempt.id, "uncertain"))
-        .then(() => undefined),
-    onSubmitted: () => store.markSubmission(attempt.id, "submitted").then(() => undefined),
+        .pipe(Effect.andThen(store.effects.markSubmission(attempt.id, "uncertain")), Effect.asVoid),
+    onSubmitted: () => store.effects.markSubmission(attempt.id, "submitted").pipe(Effect.asVoid),
   };
 }
 function isNoChangeImplementation(

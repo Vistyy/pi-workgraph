@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { Effect } from "effect";
+import { Deferred, Effect } from "effect";
 import { TestClock } from "effect/testing";
 import { GitRepository, runProcess } from "../src/git.js";
 import {
@@ -17,11 +17,13 @@ import {
   type WorkerRecoveryRequest,
 } from "../src/herdr.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
-import { WorkgraphRegistry } from "../src/registry.js";
+import { type Lease, WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity, WorkerReport } from "../src/types.js";
 import { type WorkstreamState, WorkstreamStore } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
+import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
 import { required } from "./decoders.js";
+import { promiseWorkerEffects } from "./runtime-worker-port.js";
 
 const FIXTURE_TIMESTAMP = 1_700_000_000_000;
 const FIXTURE_OBSERVED_AT = "2023-11-14T22:13:20.000Z";
@@ -70,12 +72,14 @@ const researchReport: WorkerReport = {
 
 class Worker implements VisibleWorkerRuntime {
   readonly available = true;
+  readonly effects = promiseWorkerEffects(this);
   readonly requests: WorkerLaunchRequest[] = [];
   readonly identities = new Map<string, WorkerIdentity>();
   promptCount = 0;
   cleanupCount = 0;
   deferWork = false;
   status: HerdrObservation["status"] = "idle";
+  failBeforePane = false;
   failBeforeSubmission = false;
   failAfterSubmission = false;
   onWork: (request: WorkerLaunchRequest) => Promise<WorkerReport | undefined> = async () =>
@@ -127,6 +131,8 @@ class Worker implements VisibleWorkerRuntime {
       sessionFile: request.sessionFile,
       cwd: request.cwd,
     };
+    if (this.failBeforePane) throw new Error("fixture tab creation response interrupted");
+    await request.onTab?.({ workspaceId: identity.workspaceId, paneId: identity.paneId });
     this.identities.set(identity.agentName, identity);
     await request.onResource?.({
       workspaceId: identity.workspaceId,
@@ -416,7 +422,7 @@ await test("cleaned history has constant reconciliation reads while error cleari
       throw new Error("interrupted notification");
     });
     await active.perform(async () => undefined);
-    const reads = t.mock.method(f.store, "load");
+    const reads = t.mock.method(f.store.effects, "load");
     await active.reconcile();
     const emptyReads = reads.mock.callCount();
     for (let index = 0; index < 4; index++) await active.queue(research(`read-${index}`));
@@ -433,7 +439,7 @@ await test("cleaned history has constant reconciliation reads while error cleari
     );
     const id = required(state.attempts[0], "cleaned attempt").id;
     await active.perform(() => f.store.recordAttention(id, "retained stale attention"));
-    const updates = t.mock.method(f.store, "clearAttention");
+    const updates = t.mock.method(f.store.effects, "clearAttention");
     state = await active.reconcile();
     assert.equal(updates.mock.callCount(), 1);
     assert.equal(state.attempts[0]?.error, undefined);
@@ -1247,9 +1253,16 @@ await test("failed notification is not retried by polling and manual observed re
 await test("partial adoption failure releases the acquired lease before runtime failure", async (t) => {
   const f = await fixture();
   try {
-    const adopt = t.mock.method(f.store, "adopt", async () => {
-      throw new Error("fixture adoption failure");
-    });
+    const adoptionFailure = new Error("fixture adoption failure");
+    const adopt = t.mock.method(f.store.effects, "adopt", () =>
+      Effect.fail(
+        new WorkstreamStoreOperationError({
+          code: "workstream_store_operation_failed",
+          message: adoptionFailure.message,
+          cause: adoptionFailure,
+        }),
+      ),
+    );
     const failed = f.runtime(undefined, {
       owner: {
         sessionId: "adopting-owner",
@@ -1310,6 +1323,147 @@ await test("heartbeat ownership loss reports once and interrupts scoped reconcil
       f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
       undefined,
     );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("stop interrupts a suspended store operation and fails queued replies before releasing the lease", async (t) => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    await active.perform(async () => undefined);
+    const entered = Deferred.makeUnsafe<void>();
+    t.mock.method(f.store.effects, "load", () =>
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+    );
+    const running = active.reconcile();
+    await Effect.runPromise(Deferred.await(entered));
+    const queued = active.queue(research("queued-behind-suspended-store"));
+    await Effect.runPromise(Effect.sleep("1 millis"));
+    await active.stop();
+    await assert.rejects(running, /stopped|interrupt/i);
+    await assert.rejects(queued, /stopped|interrupt/i);
+    assert.equal(
+      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
+      undefined,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("stop interrupts a suspended native observation without waiting behind it", async (t) => {
+  const f = await fixture();
+  try {
+    f.workers.deferWork = true;
+    const active = f.runtime();
+    await active.queue(research("suspended-native-observation"));
+    await active.reconcile();
+    const entered = Deferred.makeUnsafe<void>();
+    t.mock.method(f.workers.effects, "observe", () =>
+      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+    );
+    const running = active.reconcile();
+    await Effect.runPromise(Deferred.await(entered));
+    await active.stop();
+    await assert.rejects(running, /stopped|interrupt/i);
+    assert.equal(
+      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
+      undefined,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("stop surfaces registry release failures after attempting the exact release", async (t) => {
+  const f = await fixture();
+  const active = f.runtime();
+  await active.perform(async () => undefined);
+  const release = f.registry.release.bind(f.registry);
+  t.mock.method(f.registry, "release", (lease: Lease) => {
+    release(lease);
+    throw new Error("fixture registry release failure");
+  });
+  try {
+    await assert.rejects(active.stop(), /registry release failure/);
+    assert.equal(
+      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
+      undefined,
+    );
+  } finally {
+    f.registry.close();
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+await test("pre-session cancellation cleans only the known placement and never launches Herdr", async (t) => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const authority = await f.authority(active);
+    const checkpointFailure = new Error("fixture session checkpoint failure");
+    t.mock.method(f.store.effects, "recordSessionFile", () =>
+      Effect.fail(
+        new WorkstreamStoreOperationError({
+          code: "workstream_store_operation_failed",
+          message: checkpointFailure.message,
+          cause: checkpointFailure,
+        }),
+      ),
+    );
+    await active.queue({
+      id: "cancel-before-session-checkpoint",
+      capability: "implement",
+      artifactIntent: "maintained_change",
+      objective: "Cancel before the session checkpoint",
+      intentVersion: 1,
+      authority,
+      acceptance: ["No native worker is launched"],
+    });
+    await active.reconcile();
+    let state = await f.store.load();
+    const attempt = required(state.attempts[0], "pre-session attempt");
+    assert.equal(attempt.state, "starting");
+    assert.equal(attempt.sessionFile, undefined);
+    assert.equal(attempt.launchPane, undefined);
+    assert.equal(f.workers.requests.length, 0);
+    await active.cancel(attempt.id);
+    state = await f.store.load();
+    assert.equal(state.attempts[0]?.state, "cancel_requested");
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(f.workers.requests.length, 0);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("pre-pane cancellation preserves unlocated native uncertainty without relaunch or fabricated absence", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    f.workers.failBeforePane = true;
+    await active.queue(research("cancel-before-pane-checkpoint"));
+    await active.reconcile();
+    let state = await f.store.load();
+    const attempt = required(state.attempts[0], "pre-pane attempt");
+    assert.equal(attempt.sessionFile === undefined, false);
+    assert.equal(attempt.launchPane, undefined);
+    assert.equal(attempt.worker, undefined);
+    await active.cancel(attempt.id);
+    await assert.rejects(
+      active.recoverAttempt({
+        attemptId: attempt.id,
+        action: "retry",
+        reason: "Observe without inventing an absent pane.",
+      }),
+      /no pane locator|remains uncertain/i,
+    );
+    await active.reconcile();
+    state = await f.store.load();
+    assert.equal(state.attempts[0]?.cleanup, undefined);
+    assert.equal(f.workers.requests.length, 1);
   } finally {
     await f.dispose();
   }

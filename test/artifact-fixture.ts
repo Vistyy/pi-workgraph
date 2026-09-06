@@ -20,6 +20,7 @@ import { WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity, WorkerReport } from "../src/types.js";
 import { WorkstreamStore } from "../src/workstream.js";
 import { type RuntimeOwnership, WorkstreamRuntime } from "../src/workstream-runtime.js";
+import { promiseWorkerEffects } from "./runtime-worker-port.js";
 
 const report: WorkerReport = {
   kind: "research",
@@ -31,6 +32,7 @@ const report: WorkerReport = {
 
 class ArtifactWorker implements VisibleWorkerRuntime {
   readonly available = true;
+  readonly effects = promiseWorkerEffects(this);
   cleanupCount = 0;
 
   launch(_request: WorkerLaunchRequest): Promise<HerdrObservation> {

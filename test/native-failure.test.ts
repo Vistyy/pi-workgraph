@@ -21,11 +21,13 @@ import type { WorkerIdentity } from "../src/types.js";
 import { WorkstreamStore } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
 import { git, persistentSession, researchReport, usage } from "./helpers.js";
+import { promiseWorkerEffects } from "./runtime-worker-port.js";
 
 const RAW_SECRET = "Bearer fixture-secret at https://provider.example/private";
 
 class NativeFailureWorker implements VisibleWorkerRuntime {
   readonly available = true;
+  readonly effects = promiseWorkerEffects(this);
 
   async launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
     const identity: WorkerIdentity = {

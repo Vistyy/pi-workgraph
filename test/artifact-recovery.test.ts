@@ -7,6 +7,7 @@ import test from "node:test";
 import { Effect, Fiber, FileSystem, Layer, Path } from "effect";
 import { ArtifactIoError, ArtifactStore, type ArtifactStoreError } from "../src/artifact-store.js";
 import { liveLayer } from "../src/node-platform.js";
+import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
 import { artifactFixture, transformArtifactStore } from "./artifact-fixture.js";
 
 function testFailure(message: string): ArtifactIoError {
@@ -253,16 +254,22 @@ void test("file and nested directory payloads publish atomically after a lost st
         await artifactFs.writeFile(join(nested, "evidence.txt"), "directory evidence\n");
       }
 
-      const finish = f.store.finishArtifactRetention.bind(f.store);
+      const finish = f.store.effects.finishArtifactRetention.bind(f.store.effects);
       let loseResponse = true;
-      f.store.finishArtifactRetention = (...input) =>
-        finish(...input).then((state) => {
-          if (loseResponse) {
+      f.store.effects.finishArtifactRetention = (...input) =>
+        finish(...input).pipe(
+          Effect.flatMap((state) => {
+            if (!loseResponse) return Effect.succeed(state);
             loseResponse = false;
-            throw new Error("checkpoint response lost after atomic state replacement");
-          }
-          return state;
-        });
+            return Effect.fail(
+              new WorkstreamStoreOperationError({
+                code: "workstream_store_operation_failed",
+                message: "checkpoint response lost after atomic state replacement",
+                cause: new Error("checkpoint response lost after atomic state replacement"),
+              }),
+            );
+          }),
+        );
 
       const first = f.runtime();
       await first.reconcile();
