@@ -4,7 +4,8 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const entry = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
-const result = spawnSync(process.execPath, ["--import", "tsx", entry, ...process.argv.slice(2)], {
+const loader = import.meta.resolve("tsx");
+const result = spawnSync(process.execPath, ["--import", loader, entry, ...process.argv.slice(2)], {
   stdio: "inherit",
   env: process.env,
 });
