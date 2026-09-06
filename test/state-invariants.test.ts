@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Persisted-state fixtures intentionally cross the real host filesystem boundary.
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are host filesystem identities.
 import { join } from "node:path";
@@ -251,6 +251,7 @@ async function stateFixture(): Promise<{
 }> {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-state-invariants-"));
   const projectRoot = join(parent, "project");
+  await mkdir(join(projectRoot, ".git"), { recursive: true });
   const { store } = await WorkstreamStore.create({
     id: "workstream",
     purpose: "Exercise persisted state invariants.",

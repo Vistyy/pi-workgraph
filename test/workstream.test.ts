@@ -168,17 +168,20 @@ const coordinator: SessionIdentity = {
   sessionFile: "/sessions/coordinator.jsonl",
 };
 
-function fixture(): Promise<{ parent: string; store: WorkstreamStore }> {
-  return mkdtemp(join(tmpdir(), "pi-workgraph-workstream-")).then((parent) =>
-    WorkstreamStore.create({
-      id: "workstream",
-      purpose: "Determine the safe fixture change.",
-      projectRoot: join(parent, "project"),
-      gitCommonDir: join(parent, "project", ".git"),
-      coordinator,
-      now: dateAt(0),
-    }).then(({ store }) => ({ parent, store })),
-  );
+async function fixture(): Promise<{ parent: string; store: WorkstreamStore }> {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-workstream-"));
+  const projectRoot = join(parent, "project");
+  const gitCommonDir = join(projectRoot, ".git");
+  await mkdir(gitCommonDir, { recursive: true });
+  const { store } = await WorkstreamStore.create({
+    id: "workstream",
+    purpose: "Determine the safe fixture change.",
+    projectRoot,
+    gitCommonDir,
+    coordinator,
+    now: dateAt(0),
+  });
+  return { parent, store };
 }
 
 function recordedAuthority(
@@ -1145,6 +1148,71 @@ void test("new storage is private across umasks and existing shared directories 
     assert.equal((await lstat(sharedStorage)).mode & 0o777, 0o755);
   } finally {
     process.umask(originalUmask);
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("missing or invalid common roots are rejected without external mutation", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-common-root-fence-"));
+  try {
+    const existingAncestor = join(parent, "existing");
+    await mkdir(existingAncestor, { mode: 0o755 });
+    await chmod(existingAncestor, 0o755);
+    const missingProject = join(existingAncestor, "project");
+    const missingCommonDir = join(missingProject, "nested", ".git");
+
+    await assert.rejects(
+      WorkstreamStore.create({
+        id: "missing-root",
+        purpose: "A missing common root must not be created.",
+        projectRoot: missingProject,
+        gitCommonDir: missingCommonDir,
+        coordinator,
+        now: dateAt(0),
+      }),
+      /Git common directory does not exist/,
+    );
+    assert.deepEqual(await readdir(existingAncestor), []);
+    assert.equal((await lstat(existingAncestor)).mode & 0o777, 0o755);
+    await assert.rejects(
+      lstat(missingProject),
+      (error: NodeJS.ErrnoException) => error.code === "ENOENT",
+    );
+
+    const commonFile = join(existingAncestor, "common-file");
+    await writeFile(commonFile, "foreign common root");
+    await assert.rejects(
+      WorkstreamStore.create({
+        id: "file-root",
+        purpose: "A file common root must remain untouched.",
+        projectRoot: existingAncestor,
+        gitCommonDir: commonFile,
+        coordinator,
+        now: dateAt(0),
+      }),
+      /not an ordinary directory/,
+    );
+    assert.equal(await readFile(commonFile, "utf8"), "foreign common root");
+
+    const external = join(parent, "external");
+    const commonLink = join(existingAncestor, "common-link");
+    await mkdir(external);
+    await symlink(external, commonLink, "dir");
+    await assert.rejects(
+      WorkstreamStore.create({
+        id: "link-root",
+        purpose: "A symlink common root must remain untouched.",
+        projectRoot: existingAncestor,
+        gitCommonDir: commonLink,
+        coordinator,
+        now: dateAt(0),
+      }),
+      /not an ordinary directory/,
+    );
+    assert.equal((await lstat(commonLink)).isSymbolicLink(), true);
+    assert.deepEqual(await readdir(external), []);
+    assert.equal((await lstat(existingAncestor)).mode & 0o777, 0o755);
+  } finally {
     await rm(parent, { recursive: true, force: true });
   }
 });

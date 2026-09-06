@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The regression exercises the native executable boundary.
 import { spawnSync } from "node:child_process";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The test uses a real temporary filesystem boundary.
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The test uses native temporary path identities.
 import { join } from "node:path";
@@ -105,6 +105,7 @@ void test("CLI inspect wires new context and judgments sections through the nati
   const parent = await mkdtemp(join(tmpdir(), "workgraph-cli-inspect-"));
   const gitCommonDir = join(parent, ".git");
   try {
+    await mkdir(gitCommonDir);
     const { state } = await WorkstreamStore.create({
       id: "cli-inspect",
       purpose: "Inspect every current top-level section",

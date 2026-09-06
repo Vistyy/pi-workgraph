@@ -180,11 +180,7 @@ export function claimWorkstreamDirectory(path: string): StoreEffect<void> {
         throw new Error(`Workstream state path is outside the known storage layout: ${path}.`);
     });
 
-    const realCommonDirectory = yield* prepareCommonDirectory(
-      fileSystem,
-      paths,
-      gitCommonDirectory,
-    );
+    const realCommonDirectory = yield* prepareCommonDirectory(gitCommonDirectory);
     const storageComponents = [storageDirectory, workstreamsDirectory, workstreamDirectory];
     const existing = yield* Effect.forEach(storageComponents, (component) =>
       lstatOptional(component).pipe(
@@ -218,34 +214,15 @@ export function removeWorkstreamDirectory(path: string): StoreEffect<void> {
   });
 }
 
-function prepareCommonDirectory(
-  fileSystem: FileSystem.FileSystem,
-  paths: Path.Path,
-  gitCommonDirectory: string,
-): StoreEffect<string, never> {
+function prepareCommonDirectory(gitCommonDirectory: string): StoreEffect<string, never> {
   return Effect.gen(function* () {
-    const missing: string[] = [];
-    let current = gitCommonDirectory;
-    let status = yield* lstatOptional(current);
-    while (status === undefined) {
-      missing.unshift(current);
-      const parent = paths.dirname(current);
-      if (parent === current)
-        return yield* storeError(
-          "locate workstream storage boundary",
-          new Error(`No existing ancestor contains Git common directory: ${gitCommonDirectory}.`),
-        );
-      current = parent;
-      status = yield* lstatOptional(current);
-    }
-    yield* assertDirectoryStatus(current, status);
-    const realExistingAncestor = yield* realPath(current);
-
-    for (const directory of missing) {
-      yield* createOwnedDirectory(fileSystem, directory);
-      yield* assertContainedDirectory(paths, realExistingAncestor, directory);
-    }
-
+    const status = yield* lstatOptional(gitCommonDirectory);
+    if (status === undefined)
+      return yield* storeError(
+        "validate Git common directory",
+        new Error(`Git common directory does not exist: ${gitCommonDirectory}.`),
+      );
+    yield* assertDirectoryStatus(gitCommonDirectory, status);
     return yield* realPath(gitCommonDirectory);
   });
 }

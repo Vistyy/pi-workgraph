@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This fixture establishes a fake existing Git common-directory boundary.
+import { mkdir } from "node:fs/promises";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
@@ -42,8 +44,9 @@ function failedAssistant(session: SessionManager, stopReason: "error" | "aborted
   });
 }
 
-function baseState() {
+async function baseState() {
   const root = `/tmp/natural-test-${randomUUID()}`;
+  await mkdir(`${root}/.git`, { recursive: true });
   return WorkstreamStore.create({
     id: "natural-test",
     purpose: "Test natural observation",
