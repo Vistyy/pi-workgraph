@@ -7,7 +7,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
   activeWorkerCount,
   attachCalmPresentation,
+  calmActivityLines,
   calmStatus,
+  calmWorkingIndicatorFrames,
   DEFAULT_CALM_HIDDEN_TOOLS,
   installCalmMode,
   isCalmActivityActive,
@@ -51,20 +53,38 @@ class FakeMessageRow {
   }
 }
 
+type FakeTheme = {
+  fg(color: string, text: string): string;
+};
+
+function fakeTheme(): FakeTheme {
+  return {
+    fg: (color, text) => `<${color}>${text}</${color}>`,
+  };
+}
+
 function fakeUi() {
   const statuses: Array<[string, string | undefined]> = [];
   type WorkingIndicator = { readonly frames?: readonly string[]; readonly intervalMs?: number };
+  type CalmWidget = { render(width: number): string[] };
+  type Widget = (tui: { requestRender(): void }, theme: FakeTheme) => CalmWidget;
   const indicators: WorkingIndicator[] = [];
+  const widgets: Array<[string, Widget | undefined]> = [];
   const notifications: string[] = [];
   const ui = {
     statuses,
     indicators,
+    widgets,
     notifications,
+    theme: fakeTheme(),
     setStatus(key: string, text: string | undefined) {
       statuses.push([key, text]);
     },
     setWorkingIndicator(options?: WorkingIndicator) {
       if (options !== undefined) indicators.push(options);
+    },
+    setWidget(key: string, content: Widget | undefined) {
+      widgets.push([key, content]);
     },
     notify(message: string) {
       notifications.push(message);
@@ -99,6 +119,10 @@ function moduleForFakeRows() {
     ToolExecutionComponent: FakeToolRow,
     CustomMessageComponent: FakeMessageRow,
   };
+}
+
+function stripAnsiLikeTheme(value: string): string {
+  return value.replace(/<\/?[A-Za-z]+>/g, "");
 }
 
 void test("calm policy defaults cover builtins, search tools, and Workgraph tools", () => {
@@ -177,6 +201,29 @@ void test("activity indicator remains active for coordinator or workers and sett
   assert.equal(calmStatus({ coordinatorActive: false, activeWorkers: 0 }, 3), "· calm");
 });
 
+void test("constellation frames are themed, compact, and width-safe", () => {
+  const theme = fakeTheme();
+  const active = { coordinatorActive: true, activeWorkers: 2 };
+  const wideA = calmActivityLines(active, 2, 80, theme);
+  const wideB = calmActivityLines(active, 8, 80, theme);
+  assert.equal(wideA.length, 2);
+  assert.notDeepEqual(wideA, wideB);
+  assert.match(wideA[0] ?? "", /Workgraph/);
+  assert.match(wideA[0] ?? "", /<accent>◆<\/?accent>/);
+  assert.match(wideA[1] ?? "", /coordinator \+ 2 workers/);
+
+  for (const width of [40, 24, 12, 3, 1]) {
+    const lines = calmActivityLines(active, 4, width, theme);
+    assert.ok(lines.every((line) => stripAnsiLikeTheme(line).length <= width));
+  }
+  assert.deepEqual(
+    calmActivityLines({ coordinatorActive: false, activeWorkers: 0 }, 1, 80, theme),
+    [],
+  );
+  assert.equal(calmWorkingIndicatorFrames(theme).length, 4);
+  assert.notEqual(calmWorkingIndicatorFrames(theme)[0], calmWorkingIndicatorFrames(theme)[1]);
+});
+
 void test("coordinator calm command is off by default and uses the guarded adapter", async () => {
   const pi = fakePi();
   const ui = fakeUi();
@@ -197,8 +244,18 @@ void test("coordinator calm command is off by default and uses the guarded adapt
   await pi.commands.get("calm")?.("", context);
   assert.deepEqual(tool.render(80), []);
   assert.match(ui.statuses.at(-1)?.[1] ?? "", /calm/);
+  assert.equal(ui.widgets.at(-1)?.[0], "calm");
+  const widgetFactory = ui.widgets.at(-1)?.[1];
+  assert.ok(widgetFactory);
+  const widget = widgetFactory({ requestRender() {} }, ui.theme);
+  assert.equal(widget.render(80).length, 2);
+  assert.match(widget.render(80)[0] ?? "", /Workgraph/);
+  calm.setActiveWorkers(0);
+  assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
+  calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
   assert.deepEqual(tool.render(80), ["tool:read:80"]);
+  assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
   assert.equal(ui.statuses.at(-1)?.[1], undefined);
   await pi.events.get("session_shutdown")?.({}, context);
   assert.deepEqual(tool.render(80), ["tool:read:80"]);

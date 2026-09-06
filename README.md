@@ -20,6 +20,7 @@ Composition still requires a clean destination at the maintained-application bou
 ### Coordinator Calm
 
 The coordinator extension registers `/calm` as an off-by-default, presentation-only toggle for operational tool rows and Workgraph notification rows.
+Calm activity renders a compact animated connected-node constellation with gently traveling highlights, theme-aware colors, and a stable narrow-terminal fallback.
 It does not change the session, model context, exports, tool execution, or worker tabs.
 The default hidden tool-name list covers Pi builtins, installed search tools, Workgraph tools, and `herdr_rename`.
 Override it with `PI_WORKGRAPH_CALM_HIDDEN_TOOLS=tool_a,tool_b` before starting Pi.
