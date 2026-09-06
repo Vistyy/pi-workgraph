@@ -352,6 +352,17 @@ function applicationProjection(attempt: WorkAttempt | undefined, result: WorkRes
   return { state: "not_applicable" as const };
 }
 
+function artifactRetentionProjection(attempt: WorkAttempt | undefined) {
+  const retention = attempt?.artifactRetention;
+  if (retention === undefined) return { state: "not_recorded" as const };
+  return {
+    state: retention.state,
+    required: retention.required.length,
+    retained: retention.state === "completed" ? retention.required.length : 0,
+    blocker: retention.error === undefined ? undefined : compactText(retention.error, 280),
+  };
+}
+
 function cleanupProjection(attempt: WorkAttempt | undefined) {
   const cleanup = attempt?.cleanup;
   if (cleanup === undefined) return { state: "not_recorded" as const };
@@ -381,6 +392,7 @@ function settlement(state: WorkstreamState, result: WorkResult) {
     blockers,
     blockerCount,
     application: applicationProjection(attempt, result),
+    artifactRetention: artifactRetentionProjection(attempt),
     cleanup: cleanupProjection(attempt),
     delivery: deliveryPreview(state, result),
     recovery:
@@ -465,7 +477,11 @@ function taskView(state: WorkstreamState, assignment: WorkAssignment, request: I
 
 function attention(state: WorkstreamState) {
   return state.attempts.flatMap((attempt) => {
-    const blocker = attempt.error ?? attempt.composition?.error ?? attempt.cleanup?.error;
+    const blocker =
+      attempt.error ??
+      attempt.artifactRetention?.error ??
+      attempt.composition?.error ??
+      attempt.cleanup?.error;
     if (blocker === undefined) return [];
     return [
       {
@@ -663,13 +679,18 @@ function recoveryView(
     launchPane: attempt.launchPane,
     submission: attempt.submission,
     composition: attempt.composition,
+    artifactRetention: attempt.artifactRetention,
     cleanup: attempt.cleanup,
     attentionHistory: attempt.attentionHistory,
     models: attempt.models,
     effectiveModels: attempt.effectiveModels,
     delivery: state.deliveries.find((item) => item.resultId === attempt.resultId),
   };
-  const blocker = attempt.error ?? attempt.composition?.error ?? attempt.cleanup?.error;
+  const blocker =
+    attempt.error ??
+    attempt.artifactRetention?.error ??
+    attempt.composition?.error ??
+    attempt.cleanup?.error;
   const runtimeSettlementRecorded =
     attempt.resultId !== undefined &&
     attempt.sessionFile !== undefined &&
@@ -697,6 +718,7 @@ function recoveryView(
         : ("not_recorded" as const),
       nativeOrGitStateFromTerminalStateAlone: false,
       composition: recordedComposition(attempt),
+      artifactRetention: artifactRetentionProjection(attempt),
       cleanup: recordedCleanup(attempt),
       delivery: recordedDelivery(state, attempt),
       models: projectedModels(attempt),
@@ -715,7 +737,10 @@ function recoveryView(
         : {
             tool: "workgraph_control" as const,
             attempt: attempt.id,
-            actions: ["recover", "retain_not_applied"] as const,
+            actions:
+              attempt.artifactRetention?.state === "blocked"
+                ? (["recover"] as const)
+                : (["recover", "retain_not_applied"] as const),
           },
   };
 }

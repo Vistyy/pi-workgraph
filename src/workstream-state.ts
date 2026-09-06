@@ -158,6 +158,21 @@ export const ArtifactSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+export const ArtifactRetentionSchema = Type.Object(
+  {
+    state: StringEnum(["pending", "blocked", "completed"] as const),
+    resultId: NonEmptyStringSchema,
+    assignmentIntentVersion: Type.Integer({ minimum: 0 }),
+    sourceRoot: NonEmptyStringSchema,
+    sourceIdentity: Type.String({ pattern: "^[0-9a-f]{64}$" }),
+    expectedHead: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+    destinationRoot: NonEmptyStringSchema,
+    stagingRoot: NonEmptyStringSchema,
+    required: Type.Array(NonEmptyStringSchema),
+    error: Type.Optional(NonEmptyStringSchema),
+  },
+  { additionalProperties: false },
+);
 const ResultBase = {
   id: NonEmptyStringSchema,
   /** Stable UUID retained for recovery and compatibility; semantic ids are the normal handle. */
@@ -335,6 +350,7 @@ export const AttemptSchema = Type.Object(
         { additionalProperties: false },
       ),
     ),
+    artifactRetention: Type.Optional(ArtifactRetentionSchema),
     sessionFile: Type.Optional(NonEmptyStringSchema),
     placement: Type.Optional(AttemptPlacementSchema),
     /** @deprecated Derived only for isolated placement compatibility views. */
@@ -495,6 +511,7 @@ export type AuthorityReference = Static<typeof AuthorityReferenceSchema>;
 export type ResultSubject = Static<typeof ResultSubjectSchema>;
 export type WorkAssignment = Static<typeof AssignmentSchema>;
 export type RetainedArtifact = Static<typeof ArtifactSchema>;
+export type ArtifactRetention = Static<typeof ArtifactRetentionSchema>;
 export type WorkResult = Static<typeof ResultSchema>;
 export type ResultDisposition = Static<typeof DispositionSchema>;
 export type WorkAttempt = Static<typeof AttemptSchema>;

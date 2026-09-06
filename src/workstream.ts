@@ -8,6 +8,7 @@ import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { EvidenceSchema } from "./report-schema.js";
 import {
+  type ArtifactRetention,
   AssignmentSchema,
   type AttemptPlacementSchema,
   type AuthorityReference,
@@ -54,6 +55,7 @@ import {
 } from "./workstream-validation.js";
 
 export type {
+  ArtifactRetention,
   AuthorityReference,
   CompletionAccounting,
   HumanInputReceipt,
@@ -365,25 +367,72 @@ export class WorkstreamStore {
     validateId(input.id, "Result id");
     return this.update(
       (draft, now) => {
-        if (draft.results.some((result) => result.id === input.id))
-          throw new Error(`Duplicate result ${input.id}.`);
         const assignment = requireAssignment(draft, input.assignmentId);
-        if (input.assignmentIntentVersion !== assignment.intentVersion)
-          throw new Error("Result intent version does not match its assignment.");
         const { now: _now, artifacts = [], ...fields } = input;
         validateArtifactsForAssignment(
           assignment,
           artifacts,
           input.validity === "typed" && input.report.status === "completed" ? "typed" : "absent",
         );
-        const result = {
+        retainResultTransition(draft, {
           ...fields,
           artifacts,
           observedAt: (input.now ?? now).toISOString(),
+        });
+      },
+      input.now,
+      ["active", "suspended"],
+    );
+  }
+
+  retainResultPendingArtifacts(input: {
+    attemptId: string;
+    id: string;
+    assignmentId: string;
+    assignmentIntentVersion: number;
+    report: Extract<WorkResult, { validity: "typed" }>["report"];
+    sourceRoot: string;
+    sourceIdentity: string;
+    expectedHead: string;
+    destinationRoot: string;
+    stagingRoot: string;
+    required: string[];
+    now?: Date;
+  }): Promise<WorkstreamState> {
+    validateId(input.id, "Result id");
+    return this.update(
+      (draft, now) => {
+        const attempt = draft.attempts.find((item) => item.id === input.attemptId);
+        if (!attempt) throw new Error(`Unknown attempt ${input.attemptId}.`);
+        const assignment = requireAssignment(draft, input.assignmentId);
+        if (
+          assignment.artifactIntent !== "disposable_experiment" ||
+          attempt.assignmentId !== assignment.id ||
+          input.assignmentIntentVersion !== assignment.intentVersion ||
+          input.report.status !== "completed" ||
+          !sameValue(input.required, assignment.artifactPolicy.retain)
+        )
+          throw new Error("Pending artifact retention does not match its experiment assignment.");
+        retainResultTransition(draft, {
+          id: input.id,
+          assignmentId: input.assignmentId,
+          assignmentIntentVersion: input.assignmentIntentVersion,
+          validity: "typed",
+          report: structuredClone(input.report),
+          artifacts: [],
+          observedAt: (input.now ?? now).toISOString(),
+        });
+        attempt.artifactRetention = {
+          state: "pending",
+          resultId: input.id,
+          assignmentIntentVersion: input.assignmentIntentVersion,
+          sourceRoot: input.sourceRoot,
+          sourceIdentity: input.sourceIdentity,
+          expectedHead: input.expectedHead,
+          destinationRoot: input.destinationRoot,
+          stagingRoot: input.stagingRoot,
+          required: [...input.required],
         };
-        if (!Value.Check(ResultSchema, result))
-          throw new Error("Result input does not satisfy its validity contract.");
-        draft.results.push(result);
       },
       input.now,
       ["active", "suspended"],
@@ -731,6 +780,69 @@ export class WorkstreamStore {
           throw new Error(`Cleanup for ${id} is not pending.`);
         if (attempt.cleanup.workerClosed === true) return;
         attempt.cleanup = { ...attempt.cleanup, workerClosed: true };
+      },
+      now,
+    );
+  }
+
+  retryArtifactRetention(id: string, now?: Date): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const retention = attempt.artifactRetention;
+        if (retention === undefined || retention.state !== "blocked")
+          throw new Error(`Artifact retention for ${id} is not blocked.`);
+        attempt.artifactRetention = { ...retention, state: "pending" };
+        delete attempt.artifactRetention.error;
+      },
+      now,
+    );
+  }
+
+  finishArtifactRetention(
+    id: string,
+    artifacts: RetainedArtifact[],
+    now?: Date,
+  ): Promise<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt, draft) => {
+        const retention = attempt.artifactRetention;
+        if (retention?.state === "completed") {
+          const result = draft.results.find((item) => item.id === retention.resultId);
+          if (result && sameValue(result.artifacts, artifacts)) return;
+          throw new Error(`Artifact retention for ${id} has contradictory completion evidence.`);
+        }
+        if (retention?.state !== "pending")
+          throw new Error(`Artifact retention for ${id} is not pending.`);
+        const result = draft.results.find((item) => item.id === retention.resultId);
+        if (!result) throw new Error(`Unknown result ${retention.resultId}.`);
+        if (result.artifacts.length > 0 && !sameValue(result.artifacts, artifacts))
+          throw new Error(`Result ${result.id} artifacts are immutable after retention.`);
+        result.artifacts = structuredClone(artifacts);
+        attempt.artifactRetention = { ...retention, state: "completed" };
+        delete attempt.artifactRetention.error;
+      },
+      now,
+    );
+  }
+
+  blockArtifactRetention(id: string, error: string, now?: Date): Promise<WorkstreamState> {
+    requireText(error, "Artifact retention error");
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const retention = attempt.artifactRetention;
+        if (retention === undefined || retention.state === "completed")
+          throw new Error(`Artifact retention for ${id} is not blockable.`);
+        if (retention.state === "blocked" && retention.error === error.trim()) return;
+        if (retention.state === "blocked")
+          throw new Error(`Artifact retention for ${id} has contradictory failure evidence.`);
+        attempt.artifactRetention = {
+          ...retention,
+          state: "blocked",
+          error: error.trim(),
+        };
       },
       now,
     );
@@ -1162,6 +1274,8 @@ function beginCleanupTransition(
   attempt: WorkAttempt,
   input: { expectedHead?: string; discard: boolean; id: string },
 ): void {
+  if (attempt.artifactRetention !== undefined && attempt.artifactRetention.state !== "completed")
+    throw new Error(`Cleanup for ${input.id} requires completed artifact retention.`);
   if (attempt.cleanup) {
     if (
       attempt.cleanup.state === "pending" &&
@@ -1184,6 +1298,17 @@ function beginCleanupTransition(
   };
   if (input.expectedHead !== undefined) cleanup.expectedHead = input.expectedHead;
   attempt.cleanup = cleanup;
+}
+
+function retainResultTransition(draft: WorkstreamState, result: WorkResult): void {
+  if (draft.results.some((item) => item.id === result.id))
+    throw new Error(`Duplicate result ${result.id}.`);
+  const assignment = requireAssignment(draft, result.assignmentId);
+  if (result.assignmentIntentVersion !== assignment.intentVersion)
+    throw new Error("Result intent version does not match its assignment.");
+  if (!Value.Check(ResultSchema, result))
+    throw new Error("Result input does not satisfy its validity contract.");
+  draft.results.push(result);
 }
 
 function runStorePromise<A, E>(operation: Effect.Effect<A, E>): Promise<A> {

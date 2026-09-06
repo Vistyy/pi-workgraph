@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Pi supplies Node filesystem promises as the concrete artifact-retention boundary.
-import { access, cp, lstat, mkdir, realpath } from "node:fs/promises";
+import * as artifactFs from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Git worktrees require the host's Node path semantics.
 import { dirname, join, relative, resolve, sep } from "node:path";
 import {
@@ -43,6 +43,7 @@ import {
 import { type Lease, type LeaseOwner, WorkgraphRegistry } from "./registry.js";
 import type { ThinkingLevel } from "./types.js";
 import type {
+  ArtifactRetention,
   RetainedArtifact,
   WorkAssignment,
   WorkAttempt,
@@ -781,7 +782,12 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     assignment: WorkAssignment,
   ): Effect.Effect<void, RuntimeError> {
-    if (attempt.cleanup !== undefined || attempt.placement === undefined) return Effect.void;
+    if (
+      attempt.cleanup !== undefined ||
+      attempt.placement === undefined ||
+      (attempt.artifactRetention !== undefined && attempt.artifactRetention.state !== "completed")
+    )
+      return Effect.void;
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const input: Parameters<WorkstreamStore["beginCleanup"]>[0] = {
@@ -879,6 +885,10 @@ export class WorkstreamRuntime {
         const resultId = attempt.resultId ?? `result-${attempt.id}`;
         if (!state.results.some((item) => item.id === resultId))
           yield* this.retainNewResult(state, attempt, assignment, sessionFile, resultId);
+        const retainedState = yield* this.dependency("store", "reload artifact retention", () =>
+          this.store.load(),
+        );
+        yield* this.advanceArtifactRetention(retainedState, findAttempt(retainedState, attempt.id));
         const effectiveModels = yield* this.runtimeSync("read effective model observations", () =>
           effectiveModelObservations(sessionFile, generation),
         );
@@ -948,52 +958,78 @@ export class WorkstreamRuntime {
     base: { id: string; assignmentId: string; assignmentIntentVersion: number },
     report: NonNullable<ReturnType<typeof readWorkgraphReportResult>["report"]>,
   ): Effect.Effect<void, RuntimeError> {
-    const retention = Effect.gen(
+    if (isNoChangeImplementation(assignment, report))
+      return this.dependency("git", "validate no-change worker", () =>
+        this.repository.validateWorkerNoChange(placementOf(attempt), report.revision),
+      ).pipe(
+        Effect.andThen(
+          this.dependency("store", "retain typed worker result", () =>
+            this.store.retainResult({ ...base, validity: "typed", report }),
+          ),
+        ),
+        Effect.catch((error) => this.retainFailedNoChange(attempt, base, error)),
+        Effect.asVoid,
+      );
+    if (assignment.artifactIntent === "disposable_experiment" && report.status === "completed")
+      return this.checkpointArtifactRetention(state, attempt, assignment, base, report);
+    return this.dependency("store", "retain typed worker result", () =>
+      this.store.retainResult({ ...base, validity: "typed", report }),
+    ).pipe(Effect.asVoid);
+  }
+
+  private checkpointArtifactRetention(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: Extract<WorkAssignment, { artifactIntent: "disposable_experiment" }>,
+    base: { id: string; assignmentId: string; assignmentIntentVersion: number },
+    report: NonNullable<ReturnType<typeof readWorkgraphReportResult>["report"]>,
+  ): Effect.Effect<void, RuntimeError> {
+    return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        if (isNoChangeImplementation(assignment, report))
-          yield* this.dependency("git", "validate no-change worker", () =>
-            this.repository.validateWorkerNoChange(placementOf(attempt), report.revision),
-          );
-        const artifacts =
-          assignment.artifactIntent === "disposable_experiment"
-            ? yield* this.retainExperiment(
-                state,
-                assignment,
-                attempt,
-                base.id,
-                report.status === "completed",
-              )
-            : [];
-        yield* this.dependency("store", "retain typed worker result", () =>
-          this.store.retainResult({
+        const placement = required(
+          attempt.placement?.kind === "isolated_worktree" ? attempt.placement.path : undefined,
+          "experiment worktree",
+        );
+        const sourceRoot = yield* this.dependency("runtime", "resolve experiment root", () =>
+          artifactFs.realpath(placement),
+        );
+        const expectedHead = yield* this.dependency("git", "checkpoint experiment head", () =>
+          this.repository.head(placement),
+        );
+        const sourceIdentity = yield* this.dependency(
+          "runtime",
+          "checkpoint experiment identity",
+          () => worktreeSourceIdentity(sourceRoot),
+        );
+        yield* this.dependency("store", "retain report and checkpoint artifacts", () =>
+          this.store.retainResultPendingArtifacts({
+            attemptId: attempt.id,
             ...base,
-            validity: "typed",
             report,
-            artifacts,
+            sourceRoot,
+            sourceIdentity,
+            expectedHead,
+            destinationRoot: join(dirname(state.statePath), "artifacts", base.id),
+            stagingRoot: join(dirname(state.statePath), "artifact-staging", base.id),
+            required: assignment.artifactPolicy.retain,
           }),
         );
       }.bind(this),
     );
-    return retention.pipe(
-      Effect.catch((error) =>
-        this.retainFailedResult(attempt, base, isNoChangeImplementation(assignment, report), error),
-      ),
-    );
   }
 
-  private retainFailedResult(
+  private retainFailedNoChange(
     attempt: WorkAttempt,
     base: { id: string; assignmentId: string; assignmentIntentVersion: number },
-    noChangeValidation: boolean,
     error: RuntimeError,
   ): Effect.Effect<void, RuntimeError> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        yield* this.dependency("store", "retain failed worker result", () =>
+        yield* this.dependency("store", "retain failed no-change result", () =>
           this.store.retainResult({
             ...base,
             validity: "invalid",
-            detail: `${noChangeValidation ? "No-change validation failed" : "Artifact retention failed"}: ${error.message}`,
+            detail: `No-change validation failed: ${error.message}`,
           }),
         );
         const cleanup: Parameters<WorkstreamStore["beginCleanup"]>[0] = {
@@ -1001,13 +1037,13 @@ export class WorkstreamRuntime {
           discard: false,
         };
         if (attempt.placement?.kind === "isolated_worktree")
-          cleanup.expectedHead = yield* this.dependency("git", "read failed retention head", () =>
+          cleanup.expectedHead = yield* this.dependency("git", "read failed validation head", () =>
             this.repository.head(attempt.placement?.path),
           );
-        yield* this.dependency("store", "begin blocked retention cleanup", () =>
+        yield* this.dependency("store", "begin blocked validation cleanup", () =>
           this.store.beginCleanup(cleanup),
         );
-        yield* this.dependency("store", "block failed retention cleanup", () =>
+        yield* this.dependency("store", "block failed validation cleanup", () =>
           this.store.blockCleanup(attempt.id, error.message),
         );
       }.bind(this),
@@ -1135,96 +1171,177 @@ export class WorkstreamRuntime {
     ).pipe(Effect.asVoid);
   }
 
-  private retainExperiment(
+  private advanceArtifactRetention(
     state: WorkstreamState,
-    assignment: Extract<WorkAssignment, { artifactIntent: "disposable_experiment" }>,
     attempt: WorkAttempt,
-    resultId: string,
-    successful: boolean,
-  ): Effect.Effect<RetainedArtifact[], RuntimeError> {
+  ): Effect.Effect<void, RuntimeError> {
+    const retention = attempt.artifactRetention;
+    if (retention?.state !== "pending") return Effect.void;
+    const operation = Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const assignment = findAssignment(state, attempt.assignmentId);
+        yield* this.runtimeSync("validate artifact retention intent", () => {
+          if (
+            assignment.artifactIntent !== "disposable_experiment" ||
+            state.intents.at(-1)?.version !== retention.assignmentIntentVersion
+          )
+            throw new Error(
+              "Required artifact retention is blocked because its assignment intent is no longer current.",
+            );
+        });
+        yield* this.verifyArtifactRetentionSource(attempt, retention);
+        yield* this.ownershipEffect();
+        const artifacts = yield* Effect.forEach(retention.required, (name) =>
+          this.retainExperimentArtifact(retention, name),
+        );
+        yield* this.dependency("store", "complete artifact retention", () =>
+          this.store.finishArtifactRetention(attempt.id, artifacts),
+        );
+      }.bind(this),
+    );
+    return operation.pipe(
+      Effect.catch((error) =>
+        this.dependency("store", "block artifact retention", () =>
+          this.store.blockArtifactRetention(attempt.id, error.message),
+        ),
+      ),
+    );
+  }
+
+  private verifyArtifactRetentionSource(
+    attempt: WorkAttempt,
+    retention: ArtifactRetention,
+  ): Effect.Effect<void, RuntimeError> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const placement = required(
           attempt.placement?.kind === "isolated_worktree" ? attempt.placement.path : undefined,
           "experiment worktree",
         );
-        const root = yield* this.dependency("runtime", "resolve experiment root", () =>
-          realpath(placement),
+        const root = yield* this.dependency("runtime", "resolve retained experiment root", () =>
+          artifactFs.realpath(placement),
         );
-        const destination = join(dirname(state.statePath), "artifacts", resultId);
-        const retained = yield* Effect.forEach(assignment.artifactPolicy.retain, (name) =>
-          this.retainExperimentArtifact(root, destination, name, successful),
+        const head = yield* this.dependency("git", "verify retained experiment head", () =>
+          this.repository.head(placement),
         );
-        return retained.filter((artifact): artifact is RetainedArtifact => artifact !== undefined);
+        const sourceIdentity = yield* this.dependency(
+          "runtime",
+          "verify retained experiment metadata",
+          () => worktreeSourceIdentity(root),
+        );
+        yield* this.runtimeSync("validate retained experiment identity", () => {
+          if (
+            root !== retention.sourceRoot ||
+            sourceIdentity !== retention.sourceIdentity ||
+            head !== retention.expectedHead ||
+            resolve(attempt.worker?.cwd ?? "") !== resolve(placement) ||
+            (attempt.resource !== undefined && resolve(attempt.resource.cwd) !== resolve(placement))
+          )
+            throw new Error("Required artifact source no longer has its exact owned identity.");
+        });
       }.bind(this),
     );
   }
 
   private retainExperimentArtifact(
-    root: string,
-    destination: string,
+    retention: ArtifactRetention,
     name: string,
-    successful: boolean,
-  ): Effect.Effect<RetainedArtifact | undefined, RuntimeError> {
+  ): Effect.Effect<RetainedArtifact, RuntimeError> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         yield* this.runtimeSync("validate experiment artifact name", () => {
-          if (name.trim() === "" || name.split(/[\\/]/).includes(".git") || name === ".")
+          if (
+            name.trim() === "" ||
+            name === "." ||
+            resolve(retention.sourceRoot, name) === retention.sourceRoot ||
+            name.split(/[\\/]/).some((part) => part === ".git" || part === "..")
+          )
             throw new Error("Artifact must name a non-metadata path within the experiment.");
         });
-        const source = resolve(root, name);
-        const target = resolve(destination, name);
-        const exists = yield* this.artifactExists(source, successful);
-        if (!exists) return undefined;
-        const realSource = yield* this.dependency("runtime", "resolve experiment artifact", () =>
-          realpath(source),
-        );
-        yield* this.runtimeSync("validate experiment artifact path", () => {
-          if (!within(root, source) || !within(destination, target) || !within(root, realSource))
-            throw new Error(`Experiment artifact escapes its workspace: ${name}.`);
+        const source = resolve(retention.sourceRoot, name);
+        const target = resolve(retention.destinationRoot, name);
+        yield* this.runtimeSync("validate experiment artifact paths", () => {
+          if (!within(retention.sourceRoot, source) || !within(retention.destinationRoot, target))
+            throw new Error(`Experiment artifact escapes its retained boundary: ${name}.`);
         });
+        const sourceFingerprint = yield* this.dependency(
+          "runtime",
+          "fingerprint experiment artifact",
+          () => artifactFingerprint(source, retention.sourceRoot),
+        );
+        const staging = join(
+          retention.stagingRoot,
+          createHash("sha256").update(`${name}\0${sourceFingerprint}`).digest("hex"),
+        );
         yield* this.dependency("runtime", "create artifact destination", () =>
-          mkdir(dirname(target), { recursive: true }),
+          prepareArtifactDirectory(retention.destinationRoot, dirname(target)),
         );
-        yield* this.dependency("runtime", "copy experiment artifact", () =>
-          cp(source, target, {
-            recursive: true,
-            force: true,
-            filter: (path) =>
-              lstat(path)
-                .then((status) => {
-                  if (status.isSymbolicLink())
-                    throw new Error(`Symlink artifact is not retained: ${path}.`);
-                  return realpath(path);
-                })
-                .then((resolvedPath) => {
-                  if (!within(root, resolvedPath))
-                    throw new Error("Artifact escaped the experiment.");
-                  return true;
-                }),
-          }),
+        yield* this.dependency("runtime", "create artifact staging", () =>
+          prepareArtifactDirectory(retention.stagingRoot, dirname(staging)),
         );
-        const artifact: RetainedArtifact = {
-          id: name,
-          kind: "path",
-          reference: target,
-          retention: "retained",
-          summary: "Retained from authorized disposable experiment before cleanup.",
-        };
-        return artifact;
+        const targetExists = yield* this.pathExists(target);
+        if (targetExists) {
+          const retainedFingerprint = yield* this.dependency(
+            "runtime",
+            "verify retained artifact",
+            () => artifactFingerprint(target, retention.destinationRoot),
+          );
+          yield* this.runtimeSync("compare retained artifact", () => {
+            if (retainedFingerprint !== sourceFingerprint)
+              throw new Error(`Retained artifact conflicts with its exact source: ${name}.`);
+          });
+          return retainedArtifact(name, target);
+        }
+        const stagingExists = yield* this.pathExists(staging);
+        if (!stagingExists)
+          yield* this.dependency("runtime", "copy experiment artifact to staging", () =>
+            artifactFs.cp(source, staging, {
+              recursive: true,
+              force: false,
+              errorOnExist: true,
+              filter: (path) => assertSafeArtifactPath(path, retention.sourceRoot),
+            }),
+          );
+        const stagedFingerprint = yield* this.dependency("runtime", "verify staged artifact", () =>
+          artifactFingerprint(staging, retention.stagingRoot),
+        );
+        const currentSourceFingerprint = yield* this.dependency(
+          "runtime",
+          "recheck experiment artifact",
+          () => artifactFingerprint(source, retention.sourceRoot),
+        );
+        yield* this.runtimeSync("compare staged artifact", () => {
+          if (
+            stagedFingerprint !== sourceFingerprint ||
+            currentSourceFingerprint !== sourceFingerprint
+          )
+            throw new Error(`Experiment artifact changed while being retained: ${name}.`);
+        });
+        yield* this.dependency("runtime", "publish retained artifact", () =>
+          artifactFs.rename(staging, target),
+        );
+        const publishedFingerprint = yield* this.dependency(
+          "runtime",
+          "verify published artifact",
+          () => artifactFingerprint(target, retention.destinationRoot),
+        );
+        yield* this.runtimeSync("confirm published artifact", () => {
+          if (publishedFingerprint !== sourceFingerprint)
+            throw new Error(`Published artifact does not match its source: ${name}.`);
+        });
+        return retainedArtifact(name, target);
       }.bind(this),
     );
   }
 
-  private artifactExists(
-    source: string,
-    successful: boolean,
-  ): Effect.Effect<boolean, RuntimeError> {
-    return this.dependency("runtime", "access experiment artifact", () => access(source)).pipe(
+  private pathExists(path: string): Effect.Effect<boolean, RuntimeError> {
+    return this.dependency("runtime", "access retained artifact path", () =>
+      artifactFs.access(path),
+    ).pipe(
       Effect.as(true),
       Effect.catch((error) => {
         const cause = error.cause;
-        return !successful && cause instanceof Error && "code" in cause && cause.code === "ENOENT"
+        return cause instanceof Error && "code" in cause && cause.code === "ENOENT"
           ? Effect.succeed(false)
           : Effect.fail(error);
       }),
@@ -1239,7 +1356,13 @@ export class WorkstreamRuntime {
         );
         const attempt = findAttempt(state, id);
         const cleanup = attempt.cleanup;
-        if (cleanup?.state !== "pending" || attempt.composition?.state === "blocked") return;
+        if (
+          cleanup?.state !== "pending" ||
+          attempt.composition?.state === "blocked" ||
+          (attempt.artifactRetention !== undefined &&
+            attempt.artifactRetention.state !== "completed")
+        )
+          return;
         const operation = this.cleanupAttempt(attempt, cleanup);
         yield* operation.pipe(
           Effect.catch((error) =>
@@ -1332,14 +1455,65 @@ export class WorkstreamRuntime {
           this.store.load(),
         );
         const attempt = findAttempt(state, input.attemptId);
-        if (attempt.composition?.state === "blocked")
+        if (attempt.artifactRetention?.state === "blocked")
+          yield* this.recoverBlockedArtifactRetention(state, attempt);
+        else if (attempt.composition?.state === "blocked")
           yield* this.recoverBlockedComposition(state, attempt, input);
-        else if (attempt.cleanup?.state === "blocked") yield* this.recoverBlockedCleanup(attempt);
-        else
+        else if (attempt.cleanup?.state === "blocked") {
+          yield* this.runtimeSync("validate legacy retention recovery", () => {
+            if (isLegacyArtifactRetentionFailure(state, attempt))
+              throw new Error(
+                "Legacy artifact-retention failure has no independently retained report and source checkpoint; preserve it for inspection rather than inventing validity or retrying cleanup.",
+              );
+          });
+          yield* this.recoverBlockedCleanup(attempt);
+        } else if (attempt.artifactRetention?.state === "completed" && input.action === "retry") {
+          yield* this.advanceRetainedResult(
+            attempt.id,
+            findAssignment(state, attempt.assignmentId),
+          );
+        } else
           yield* this.runtimeSync("validate recovery boundary", () => {
             throw new Error(`Attempt ${attempt.id} has no blocked recovery boundary.`);
           });
         return yield* this.dependency("store", "load recovered state", () => this.store.load());
+      }.bind(this),
+    );
+  }
+
+  private recoverBlockedArtifactRetention(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+  ): Effect.Effect<void, RuntimeError> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
+        yield* this.runtimeSync("validate current artifact retention", () => {
+          if (state.intents.at(-1)?.version !== attempt.artifactRetention?.assignmentIntentVersion)
+            throw new Error(
+              "Required artifact retention belongs to a stale intent; leave its source intact.",
+            );
+        });
+        yield* this.verifyArtifactRetentionSource(
+          attempt,
+          required(attempt.artifactRetention, "artifact retention"),
+        );
+        yield* this.ownershipEffect();
+        yield* this.dependency("store", "retry blocked artifact retention", () =>
+          this.store.retryArtifactRetention(attempt.id),
+        );
+        let latest = yield* this.dependency("store", "load retried artifact retention", () =>
+          this.store.load(),
+        );
+        yield* this.advanceArtifactRetention(latest, findAttempt(latest, attempt.id));
+        latest = yield* this.dependency("store", "load retained artifacts", () =>
+          this.store.load(),
+        );
+        const retainedAttempt = findAttempt(latest, attempt.id);
+        if (retainedAttempt.artifactRetention?.state !== "completed") return;
+        const assignment = findAssignment(latest, attempt.assignmentId);
+        yield* this.beginCleanupIfNeeded(retainedAttempt, assignment);
+        yield* this.cleanup(attempt.id);
       }.bind(this),
     );
   }
@@ -1849,6 +2023,119 @@ function required<T>(value: T | undefined, label: string): T {
   if (value === undefined) throw new Error(`Missing ${label}.`);
   return value;
 }
+function isLegacyArtifactRetentionFailure(state: WorkstreamState, attempt: WorkAttempt): boolean {
+  if (attempt.artifactRetention !== undefined || attempt.resultId === undefined) return false;
+  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
+  const result = state.results.find((item) => item.id === attempt.resultId);
+  return (
+    assignment?.artifactIntent === "disposable_experiment" &&
+    result?.validity === "invalid" &&
+    result.detail.startsWith("Artifact retention failed:")
+  );
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- The Git worktree marker is read inside a runtime dependency checkpoint.
+async function worktreeSourceIdentity(root: string): Promise<string> {
+  const marker = join(root, ".git");
+  const status = await artifactFs.lstat(marker);
+  if (!status.isFile() || status.isSymbolicLink())
+    throw new Error("Experiment source has unsafe Git worktree metadata.");
+  return createHash("sha256")
+    .update(await artifactFs.readFile(marker))
+    .digest("hex");
+}
+
+function retainedArtifact(name: string, target: string): RetainedArtifact {
+  return {
+    id: name,
+    kind: "path",
+    reference: target,
+    retention: "retained",
+    summary: "Retained from authorized disposable experiment before cleanup.",
+  };
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- This bounded filesystem helper runs inside the runtime dependency checkpoint.
+async function prepareArtifactDirectory(root: string, path: string): Promise<void> {
+  const base = resolve(root, "..", "..");
+  const baseStatus = await artifactFs.lstat(base);
+  if (baseStatus.isSymbolicLink() || !baseStatus.isDirectory())
+    throw new Error(`Artifact retention base is unsafe: ${base}.`);
+  const realBase = await artifactFs.realpath(base);
+  const part = relative(base, path);
+  if (part === ".." || part.startsWith(`..${sep}`) || part.startsWith(sep))
+    throw new Error(`Artifact retention directory escapes its base: ${path}.`);
+  let current = base;
+  for (const component of part.split(sep).filter(Boolean)) {
+    current = join(current, component);
+    const status = await existingOrCreatedDirectory(current);
+    if (status.isSymbolicLink() || !status.isDirectory())
+      throw new Error(`Artifact retention directory is unsafe: ${current}.`);
+    const realDirectory = await artifactFs.realpath(current);
+    if (!within(realBase, realDirectory))
+      throw new Error(`Artifact retention directory escapes its base: ${current}.`);
+  }
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Directory creation is contained by the caller's checked retention base.
+async function existingOrCreatedDirectory(
+  path: string,
+): Promise<Awaited<ReturnType<typeof artifactFs.lstat>>> {
+  try {
+    return await artifactFs.lstat(path);
+  } catch (cause) {
+    if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
+    await artifactFs.mkdir(path);
+    return artifactFs.lstat(path);
+  }
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Node's asynchronous stat/realpath checks implement the concrete artifact boundary.
+async function assertSafeArtifactPath(path: string, root: string): Promise<boolean> {
+  const status = await artifactFs.lstat(path);
+  if (status.isSymbolicLink()) throw new Error(`Symlink artifact is not retained: ${path}.`);
+  const resolvedPath = await artifactFs.realpath(path);
+  if (resolvedPath !== root && !within(root, resolvedPath))
+    throw new Error(`Artifact escaped its experiment: ${path}.`);
+  return true;
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Fingerprinting is a bounded Promise dependency wrapped by the runtime Effect.
+async function artifactFingerprint(path: string, root: string): Promise<string> {
+  const hash = createHash("sha256");
+  // oxlint-disable-next-line effecttsgo/async-function -- Recursive traversal shares the outer bounded fingerprint operation.
+  async function visit(current: string): Promise<void> {
+    await assertSafeArtifactPath(current, root);
+    const status = await artifactFs.lstat(current);
+    const name = relative(path, current);
+    if (status.isDirectory()) {
+      hash.update(`directory\0${name}\0`);
+      const entries = await artifactFs.readdir(current);
+      for (const entry of entries.sort()) await visit(join(current, entry));
+      return;
+    }
+    if (!status.isFile()) throw new Error(`Unsupported artifact file type: ${current}.`);
+    hash.update(`file\0${name}\0${status.size}\0`);
+    const handle = await artifactFs.open(current, "r");
+    try {
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      let position = 0;
+      while (position < status.size) {
+        const read = await handle.read(buffer, 0, buffer.length, position);
+        if (read.bytesRead === 0) break;
+        hash.update(buffer.subarray(0, read.bytesRead));
+        position += read.bytesRead;
+      }
+      if (position !== status.size)
+        throw new Error(`Artifact changed while being fingerprinted: ${current}.`);
+    } finally {
+      await handle.close();
+    }
+  }
+  await visit(path);
+  return hash.digest("hex");
+}
+
 function within(root: string, path: string): boolean {
   const part = relative(resolve(root), resolve(path));
   return part !== "" && part !== ".." && !part.startsWith(`..${sep}`) && !part.startsWith(sep);

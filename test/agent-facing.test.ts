@@ -195,6 +195,49 @@ void test("recovery distinguishes prelaunch records and exact handles", () => {
   assert.equal(resolveAttemptHandle(current, recovery.guardedAction.attempt).id, prelaunch.id);
 });
 
+void test("settlement exposes blocked artifact retention without changing worker report validity", () => {
+  const experiment: WorkAssignment = {
+    id: "experiment",
+    capability: "research",
+    artifactIntent: "disposable_experiment",
+    objective: "Retain probe output",
+    intentVersion: 0,
+    authority: { receiptId: "human", intentVersion: 1 },
+    permittedEffects: ["Write probe output"],
+    stopCondition: "One output",
+    expectedEvidence: ["probe.txt"],
+    artifactPolicy: { retain: ["probe.txt"], discardOthers: true },
+    createdAt: timestamp,
+  };
+  const result = typedResult("experiment-result", experiment.id, researchReport("Probe done"));
+  const workerAttempt = attempt("experiment-attempt", experiment.id, "settled");
+  workerAttempt.resultId = result.id;
+  workerAttempt.artifactRetention = {
+    state: "blocked",
+    resultId: result.id,
+    assignmentIntentVersion: 0,
+    sourceRoot: "/tmp/probe-worktree",
+    sourceIdentity: "b".repeat(64),
+    expectedHead: "a".repeat(40),
+    destinationRoot: "/tmp/state/artifacts/experiment-result",
+    stagingRoot: "/tmp/state/artifact-staging/experiment-result",
+    required: ["probe.txt"],
+    error: "Required artifact is missing.",
+  };
+  const current = state([experiment], [workerAttempt], [result]);
+  const outcome = inspectView(current, { section: "outcome", result: result.id });
+  assert.equal("settlement" in outcome, true);
+  if (!("settlement" in outcome)) return;
+  assert.ok("status" in outcome.settlement.workerReport);
+  assert.equal(outcome.settlement.workerReport.status, "completed");
+  assert.equal(outcome.settlement.artifactRetention.state, "blocked");
+  assert.equal(outcome.settlement.artifactRetention.retained, 0);
+  assert.equal(current.dispositions.length, 0);
+  const recovery = inspectView(current, { section: "recovery", attempt: workerAttempt.id });
+  assert.match(recovery.blocker ?? "", /missing/);
+  assert.ok(recovery.guardedAction);
+});
+
 void test("typed report kinds and untyped or malformed reports remain inspectable", () => {
   const reports: WorkerReport[] = [
     researchReport("Research"),

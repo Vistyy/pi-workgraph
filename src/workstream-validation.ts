@@ -241,10 +241,18 @@ function validateResults(state: WorkstreamState, assignmentIds: Set<string>): Se
       result.artifacts.map((artifact) => artifact.id),
       `artifact in result ${result.id}`,
     );
+    const retention = state.attempts.find(
+      (attempt) => attempt.artifactRetention?.resultId === result.id,
+    )?.artifactRetention;
     validateArtifactsForAssignment(
       assignment,
       result.artifacts,
-      result.validity === "typed" && result.report.status === "completed" ? "typed" : "absent",
+      result.validity === "typed" &&
+        result.report.status === "completed" &&
+        retention?.state !== "pending" &&
+        retention?.state !== "blocked"
+        ? "typed"
+        : "absent",
     );
   }
   for (const disposition of state.dispositions)
@@ -264,6 +272,12 @@ function validateAttempts(
     state.attempts.map((attempt) => attempt.id),
     "attempt",
   );
+  unique(
+    state.attempts.flatMap((attempt) =>
+      attempt.artifactRetention === undefined ? [] : [attempt.artifactRetention.resultId],
+    ),
+    "artifact retention result",
+  );
   for (const attempt of state.attempts) {
     validateAttemptPlacement(state, attempt);
     if (!assignmentIds.has(attempt.assignmentId))
@@ -279,7 +293,63 @@ function validateAttempts(
     }
     if (attempt.models?.selection && attempt.models.selection.selected.length === 0)
       throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} has an empty model selection.`);
+    validateArtifactRetention(state, attempt);
   }
+}
+
+function validateArtifactRetention(state: WorkstreamState, attempt: WorkAttempt): void {
+  const retention = attempt.artifactRetention;
+  if (retention === undefined) return;
+  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
+  const result = state.results.find((item) => item.id === retention.resultId);
+  if (
+    assignment?.artifactIntent !== "disposable_experiment" ||
+    attempt.placement?.kind !== "isolated_worktree" ||
+    result?.validity !== "typed" ||
+    result.report.status !== "completed" ||
+    result.assignmentId !== assignment.id ||
+    (attempt.resultId !== undefined && attempt.resultId !== retention.resultId) ||
+    retention.assignmentIntentVersion !== assignment.intentVersion ||
+    retention.assignmentIntentVersion !== result.assignmentIntentVersion ||
+    JSON.stringify(retention.required) !== JSON.stringify(assignment.artifactPolicy.retain)
+  )
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} has artifact retention outside its exact experiment result.`,
+    );
+  const expectedDestination = resolve(state.statePath, "..", "artifacts", retention.resultId);
+  const expectedStaging = resolve(state.statePath, "..", "artifact-staging", retention.resultId);
+  if (
+    resolve(retention.destinationRoot) !== expectedDestination ||
+    resolve(retention.stagingRoot) !== expectedStaging
+  )
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} artifact retention has foreign destination paths.`,
+    );
+  if ((retention.state === "blocked") !== (retention.error !== undefined))
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} artifact retention blocker does not match its state.`,
+    );
+  if (retention.state !== "completed" && result.artifacts.length > 0)
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} has artifacts before retention completed.`,
+    );
+  if (retention.state === "completed") {
+    validateArtifactsForAssignment(assignment, result.artifacts, "typed");
+    if (
+      result.artifacts.some(
+        (artifact) =>
+          artifact.kind !== "path" ||
+          resolve(artifact.reference) !== resolve(retention.destinationRoot, artifact.id),
+      )
+    )
+      throw new InvalidWorkstreamStateError(
+        `Attempt ${attempt.id} retained artifacts have foreign references.`,
+      );
+  }
+  if (retention.state !== "completed" && attempt.cleanup !== undefined)
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} cleanup began before required artifact retention completed.`,
+    );
 }
 
 function validateAttemptPlacement(state: WorkstreamState, attempt: WorkAttempt): void {

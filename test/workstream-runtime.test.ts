@@ -5,6 +5,7 @@ import {
   readFile,
   rm,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -760,7 +761,7 @@ test("maintained changes use guide/executor policy and review checks the request
   }
 });
 
-test("experiments retain authorized artifacts without composition, including failed and unsafe artifact results", async () => {
+test("experiments preserve valid reports while guarded retention repairs unsafe artifacts", async () => {
   const f = await fixture();
   try {
     const active = f.runtime();
@@ -780,10 +781,6 @@ test("experiments retain authorized artifacts without composition, including fai
     });
     f.workers.onWork = async (request) => {
       assert.equal(request.env.PI_WORKGRAPH_EXPERIMENT, "1");
-      assert.match(
-        await readFile(request.sessionFile, "utf8"),
-        /Expected evidence: Probe output/,
-      );
       await writeFile(join(request.cwd, "probe.txt"), "observed\n");
       await writeFile(join(request.cwd, "scratch.txt"), "discardable\n");
       return researchReport;
@@ -794,8 +791,10 @@ test("experiments retain authorized artifacts without composition, including fai
     const artifact = state.results[0]?.artifacts[0];
     assert.ok(artifact);
     assert.equal(await readFile(artifact.reference, "utf8"), "observed\n");
+    assert.equal(state.attempts[0]?.artifactRetention?.state, "completed");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(await f.repository.head(), initial);
+
     f.workers.onWork = async () => ({
       ...researchReport,
       status: "failed",
@@ -807,6 +806,7 @@ test("experiments retain authorized artifacts without composition, including fai
     assert.equal(state.results[1]?.validity, "typed");
     assert.equal(state.results[1]?.artifacts.length, 0);
     assert.equal(state.attempts[1]?.cleanup?.state, "completed");
+
     f.workers.onWork = async (request) => {
       await symlink(join(f.root, "value.txt"), join(request.cwd, "probe.txt"));
       return researchReport;
@@ -814,12 +814,206 @@ test("experiments retain authorized artifacts without composition, including fai
     await active.queue(input("unsafe-probe"));
     await active.reconcile();
     state = await active.reconcile();
-    assert.equal(state.results[2]?.validity, "invalid");
-    assert.equal(state.attempts[2]?.cleanup?.state, "blocked");
-    assert.equal(
-      await readFile(join(f.root, "value.txt"), "utf8"),
-      "initial\n",
+    const unsafeAttempt = state.attempts[2];
+    const unsafeResult = state.results[2];
+    assert.ok(unsafeAttempt && unsafeResult);
+    assert.equal(unsafeResult.validity, "typed");
+    assert.deepEqual(
+      unsafeResult.validity === "typed" ? unsafeResult.report : undefined,
+      researchReport,
     );
+    assert.equal(unsafeAttempt.artifactRetention?.state, "blocked");
+    assert.match(unsafeAttempt.artifactRetention?.error ?? "", /Symlink artifact/);
+    assert.equal(unsafeAttempt.cleanup, undefined);
+    assert.equal(f.workers.cleanupCount, 2);
+    await active.recoverAttempt({
+      attemptId: unsafeAttempt.id,
+      action: "retry",
+      reason: "Recheck the exact required artifact without accepting its report.",
+    });
+    state = await f.store.load();
+    assert.equal(state.attempts[2]?.artifactRetention?.state, "blocked");
+    assert.equal(state.attempts[2]?.cleanup, undefined);
+
+    const unsafeSource = join(unsafeAttempt.placement?.path ?? "", "probe.txt");
+    await unlink(unsafeSource);
+    await writeFile(unsafeSource, "repaired evidence\n");
+    await active.recoverAttempt({
+      attemptId: unsafeAttempt.id,
+      action: "retry",
+      reason: "The exact owned source now contains a regular required artifact.",
+    });
+    state = await f.store.load();
+    const repaired = state.results[2]?.artifacts[0];
+    assert.ok(repaired);
+    assert.equal(await readFile(repaired.reference, "utf8"), "repaired evidence\n");
+    assert.equal(state.attempts[2]?.artifactRetention?.state, "completed");
+    assert.equal(state.attempts[2]?.cleanup?.state, "completed");
+    await active.recoverAttempt({
+      attemptId: unsafeAttempt.id,
+      action: "retry",
+      reason: "Repeat the guarded retry to prove completed retention is idempotent.",
+    });
+    assert.equal(await readFile(repaired.reference, "utf8"), "repaired evidence\n");
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("artifact retry reconciles interrupted copies and refuses missing, unsafe, or stale sources", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const authority = await f.authority(active);
+    const input = (id: string, retain: string[]) => ({
+      id,
+      capability: "research" as const,
+      artifactIntent: "disposable_experiment" as const,
+      objective: "Probe",
+      intentVersion: 1,
+      authority,
+      permittedEffects: ["Scratch edits in isolated worktree"],
+      stopCondition: "One observation",
+      expectedEvidence: ["Probe output"],
+      artifactPolicy: { retain, discardOthers: true as const },
+    });
+    f.workers.onWork = async () => researchReport;
+    await active.queue(input("missing-probe", ["probe.txt"]));
+    await active.reconcile();
+    let state = await active.reconcile();
+    const missingAttempt = state.attempts[0];
+    assert.ok(missingAttempt);
+    assert.equal(state.results[0]?.validity, "typed");
+    assert.equal(missingAttempt.artifactRetention?.state, "blocked");
+    assert.equal(missingAttempt.cleanup, undefined);
+    await active.recoverAttempt({
+      attemptId: missingAttempt.id,
+      action: "retry",
+      reason: "Verify that the required source is still missing.",
+    });
+    state = await f.store.load();
+    const retention = state.attempts[0]?.artifactRetention;
+    const placement = state.attempts[0]?.placement;
+    assert.equal(retention?.state, "blocked");
+    assert.equal(state.attempts[0]?.cleanup, undefined);
+    assert.ok(retention && placement);
+
+    await writeFile(join(placement.path, "probe.txt"), "checkpointed evidence\n");
+    await mkdir(retention.destinationRoot, { recursive: true });
+    const target = join(retention.destinationRoot, "probe.txt");
+    await writeFile(target, "checkpointed evidence\n");
+    await active.recoverAttempt({
+      attemptId: missingAttempt.id,
+      action: "retry",
+      reason: "Reconcile an exact copy whose post-effect checkpoint was interrupted.",
+    });
+    state = await f.store.load();
+    assert.equal(state.attempts[0]?.artifactRetention?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(await readFile(target, "utf8"), "checkpointed evidence\n");
+
+    await active.queue(input("escaping-probe", ["../foreign.txt"]));
+    await active.reconcile();
+    state = await active.reconcile();
+    const escapingAttempt = state.attempts[1];
+    assert.ok(escapingAttempt);
+    assert.equal(state.results[1]?.validity, "typed");
+    assert.equal(escapingAttempt.artifactRetention?.state, "blocked");
+    assert.match(
+      escapingAttempt.artifactRetention?.error ?? "",
+      /non-metadata path|retained boundary/,
+    );
+    assert.equal(escapingAttempt.cleanup, undefined);
+    await active.perform(() =>
+      f.store.reviseIntent({
+        authorityReceiptId: authority.receiptId,
+        statement: "A newer experiment constraint supersedes retries.",
+        constraints: ["Do not retry historical artifact retention."],
+      }),
+    );
+    await assert.rejects(
+      active.recoverAttempt({
+        attemptId: escapingAttempt.id,
+        action: "retry",
+        reason: "A stale intent must not authorize artifact recovery.",
+      }),
+      /stale intent/,
+    );
+    state = await f.store.load();
+    assert.equal(state.attempts[1]?.artifactRetention?.state, "blocked");
+    assert.equal(state.attempts[1]?.cleanup, undefined);
+    assert.ok(escapingAttempt.placement);
+    assert.match(
+      await readFile(join(escapingAttempt.placement.path, ".git"), "utf8"),
+      /gitdir/,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("legacy conflated artifact failures remain immutable and cannot be repaired as valid reports", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const authority = await f.authority(active);
+    f.workers.onWork = async (request) => {
+      await symlink(join(f.root, "value.txt"), join(request.cwd, "probe.txt"));
+      return researchReport;
+    };
+    await active.queue({
+      id: "legacy-artifact-failure",
+      capability: "research",
+      artifactIntent: "disposable_experiment",
+      objective: "Retain probe output",
+      intentVersion: 1,
+      authority,
+      permittedEffects: ["Write isolated probe output"],
+      stopCondition: "One observation",
+      expectedEvidence: ["probe.txt"],
+      artifactPolicy: { retain: ["probe.txt"], discardOthers: true },
+    });
+    await active.reconcile();
+    const current = await active.reconcile();
+    const attempt = current.attempts[0];
+    const result = current.results[0];
+    assert.ok(attempt?.artifactRetention && result);
+    const legacy = structuredClone(current);
+    legacy.results.splice(0, 1, {
+      id: result.id,
+      assignmentId: result.assignmentId,
+      assignmentIntentVersion: result.assignmentIntentVersion,
+      artifacts: [],
+      observedAt: result.observedAt,
+      validity: "invalid",
+      detail: `Artifact retention failed: ${attempt.artifactRetention.error ?? "copy failed"}`,
+    });
+    const legacyAttempt = legacy.attempts[0];
+    assert.ok(legacyAttempt);
+    legacyAttempt.cleanup = {
+      state: "blocked",
+      expectedHead: attempt.artifactRetention.expectedHead,
+      workerClosed: false,
+      discard: false,
+      error: attempt.artifactRetention.error ?? "copy failed",
+    };
+    delete legacyAttempt.artifactRetention;
+    await writeFile(f.store.path, `${JSON.stringify(legacy, null, 2)}\n`, { mode: 0o600 });
+    const before = await readFile(f.store.path, "utf8");
+    await assert.rejects(
+      active.recoverAttempt({
+        attemptId: attempt.id,
+        action: "retry",
+        reason: "Legacy records must not invent the original valid report.",
+      }),
+      /Legacy artifact-retention failure has no independently retained report/,
+    );
+    assert.equal(await readFile(f.store.path, "utf8"), before);
+    const retainedLegacy = await f.store.load();
+    assert.equal(retainedLegacy.results[0]?.validity, "invalid");
+    assert.equal(retainedLegacy.attempts[0]?.cleanup?.state, "blocked");
+    assert.equal(f.workers.cleanupCount, 0);
   } finally {
     await f.dispose();
   }
