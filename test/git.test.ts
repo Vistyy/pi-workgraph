@@ -51,6 +51,7 @@ function processResult(
   return {
     exitCode: overrides.exitCode ?? 0,
     stderr: overrides.stderr ?? "",
+    stderrTruncated: false,
     stdout: overrides.stdout ?? "",
     stdoutTruncated: false,
     timedOut: overrides.timedOut ?? false,
