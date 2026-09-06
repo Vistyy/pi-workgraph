@@ -1,5 +1,12 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import type { WorkstreamState } from "../src/workstream.js";
+
+const TextSchema = Type.String();
+const TextBlockSchema = Type.Object({ type: Type.Literal("text"), text: Type.String() });
+const ResultNotificationSchema = Type.Object({ resultId: Type.String() });
+const ResearchArgumentsSchema = Type.Object({ id: Type.String() });
 
 export const CAPABILITY_SCENARIO_IDS = {
   baselineResearch: "baseline-research",
@@ -33,19 +40,11 @@ export type CoordinatorTurnObservation =
 function messageText(entry: SessionEntry): string {
   if (entry.type !== "message" || !("content" in entry.message)) return "";
   const content = entry.message.content;
-  if (typeof content === "string") return content;
+  if (Value.Check(TextSchema, content)) return Value.Decode(TextSchema, content);
   if (!Array.isArray(content)) return "";
   return content
-    .filter(
-      (block): block is { type: "text"; text: string } =>
-        Boolean(block) &&
-        typeof block === "object" &&
-        "type" in block &&
-        block.type === "text" &&
-        "text" in block &&
-        typeof block.text === "string",
-    )
-    .map((block) => block.text)
+    .filter((block) => Value.Check(TextBlockSchema, block))
+    .map((block) => Value.Decode(TextBlockSchema, block).text)
     .join("\n");
 }
 
@@ -53,6 +52,7 @@ function messageText(entry: SessionEntry): string {
  * Observe the native Pi turn after the submitted human request.
  * Startup messages, idle metadata, tool-use stops, and queued delivery are not completion.
  */
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: The pure observer keeps all terminal Pi states explicit and side-effect free.
 export function observeCoordinatorTurn(
   entries: SessionEntry[],
   requestText: string,
@@ -71,7 +71,8 @@ export function observeCoordinatorTurn(
 
   let settled: CoordinatorTurnObservation | undefined;
   for (let index = requestIndex + 1; index < entries.length; index++) {
-    const entry = entries[index]!;
+    const entry = entries[index];
+    if (entry === undefined) continue;
     if (
       entry.type !== "message" ||
       entry.message.role !== "assistant" ||
@@ -92,8 +93,7 @@ export function observeCoordinatorTurn(
         assistantIndex: index,
       };
     if (reason === "stop") {
-      const detail =
-        messageText(entry) || "Native coordinator turn settled without text.";
+      const detail = messageText(entry) || "Native coordinator turn settled without text.";
       if (
         /(?:cannot|can't|unable|refus(?:e|ed|al)|blocked)\s+(?:complete|continue|proceed|the request)/i.test(
           detail,
@@ -162,6 +162,7 @@ export interface DelegatedEffectObservation {
 }
 
 /** Validate the state-level attribution and cleanup guarantees of a delegated natural strategy. */
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: The pure observer deliberately reports every independent attribution and cleanup invariant.
 export function observeDelegatedOutcome(
   state: WorkstreamState,
   directEffect: DirectEffectObservation,
@@ -169,17 +170,14 @@ export function observeDelegatedOutcome(
   const problems: string[] = [];
   if (state.lifecycle.state !== "completed")
     problems.push(`workstream lifecycle is ${state.lifecycle.state}`);
-  if (state.attempts.length === 0)
-    problems.push("no delegated attempts are attributable");
+  if (state.attempts.length === 0) problems.push("no delegated attempts are attributable");
   const assignmentsById = new Map(
     state.assignments.map((assignment) => [assignment.id, assignment]),
   );
   if (assignmentsById.size !== state.assignments.length)
     problems.push("delegated assignments are not uniquely attributable");
   for (const assignment of state.assignments) {
-    if (
-      !state.attempts.some((attempt) => attempt.assignmentId === assignment.id)
-    )
+    if (!state.attempts.some((attempt) => attempt.assignmentId === assignment.id))
       problems.push(`delegated assignment ${assignment.id} has no attempt`);
   }
   const resultOwners = new Set<string>();
@@ -189,24 +187,22 @@ export function observeDelegatedOutcome(
       problems.push(`attempt ${attempt.id} has no delegated assignment`);
       continue;
     }
-    if (!attempt.worker)
-      problems.push(`attempt ${attempt.id} has no worker identity`);
+    if (attempt.worker === undefined) problems.push(`attempt ${attempt.id} has no worker identity`);
     else if (
-      !attempt.sessionFile ||
+      attempt.sessionFile === undefined ||
       attempt.worker.sessionFile !== attempt.sessionFile
     )
       problems.push(`attempt ${attempt.id} worker session is not attributable`);
-    else if (attempt.placement && attempt.worker.cwd !== attempt.placement.path)
+    else if (attempt.placement !== undefined && attempt.worker.cwd !== attempt.placement.path)
       problems.push(`attempt ${attempt.id} worker cwd is not attributable`);
-    if (!attempt.resultId)
+    if (attempt.resultId === undefined)
       problems.push(`attempt ${attempt.id} has no retained result`);
     else {
       if (resultOwners.has(attempt.resultId))
         problems.push(`result ${attempt.resultId} has multiple attempt owners`);
       resultOwners.add(attempt.resultId);
       const result = state.results.find((item) => item.id === attempt.resultId);
-      if (!result)
-        problems.push(`attempt ${attempt.id} retained result is missing`);
+      if (!result) problems.push(`attempt ${attempt.id} retained result is missing`);
       else if (result.assignmentId !== assignment.id)
         problems.push(`attempt ${attempt.id} result assignment is mismatched`);
       else if (result.assignmentIntentVersion !== assignment.intentVersion)
@@ -216,9 +212,7 @@ export function observeDelegatedOutcome(
   for (const result of state.results) {
     if (
       !state.attempts.some(
-        (attempt) =>
-          attempt.resultId === result.id &&
-          attempt.assignmentId === result.assignmentId,
+        (attempt) => attempt.resultId === result.id && attempt.assignmentId === result.assignmentId,
       )
     )
       problems.push(`result ${result.id} has no attributable attempt`);
@@ -227,44 +221,31 @@ export function observeDelegatedOutcome(
     problems.push("one or more delegated attempts are not settled");
   if (
     state.attempts.some(
-      (attempt) =>
-        attempt.cleanup?.state !== "completed" ||
-        attempt.cleanup.workerClosed !== true,
+      (attempt) => attempt.cleanup?.state !== "completed" || attempt.cleanup.workerClosed !== true,
     )
   )
-    problems.push(
-      "one or more delegated resources lack exact completed cleanup",
-    );
+    problems.push("one or more delegated resources lack exact completed cleanup");
   if (
     state.results.some(
-      (result) =>
-        result.validity !== "typed" || result.report.status !== "completed",
+      (result) => result.validity !== "typed" || result.report.status !== "completed",
     )
   )
-    problems.push(
-      "one or more delegated worker results are not typed completed outcomes",
-    );
+    problems.push("one or more delegated worker results are not typed completed outcomes");
 
   const implementationAttempts = state.attempts.filter((attempt) =>
     state.assignments.some(
       (assignment) =>
-        assignment.id === attempt.assignmentId &&
-        assignment.capability === "implement",
+        assignment.id === attempt.assignmentId && assignment.capability === "implement",
     ),
   );
   const implementationOrigin: "direct" | "delegated" =
     implementationAttempts.length > 0 ? "delegated" : "direct";
   if (
     implementationOrigin === "delegated" &&
-    implementationAttempts.some(
-      (attempt) => attempt.composition?.state !== "composed",
-    )
+    implementationAttempts.some((attempt) => attempt.composition?.state !== "composed")
   )
     problems.push("attributable maintained implementation is not composed");
-  if (
-    implementationOrigin === "direct" &&
-    state.attempts.some((attempt) => attempt.composition)
-  )
+  if (implementationOrigin === "direct" && state.attempts.some((attempt) => attempt.composition))
     problems.push("a non-implementation delegation has a composition");
 
   const experimentAssignments = state.assignments.filter(
@@ -274,22 +255,15 @@ export function observeDelegatedOutcome(
   if (experimentAssignments.length > 0) {
     experiment = "verified";
     for (const assignment of experimentAssignments) {
-      const attempt = state.attempts.find(
-        (item) => item.assignmentId === assignment.id,
-      );
-      const result = state.results.find(
-        (item) => item.assignmentId === assignment.id,
-      );
+      const attempt = state.attempts.find((item) => item.assignmentId === assignment.id);
+      const result = state.results.find((item) => item.assignmentId === assignment.id);
       if (!attempt || !result || attempt.composition)
-        problems.push(
-          `experiment ${assignment.id} lacks attributable non-composed outcome`,
-        );
+        problems.push(`experiment ${assignment.id} lacks attributable non-composed outcome`);
       if (result?.validity === "typed") {
         for (const artifactId of assignment.artifactPolicy.retain) {
           if (
             !result.artifacts.some(
-              (artifact) =>
-                artifact.id === artifactId && artifact.retention === "retained",
+              (artifact) => artifact.id === artifactId && artifact.retention === "retained",
             )
           )
             problems.push(
@@ -323,10 +297,8 @@ export function notificationDrivenProgress(
       (entry) =>
         entry.type === "custom_message" &&
         entry.customType === "pi-workgraph-workstream" &&
-        entry.details !== null &&
-        typeof entry.details === "object" &&
-        "resultId" in entry.details &&
-        entry.details.resultId === resultId,
+        Value.Check(ResultNotificationSchema, entry.details) &&
+        Value.Decode(ResultNotificationSchema, entry.details).resultId === resultId,
     );
   const experimentIndex = entries.findIndex(
     (entry) =>
@@ -336,15 +308,14 @@ export function notificationDrivenProgress(
         (block) =>
           block.type === "toolCall" &&
           block.name === "workgraph_research" &&
-          block.arguments.id === CAPABILITY_SCENARIO_IDS.uppercaseExperiment,
+          Value.Check(ResearchArgumentsSchema, block.arguments) &&
+          Value.Decode(ResearchArgumentsSchema, block.arguments).id ===
+            CAPABILITY_SCENARIO_IDS.uppercaseExperiment,
       ),
   );
   const baselineIndex = notificationIndex(baselineResultId);
   // A later drained notification cannot repair a transition made by polling.
-  if (
-    experimentIndex >= 0 &&
-    (baselineIndex < 0 || experimentIndex < baselineIndex)
-  )
+  if (experimentIndex >= 0 && (baselineIndex < 0 || experimentIndex < baselineIndex))
     throw new Error(
       "Experiment was queued before the actual baseline result notification; notification-driven progression was not observed.",
     );
@@ -360,9 +331,7 @@ export function notificationDrivenProgress(
             (entry) =>
               entry.type === "message" &&
               entry.message.role === "assistant" &&
-              !["error", "aborted", "pending"].includes(
-                entry.message.stopReason,
-              ),
+              !["error", "aborted", "pending"].includes(entry.message.stopReason),
           )
       );
     })

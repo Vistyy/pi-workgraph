@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { readFileSync } from "node:fs";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { join, resolve } from "node:path";
 import type { ExtensionActions } from "@earendil-works/pi-coding-agent";
 import {
@@ -9,10 +11,17 @@ import {
   ModelRuntime,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import { Clock, Effect } from "effect";
+import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { runProcess } from "../src/git.js";
 import type { WorkerReport } from "../src/types.js";
 import { WorkstreamStateSchema } from "../src/workstream.js";
+
+const ResultDetailsSchema = Type.Object({
+  workstream: Type.Optional(WorkstreamStateSchema),
+  statePath: Type.Optional(Type.String()),
+});
 
 export const usage = {
   input: 0,
@@ -32,6 +41,7 @@ export function researchReport(summary = "Evidence found."): WorkerReport {
   };
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 export async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await runProcess("git", ["-C", cwd, ...args], {
     cwd,
@@ -43,10 +53,11 @@ export async function git(cwd: string, ...args: string[]): Promise<string> {
 
 export function persistentSession(root: string, sessionDir: string) {
   const session = SessionManager.create(root, sessionDir);
+  const timestamp = Effect.runSync(Clock.currentTimeMillis);
   session.appendMessage({
     role: "user",
     content: "Fixture request",
-    timestamp: Date.now(),
+    timestamp,
   });
   session.appendMessage({
     role: "assistant",
@@ -56,12 +67,13 @@ export function persistentSession(root: string, sessionDir: string) {
     model: "fixture",
     usage,
     stopReason: "stop",
-    timestamp: Date.now(),
+    timestamp,
   });
   return session;
 }
 
 /** Real Pi registration/context machinery; only session actions are replaced, never a model call. */
+// oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 export async function extensionFixture(
   name: "coordinator" | "worker",
   root: string,
@@ -83,13 +95,7 @@ export async function extensionFixture(
     allowModelNetwork: false,
   });
   const registry = new ModelRegistry(models);
-  const runner = new ExtensionRunner(
-    loaded.extensions,
-    loaded.runtime,
-    root,
-    session,
-    registry,
-  );
+  const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, session, registry);
   const messages: Parameters<ExtensionActions["sendMessage"]>[0][] = [];
   const selected: string[] = [];
   let level: ReturnType<ExtensionActions["getThinkingLevel"]> = "high";
@@ -104,9 +110,7 @@ export async function extensionFixture(
     {
       ...runner.getUIContext(),
       notify(message, type) {
-        notifications.push(
-          type === undefined ? { message } : { message, type },
-        );
+        notifications.push(type === undefined ? { message } : { message, type });
       },
     },
     "rpc",
@@ -124,6 +128,7 @@ export async function extensionFixture(
       setThinkingLevel: (next) => {
         level = next;
       },
+      // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
       setModel: async (next) => {
         model = next;
         selected.push(`${next.provider}/${next.id}`);
@@ -154,21 +159,16 @@ export async function extensionFixture(
     notifications,
     selected,
     registry,
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters, effecttsgo/async-function -- Raw input intentionally enters through Pi's registered tool boundary and is decoded against that exact registration schema before execute performs authority validation.
     async call(toolName: string, params: unknown) {
       const tool = runner.getToolDefinition(toolName);
-      assert.ok(tool, `Missing registered tool ${toolName}`);
-      assert.ok(
-        Value.Check(tool.parameters, params),
-        `Invalid fixture input to ${toolName}`,
-      );
-      return tool.execute(
-        "fixture",
-        params,
-        undefined,
-        undefined,
-        runner.createContext(),
-      );
+      assert.ok(tool !== undefined, `Missing registered tool ${toolName}`);
+      assert.ok(Value.Check(tool.parameters, params), `Invalid fixture input to ${toolName}`);
+      // SAFETY: Pi's registered definition erases its concrete schema generic, but Value.Check above validates this value against the exact runtime schema.
+      const decoded = Value.Decode(tool.parameters, params);
+      return tool.execute("fixture", decoded, undefined, undefined, runner.createContext());
     },
+    // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
     async close() {
       await runner.emit({ type: "session_shutdown", reason: "quit" });
       assert.deepEqual(errors, []);
@@ -176,14 +176,13 @@ export async function extensionFixture(
   };
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Pi tool result details are external input and are decoded immediately against their domain schema.
 export function resultState(details: unknown) {
-  assert.ok(details && typeof details === "object");
-  const record = details as { workstream?: unknown; statePath?: unknown };
-  const state =
-    record.workstream ??
-    (typeof record.statePath === "string"
-      ? JSON.parse(readFileSync(record.statePath, "utf8"))
-      : undefined);
+  assert.ok(Value.Check(ResultDetailsSchema, details), "Invalid Pi tool result details");
+  const record = Value.Decode(ResultDetailsSchema, details);
+  const persisted: unknown =
+    record.statePath === undefined ? undefined : JSON.parse(readFileSync(record.statePath, "utf8"));
+  const state = record.workstream ?? persisted;
   assert.ok(Value.Check(WorkstreamStateSchema, state));
-  return state;
+  return Value.Decode(WorkstreamStateSchema, state);
 }

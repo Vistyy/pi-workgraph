@@ -1,4 +1,6 @@
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { readFile } from "node:fs/promises";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
@@ -19,7 +21,8 @@ const CliEnvironmentConfig = Config.all({
   agentDir: Config.string("PI_CODING_AGENT_DIR").pipe(Config.option),
 });
 
-// oxlint-disable-next-line effecttsgo/async-function -- Public CLI callers require Promise interoperability.
+// biome-ignore-start lint/complexity/noExcessiveCognitiveComplexity: CLI dispatch keeps each public mode's validation visible at this executable boundary.
+// oxlint-disable-next-line effecttsgo/async-function -- This exact Node CLI boundary preserves Promise interoperability for callers.
 export async function runCli(argv: readonly string[], env: NodeJS.ProcessEnv = process.env) {
   const [command, ...rest] = argv;
   if (command === undefined || ["help", "--help", "-h"].includes(command))
@@ -83,8 +86,9 @@ export async function runCli(argv: readonly string[], env: NodeJS.ProcessEnv = p
   }
   throw new Error(`Unsupported command ${command}. ${usage()}`);
 }
+// biome-ignore-end lint/complexity/noExcessiveCognitiveComplexity: End CLI dispatch boundary.
 
-// oxlint-disable-next-line effecttsgo/async-function -- Registry lookup is a Promise-based host boundary.
+// oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 async function resolveStatePath(
   options: Map<string, string>,
   agentDir: string | undefined,
@@ -164,7 +168,7 @@ function usage(): string {
   ].join("\n");
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- Node's executable boundary must await the public Promise API.
+// oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 async function main(): Promise<void> {
   try {
     process.stdout.write(

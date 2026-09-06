@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { readdir, readFile, writeFile } from "node:fs/promises";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Config, ConfigProvider, Effect } from "effect";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import { hasNativeAgentSettled } from "../src/pi-process.js";
 import { type WorkstreamState, WorkstreamStore } from "../src/workstream.js";
 import {
@@ -20,6 +25,12 @@ import {
   waitFor,
 } from "./live-fixture.js";
 
+const smokeTimeout = Effect.runSync(
+  Config.number("PI_WORKGRAPH_SMOKE_TIMEOUT_MS")
+    .pipe(Config.withDefault(1_800_000))
+    .parse(ConfigProvider.fromEnvRecord(process.env)),
+);
+
 let fixture: LiveFixture | undefined;
 let latest: WorkstreamState | undefined;
 try {
@@ -29,55 +40,43 @@ try {
   const privateToken = "PRIVATE_COORDINATOR_VIOLET";
   const prompt = capabilityScenarioPrompt(privateToken);
   await writeFile(join(f.parent, "initial-request.txt"), prompt);
-  await herdr(f.root, "agent", "prompt", coordinator.agentName, prompt);
-  const timeoutMs = Number(
-    process.env.PI_WORKGRAPH_SMOKE_TIMEOUT_MS || 1_800_000,
-  );
+  await herdr(f.root, Type.Object({}), "agent", "prompt", coordinator.agentName, prompt);
+  const timeoutMs = smokeTimeout;
   assert.ok(Number.isFinite(timeoutMs) && timeoutMs > 0);
   const state = await waitFor(
+    // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
     async () => {
       const directory = join(f.root, ".git", "pi-workgraph", "workstreams");
       let names: string[];
       try {
         names = await readdir(directory);
       } catch (error) {
-        if (
-          error instanceof Error &&
-          "code" in error &&
-          error.code === "ENOENT"
-        )
-          return undefined;
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
         throw error;
       }
       assert.equal(names.length, 1, "Scenario must stay in one workstream");
-      latest = await WorkstreamStore.inspect(
-        join(directory, names[0]!, "workstream.json"),
-      );
+      const workstreamName = names[0];
+      assert.ok(workstreamName !== undefined);
+      latest = await WorkstreamStore.inspect(join(directory, workstreamName, "workstream.json"));
       const blocked = latest.attempts.find(
         (attempt) =>
-          attempt.error ||
+          attempt.error !== undefined ||
           attempt.cleanup?.state === "blocked" ||
           attempt.composition?.state === "blocked",
       );
-      if (blocked)
-        throw new Error(
-          `Attempt requires reconciliation: ${JSON.stringify(blocked)}`,
-        );
-      if (
-        latest.lifecycle.state !== "active" &&
-        latest.lifecycle.state !== "completed"
-      )
+      if (blocked !== undefined)
+        throw new Error(`Attempt requires reconciliation: ${JSON.stringify(blocked)}`);
+      if (latest.lifecycle.state !== "active" && latest.lifecycle.state !== "completed")
         throw new Error(`Unexpected lifecycle ${latest.lifecycle.state}`);
       const baseline = latest.results.find(
-        (result) =>
-          result.assignmentId === CAPABILITY_SCENARIO_IDS.baselineResearch,
+        (result) => result.assignmentId === CAPABILITY_SCENARIO_IDS.baselineResearch,
       );
-      if (!baseline && latest.lifecycle.state === "completed")
+      if (baseline === undefined && latest.lifecycle.state === "completed")
         throw new Error(
           `Completed state is missing required protocol assignment ${CAPABILITY_SCENARIO_IDS.baselineResearch}; observed assignments: ${latest.assignments.map((assignment) => assignment.id).join(", ")}.`,
         );
       const progressed =
-        baseline &&
+        baseline !== undefined &&
         notificationDrivenProgress(
           SessionManager.open(coordinator.sessionFile).getBranch(),
           latest.results.map((result) => result.id),
@@ -85,17 +84,12 @@ try {
         );
       // Completion can precede the last queued followUp. Observe its actual
       // message and assistant continuation, without accepting late-only progression.
-      return latest.lifecycle.state === "completed" && progressed
-        ? latest
-        : undefined;
+      return latest.lifecycle.state === "completed" && progressed ? latest : undefined;
     },
     timeoutMs,
     "notification-driven capability flow and actual assistant continuations; inspect retained coordinator session and workstream state",
   );
-  await writeFile(
-    join(f.parent, "state-observation.json"),
-    JSON.stringify(state, null, 2),
-  );
+  await writeFile(join(f.parent, "state-observation.json"), JSON.stringify(state, null, 2));
   assert.deepEqual(
     state.assignments.map((assignment) => assignment.id).sort(),
     Object.values(CAPABILITY_SCENARIO_IDS).sort(),
@@ -104,8 +98,7 @@ try {
   assert.equal(state.results.length, 5);
   assert.ok(
     state.results.every(
-      (result) =>
-        result.validity === "typed" && result.report.status === "completed",
+      (result) => result.validity === "typed" && result.report.status === "completed",
     ),
   );
   assert.equal(state.deliveries.length, 5);
@@ -115,32 +108,22 @@ try {
     assert.equal(attempt.state, "settled");
     assert.equal(attempt.cleanup?.state, "completed");
     assert.equal(attempt.cleanup?.workerClosed, true);
-    assert.ok(attempt.worker && attempt.sessionFile);
+    assert.ok(attempt.worker !== undefined);
+    assert.ok(attempt.sessionFile !== undefined);
     assert.equal(attempt.worker.workspaceId, f.workspaceId);
-    const assignment = state.assignments.find(
-      (item) => item.id === attempt.assignmentId,
-    );
-    assert.ok(assignment);
-    assert.ok(attempt.placement);
+    const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
+    assert.ok(assignment !== undefined);
+    assert.ok(attempt.placement !== undefined);
     const isolated =
       assignment.capability === "implement" ||
       assignment.artifactIntent === "disposable_experiment";
-    assert.equal(
-      attempt.placement.kind,
-      isolated ? "isolated_worktree" : "shared_project",
-    );
-    assert.equal(
-      attempt.worker.cwd,
-      isolated ? attempt.placement.path : f.root,
-    );
+    assert.equal(attempt.placement.kind, isolated ? "isolated_worktree" : "shared_project");
+    assert.equal(attempt.worker.cwd, isolated ? attempt.placement.path : f.root);
     assert.ok(hasNativeAgentSettled(attempt.sessionFile, state.id, attempt.id));
-    assert.ok(
-      !(await readFile(attempt.sessionFile, "utf8")).includes(privateToken),
-    );
+    assert.ok(!(await readFile(attempt.sessionFile, "utf8")).includes(privateToken));
   }
   const experiment = state.results.find(
-    (result) =>
-      result.assignmentId === CAPABILITY_SCENARIO_IDS.uppercaseExperiment,
+    (result) => result.assignmentId === CAPABILITY_SCENARIO_IDS.uppercaseExperiment,
   );
   const artifact = experiment?.artifacts.find(
     (item) => item.id === "probe.txt" && item.retention === "retained",
@@ -151,64 +134,50 @@ try {
   assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "after\n");
   assert.equal(await command(f.root, "node", ["verify.mjs"]), "value verified");
   assert.equal(await command(f.root, "git", ["status", "--porcelain"]), "");
-  assert.equal(
-    await command(f.root, "git", ["diff", "--name-only", f.base, "HEAD"]),
-    "value.txt",
-  );
+  assert.equal(await command(f.root, "git", ["diff", "--name-only", f.base, "HEAD"]), "value.txt");
   const implementation = state.attempts.find(
     (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
   );
   const review = state.attempts.find(
-    (attempt) =>
-      attempt.assignmentId === CAPABILITY_SCENARIO_IDS.exactRevisionReview,
+    (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.exactRevisionReview,
   );
   const concurrent = state.assignments.find(
     (assignment) => assignment.id === CAPABILITY_SCENARIO_IDS.concurrentReadme,
   );
-  assert.ok(implementation && review && concurrent);
+  assert.ok(implementation !== undefined);
+  assert.ok(review !== undefined);
+  assert.ok(concurrent !== undefined);
   assert.equal(review.baseRevision, implementation.composition?.revision);
-  assert.equal(
-    review.baseRevision,
-    await command(f.root, "git", ["rev-parse", "HEAD"]),
-  );
+  assert.equal(review.baseRevision, await command(f.root, "git", ["rev-parse", "HEAD"]));
   const implementationResult = state.results.find(
     (result) => result.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
   );
+  assert.ok(implementationResult !== undefined);
   assert.ok(
-    implementationResult &&
-      concurrent.createdAt < implementationResult.observedAt,
+    concurrent.createdAt < implementationResult.observedAt,
     "Research must be queued before implementation settles",
   );
-  for (const role of [
-    "implementation.guide",
-    "implementation.executor",
-  ] as const) {
+  for (const role of ["implementation.guide", "implementation.executor"] as const) {
     assert.ok(
       implementation.effectiveModels?.some(
-        (model) =>
-          model.source === "message" &&
-          model.model === f.policy.roles[role].model,
-      ),
+        (model) => model.source === "message" && model.model === f.policy.roles[role].model,
+      ) === true,
       `No actual message observed for ${role}`,
     );
   }
-  const workerEntries = SessionManager.open(
-    implementation.sessionFile!,
-  ).getBranch();
+  const implementationSession = implementation.sessionFile;
+  assert.ok(implementationSession !== undefined);
+  const workerEntries = SessionManager.open(implementationSession).getBranch();
+  const workerPhaseSchema = Type.Object({ phase: Type.Literal("executor") });
   assert.ok(
     workerEntries.some(
       (entry) =>
         entry.type === "custom" &&
         entry.customType === "pi-workgraph-worker-state" &&
-        entry.data !== null &&
-        typeof entry.data === "object" &&
-        "phase" in entry.data &&
-        entry.data.phase === "executor",
+        Value.Check(workerPhaseSchema, entry.data),
     ),
   );
-  const coordinatorEntries = SessionManager.open(
-    coordinator.sessionFile,
-  ).getBranch();
+  const coordinatorEntries = SessionManager.open(coordinator.sessionFile).getBranch();
   assert.ok(
     !coordinatorEntries.some(
       (entry) =>
@@ -224,9 +193,8 @@ try {
     ),
   );
   assert.equal(
-    (await command(f.root, "git", ["worktree", "list", "--porcelain"])).split(
-      "worktree ",
-    ).length - 1,
+    (await command(f.root, "git", ["worktree", "list", "--porcelain"])).split("worktree ").length -
+      1,
     1,
   );
   await closeOwnedWorkspace(f, coordinator);
@@ -243,12 +211,12 @@ try {
       2,
     ),
   );
-  console.log(
-    JSON.stringify({
+  process.stdout.write(
+    `${JSON.stringify({
       status: "passed",
       evidence: f.parent,
       candidateRevision: f.revision,
-    }),
+    })}\n`,
   );
 } catch (error) {
   if (fixture && latest)

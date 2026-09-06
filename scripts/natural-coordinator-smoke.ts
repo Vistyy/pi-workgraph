@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { readdir, readFile, writeFile } from "node:fs/promises";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { join } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Config, ConfigProvider, Effect } from "effect";
+import { Type } from "typebox";
 import { hasNativeAgentSettled } from "../src/pi-process.js";
 import { WorkstreamStore } from "../src/workstream.js";
 import {
@@ -15,112 +19,115 @@ import {
   command,
   createLiveFixture,
   herdr,
-  object,
   retainFailure,
   startCoordinator,
   waitFor,
 } from "./live-fixture.js";
 
-async function snapshotWorkingTree(root: string): Promise<RepositorySnapshot> {
-  const tracked = await command(root, "git", ["ls-files", "-z"]);
-  const untracked = await command(root, "git", [
-    "ls-files",
-    "--others",
-    "--exclude-standard",
-    "-z",
-  ]);
-  const paths = new Set(
-    `${tracked}\0${untracked}`.split("\0").filter((path) => path.length > 0),
-  );
-  const snapshot = new Map<string, string>();
-  for (const path of paths) {
-    try {
-      snapshot.set(path, (await readFile(join(root, path))).toString("base64"));
-    } catch (error) {
-      if (error instanceof Error && "code" in error && error.code === "ENOENT")
-        snapshot.set(path, "<missing>");
-      else throw error;
-    }
-  }
-  return snapshot;
+function snapshotWorkingTree(root: string): Promise<RepositorySnapshot> {
+  return Promise.all([
+    command(root, "git", ["ls-files", "-z"]),
+    command(root, "git", ["ls-files", "--others", "--exclude-standard", "-z"]),
+  ]).then(([tracked, untracked]) => {
+    const paths = new Set(`${tracked}\0${untracked}`.split("\0").filter((path) => path.length > 0));
+    return Promise.all(
+      [...paths].map((path) =>
+        readFile(join(root, path))
+          .then((bytes) => [path, bytes.toString("base64")] as const)
+          // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Native filesystem rejection is decoded before missing-file recovery.
+          .catch((error: unknown) => {
+            if (error instanceof Error && "code" in error && error.code === "ENOENT")
+              return [path, "<missing>"] as const;
+            throw error;
+          }),
+      ),
+    ).then((entries) => new Map(entries));
+  });
 }
 
-async function inspectWorkstream(root: string) {
+function inspectWorkstream(root: string) {
   const directory = join(root, ".git", "pi-workgraph", "workstreams");
-  let names: string[];
-  try {
-    names = await readdir(directory);
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT")
-      return undefined;
-    throw error;
-  }
-  if (names.length > 1)
-    throw new Error(
-      `Natural scenario created multiple workstreams: ${names.join(", ")}`,
-    );
-  if (names.length === 0) return undefined;
-  return WorkstreamStore.inspect(join(directory, names[0]!, "workstream.json"));
+  return (
+    readdir(directory)
+      // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Native filesystem rejection is decoded before absent-workstream recovery.
+      .catch((error: unknown) => {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+        throw error;
+      })
+      .then((names) => {
+        if (names.length > 1)
+          throw new Error(`Natural scenario created multiple workstreams: ${names.join(", ")}`);
+        if (names.length === 0) return undefined;
+        const workstreamName = names[0];
+        assert.ok(workstreamName !== undefined);
+        return WorkstreamStore.inspect(join(directory, workstreamName, "workstream.json"));
+      })
+  );
 }
 
-async function assertNativeCoordinatorIdentity(
+function assertNativeCoordinatorIdentity(
   root: string,
   coordinator: Awaited<ReturnType<typeof startCoordinator>>,
 ): Promise<void> {
-  const observed = object(
-    (await herdr(root, "agent", "get", coordinator.paneId)).agent,
-  );
-  if (observed.terminal_id !== coordinator.terminalId)
-    throw new Error(
-      "Native coordinator terminal identity changed while observing the request.",
-    );
-  if (observed.cwd !== coordinator.cwd)
-    throw new Error(
-      "Native coordinator cwd changed while observing the request.",
-    );
-  const session = object(observed.agent_session);
-  if (session.value !== coordinator.sessionFile)
-    throw new Error(
-      "Native coordinator session changed while observing the request.",
-    );
-  if (observed.agent_status === "blocked")
-    throw new Error(
-      "Native coordinator is blocked and requires operator action; request cannot complete.",
-    );
+  return herdr(
+    root,
+    Type.Object({
+      agent: Type.Object({
+        terminal_id: Type.String(),
+        cwd: Type.String(),
+        agent_session: Type.Object({ value: Type.String() }),
+        agent_status: Type.String(),
+      }),
+    }),
+    "agent",
+    "get",
+    coordinator.paneId,
+  ).then(({ agent: observed }) => {
+    if (observed.terminal_id !== coordinator.terminalId)
+      throw new Error("Native coordinator terminal identity changed while observing the request.");
+    if (observed.cwd !== coordinator.cwd)
+      throw new Error("Native coordinator cwd changed while observing the request.");
+    if (observed.agent_session.value !== coordinator.sessionFile)
+      throw new Error("Native coordinator session changed while observing the request.");
+    if (observed.agent_status === "blocked")
+      throw new Error(
+        "Native coordinator is blocked and requires operator action; request cannot complete.",
+      );
+  });
 }
 
-async function verifyDelegatedSettlements(
+function verifyDelegatedSettlements(
   workspaceId: string,
   state: Awaited<ReturnType<typeof WorkstreamStore.inspect>>,
-): Promise<void> {
+): void {
   for (const attempt of state.attempts) {
     if (
-      !attempt.sessionFile ||
+      attempt.sessionFile === undefined ||
       !hasNativeAgentSettled(attempt.sessionFile, state.id, attempt.id)
     )
       throw new Error(
         `Delegated attempt ${attempt.id} has no native settled marker for its exact generation.`,
       );
     const worker = attempt.worker;
-    if (!worker || worker.workspaceId !== workspaceId)
+    if (worker === undefined || worker.workspaceId !== workspaceId)
       throw new Error(
         `Delegated attempt ${attempt.id} is not attributable to the owned workspace.`,
       );
-    if (!attempt.placement || worker.cwd !== attempt.placement.path)
+    if (attempt.placement === undefined || worker.cwd !== attempt.placement.path)
       throw new Error(
         `Delegated attempt ${attempt.id} has an unexpected worker placement identity.`,
       );
   }
 }
 
-async function verifyRetainedExperiments(
+// biome-ignore-start lint/complexity/noExcessiveCognitiveComplexity: Experiment verification keeps retention and readability failures separately attributable.
+function verifyRetainedExperiments(
   state: Awaited<ReturnType<typeof WorkstreamStore.inspect>>,
 ): Promise<void> {
+  const retainedReferences: Array<{ artifactId: string; reference: string }> = [];
   for (const assignment of state.assignments) {
     if (assignment.artifactIntent !== "disposable_experiment") continue;
-    const result = state.results.find(
-      (item) => item.assignmentId === assignment.id,
-    );
+    const result = state.results.find((item) => item.assignmentId === assignment.id);
     if (result?.validity !== "typed")
       throw new Error(
         `Experiment ${assignment.id} has no typed result to verify retained outputs.`,
@@ -133,16 +140,28 @@ async function verifyRetainedExperiments(
         throw new Error(
           `Experiment ${assignment.id} did not declare retained output ${artifactId}.`,
         );
-      try {
-        await readFile(artifact.reference);
-      } catch (error) {
-        throw new Error(
-          `Retained experiment output ${artifactId} is not readable: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+      retainedReferences.push({ artifactId, reference: artifact.reference });
     }
   }
+  return Promise.all(
+    retainedReferences.map(({ artifactId, reference }) =>
+      readFile(reference)
+        // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Native filesystem rejection is normalized into retained-artifact evidence.
+        .catch((error: unknown) => {
+          throw new Error(
+            `Retained experiment output ${artifactId} is not readable: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }),
+    ),
+  ).then(() => undefined);
 }
+// biome-ignore-end lint/complexity/noExcessiveCognitiveComplexity: End retained experiment observation.
+
+const smokeTimeout = Effect.runSync(
+  Config.number("PI_WORKGRAPH_SMOKE_TIMEOUT_MS")
+    .pipe(Config.withDefault(1_800_000))
+    .parse(ConfigProvider.fromEnvRecord(process.env)),
+);
 
 let fixture: Awaited<ReturnType<typeof createLiveFixture>> | undefined;
 let latest: Awaited<ReturnType<typeof WorkstreamStore.inspect>> | undefined;
@@ -153,8 +172,9 @@ try {
   const prompt = `Inspect the fixture's parser and marker bytes to determine the concrete normalization issue, using the least expensive useful evidence. A disposable scratch effect is permitted only for a small, isolated observation and only if reading the supplied files does not resolve the question; retain any resulting observation. If the evidence supports a correction, make the smallest authorized change so value.txt contains exactly after followed by one newline, without changing any other maintained file. Verify the final bytes, parser/verifier behavior, exact changed-file set, and every owned worker/resource cleanup before concluding. If any check cannot be established, report the concrete blocker instead of claiming success.`;
   await writeFile(join(f.parent, "initial-request.txt"), prompt);
   const before = await snapshotWorkingTree(f.root);
-  await herdr(f.root, "agent", "prompt", coordinator.agentName, prompt);
+  await herdr(f.root, Type.Object({}), "agent", "prompt", coordinator.agentName, prompt);
   const outcome = await waitFor(
+    // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
     async () => {
       await assertNativeCoordinatorIdentity(f.root, coordinator);
       const turn = observeCoordinatorTurn(
@@ -162,9 +182,7 @@ try {
         prompt,
       );
       if (turn.state === "failed" || turn.state === "blocked")
-        throw new Error(
-          `Natural coordinator request did not complete: ${turn.detail}`,
-        );
+        throw new Error(`Natural coordinator request did not complete: ${turn.detail}`);
       if (turn.state === "waiting") return undefined;
 
       latest = await inspectWorkstream(f.root);
@@ -181,10 +199,7 @@ try {
           );
         return { strategy: "direct" as const, turn, directEffect };
       }
-      if (
-        latest.lifecycle.state !== "active" &&
-        latest.lifecycle.state !== "completed"
-      )
+      if (latest.lifecycle.state !== "active" && latest.lifecycle.state !== "completed")
         throw new Error(
           `Natural delegated request reached ${latest.lifecycle.state}: ${latest.lifecycle.reason}`,
         );
@@ -205,26 +220,25 @@ try {
         throw new Error(
           `Settled delegated request produced an invalid result: ${delegated.detail}`,
         );
-      await verifyDelegatedSettlements(f.workspaceId, latest);
+      verifyDelegatedSettlements(f.workspaceId, latest);
       await verifyRetainedExperiments(latest);
       return {
-        strategy:
-          delegated.implementationOrigin === "direct" ? "mixed" : "delegated",
+        strategy: delegated.implementationOrigin === "direct" ? "mixed" : "delegated",
         implementationOrigin: delegated.implementationOrigin,
         turn,
         directEffect,
         delegated,
       };
     },
-    Number(process.env.PI_WORKGRAPH_SMOKE_TIMEOUT_MS || 1_800_000),
+    smokeTimeout,
     "native coordinator request settlement and truthful direct/delegated outcome",
   );
 
   assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "after\n");
-  assert.deepEqual(
-    JSON.parse(await command(f.root, "node", ["parse-marker.mjs"])),
-    { raw: "AMBER.", parsed: "AMBER" },
-  );
+  assert.deepEqual(JSON.parse(await command(f.root, "node", ["parse-marker.mjs"])), {
+    raw: "AMBER.",
+    parsed: "AMBER",
+  });
   assert.equal(await command(f.root, "node", ["verify.mjs"]), "value verified");
   const after = await snapshotWorkingTree(f.root);
   const directEffect = observeDirectEffect(
@@ -237,21 +251,20 @@ try {
   const observations = {
     strategy: outcome.strategy,
     delegationExercised: outcome.strategy !== "direct",
-    implementationOrigin:
-      outcome.strategy === "direct" ? "direct" : outcome.implementationOrigin,
+    implementationOrigin: outcome.strategy === "direct" ? "direct" : outcome.implementationOrigin,
     ...(outcome.strategy === "direct"
       ? {
-          evidenceLimit:
-            "No delegation was exercised; native direct outcome only.",
+          evidenceLimit: "No delegation was exercised; native direct outcome only.",
         }
       : {
-          experiment: outcome.delegated!.experiment,
-          delegatedOutcome: outcome.delegated!.detail,
+          experiment: outcome.delegated?.experiment,
+          delegatedOutcome: outcome.delegated?.detail,
         }),
     nativeSettlement: outcome.turn.detail,
     changedPaths: directEffect.changedPaths,
     finalWorkingTreeBytesChecked: true,
     finalRevision: await command(f.root, "git", ["rev-parse", "HEAD"]),
+    // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
     ...(latest
       ? {
           assignments: latest.assignments.map((assignment) => ({
@@ -287,12 +300,12 @@ try {
       2,
     ),
   );
-  console.log(
-    JSON.stringify({
+  process.stdout.write(
+    `${JSON.stringify({
       status: "passed",
       evidence: f.parent,
       candidateRevision: f.revision,
-    }),
+    })}\n`,
   );
 } catch (error) {
   await retainFailure(fixture, error);
