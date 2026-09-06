@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixtures intentionally use real host storage at the node:test boundary.
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are host filesystem identities.
 import { join } from "node:path";
 import test from "node:test";
+import { DateTime } from "effect";
 import {
   type AuthorityReference,
   type HumanInputReceipt,
@@ -11,9 +14,15 @@ import {
   UnsupportedWorkstreamStateError,
   WorkstreamStore,
 } from "../src/workstream.js";
+import { parsePersistedObject } from "../src/workstream-validation.js";
 import { researchReport } from "./helpers.js";
 
-test("accepted historical research closes its original scope after intent changes, without invented limitations", async () => {
+function dateAt(milliseconds: number): Date {
+  return DateTime.toDate(DateTime.makeUnsafe(milliseconds));
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
+void test("accepted historical research closes its original scope after intent changes, without invented limitations", async () => {
   const { parent, store } = await fixture();
   try {
     await store.assign({
@@ -42,9 +51,7 @@ test("accepted historical research closes its original scope after intent change
     assert.equal(revised.results[0]?.assignmentIntentVersion, 0);
     const state = await store.complete({
       conclusion: "Baseline research is resolved in its original scope",
-      evidence: [
-        { label: "Baseline", observation: "Evidence predates the new intent" },
-      ],
+      evidence: [{ label: "Baseline", observation: "Evidence predates the new intent" }],
       limitations: [],
       reasons: [],
     });
@@ -54,7 +61,8 @@ test("accepted historical research closes its original scope after intent change
   }
 });
 
-test("accepting a failed report or uncomposed stale implementation as evidence does not resolve its assignment", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
+void test("accepting a failed report or uncomposed stale implementation as evidence does not resolve its assignment", async () => {
   for (const capability of ["research", "implement"] as const) {
     const { parent, store } = await fixture();
     try {
@@ -108,9 +116,7 @@ test("accepting a failed report or uncomposed stale implementation as evidence d
       });
       const completion = {
         conclusion: "Known unresolved work",
-        evidence: [
-          { label: "Result", observation: "The assignment is not fulfilled" },
-        ],
+        evidence: [{ label: "Result", observation: "The assignment is not fulfilled" }],
         limitations: [],
         reasons: [],
       };
@@ -121,9 +127,7 @@ test("accepting a failed report or uncomposed stale implementation as evidence d
       const state = await store.complete({
         ...completion,
         limitations: [
-          capability === "research"
-            ? "The read failed"
-            : "The stale change was never composed",
+          capability === "research" ? "The read failed" : "The stale change was never composed",
         ],
         reasons: [
           {
@@ -153,42 +157,47 @@ const coordinator: SessionIdentity = {
   sessionFile: "/sessions/coordinator.jsonl",
 };
 
-async function fixture(): Promise<{ parent: string; store: WorkstreamStore }> {
-  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-workstream-"));
-  const { store } = await WorkstreamStore.create({
-    id: "workstream",
-    purpose: "Determine the safe fixture change.",
-    projectRoot: join(parent, "project"),
-    gitCommonDir: join(parent, "project", ".git"),
-    coordinator,
-    now: new Date(0),
-  });
-  return { parent, store };
+function fixture(): Promise<{ parent: string; store: WorkstreamStore }> {
+  return mkdtemp(join(tmpdir(), "pi-workgraph-workstream-")).then((parent) =>
+    WorkstreamStore.create({
+      id: "workstream",
+      purpose: "Determine the safe fixture change.",
+      projectRoot: join(parent, "project"),
+      gitCommonDir: join(parent, "project", ".git"),
+      coordinator,
+      now: dateAt(0),
+    }).then(({ store }) => ({ parent, store })),
+  );
 }
 
-async function recordedAuthority(
+function recordedAuthority(
   store: WorkstreamStore,
 ): Promise<{ receipt: HumanInputReceipt; authority: AuthorityReference }> {
-  const { receipt } = await store.recordInputEvent({
-    ...coordinator,
-    source: "interactive",
-    text: "I approve the bounded fixture experiment and maintained correction.",
-    now: new Date(1_000),
-  });
-  const revised = await store.reviseIntent({
-    authorityReceiptId: receipt.id,
-    statement: "Establish and correct the fixture behavior.",
-    constraints: ["Keep the fixture local."],
-    now: new Date(2_000),
-  });
-  const authority = {
-    receiptId: receipt.id,
-    intentVersion: revised.intents.at(-1)!.version,
-  };
-  return { receipt, authority };
+  return store
+    .recordInputEvent({
+      ...coordinator,
+      source: "interactive",
+      text: "I approve the bounded fixture experiment and maintained correction.",
+      now: dateAt(1_000),
+    })
+    .then(({ receipt }) =>
+      store
+        .reviseIntent({
+          authorityReceiptId: receipt.id,
+          statement: "Establish and correct the fixture behavior.",
+          constraints: ["Keep the fixture local."],
+          now: dateAt(2_000),
+        })
+        .then((revised) => {
+          const intent = revised.intents.at(-1);
+          if (!intent) throw new Error("Fixture intent was not recorded.");
+          return { receipt, authority: { receiptId: receipt.id, intentVersion: intent.version } };
+        }),
+    );
 }
 
-test("workstream persists human-backed intent, local readiness, and retained experiment evidence", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
+void test("workstream persists human-backed intent, local readiness, and retained experiment evidence", async () => {
   const { parent, store } = await fixture();
   try {
     const { authority } = await recordedAuthority(store);
@@ -199,7 +208,7 @@ test("workstream persists human-backed intent, local readiness, and retained exp
       objective: "Inspect the fixture behavior.",
       intentVersion: authority.intentVersion,
       expectedEvidence: ["A direct fixture observation."],
-      now: new Date(3_000),
+      now: dateAt(3_000),
     });
     assert.equal(state.assignments[0]?.capability, "research");
 
@@ -210,14 +219,11 @@ test("workstream persists human-backed intent, local readiness, and retained exp
       objective: "Probe whether the fixture accepts the candidate input.",
       intentVersion: authority.intentVersion,
       authority,
-      permittedEffects: [
-        "Write only under the disposable experiment directory.",
-      ],
-      stopCondition:
-        "The fixture either accepts or rejects the candidate input.",
+      permittedEffects: ["Write only under the disposable experiment directory."],
+      stopCondition: "The fixture either accepts or rejects the candidate input.",
       expectedEvidence: ["The observed fixture output."],
       artifactPolicy: { retain: ["experiment-log"], discardOthers: true },
-      now: new Date(4_000),
+      now: dateAt(4_000),
     });
     assert.equal(state.assignments[1]?.artifactIntent, "disposable_experiment");
 
@@ -256,7 +262,7 @@ test("workstream persists human-backed intent, local readiness, and retained exp
           summary: "The bounded experiment output.",
         },
       ],
-      now: new Date(5_000),
+      now: dateAt(5_000),
     });
     assert.equal(state.results[0]?.artifacts[0]?.retention, "retained");
 
@@ -272,7 +278,7 @@ test("workstream persists human-backed intent, local readiness, and retained exp
         artifactId: "experiment-log",
       },
       concern: "Does the retained output support the proposed conclusion?",
-      now: new Date(6_000),
+      now: dateAt(6_000),
     });
     assert.equal(state.assignments[2]?.capability, "review");
 
@@ -283,16 +289,14 @@ test("workstream persists human-backed intent, local readiness, and retained exp
     );
     const experimentResult = persisted.results[0];
     assert.ok(experimentResult && experimentResult.validity === "typed");
-    assert.equal(
-      experimentResult.report.summary,
-      "The disposable probe rejected the candidate.",
-    );
+    assert.equal(experimentResult.report.summary, "The disposable probe rejected the candidate.");
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
 });
 
-test("workstream rejects extension or arbitrary authority and stale intent", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
+void test("workstream rejects extension or arbitrary authority and stale intent", async () => {
   const { parent, store } = await fixture();
   try {
     await assert.rejects(
@@ -355,7 +359,8 @@ test("workstream rejects extension or arbitrary authority and stale intent", asy
   }
 });
 
-test("workstream keeps worker validity, disposition, limitations, and stale results distinct", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
+void test("workstream keeps worker validity, disposition, limitations, and stale results distinct", async () => {
   const { parent, store } = await fixture();
   try {
     const { receipt, authority } = await recordedAuthority(store);
@@ -432,7 +437,8 @@ test("workstream keeps worker validity, disposition, limitations, and stale resu
   }
 });
 
-test("every independent attempt remains accounted for regardless of result arrival order", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
+void test("every independent attempt remains accounted for regardless of result arrival order", async () => {
   for (const order of [
     ["failed", "success"],
     ["success", "failed"],
@@ -475,10 +481,7 @@ test("every independent attempt remains accounted for regardless of result arriv
           agentName: `agent-${index}`,
           cwd: `/tmp/worktree-${index}`,
         });
-        await store.recordSessionFile(
-          `attempt-${index}`,
-          `/tmp/session-${index}`,
-        );
+        await store.recordSessionFile(`attempt-${index}`, `/tmp/session-${index}`);
         await store.markSubmission(`attempt-${index}`, "uncertain");
         await store.markSubmission(`attempt-${index}`, "submitted");
         await store.retainResult({
@@ -488,10 +491,7 @@ test("every independent attempt remains accounted for regardless of result arriv
           validity: "typed",
           report: {
             kind: "research" as const,
-            status:
-              order[index] === "success"
-                ? ("completed" as const)
-                : ("failed" as const),
+            status: order[index] === "success" ? ("completed" as const) : ("failed" as const),
             summary: `${order[index]} observation`,
             evidence: [],
             findings: [],
@@ -532,9 +532,7 @@ test("every independent attempt remains accounted for regardless of result arriv
       await assert.rejects(
         store.complete({
           conclusion: "One contribution failed",
-          evidence: [
-            { label: "comparison", observation: "Both attempts retained" },
-          ],
+          evidence: [{ label: "comparison", observation: "Both attempts retained" }],
           limitations: ["The failed attempt remains unresolved."],
           reasons: [],
         }),
@@ -542,15 +540,13 @@ test("every independent attempt remains accounted for regardless of result arriv
       );
       const failed = state.attempts.find((attempt) =>
         attempt.id.endsWith(order.indexOf("failed").toString()),
-      )!;
-      const failedResult = state.results.find(
-        (result) => result.id === failed.resultId,
-      )!;
+      );
+      assert.ok(failed);
+      const failedResult = state.results.find((result) => result.id === failed.resultId);
+      assert.ok(failedResult);
       const completed = await store.complete({
         conclusion: "One contribution failed",
-        evidence: [
-          { label: "comparison", observation: "Both attempts retained" },
-        ],
+        evidence: [{ label: "comparison", observation: "Both attempts retained" }],
         limitations: ["The failed attempt remains unresolved."],
         reasons: [
           {
@@ -577,20 +573,23 @@ test("every independent attempt remains accounted for regardless of result arriv
   }
 });
 
-test("malformed state diagnostics identify a bounded field path without echoing payloads", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
+void test("malformed state diagnostics identify a bounded field path without echoing payloads", async () => {
   const { parent, store } = await fixture();
   try {
     const original = await readFile(store.path, "utf8");
     await writeFile(
       store.path,
-      original.replace(
-        '"purpose": "Determine the safe fixture change."',
-        '"purpose": "credential=redacted-secret"',
-      ).replace('"revision": 0', '"revision": "invalid"'),
+      original
+        .replace(
+          '"purpose": "Determine the safe fixture change."',
+          '"purpose": "credential=redacted-secret"',
+        )
+        .replace('"revision": 0', '"revision": "invalid"'),
     );
     await assert.rejects(
       WorkstreamStore.inspect(store.path),
-      (error: unknown) =>
+      (error: Error) =>
         error instanceof InvalidWorkstreamStateError &&
         error.message.includes("/revision") &&
         !error.message.includes("credential=redacted-secret"),
@@ -600,7 +599,8 @@ test("malformed state diagnostics identify a bounded field path without echoing 
   }
 });
 
-test("workstream serializes receipt writes and rejects corrupt or foreign history without rewriting it", async () => {
+// oxlint-disable-next-line effecttsgo/async-function -- node:test owns this asynchronous lifecycle callback.
+void test("workstream serializes receipt writes and rejects corrupt or foreign history without rewriting it", async () => {
   const { parent, store } = await fixture();
   try {
     await Promise.all([
@@ -650,32 +650,21 @@ test("workstream serializes receipt writes and rejects corrupt or foreign histor
       foreignPath,
       JSON.stringify({ version: 7, runId: "old-run", phase: "discovery" }),
     );
-    await assert.rejects(
-      WorkstreamStore.inspect(foreignPath),
-      UnsupportedWorkstreamStateError,
-    );
-    assert.equal(
-      JSON.parse(await readFile(foreignPath, "utf8")).runId,
-      "old-run",
-    );
+    await assert.rejects(WorkstreamStore.inspect(foreignPath), UnsupportedWorkstreamStateError);
+    const foreignObject = parsePersistedObject(await readFile(foreignPath, "utf8"));
+    const runIdKey = "runId";
+    assert.equal(foreignObject[runIdKey], "old-run");
 
     const copiedPath = join(parent, "copied.json");
     await writeFile(copiedPath, await readFile(state.statePath, "utf8"));
-    await assert.rejects(
-      WorkstreamStore.inspect(copiedPath),
-      InvalidWorkstreamStateError,
-    );
-    assert.equal(
-      JSON.parse(await readFile(copiedPath, "utf8")).statePath,
-      state.statePath,
-    );
+    await assert.rejects(WorkstreamStore.inspect(copiedPath), InvalidWorkstreamStateError);
+    const copiedObject = parsePersistedObject(await readFile(copiedPath, "utf8"));
+    const statePathKey = "statePath";
+    assert.equal(copiedObject[statePathKey], state.statePath);
 
     const corruptPath = join(parent, "corrupt.json");
     await writeFile(corruptPath, "not JSON");
-    await assert.rejects(
-      WorkstreamStore.inspect(corruptPath),
-      InvalidWorkstreamStateError,
-    );
+    await assert.rejects(WorkstreamStore.inspect(corruptPath), InvalidWorkstreamStateError);
     assert.equal(await readFile(corruptPath, "utf8"), "not JSON");
   } finally {
     await rm(parent, { recursive: true, force: true });

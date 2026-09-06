@@ -1,5 +1,8 @@
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- The existing Promise store API requires direct host filesystem reads at this external I/O boundary.
 import { readFile } from "node:fs/promises";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Cross-reference path checks use the canonical host path implementation.
 import { resolve } from "node:path";
+import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
   type AuthorityReference,
@@ -22,6 +25,8 @@ import {
 
 type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
+const JsonStringSchema = Type.String();
+
 export type JsonObject = {
   readonly format?: JsonValue;
   readonly version?: JsonValue;
@@ -107,7 +112,13 @@ export function retainedTerminalInspection(
   const gitCommonDir = stringField(value, "gitCommonDir");
   const id = stringField(value, "id");
   const lifecycle = value.lifecycle;
-  if (!statePath || !gitCommonDir || !id || !isJsonObject(lifecycle)) return undefined;
+  if (
+    statePath === undefined ||
+    gitCommonDir === undefined ||
+    id === undefined ||
+    !isJsonObject(lifecycle)
+  )
+    return undefined;
   const lifecycleState = lifecycle.state;
   const changedAt = stringField(lifecycle, "changedAt");
   const reason = stringField(lifecycle, "reason");
@@ -130,7 +141,7 @@ export function retainedTerminalInspection(
 
 function stringField(value: JsonObject, key: string): string | undefined {
   const field = value[key];
-  return typeof field === "string" ? field : undefined;
+  return Value.Check(JsonStringSchema, field) ? field : undefined;
 }
 
 export function isKnownHistoricalWorkstreamVersion(value: JsonValue | undefined): boolean {
@@ -257,9 +268,9 @@ function validateAttempts(
     validateAttemptPlacement(state, attempt);
     if (!assignmentIds.has(attempt.assignmentId))
       throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} references unknown assignment.`);
-    if (attempt.resultId && !resultIds.has(attempt.resultId))
+    if (attempt.resultId !== undefined && !resultIds.has(attempt.resultId))
       throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} references unknown result.`);
-    if (attempt.resultId) {
+    if (attempt.resultId !== undefined) {
       const result = state.results.find((item) => item.id === attempt.resultId);
       if (result?.assignmentId !== attempt.assignmentId)
         throw new InvalidWorkstreamStateError(
@@ -279,7 +290,7 @@ function validateAttemptPlacement(state: WorkstreamState, attempt: WorkAttempt):
       `Attempt ${attempt.id} shared placement must be the project root.`,
     );
   if (placement.kind === "isolated_worktree") {
-    if (!attempt.baseRevision)
+    if (attempt.baseRevision === undefined)
       throw new InvalidWorkstreamStateError(
         `Attempt ${attempt.id} isolated placement has no base revision.`,
       );
@@ -287,7 +298,7 @@ function validateAttemptPlacement(state: WorkstreamState, attempt: WorkAttempt):
       throw new InvalidWorkstreamStateError(
         `Attempt ${attempt.id} isolated placement compatibility fields disagree.`,
       );
-  } else if (attempt.worktreePath || attempt.branch) {
+  } else if (attempt.worktreePath !== undefined || attempt.branch !== undefined) {
     throw new InvalidWorkstreamStateError(
       `Attempt ${attempt.id} shared placement has isolated compatibility fields.`,
     );
@@ -362,7 +373,11 @@ export function validateArtifactsForAssignment(
 export function validateAuthority(state: WorkstreamState, authority: AuthorityReference): void {
   const receipt = state.inputs.find((candidate) => candidate.id === authority.receiptId);
   const intent = state.intents.find((candidate) => candidate.version === authority.intentVersion);
-  if (!receipt || !intent?.authorityReceiptIds.includes(authority.receiptId))
+  if (
+    receipt === undefined ||
+    intent === undefined ||
+    !intent.authorityReceiptIds.includes(authority.receiptId)
+  )
     throw new InvalidWorkstreamStateError(
       "Assignment authority does not reference a retained human-backed intent.",
     );

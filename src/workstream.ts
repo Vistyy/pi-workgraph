@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Atomic replacement and file mode require the host Node filesystem Promise API at this compatibility boundary.
 import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Workstream paths are pure host paths and do not require an Effect service.
 import { dirname, resolve } from "node:path";
 import { DateTime, Effect, Semaphore } from "effect";
-import type { Static } from "typebox";
+import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { EvidenceSchema } from "./report-schema.js";
 import {
@@ -30,11 +32,14 @@ import {
   type WorkstreamReattachmentInspection,
   type WorkstreamState,
   WorkstreamStateSchema,
+  WorkstreamStoreOperationError,
 } from "./workstream-state.js";
 import {
   decodeState,
   isActiveHistoricalState,
   isKnownHistoricalWorkstreamVersion,
+  type JsonObject,
+  type JsonValue,
   readState,
   readStateValue,
   requireText,
@@ -91,17 +96,18 @@ export class WorkstreamStore {
     this.mutationGuard = guard;
   }
 
-  async adopt(owner: SessionIdentity): Promise<WorkstreamState> {
+  adopt(owner: SessionIdentity): Promise<WorkstreamState> {
     validateSession(owner);
-    const state = await this.update(
+    return this.update(
       (draft) => {
         draft.coordinator = { ...owner };
       },
       undefined,
       ["active", "suspended"],
-    );
-    this.owner = { ...owner };
-    return state;
+    ).then((state) => {
+      this.owner = { ...owner };
+      return state;
+    });
   }
 
   static pathFor(gitCommonDir: string, id: string): string {
@@ -109,7 +115,7 @@ export class WorkstreamStore {
     return pathForWorkstream(gitCommonDir, id);
   }
 
-  static async create(input: {
+  static create(input: {
     id: string;
     purpose: string;
     projectRoot: string;
@@ -123,50 +129,52 @@ export class WorkstreamStore {
     requireText(input.gitCommonDir, "Git common directory");
     validateSession(input.coordinator);
     const path = WorkstreamStore.pathFor(input.gitCommonDir, input.id);
-    await mkdir(dirname(dirname(path)), { recursive: true });
-    await mkdir(dirname(path));
-    const now = (input.now ?? currentDate()).toISOString();
-    const state: WorkstreamState = {
-      format: WORKSTREAM_FORMAT,
-      version: WORKSTREAM_STATE_VERSION,
-      revision: 0,
-      id: input.id,
-      purpose: input.purpose.trim(),
-      projectRoot: input.projectRoot,
-      gitCommonDir: input.gitCommonDir,
-      statePath: path,
-      coordinator: { ...input.coordinator },
-      lifecycle: {
-        state: "active",
-        changedAt: now,
-        reason: "Workstream created.",
-      },
-      inputs: [],
-      intents: [
-        {
-          version: 0,
-          statement: input.purpose.trim(),
-          constraints: [],
-          authorityReceiptIds: [],
-          recordedAt: now,
-        },
-      ],
-      assignments: [],
-      results: [],
-      dispositions: [],
-      attempts: [],
-      deliveries: [],
-      createdAt: now,
-      updatedAt: now,
-    };
-    const store = new WorkstreamStore(path, input.coordinator);
-    try {
-      await store.write(state);
-    } catch (error) {
-      await rm(dirname(path), { recursive: true, force: true });
-      throw error;
-    }
-    return { store, state: structuredClone(state) };
+    return mkdir(dirname(dirname(path)), { recursive: true })
+      .then(() => mkdir(dirname(path)))
+      .then(() => {
+        const now = (input.now ?? currentDate()).toISOString();
+        const state: WorkstreamState = {
+          format: WORKSTREAM_FORMAT,
+          version: WORKSTREAM_STATE_VERSION,
+          revision: 0,
+          id: input.id,
+          purpose: input.purpose.trim(),
+          projectRoot: input.projectRoot,
+          gitCommonDir: input.gitCommonDir,
+          statePath: path,
+          coordinator: { ...input.coordinator },
+          lifecycle: {
+            state: "active",
+            changedAt: now,
+            reason: "Workstream created.",
+          },
+          inputs: [],
+          intents: [
+            {
+              version: 0,
+              statement: input.purpose.trim(),
+              constraints: [],
+              authorityReceiptIds: [],
+              recordedAt: now,
+            },
+          ],
+          assignments: [],
+          results: [],
+          dispositions: [],
+          attempts: [],
+          deliveries: [],
+          createdAt: now,
+          updatedAt: now,
+        };
+        const store = new WorkstreamStore(path, input.coordinator);
+        return store.write(state).then(
+          () => ({ store, state: structuredClone(state) }),
+          (error) =>
+            rm(dirname(path), { recursive: true, force: true }).then(() => {
+              throw error;
+            }),
+        );
+      });
   }
 
   static open(path: string, owner: SessionIdentity): WorkstreamStore {
@@ -183,32 +191,11 @@ export class WorkstreamStore {
    * A canonical terminal envelope from a known workstream version may be retained
    * without applying the current mutable schema or adopting its ownership.
    */
-  static async inspectForReattachment(path: string): Promise<WorkstreamReattachmentInspection> {
+  static inspectForReattachment(path: string): Promise<WorkstreamReattachmentInspection> {
     const resolvedPath = resolve(path);
-    const value = await readStateValue(resolvedPath);
-    const format = value.format;
-    const version = value.version;
-    if (format === WORKSTREAM_FORMAT && version === WORKSTREAM_STATE_VERSION) {
-      try {
-        const state = decodeState(value);
-        validateStoredPath(state, resolvedPath);
-        return { kind: "current", state: structuredClone(state) };
-      } catch (error) {
-        const retained = retainedTerminalInspection(value, resolvedPath);
-        if (retained) return retained;
-        throw error;
-      }
-    }
-    if (format === WORKSTREAM_FORMAT && isKnownHistoricalWorkstreamVersion(version)) {
-      const retained = retainedTerminalInspection(value, resolvedPath);
-      if (retained) return retained;
-      if (isActiveHistoricalState(value))
-        throw new UnsupportedWorkstreamStateError(format, version);
-      throw new InvalidWorkstreamStateError(
-        `Historical workstream state version ${String(version)} cannot be classified as canonical terminal history.`,
-      );
-    }
-    throw new UnsupportedWorkstreamStateError(format, version);
+    return readStateValue(resolvedPath).then((value) =>
+      inspectReattachmentValue(value, resolvedPath),
+    );
   }
 
   load(): Promise<WorkstreamState> {
@@ -218,7 +205,7 @@ export class WorkstreamStore {
     });
   }
 
-  async recordInputEvent(input: {
+  recordInputEvent(input: {
     id?: string;
     sessionId: string;
     sessionFile: string;
@@ -227,19 +214,20 @@ export class WorkstreamStore {
     now?: Date;
   }): Promise<{ state: WorkstreamState; receipt: HumanInputReceipt }> {
     if (input.source === "extension")
-      throw new Error("Extension-generated input cannot create human authority.");
+      return Promise.reject(new Error("Extension-generated input cannot create human authority."));
     const source: HumanInputReceipt["source"] = input.source;
     validateSession(input);
     requireText(input.text, "Human input");
     let receipt: HumanInputReceipt | undefined;
-    const state = await this.update(
+    return this.update(
       (draft, now) => {
         if (
           input.sessionId !== this.owner.sessionId ||
           input.sessionFile !== this.owner.sessionFile
         )
           throw new Error("Input receipt belongs to another session.");
-        const previous = input.id ? draft.inputs.find((item) => item.id === input.id) : undefined;
+        const previous =
+          input.id === undefined ? undefined : draft.inputs.find((item) => item.id === input.id);
         if (previous) {
           if (
             previous.text !== input.text.trim() ||
@@ -259,14 +247,15 @@ export class WorkstreamStore {
           receivedAt: (input.now ?? now).toISOString(),
         };
         const recorded = receipt;
-        if (!recorded) throw new Error("Human input receipt was not recorded.");
+        if (recorded === undefined) throw new Error("Human input receipt was not recorded.");
         draft.inputs.push(recorded);
       },
       input.now,
       ["active", "suspended"],
-    );
-    if (!receipt) throw new Error("Human input receipt was not recorded.");
-    return { state, receipt };
+    ).then((state) => {
+      if (!receipt) throw new Error("Human input receipt was not recorded.");
+      return { state, receipt };
+    });
   }
 
   setLifecycle(input: {
@@ -349,13 +338,13 @@ export class WorkstreamStore {
         if (draft.attempts.some((item) => item.id === attempt.id))
           throw new Error("Duplicate attempt.");
         if (
-          attempt.continuationOf &&
+          attempt.continuationOf !== undefined &&
           !draft.attempts.some(
             (item) =>
               item.id === attempt.continuationOf &&
               item.state === "settled" &&
               item.cleanup?.state === "completed" &&
-              item.sessionFile,
+              item.sessionFile !== undefined,
           )
         )
           throw new Error(
@@ -436,7 +425,7 @@ export class WorkstreamStore {
           delete attempt.worktreePath;
           delete attempt.branch;
         }
-        if (input.baseRevision) attempt.baseRevision = input.baseRevision;
+        if (input.baseRevision !== undefined) attempt.baseRevision = input.baseRevision;
         else delete attempt.baseRevision;
         attempt.submission = "not_sent";
       },
@@ -449,7 +438,7 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
-        if (attempt.sessionFile) {
+        if (attempt.sessionFile !== undefined) {
           if (attempt.sessionFile === sessionFile) return;
           throw new Error(`Attempt ${id} has contradictory session identity.`);
         }
@@ -492,7 +481,7 @@ export class WorkstreamStore {
           if (attempt.resource && sameValue(attempt.resource, resource)) return;
           throw new Error(`Attempt ${id} is not accepting a resource.`);
         }
-        if (attempt.resource && !sameValue(attempt.resource, resource))
+        if (attempt.resource !== undefined && !sameValue(attempt.resource, resource))
           throw new Error(`Attempt ${id} has contradictory resource identity.`);
         attempt.resource = resource;
       },
@@ -508,11 +497,12 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
-        if (attempt.worker) {
+        if (attempt.worker !== undefined) {
           if (sameValue(attempt.worker, worker)) return;
           throw new Error(`Attempt ${id} has contradictory worker identity.`);
         }
-        if (!attempt.sessionFile) throw new Error("Worker identity requires a session file.");
+        if (attempt.sessionFile === undefined)
+          throw new Error("Worker identity requires a session file.");
         if (!["starting", "running"].includes(attempt.state))
           throw new Error(`Attempt ${id} is not accepting worker identity.`);
         attempt.worker = worker;
@@ -529,7 +519,8 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
-        if (!attempt.sessionFile) throw new Error("Submission state requires a session file.");
+        if (attempt.sessionFile === undefined)
+          throw new Error("Submission state requires a session file.");
         const previous = attempt.submission ?? "not_sent";
         const allowed =
           (previous === "not_sent" && state === "uncertain") ||
@@ -554,7 +545,8 @@ export class WorkstreamStore {
     return this.changeAttempt(
       input.id,
       (attempt, draft) => {
-        if (!attempt.sessionFile) throw new Error("Settlement requires a session file.");
+        if (attempt.sessionFile === undefined)
+          throw new Error("Settlement requires a session file.");
         if (!draft.results.some((result) => result.id === input.resultId))
           throw new Error(`Settlement references unknown result ${input.resultId}.`);
         if (attempt.state === "settled" || attempt.state === "cancelled") {
@@ -637,14 +629,14 @@ export class WorkstreamStore {
         const composition = attempt.composition;
         if (composition?.state !== "blocked")
           throw new Error(`Composition for ${id} is not blocked.`);
-        attempt.composition = {
+        const nextComposition: NonNullable<WorkAttempt["composition"]> = {
           state: "pending",
           commit: composition.commit,
           expectedHead: composition.expectedHead,
-          ...((retainedRef ?? composition.retainedRef)
-            ? { retainedRef: retainedRef ?? composition.retainedRef }
-            : {}),
         };
+        const nextRetainedRef = retainedRef ?? composition.retainedRef;
+        if (nextRetainedRef !== undefined) nextComposition.retainedRef = nextRetainedRef;
+        attempt.composition = nextComposition;
       },
       now,
     );
@@ -737,7 +729,7 @@ export class WorkstreamStore {
         if (attempt.cleanup?.state === "completed") return;
         if (attempt.cleanup?.state !== "pending")
           throw new Error(`Cleanup for ${id} is not pending.`);
-        if (attempt.cleanup.workerClosed) return;
+        if (attempt.cleanup.workerClosed === true) return;
         attempt.cleanup = { ...attempt.cleanup, workerClosed: true };
       },
       now,
@@ -748,10 +740,9 @@ export class WorkstreamStore {
     return this.changeAttempt(
       id,
       (attempt) => {
-        if (attempt.cleanup?.state !== "blocked")
-          throw new Error(`Cleanup for ${id} is not blocked.`);
         const cleanup = attempt.cleanup;
-        if (!cleanup) throw new Error(`Cleanup for ${id} is not blocked.`);
+        if (cleanup === undefined || cleanup.state !== "blocked")
+          throw new Error(`Cleanup for ${id} is not blocked.`);
         attempt.cleanup = { ...cleanup, state: "pending" };
         delete attempt.cleanup.error;
       },
@@ -870,7 +861,7 @@ export class WorkstreamStore {
         const delivery = draft.deliveries.find((item) => item.resultId === resultId);
         if (!delivery) throw new Error(`Unknown delivery ${resultId}.`);
         delivery.attemptedBy = owner;
-        if (error) {
+        if (error !== undefined) {
           requireText(error, "Delivery failure");
           delivery.error = error.trim();
           delivery.failureHistory ??= [];
@@ -982,7 +973,7 @@ export class WorkstreamStore {
         draft.attempts.some(
           (attempt) =>
             ["queued", "starting", "running", "cancel_requested"].includes(attempt.state) ||
-            (attempt.placement && attempt.cleanup?.state !== "completed"),
+            (attempt.placement !== undefined && attempt.cleanup?.state !== "completed"),
         )
       ) {
         throw new Error(
@@ -1051,30 +1042,35 @@ export class WorkstreamStore {
     const operation = this.writeSemaphore.withPermit(
       Effect.tryPromise({
         try: () => this.performUpdate(mutator, suppliedNow, allowedLifecycleStates),
-        catch: (cause) => cause,
+        catch: (cause) =>
+          new WorkstreamStoreOperationError({
+            code: "workstream_store_operation_failed",
+            message: "Workstream store operation failed.",
+            cause,
+          }),
       }),
     );
     return runStorePromise(operation);
   }
 
-  private async performUpdate(
+  private performUpdate(
     mutator: (draft: WorkstreamState, now: Date) => void,
     suppliedNow: Date | undefined,
     allowedLifecycleStates: WorkstreamState["lifecycle"]["state"][],
   ): Promise<WorkstreamState> {
     this.mutationGuard?.();
-    const current = await readState(this.path);
-    this.assertOwner(current);
-    if (!allowedLifecycleStates.includes(current.lifecycle.state))
-      throw new Error(`Workstream is ${current.lifecycle.state}.`);
-    const draft = structuredClone(current);
-    const now = suppliedNow ?? currentDate();
-    mutator(draft, now);
-    if (sameValue(draft, current)) return structuredClone(current);
-    draft.revision = current.revision + 1;
-    draft.updatedAt = now.toISOString();
-    await this.write(draft);
-    return structuredClone(draft);
+    return readState(this.path).then((current) => {
+      this.assertOwner(current);
+      if (!allowedLifecycleStates.includes(current.lifecycle.state))
+        throw new Error(`Workstream is ${current.lifecycle.state}.`);
+      const draft = structuredClone(current);
+      const now = suppliedNow ?? currentDate();
+      mutator(draft, now);
+      if (sameValue(draft, current)) return structuredClone(current);
+      draft.revision = current.revision + 1;
+      draft.updatedAt = now.toISOString();
+      return this.write(draft).then(() => structuredClone(draft));
+    });
   }
 
   private assertOwner(state: WorkstreamState): void {
@@ -1086,21 +1082,80 @@ export class WorkstreamStore {
     }
   }
 
-  private async write(state: WorkstreamState): Promise<void> {
+  private write(state: WorkstreamState): Promise<void> {
     validateState(state);
-    await mkdir(dirname(this.path), { recursive: true });
     const temporaryPath = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      await writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, {
+    return mkdir(dirname(this.path), { recursive: true }).then(() =>
+      writeFile(temporaryPath, `${JSON.stringify(state, null, 2)}\n`, {
         encoding: "utf8",
         mode: 0o600,
-      });
-      this.mutationGuard?.();
-      await rename(temporaryPath, this.path);
-    } finally {
-      await rm(temporaryPath, { force: true });
-    }
+      })
+        .then(() => {
+          this.mutationGuard?.();
+          return rename(temporaryPath, this.path);
+        })
+        .then(
+          (result) => rm(temporaryPath, { force: true }).then(() => result),
+          (error) =>
+            rm(temporaryPath, { force: true }).then(() => {
+              throw error;
+            }),
+        ),
+    );
   }
+}
+
+function inspectReattachmentValue(
+  value: JsonObject,
+  resolvedPath: string,
+): WorkstreamReattachmentInspection {
+  const format = value.format;
+  const version = value.version;
+  if (format === WORKSTREAM_FORMAT && version === WORKSTREAM_STATE_VERSION)
+    return inspectCurrentReattachment(value, resolvedPath);
+  if (format === WORKSTREAM_FORMAT && isKnownHistoricalWorkstreamVersion(version))
+    return inspectHistoricalReattachment(value, resolvedPath, format, version);
+  throw new UnsupportedWorkstreamStateError(format, version);
+}
+
+function inspectCurrentReattachment(
+  value: JsonObject,
+  resolvedPath: string,
+): WorkstreamReattachmentInspection {
+  try {
+    const state = decodeState(value);
+    validateStoredPath(state, resolvedPath);
+    return { kind: "current", state: structuredClone(state) };
+  } catch (error) {
+    const retained = retainedTerminalInspection(value, resolvedPath);
+    if (retained) return retained;
+    throw error;
+  }
+}
+
+function inspectHistoricalReattachment(
+  value: import("./workstream-validation.js").JsonObject,
+  resolvedPath: string,
+  format: typeof WORKSTREAM_FORMAT,
+  version: JsonValue | undefined,
+): WorkstreamReattachmentInspection {
+  const retained = retainedTerminalInspection(value, resolvedPath);
+  if (retained) return retained;
+  if (isActiveHistoricalState(value)) throw new UnsupportedWorkstreamStateError(format, version);
+  throw new InvalidWorkstreamStateError(
+    `Historical workstream state version ${describeJsonValue(version)} cannot be classified as canonical terminal history.`,
+  );
+}
+
+const DiagnosticStringSchema = Type.String();
+const DiagnosticScalarSchema = Type.Union([Type.Number(), Type.Boolean()]);
+
+function describeJsonValue(value: JsonValue | undefined): string {
+  if (Value.Check(DiagnosticStringSchema, value)) return JSON.stringify(value.slice(0, 80));
+  if (Value.Check(DiagnosticScalarSchema, value)) return String(value);
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  return Array.isArray(value) ? "[array]" : "[object]";
 }
 
 function beginCleanupTransition(
@@ -1122,16 +1177,20 @@ function beginCleanupTransition(
     throw new Error("Isolated worktree cleanup requires its exact HEAD.");
   if (placement.kind === "shared_project" && input.discard)
     throw new Error("Shared project cleanup cannot discard files.");
-  attempt.cleanup = {
+  const cleanup: NonNullable<WorkAttempt["cleanup"]> = {
     state: "pending",
-    ...(input.expectedHead === undefined ? {} : { expectedHead: input.expectedHead }),
     workerClosed: false,
     discard: input.discard,
   };
+  if (input.expectedHead !== undefined) cleanup.expectedHead = input.expectedHead;
+  attempt.cleanup = cleanup;
 }
 
 function runStorePromise<A, E>(operation: Effect.Effect<A, E>): Promise<A> {
-  return Effect.runPromise(operation);
+  return Effect.runPromise(operation).catch((failure) => {
+    if (failure instanceof WorkstreamStoreOperationError) throw failure.cause;
+    throw failure;
+  });
 }
 
 function currentDate(): Date {
@@ -1212,10 +1271,11 @@ function assignmentResolved(state: WorkstreamState, assignment: WorkAssignment):
 }
 
 function attemptResolved(state: WorkstreamState, attempt: WorkAttempt): boolean {
-  const result = attempt.resultId
-    ? state.results.find((candidate) => candidate.id === attempt.resultId)
-    : undefined;
-  if (!result || resultUnresolved(state, result.id)) return false;
+  const result =
+    attempt.resultId === undefined
+      ? undefined
+      : state.results.find((candidate) => candidate.id === attempt.resultId);
+  if (result === undefined || resultUnresolved(state, result.id)) return false;
   const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
   return (
     result.validity === "typed" &&
@@ -1284,7 +1344,7 @@ function requireActive(state: WorkstreamState): void {
 }
 
 function requireTextValue(value: string | undefined, label: string): string {
-  if (!value?.trim()) throw new Error(`${label} is required.`);
+  if (value === undefined || value.trim().length === 0) throw new Error(`${label} is required.`);
   return value;
 }
 

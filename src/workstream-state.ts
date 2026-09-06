@@ -1,7 +1,9 @@
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Canonical persisted paths require the host Node path implementation; Effect exposes only the service contract here.
 import { join, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Data } from "effect";
 import { type Static, Type } from "typebox";
+import { Value } from "typebox/value";
 import { ModelTargetSchema } from "./model-policy.js";
 import { EvidenceSchema, WorkerReportSchema } from "./report-schema.js";
 
@@ -516,6 +518,15 @@ export class InvalidWorkstreamStateError extends Data.TaggedError("InvalidWorkst
   }
 }
 
+export class WorkstreamStoreOperationError extends Data.TaggedError(
+  "WorkstreamStoreOperationError",
+)<{
+  readonly code: "workstream_store_operation_failed";
+  readonly message: string;
+  /** Original rejection retained for the outward Promise compatibility boundary. */
+  readonly cause: unknown;
+}> {}
+
 export class UnsupportedWorkstreamStateError extends Data.TaggedError(
   "UnsupportedWorkstreamStateError",
 )<{
@@ -524,8 +535,7 @@ export class UnsupportedWorkstreamStateError extends Data.TaggedError(
   readonly version: unknown;
   readonly message: string;
 }> {
-  // This constructor is the public boundary for arbitrary persisted JSON headers.
-  // oxlint-disable-next-line anti-slop(no-unknown-parameters) -- Unknown is retained only as diagnostic metadata at the external decode boundary.
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Public compatibility retains raw format/version metadata from the persisted JSON boundary.
   constructor(format: unknown, version: unknown) {
     super({
       code: "unsupported_workstream_state",
@@ -536,9 +546,13 @@ export class UnsupportedWorkstreamStateError extends Data.TaggedError(
   }
 }
 
+const DiagnosticStringSchema = Type.String();
+const DiagnosticScalarSchema = Type.Union([Type.Number(), Type.Boolean()]);
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This formatter receives only persisted header metadata and emits bounded diagnostics.
 function describeHeaderValue(value: unknown): string {
-  if (typeof value === "string") return JSON.stringify(value.slice(0, 80));
-  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Value.Check(DiagnosticStringSchema, value)) return JSON.stringify(value.slice(0, 80));
+  if (Value.Check(DiagnosticScalarSchema, value)) return String(value);
   if (value === null) return "null";
   if (value === undefined) return "undefined";
   return "[non-scalar]";
