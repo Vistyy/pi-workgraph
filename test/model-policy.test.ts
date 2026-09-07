@@ -26,7 +26,7 @@ await test("policy defaults, legacy reads, and independent role-list writes use 
       roles: {
         research: [{ model: "openai-codex/gpt-5.6-luna", thinking: "high" }],
         "implementation.guide": { model: "openai-codex/gpt-6-astra", thinking: "low" },
-        "implementation.executor": { model: "openai-codex/gpt-5.6-luna", thinking: "max" },
+        "implementation.executor": { model: "openai-codex/gpt-5.6-luna", thinking: "xhigh" },
         review: [
           { model: "openai-codex/gpt-5.6-terra", thinking: "high" },
           { model: "opencode-go/deepseek-v4-flash", thinking: "high" },

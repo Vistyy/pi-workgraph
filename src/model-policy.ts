@@ -84,7 +84,7 @@ const DEFAULT_GUIDE_TARGET: ModelTarget = {
 };
 const DEFAULT_EXECUTOR_TARGET: ModelTarget = {
   model: "openai-codex/gpt-5.6-luna",
-  thinking: "max",
+  thinking: "xhigh",
 };
 
 export const DEFAULT_MODEL_POLICY: ModelPolicy = {
