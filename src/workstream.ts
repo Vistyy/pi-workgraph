@@ -24,7 +24,6 @@ import {
   type Intent,
   InvalidWorkstreamStateError,
   pathForWorkstream,
-  type ResultDisposition,
   ResultSchema,
   type ResultSubject,
   ResultSubjectSchema,
@@ -70,7 +69,6 @@ export type {
   HumanInputReceipt,
   HumanInputSource,
   Intent,
-  ResultDisposition,
   ResultSubject,
   RetainedArtifact,
   SessionIdentity,
@@ -182,7 +180,6 @@ export class WorkstreamStoreEffects {
         ],
         assignments: [],
         results: [],
-        dispositions: [],
         attempts: [],
         deliveries: [],
         createdAt: now,
@@ -1007,12 +1004,6 @@ export class WorkstreamStoreEffects {
 
   isAssignmentCurrent(state: WorkstreamState, assignmentId: string): boolean {
     return requireAssignment(state, assignmentId).intentVersion === currentIntent(state).version;
-  }
-
-  isResultCurrent(state: WorkstreamState, resultId: string): boolean {
-    const result = state.results.find((candidate) => candidate.id === resultId);
-    if (!result) throw new Error(`Unknown result ${resultId}.`);
-    return result.assignmentIntentVersion === currentIntent(state).version;
   }
 
   private prepared<Preparation, Success>(

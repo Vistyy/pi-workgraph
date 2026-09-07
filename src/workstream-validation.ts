@@ -124,7 +124,7 @@ function stringField(value: JsonObject, key: string): string | undefined {
 }
 
 export function isKnownHistoricalWorkstreamVersion(value: JsonValue | undefined): boolean {
-  return value === 1 || value === 2 || value === 3 || value === 4 || value === 5;
+  return value === 1 || value === 2 || value === 3 || value === 4 || value === 5 || value === 6;
 }
 
 export function isActiveHistoricalState(value: JsonObject): boolean {
@@ -242,11 +242,6 @@ function validateResults(state: WorkstreamState, assignmentIds: Set<string>): Se
     );
     validateExperimentWorktree(state, assignment, result);
   }
-  for (const disposition of state.dispositions)
-    if (!resultIds.has(disposition.resultId))
-      throw new InvalidWorkstreamStateError(
-        `Disposition references unknown result ${disposition.resultId}.`,
-      );
   return resultIds;
 }
 

@@ -672,20 +672,20 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_inspect",
     label: "Workgraph Inspect",
     description:
-      "Inspect one unified bounded view of workstream overview, retained human context, a semantic task or complete assignment, its outcome/evidence, coordinator judgments, or exact recovery. Notifications already include a bounded actionable outcome; inspect only for uncertainty, blockers, repeated attempts, or truncated content. Detail reads are character-bounded and lossless through the returned next handle, including exact inputs, intents, assignments, dispositions, completion, and untyped or malformed reports.",
+      "Inspect one unified bounded view of workstream overview, retained human context, a semantic task or complete assignment, its outcome/evidence, completion, or exact recovery. Notifications already include a bounded actionable outcome; inspect only for uncertainty, blockers, repeated attempts, or truncated content. Detail reads are character-bounded and lossless through the returned next handle, including exact inputs, intents, assignments, completion, and untyped or malformed reports.",
     promptSnippet:
-      "Inspect Workgraph overview, retained context, complete assignments, outcomes, judgments, or recovery",
+      "Inspect Workgraph overview, retained context, complete assignments, outcomes, completion, or recovery",
     parameters: Type.Object({
       section: StringEnum([
         "overview",
         "context",
+        "completion",
         "task",
         "assignment",
         "outcome",
         "evidence",
         "recovery",
         "report",
-        "judgments",
       ] as const),
       task: Type.Optional(Type.String()),
       attempt: Type.Optional(Type.String()),

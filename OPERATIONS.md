@@ -5,7 +5,7 @@ Use this reference when operating Workgraph encounters missing evidence, interru
 ## Inspect evidence
 
 Ordinary notifications contain actionable summaries. When missing detail could change a decision, use `workgraph_inspect` and follow its `next` handle for truncated content.
-Notifications can recur after inspection or completion; a repeated result ID is not new work and needs no acknowledgment ceremony.
+Notifications can recur after inspection or completion; a repeated result ID is not new work and needs no separate coordination action.
 
 State and worker sessions live under Git's common directory. Tools return the exact state path. For offline, read-only inspection:
 

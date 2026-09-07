@@ -250,13 +250,9 @@ try {
       (entry) =>
         entry.type === "message" &&
         entry.message.role === "toolResult" &&
-        [
-          "workgraph_begin",
-          "workgraph_status",
-          "workgraph_result",
-          "workgraph_acknowledge",
-          "workgraph_disposition",
-        ].includes(entry.message.toolName),
+        ["workgraph_begin", "workgraph_status", "workgraph_result"].includes(
+          entry.message.toolName,
+        ),
     ),
   );
   const releasePrompt = `The capability scenario is already completed and all five existing attempts are settled. Do not delegate, retry, inspect through another tool, alter any file, apply any output, or change intent. The harness has already established the exact retained bytes BEFORE followed by one newline at ${retainedProbe}. Invoke exactly one supported coordinator action now: workgraph_control with action release_output, attempt ${experimentAttempt.id}, and destructive reason "${retainedOutputReleaseReason}". Use that exact internal attempt id, not a task handle. Return only after the action result is recorded.`;

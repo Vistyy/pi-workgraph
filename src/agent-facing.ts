@@ -9,13 +9,13 @@ const PREVIEW_CHARS = 180;
 export type InspectSection =
   | "overview"
   | "context"
+  | "completion"
   | "task"
   | "assignment"
   | "outcome"
   | "evidence"
   | "recovery"
-  | "report"
-  | "judgments";
+  | "report";
 
 export interface InspectRequest {
   section: InspectSection;
@@ -334,7 +334,6 @@ function deliveryPreview(state: WorkstreamState, result: WorkResult) {
     attemptedBy:
       delivery.attemptedBy === undefined ? undefined : compactText(delivery.attemptedBy, 120),
     deliveredAt: delivery.deliveredAt,
-    acknowledgedAt: delivery.acknowledgedAt,
     error: delivery.error === undefined ? undefined : compactText(delivery.error, 280),
     failureCount: delivery.failureHistory?.length ?? 0,
   };
@@ -486,7 +485,6 @@ function taskView(state: WorkstreamState, assignment: WorkAssignment, request: I
       retrieval,
     ),
     completeAssignment: { section: "assignment" as const, task: assignment.id },
-    judgments: { section: "judgments" as const, task: assignment.id },
     attempts: itemPage(attempts, request, retrieval, (attempt) => attemptPreview(state, attempt)),
   };
 }
@@ -525,36 +523,13 @@ function assignmentView(assignment: WorkAssignment, request: InspectRequest) {
   };
 }
 
-function judgmentSelection(state: WorkstreamState, request: InspectRequest) {
-  if (request.task === undefined && request.attempt === undefined && request.result === undefined)
-    return { dispositions: state.dispositions, retrieval: { section: "judgments" as const } };
-  const selection = resolveSelection(state, request);
-  const resultIds =
-    selection.outcome !== undefined
-      ? new Set([selection.outcome.id])
-      : selection.attempt !== undefined
-        ? new Set<string>()
-        : new Set(selection.taskOutcomes.map((result) => result.id));
-  const retrieval: RetrievalTarget = { section: "judgments" };
-  if (request.task !== undefined) retrieval.task = request.task;
-  if (request.attempt !== undefined) retrieval.attempt = request.attempt;
-  if (request.result !== undefined) retrieval.result = request.result;
+function completionView(state: WorkstreamState, request: InspectRequest) {
   return {
-    dispositions: state.dispositions.filter((item) => resultIds.has(item.resultId)),
-    retrieval,
-  };
-}
-
-function judgmentsView(state: WorkstreamState, request: InspectRequest) {
-  const selection = judgmentSelection(state, request);
-  return {
-    dispositionCount: selection.dispositions.length,
     completionRecorded: state.completion !== undefined,
     records: boundedText(
       JSON.stringify(
         {
           lifecycle: state.lifecycle,
-          dispositions: selection.dispositions,
           completion: state.completion,
         },
         null,
@@ -562,7 +537,7 @@ function judgmentsView(state: WorkstreamState, request: InspectRequest) {
       ),
       request.offset ?? 0,
       request.maxChars ?? DEFAULT_CHARS,
-      selection.retrieval,
+      { section: "completion" },
     ),
   };
 }
@@ -632,14 +607,13 @@ function overview(state: WorkstreamState, request: InspectRequest) {
       truncated: active.length > 10,
     },
     retainedContext: { section: "context" as const },
-    judgments: { section: "judgments" as const },
     completion:
       state.completion === undefined
         ? undefined
         : {
             completedAt: state.completion.completedAt,
             unresolvedCount: state.completion.accounting.length,
-            fullDetail: { section: "judgments" as const },
+            fullDetail: { section: "completion" as const },
           },
   };
 }
@@ -888,7 +862,6 @@ function outcomeView(state: WorkstreamState, outcome: WorkResult, request: Inspe
     fullReport: { section: "report" as const, result: outcome.id },
     fullEvidence: { section: "evidence" as const, result: outcome.id },
     completeAssignment: { section: "assignment" as const, task: outcome.assignmentId },
-    judgments: { section: "judgments" as const, result: outcome.id },
   };
   if (outcome.artifacts.length === 0) return base;
   return {
@@ -930,17 +903,17 @@ type RecoveryView = ReturnType<typeof recoveryView>;
 type PendingView = ReturnType<typeof pendingView>;
 type OutcomeView = ReturnType<typeof outcomeView>;
 type ReportView = ReturnType<typeof reportView>;
-type JudgmentsView = ReturnType<typeof judgmentsView>;
+type CompletionView = ReturnType<typeof completionView>;
 export type InspectView =
   | OverviewView
   | ContextView
+  | CompletionView
   | TaskView
   | AssignmentView
   | RecoveryView
   | PendingView
   | OutcomeView
-  | ReportView
-  | JudgmentsView;
+  | ReportView;
 
 export function inspectView(
   state: WorkstreamState,
@@ -950,6 +923,10 @@ export function inspectView(
   state: WorkstreamState,
   request: InspectRequest & { section: "context" },
 ): ContextView;
+export function inspectView(
+  state: WorkstreamState,
+  request: InspectRequest & { section: "completion" },
+): CompletionView;
 export function inspectView(
   state: WorkstreamState,
   request: InspectRequest & { section: "task" },
@@ -970,15 +947,11 @@ export function inspectView(
   state: WorkstreamState,
   request: InspectRequest & { section: "evidence" | "report" },
 ): PendingView | ReportView;
-export function inspectView(
-  state: WorkstreamState,
-  request: InspectRequest & { section: "judgments" },
-): JudgmentsView;
 export function inspectView(state: WorkstreamState, request: InspectRequest): InspectView;
 export function inspectView(state: WorkstreamState, request: InspectRequest): InspectView {
   if (request.section === "overview") return overview(state, request);
   if (request.section === "context") return contextView(state, request);
-  if (request.section === "judgments") return judgmentsView(state, request);
+  if (request.section === "completion") return completionView(state, request);
   const selection = resolveSelection(state, request);
   if (selection.task === undefined)
     throw new Error(`${request.section} inspection requires a task, attempt, or result handle.`);

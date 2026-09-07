@@ -7,7 +7,7 @@ import { Value } from "typebox/value";
 import { ModelTargetSchema } from "./model-policy.js";
 import { EvidenceSchema, WorkerReportSchema } from "./report-schema.js";
 
-export const WORKSTREAM_STATE_VERSION = 6 as const;
+export const WORKSTREAM_STATE_VERSION = 7 as const;
 export const WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
 
 export function pathForWorkstream(gitCommonDir: string, id: string): string {
@@ -191,15 +191,6 @@ export const ResultSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-export const DispositionSchema = Type.Object(
-  {
-    resultId: NonEmptyStringSchema,
-    status: StringEnum(["accepted", "rejected", "needs_followup"] as const),
-    reason: NonEmptyStringSchema,
-    recordedAt: TimestampSchema,
-  },
-  { additionalProperties: false },
-);
 export const SelectionReceiptSchema = Type.Object(
   {
     role: StringEnum(["research", "review"] as const),
@@ -365,13 +356,11 @@ export const AttemptSchema = Type.Object(
 export const DeliverySchema = Type.Object(
   {
     resultId: NonEmptyStringSchema,
-    state: StringEnum(["pending", "delivered", "acknowledged"] as const),
+    state: StringEnum(["pending", "delivered"] as const),
     requestedAt: TimestampSchema,
     attemptedBy: Type.Optional(NonEmptyStringSchema),
     error: Type.Optional(NonEmptyStringSchema),
     deliveredAt: Type.Optional(TimestampSchema),
-    acknowledgedAt: Type.Optional(TimestampSchema),
-    acknowledgment: Type.Optional(NonEmptyStringSchema),
     failureHistory: Type.Optional(
       Type.Array(
         Type.Object(
@@ -436,6 +425,7 @@ export const RetainedTerminalEnvelopeSchema = Type.Object(
       Type.Literal(3),
       Type.Literal(4),
       Type.Literal(5),
+      Type.Literal(6),
       Type.Literal(WORKSTREAM_STATE_VERSION),
     ]),
     revision: Type.Integer({ minimum: 0 }),
@@ -470,7 +460,6 @@ export const WorkstreamStateSchema = Type.Object(
     intents: Type.Array(IntentSchema, { minItems: 1 }),
     assignments: Type.Array(AssignmentSchema),
     results: Type.Array(ResultSchema),
-    dispositions: Type.Array(DispositionSchema),
     attempts: Type.Array(AttemptSchema),
     deliveries: Type.Array(DeliverySchema),
     completion: Type.Optional(CompletionSchema),
@@ -489,7 +478,6 @@ export type ResultSubject = Static<typeof ResultSubjectSchema>;
 export type WorkAssignment = Static<typeof AssignmentSchema>;
 export type RetainedArtifact = Static<typeof ArtifactSchema>;
 export type WorkResult = Static<typeof ResultSchema>;
-export type ResultDisposition = Static<typeof DispositionSchema>;
 export type WorkAttempt = Static<typeof AttemptSchema>;
 export type ResultDelivery = Static<typeof DeliverySchema>;
 export type CompletionAccounting = Static<typeof CompletionAccountingSchema>;

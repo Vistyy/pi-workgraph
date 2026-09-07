@@ -176,7 +176,7 @@ class Worker {
             return yield* new HerdrProtocolError({
               operation: "launch fixture worker",
               reason: "process",
-              detail: "fixture uncertain prompt acknowledgment",
+              detail: "fixture uncertain prompt receipt",
             });
           const onSubmitted = request.onSubmitted;
           yield* fixtureCheckpoint(

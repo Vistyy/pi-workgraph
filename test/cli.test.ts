@@ -102,7 +102,7 @@ void test("CLI status preserves historical JSON and resolves a registered run re
   }
 });
 
-void test("CLI inspect wires new context and judgments sections through the native store Effect", async () => {
+void test("CLI inspect wires new context and completion sections through the native store Effect", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-cli-inspect-"));
   const gitCommonDir = join(parent, ".git");
   try {
@@ -116,7 +116,7 @@ void test("CLI inspect wires new context and judgments sections through the nati
         coordinator: { sessionId: "coordinator", sessionFile: join(parent, "session.jsonl") },
       }).pipe(Effect.provide(liveLayer)),
     );
-    for (const section of ["overview", "context", "judgments"] as const) {
+    for (const section of ["overview", "context", "completion"] as const) {
       const result = await runCli(["inspect", "--state", state.statePath, "--section", section]);
       assert.equal(result.command, "inspect");
     }

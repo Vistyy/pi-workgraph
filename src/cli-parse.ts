@@ -4,13 +4,13 @@ import type { InspectRequest, InspectSection } from "./agent-facing.js";
 export const inspectSections = [
   "overview",
   "context",
+  "completion",
   "task",
   "assignment",
   "outcome",
   "evidence",
   "recovery",
   "report",
-  "judgments",
 ] as const satisfies readonly InspectSection[];
 
 const stateOptions = ["state", "run-id", "registry"] as const;

@@ -19,10 +19,10 @@ Mechanical receipts, validation, and settlement must not manufacture authority o
 
 Coordinator pending items are session-owned compact id/text reminders for future coordination, persisted independently of WorkstreamStoreEffects and injected only as a cache-friendly hidden snapshot when needed.
 The coordinator-only notepad exposes read, add, update, and remove; removing a mistaken item is ordinary editing, with no receipt, presentation, acknowledgment, auto-expiry, or authority semantics.
-Pending items do not replace genuine human input receipts, Workstream delivery acknowledgment, evidence disposition, or intent authority, and never block workstream completion.
+Pending items do not replace genuine human input receipts or intent authority, and never block workstream completion.
 Legacy response-note snapshots migrate only their currently pending substance into the notepad; presentation, draft, resolution, and supersession ledger metadata are not continued.
 Compaction, reload, resume, and branch restoration recover the latest valid notepad snapshot; malformed state is retained and warned about rather than guessed or cleared.
-The implementation must not parse task prose or replies to infer repository choice, acknowledgment, or item removal.
+The implementation must not parse task prose or replies to infer repository choice or item removal.
 
 Optimize for total tokens, calls, and correct decisions across the task rather than minimizing or maximizing tool use in isolation.
 A direct answer can be better than delegation, and one well-bounded delegation can be better than repeated coordinator work.
@@ -47,7 +47,7 @@ Display names and semantic handles must not be mistaken for resource identity.
 
 The runtime should derive mechanical state when it can establish it from authoritative events and repository or resource facts.
 It should not require agents to narrate bookkeeping that the runtime can compute reliably.
-It must keep mechanical settlement distinct from semantic acceptance, disposition, and other judgments that belong to a human or coordinating agent.
+It must keep mechanical settlement distinct from human judgment and current-intent authority; reports and application facts must not manufacture either one.
 
 Preserve genuine authority, input and model provenance, exact resource ownership, and the scope under which evidence was produced.
 Represent uncertainty explicitly, especially when an operation may have taken effect despite an interrupted response.

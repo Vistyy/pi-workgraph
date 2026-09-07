@@ -183,11 +183,7 @@ function resultForAttempt(state: WorkstreamState, attempt: WorkAttempt): WorkRes
 
 function resultUnresolved(state: WorkstreamState, resultId: string): boolean {
   const result = state.results.find((candidate) => candidate.id === resultId);
-  // Judgment cannot repair failed, invalid, absent, or untyped evidence.
-  if (result?.validity !== "typed" || result.report.status !== "completed") return true;
-  return state.dispositions.some(
-    (disposition) => disposition.resultId === resultId && disposition.status !== "accepted",
-  );
+  return result?.validity !== "typed" || result.report.status !== "completed";
 }
 
 function sameValue<T>(left: T, right: T): boolean {

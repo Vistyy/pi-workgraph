@@ -24,20 +24,6 @@ function assignment(id: string): WorkAssignment {
   };
 }
 
-function attempt(
-  id: string,
-  assignmentId: string,
-  state: WorkAttempt["state"] = "queued",
-): WorkAttempt {
-  return {
-    id,
-    assignmentId,
-    state,
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-}
-
 function typedResult(id: string, assignmentId: string, report: WorkerReport): WorkResult {
   return {
     id,
@@ -84,7 +70,7 @@ function state(
 ): WorkstreamState {
   return {
     format: "pi-workgraph-workstream",
-    version: 6,
+    version: 7,
     revision: 0,
     id: "agent-facing",
     purpose: "Test bounded agent-facing projections.",
@@ -109,7 +95,6 @@ function state(
     assignments,
     attempts,
     results,
-    dispositions: [],
     deliveries: [],
     createdAt: timestamp,
     updatedAt: timestamp,
@@ -157,11 +142,10 @@ void test("overview task index recovers every arbitrary task id", () => {
   assert.ok(overview.tasks.next);
 });
 
-void test("retained authority, complete assignments, and coordinator judgments roundtrip exactly", () => {
+void test("retained authority, complete assignments, and completion roundtrip exactly", () => {
   const longInput = `second human scope ${"scope detail 🧭 ".repeat(700)}`;
   const longObjective = `Implement exact behavior ${"objective detail ".repeat(650)}`;
   const longAcceptance = `Preserve acceptance ${"acceptance detail ".repeat(600)}`;
-  const longDisposition = `Coordinator judgment ${"judgment detail ".repeat(620)}`;
   const longConclusion = `Completion substance ${"completion detail ".repeat(640)}`;
   const implementation: WorkAssignment = {
     id: "implementation task",
@@ -239,14 +223,6 @@ void test("retained authority, complete assignments, and coordinator judgments r
       recordedAt: timestamp,
     },
   ];
-  current.dispositions = [
-    {
-      resultId: outcome.id,
-      status: "accepted",
-      reason: longDisposition,
-      recordedAt: timestamp,
-    },
-  ];
   current.completion = {
     conclusion: longConclusion,
     evidence: [{ label: "exact", observation: "All retained decisions were inspected." }],
@@ -292,97 +268,23 @@ void test("retained authority, complete assignments, and coordinator judgments r
     assert.deepEqual(JSON.parse(assignmentText), expected);
   }
 
-  let judgmentsText = "";
-  let judgmentsOffset = 0;
+  let completionText = "";
+  let completionOffset = 0;
   for (;;) {
     const view = inspectView(current, {
-      section: "judgments",
-      result: outcome.id,
-      offset: judgmentsOffset,
+      section: "completion",
+      offset: completionOffset,
       maxChars: 193,
     });
-    judgmentsText += view.records.text;
+    completionText += view.records.text;
     if (view.records.next === undefined) break;
-    assert.equal(view.records.next.result, outcome.id);
-    judgmentsOffset = view.records.next.offset;
+    assert.equal(view.records.next.section, "completion");
+    completionOffset = view.records.next.offset;
   }
-  assert.deepEqual(JSON.parse(judgmentsText), {
+  assert.deepEqual(JSON.parse(completionText), {
     lifecycle: current.lifecycle,
-    dispositions: current.dispositions,
     completion: current.completion,
   });
-});
-
-void test("pending attempt selection never broadens judgments to sibling outcomes", () => {
-  const pendingAttempt = attempt("opaque-pending", "research task");
-  const sibling = typedResult("opaque-sibling-result", "research task", researchReport("Sibling"));
-  const siblingAttempt = attempt("opaque-sibling-attempt", "research task", "settled");
-  siblingAttempt.resultId = sibling.id;
-  const current = state([assignment("research task")], [pendingAttempt, siblingAttempt], [sibling]);
-  current.dispositions = [
-    {
-      resultId: sibling.id,
-      status: "accepted",
-      reason: `Exact sibling judgment ${"long retained detail ".repeat(500)}`,
-      recordedAt: timestamp,
-    },
-  ];
-
-  const pending = inspectView(current, { section: "outcome", attempt: pendingAttempt.id });
-  assert.equal("state" in pending, true);
-  if ("state" in pending) {
-    assert.equal(pending.state, "pending");
-    assert.equal(pending.attempt?.state, "queued");
-  }
-
-  let pendingJudgments = "";
-  let pendingOffset = 0;
-  for (;;) {
-    const view = inspectView(current, {
-      section: "judgments",
-      attempt: pendingAttempt.id,
-      offset: pendingOffset,
-      maxChars: 17,
-    });
-    assert.equal(view.dispositionCount, 0);
-    pendingJudgments += view.records.text;
-    if (view.records.next === undefined) break;
-    assert.equal(view.records.next.attempt, pendingAttempt.id);
-    pendingOffset = view.records.next.offset;
-  }
-  assert.deepEqual(JSON.parse(pendingJudgments), {
-    lifecycle: current.lifecycle,
-    dispositions: [],
-  });
-
-  let taskJudgments = "";
-  let taskOffset = 0;
-  for (;;) {
-    const view = inspectView(current, {
-      section: "judgments",
-      task: "research task",
-      offset: taskOffset,
-      maxChars: 127,
-    });
-    taskJudgments += view.records.text;
-    if (view.records.next === undefined) break;
-    assert.equal(view.records.next.task, "research task");
-    taskOffset = view.records.next.offset;
-  }
-  assert.deepEqual(JSON.parse(taskJudgments), {
-    lifecycle: current.lifecycle,
-    dispositions: current.dispositions,
-  });
-
-  assert.throws(
-    () =>
-      inspectView(current, {
-        section: "outcome",
-        attempt: pendingAttempt.id,
-        result: sibling.id,
-      }),
-    /has no retained outcome/,
-  );
 });
 
 void test("typed report kinds and untyped or malformed reports remain inspectable", () => {

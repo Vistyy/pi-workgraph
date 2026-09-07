@@ -23,7 +23,6 @@ import {
   InvalidWorkstreamStateError,
   type SessionIdentity,
   UnsupportedWorkstreamStateError,
-  type WorkstreamState,
   WorkstreamStoreEffects,
 } from "../src/workstream.js";
 import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
@@ -44,7 +43,6 @@ function runStore<A, E>(
 }
 
 type AssignmentInput = Parameters<WorkstreamStoreEffects["enqueue"]>[0];
-type HistoricalStoreFixture = Pick<WorkstreamState, "dispositions">;
 
 async function enqueueFixtureAssignment(
   store: WorkstreamStoreEffects,
@@ -89,7 +87,7 @@ function dateAt(milliseconds: number): Date {
   return DateTime.toDate(DateTime.makeUnsafe(milliseconds));
 }
 
-void test("accepted historical research closes its original scope after intent changes, without invented limitations", async () => {
+void test("historical research closes its original scope after intent changes, without invented limitations", async () => {
   const { parent, store } = await fixture();
   try {
     await enqueueFixtureAssignment(store, {
@@ -112,7 +110,6 @@ void test("accepted historical research closes its original scope after intent c
     await settleFixtureAttempt(store, "baseline-attempt", "baseline-result");
     await recordedAuthority(store);
     const revised = await runStore(store.load());
-    assert.equal(store.isResultCurrent(revised, "baseline-result"), false);
     assert.equal(revised.results[0]?.assignmentIntentVersion, 0);
     const state = await runStore(
       store.complete({
@@ -370,7 +367,6 @@ void test("workstream keeps worker validity, limitations, and stale results dist
     );
     await settleFixtureAttempt(store, "research-attempt", "research-result");
     state = await runStore(store.load());
-    assert.equal(store.isResultCurrent(state, "research-result"), true);
     state = await runStore(
       store.reviseIntent({
         authorityReceiptId: receipt.id,
@@ -378,7 +374,6 @@ void test("workstream keeps worker validity, limitations, and stale results dist
         constraints: ["Exercise a second fixture input."],
       }),
     );
-    assert.equal(store.isResultCurrent(state, "research-result"), false);
     state = await runStore(
       store.retainResult({
         id: "stale-result",
@@ -388,7 +383,6 @@ void test("workstream keeps worker validity, limitations, and stale results dist
         text: "Old worker prose.",
       }),
     );
-    assert.equal(store.isResultCurrent(state, "stale-result"), false);
 
     state = await runStore(
       store.complete({
@@ -640,69 +634,7 @@ void test("workstream serializes receipt writes and rejects corrupt or foreign h
   }
 });
 
-void test("historical disposition evidence remains readonly and invalid evidence stays unresolved", async () => {
-  const { parent, store } = await fixture();
-  try {
-    await enqueueFixtureAssignment(store, {
-      id: "research",
-      capability: "research",
-      artifactIntent: "evidence_only",
-      objective: "Read the retained bytes.",
-      intentVersion: 0,
-      expectedEvidence: ["Retained bytes."],
-    });
-    await runStore(
-      store.retainResult({
-        id: "result",
-        assignmentId: "research",
-        assignmentIntentVersion: 0,
-        validity: "typed",
-        report: researchReport("The bytes were retained."),
-      }),
-    );
-    await settleFixtureAttempt(store, "research-attempt", "result");
-    // SAFETY: The store was initialized and updated through WorkstreamStoreEffects immediately above; this test only replaces its validated historical disposition list.
-    const historical = JSON.parse(await readFile(store.path, "utf8")) as HistoricalStoreFixture;
-    historical.dispositions = [
-      {
-        resultId: "result",
-        status: "rejected",
-        reason: "The first review found a gap.",
-        recordedAt: dateAt(3_000).toISOString(),
-      },
-      {
-        resultId: "result",
-        status: "accepted",
-        reason: "A later review accepted the retained evidence.",
-        recordedAt: dateAt(4_000).toISOString(),
-      },
-    ];
-    await writeFile(store.path, `${JSON.stringify(historical, null, 2)}\n`);
-    const completed = await runStore(
-      store.complete({
-        conclusion: "The historical rejection remains unresolved under retained semantics.",
-        evidence: [{ label: "result", observation: "The completed report was retained." }],
-        limitations: ["The historical rejection remains part of the authoritative judgment."],
-        reasons: [
-          {
-            taskId: "research",
-            reason: "The assignment and result retain a non-accepted disposition.",
-          },
-        ],
-      }),
-    );
-    assert.deepEqual(
-      completed.completion?.accounting.map((item) => item.kind),
-      ["unresolved_assignment", "unresolved_attempt", "unresolved_result"],
-    );
-    const persisted = await readFile(store.path, "utf8");
-    const inspected = await runStore(WorkstreamStoreEffects.inspect(store.path));
-    assert.deepEqual(inspected.completion, completed.completion);
-    assert.equal(await readFile(store.path, "utf8"), persisted);
-  } finally {
-    await rm(parent, { recursive: true, force: true });
-  }
-
+void test("invalid evidence remains unresolved", async () => {
   const invalidFixture = await fixture();
   try {
     await enqueueFixtureAssignment(invalidFixture.store, {
