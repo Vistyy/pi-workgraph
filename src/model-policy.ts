@@ -357,15 +357,6 @@ export function setModelListEffect(
   });
 }
 
-/** Promise facade for current Pi host callers. */
-export function setModelList(
-  role: ListModelRole,
-  list: ModelTarget[],
-  path = modelPolicyPath(),
-): Promise<ModelPolicy> {
-  return runNodePlatformPromise(setModelListEffect(role, list, path));
-}
-
 export function setModelRoleEffect(
   role: ModelRole,
   target: ModelTarget,
@@ -384,15 +375,6 @@ export function setModelRoleEffect(
     else policy.roles[role] = decoded;
     return yield* writeModelPolicyEffect(policy, path);
   });
-}
-
-/** Promise facade for current Pi host callers. */
-export function setModelRole(
-  role: ModelRole,
-  target: ModelTarget,
-  path = modelPolicyPath(),
-): Promise<ModelPolicy> {
-  return runNodePlatformPromise(setModelRoleEffect(role, target, path));
 }
 
 function writeModelPolicyEffect(

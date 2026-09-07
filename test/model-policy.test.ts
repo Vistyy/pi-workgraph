@@ -12,10 +12,10 @@ import {
   loadModelPolicyEffect,
   ModelPolicyError,
   resolveSelection,
-  setModelList,
-  setModelRole,
+  setModelListEffect,
+  setModelRoleEffect,
 } from "../src/model-policy.js";
-import { liveLayer } from "../src/node-platform.js";
+import { liveLayer, runNodePlatformPromise } from "../src/node-platform.js";
 
 await test("policy defaults, legacy reads, and independent role-list writes use isolated paths", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-models-"));
@@ -82,18 +82,22 @@ await test("policy defaults, legacy reads, and independent role-list writes use 
     ]);
     assert.equal(await readFile(path, "utf8"), legacyV3);
 
-    await setModelList(
-      "review",
-      [
-        { model: "fixture/review-first", thinking: "high" },
-        { model: "fixture/review-second", thinking: "low" },
-      ],
-      path,
+    await runNodePlatformPromise(
+      setModelListEffect(
+        "review",
+        [
+          { model: "fixture/review-first", thinking: "high" },
+          { model: "fixture/review-second", thinking: "low" },
+        ],
+        path,
+      ),
     );
-    await setModelRole(
-      "implementation.guide",
-      { model: "fixture/guide-independent", thinking: "low" },
-      path,
+    await runNodePlatformPromise(
+      setModelRoleEffect(
+        "implementation.guide",
+        { model: "fixture/guide-independent", thinking: "low" },
+        path,
+      ),
     );
     assert.equal((await stat(path)).mode & 0o777, 0o600);
     const written = await loadModelPolicy(path);
@@ -105,7 +109,10 @@ await test("policy defaults, legacy reads, and independent role-list writes use 
     assert.equal(written.roles["implementation.guide"].model, "fixture/guide-independent");
     assert.equal(written.version, 4);
 
-    await assert.rejects(setModelList("research", [], path), /Invalid model list/);
+    await assert.rejects(
+      runNodePlatformPromise(setModelListEffect("research", [], path)),
+      /Invalid model list/,
+    );
     await writeFile(path, '{"version":4,"roles":{"research":[]}}');
     await assert.rejects(loadModelPolicy(path), /Invalid model list for research/);
     await writeFile(
