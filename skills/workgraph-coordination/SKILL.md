@@ -43,5 +43,5 @@ Use actionable notifications for ordinary decisions; retrieve more evidence when
 Choose whether to apply maintained output or retain it for further work; settlement does not apply it or require acceptance.
 Release unselected output only when it is no longer useful.
 For uncertain launches, application, release, or ownership, inspect exact retained identities and resulting effects before retrying; preserve blocked work rather than manufacturing cleanup or completion.
-Before recovery or adoption, read [Recovery and inspection](../../README.md#recovery-and-inspection).
-For installation, placement, model policy, or live-scenario details, read the relevant section of [README.md](../../README.md).
+Before recovery or adoption, read [OPERATIONS.md](../../OPERATIONS.md).
+For setup and everyday controls, read [README.md](../../README.md); before choosing boundary checks or running live scenarios, read [VERIFICATION.md](../../VERIFICATION.md).
