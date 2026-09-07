@@ -866,7 +866,21 @@ void test("registered session_start safely inspects retained and pointed workstr
 void test("registered model policy mutations require retained genuine input provenance", async () => {
   const f = await fixture();
   try {
+    const policyPath = join(f.parent, "agent", "workgraph", "models.json");
+    await mkdir(join(f.parent, "agent", "workgraph"), { recursive: true });
+    const legacy = JSON.stringify({
+      version: 3,
+      roles: {
+        research: { model: "fixture/legacy-research", thinking: "low" },
+        "implementation.guide": { model: "fixture/legacy-guide", thinking: "high" },
+        "implementation.executor": { model: "fixture/legacy-executor", thinking: "max" },
+        review: { model: "fixture/legacy-review", thinking: "medium" },
+      },
+      workerPool: [{ model: "fixture/legacy-shared", thinking: "high" }],
+    });
+    await writeFile(policyPath, legacy);
     await f.call("workgraph_models", { action: "get" });
+    assert.equal(await readFile(policyPath, "utf8"), legacy);
     await f.runner.emitInput("Extension model request", undefined, "extension");
     await assert.rejects(
       f.call("workgraph_models", {
@@ -883,9 +897,9 @@ void test("registered model policy mutations require retained genuine input prov
       modelPolicyDetailsSchema,
       (
         await f.call("workgraph_models", {
-          action: "set",
+          action: "set_list",
           role: "research",
-          target: { model: "fixture/default", thinking: "low" },
+          list: [{ model: "fixture/default", thinking: "low" }],
         })
       ).details,
     );
@@ -910,36 +924,41 @@ void test("registered model policy mutations require retained genuine input prov
       modelPolicyDetailsSchema,
       (
         await f.call("workgraph_models", {
-          action: "set",
+          action: "set_list",
           role: "research",
-          target: { model: "fixture/changed", thinking: "high" },
+          list: [{ model: "fixture/changed", thinking: "high" }],
         })
       ).details,
     );
     assert.equal(secondMutation.authority?.source, "rpc");
     assert.notEqual(secondMutation.authority?.receiptId, firstReceipt);
-    const explicitPoolMutation = decodeTestValue(
+    const explicitReviewListMutation = decodeTestValue(
       modelPolicyDetailsSchema,
       (
         await f.call("workgraph_models", {
-          action: "set_pool",
+          action: "set_list",
           authorityReceiptId: firstReceipt,
-          pool: [{ model: "fixture/pool", thinking: "medium" }],
+          role: "review",
+          list: [
+            { model: "fixture/review-first", thinking: "high" },
+            { model: "fixture/review-second", thinking: "medium" },
+          ],
         })
       ).details,
     );
-    assert.equal(explicitPoolMutation.authority?.receiptId, firstReceipt);
+    assert.equal(explicitReviewListMutation.authority?.receiptId, firstReceipt);
     await assert.rejects(
       f.call("workgraph_models", {
-        action: "set_pool",
+        action: "set_list",
         authorityReceiptId: "extension-invented-receipt",
-        pool: [{ model: "fixture/rejected-pool", thinking: "low" }],
+        role: "review",
+        list: [{ model: "fixture/rejected-list", thinking: "low" }],
       }),
       /Unknown retained human input receipt/,
     );
     const afterInventedReceipt = await f.call("workgraph_models", { action: "get" });
-    assert.match(JSON.stringify(afterInventedReceipt), /fixture\/pool/);
-    assert.equal(JSON.stringify(afterInventedReceipt).includes("fixture/rejected-pool"), false);
+    assert.match(JSON.stringify(afterInventedReceipt), /fixture\/review-first/);
+    assert.equal(JSON.stringify(afterInventedReceipt).includes("fixture/rejected-list"), false);
     state = resultState(
       (
         await f.call("workgraph_research", {

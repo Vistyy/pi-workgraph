@@ -19,12 +19,13 @@ import {
 import { GitRepository, inspectRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import {
+  type ListModelRole,
   loadModelPolicyEffect,
   MODEL_ROLES,
   type ModelPolicy,
   modelPolicyPath,
   SelectionRequestSchema as Selection,
-  setModelPoolEffect,
+  setModelListEffect,
   setModelRoleEffect,
   ModelTargetSchema as Target,
   ThinkingSchema as Thinking,
@@ -406,28 +407,28 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_models",
     label: "Workgraph Models",
     description:
-      "Get model defaults and their configuration path, or persist a role/pool change backed by a retained interactive or RPC input receipt. Assignment model/thinking/executor parameters override defaults without changing policy or the coordinator model.",
+      "Get model defaults and their configuration path, or persist an implementation default or ordered research/review list backed by a retained interactive or RPC input receipt. Assignment model/thinking/executor parameters override defaults without changing policy or the coordinator model.",
     promptSnippet: "Inspect or configure Workgraph model defaults",
     parameters: Type.Object({
-      action: StringEnum(["get", "set", "set_pool", "rates"] as const),
+      action: StringEnum(["get", "set", "set_list", "rates"] as const),
       authorityReceiptId: Type.Optional(
         Type.String({
           description:
-            "Retained interactive/RPC input receipt authorizing set or set_pool. Omit to use the latest retained genuine input.",
+            "Retained interactive/RPC input receipt authorizing set or set_list. Omit to use the latest retained genuine input.",
         }),
       ),
       role: Type.Optional(StringEnum(MODEL_ROLES)),
       target: Type.Optional(Target),
-      pool: Type.Optional(Type.Array(Target, { minItems: 1 })),
+      list: Type.Optional(Type.Array(Target, { minItems: 1 })),
       models: Type.Optional(Type.Array(Type.String())),
     }),
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
         Effect.gen(function* () {
-          validateModelRequest(params.action, params.role, params.target, params.pool);
+          validateModelRequest(params.action, params.role, params.target, params.list);
           if (params.action === "rates") {
             const policy = yield* loadModelPolicyEffect();
-            const models = params.models ?? policy.workerPool.map((target) => target.model);
+            const models = params.models ?? policyModelIds(policy);
             const rates = modelRates(models, ctx);
             return {
               content: [{ type: "text", text: formatRates(rates) }],
@@ -441,7 +442,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             params.action,
             params.role,
             params.target,
-            params.pool,
+            params.list,
           );
           return {
             content: [
@@ -948,8 +949,8 @@ function selectSessionAuthority(
   };
 }
 
-function isPersistentModelMutation(action: "get" | "set" | "set_pool" | "rates"): boolean {
-  return action === "set" || action === "set_pool";
+function isPersistentModelMutation(action: "get" | "set" | "set_list" | "rates"): boolean {
+  return action === "set" || action === "set_list";
 }
 
 function researchAssignment(
@@ -975,31 +976,54 @@ function researchAssignment(
   };
 }
 
+function isModelListRole(role: (typeof MODEL_ROLES)[number] | undefined): role is ListModelRole {
+  return role === "research" || role === "review";
+}
+
+function requiredModelListRole(role: (typeof MODEL_ROLES)[number] | undefined): ListModelRole {
+  if (!isModelListRole(role))
+    throw new Error("Model list operations require research or review role.");
+  return role;
+}
+
 function validateModelRequest(
-  action: "get" | "set" | "set_pool" | "rates",
+  action: "get" | "set" | "set_list" | "rates",
   role: (typeof MODEL_ROLES)[number] | undefined,
   target: Static<typeof Target> | undefined,
-  pool: Static<typeof Target>[] | undefined,
+  list: Static<typeof Target>[] | undefined,
 ): void {
   if (action === "set" && (role === undefined || target === undefined))
     throw new Error("Setting a model default requires role and target.");
-  if (action === "set_pool" && pool === undefined)
-    throw new Error("Setting the worker pool requires an ordered pool.");
+  if (action === "set_list" && (!isModelListRole(role) || list === undefined))
+    throw new Error("Setting a model list requires research/review role and a nonempty list.");
 }
 
 function resolveModelPolicyEffect(
-  action: "get" | "set" | "set_pool" | "rates",
+  action: "get" | "set" | "set_list" | "rates",
   role: (typeof MODEL_ROLES)[number] | undefined,
   target: Static<typeof Target> | undefined,
-  pool: Static<typeof Target>[] | undefined,
+  list: Static<typeof Target>[] | undefined,
 ) {
   if (action === "set")
     return setModelRoleEffect(
       requiredValue(role, "model role"),
       requiredValue(target, "model target"),
     );
-  if (action === "set_pool") return setModelPoolEffect(requiredValue(pool, "model pool"));
+  if (action === "set_list")
+    return setModelListEffect(requiredModelListRole(role), requiredValue(list, "model list"));
   return loadModelPolicyEffect();
+}
+
+function policyModelIds(policy: ModelPolicy): string[] {
+  return [
+    ...policy.roles.research,
+    ...policy.roles.review,
+    policy.roles["implementation.guide"],
+    policy.roles["implementation.executor"],
+  ].reduce<string[]>((models, target) => {
+    if (!models.includes(target.model)) models.push(target.model);
+    return models;
+  }, []);
 }
 
 function formatRates(rates: ReturnType<typeof modelRates>): string {

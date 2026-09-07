@@ -348,7 +348,12 @@ const research = (id: string, intentVersion = 0) => ({
 await test("multi-attempt queueing resolves one shared validated base and exact-review conflicts have no effects", async () => {
   const f = await fixture();
   try {
-    const active = await f.runtime();
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles.research = [
+      { model: "fixture/research-first", thinking: "high" },
+      { model: "fixture/research-second", thinking: "high" },
+    ];
+    const active = await f.runtime(undefined, { policy });
     const initial = await f.repository.head();
     const queued = await runRuntime(
       active.effects.queue(research("shared-base"), {
@@ -770,7 +775,7 @@ await test("maintained changes use guide/executor policy and review checks the r
     const authority = await f.authority(active);
     f.workers.onWork = async (request) => {
       if (workerEnvironment(request, "PI_WORKGRAPH_MODE") === "implementation") {
-        assert.equal(request.model, "openai-codex/gpt-5.6-sol");
+        assert.equal(request.model, "openai-codex/gpt-6-astra");
         assert.equal(
           workerEnvironment(request, "PI_WORKGRAPH_EXECUTOR_MODEL"),
           "openai-codex/gpt-5.6-luna",

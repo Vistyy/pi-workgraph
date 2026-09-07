@@ -1328,8 +1328,8 @@ function selectedAttempts(
     const role = capability === "review" ? "review" : "research";
     request.override = {
       target: {
-        model: options.model ?? policy.roles[role].model,
-        thinking: options.thinking ?? policy.roles[role].thinking,
+        model: options.model ?? policy.roles[role][0].model,
+        thinking: options.thinking ?? policy.roles[role][0].thinking,
       },
       reason: options.modelReason ?? "",
     };

@@ -15,6 +15,11 @@ export const MODEL_ROLES = [
   "implementation.executor",
   "review",
 ] as const;
+export const MODEL_LIST_ROLES = ["research", "review"] as const;
+export const IMPLEMENTATION_MODEL_ROLES = [
+  "implementation.guide",
+  "implementation.executor",
+] as const;
 export type ModelRole = (typeof MODEL_ROLES)[number];
 export const ThinkingSchema = StringEnum([
   "off",
@@ -49,10 +54,13 @@ export const SelectionRequestSchema = Type.Object(
 );
 export type SelectionRequest = Static<typeof SelectionRequestSchema>;
 
+export type ListModelRole = "research" | "review";
+export type ImplementationModelRole = "implementation.guide" | "implementation.executor";
+export type ModelTargetList = [ModelTarget, ...ModelTarget[]];
+
 export interface ModelPolicy {
-  version: 3;
-  roles: Record<ModelRole, ModelTarget>;
-  workerPool: ModelTarget[];
+  version: 4;
+  roles: Record<ImplementationModelRole, ModelTarget> & Record<ListModelRole, ModelTargetList>;
 }
 
 export type ModelPolicyOperation = "parse" | "decode" | "temporary-path";
@@ -66,35 +74,31 @@ export class ModelPolicyError extends Data.TaggedError("ModelPolicyError")<{
   override readonly name = "Error";
 }
 
-const RESEARCH_TARGET: ModelTarget = {
-  model: "opencode-go/muse-spark-1.3-contributor",
-  thinking: "high",
-};
-const EXECUTOR_TARGET: ModelTarget = {
-  model: "openai-codex/gpt-5.6-luna",
-  thinking: "high",
-};
-
-export const DEFAULT_WORKER_POOL: ModelTarget[] = [
-  RESEARCH_TARGET,
-  EXECUTOR_TARGET,
+export const DEFAULT_RESEARCH_MODELS: ModelTargetList = [
+  { model: "openai-codex/gpt-5.6-luna", thinking: "high" },
+];
+export const DEFAULT_REVIEW_MODELS: ModelTargetList = [
+  { model: "openai-codex/gpt-5.6-terra", thinking: "high" },
   { model: "opencode-go/deepseek-v4-flash", thinking: "high" },
   { model: "opencode-go/glm-5.3-flash", thinking: "high" },
-  { model: "openai-codex/gpt-5.6-terra", thinking: "high" },
 ];
+const DEFAULT_GUIDE_TARGET: ModelTarget = {
+  model: "openai-codex/gpt-6-astra",
+  thinking: "low",
+};
+const DEFAULT_EXECUTOR_TARGET: ModelTarget = {
+  model: "openai-codex/gpt-5.6-luna",
+  thinking: "max",
+};
 
 export const DEFAULT_MODEL_POLICY: ModelPolicy = {
-  version: 3,
+  version: 4,
   roles: {
-    research: RESEARCH_TARGET,
-    "implementation.guide": {
-      model: "openai-codex/gpt-5.6-sol",
-      thinking: "high",
-    },
-    "implementation.executor": EXECUTOR_TARGET,
-    review: RESEARCH_TARGET,
+    research: DEFAULT_RESEARCH_MODELS,
+    "implementation.guide": DEFAULT_GUIDE_TARGET,
+    "implementation.executor": DEFAULT_EXECUTOR_TARGET,
+    review: DEFAULT_REVIEW_MODELS,
   },
-  workerPool: DEFAULT_WORKER_POOL,
 };
 
 const PolicyRolesInputSchema = Type.Object(
@@ -110,13 +114,14 @@ const PolicyRolesInputSchema = Type.Object(
 );
 const ModelPolicyInputSchema = Type.Object(
   {
-    version: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3)]),
+    version: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3), Type.Literal(4)]),
     roles: PolicyRolesInputSchema,
+    // Version 3 used one shared pool. It is accepted only to read and migrate that legacy shape.
     workerPool: Type.Optional(Type.Unknown()),
   },
   { additionalProperties: true },
 );
-const WorkerPoolSchema = Type.Array(ModelTargetSchema, { minItems: 1 });
+const ModelTargetListSchema = Type.Array(ModelTargetSchema, { minItems: 1 });
 type ModelPolicyInput = Static<typeof ModelPolicyInputSchema>;
 
 export function modelPolicyPath(agentDir = getAgentDir()): string {
@@ -131,29 +136,70 @@ function decodeModelPolicyInput(value: unknown): ModelPolicyInput {
 }
 
 function applyConfiguredRoles(policy: ModelPolicyInput, result: ModelPolicy): void {
-  for (const role of MODEL_ROLES) {
-    let configured: unknown;
-    if (policy.version !== 1) configured = policy.roles[role];
-    else {
-      switch (role) {
-        case "research":
-          configured = policy.roles["discovery.evidence"];
-          break;
-        case "implementation.guide":
-        case "implementation.executor":
-          configured = policy.roles[role];
-          break;
-        case "review":
-          configured = policy.roles["verification.product"];
-          break;
-      }
+  for (const role of MODEL_ROLES) applyConfiguredRole(policy, result, role);
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-returns -- Legacy and current role fields intentionally enter this decoder as unknown before version-specific validation.
+function configuredRole(policy: ModelPolicyInput, role: ModelRole): unknown {
+  if (policy.version !== 1) return policy.roles[role];
+  switch (role) {
+    case "research":
+      return policy.roles["discovery.evidence"];
+    case "implementation.guide":
+    case "implementation.executor":
+      return policy.roles[role];
+    case "review":
+      return policy.roles["verification.product"];
+  }
+}
+
+function applyConfiguredRole(policy: ModelPolicyInput, result: ModelPolicy, role: ModelRole): void {
+  const configured = configuredRole(policy, role);
+  if (configured === undefined) return;
+  if (isListModelRole(role)) {
+    if (policy.version === 4) {
+      result.roles[role] = decodeModelList(configured, role);
+      return;
     }
-    if (configured === undefined) continue;
-    const target: unknown =
-      policy.version === 1 && Array.isArray(configured) ? configured[0] : configured;
-    if (!Value.Check(ModelTargetSchema, target))
-      throw new Error(`Invalid model target for ${role}.`);
-    result.roles[role] = Value.Decode(ModelTargetSchema, target);
+    result.roles[role] = [decodeLegacyTarget(configured, role)];
+    return;
+  }
+  result.roles[role] = decodeTarget(
+    policy.version === 1 && Array.isArray(configured) ? configured[0] : configured,
+    role,
+  );
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- A role list is parsed and checked by this decoder before it enters the typed policy.
+function decodeModelList(value: unknown, role: ModelRole): ModelTargetList {
+  if (!Value.Check(ModelTargetListSchema, value))
+    throw new Error(`Invalid model list for ${role}.`);
+  // SAFETY: The preceding Value.Check establishes a nonempty array of ModelTarget values.
+  return Value.Decode(ModelTargetListSchema, value) as ModelTargetList;
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Legacy role values are checked as targets before they enter the typed policy.
+function decodeLegacyTarget(value: unknown, role: ModelRole): ModelTarget {
+  return decodeTarget(Array.isArray(value) ? value[0] : value, role);
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This is the final TypeBox validation boundary for an external role value.
+function decodeTarget(value: unknown, role: ModelRole): ModelTarget {
+  if (!Value.Check(ModelTargetSchema, value)) throw new Error(`Invalid model target for ${role}.`);
+  return Value.Decode(ModelTargetSchema, value);
+}
+
+function migrateLegacyWorkerPool(policy: ModelPolicyInput, result: ModelPolicy): void {
+  if (policy.version !== 3 || policy.workerPool === undefined) return;
+  if (!Value.Check(ModelTargetListSchema, policy.workerPool))
+    throw new Error("Invalid Workgraph worker pool.");
+  const pool = uniqueTargets(Value.Decode(ModelTargetListSchema, policy.workerPool));
+  for (const role of MODEL_LIST_ROLES) {
+    const defaultTarget = result.roles[role][0];
+    result.roles[role] = [
+      defaultTarget,
+      ...pool.filter((target) => targetKey(target) !== targetKey(defaultTarget)),
+    ];
   }
 }
 
@@ -198,11 +244,9 @@ function decodeModelPolicyEffect(
       const policy = decodeModelPolicyInput(parsed);
       const result = structuredClone(DEFAULT_MODEL_POLICY);
       applyConfiguredRoles(policy, result);
-      if (policy.version === 3 && policy.workerPool !== undefined) {
-        if (!Value.Check(WorkerPoolSchema, policy.workerPool))
-          throw new Error("Invalid Workgraph worker pool.");
-        result.workerPool = Value.Decode(WorkerPoolSchema, policy.workerPool);
-      }
+      if (policy.version === 4 && policy.workerPool !== undefined)
+        throw new Error("The shared worker pool is unsupported in model policy version 4.");
+      migrateLegacyWorkerPool(policy, result);
       return result;
     },
     catch: (cause) =>
@@ -225,11 +269,11 @@ export function resolveSelection(
   const diversity = normalized.diversity ?? "same-model";
   if (normalized.override !== undefined)
     return overrideReceipt(role, normalized.override, count, diversity);
-  const pool = policy.workerPool.length > 0 ? policy.workerPool : [policy.roles[role]];
+  const models = policy.roles[role];
   const selected =
     diversity === "same-model"
-      ? Array.from({ length: count }, () => policy.roles[role])
-      : uniqueTargets(pool).slice(0, count);
+      ? Array.from({ length: count }, () => models[0])
+      : uniqueTargets(models).slice(0, count);
   return {
     role,
     requested: count,
@@ -284,33 +328,46 @@ export interface SelectionReceipt {
 function uniqueTargets(targets: ModelTarget[]): ModelTarget[] {
   const seen = new Set<string>();
   return targets.filter((target) => {
-    const key = `${target.model}\0${target.thinking}`;
+    const key = targetKey(target);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 }
 
-export function setModelPoolEffect(
-  pool: ModelTarget[],
+function targetKey(target: ModelTarget): string {
+  return `${target.model}\0${target.thinking}`;
+}
+
+function isListModelRole(role: ModelRole): role is ListModelRole {
+  return role === "research" || role === "review";
+}
+
+export function setModelListEffect(
+  role: ListModelRole,
+  list: ModelTarget[],
   path = modelPolicyPath(),
 ): Effect.Effect<ModelPolicy, ModelPolicyError | PlatformError, FileSystem.FileSystem | Path.Path> {
   return Effect.gen(function* () {
-    if (!Value.Check(WorkerPoolSchema, pool))
+    if (!isListModelRole(role) || !Value.Check(ModelTargetListSchema, list))
       return yield* new ModelPolicyError({
         operation: "decode",
         path,
-        message: "Invalid model pool.",
+        message: "Invalid model list or role.",
       });
     const policy = yield* loadModelPolicyEffect(path);
-    policy.workerPool = structuredClone(pool);
+    policy.roles[role] = decodeModelList(list, role);
     return yield* writeModelPolicyEffect(policy, path);
   });
 }
 
 /** Promise facade for current Pi host callers. */
-export function setModelPool(pool: ModelTarget[], path = modelPolicyPath()): Promise<ModelPolicy> {
-  return runNodePlatformPromise(setModelPoolEffect(pool, path));
+export function setModelList(
+  role: ListModelRole,
+  list: ModelTarget[],
+  path = modelPolicyPath(),
+): Promise<ModelPolicy> {
+  return runNodePlatformPromise(setModelListEffect(role, list, path));
 }
 
 export function setModelRoleEffect(
@@ -326,7 +383,9 @@ export function setModelRoleEffect(
         message: "Invalid model role or target.",
       });
     const policy = yield* loadModelPolicyEffect(path);
-    policy.roles[role] = Value.Decode(ModelTargetSchema, target);
+    const decoded = Value.Decode(ModelTargetSchema, target);
+    if (isListModelRole(role)) policy.roles[role] = [decoded];
+    else policy.roles[role] = decoded;
     return yield* writeModelPolicyEffect(policy, path);
   });
 }

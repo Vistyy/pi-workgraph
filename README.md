@@ -99,16 +99,15 @@ Worker settlement, report validity, coordinator acknowledgment, and acceptance r
 ## Models
 
 Call `workgraph_models` with `action: "get"` to see the effective defaults and their file path.
-The four roles are `research`, `implementation.guide`, `implementation.executor`, and `review`.
-A persistent change uses `action: "set"`, `role`, and `target: { model, thinking }` when the user requests a policy change.
+The four roles are `research`, `implementation.guide`, `implementation.executor`, and `review`. Research and review each own an ordered nonempty model list; its first entry is that role's ordinary default. Implementation guide and executor each own one independent target.
+A persistent implementation-default change uses `action: "set"`, `role`, and `target: { model, thinking }`. A research or review list change uses `action: "set_list"`, `role`, and a nonempty `list` of `{ model, thinking }` targets.
 Persistent model-policy mutation is separate from workstream semantic scope: it defaults to the latest genuine session input receipt, or uses the explicitly supplied retained receipt, and reports that authority receipt and source.
 Assignment `model`, `thinking`, and implementation `executor` parameters override defaults without changing policy or the coordinator model.
 Policy changes affect subsequent assignments, not already queued work.
 
 Policy lives at `workgraph/models.json` under Pi's agent directory.
-Versions 1 and 2 are read without rewriting and retain their historical role mapping.
-The active version 3 policy stores the four role defaults and one ordered worker pool for optional research/review fan-out.
-The default ordinary worker is Muse Spark, and pool order is a preference rather than a price or quality claim.
+Versions 1 through 3 are read without rewriting and retain explicit historical role defaults. Version 3's shared pool is only read-time migration input: each resulting role list puts that role's old default first and then the unique legacy pool entries. A `get` does not rewrite the file; the next persistent mutation writes the current version.
+The active version 4 policy stores the two role-owned lists and the independent implementation targets; there is no shared worker pool or duplicated list/default source. Defaults are research `openai-codex/gpt-5.6-luna` at `high`, review `openai-codex/gpt-5.6-terra` at `high` followed by `opencode-go/deepseek-v4-flash` and `opencode-go/glm-5.3-flash` at `high`, guide `openai-codex/gpt-6-astra` at `low`, and executor `openai-codex/gpt-5.6-luna` at `max`. Distinct selection uses only the requested role's list and its policy order; insufficient diversity is reported rather than borrowed from another role.
 Explicit target overrides require a specific retained reason, and uncertain launches never trigger silent replacement.
 
 ## Recovery and inspection
