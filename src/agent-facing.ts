@@ -347,18 +347,18 @@ function deliveryPreview(state: WorkstreamState, result: WorkResult) {
 }
 
 function applicationProjection(attempt: WorkAttempt | undefined, result: WorkResult) {
-  const composition = attempt?.composition;
-  if (composition?.state === "composed")
+  const application = attempt?.application;
+  if (application?.state === "applied")
     return {
       state: "applied" as const,
-      revision: composition.revision,
-      reportedCommit: composition.commit,
+      revision: application.revision,
+      reportedCommit: application.commit,
     };
-  if (composition !== undefined)
+  if (application !== undefined)
     return {
-      state: composition.state,
-      reportedCommit: composition.commit,
-      blocker: composition.error === undefined ? undefined : compactText(composition.error, 280),
+      state: application.state,
+      reportedCommit: application.commit,
+      blocker: application.error === undefined ? undefined : compactText(application.error, 280),
     };
   const report = result.validity === "typed" ? result.report : undefined;
   if (
@@ -370,10 +370,10 @@ function applicationProjection(attempt: WorkAttempt | undefined, result: WorkRes
   return { state: "not_applicable" as const };
 }
 
-function experimentRetentionProjection(attempt: WorkAttempt | undefined) {
+function retainedOutputProjection(attempt: WorkAttempt | undefined) {
   const placement = attempt?.placement;
   if (placement?.kind !== "isolated_worktree") return { state: "not_applicable" as const };
-  const release = attempt?.experimentRelease;
+  const release = attempt?.outputRelease;
   return {
     state: release?.state === "completed" ? ("released" as const) : ("retained" as const),
     path: placement.path,
@@ -411,7 +411,7 @@ function settlement(state: WorkstreamState, result: WorkResult) {
     blockers,
     blockerCount,
     application: applicationProjection(attempt, result),
-    experimentWorktree: experimentRetentionProjection(attempt),
+    retainedOutput: retainedOutputProjection(attempt),
     cleanup: cleanupProjection(attempt),
     delivery: deliveryPreview(state, result),
     recovery:
@@ -577,8 +577,8 @@ function attention(state: WorkstreamState) {
   return state.attempts.flatMap((attempt) => {
     const blocker =
       attempt.error ??
-      attempt.experimentRelease?.error ??
-      attempt.composition?.error ??
+      attempt.outputRelease?.error ??
+      attempt.application?.error ??
       attempt.cleanup?.error;
     if (blocker === undefined) return [];
     return [
@@ -731,14 +731,14 @@ function launchFact(attempt: WorkAttempt) {
   };
 }
 
-function recordedComposition(attempt: WorkAttempt) {
-  const composition = attempt.composition;
-  if (composition === undefined) return { state: "not_recorded" as const };
+function recordedApplication(attempt: WorkAttempt) {
+  const application = attempt.application;
+  if (application === undefined) return { state: "not_recorded" as const };
   return {
-    state: composition.state,
-    revision: composition.revision,
-    commit: composition.commit,
-    blocker: composition.error === undefined ? undefined : compactText(composition.error, 280),
+    state: application.state,
+    revision: application.revision,
+    commit: application.commit,
+    blocker: application.error === undefined ? undefined : compactText(application.error, 280),
   };
 }
 
@@ -780,8 +780,8 @@ function recoveryView(
     placement: attempt.placement,
     launchPane: attempt.launchPane,
     submission: attempt.submission,
-    composition: attempt.composition,
-    experimentRelease: attempt.experimentRelease,
+    application: attempt.application,
+    outputRelease: attempt.outputRelease,
     cleanup: attempt.cleanup,
     attentionHistory: attempt.attentionHistory,
     models: attempt.models,
@@ -790,8 +790,8 @@ function recoveryView(
   };
   const blocker =
     attempt.error ??
-    attempt.experimentRelease?.error ??
-    attempt.composition?.error ??
+    attempt.outputRelease?.error ??
+    attempt.application?.error ??
     attempt.cleanup?.error;
   const runtimeSettlementRecorded =
     attempt.resultId !== undefined &&
@@ -819,8 +819,8 @@ function recoveryView(
         ? ("recorded_after_runtime_native_marker_check" as const)
         : ("not_recorded" as const),
       nativeOrGitStateFromTerminalStateAlone: false,
-      composition: recordedComposition(attempt),
-      experimentWorktree: experimentRetentionProjection(attempt),
+      application: recordedApplication(attempt),
+      retainedOutput: retainedOutputProjection(attempt),
       cleanup: recordedCleanup(attempt),
       delivery: recordedDelivery(state, attempt),
       models: projectedModels(attempt),
@@ -833,18 +833,41 @@ function recoveryView(
       { section: "recovery", attempt: attempt.id },
     ),
     uncertainty,
-    guardedAction:
-      task.artifactIntent === "disposable_experiment" &&
-      attempt.state === "settled" &&
-      attempt.experimentRelease?.state !== "completed"
-        ? {
-            tool: "workgraph_control" as const,
-            action: "release_experiment" as const,
-            attempt: attempt.id,
-            requirement: "Provide a reason only after the retained worktree is no longer needed.",
-          }
-        : undefined,
+    guardedActions: retainedOutputActions(task, attempt),
   };
+}
+
+function retainedOutputActions(task: WorkAssignment, attempt: WorkAttempt) {
+  if (
+    attempt.placement?.kind !== "isolated_worktree" ||
+    attempt.cleanup?.state !== "completed" ||
+    attempt.outputRelease?.state === "completed"
+  )
+    return [];
+  const actions = [
+    {
+      tool: "workgraph_control" as const,
+      action: "release_output" as const,
+      attempt: attempt.id,
+      requirement: "Provide a destructive reason after the retained output is no longer needed.",
+    },
+  ];
+  if (
+    task.capability === "implement" &&
+    attempt.state === "settled" &&
+    attempt.application === undefined
+  )
+    return [
+      {
+        tool: "workgraph_control" as const,
+        action: "apply" as const,
+        attempt: attempt.id,
+        requirement:
+          "Provide the exact reported sourceCommit and freshly observed current destinationHead.",
+      },
+      ...actions,
+    ];
+  return actions;
 }
 
 function pendingView(state: WorkstreamState, selection: Selection) {

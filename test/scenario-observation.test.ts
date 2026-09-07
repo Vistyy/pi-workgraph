@@ -102,7 +102,7 @@ void test("isolated Git cleanup requires exact worktree path and branch absence"
   );
 });
 
-void test("delegated native outcome requires attributable composition, cleanup, and retained experiment output", async () => {
+void test("delegated native outcome requires attributable application, cleanup, and retained experiment output", async () => {
   const { state } = await baseState();
   const now = fixtureInstant;
   state.lifecycle = { state: "completed", changedAt: now, reason: "done" };
@@ -172,8 +172,8 @@ void test("delegated native outcome requires attributable composition, cleanup, 
         cwd: "/tmp/natural-test",
         sessionFile: "/tmp/implementation.jsonl",
       },
-      composition: {
-        state: "composed",
+      application: {
+        state: "applied",
         commit: "commit",
         expectedHead: "base",
         revision: "revision",
@@ -201,7 +201,7 @@ void test("delegated native outcome requires attributable composition, cleanup, 
       },
       artifacts: [
         {
-          id: "experiment-worktree",
+          id: "retained-output-worktree",
           kind: "path",
           reference: "/tmp/natural-test",
           retention: "retained",

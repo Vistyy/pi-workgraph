@@ -193,7 +193,7 @@ void test("a real cherry-pick conflict is aborted only after ownership checks an
   const f = await conflictFixture();
   try {
     await assert.rejects(
-      () => f.repository.compose(f.commit, f.expectedHead),
+      () => f.repository.applyCommit(f.commit, f.expectedHead),
       /Cherry-pick conflict/,
     );
     assert.equal(await f.repository.head(), f.expectedHead);
@@ -230,7 +230,7 @@ void test("an unavailable HEAD after a real cherry-pick conflict prevents abort 
   );
   try {
     const failure = await Effect.runPromise(
-      Effect.flip(repository.effects.compose(f.commit, f.expectedHead)),
+      Effect.flip(repository.effects.applyCommit(f.commit, f.expectedHead)),
     );
     assert.ok(failure instanceof GitStateUncertainError);
     assert.match(failure.message, /resulting HEAD is unavailable/);
@@ -278,7 +278,7 @@ void test("real cherry-pick conflicts retain nonzero, timed-out, and spawn rollb
     );
     try {
       const failure = await Effect.runPromise(
-        Effect.flip(repository.effects.compose(f.commit, f.expectedHead)),
+        Effect.flip(repository.effects.applyCommit(f.commit, f.expectedHead)),
       );
       assert.ok(
         failure instanceof GitStateUncertainError,
@@ -374,7 +374,7 @@ void test("cleanup independently rechecks the exact branch after worktree regist
   }
 });
 
-void test("composition recovery compares complete large patches and rejects non-direct worker commits", async () => {
+void test("application recovery compares complete large patches and rejects non-direct worker commits", async () => {
   const f = await fixture();
   try {
     const placement = await f.repository.createWorktree("run", "worker", f.base);
@@ -405,15 +405,15 @@ void test("composition recovery compares complete large patches and rejects non-
       "The old diagnostic-tail comparison would falsely attribute this commit",
     );
     await assert.rejects(
-      () => f.repository.recoverComposition(f.base, source),
+      () => f.repository.recoverApplication(f.base, source),
       /Could not attribute/,
     );
 
     await git(f.root, "revert", "--no-edit", "HEAD");
     const before = await f.repository.head();
-    assert.equal(await f.repository.recoverComposition(before, source), undefined);
-    const head = await f.repository.compose(source.commit, before);
-    assert.deepEqual(await f.repository.recoverComposition(before, source), {
+    assert.equal(await f.repository.recoverApplication(before, source), undefined);
+    const head = await f.repository.applyCommit(source.commit, before);
+    assert.deepEqual(await f.repository.recoverApplication(before, source), {
       head,
     });
     assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), `expected-prefix\n${suffix}`);

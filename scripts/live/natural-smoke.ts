@@ -139,7 +139,8 @@ function retainedExperimentReferences(
       throw new Error(`Experiment ${assignment.id} has no typed retained result.`);
     assert.ok(
       result.artifacts.some(
-        (artifact) => artifact.id === "experiment-worktree" && artifact.retention === "retained",
+        (artifact) =>
+          artifact.id === "retained-output-worktree" && artifact.retention === "retained",
       ),
     );
   }
@@ -243,7 +244,7 @@ try {
           (attempt) =>
             attempt.state === "failed" ||
             attempt.cleanup?.state === "blocked" ||
-            attempt.composition?.state === "blocked",
+            attempt.application?.state === "blocked",
         )
       )
         throw new Error(

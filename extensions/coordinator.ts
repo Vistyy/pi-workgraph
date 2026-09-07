@@ -42,6 +42,7 @@ import {
 import {
   type QueueOptions,
   type RuntimeError,
+  RuntimeOperationError,
   WorkstreamRuntime,
 } from "../src/workstream-runtime.js";
 import { RuntimeHostError } from "../src/workstream-runtime-services.js";
@@ -707,12 +708,21 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_control",
     label: "Workgraph Control",
     description:
-      "Suspend or resume work, or use an explicitly identified semantic task to cancel, steer, or recover a boundary. Repeated attempts require an explicit attempt handle; recovery is guarded and administrative.",
+      "Suspend or resume work, cancel or steer a worker, explicitly apply retained maintained output, or release retained output. Apply requires exact attempt, reported source commit, and current destination HEAD; release requires exact attempt and a destructive reason.",
     parameters: Type.Object({
-      action: StringEnum(["suspend", "resume", "cancel", "steer", "release_experiment"] as const),
+      action: StringEnum([
+        "suspend",
+        "resume",
+        "cancel",
+        "steer",
+        "apply",
+        "release_output",
+      ] as const),
       reason: Type.String({ minLength: 1 }),
       task: Type.Optional(Type.String()),
       attempt: Type.Optional(Type.String()),
+      sourceCommit: Type.Optional(Type.String()),
+      destinationHead: Type.Optional(Type.String()),
     }),
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
@@ -833,8 +843,9 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
               })),
             }),
           );
-          yield* active.effects.close;
-          runtime = undefined;
+          // Keep the scoped owner available for exact retained-output release after
+          // semantic completion. Terminal lifecycle prevents launches or resume;
+          // extension shutdown remains the native owner close boundary.
           return mutationResult("Completed workstream.", yield* remember(state, ctx), {
             action: "workgraph_complete",
             outcome: "completed",
@@ -846,12 +857,14 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   });
 }
 
-type ControlAction = "suspend" | "resume" | "cancel" | "steer" | "release_experiment";
+type ControlAction = "suspend" | "resume" | "cancel" | "steer" | "apply" | "release_output";
 type ControlParams = {
   action: ControlAction;
   reason: string;
   task?: string;
   attempt?: string;
+  sourceCommit?: string;
+  destinationHead?: string;
 };
 type ResultView = InspectView | ReturnType<typeof actionView>;
 
@@ -1059,25 +1072,50 @@ function modelRates(models: string[], ctx: ExtensionContext) {
 }
 
 function isAttemptControl(action: ControlAction): boolean {
-  return action === "cancel" || action === "steer" || action === "release_experiment";
+  return (
+    action === "cancel" || action === "steer" || action === "apply" || action === "release_output"
+  );
 }
 
 function controlAttemptEffect(
   active: WorkstreamRuntime,
   params: ControlParams,
-): CoordinatorEffect<string> {
+): CoordinatorEffect<string, RuntimeError | Error> {
   return Effect.gen(function* () {
     const state = yield* active.effects.submit(active.store.effects.load());
     const attemptId = resolveControlAttempt(state, params.task, params.attempt);
-    if (params.action === "cancel") yield* active.effects.cancel(attemptId);
-    else if (params.action === "steer") yield* active.effects.steer(attemptId, params.reason);
-    else {
-      if (params.attempt === undefined || params.attempt === "")
-        throw new Error("Experiment release requires an exact attempt handle.");
-      yield* active.effects.releaseExperiment(attemptId, params.reason);
-    }
+    yield* executeAttemptControl(active, params, attemptId);
     return attemptId;
   });
+}
+
+function executeAttemptControl(
+  active: WorkstreamRuntime,
+  params: ControlParams,
+  attemptId: string,
+): CoordinatorEffect<void> {
+  if (params.action === "cancel") return active.effects.cancel(attemptId);
+  if (params.action === "steer") return active.effects.steer(attemptId, params.reason);
+  if (params.attempt === undefined || params.attempt === "")
+    return Effect.fail(
+      new RuntimeOperationError({
+        operation: "validate control action",
+        cause: new Error(`${params.action} requires an exact attempt handle.`),
+      }),
+    );
+  if (params.action === "apply") {
+    if (params.sourceCommit === undefined || params.destinationHead === undefined)
+      return Effect.fail(
+        new RuntimeOperationError({
+          operation: "validate apply action",
+          cause: new Error("Apply requires exact sourceCommit and destinationHead values."),
+        }),
+      );
+    return active.effects
+      .apply(attemptId, params.sourceCommit, params.destinationHead)
+      .pipe(Effect.asVoid);
+  }
+  return active.effects.releaseOutput(attemptId, params.reason).pipe(Effect.asVoid);
 }
 
 function lifecycleControlEffect(
@@ -1096,12 +1134,13 @@ function lifecycleControlEffect(
 
 function controlMessage(action: ControlAction): string {
   if (action === "steer") return "Steering submitted; application is not yet established.";
-  if (action === "release_experiment") return "Released the exact retained experiment worktree.";
+  if (action === "apply") return "Applied the exact retained maintained output.";
+  if (action === "release_output") return "Released the exact retained output worktree.";
   return "Control request recorded.";
 }
 function controlOutcome(action: ControlAction): "submitted" | "inspected" | "recorded" {
   if (action === "steer") return "submitted";
-  if (action === "release_experiment") return "recorded";
+  if (action === "apply" || action === "release_output") return "recorded";
   return "recorded";
 }
 function requiredValue<T>(value: T | undefined, label: string): T {

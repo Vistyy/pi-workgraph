@@ -21,10 +21,11 @@ export function capabilityScenarioPrompt(privateToken: string): string {
   return `Use Workgraph capability tools to complete this single bounded workstream without another approval ceremony.
 Coordinator-only context: ${privateToken}. Never include that token in worker assignments.
 First delegate read-only research id ${CAPABILITY_SCENARIO_IDS.baselineResearch} to gather cheap evidence about the README marker and exact current value.txt bytes, then use the returned findings to decide what bounded work is justified. End your turn when only workers are running and resume on actual results.
-Next delegate disposable experiment id ${CAPABILITY_SCENARIO_IDS.uppercaseExperiment}, explicitly authorized to read value.txt and write only probe.txt containing its uppercase bytes. Stop after one observation, retain probe.txt, never compose scratch code.
+Next delegate disposable experiment id ${CAPABILITY_SCENARIO_IDS.uppercaseExperiment}, explicitly authorized to read value.txt and write only probe.txt containing its uppercase bytes. Stop after one observation and retain probe.txt; never apply scratch code.
 Then delegate maintained implementation id ${CAPABILITY_SCENARIO_IDS.updateValue}, explicitly authorized to change only value.txt to exactly after followed by one newline, with acceptance node verify.mjs and exact bytes/scope. Use policy guide/executor defaults.
 Immediately after queueing implementation, before waiting for its result, queue read-only research id ${CAPABILITY_SCENARIO_IDS.concurrentReadme} to read the README marker, demonstrating interleaving.
-After maintained composition, delegate independent review id ${CAPABILITY_SCENARIO_IDS.exactRevisionReview} of that exact retained revision, concerned with scope, exact bytes, absence of probe.txt and node verify.mjs.
+When the implementation reports a changed commit, independently read the destination HEAD and explicitly choose application with workgraph_control action apply, the exact implementation attempt, exact reported sourceCommit, and that current destinationHead. Do not apply from a notification alone or invent an approval/review step.
+After explicit maintained application, delegate independent review id ${CAPABILITY_SCENARIO_IDS.exactRevisionReview} of that exact applied revision, concerned with scope, exact bytes, absence of probe.txt and node verify.mjs.
 You may run read-only verification yourself but do not edit the fixture directly. Do not delegate extra workers or change model policy.
 Handle result notifications automatically and inspect execution, findings, evidence, uncertainty, and cleanup through workgraph_inspect only when a blocker, repeated attempt, uncertainty, or truncation requires it. After queueing useful independent work, end your turn to receive notifications; do not poll, run waits for workers, or wait inside shell commands.
 Independently verify retained probe.txt is BEFORE followed by a newline, maintained value.txt is after followed by a newline, only value.txt changed, node verify.mjs passes, and all owned attempts/resources settled and cleaned.
@@ -287,11 +288,11 @@ function validateImplementation(state: WorkstreamState) {
   const problems: string[] = [];
   if (
     origin === "delegated" &&
-    attempts.some((attempt) => attempt.composition?.state !== "composed")
+    attempts.some((attempt) => attempt.application?.state !== "applied")
   )
-    problems.push("attributable maintained implementation is not composed");
-  if (origin === "direct" && state.attempts.some((attempt) => attempt.composition !== undefined))
-    problems.push("a non-implementation delegation has a composition");
+    problems.push("attributable maintained implementation is not applied");
+  if (origin === "direct" && state.attempts.some((attempt) => attempt.application !== undefined))
+    problems.push("a non-implementation delegation has an application");
   return { problems, origin };
 }
 
@@ -303,14 +304,14 @@ function validateExperiments(state: WorkstreamState) {
   for (const assignment of assignments) {
     const attempt = state.attempts.find((item) => item.assignmentId === assignment.id);
     const result = state.results.find((item) => item.assignmentId === assignment.id);
-    if (attempt === undefined || result === undefined || attempt.composition !== undefined)
-      problems.push(`experiment ${assignment.id} lacks attributable non-composed outcome`);
+    if (attempt === undefined || result === undefined || attempt.application !== undefined)
+      problems.push(`experiment ${assignment.id} lacks attributable non-applied outcome`);
     if (result?.validity !== "typed") continue;
     if (
       attempt?.placement?.kind !== "isolated_worktree" ||
       !result.artifacts.some(
         (artifact) =>
-          artifact.id === "experiment-worktree" &&
+          artifact.id === "retained-output-worktree" &&
           artifact.kind === "path" &&
           artifact.reference === attempt.placement?.path &&
           artifact.retention === "retained",
@@ -341,7 +342,7 @@ export function observeDelegatedOutcome(
     valid: problems.length === 0,
     detail:
       problems.length === 0
-        ? "Delegated outcomes, composition, cleanup, and authorized bytes are attributable and valid."
+        ? "Delegated outcomes, application, cleanup, and authorized bytes are attributable and valid."
         : problems.join("; "),
     delegationExercised: true,
     implementationOrigin: implementation.origin,

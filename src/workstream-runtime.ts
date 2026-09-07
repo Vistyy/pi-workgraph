@@ -130,7 +130,12 @@ export interface WorkstreamRuntimeEffects {
     options?: QueueOptions,
   ) => RuntimeEffect<WorkstreamState>;
   readonly reconcile: RuntimeEffect<WorkstreamState>;
-  readonly releaseExperiment: (attemptId: string, reason: string) => RuntimeEffect<WorkstreamState>;
+  readonly apply: (
+    attemptId: string,
+    sourceCommit: string,
+    destinationHead: string,
+  ) => RuntimeEffect<WorkstreamState>;
+  readonly releaseOutput: (attemptId: string, reason: string) => RuntimeEffect<WorkstreamState>;
   readonly steer: (attemptId: string, instruction: string) => RuntimeEffect<void>;
   readonly cancel: (attemptId: string) => RuntimeEffect<void>;
   readonly close: Effect.Effect<void, RuntimeRegistryError>;
@@ -172,8 +177,10 @@ export class WorkstreamRuntime {
         this.submit(effect).pipe(Effect.mapError((error) => this.submissionError(error))),
       queue: (input, options = {}) => this.submit(this.queueEffect(input, options)),
       reconcile: this.submit(this.reconcileOperation()),
-      releaseExperiment: (attemptId, reason) =>
-        this.submit(this.releaseExperimentEffect(attemptId, reason)),
+      apply: (attemptId, sourceCommit, destinationHead) =>
+        this.submit(this.applyEffect(attemptId, sourceCommit, destinationHead)),
+      releaseOutput: (attemptId, reason) =>
+        this.submit(this.releaseOutputEffect(attemptId, reason)),
       steer: (attemptId, instruction) => this.submit(this.steerEffect(attemptId, instruction)),
       cancel: (attemptId) => this.submit(this.cancelEffect(attemptId)),
       close: Effect.suspend(() => this.close(Exit.void)),
@@ -497,9 +504,19 @@ export class WorkstreamRuntime {
   private preserveExistingBoundary(item: WorkAttempt): RuntimeEffect<boolean> {
     if (item.state === "cancel_requested" && item.cleanup?.state === "completed")
       return this.storeEffect((store) => store.finishCleanup(item.id)).pipe(Effect.as(true));
-    if (item.experimentRelease?.state === "blocked")
-      return this.runtimeSync("preserve blocked experiment release", () => {
-        throw new Error(required(item.experimentRelease?.error, "experiment release blocker"));
+    if (item.outputRelease?.state === "pending" || item.outputRelease?.state === "blocked")
+      return this.runtimeSync("preserve interrupted retained-output release", () => {
+        throw new Error(
+          item.outputRelease?.error ??
+            "Retained-output release is pending; freshly inspect exact worktree ownership and presence before any recovery.",
+        );
+      });
+    if (item.application?.state === "pending" || item.application?.state === "blocked")
+      return this.runtimeSync("preserve interrupted application", () => {
+        throw new Error(
+          item.application?.error ??
+            "Application is pending; freshly inspect destination and source postconditions before any recovery.",
+        );
       });
     if (item.cleanup?.state === "completed")
       return (
@@ -511,10 +528,7 @@ export class WorkstreamRuntime {
       item.cleanup?.state === "pending" || item.cleanup?.state === "blocked"
         ? (item.cleanup.error ??
           "Cleanup was interrupted after its checkpoint; exact resources were preserved for coordinator diagnosis.")
-        : item.composition?.state === "pending" || item.composition?.state === "blocked"
-          ? (item.composition.error ??
-            "Composition was interrupted after its checkpoint; inspect repository and worktree facts before deciding recovery.")
-          : undefined;
+        : undefined;
     if (interruption === undefined) return Effect.succeed(false);
     return this.runtimeSync("preserve interrupted operation", () => {
       throw new Error(interruption);
@@ -676,7 +690,7 @@ export class WorkstreamRuntime {
     });
   }
 
-  private advanceRetainedResult(id: string, assignment: WorkAssignment): RuntimeEffect<void> {
+  private advanceRetainedResult(id: string, _assignment: WorkAssignment): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         let state = yield* this.storeEffect((store) => store.load());
@@ -689,13 +703,10 @@ export class WorkstreamRuntime {
           });
         if (!state.deliveries.some((delivery) => delivery.resultId === result.id))
           yield* this.storeEffect((store) => store.requestDelivery(result.id));
-        yield* this.runtimeSync("validate implementation result", () =>
-          validateImplementationResult(assignment, result),
-        );
-        if (shouldCompose(assignment, attempt, result)) {
-          if (state.lifecycle.state !== "active") return;
-          yield* this.compose(state, attempt, assignment);
-        }
+        // Reports, including malformed or failed reports, never prevent closure of
+        // an independently proven stopped worker.
+        // A worker report retains output; only an explicit coordinator apply may
+        // mutate the destination repository.
         state = yield* this.storeEffect((store) => store.load());
         attempt = findAttempt(state, id);
         yield* this.beginCleanupIfNeeded(attempt);
@@ -871,18 +882,22 @@ export class WorkstreamRuntime {
         Effect.catch((error) => this.retainFailedNoChange(attempt, base, error)),
         Effect.asVoid,
       );
-    const artifacts =
-      assignment.artifactIntent === "disposable_experiment" && report.status === "completed"
-        ? [
-            {
-              id: "experiment-worktree",
-              kind: "path" as const,
-              reference: required(attempt.placement, "experiment placement").path,
-              retention: "retained" as const,
-              summary: "Owned experiment worktree retained until explicit coordinator release.",
-            },
-          ]
-        : [];
+    const placement = attempt.placement;
+    const retainsOutput =
+      placement?.kind === "isolated_worktree" &&
+      (assignment.artifactIntent === "disposable_experiment" ||
+        assignment.capability === "implement");
+    const artifacts = retainsOutput
+      ? [
+          {
+            id: "retained-output-worktree",
+            kind: "path" as const,
+            reference: placement.path,
+            retention: "retained" as const,
+            summary: "Owned output worktree retained until explicit coordinator apply or release.",
+          },
+        ]
+      : [];
     return this.storeEffect((store) =>
       store.retainResult({ ...base, validity: "typed", report, artifacts }),
     ).pipe(Effect.asVoid);
@@ -915,40 +930,50 @@ export class WorkstreamRuntime {
     );
   }
 
-  private compose(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: WorkAssignment,
-  ): RuntimeEffect<void> {
-    if (attempt.composition?.state === "blocked") return Effect.void;
-    if (attempt.composition?.state === "composed")
-      return this.recordCompositionArtifact(
-        attempt,
-        required(attempt.composition.revision, "composed revision"),
-        `Composed ${attempt.composition.commit}.`,
-      );
-    const result = state.results.find((item) => item.id === attempt.resultId);
-    const commit = validCompositionCommit(result);
+  private applyEffect(
+    attemptId: string,
+    sourceCommit: string,
+    destinationHead: string,
+  ): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const expectedHead =
-          attempt.composition?.expectedHead ??
-          (yield* this.gitEffect((repository) => repository.head()));
-        if (attempt.composition?.state === "pending")
-          return yield* this.runtimeSync("preserve pending composition", () => {
-            throw new Error(
-              "Composition checkpoint is pending; inspect exact repository and worktree facts before any coordinator-led recovery.",
-            );
+        const state = yield* this.storeEffect((store) => store.load());
+        const attempt = findAttempt(state, attemptId);
+        const assignment = findAssignment(state, attempt.assignmentId);
+        const result = state.results.find((item) => item.id === attempt.resultId);
+        const reportedCommit = validApplicationCommit(result);
+        yield* this.runtimeSync("validate explicit application", () =>
+          validateExplicitApplication(
+            state,
+            attempt,
+            assignment,
+            reportedCommit,
+            sourceCommit,
+            this.store.isAssignmentCurrent(state, assignment.id),
+          ),
+        );
+        yield* this.applyMaintainedOutput(attempt, assignment, sourceCommit, destinationHead).pipe(
+          Effect.catch((error) =>
+            this.recoverApplication(attempt, sourceCommit, destinationHead, error),
+          ),
+        );
+        const applied = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
+        if (applied.application?.state !== "applied")
+          return yield* this.runtimeSync("validate application postcondition", () => {
+            throw new Error("Application did not establish an applied destination revision.");
           });
-        const operation = this.applyComposition(attempt, assignment, commit, expectedHead);
-        yield* operation.pipe(
-          Effect.catch((error) => this.recoverComposition(attempt, commit, expectedHead, error)),
+        return yield* this.releaseOutputEffect(
+          attemptId,
+          `Applied source ${sourceCommit} to destination ${required(
+            applied.application.revision,
+            "applied revision",
+          )}.`,
         );
       }.bind(this),
     );
   }
 
-  private applyComposition(
+  private applyMaintainedOutput(
     attempt: WorkAttempt,
     assignment: WorkAssignment,
     commit: string,
@@ -960,24 +985,26 @@ export class WorkstreamRuntime {
           repository.validateWorkerCommit(placementOf(attempt), commit),
         );
         yield* this.storeEffect((store) =>
-          store.beginComposition({ id: attempt.id, commit, expectedHead }),
+          store.beginApplication({ id: attempt.id, commit, expectedHead }),
         );
         const state = yield* this.storeEffect((store) => store.load());
-        yield* this.runtimeSync("validate current composition intent", () => {
+        yield* this.runtimeSync("validate current application intent", () => {
           if (!this.store.isAssignmentCurrent(state, assignment.id))
-            throw new Error("Intent changed; retained implementation is stale and cannot compose.");
+            throw new Error(
+              "Intent changed; retained implementation is stale and cannot be applied.",
+            );
         });
         yield* this.ownershipEffect();
         const revision = yield* this.gitEffect((repository) =>
-          repository.compose(commit, expectedHead),
+          repository.applyCommit(commit, expectedHead),
         );
-        yield* this.storeEffect((store) => store.finishComposition(attempt.id, revision));
-        yield* this.recordCompositionArtifact(attempt, revision, `Composed ${commit}.`);
+        yield* this.storeEffect((store) => store.finishApplication(attempt.id, revision));
+        yield* this.recordApplicationArtifact(attempt, revision, `Applied ${commit}.`);
       }.bind(this),
     );
   }
 
-  private recoverComposition(
+  private recoverApplication(
     attempt: WorkAttempt,
     commit: string,
     expectedHead: string,
@@ -987,29 +1014,29 @@ export class WorkstreamRuntime {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const recovery = yield* this.gitEffect((repository) =>
-          repository.recoverComposition(expectedHead, {
+          repository.recoverApplication(expectedHead, {
             baseCommit: required(attempt.baseRevision, "base revision"),
             commit,
           }),
         ).pipe(Effect.option);
         if (Option.isNone(recovery) || recovery.value === undefined) {
           yield* this.storeEffect((store) =>
-            store.blockComposition(attempt.id, originalError.message),
+            store.blockApplication(attempt.id, originalError.message),
           );
           return;
         }
         const recovered = recovery.value;
-        yield* this.storeEffect((store) => store.finishComposition(attempt.id, recovered.head));
-        yield* this.recordCompositionArtifact(
+        yield* this.storeEffect((store) => store.finishApplication(attempt.id, recovered.head));
+        yield* this.recordApplicationArtifact(
           attempt,
           recovered.head,
-          `Recovered composition of ${commit}.`,
+          `Recovered application of ${commit}.`,
         );
       }.bind(this),
     );
   }
 
-  private recordCompositionArtifact(
+  private recordApplicationArtifact(
     attempt: WorkAttempt,
     revision: string,
     summary: string,
@@ -1033,9 +1060,9 @@ export class WorkstreamRuntime {
         const state = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(state, id);
         const cleanup = attempt.cleanup;
-        if (cleanup?.state !== "pending" || attempt.composition?.state === "blocked") return;
+        if (cleanup?.state !== "pending") return;
         const assignment = findAssignment(state, attempt.assignmentId);
-        const operation = this.cleanupAttempt(attempt, cleanup, assignment);
+        const operation = this.cleanupAttempt(state, attempt, cleanup, assignment);
         yield* operation.pipe(
           Effect.catch((error) =>
             this.storeEffect((store) => store.blockCleanup(id, error.message)),
@@ -1046,6 +1073,7 @@ export class WorkstreamRuntime {
   }
 
   private cleanupAttempt(
+    state: WorkstreamState,
     attempt: WorkAttempt,
     cleanup: NonNullable<WorkAttempt["cleanup"]>,
     assignment: WorkAssignment,
@@ -1064,20 +1092,30 @@ export class WorkstreamRuntime {
           yield* this.storeEffect((store) => store.markWorkerClosed(attempt.id));
         }
         yield* this.ownershipEffect();
-        yield* this.cleanupPlacement(attempt, cleanup, assignment);
+        yield* this.cleanupPlacement(state, attempt, cleanup, assignment);
         yield* this.storeEffect((store) => store.finishCleanup(attempt.id));
       }.bind(this),
     );
   }
 
   private cleanupPlacement(
+    state: WorkstreamState,
     attempt: WorkAttempt,
     cleanup: NonNullable<WorkAttempt["cleanup"]>,
     assignment: WorkAssignment,
   ): RuntimeEffect<void> {
+    const result = state.results.find((item) => item.id === attempt.resultId);
+    const noChange =
+      result?.validity === "typed" &&
+      result.report.kind === "implementation" &&
+      result.report.status === "completed" &&
+      result.report.outcome === "no_change";
     if (
       attempt.placement?.kind !== "isolated_worktree" ||
-      assignment.artifactIntent === "disposable_experiment"
+      assignment.artifactIntent === "disposable_experiment" ||
+      (assignment.capability === "implement" &&
+        attempt.application?.state !== "applied" &&
+        !noChange)
     )
       return Effect.void;
     return this.gitEffect((repository) =>
@@ -1088,37 +1126,37 @@ export class WorkstreamRuntime {
     ).pipe(Effect.asVoid);
   }
 
-  private releaseExperimentEffect(
-    attemptId: string,
-    reason: string,
-  ): RuntimeEffect<WorkstreamState> {
+  private releaseOutputEffect(attemptId: string, reason: string): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         if (reason.trim() === "")
-          return yield* this.runtimeSync("validate experiment release", () => {
-            throw new Error("Experiment release reason is required.");
+          return yield* this.runtimeSync("validate retained-output release", () => {
+            throw new Error("Retained-output release reason is required.");
           });
         let state = yield* this.storeEffect((store) => store.load());
         let attempt = findAttempt(state, attemptId);
         const assignment = findAssignment(state, attempt.assignmentId);
-        yield* this.runtimeSync("validate experiment release", () => {
+        yield* this.runtimeSync("validate retained-output release", () => {
+          const releasableAssignment =
+            assignment.artifactIntent === "disposable_experiment" ||
+            assignment.capability === "implement";
           if (
-            assignment.artifactIntent !== "disposable_experiment" ||
-            attempt.state !== "settled" ||
+            !releasableAssignment ||
+            !["settled", "failed", "cancelled"].includes(attempt.state) ||
             attempt.placement?.kind !== "isolated_worktree" ||
             attempt.cleanup?.state !== "completed" ||
             !attempt.cleanup.workerClosed
           )
             throw new Error(
-              "Only a settled owned experiment with a closed worker can be released.",
+              "Only closed retained output from an owned experiment or unapplied implementation can be released.",
             );
         });
-        if (attempt.experimentRelease?.state === "completed") return state;
+        if (attempt.outputRelease?.state === "completed") return state;
         const expectedHead =
-          attempt.experimentRelease?.expectedHead ??
+          attempt.outputRelease?.expectedHead ??
           (yield* this.gitEffect((repository) => repository.head(placementOf(attempt).path)));
         yield* this.storeEffect((store) =>
-          store.beginExperimentRelease({ id: attemptId, expectedHead, reason }),
+          store.beginOutputRelease({ id: attemptId, expectedHead, reason }),
         );
         state = yield* this.storeEffect((store) => store.load());
         attempt = findAttempt(state, attemptId);
@@ -1132,14 +1170,14 @@ export class WorkstreamRuntime {
             yield* this.gitEffect((repository) =>
               repository.cleanupWorktree(placementOf(attempt), expectedHead),
             );
-            yield* this.storeEffect((store) => store.finishExperimentRelease(attemptId));
+            yield* this.storeEffect((store) => store.finishOutputRelease(attemptId));
           }.bind(this),
         );
         yield* release.pipe(
           Effect.catch((error) =>
-            this.storeEffect((store) =>
-              store.blockExperimentRelease(attemptId, error.message),
-            ).pipe(Effect.andThen(Effect.fail(error))),
+            this.storeEffect((store) => store.blockOutputRelease(attemptId, error.message)).pipe(
+              Effect.andThen(Effect.fail(error)),
+            ),
           ),
         );
         return yield* this.storeEffect((store) => store.load());
@@ -1227,6 +1265,7 @@ export class WorkstreamRuntime {
         yield* this.beginCleanupIfNeeded(cancelled);
         yield* this.storeEffect((store) => store.markWorkerClosed(attemptId));
         yield* this.cleanup(attemptId);
+        yield* this.releaseCancelledExperiment(attemptId);
       }.bind(this),
     );
   }
@@ -1251,10 +1290,30 @@ export class WorkstreamRuntime {
         if (cancelled.placement === undefined) return;
         yield* this.beginCleanupIfNeeded(cancelled);
         yield* this.cleanup(attemptId);
-        if (interruptionError === undefined) return;
+        yield* this.releaseCancelledExperiment(attemptId);
         const latest = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
-        if (latest.cleanup?.state !== "completed")
+        if (interruptionError !== undefined && latest.cleanup?.state !== "completed")
           yield* this.recordAttemptFailure(attemptId, interruptionError);
+      }.bind(this),
+    );
+  }
+
+  private releaseCancelledExperiment(attemptId: string): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const state = yield* this.storeEffect((store) => store.load());
+        const attempt = findAttempt(state, attemptId);
+        const assignment = findAssignment(state, attempt.assignmentId);
+        if (
+          attempt.state === "cancelled" &&
+          attempt.cleanup?.state === "completed" &&
+          attempt.placement?.kind === "isolated_worktree" &&
+          assignment.artifactIntent === "disposable_experiment"
+        )
+          yield* this.releaseOutputEffect(
+            attemptId,
+            "Cancellation discards this disposable experiment output.",
+          );
       }.bind(this),
     );
   }
@@ -1349,7 +1408,7 @@ function selectedAttempts(
 }
 
 function blockedDetail(attempt: WorkAttempt): string | undefined {
-  if (attempt.composition?.state === "blocked") return attempt.composition.error;
+  if (attempt.application?.state === "blocked") return attempt.application.error;
   if (attempt.cleanup?.state === "blocked") return attempt.cleanup.error;
   return undefined;
 }
@@ -1406,29 +1465,6 @@ function workerRecoveryRequest(
   };
   if (attempt.resource !== undefined) request.resource = attempt.resource;
   return request;
-}
-function validateImplementationResult(assignment: WorkAssignment, result: WorkResult): void {
-  if (
-    assignment.capability === "implement" &&
-    (result.validity !== "typed" || result.report.status !== "completed")
-  )
-    throw new Error(
-      "Implementation did not produce valid successful evidence; retain its workspace for inspection.",
-    );
-}
-function shouldCompose(
-  assignment: WorkAssignment,
-  attempt: WorkAttempt,
-  result: WorkResult,
-): boolean {
-  return (
-    assignment.capability === "implement" &&
-    result.validity === "typed" &&
-    result.report.kind === "implementation" &&
-    result.report.status === "completed" &&
-    result.report.outcome === "changed" &&
-    attempt.state !== "cancelled"
-  );
 }
 function workerSessionRequest(
   state: WorkstreamState,
@@ -1519,7 +1555,27 @@ function isNoChangeImplementation(
     report.outcome === "no_change"
   );
 }
-function validCompositionCommit(result: WorkResult | undefined): string {
+function validateExplicitApplication(
+  state: WorkstreamState,
+  attempt: WorkAttempt,
+  assignment: WorkAssignment,
+  reportedCommit: string,
+  sourceCommit: string,
+  current: boolean,
+): void {
+  if (state.lifecycle.state !== "active")
+    throw new Error("Maintained output can be applied only while coordination is active.");
+  if (assignment.capability !== "implement" || attempt.state !== "settled")
+    throw new Error("Attempt is not settled maintained implementation output.");
+  if (!current)
+    throw new Error("Intent changed; retained implementation is stale and cannot be applied.");
+  if (reportedCommit !== sourceCommit)
+    throw new Error("Source commit does not exactly match the worker report.");
+  if (attempt.application !== undefined)
+    throw new Error("Application already has a recorded checkpoint; inspect it before recovery.");
+}
+
+function validApplicationCommit(result: WorkResult | undefined): string {
   if (
     result?.validity !== "typed" ||
     result.report.kind !== "implementation" ||
@@ -1529,7 +1585,7 @@ function validCompositionCommit(result: WorkResult | undefined): string {
     result.report.commit === ""
   )
     throw new Error(
-      "Composition requires a completed changed implementation report's exact commit.",
+      "Application requires a completed changed implementation report's exact commit.",
     );
   return result.report.commit;
 }
@@ -1599,7 +1655,7 @@ function workerPrompt(
   if (baseRevision !== undefined) lines.push(`Exact base/review revision: ${baseRevision}`);
   if (assignment.capability === "implement")
     lines.push(
-      "For a changed result, use the assigned worktree, create exactly one direct commit on the exact base, and leave it clean; report that commit. For no change, report the unchanged exact base without a commit. Do not integrate into the coordinator repository or push; composition remains a coordinator decision.",
+      "For a changed result, use the assigned worktree, create exactly one direct commit on the exact base, and leave it clean; report that commit. For no change, report the unchanged exact base without a commit. Do not integrate into the coordinator repository or push; application remains a coordinator decision.",
     );
   if (assignment.capability === "review")
     lines.push(
@@ -1633,12 +1689,12 @@ function objectiveFor(
       `Permitted effects: ${assignment.permittedEffects.join("; ")}`,
       `Stop condition: ${assignment.stopCondition}`,
       "The complete isolated worktree is retained after completion until the coordinator explicitly releases it.",
-      "Experimental changes are not maintained product changes and must not be committed for composition.",
+      "Experimental changes are not maintained product changes and must not be committed for application.",
     );
   if (assignment.capability === "implement")
     common.push(
       `Acceptance: ${assignment.acceptance.join("; ")}`,
-      "If a change is needed, create one clean maintained commit and report its exact commit for composition. If the requirement already holds, verify it and report no_change with the inspected base revision and reason, without manufacturing an edit, commit, or executor turn.",
+      "If a change is needed, create one clean maintained commit and report its exact commit for application. If the requirement already holds, verify it and report no_change with the inspected base revision and reason, without manufacturing an edit, commit, or executor turn.",
     );
   if (assignment.capability === "review") {
     common.push(

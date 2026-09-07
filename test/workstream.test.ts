@@ -71,7 +71,7 @@ void test("accepted historical research closes its original scope after intent c
   }
 });
 
-void test("accepting a failed report or uncomposed stale implementation as evidence does not resolve its assignment", async () => {
+void test("accepting a failed report or unapplied stale implementation as evidence does not resolve its assignment", async () => {
   for (const capability of ["research", "implement"] as const) {
     const { parent, store } = await fixture();
     try {
@@ -136,7 +136,7 @@ void test("accepting a failed report or uncomposed stale implementation as evide
       const state = await store.complete({
         ...completion,
         limitations: [
-          capability === "research" ? "The read failed" : "The stale change was never composed",
+          capability === "research" ? "The read failed" : "The stale change was never applied",
         ],
         reasons: [
           {

@@ -113,11 +113,11 @@ export interface GitRepositoryEffects {
     placement: WorktreePlacement,
     reportedCommit?: string,
   ) => GitEffect<ValidatedCommit>;
-  readonly recoverComposition: (
+  readonly recoverApplication: (
     expectedHead: string,
     source: { baseCommit: string; commit: string },
   ) => GitEffect<{ head: string } | undefined>;
-  readonly compose: (commit: string, expectedHead: string) => GitEffect<string>;
+  readonly applyCommit: (commit: string, expectedHead: string) => GitEffect<string>;
   readonly discardExperiment: (
     placement: WorktreePlacement,
     expectedHead: string,
@@ -150,9 +150,9 @@ export class GitRepository {
         this.validateWorkerNoChangeEffect(placement, reportedRevision),
       validateWorkerCommit: (placement, reportedCommit) =>
         this.validateWorkerCommitEffect(placement, reportedCommit),
-      recoverComposition: (expectedHead, source) =>
-        this.recoverCompositionEffect(expectedHead, source),
-      compose: (commit, expectedHead) => this.composeEffect(commit, expectedHead),
+      recoverApplication: (expectedHead, source) =>
+        this.recoverApplicationEffect(expectedHead, source),
+      applyCommit: (commit, expectedHead) => this.applyCommitEffect(commit, expectedHead),
       discardExperiment: (placement, expectedHead) =>
         this.discardExperimentEffect(placement, expectedHead),
       cleanupWorktree: (placement, expectedHead) =>
@@ -365,14 +365,14 @@ export class GitRepository {
     });
   }
 
-  recoverComposition(
+  recoverApplication(
     expectedHead: string,
     source: { baseCommit: string; commit: string },
   ): Promise<{ head: string } | undefined> {
-    return runGitPromise(this.effects.recoverComposition(expectedHead, source));
+    return runGitPromise(this.effects.recoverApplication(expectedHead, source));
   }
 
-  private recoverCompositionEffect(
+  private recoverApplicationEffect(
     expectedHead: string,
     source: { baseCommit: string; commit: string },
   ): GitEffect<{ head: string } | undefined> {
@@ -384,25 +384,25 @@ export class GitRepository {
       if (head === expectedHead) return undefined;
       const parents = yield* git.text(root, ["rev-list", "--parents", "-n", "1", head]);
       if (parents !== `${head} ${expectedHead}`) {
-        return yield* fail("Recovery requires one direct unrecorded composition commit.");
+        return yield* fail("Recovery requires one direct unrecorded application commit.");
       }
       const rootDiff = yield* diffFingerprint(git, root, expectedHead, head);
       const workerDiff = yield* diffFingerprint(git, root, source.baseCommit, source.commit);
       if (workerDiff !== rootDiff) {
         return yield* fail(
-          `Could not attribute unrecorded composition HEAD ${head} to ${source.commit}.`,
+          `Could not attribute unrecorded application HEAD ${head} to ${source.commit}.`,
         );
       }
-      yield* assertStableCleanHead(git, root, head, "Composition recovery");
+      yield* assertStableCleanHead(git, root, head, "Application recovery");
       return { head };
     });
   }
 
-  compose(commit: string, expectedHead: string): Promise<string> {
-    return runGitPromise(this.effects.compose(commit, expectedHead));
+  applyCommit(commit: string, expectedHead: string): Promise<string> {
+    return runGitPromise(this.effects.applyCommit(commit, expectedHead));
   }
 
-  private composeEffect(commit: string, expectedHead: string): GitEffect<string> {
+  private applyCommitEffect(commit: string, expectedHead: string): GitEffect<string> {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
@@ -410,17 +410,17 @@ export class GitRepository {
       const resolvedCommit = yield* resolveRevision(git, root, commit);
       const before = yield* git.text(root, ["rev-parse", "HEAD"]);
       if (before !== expectedHead) {
-        return yield* fail(`Composition HEAD changed: expected ${expectedHead}, found ${before}.`);
+        return yield* fail(`Application HEAD changed: expected ${expectedHead}, found ${before}.`);
       }
       const priorCherryPick = yield* inspectRef(
         git,
         root,
         "CHERRY_PICK_HEAD",
-        (result) => `Could not inspect pre-composition cherry-pick state: ${diagnostic(result)}`,
+        (result) => `Could not inspect pre-application cherry-pick state: ${diagnostic(result)}`,
       );
       if (priorCherryPick.state === "present") {
         return yield* fail(
-          `Composition found pre-existing cherry-pick state at ${priorCherryPick.head}; no mutation was attempted.`,
+          `Application found pre-existing cherry-pick state at ${priorCherryPick.head}; no mutation was attempted.`,
         );
       }
       return yield* Effect.uninterruptible(
@@ -441,7 +441,7 @@ export class GitRepository {
           const parents = yield* git.text(root, ["rev-list", "--parents", "-n", "1", head]);
           if (parents !== `${head} ${expectedHead}`) {
             return yield* fail(
-              `Cherry-pick completed after composition HEAD changed from ${expectedHead}; inspect repository state before retrying.`,
+              `Cherry-pick completed after application HEAD changed from ${expectedHead}; inspect repository state before retrying.`,
             );
           }
           return head;

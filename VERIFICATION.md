@@ -27,11 +27,11 @@ Workstream persistence claims require real temporary state files and real isolat
 
 Target repository checks use an explicit repository path whose inspected root and Git common directory remain fixed for the workstream; coordinator cwd may differ. Deterministic coverage must verify cross-repository targeting and reject attempts to switch an active workstream's repository.
 Coordinator notepad checks must enter through the coordinator's registered tool path, verify read/add/update/remove without receipt or presentation resolution, verify the stable pending-item prefix and restoration after reload and compaction, verify legacy pending-substance migration, and verify that worker scope does not expose the tool.
-Experiment checks must establish that worker settlement leaves output in the exact owned worktree, that only an explicit coordinator release with an exact attempt and reason removes it, and that foreign or uncertain resources are refused and retained.
-Ordinary successful implementation checks must still establish composition, worker closure, exact clean worktree removal, and branch removal.
-Interrupted cleanup or composition checks must establish preserved resources and actionable recorded facts without an automatic retry.
+Retained-output checks must establish that worker settlement never changes destination HEAD or bytes; proven stopped-worker closure proceeds despite failed or malformed reports; and experiment or unapplied implementation output remains in the exact owned worktree until explicit exact release. Cancellation must release disposable experiment output after closure. Release must work after semantic completion and must refuse foreign, mismatched, or uncertain resources without deletion.
+Application checks must enter through the coordinator action with exact attempt, reported source commit, and freshly observed destination HEAD; establish current intent and authority plus existing Git cleanliness, ownership, and direct-commit checks; establish the actual resulting revision and exact worktree/branch release; and prove newer or dirty destinations remain unchanged on refusal.
+Interrupted output release or application checks must establish preserved resources and actionable recorded facts without an automatic retry.
 
-A retained report, successful tool response, or worker statement alone does not establish Git composition, artifact retention, or resource cleanup.
+A retained report, successful tool response, or worker statement alone does not establish Git application, artifact retention, or resource cleanup.
 Those claims require the exact repository revision, retained bytes, or resource identity at the dependent boundary.
 Interrupted operations can leave effects despite an uncertain response; recovery must inspect those effects before retrying.
 Delivery is recoverable and identifier-based, not exactly once.
@@ -44,7 +44,7 @@ Lease and ownership checks use real isolated SQLite storage.
 Git safety checks use disposable real repositories and preserve mismatched or unattributed resources.
 Shared read-only workers use the live project cwd, including dirty tracked and untracked files, and their settlement and recovery must not invoke Git cleanup or discard.
 Human authority tests enter through Pi's registered input/tool path, including rejection of extension-generated authority.
-Historical work keeps its original intent scope; current maintained composition requires current intent.
+Historical work keeps its original intent scope; current maintained application requires current intent.
 
 ## Packed consumer bootstrap
 

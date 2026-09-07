@@ -395,7 +395,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
   }
 });
 
-await test("experiment output remains until exact explicit coordinator release", async () => {
+await test("experiment output remains releasable after semantic completion", async () => {
   const f = await fixture();
   try {
     const active = await f.runtime();
@@ -418,6 +418,7 @@ await test("experiment output remains until exact explicit coordinator release",
       }),
     );
     await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
     let state = await runRuntime(active.effects.reconcile);
     const attempt = required(state.attempts[0], "experiment attempt");
     assert.equal(attempt.cleanup?.state, "completed");
@@ -425,12 +426,22 @@ await test("experiment output remains until exact explicit coordinator release",
       await readFile(join(required(attempt.placement, "placement").path, "probe.txt"), "utf8"),
       "retained output\n",
     );
-    assert.equal(state.results[0]?.artifacts[0]?.id, "experiment-worktree");
+    assert.equal(state.results[0]?.artifacts[0]?.id, "retained-output-worktree");
+    state = await submit(
+      active,
+      f.store.effects.complete({
+        conclusion: "The experiment answered the bounded question.",
+        evidence: [{ label: "probe", observation: "Output remains at the exact owned path." }],
+        limitations: [],
+        reasons: [],
+      }),
+    );
+    assert.equal(state.lifecycle.state, "completed");
     await runRuntime(
-      active.effects.releaseExperiment(attempt.id, "The retained observation has been reviewed."),
+      active.effects.releaseOutput(attempt.id, "The retained observation has been reviewed."),
     );
     state = await runRuntime(active.effects.reconcile);
-    assert.equal(state.attempts[0]?.experimentRelease?.state, "completed");
+    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
     assert.equal(
       (await git(f.root, "worktree", "list", "--porcelain")).includes(
         required(attempt.placement, "placement").path,
@@ -587,7 +598,7 @@ await test("cleaned history has constant reconciliation reads while error cleari
   }
 });
 
-await test("completed no-change implementations retain explicit attribution, skip composition, and clean only the isolated worker", async () => {
+await test("completed no-change implementations retain explicit attribution, skip application, and clean only the isolated worker", async () => {
   const f = await fixture();
   try {
     const active = await f.runtime();
@@ -628,7 +639,7 @@ await test("completed no-change implementations retain explicit attribution, ski
     assert.ok(result.report.kind === "implementation" && result.report.status === "completed");
     assert.equal(result.report.outcome, "no_change");
     assert.equal(result.report.revision, base);
-    assert.equal(attempt.composition, undefined);
+    assert.equal(attempt.application, undefined);
     assert.equal(attempt.cleanup?.state, "completed");
     assert.equal(f.workers.cleanupCount, 1);
     assert.equal(await f.repository.head(), base);
@@ -673,7 +684,7 @@ await test("dirty isolated trees cannot settle a successful no-change implementa
     await runRuntime(active.effects.reconcile);
     const state = await runRuntime(active.effects.reconcile);
     assert.equal(state.results[0]?.validity, "invalid");
-    assert.equal(state.attempts[0]?.composition, undefined);
+    assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(await f.repository.head(), base);
   } finally {
@@ -716,7 +727,7 @@ await test("advanced isolated trees cannot settle a successful no-change impleme
     await runRuntime(active.effects.reconcile);
     const state = await runRuntime(active.effects.reconcile);
     assert.equal(state.results[0]?.validity, "invalid");
-    assert.equal(state.attempts[0]?.composition, undefined);
+    assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(await f.repository.head(), base);
   } finally {
@@ -827,10 +838,29 @@ await test("maintained changes use guide/executor policy and review checks the r
     );
     await runRuntime(active.effects.reconcile);
     let state = await runRuntime(active.effects.reconcile);
+    const implementationAttempt = required(state.attempts[0], "implementation attempt");
+    const implementationResult = required(state.results[0], "implementation result");
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
+    assert.equal(implementationResult.validity, "typed");
+    if (
+      implementationResult.validity !== "typed" ||
+      implementationResult.report.kind !== "implementation" ||
+      implementationResult.report.status !== "completed" ||
+      implementationResult.report.outcome !== "changed"
+    )
+      assert.fail("Expected changed implementation report.");
+    const destinationHead = await git(f.root, "rev-parse", "HEAD");
+    state = await runRuntime(
+      active.effects.apply(
+        implementationAttempt.id,
+        required(implementationResult.report.commit, "reported implementation commit"),
+        destinationHead,
+      ),
+    );
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "maintained\n");
     const revision =
-      state.attempts[0]?.composition?.revision ??
-      assert.fail("Composition revision must be present.");
+      state.attempts[0]?.application?.revision ??
+      assert.fail("Application revision must be present.");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     await writeFile(join(f.root, "value.txt"), "later\n");
     await git(f.root, "add", ".");
@@ -857,7 +887,7 @@ await test("maintained changes use guide/executor policy and review checks the r
   }
 });
 
-await test("wrong-mode and stale maintained results remain retained without composition or destructive cleanup", async () => {
+await test("wrong-mode and stale maintained results remain retained without application or destructive cleanup", async () => {
   const f = await fixture();
   try {
     const active = await f.runtime();
@@ -875,7 +905,8 @@ await test("wrong-mode and stale maintained results remain retained without comp
     await runRuntime(active.effects.reconcile);
     let state = await runRuntime(active.effects.reconcile);
     assert.equal(state.results[0]?.validity, "invalid");
-    assert.equal(state.attempts[0]?.cleanup, undefined);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     f.workers.onWork = async (request) => {
       await writeFile(join(request.cwd, "value.txt"), "stale\n");
       await git(request.cwd, "add", ".");
@@ -902,9 +933,10 @@ await test("wrong-mode and stale maintained results remain retained without comp
     );
     state = await runRuntime(active.effects.reconcile);
     assert.equal(state.results[1]?.validity, "typed");
-    assert.equal(state.attempts[1]?.composition?.state, "blocked");
+    assert.equal(state.attempts[1]?.application, undefined);
+    assert.equal(state.attempts[1]?.cleanup?.state, "completed");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
-    assert.equal(f.workers.cleanupCount, 0);
+    assert.equal(f.workers.cleanupCount, 2);
     await assert.rejects(
       submit(
         active,
@@ -915,7 +947,7 @@ await test("wrong-mode and stale maintained results remain retained without comp
           reasons: [],
         }),
       ),
-      /workers and owned resources/,
+      /exactly one reason per unresolved semantic task/,
     );
   } finally {
     await f.dispose();
@@ -1278,6 +1310,43 @@ await test("owned idle-worker cancellation closes without a model turn or fabric
     assert.equal(state.results.length, 0);
     assert.equal(f.workers.interruptCount, 1);
     assert.equal(f.workers.cleanupCount, 1);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("cancelling a disposable experiment closes its worker and releases its output", async () => {
+  const f = await fixture();
+  try {
+    f.workers.deferWork = true;
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    await runRuntime(
+      active.effects.queue({
+        id: "cancel-experiment",
+        capability: "research",
+        artifactIntent: "disposable_experiment",
+        objective: "Cancel this isolated probe",
+        intentVersion: authority.intentVersion,
+        authority,
+        permittedEffects: ["Write only inside the isolated worktree"],
+        stopCondition: "Cancellation requested",
+        expectedEvidence: ["No model turn"],
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    const attempt = required((await f.store.load()).attempts[0], "experiment attempt");
+    const placement = required(attempt.placement, "experiment placement");
+    await runRuntime(active.effects.cancel(attempt.id));
+    const state = await f.store.load();
+    assert.equal(state.attempts[0]?.state, "cancelled");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
+    assert.equal(f.workers.promptCount, 0);
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      false,
+    );
   } finally {
     await f.dispose();
   }

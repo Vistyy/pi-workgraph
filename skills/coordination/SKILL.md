@@ -37,7 +37,7 @@ When intent version 0 has no human authority yet, an authorized maintained chang
 Otherwise, delegation defaults to the current intent's retained authority receipt, not the latest input.
 Check the mutation's `authorityContext.selectedScope`; when `latestObservedInput` is also present, it is newer retained context and was not claimed as the assignment's authority.
 If an explicit receipt is outside the current intent, use `workgraph_intent` first only when you judge that the human request changes semantic scope; do not infer a revision from receipt text or add an approval ceremony.
-Historical evidence retains its original scope, and only an explicit intent revision makes older maintained work stale for composition.
+Historical evidence retains its original scope, and only an explicit intent revision makes older maintained work stale for application.
 Persistent `workgraph_models` changes are separate and continue to use the latest genuine session input by default or an explicitly selected retained receipt.
 
 ## Returned work and recovery
@@ -54,11 +54,12 @@ Do not perform routine status/result polling or acknowledgement/disposition cere
 Pending notifications retry on reattachment, not every polling cycle; the same result identifier can recur after an interrupted delivery.
 Do not blindly resubmit an uncertain worker prompt.
 Inspect the retained native session and exact resource identities before deciding whether an operation needs recovery.
-Suspension stops new work and composition but preserves observations, results, and exact resources.
+Suspension stops new work and application but preserves observations, results, and exact resources.
 Adoption preserves suspension and rejects competing or uncertain ownership.
 Keep blocked work and its evidence rather than rewriting state to claim cleanup or completion.
-A completed experiment retains its complete isolated worktree.
-Release it only when no longer needed, using `workgraph_control` with `action: "release_experiment"`, its exact attempt handle, and a reason.
-Do not treat worker completion as permission to remove experiment output or retry interrupted composition or cleanup automatically.
+Worker settlement never applies output. Close a proven stopped worker even when its report is failed or malformed; inspect retained output separately.
+Apply selected current maintained output only with `workgraph_control` action `apply`, its exact attempt, exact reported `sourceCommit`, and freshly observed current `destinationHead`. This uses existing human authority and is not another approval or mandatory-review step.
+Experiments and unapplied implementations retain their complete isolated worktree. Release unselected output only when no longer needed with action `release_output`, its exact attempt, and a destructive reason; this remains available after semantic completion. Cancellation releases disposable experiment output after closure.
+Do not retry interrupted application or release automatically. Unknown or foreign resources remain retained with explicit diagnostics.
 
 When you need installation, tool, model-policy, or live-scenario details, read [README.md](../../README.md).

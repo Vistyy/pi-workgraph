@@ -614,7 +614,7 @@ export class WorkstreamStoreEffects {
     );
   }
 
-  beginComposition(input: {
+  beginApplication(input: {
     id: string;
     commit: string;
     expectedHead: string;
@@ -623,16 +623,16 @@ export class WorkstreamStoreEffects {
     return this.changeAttempt(
       input.id,
       (attempt) => {
-        if (attempt.composition) {
+        if (attempt.application) {
           if (
-            attempt.composition.state === "pending" &&
-            attempt.composition.commit === input.commit &&
-            attempt.composition.expectedHead === input.expectedHead
+            attempt.application.state === "pending" &&
+            attempt.application.commit === input.commit &&
+            attempt.application.expectedHead === input.expectedHead
           )
             return;
-          throw new Error(`Composition for ${input.id} is already recorded.`);
+          throw new Error(`Application for ${input.id} is already recorded.`);
         }
-        attempt.composition = {
+        attempt.application = {
           state: "pending",
           commit: input.commit,
           expectedHead: input.expectedHead,
@@ -642,37 +642,37 @@ export class WorkstreamStoreEffects {
     );
   }
 
-  finishComposition(id: string, revision: string, now?: Date): StoreEffect<WorkstreamState> {
+  finishApplication(id: string, revision: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
-        const composition = attempt.composition;
-        if (composition?.state === "composed") {
-          if (composition.revision === revision) return;
-          throw new Error(`Composition for ${id} has an immutable revision.`);
+        const application = attempt.application;
+        if (application?.state === "applied") {
+          if (application.revision === revision) return;
+          throw new Error(`Application for ${id} has an immutable revision.`);
         }
-        if (composition?.state !== "pending")
-          throw new Error(`Composition for ${id} is not pending.`);
-        attempt.composition = { ...composition, state: "composed", revision };
+        if (application?.state !== "pending")
+          throw new Error(`Application for ${id} is not pending.`);
+        attempt.application = { ...application, state: "applied", revision };
       },
       now,
     );
   }
 
-  blockComposition(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
+  blockApplication(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
-        requireText(error, "Composition error");
-        const composition = attempt.composition;
-        if (composition?.state === "blocked") {
-          if (composition.error === error.trim()) return;
-          throw new Error(`Composition for ${id} has contradictory failure evidence.`);
+        requireText(error, "Application error");
+        const application = attempt.application;
+        if (application?.state === "blocked") {
+          if (application.error === error.trim()) return;
+          throw new Error(`Application for ${id} has contradictory failure evidence.`);
         }
-        if (composition?.state !== "pending")
-          throw new Error(`Composition for ${id} is not pending.`);
-        attempt.composition = {
-          ...composition,
+        if (application?.state !== "pending")
+          throw new Error(`Application for ${id} is not pending.`);
+        attempt.application = {
+          ...application,
           state: "blocked",
           error: error.trim(),
         };
@@ -746,7 +746,7 @@ export class WorkstreamStoreEffects {
     );
   }
 
-  beginExperimentRelease(input: {
+  beginOutputRelease(input: {
     id: string;
     expectedHead: string;
     reason: string;
@@ -755,61 +755,67 @@ export class WorkstreamStoreEffects {
     return this.changeAttempt(
       input.id,
       (attempt, draft) => {
-        requireText(input.reason, "Experiment release reason");
+        requireText(input.reason, "Retained-output release reason");
         const assignment = requireAssignment(draft, attempt.assignmentId);
+        const releasableAssignment =
+          assignment.artifactIntent === "disposable_experiment" ||
+          assignment.capability === "implement";
         if (
-          assignment.artifactIntent !== "disposable_experiment" ||
-          attempt.state !== "settled" ||
+          !releasableAssignment ||
+          !["settled", "failed", "cancelled"].includes(attempt.state) ||
           attempt.placement?.kind !== "isolated_worktree" ||
           attempt.cleanup?.state !== "completed" ||
           !attempt.cleanup.workerClosed
         )
           throw new Error(
-            "Experiment release requires a settled owned experiment with a closed worker.",
+            "Retained-output release requires closed owned experiment or unapplied implementation output.",
           );
-        if (attempt.experimentRelease?.state === "completed") return;
+        if (attempt.outputRelease?.state === "completed") return;
         if (
-          attempt.experimentRelease !== undefined &&
-          attempt.experimentRelease.expectedHead !== input.expectedHead
+          attempt.outputRelease !== undefined &&
+          attempt.outputRelease.expectedHead !== input.expectedHead
         )
-          throw new Error("Experiment release HEAD does not match its retained identity.");
-        attempt.experimentRelease = {
+          throw new Error("Retained-output release HEAD does not match its retained identity.");
+        attempt.outputRelease = {
           state: "pending",
           expectedHead: input.expectedHead,
           reason: input.reason.trim(),
         };
       },
       input.now,
+      ["active", "suspended", "completed"],
     );
   }
 
-  finishExperimentRelease(id: string, now?: Date): StoreEffect<WorkstreamState> {
+  finishOutputRelease(id: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
-        if (attempt.experimentRelease?.state === "completed") return;
-        if (attempt.experimentRelease?.state !== "pending")
-          throw new Error(`Experiment release for ${id} is not pending.`);
-        attempt.experimentRelease = { ...attempt.experimentRelease, state: "completed" };
+        if (attempt.outputRelease?.state === "completed") return;
+        if (attempt.outputRelease?.state !== "pending")
+          throw new Error(`Retained-output release for ${id} is not pending.`);
+        attempt.outputRelease = { ...attempt.outputRelease, state: "completed" };
       },
       now,
+      ["active", "suspended", "completed"],
     );
   }
 
-  blockExperimentRelease(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
+  blockOutputRelease(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
       (attempt) => {
-        requireText(error, "Experiment release error");
-        if (attempt.experimentRelease?.state !== "pending")
-          throw new Error(`Experiment release for ${id} is not pending.`);
-        attempt.experimentRelease = {
-          ...attempt.experimentRelease,
+        requireText(error, "Retained-output release error");
+        if (attempt.outputRelease?.state !== "pending")
+          throw new Error(`Retained-output release for ${id} is not pending.`);
+        attempt.outputRelease = {
+          ...attempt.outputRelease,
           state: "blocked",
           error: error.trim(),
         };
       },
       now,
+      ["active", "suspended", "completed"],
     );
   }
 
@@ -852,6 +858,7 @@ export class WorkstreamStoreEffects {
     id: string,
     mutator: (attempt: WorkAttempt, draft: WorkstreamState, now: Date) => void,
     suppliedNow?: Date,
+    allowedStates: WorkstreamState["lifecycle"]["state"][] = ["active", "suspended"],
   ): StoreEffect<WorkstreamState> {
     return this.update(
       (draft, now) => {
@@ -861,7 +868,7 @@ export class WorkstreamStoreEffects {
         attempt.updatedAt = (suppliedNow ?? now).toISOString();
       },
       suppliedNow,
-      ["active", "suspended"],
+      allowedStates,
     );
   }
 
@@ -912,12 +919,18 @@ export class WorkstreamStoreEffects {
       (draft) => {
         const result = draft.results.find((item) => item.id === resultId);
         if (!result) throw new Error(`Unknown result ${resultId}.`);
-        if (sameValue(result.artifacts, artifacts)) return;
-        if (result.artifacts.length === 0) {
-          result.artifacts = artifacts;
+        if (
+          artifacts.every((artifact) =>
+            result.artifacts.some((retained) => sameValue(retained, artifact)),
+          )
+        )
           return;
+        for (const artifact of artifacts) {
+          const retained = result.artifacts.find((item) => item.id === artifact.id);
+          if (retained !== undefined)
+            throw new Error(`Result ${resultId} artifact ${artifact.id} is immutable.`);
         }
-        throw new Error(`Result ${resultId} artifacts are immutable after retention.`);
+        result.artifacts = [...result.artifacts, ...artifacts];
       },
       undefined,
       ["active", "suspended"],
@@ -1190,18 +1203,16 @@ function promiseFacade(effects: WorkstreamStoreEffects): WorkstreamStore {
     settleAttempt: promiseOperation((...args) => effects.settleAttempt(...args)),
     recordAttention: promiseOperation((...args) => effects.recordAttention(...args)),
     clearAttention: promiseOperation((...args) => effects.clearAttention(...args)),
-    beginComposition: promiseOperation((...args) => effects.beginComposition(...args)),
-    finishComposition: promiseOperation((...args) => effects.finishComposition(...args)),
-    blockComposition: promiseOperation((...args) => effects.blockComposition(...args)),
+    beginApplication: promiseOperation((...args) => effects.beginApplication(...args)),
+    finishApplication: promiseOperation((...args) => effects.finishApplication(...args)),
+    blockApplication: promiseOperation((...args) => effects.blockApplication(...args)),
     beginCleanup: promiseOperation((...args) => effects.beginCleanup(...args)),
     markWorkerClosed: promiseOperation((...args) => effects.markWorkerClosed(...args)),
     finishCleanup: promiseOperation((...args) => effects.finishCleanup(...args)),
     blockCleanup: promiseOperation((...args) => effects.blockCleanup(...args)),
-    beginExperimentRelease: promiseOperation((...args) => effects.beginExperimentRelease(...args)),
-    finishExperimentRelease: promiseOperation((...args) =>
-      effects.finishExperimentRelease(...args),
-    ),
-    blockExperimentRelease: promiseOperation((...args) => effects.blockExperimentRelease(...args)),
+    beginOutputRelease: promiseOperation((...args) => effects.beginOutputRelease(...args)),
+    finishOutputRelease: promiseOperation((...args) => effects.finishOutputRelease(...args)),
+    blockOutputRelease: promiseOperation((...args) => effects.blockOutputRelease(...args)),
     recordSteering: promiseOperation((...args) => effects.recordSteering(...args)),
     cancelAttempt: promiseOperation((...args) => effects.cancelAttempt(...args)),
     requestDelivery: promiseOperation((...args) => effects.requestDelivery(...args)),

@@ -409,7 +409,7 @@ function projectWorkstreamState(state: WorkstreamState) {
       resource: attempt.resource,
       error: attempt.error,
       cleanup: attempt.cleanup,
-      composition: attempt.composition,
+      application: attempt.application,
     })),
     results: state.results.map((result) => ({
       id: result.id,

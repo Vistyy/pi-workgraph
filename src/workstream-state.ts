@@ -300,10 +300,10 @@ export const AttemptSchema = Type.Object(
         { additionalProperties: false },
       ),
     ),
-    composition: Type.Optional(
+    application: Type.Optional(
       Type.Object(
         {
-          state: StringEnum(["pending", "composed", "blocked"] as const),
+          state: StringEnum(["pending", "applied", "blocked"] as const),
           commit: NonEmptyStringSchema,
           expectedHead: NonEmptyStringSchema,
           revision: Type.Optional(NonEmptyStringSchema),
@@ -323,7 +323,7 @@ export const AttemptSchema = Type.Object(
         { additionalProperties: false },
       ),
     ),
-    experimentRelease: Type.Optional(
+    outputRelease: Type.Optional(
       Type.Object(
         {
           state: StringEnum(["pending", "blocked", "completed"] as const),

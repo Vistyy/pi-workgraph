@@ -22,7 +22,6 @@ import {
   accountingIdentity,
   accountingTaskId,
   deriveCompletionAccounting,
-  hasActiveOrUncleanAttempt,
 } from "./workstream-transitions.js";
 
 type JsonPrimitive = string | number | boolean | null;
@@ -164,10 +163,18 @@ export function validateState(state: WorkstreamState): void {
   validateCompletion(state, assignmentIds, resultIds);
   if (
     state.lifecycle.state === "completed" &&
-    state.attempts.some((attempt) => hasActiveOrUncleanAttempt(state, attempt))
+    state.attempts.some(
+      (attempt) =>
+        ["queued", "starting", "running", "cancel_requested"].includes(attempt.state) ||
+        (attempt.placement !== undefined &&
+          (attempt.cleanup?.state !== "completed" ||
+            !attempt.cleanup.workerClosed ||
+            attempt.application?.state === "pending" ||
+            attempt.application?.state === "blocked")),
+    )
   )
     throw new InvalidWorkstreamStateError(
-      "Completed workstream retains an active attempt or unclean owned resource.",
+      "Completed workstream retains live execution or an unclosed worker/application boundary.",
     );
   if (state.lifecycle.state === "completed" && !state.completion)
     throw new InvalidWorkstreamStateError("Completed workstream has no completion record.");
@@ -268,7 +275,7 @@ function validateAttempts(
     }
     if (attempt.models?.selection && attempt.models.selection.selected.length === 0)
       throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} has an empty model selection.`);
-    validateExperimentRelease(state, attempt);
+    validateOutputRelease(state, attempt);
   }
 }
 
@@ -333,9 +340,9 @@ function hasLaunchOrTerminalFields(attempt: WorkAttempt): boolean {
     attempt.worker !== undefined ||
     attempt.resultId !== undefined ||
     attempt.steering !== undefined ||
-    attempt.composition !== undefined ||
+    attempt.application !== undefined ||
     attempt.cleanup !== undefined ||
-    attempt.experimentRelease !== undefined
+    attempt.outputRelease !== undefined
   );
 }
 
@@ -355,9 +362,9 @@ function validateLaunchedAttempt(attempt: WorkAttempt): void {
     throw new InvalidWorkstreamStateError(
       `Active attempt ${attempt.id} contains terminal result evidence.`,
     );
-  if (attempt.composition !== undefined && (attempt.state !== "settled" || !hasResult))
+  if (attempt.application !== undefined && (attempt.state !== "settled" || !hasResult))
     throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} composition is outside a settled result.`,
+      `Attempt ${attempt.id} application is outside a settled result.`,
     );
 }
 
@@ -400,23 +407,26 @@ function isActiveAttemptState(state: WorkAttempt["state"]): boolean {
   return state === "starting" || state === "running" || state === "cancel_requested";
 }
 
-function validateExperimentRelease(state: WorkstreamState, attempt: WorkAttempt): void {
-  const release = attempt.experimentRelease;
+function validateOutputRelease(state: WorkstreamState, attempt: WorkAttempt): void {
+  const release = attempt.outputRelease;
   if (release === undefined) return;
   const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
+  const releasableAssignment =
+    assignment?.artifactIntent === "disposable_experiment" ||
+    assignment?.capability === "implement";
   if (
-    assignment?.artifactIntent !== "disposable_experiment" ||
-    attempt.state !== "settled" ||
+    !releasableAssignment ||
+    !["settled", "failed", "cancelled"].includes(attempt.state) ||
     attempt.placement?.kind !== "isolated_worktree" ||
     attempt.cleanup?.state !== "completed" ||
     !attempt.cleanup.workerClosed
   )
     throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} experiment release is outside a settled owned experiment.`,
+      `Attempt ${attempt.id} retained-output release is outside closed owned output.`,
     );
   if ((release.state === "blocked") !== (release.error !== undefined))
     throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} experiment release blocker does not match its state.`,
+      `Attempt ${attempt.id} retained-output release blocker does not match its state.`,
     );
 }
 
@@ -439,7 +449,7 @@ function validateExperimentWorktree(
       resolve(item.placement.path) === resolve(artifact?.reference ?? ""),
   );
   if (
-    artifact?.id !== "experiment-worktree" ||
+    artifact?.id !== "retained-output-worktree" ||
     artifact.kind !== "path" ||
     artifact.retention !== "retained" ||
     attempt === undefined

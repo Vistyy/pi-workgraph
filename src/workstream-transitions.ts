@@ -154,7 +154,10 @@ export function accountingIdentity(item: CompletionAccounting): string {
 export function hasActiveOrUncleanAttempt(_state: WorkstreamState, attempt: WorkAttempt): boolean {
   if (["queued", "starting", "running", "cancel_requested"].includes(attempt.state)) return true;
   if (attempt.placement === undefined) return false;
-  return attempt.cleanup?.state !== "completed" || attempt.cleanup.workerClosed !== true;
+  if (attempt.cleanup?.state !== "completed" || attempt.cleanup.workerClosed !== true) return true;
+  if (attempt.application?.state === "pending" || attempt.application?.state === "blocked")
+    return true;
+  return attempt.outputRelease?.state === "pending" || attempt.outputRelease?.state === "blocked";
 }
 
 function assignmentResolved(state: WorkstreamState, assignment: WorkAssignment): boolean {
@@ -175,7 +178,7 @@ function attemptResolved(state: WorkstreamState, attempt: WorkAttempt): boolean 
     result.validity === "typed" &&
     result.report.status === "completed" &&
     (assignment?.capability !== "implement" ||
-      attempt.composition?.state === "composed" ||
+      attempt.application?.state === "applied" ||
       (result.report.kind === "implementation" && result.report.outcome === "no_change"))
   );
 }

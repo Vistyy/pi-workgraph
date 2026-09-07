@@ -15,7 +15,7 @@ pi -e /absolute/path/to/pi-workgraph
 ```
 
 Start from the project directory and ask the coordinator to delegate the needed work.
-Composition still requires a clean destination at the maintained-application boundary.
+Application still requires a clean destination at the maintained-application boundary.
 
 ### Coordinator Calm
 
@@ -84,16 +84,16 @@ The coordinator also keeps a session-owned pending-items notepad independently o
 The coordinator-only `workgraph_notepad` tool supports `read`, `add`, `update`, and `remove` for current id/text items. It is not a receipt, acknowledgment detector, delivery ledger, disposition, authority mutation, or auto-expiring notebook; mistaken items may be removed without presentation or receipt resolution.
 Reload, resume, branch navigation, and compaction restore the latest valid persisted notepad snapshot and inject only a compact hidden context when the branch lacks it. The stable `[WORKGRAPH PENDING ITEMS]` prefix is kept cache-friendly, and notepad state never blocks `workgraph_complete`.
 Legacy response-note snapshots migrate only pending substance; presentation, draft, resolution, and supersession history are not continued.
-An explicit semantic scope revision leaves historical evidence intact and tied to its original intent, while stale maintained output cannot compose into the current intent.
-An experiment retains its complete isolated worktree and never composes it automatically.
-Worker settlement closes the worker but does not remove experiment output.
-Only `workgraph_control` with `action: "release_experiment"`, an exact attempt handle, and a reason removes that owned worktree after the coordinator decides it is no longer needed.
+An explicit semantic scope revision leaves historical evidence intact and tied to its original intent, while stale maintained output cannot apply into the current intent.
+Worker settlement never mutates the destination repository. A stopped worker closes independently of a successful, failed, or malformed report, while experiment and unapplied implementation output remains in its exact isolated worktree.
+To select a changed implementation, call `workgraph_control` with `action: "apply"`, the exact attempt handle, its exact reported `sourceCommit`, the freshly observed current `destinationHead`, and a concise reason. This is a coordinator decision within existing human authority, not an approval or review gate. Current intent and assignment authority, source ownership and direct ancestry, destination cleanliness and exact HEAD are rechecked before mutation; the actual resulting revision and output release are recorded.
+To discard unselected output, use `action: "release_output"` with the exact attempt and a destructive reason. It applies to retained experiments and unapplied implementations, including after semantic workstream completion. Cancellation releases disposable experiment output after independently proven worker closure; unknown or foreign resources are retained with diagnostics.
 
 Implementation uses Local Prewalk in the same worker session: a guide inspects the runtime-generated repository, placement, and exact base instructions and makes the first edit, then the executor continues.
 A bounded TODO is useful telemetry, not an artificial prerequisite for accepting a valid implementation.
 Both selected models and actual message models are retained.
-A maintained result that changes code requires one clean direct commit on the assigned exact base before composition; the worker commit requirement is distinct from coordinator integration and any push authority.
-A maintained result may instead report `no_change` with a reason and the inspected base revision; the isolated worktree must be independently Git-validated clean and unchanged, and no composition is performed.
+A maintained result that changes code requires one clean direct commit on the assigned exact base before application; the worker commit requirement is distinct from coordinator integration and any push authority.
+A maintained result may instead report `no_change` with a reason and the inspected base revision; the isolated worktree must be independently Git-validated clean and unchanged, and no application is performed.
 Worker settlement, report validity, coordinator acknowledgment, and acceptance remain separate facts.
 
 ## Models
@@ -117,7 +117,7 @@ Only one runtime instance can hold a workstream lease, including within the same
 An unsuccessful adoption leaves the current attachment intact.
 Expired ownership is not sufficient for takeover when the prior owner's liveness is unknown.
 
-Suspension stops new launches and composition while retaining observations, evidence, and exact resources.
+Suspension stops new launches and application while retaining observations, evidence, and exact resources.
 Result notifications have stable identifiers and can recur after an interrupted delivery; this is not an exactly-once transport.
 The runtime records successful enqueue as delivery, but Pi exposes no supported selective cancellation or presentation/inspection receipt for one queued follow-up.
 The notice therefore describes retained-result availability, not new outstanding work; it may appear after inspection or workstream completion and must not cause reprocessing or reopening solely because it surfaced.
@@ -126,12 +126,13 @@ The runtime does not repeatedly wake the coordinator on every poll.
 Completion always refuses unfinished or blocked owned work and derives exact structured accounting for unresolved assignments, attempts, results, and undelivered results from current state.
 The coordinator supplies one explicit reason by semantic task for actual unresolved exceptions; unknown or missing reasons are rejected.
 A blocked or uncertain boundary retains its exact resources and recorded facts for coordinator-led diagnosis.
-The runtime does not automatically retry interrupted cleanup or composition, create retained-not-applied refs, or repair exceptional state.
+The runtime does not automatically retry interrupted cleanup or application, create retained-not-applied refs, or repair exceptional state.
 Routine completion does not require acknowledgement or disposition; inspection is read-only and semantic acceptance remains a separate coordinator judgment.
 Blocked work is preserved for inspection rather than force-deleted.
 
-`workgraph_control` supports one destructive retained-output operation: `release_experiment` requires an exact attempt handle and reason and removes only that attempt’s verified owned worktree and branch.
-Use a semantic task handle for control; repeated attempts require an explicit attempt handle and never silently select one.
+`workgraph_control` has one narrow destination mutation, `apply`, which requires the exact attempt, source commit, and current destination HEAD. It has no acceptance ledger, approval object, mandatory review, or additional human gate.
+Its destructive `release_output` action requires an exact attempt handle and reason and removes only that attempt’s verified owned worktree and branch. It remains available after completion while the scoped owner is attached; a later coordinator may adopt the retained terminal workstream under the existing fenced ownership rules.
+Use a semantic task handle for ordinary control; apply and release always require an explicit attempt handle and never silently select one.
 Repeated inspections preserve delivery provenance and expose exact native, resource, cleanup, Git, applied-versus-reported revision, blocker, and uncertainty evidence.
 
 The CLI provides read-only state inspection and explicit conversation forking:
@@ -182,14 +183,14 @@ The shared blocking policy rejects non-null assertions, assertions to `never`, a
 A natural-use verification request should state the desired outcome, constraints, and uncertainty to resolve without naming Workgraph tools, worker counts, or model panels.
 The explicitly optional `pnpm smoke:natural` UX observation asks the coordinator to resolve whether a disposable parser probe is justified and, only if it is, make one authorized small change.
 It checks native request settlement, the actual direct or delegated strategy, exact bytes, retained outputs when present, and independent isolated worktree, branch, and workspace absence.
-A natural pass is evidence of caller usability only and is never a substitute for the fixed capability scenario's lifecycle, composition, or model-transition coverage.
+A natural pass is evidence of caller usability only and is never a substitute for the fixed capability scenario's lifecycle, application, or model-transition coverage.
 `pnpm pack --dry-run` verifies the published file list but not dependency resolution or executable startup in an installed consumer; [VERIFICATION.md](VERIFICATION.md) gives the disposable packed-consumer check.
 
-Run live scenarios only from a Herdr-managed pane, against a clean committed candidate when the scenario itself requires composition.
+Run live scenarios only from a Herdr-managed pane, against a clean committed candidate when the scenario itself requires application.
 Shared research is separately expected to start with local tracked or untracked changes and leave those bytes untouched after native worker closure and retry.
 `smoke:herdr` starts idle Pi sessions without harness prompt submissions and checks native parent/fork identity, a distinct no-focus coordinator workspace, child tab-scoped workers, cleanup refusal for mismatched identity, and Herdr closure before Git removal.
 It does not claim to measure provider-side model requests.
-`smoke:coordinator` submits one authorized request through a normal visible Pi coordinator and observes automatic handling of research, retained experiment worktrees/non-composition, implementation with guide/executor messages, concurrent research, review launched against the exact implementation revision, and resource cleanup.
+`smoke:coordinator` submits one authorized request through a normal visible Pi coordinator and observes research, retained experiment output, coordinator-selected explicit application, implementation guide/executor messages, concurrent research, review launched against the exact applied revision, and resource cleanup.
 It requires authenticated configured models and does not supply later approval or progress nudges.
 Before either model-driven scenario submits its request, it prints and privately records selected models and the expected attempt shape without imposing automatic model or retry decisions.
 Available usage and cost attached to native assistant messages are recorded with an explicit limitation that provider-side requests or accounting may be unavailable.

@@ -80,7 +80,7 @@ try {
         (attempt) =>
           attempt.error !== undefined ||
           attempt.cleanup?.state === "blocked" ||
-          attempt.composition?.state === "blocked",
+          attempt.application?.state === "blocked",
       );
       if (blocked !== undefined)
         throw new Error(`Attempt requires reconciliation: ${JSON.stringify(blocked)}`);
@@ -165,7 +165,7 @@ try {
   assert.ok(implementation !== undefined);
   assert.ok(review !== undefined);
   assert.ok(concurrent !== undefined);
-  assert.equal(review.baseRevision, implementation.composition?.revision);
+  assert.equal(review.baseRevision, implementation.application?.revision);
   assert.equal(review.baseRevision, await command(f.root, "git", ["rev-parse", "HEAD"]));
   const implementationResult = state.results.find(
     (result) => result.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
