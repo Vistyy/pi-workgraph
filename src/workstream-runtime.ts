@@ -95,7 +95,7 @@ export class RuntimeOperationError extends Data.TaggedError("RuntimeOperationErr
   }
 }
 
-export class RuntimeStoppedError extends Data.TaggedError("RuntimeStoppedError")<{
+class RuntimeStoppedError extends Data.TaggedError("RuntimeStoppedError")<{
   readonly message: string;
 }> {}
 

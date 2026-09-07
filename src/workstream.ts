@@ -81,12 +81,7 @@ export type {
   WorkstreamStoreError,
   WorkstreamStoreRequirements,
 };
-export {
-  InvalidWorkstreamStateError,
-  UnsupportedWorkstreamStateError,
-  WORKSTREAM_STATE_VERSION,
-  WorkstreamStateSchema,
-};
+export { InvalidWorkstreamStateError, UnsupportedWorkstreamStateError, WorkstreamStateSchema };
 
 type OmitEach<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 type AssignmentInput = OmitEach<WorkAssignment, "createdAt">;

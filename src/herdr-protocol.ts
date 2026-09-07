@@ -28,7 +28,7 @@ export class HerdrProtocolError extends Data.TaggedError("HerdrProtocolError")<{
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Each supplied decoder validates this raw Herdr protocol value.
 export type HerdrResponseDecoder<Decoded> = (value: unknown) => Decoded;
 
-export class InvalidInspection extends Data.TaggedClass("InvalidInspection")<{
+class InvalidInspection extends Data.TaggedClass("InvalidInspection")<{
   readonly message: string;
 }> {}
 
@@ -89,7 +89,7 @@ export class HerdrCommandTransport {
   }
 }
 
-export function operationName(args: readonly string[]): string {
+function operationName(args: readonly string[]): string {
   return args.slice(0, 2).join(" ") || "availability";
 }
 
@@ -165,7 +165,7 @@ export function decodeInspection<Decoded>(
   });
 }
 
-export function decodeCommandResponse<Decoded>(
+function decodeCommandResponse<Decoded>(
   result: HerdrCommandResult,
   args: string[],
   decode: HerdrResponseDecoder<Decoded>,

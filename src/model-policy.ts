@@ -15,11 +15,7 @@ export const MODEL_ROLES = [
   "implementation.executor",
   "review",
 ] as const;
-export const MODEL_LIST_ROLES = ["research", "review"] as const;
-export const IMPLEMENTATION_MODEL_ROLES = [
-  "implementation.guide",
-  "implementation.executor",
-] as const;
+const MODEL_LIST_ROLES = ["research", "review"] as const;
 export type ModelRole = (typeof MODEL_ROLES)[number];
 export const ThinkingSchema = StringEnum([
   "off",
@@ -74,10 +70,10 @@ export class ModelPolicyError extends Data.TaggedError("ModelPolicyError")<{
   override readonly name = "Error";
 }
 
-export const DEFAULT_RESEARCH_MODELS: ModelTargetList = [
+const DEFAULT_RESEARCH_MODELS: ModelTargetList = [
   { model: "openai-codex/gpt-5.6-luna", thinking: "high" },
 ];
-export const DEFAULT_REVIEW_MODELS: ModelTargetList = [
+const DEFAULT_REVIEW_MODELS: ModelTargetList = [
   { model: "openai-codex/gpt-5.6-terra", thinking: "high" },
   { model: "opencode-go/deepseek-v4-flash", thinking: "high" },
   { model: "opencode-go/glm-5.3-flash", thinking: "high" },

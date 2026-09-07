@@ -10,7 +10,7 @@ import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import type { SessionIdentity, WorkstreamState } from "./workstream.js";
 
-export const LEASE_DURATION_MS = 30_000;
+const LEASE_DURATION_MS = 30_000;
 export type LeaseOwner = SessionIdentity;
 export interface Lease {
   runId: string;

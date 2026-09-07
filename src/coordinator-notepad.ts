@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 
-export const HUMAN_INPUT_ENTRY = "pi-workgraph-human-input";
+const HUMAN_INPUT_ENTRY = "pi-workgraph-human-input";
 const NOTEPAD_STATE_ENTRY = "pi-workgraph-coordinator-notepad-state";
 const LEGACY_NOTE_STATE_ENTRY = "pi-workgraph-coordinator-note-state";
 const NOTEPAD_PREFIX = "[WORKGRAPH PENDING ITEMS]";

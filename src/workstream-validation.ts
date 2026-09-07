@@ -621,7 +621,7 @@ export function requireText(value: string, label: string): void {
   if (!value.trim()) throw new Error(`${label} is required.`);
 }
 
-export function unique(values: string[], label: string): Set<string> {
+function unique(values: string[], label: string): Set<string> {
   const result = new Set(values);
   if (result.size !== values.length)
     throw new InvalidWorkstreamStateError(`Duplicate ${label} id.`);

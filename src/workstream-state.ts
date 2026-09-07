@@ -16,14 +16,14 @@ export function pathForWorkstream(gitCommonDir: string, id: string): string {
 
 const NonEmptyStringSchema = Type.String({ minLength: 1 });
 const TimestampSchema = Type.String({ minLength: 1 });
-export const SessionIdentitySchema = Type.Object(
+const SessionIdentitySchema = Type.Object(
   {
     sessionId: NonEmptyStringSchema,
     sessionFile: NonEmptyStringSchema,
   },
   { additionalProperties: false },
 );
-export const LifecycleSchema = Type.Object(
+const LifecycleSchema = Type.Object(
   {
     state: StringEnum(["active", "suspended", "completed", "abandoned", "archived"] as const),
     changedAt: TimestampSchema,
@@ -31,7 +31,7 @@ export const LifecycleSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const HumanInputReceiptSchema = Type.Object(
+const HumanInputReceiptSchema = Type.Object(
   {
     id: NonEmptyStringSchema,
     sessionId: NonEmptyStringSchema,
@@ -42,7 +42,7 @@ export const HumanInputReceiptSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const IntentSchema = Type.Object(
+const IntentSchema = Type.Object(
   {
     version: Type.Integer({ minimum: 0 }),
     statement: NonEmptyStringSchema,
@@ -52,7 +52,7 @@ export const IntentSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const AuthorityReferenceSchema = Type.Object(
+const AuthorityReferenceSchema = Type.Object(
   {
     receiptId: NonEmptyStringSchema,
     intentVersion: Type.Integer({ minimum: 1 }),
@@ -140,7 +140,7 @@ export const AssignmentSchema = Type.Union([
   ImplementationAssignmentSchema,
   ReviewAssignmentSchema,
 ]);
-export const ArtifactSchema = Type.Object(
+const ArtifactSchema = Type.Object(
   {
     id: NonEmptyStringSchema,
     kind: StringEnum(["path", "revision", "reference"] as const),
@@ -191,7 +191,7 @@ export const ResultSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-export const SelectionReceiptSchema = Type.Object(
+const SelectionReceiptSchema = Type.Object(
   {
     role: StringEnum(["research", "review"] as const),
     requested: Type.Integer({ minimum: 1 }),
@@ -203,7 +203,7 @@ export const SelectionReceiptSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const ModelsSchema = Type.Object(
+const ModelsSchema = Type.Object(
   {
     guide: ModelTargetSchema,
     executor: Type.Optional(ModelTargetSchema),
@@ -213,7 +213,7 @@ export const ModelsSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const ResourceSchema = Type.Object(
+const ResourceSchema = Type.Object(
   {
     workspaceId: NonEmptyStringSchema,
     tabId: NonEmptyStringSchema,
@@ -241,7 +241,7 @@ export const AttemptPlacementSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-export const AttemptSchema = Type.Object(
+const AttemptSchema = Type.Object(
   {
     id: NonEmptyStringSchema,
     assignmentId: NonEmptyStringSchema,
@@ -353,7 +353,7 @@ export const AttemptSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const DeliverySchema = Type.Object(
+const DeliverySchema = Type.Object(
   {
     resultId: NonEmptyStringSchema,
     state: StringEnum(["pending", "delivered"] as const),
@@ -372,7 +372,7 @@ export const DeliverySchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const CompletionAccountingSchema = Type.Union([
+const CompletionAccountingSchema = Type.Union([
   Type.Object(
     {
       kind: Type.Literal("unresolved_assignment"),
@@ -406,7 +406,7 @@ export const CompletionAccountingSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-export const CompletionSchema = Type.Object(
+const CompletionSchema = Type.Object(
   {
     conclusion: NonEmptyStringSchema,
     evidence: Type.Array(EvidenceSchema, { minItems: 1 }),

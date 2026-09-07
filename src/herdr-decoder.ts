@@ -1,7 +1,7 @@
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
-export const AgentStatusSchema = Type.Union([
+const AgentStatusSchema = Type.Union([
   Type.Literal("idle"),
   Type.Literal("working"),
   Type.Literal("blocked"),
@@ -139,15 +139,6 @@ export function decodeAgent(value: unknown): DecodedAgent {
     throw invalidAgentShape(detail);
   }
   return Value.Decode(AgentSchema, value);
-}
-
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This named decoder validates a raw Herdr protocol boundary.
-export function decodeCoordinatorAgent(value: unknown): DecodedCoordinatorAgent {
-  if (!Value.Check(CoordinatorAgentSchema, value)) {
-    const detail = [...Value.Errors(CoordinatorAgentSchema, value)][0]?.message ?? "invalid shape";
-    throw invalidAgentShape(detail);
-  }
-  return Value.Decode(CoordinatorAgentSchema, value);
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This named decoder validates the complete Herdr agent response.

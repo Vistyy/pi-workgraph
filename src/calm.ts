@@ -56,7 +56,7 @@ export const DEFAULT_CALM_HIDDEN_TOOLS = [
   "herdr_rename",
 ] as const;
 
-export const CALM_OPERATIONAL_MESSAGE_TYPES = [
+const CALM_OPERATIONAL_MESSAGE_TYPES = [
   "pi-workgraph-workstream",
   "pi-workgraph-attention",
 ] as const;

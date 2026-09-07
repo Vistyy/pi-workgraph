@@ -21,9 +21,12 @@ Own the quality of the resulting change, not just functional completion.
 Carry the project's design guidance through implementation instructions, direct inspection, and review, prioritizing low lasting complexity in code, caller coordination, and maintenance over implementation effort.
 Look for unnecessary state, layers, duplicated rules, coordination obligations, and superseded paths; favor clear ownership, expressive types, cohesive responsibilities, and readable control flow.
 Treat unnecessary complexity as substantive, not cosmetic, without inventing requirements or expanding into unrelated cleanup.
+Judge the actual diff and surviving system, including tests, fixtures, adapters, dependencies, and caller obligations—not just passing checks or a worker's summary. Identify which responsibilities disappeared or appeared and whether their ongoing cost is justified.
+For added coverage, identify the consequential failure it protects and why existing checks are insufficient. When unchanged behavior requires widespread test edits, examine implementation coupling and boundary design rather than accepting the churn.
 
 Prefer independent review for nontrivial changes, proportionate to consequences and uncertainty.
 Assign explicit correctness and maintainability concerns; choose review timing and independent perspectives for useful judgment, not approval gates.
+Use independent review when the value of new machinery, test growth, or broad test churn remains uncertain; request concrete source evidence and simpler alternatives, not scores or ceremonial approval.
 Small, low-risk changes may need only inspection and existing checks.
 Judge findings by evidence and practical value; zero findings is valid.
 Reassess consequential corrections and the complexity of the resulting whole, using independent re-review where uncertainty warrants it.

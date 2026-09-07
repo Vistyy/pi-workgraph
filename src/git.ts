@@ -64,11 +64,11 @@ interface GitClient {
   readonly text: (cwd: string, args: readonly string[], allowEmpty?: boolean) => GitEffect<string>;
 }
 
-export class GitOperationError extends Data.TaggedError("GitOperationError")<{
+class GitOperationError extends Data.TaggedError("GitOperationError")<{
   readonly message: string;
 }> {}
 
-export class GitFileSystemError extends Data.TaggedError("GitFileSystemError")<{
+class GitFileSystemError extends Data.TaggedError("GitFileSystemError")<{
   readonly message: string;
   readonly code: string;
 }> {}

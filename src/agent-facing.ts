@@ -81,7 +81,7 @@ interface Selection {
   taskOutcomes: WorkResult[];
 }
 
-export function compactText(value: string, max = PREVIEW_CHARS): string {
+function compactText(value: string, max = PREVIEW_CHARS): string {
   const text = value.replace(/\s+/g, " ").trim();
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }

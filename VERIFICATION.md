@@ -9,7 +9,7 @@ Herdr's idle/done observation can lag Pi events; native attempt-generation marke
 
 ## Static and deterministic checks
 
-`pnpm check` is the maintained local and CI boundary for quality preparation, shared Biome, type-aware Effect Oxlint, and all deterministic `node:test` tests.
+`pnpm check` is the maintained local and CI boundary for quality preparation, shared Biome, type-aware Effect Oxlint, the pinned Knip export check, and all deterministic `node:test` tests. The Knip check uses `knip.json` with explicit `src/cli.ts`, `extensions/**/*.ts`, `test/**/*.test.ts`, and `scripts/live/**/*.ts` roots; it has no ignore list or custom plugin and is an export-boundary check, not a second test suite.
 `pnpm typecheck` runs `tsc --noEmit` independently and can expose compiler compatibility diagnostics, but it is not part of `pnpm check` because Oxlint already performs the full type-aware check over the configured source set.
 The project pins pnpm `11.25.0` and `@syzom/typescript-quality` `0.2.0`, so evidence from another package-manager or shared-config version is not evidence for the committed lockfile.
 The only test-framework quality override disables `effecttsgo/async-function` for `test/**/*.test.ts` because `node:test` callbacks and standalone test runners expose Promise contracts.
