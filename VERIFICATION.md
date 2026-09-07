@@ -1,91 +1,53 @@
 # Workgraph verification boundaries
 
-## Pi and Herdr
+This document owns project-specific evidence requirements, not a mandatory test pipeline or harness architecture. Choose the smallest check that establishes the affected claim through a supported interface. Passing component tests does not establish a complete workflow; running an autonomous model does not make weak assertions stronger.
 
-Deterministic adapters cannot establish ordinary Pi package loading, native Herdr identity, automatic coordinator continuation, or an actual guide-to-executor model transition.
-Changes to those boundaries need a normal visible Pi operation against the exact candidate in addition to focused contract checks.
-A missing integration, trust prompt, unavailable model, or absent native identity is an evidence limitation, not permission to bypass approval or claim settlement.
-Herdr's idle/done observation can lag Pi events; native attempt-generation markers establish settlement.
-Worker prewalk verification must distinguish the immutable current-attempt objective from the editable plan, named reconciliation delivery from its persisted reminder budget, and a terminal native settlement from a pending follow-up. Deterministic checks can establish shape, identity filtering, restoration, terminal/no-action behavior, and delivery options; any native lifecycle claim still needs a normal visible Pi observation recorded with its exact limitations in the work report.
+## Consequential guarantees
 
-## Static and deterministic checks
+- **Authority and repository identity:** maintained work uses genuine human input and current intent. Reports, notifications, and plans cannot authorize scope changes. Exercise authority checks through the registered input/tool boundary. A workstream's inspected repository root and Git common directory remain fixed even when coordinator cwd differs.
+- **Isolation and application:** worker settlement must not change destination HEAD or bytes. Corrections preserve the complete candidate history; application checks exact source, root, current intent, clean destination, and observed Git postconditions. Destination movement must refuse without mutation until an explicit isolated integration is prepared against the new base. Review evidence belongs to the revision actually inspected or executed, not a later candidate.
+- **Separate lifetimes:** stopped-worker closure, retained output, and semantic completion are distinct. Failed reports must not strand a proven stopped worker. Cancellation preserves experiment output until explicit release. Release must remain possible after completion and must refuse foreign, mismatched, dirty-mismatched, or uncertain resources.
+- **Recovery and ownership:** verify exact native/Git identities before destructive effects. A failed or interrupted response may follow a successful operation; inspect before retrying. Assert that forbidden application, deletion, or duplicate submission never occurs, including mid-flight. An expired lease alone is not proof that its owner is dead.
+- **Persistence and privacy:** verify transaction rollback, serialization, and lease fencing with real private per-workstream SQLite storage. The global registry is a locator, not a lease owner. Database files must be private (`0600` within `0700` directories), including journal/WAL sidecars. Historical inspection must not rewrite records; supported imports must preserve source and reject uncertain ownership or destination collisions.
+- **Context and delivery:** distinguish immutable assignment authority from mutable worker plans and coordinator reminders. Restore only the intended attempt/session state. A queued notification is not proof of a new model turn, understanding, or acceptance; recurring delivery is not new work. Preserve malformed/absent-report uncertainty without leaking raw provider errors or credentials.
 
-`pnpm check` is the maintained local and CI boundary for quality preparation, shared Biome, type-aware Effect Oxlint, the pinned Knip export check, and all deterministic `node:test` tests. The Knip check uses `knip.json` with explicit `src/cli.ts`, `extensions/**/*.ts`, `test/**/*.test.ts`, and `scripts/live/**/*.ts` roots; it has no ignore list or custom plugin and is an export-boundary check, not a second test suite.
-`pnpm typecheck` runs `tsc --noEmit` independently and can expose compiler compatibility diagnostics, but it is not part of `pnpm check` because Oxlint already performs the full type-aware check over the configured source set.
-The project pins pnpm `11.25.0` and `@syzom/typescript-quality` `0.2.0`, so evidence from another package-manager or shared-config version is not evidence for the committed lockfile.
-The only test-framework quality override disables `effecttsgo/async-function` for `test/**/*.test.ts` because `node:test` callbacks and standalone test runners expose Promise contracts.
-That override leaves every other shared and Effect rule active, and Oxlint rejects obsolete inline disable directives as errors.
-A focused test file can establish its own behavior but cannot replace the full source-selection and unused-directive coverage of `pnpm check`.
+## Evidence boundaries
 
-## Effect lifecycle boundaries
+Start from the supported entry point for the behavior: a coordinator tool, worker tool, CLI, or native integration. Assert externally meaningful results and forbidden effects rather than internal helper calls, incidental wording, or collection order.
 
-Process ownership claims require real child-process checks for normal completion, spawn failure, bounded output and digesting, timeout escalation, pre-aborted launch prevention, and interruption that waits for close.
-The pinned `@effect/platform-node-shared` rc112 Windows spawner unconditionally invokes `taskkill /T /F` even with `detached: false`, so it cannot replace this native process boundary without reintroducing a Windows ownership regression. Keep the `node:child_process` adapter inside the existing Effect scope so one owner controls termination and close without a second backend.
-Promise-level success or rejection alone does not establish that the scoped Effect owner released the native process.
-Runtime scheduling tests may inject Effect's `TestClock`, but fenced lease checks still cross the native SQLite and wall-clock boundary and must align their fixture time explicitly.
-Workstream persistence claims require real temporary private per-workstream SQLite storage because an in-memory adapter cannot establish transaction serialization, aggregate/lease atomicity, rollback, or fenced ownership. The canonical database must be `0600` inside `0700` workstream directories, and rollback-journal/WAL sidecars must not become a privacy escape. Historical JSON checks read raw bytes without rewriting them; current JSON import checks exact identity, authoritative dead-owner proof, source readback, and collision refusal.
+| Claim | Evidence needed |
+| --- | --- |
+| Candidate preparation, correction, application, release, or recovery | Tool-driven flow with real temporary Git repositories and persisted state; inspect exact commits, bytes, worktrees, and resource ownership. Controlled worker responses may remove model variability, but must not replace the Git/persistence behavior being claimed. |
+| Process termination and resource lifetime | Real child processes; check interruption, bounded output, timeout behavior, and close before release. Promise settlement alone is insufficient. |
+| Pi loading, tool registration, model switching, result-driven continuation, or Herdr identity | Exercise the relevant real Pi/Herdr integration. Mocked callbacks establish only local contracts. A controlled provider may supply deterministic responses while real session/transport behavior executes; prove that seam rather than assuming it works. |
+| Model interpretation, delegation choices, instruction-following, or autonomous recovery | A real-model observation with disclosed model/settings and a bounded task. Treat the result as evidence about that configuration, not a deterministic correctness oracle. |
+| Packaged startup | Install the built package into a disposable consumer and invoke its supported entry point outside the checkout. A file-list check alone does not establish loading. |
 
-## Persistence and external effects
+These are claim boundaries, not required layers for every change. Keep focused component tests when they protect a consequential failure that a flow check cannot adequately distinguish. Use temporary probes when permanent fixtures would cost more than their protection warrants.
 
-Target repository checks use an explicit repository path whose inspected root and Git common directory remain fixed for the workstream; coordinator cwd may differ. Deterministic coverage must verify cross-repository targeting and reject attempts to switch an active workstream's repository.
-Coordinator notepad checks must enter through the coordinator's registered tool path, verify read/add/update/remove without receipt or presentation resolution, verify the stable pending-item prefix and restoration after reload and compaction, verify legacy pending-substance migration, and verify that worker scope does not expose the tool.
-Retained-output checks must establish that worker settlement never changes destination HEAD or bytes; proven stopped-worker closure proceeds despite failed or malformed reports; and experiment or unapplied implementation output remains in the exact owned worktree until explicit exact release. Cancellation must close the worker while preserving disposable experiment output until the coordinator explicitly releases it. Release must work through semantic completion and must refuse foreign, mismatched, or uncertain resources without deletion.
-Application checks must enter through the coordinator action with exact attempt, reported source commit, and freshly observed destination HEAD; establish current intent and authority plus existing Git cleanliness, ownership, and direct-commit checks; establish the actual resulting revision and exact worktree/branch release; and prove newer or dirty destinations remain unchanged on refusal. Candidate-chain checks must validate the exact root, parent attempt, current intent, direct one-commit increments, and complete ordered commit list; applying a correction must preserve every candidate commit rather than squash or cherry-pick only the last one. A moved destination must refuse without changing HEAD, bytes, or candidate resources, while an explicit isolated integration attempt must be rooted at the freshly observed destination and apply only its new current-base commit.
-Interrupted output release or application checks must establish preserved resources and actionable recorded facts without an automatic retry.
+## Bounded native checks
 
-A retained report, successful tool response, or worker statement alone does not establish Git application, artifact retention, or resource cleanup.
-Those claims require the exact repository revision, retained bytes, or resource identity at the dependent boundary.
-Interrupted operations can leave effects despite an uncertain response; recovery must inspect those effects before retrying.
-Delivery is recoverable and identifier-based, not exactly once.
-Tests must distinguish notification transport, explicit coordinator receipt, report validity, and evidence disposition.
-When a current native attempt has no report text, `test/pi-process.test.ts` establishes latest-message and generation-local failure categorization, while `test/native-failure.test.ts` establishes the retained and projected absent-result details.
-Those checks must establish that raw provider errors and credentials do not enter retained state or notifications and that typed or untyped results remain authoritative when present.
-The bounded category is actionable context, not proof of the provider's underlying cause.
+Every native/model check needs a concrete outcome, operation-specific deadlines, and an overall stopping condition. Report the last completed boundary and the operation that stalled; do not hide all failures behind one long convergence timeout.
 
-Lease and ownership checks use real isolated per-workstream SQLite storage. The global registry records fresh locators in its current table, reads historical locator rows as a fallback, and leaves historical tables untouched; it must not contain or decide a live lease.
-Git safety checks use disposable real repositories and preserve mismatched or unattributed resources.
-Shared read-only workers use the live project cwd, including dirty tracked and untracked files, and their settlement and recovery must not invoke Git cleanup or discard.
-Human authority tests enter through Pi's registered input/tool path, including rejection of extension-generated authority.
-Worker prewalk checks enter through the registered `workgraph_plan` tool: enforce the bounded shape, restore only the exact current attempt, ignore malformed/foreign snapshots safely, expose one current model-visible snapshot after reload and compaction, allow executor revision, and cap unfinished-plan reminders without blocking truthful failure, escalation, or no-change behavior. Plan statuses and reminder counts are navigation evidence only; Git/report boundaries remain the proof obligations.
-Historical work keeps its original intent scope; current maintained application requires current intent.
+Checkpoint owned workspace, pane, terminal, session, worktree, and branch identities as they become available. On success or failure, establish native closure before deleting verified disposable resources or copied credentials. Preserve useful private diagnostics and any resources whose ownership or liveness remains uncertain. Never change user-global model configuration, credentials, or trust settings to make a check pass.
 
-## Packed consumer bootstrap
+Classify failures as demonstrated product defects, provider/model failures, harness/environment failures, or unresolved. Record the evidence and its limits. Do not retry automatically until a model happens to succeed, or require unrelated changes to fix an unproven failure elsewhere.
 
-`pnpm pack --dry-run` establishes the intended published file list but does not establish that an installed consumer can resolve the package-owned `tsx` loader or start the executable outside the checkout.
-Use a disposable consumer, install the exact generated tarball without lifecycle scripts, and invoke its installed binary from an unrelated working directory:
+An autonomous coordinator scenario is not the routine integration gate. Use it when model behavior or a specific reproduced coordination problem is the subject. Deterministic orchestration through real supported interfaces and focused native checks should establish mechanical behavior without requiring a model to choose every test step.
 
-```bash
-set -eu
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-pnpm pack --pack-destination "$tmp" >/dev/null
-tarball=$(find "$tmp" -maxdepth 1 -name '*.tgz' -print -quit)
-printf '{"private":true}\n' > "$tmp/package.json"
-(
-  cd "$tmp"
-  pnpm add --ignore-scripts "$tarball" >/dev/null
-  mkdir caller
-  cd caller
-  ../node_modules/.bin/pi-workgraph --help
-)
-```
+## Selecting checks
 
-A successful JSON help response establishes packaged loader resolution and basic CLI startup without running install hooks or relying on the repository's `node_modules` lookup.
-It does not establish Pi package loading or any live Herdr behavior.
+The maintained static/deterministic command is `pnpm check`; `pnpm typecheck` is the independent compiler diagnostic. [package.json](package.json) owns executable commands and pinned tooling. Existing smoke scripts are available mechanisms, not obligations to run all of them.
 
-## Environment and limits
+For a change, identify the affected guarantee and the evidence missing for it. Run applicable checks, resolve concrete failures, and stop when that evidence is sufficient. Do not repeat expensive checks solely because another review or tool call occurred. A pure state-predicate refactor ordinarily needs deterministic workflow/regression evidence, not another autonomous coordinator run. A native notification change needs a real continuation observation, not only a test asserting `triggerTurn: true`.
 
-The `scripts/live/` harness and native, capability, and natural entrypoints are source-checkout development tooling and are excluded from the published package.
-The native scenario protects the cheap Herdr/Pi identity boundary without harness prompt submissions, while the model-driven capability scenario protects the fixed lifecycle boundary.
-The natural scenario is an explicitly optional UX observation and is not a lifecycle or release gate.
-Live evidence is specific to the tested Node.js, Pi, Git, Herdr, model configuration, and candidate revision.
-Before model submission, the runners disclose the selected coordinator and policy models and whether attempt count is fixed or strategy-dependent.
-They retain available native assistant-message usage and cost, but do not treat that as measurement of hidden provider requests or unavailable provider-side accounting.
-Implementation and disposable experiments use isolated worktrees, while ordinary read-only research and non-revision review use the live project cwd. Exact-revision review uses an owned isolated worktree checked out at the requested SHA and verifies both its Git HEAD and filesystem bytes.
-Worktree isolation does not constrain arbitrary filesystem, network, or credential access by a worker.
-An exact-revision review is verified by Git evidence for that revision; tests run against live working files do not validate another revision.
-Verification fixtures must not change user-global configuration or trust decisions, and retained credential-bearing evidence must stay private.
-Fixture construction checkpoints exact paths and Herdr handles as soon as they are known so a pre-return failure remains actionable without blind cleanup.
-After independently verified successful resource closure, the harness removes only copied agent credential/configuration files and preserves useful private evidence.
-On failure it preserves exact reconciliation evidence and records identity-aware cleanup instructions.
-A natural-scenario cleanup claim additionally requires independent absence checks for every isolated worktree path and branch.
+Retain prior evidence only for unchanged boundaries and identify the exact revision checked. If the combined behavior changed, verify the affected combination. Behavior-preserving refactors should ordinarily preserve behavior tests; widespread fixture churn is a reason to reconsider coupling, not to add more scaffolding.
+
+## Integration limitations
+
+- Herdr idle/done observation can lag Pi events. Use attempt-generation settlement evidence and exact identity when interpreting worker state.
+- Git worktrees isolate checkouts, not arbitrary filesystem, network, or credential access. Tests must not claim sandbox guarantees.
+- Native evidence depends on the tested Pi, Herdr, Git, OS, provider, and model configuration. Native assistant-message usage does not measure hidden provider requests or unavailable billing data.
+- The pinned Effect platform spawner's Windows behavior includes unconditional `taskkill /T /F`; any process-adapter replacement must establish ownership-safe termination rather than assuming library substitution preserves it.
+
+[OPERATIONS.md](OPERATIONS.md) owns inspection and recovery procedures. Verification reports retain concrete results and unresolved limitations; this document should not accumulate run history, test inventories, or a second workflow implementation.
