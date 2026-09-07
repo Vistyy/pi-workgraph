@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Git worktrees require the host's Node path semantics.
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import {
   Cause,
   type Clock,
@@ -18,7 +18,6 @@ import {
   Schedule,
 } from "effect";
 import type { PlatformError } from "effect/PlatformError";
-import { ArtifactStore, type ArtifactStoreError } from "./artifact-store.js";
 import type { GitFailure, GitRepository, WorktreePlacement } from "./git.js";
 import {
   type HerdrProtocolError,
@@ -26,7 +25,6 @@ import {
   legacyHerdrAgentName,
   legacyObjectiveHerdrWorkerName,
   type WorkerLaunchEffectRequest,
-  type WorkerLaunchInspectionRequest,
   type WorkerLaunchReadinessError,
   type WorkerRecoveryRequest,
 } from "./herdr.js";
@@ -45,7 +43,6 @@ import type {
 import { LeaseDecisionRequiredError, type LeaseOwner, type WorkgraphRegistry } from "./registry.js";
 import type { ThinkingLevel } from "./types.js";
 import type {
-  ArtifactRetention,
   StoreEffect,
   WorkAssignment,
   WorkAttempt,
@@ -54,10 +51,6 @@ import type {
   WorkstreamStore,
   WorkstreamStoreEffects,
   WorkstreamStoreError,
-} from "./workstream.js";
-import {
-  isLegacyArtifactRetentionFailure,
-  legacyArtifactRetentionLimitation,
 } from "./workstream.js";
 import {
   makeRuntimeLayer,
@@ -93,8 +86,6 @@ export interface RuntimeOwnership {
   owner?: LeaseOwner;
   priorOwnerLiveness?: "alive" | "dead" | "unknown";
   policy?: ModelPolicy;
-  /** Artifact byte service override; production composes ArtifactStore.layer with the runtime Node layer. */
-  artifactStoreLayer?: Parameters<typeof makeRuntimeLayer>[0]["artifactStoreLayer"];
   /** Test-only clock injection; production uses Effect's live Clock service. */
   clock?: Clock.Clock;
   /** Presentation/status observer for the latest reconciled state. */
@@ -128,7 +119,6 @@ export type RuntimeError =
   | PiObservationError
   | ModelPolicyError
   | PlatformError
-  | ArtifactStoreError
   | RuntimeHostError
   | RuntimeRegistryError
   | LeaseDecisionRequiredError;
@@ -140,7 +130,6 @@ export type RuntimeServices =
   | RuntimePi
   | RuntimeHost
   | RuntimeLease
-  | ArtifactStore
   | FileSystem.FileSystem
   | Path.Path;
 export type RuntimeEffect<A, E = RuntimeError> = Effect.Effect<A, E, RuntimeServices>;
@@ -160,8 +149,9 @@ export interface WorkstreamRuntimeEffects {
     options?: QueueOptions,
   ) => Effect.Effect<WorkstreamState, RuntimeError>;
   readonly reconcile: Effect.Effect<WorkstreamState, RuntimeError>;
-  readonly recoverAttempt: (
-    input: Parameters<WorkstreamRuntime["recoverAttempt"]>[0],
+  readonly releaseExperiment: (
+    attemptId: string,
+    reason: string,
   ) => Effect.Effect<WorkstreamState, RuntimeError>;
   readonly steer: (attemptId: string, instruction: string) => Effect.Effect<void, RuntimeError>;
   readonly cancel: (attemptId: string) => Effect.Effect<void, RuntimeError>;
@@ -217,7 +207,8 @@ export class WorkstreamRuntime {
         ),
       queue: (input, options = {}) => this.provide(this.submit(this.queueEffect(input, options))),
       reconcile: this.provide(this.submit(this.reconcileOperation())),
-      recoverAttempt: (input) => this.provide(this.submit(this.recoverAttemptEffect(input))),
+      releaseExperiment: (attemptId, reason) =>
+        this.provide(this.submit(this.releaseExperimentEffect(attemptId, reason))),
       steer: (attemptId, instruction) =>
         this.provide(this.submit(this.steerEffect(attemptId, instruction))),
       cancel: (attemptId) => this.provide(this.submit(this.cancelEffect(attemptId))),
@@ -631,12 +622,7 @@ export class WorkstreamRuntime {
   private reconcileAttempt(item: WorkstreamState["attempts"][number]): RuntimeEffect<void> {
     const operation = Effect.gen(
       function* (this: WorkstreamRuntime) {
-        // Cleanup is terminal; delivery is reconciled independently.
-        if (item.cleanup?.state === "completed") {
-          if (item.error !== undefined)
-            yield* this.storeEffect((store) => store.clearAttention(item.id));
-          return;
-        }
+        if (yield* this.preserveExistingBoundary(item)) return;
         yield* this.advance(item.id);
         const state = yield* this.storeEffect((store) => store.load());
         const advanced = findAttempt(state, item.id);
@@ -650,6 +636,31 @@ export class WorkstreamRuntime {
       }.bind(this),
     );
     return operation.pipe(Effect.catch((error) => this.recordAttemptFailure(item.id, error)));
+  }
+
+  private preserveExistingBoundary(item: WorkAttempt): RuntimeEffect<boolean> {
+    if (item.experimentRelease?.state === "blocked")
+      return this.runtimeSync("preserve blocked experiment release", () => {
+        throw new Error(required(item.experimentRelease?.error, "experiment release blocker"));
+      });
+    if (item.cleanup?.state === "completed")
+      return (
+        item.error === undefined
+          ? Effect.void
+          : this.storeEffect((store) => store.clearAttention(item.id))
+      ).pipe(Effect.as(true));
+    const interruption =
+      item.cleanup?.state === "pending" || item.cleanup?.state === "blocked"
+        ? (item.cleanup.error ??
+          "Cleanup was interrupted after its checkpoint; exact resources were preserved for coordinator diagnosis.")
+        : item.composition?.state === "pending" || item.composition?.state === "blocked"
+          ? (item.composition.error ??
+            "Composition was interrupted after its checkpoint; inspect repository and worktree facts before deciding recovery.")
+          : undefined;
+    if (interruption === undefined) return Effect.succeed(false);
+    return this.runtimeSync("preserve interrupted operation", () => {
+      throw new Error(interruption);
+    });
   }
 
   private recordAttemptFailure(id: string, error: RuntimeError): RuntimeEffect<void> {
@@ -813,11 +824,6 @@ export class WorkstreamRuntime {
       function* (this: WorkstreamRuntime) {
         let state = yield* this.storeEffect((store) => store.load());
         let attempt = findAttempt(state, id);
-        if (attempt.artifactRetention?.state === "pending") {
-          yield* this.resumePendingArtifactRetention(state, attempt);
-          state = yield* this.storeEffect((store) => store.load());
-          attempt = findAttempt(state, id);
-        }
         if (attempt.resultId === undefined) return;
         const result = state.results.find((item) => item.id === attempt.resultId);
         if (result === undefined)
@@ -835,27 +841,18 @@ export class WorkstreamRuntime {
         }
         state = yield* this.storeEffect((store) => store.load());
         attempt = findAttempt(state, id);
-        yield* this.beginCleanupIfNeeded(attempt, assignment);
+        yield* this.beginCleanupIfNeeded(attempt);
         yield* this.cleanup(id);
       }.bind(this),
     );
   }
 
-  private beginCleanupIfNeeded(
-    attempt: WorkAttempt,
-    assignment: WorkAssignment,
-  ): RuntimeEffect<void> {
-    if (
-      attempt.cleanup !== undefined ||
-      attempt.placement === undefined ||
-      (attempt.artifactRetention !== undefined && attempt.artifactRetention.state !== "completed")
-    )
-      return Effect.void;
+  private beginCleanupIfNeeded(attempt: WorkAttempt): RuntimeEffect<void> {
+    if (attempt.cleanup !== undefined || attempt.placement === undefined) return Effect.void;
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const input: Parameters<WorkstreamStore["beginCleanup"]>[0] = {
           id: attempt.id,
-          discard: assignment.artifactIntent === "disposable_experiment",
         };
         if (attempt.placement?.kind === "isolated_worktree")
           input.expectedHead = yield* this.gitEffect((repository) =>
@@ -941,8 +938,6 @@ export class WorkstreamRuntime {
         const resultId = attempt.resultId ?? `result-${attempt.id}`;
         if (!state.results.some((item) => item.id === resultId))
           yield* this.retainNewResult(state, attempt, assignment, sessionFile, resultId);
-        const retainedState = yield* this.storeEffect((store) => store.load());
-        yield* this.advanceArtifactRetention(retainedState, findAttempt(retainedState, attempt.id));
         const effectiveModels = yield* (yield* RuntimePi).models(sessionFile, generation);
         yield* this.storeEffect((store) =>
           store.settleAttempt({ id: attempt.id, resultId, effectiveModels }),
@@ -970,7 +965,7 @@ export class WorkstreamRuntime {
           assignmentIntentVersion: assignment.intentVersion,
         };
         if (read.report !== undefined && read.report.kind === modeFor(assignment)) {
-          yield* this.retainTypedResult(state, attempt, assignment, base, read.report);
+          yield* this.retainTypedResult(attempt, assignment, base, read.report);
           return;
         }
         if (read.report !== undefined || read.invalid || read.unreadable) {
@@ -1004,7 +999,6 @@ export class WorkstreamRuntime {
   }
 
   private retainTypedResult(
-    state: WorkstreamState,
     attempt: WorkAttempt,
     assignment: WorkAssignment,
     base: { id: string; assignmentId: string; assignmentIntentVersion: number },
@@ -1020,45 +1014,21 @@ export class WorkstreamRuntime {
         Effect.catch((error) => this.retainFailedNoChange(attempt, base, error)),
         Effect.asVoid,
       );
-    if (assignment.artifactIntent === "disposable_experiment" && report.status === "completed")
-      return this.checkpointArtifactRetention(state, attempt, assignment, base, report);
+    const artifacts =
+      assignment.artifactIntent === "disposable_experiment" && report.status === "completed"
+        ? [
+            {
+              id: "experiment-worktree",
+              kind: "path" as const,
+              reference: required(attempt.placement, "experiment placement").path,
+              retention: "retained" as const,
+              summary: "Owned experiment worktree retained until explicit coordinator release.",
+            },
+          ]
+        : [];
     return this.storeEffect((store) =>
-      store.retainResult({ ...base, validity: "typed", report }),
+      store.retainResult({ ...base, validity: "typed", report, artifacts }),
     ).pipe(Effect.asVoid);
-  }
-
-  private checkpointArtifactRetention(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: Extract<WorkAssignment, { artifactIntent: "disposable_experiment" }>,
-    base: { id: string; assignmentId: string; assignmentIntentVersion: number },
-    report: WorkerReport,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const placement = required(
-          attempt.placement?.kind === "isolated_worktree" ? attempt.placement.path : undefined,
-          "experiment worktree",
-        );
-        const { sourceRoot, sourceIdentity } = yield* ArtifactStore.use((store) =>
-          store.checkpointSource(placement),
-        );
-        const expectedHead = yield* this.gitEffect((repository) => repository.head(placement));
-        yield* this.storeEffect((store) =>
-          store.retainResultPendingArtifacts({
-            attemptId: attempt.id,
-            ...base,
-            report,
-            sourceRoot,
-            sourceIdentity,
-            expectedHead,
-            destinationRoot: join(dirname(state.statePath), "artifacts", base.id),
-            stagingRoot: join(dirname(state.statePath), "artifact-staging", base.id),
-            required: assignment.artifactPolicy.retain,
-          }),
-        );
-      }.bind(this),
-    );
   }
 
   private retainFailedNoChange(
@@ -1077,7 +1047,6 @@ export class WorkstreamRuntime {
         );
         const cleanup: Parameters<WorkstreamStore["beginCleanup"]>[0] = {
           id: attempt.id,
-          discard: false,
         };
         if (attempt.placement?.kind === "isolated_worktree")
           cleanup.expectedHead = yield* this.gitEffect((repository) =>
@@ -1108,6 +1077,12 @@ export class WorkstreamRuntime {
         const expectedHead =
           attempt.composition?.expectedHead ??
           (yield* this.gitEffect((repository) => repository.head()));
+        if (attempt.composition?.state === "pending")
+          return yield* this.runtimeSync("preserve pending composition", () => {
+            throw new Error(
+              "Composition checkpoint is pending; inspect exact repository and worktree facts before any coordinator-led recovery.",
+            );
+          });
         const operation = this.applyComposition(attempt, assignment, commit, expectedHead);
         yield* operation.pipe(
           Effect.catch((error) => this.recoverComposition(attempt, commit, expectedHead, error)),
@@ -1124,29 +1099,21 @@ export class WorkstreamRuntime {
   ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        if (attempt.composition === undefined) {
-          yield* this.gitEffect((repository) =>
-            repository.validateWorkerCommit(placementOf(attempt), commit),
-          );
-          yield* this.storeEffect((store) =>
-            store.beginComposition({ id: attempt.id, commit, expectedHead }),
-          );
-        }
+        yield* this.gitEffect((repository) =>
+          repository.validateWorkerCommit(placementOf(attempt), commit),
+        );
+        yield* this.storeEffect((store) =>
+          store.beginComposition({ id: attempt.id, commit, expectedHead }),
+        );
         const state = yield* this.storeEffect((store) => store.load());
         yield* this.runtimeSync("validate current composition intent", () => {
           if (!this.store.isAssignmentCurrent(state, assignment.id))
             throw new Error("Intent changed; retained implementation is stale and cannot compose.");
         });
         yield* this.ownershipEffect();
-        const recovery = yield* this.gitEffect((repository) =>
-          repository.recoverComposition(expectedHead, {
-            baseCommit: required(attempt.baseRevision, "base revision"),
-            commit,
-          }),
+        const revision = yield* this.gitEffect((repository) =>
+          repository.compose(commit, expectedHead),
         );
-        const revision =
-          recovery?.head ??
-          (yield* this.gitEffect((repository) => repository.compose(commit, expectedHead)));
         yield* this.storeEffect((store) => store.finishComposition(attempt.id, revision));
         yield* this.recordCompositionArtifact(attempt, revision, `Composed ${commit}.`);
       }.bind(this),
@@ -1203,128 +1170,15 @@ export class WorkstreamRuntime {
     ).pipe(Effect.asVoid);
   }
 
-  private advanceArtifactRetention(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-  ): RuntimeEffect<void> {
-    const retention = attempt.artifactRetention;
-    if (retention?.state !== "pending") return Effect.void;
-    const operation = Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        yield* this.validateArtifactRetentionCheckpoint(state, attempt);
-        yield* this.verifyArtifactRetentionSource(attempt, retention);
-        yield* this.ownershipEffect();
-        const artifacts = yield* Effect.forEach(retention.required, (name) =>
-          ArtifactStore.use((store) =>
-            store.retain({ retention, name }, ({ fingerprint }) =>
-              this.guardArtifactRetentionMutation(retention, name, fingerprint),
-            ),
-          ),
-        );
-        const latest = yield* this.storeEffect((store) => store.load());
-        const latestAttempt = findAttemptByRetention(latest, retention.resultId);
-        yield* this.validateArtifactRetentionCheckpoint(latest, latestAttempt, retention);
-        yield* this.verifyArtifactRetentionSource(latestAttempt, retention);
-        yield* this.ownershipEffect();
-        yield* this.storeEffect((store) => store.finishArtifactRetention(attempt.id, artifacts));
-      }.bind(this),
-    );
-    return operation.pipe(
-      Effect.catch((error) =>
-        this.storeEffect((store) => store.blockArtifactRetention(attempt.id, error.message)),
-      ),
-    );
-  }
-
-  private validateArtifactRetentionCheckpoint(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    expected?: ArtifactRetention,
-  ): RuntimeEffect<ArtifactRetention> {
-    return this.runtimeSync("validate artifact retention intent", () => {
-      const retention = required(attempt.artifactRetention, "artifact retention");
-      const assignment = findAssignment(state, attempt.assignmentId);
-      if (
-        retention.state !== "pending" ||
-        assignment.artifactIntent !== "disposable_experiment" ||
-        state.intents.at(-1)?.version !== retention.assignmentIntentVersion ||
-        (expected !== undefined && !sameRetentionCheckpoint(retention, expected))
-      )
-        throw new Error(
-          "Required artifact retention is blocked because its checkpoint or assignment intent is no longer current.",
-        );
-      return retention;
-    });
-  }
-
-  private verifyArtifactRetentionSource(
-    attempt: WorkAttempt,
-    retention: ArtifactRetention,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const placement = required(
-          attempt.placement?.kind === "isolated_worktree" ? attempt.placement.path : undefined,
-          "experiment worktree",
-        );
-        yield* ArtifactStore.use((store) =>
-          store.verifySource({
-            placement,
-            sourceRoot: retention.sourceRoot,
-            sourceIdentity: retention.sourceIdentity,
-          }),
-        );
-        const head = yield* this.gitEffect((repository) => repository.head(placement));
-        yield* this.runtimeSync("validate retained experiment identity", () => {
-          if (
-            head !== retention.expectedHead ||
-            resolve(attempt.worker?.cwd ?? "") !== resolve(placement) ||
-            (attempt.resource !== undefined && resolve(attempt.resource.cwd) !== resolve(placement))
-          )
-            throw new Error("Required artifact source no longer has its exact owned identity.");
-        });
-      }.bind(this),
-    );
-  }
-
-  private guardArtifactRetentionMutation(
-    expected: ArtifactRetention,
-    name: string,
-    sourceFingerprint: string,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        yield* this.ownershipEffect();
-        let state = yield* this.storeEffect((store) => store.load());
-        let attempt = findAttemptByRetention(state, expected.resultId);
-        const retention = yield* this.validateArtifactRetentionCheckpoint(state, attempt, expected);
-        yield* this.verifyArtifactRetentionSource(attempt, retention);
-        yield* ArtifactStore.use((store) =>
-          store.verifyArtifact({ retention, name, fingerprint: sourceFingerprint }),
-        );
-        state = yield* this.storeEffect((store) => store.load());
-        attempt = findAttemptByRetention(state, expected.resultId);
-        yield* this.validateArtifactRetentionCheckpoint(state, attempt, expected);
-        yield* this.ownershipEffect();
-      }.bind(this),
-    );
-  }
-
   private cleanup(id: string): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const state = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(state, id);
-        if (isLegacyArtifactRetentionFailure(state, attempt)) return;
         const cleanup = attempt.cleanup;
-        if (
-          cleanup?.state !== "pending" ||
-          attempt.composition?.state === "blocked" ||
-          (attempt.artifactRetention !== undefined &&
-            attempt.artifactRetention.state !== "completed")
-        )
-          return;
-        const operation = this.cleanupAttempt(attempt, cleanup);
+        if (cleanup?.state !== "pending" || attempt.composition?.state === "blocked") return;
+        const assignment = findAssignment(state, attempt.assignmentId);
+        const operation = this.cleanupAttempt(attempt, cleanup, assignment);
         yield* operation.pipe(
           Effect.catch((error) =>
             this.storeEffect((store) => store.blockCleanup(id, error.message)),
@@ -1337,6 +1191,7 @@ export class WorkstreamRuntime {
   private cleanupAttempt(
     attempt: WorkAttempt,
     cleanup: NonNullable<WorkAttempt["cleanup"]>,
+    assignment: WorkAssignment,
   ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
@@ -1352,7 +1207,7 @@ export class WorkstreamRuntime {
           yield* this.storeEffect((store) => store.markWorkerClosed(attempt.id));
         }
         yield* this.ownershipEffect();
-        yield* this.cleanupPlacement(attempt, cleanup);
+        yield* this.cleanupPlacement(attempt, cleanup, assignment);
         yield* this.storeEffect((store) => store.finishCleanup(attempt.id));
       }.bind(this),
     );
@@ -1361,475 +1216,80 @@ export class WorkstreamRuntime {
   private cleanupPlacement(
     attempt: WorkAttempt,
     cleanup: NonNullable<WorkAttempt["cleanup"]>,
+    assignment: WorkAssignment,
   ): RuntimeEffect<void> {
-    if (attempt.placement?.kind !== "isolated_worktree")
-      return this.runtimeSync("validate shared cleanup", () => {
-        if (cleanup.discard) throw new Error("Shared project cleanup cannot discard files.");
-      });
-    const placement = placementOf(attempt);
-    const expectedHead = required(cleanup.expectedHead, "expected worktree HEAD");
-    const discard = cleanup.discard
-      ? this.gitEffect((repository) => repository.discardExperiment(placement, expectedHead))
-      : Effect.void;
-    return discard.pipe(
-      Effect.andThen(
-        this.gitEffect((repository) => repository.cleanupWorktree(placement, expectedHead)),
+    if (
+      attempt.placement?.kind !== "isolated_worktree" ||
+      assignment.artifactIntent === "disposable_experiment"
+    )
+      return Effect.void;
+    return this.gitEffect((repository) =>
+      repository.cleanupWorktree(
+        placementOf(attempt),
+        required(cleanup.expectedHead, "expected worktree HEAD"),
       ),
-    );
+    ).pipe(Effect.asVoid);
   }
 
-  recoverAttempt(input: {
-    attemptId: string;
-    action: "retry" | "retain_not_applied";
-    reason: string;
-    integratedRevision?: string;
-  }): Promise<WorkstreamState> {
-    return Effect.runPromise(this.effects.recoverAttempt(input));
+  releaseExperiment(attemptId: string, reason: string): Promise<WorkstreamState> {
+    return Effect.runPromise(this.effects.releaseExperiment(attemptId, reason));
   }
 
-  private recoverAttemptEffect(input: {
-    attemptId: string;
-    action: "retry" | "retain_not_applied";
-    reason: string;
-    integratedRevision?: string;
-  }): RuntimeEffect<WorkstreamState> {
+  private releaseExperimentEffect(
+    attemptId: string,
+    reason: string,
+  ): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        yield* this.runtimeSync("validate recovery request", () => validateRecoveryInput(input));
-        const state = yield* this.storeEffect((store) => store.load());
-        const attempt = findAttempt(state, input.attemptId);
-        yield* this.runtimeSync("validate legacy retention recovery", () => {
-          if (isLegacyArtifactRetentionFailure(state, attempt))
-            throw new Error(legacyArtifactRetentionLimitation());
-        });
-        yield* this.recoverBoundary(state, attempt, input);
-        return yield* this.storeEffect((store) => store.load());
-      }.bind(this),
-    );
-  }
-
-  private recoverBoundary(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    input: {
-      action: "retry" | "retain_not_applied";
-      reason: string;
-      integratedRevision?: string;
-    },
-  ): RuntimeEffect<void> {
-    if (attempt.artifactRetention?.state === "pending")
-      return this.recoverPendingArtifactRetention(state, attempt);
-    if (attempt.artifactRetention?.state === "blocked")
-      return this.recoverBlockedArtifactRetention(state, attempt);
-    if (isIdentitylessCancelledLaunch(attempt))
-      return this.recoverIdentitylessCancelledLaunch(
-        state,
-        attempt,
-        findAssignment(state, attempt.assignmentId),
-        input.action,
-      );
-    if (isUnlocatedCancelledLaunch(attempt))
-      return this.runtimeSync("validate unlocated cancelled launch", () => {
-        throw new Error(
-          "Cancelled launch has a retained session but no pane locator. Native tab creation remains uncertain after identity recovery found no worker; preserve the placement and inspect Herdr before cleanup.",
-        );
-      });
-    if (attempt.composition?.state === "blocked")
-      return this.recoverBlockedComposition(state, attempt, input);
-    if (attempt.composition?.state === "retained_not_applied")
-      return this.recoverRetainedNotApplied(state, attempt, input);
-    if (attempt.cleanup?.state === "blocked") return this.recoverBlockedCleanup(attempt);
-    if (isFailedImplementationProposal(state, attempt))
-      return this.recoverFailedImplementationProposal(state, attempt, input);
-    if (attempt.artifactRetention?.state === "completed" && input.action === "retry")
-      return this.advanceRetainedResult(attempt.id, findAssignment(state, attempt.assignmentId));
-    return this.runtimeSync("validate recovery boundary", () => {
-      throw new Error(`Attempt ${attempt.id} has no blocked recovery boundary.`);
-    });
-  }
-
-  private recoverPendingArtifactRetention(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-  ): RuntimeEffect<void> {
-    return this.resumePendingArtifactRetention(state, attempt).pipe(
-      Effect.andThen(this.storeEffect((store) => store.load())),
-      Effect.flatMap((latest) => {
-        const retainedAttempt = findAttempt(latest, attempt.id);
-        if (retainedAttempt.resultId === undefined) return Effect.void;
-        return this.advanceRetainedResult(
-          retainedAttempt.id,
-          findAssignment(latest, retainedAttempt.assignmentId),
-        );
-      }),
-    );
-  }
-
-  private resumePendingArtifactRetention(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
-        yield* this.validateArtifactRetentionCheckpoint(state, attempt);
-        yield* this.advanceArtifactRetention(state, attempt);
-      }.bind(this),
-    );
-  }
-
-  private recoverBlockedArtifactRetention(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
-        yield* this.runtimeSync("validate current artifact retention", () => {
-          if (state.intents.at(-1)?.version !== attempt.artifactRetention?.assignmentIntentVersion)
-            throw new Error(
-              "Required artifact retention belongs to a stale intent; leave its source intact.",
-            );
-        });
-        yield* this.verifyArtifactRetentionSource(
-          attempt,
-          required(attempt.artifactRetention, "artifact retention"),
-        );
-        yield* this.ownershipEffect();
-        yield* this.storeEffect((store) => store.retryArtifactRetention(attempt.id));
-        let latest = yield* this.storeEffect((store) => store.load());
-        yield* this.advanceArtifactRetention(latest, findAttempt(latest, attempt.id));
-        latest = yield* this.storeEffect((store) => store.load());
-        const retainedAttempt = findAttempt(latest, attempt.id);
-        if (retainedAttempt.artifactRetention?.state !== "completed") return;
-        const assignment = findAssignment(latest, attempt.assignmentId);
-        yield* this.beginCleanupIfNeeded(retainedAttempt, assignment);
-        yield* this.cleanup(attempt.id);
-      }.bind(this),
-    );
-  }
-
-  private recoverIdentitylessCancelledLaunch(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: WorkAssignment,
-    action: "retry" | "retain_not_applied",
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        if (action !== "retry")
-          return yield* this.runtimeSync("validate cancelled launch recovery", () => {
-            throw new Error("Identity-less cancelled launch recovery only supports recover.");
+        if (reason.trim() === "")
+          return yield* this.runtimeSync("validate experiment release", () => {
+            throw new Error("Experiment release reason is required.");
           });
-        const request = yield* this.runtimeSync("prepare cancelled launch inspection", () =>
-          identitylessLaunchInspectionRequest(attempt),
-        );
-        const inspection = yield* this.herdrEffect((workers) => workers.inspectLaunch(request));
-        if (inspection.state !== "absent")
-          return yield* this.runtimeSync("validate cancelled launch absence", () => {
-            throw new Error(
-              `Cancelled launch inspection is ${inspection.state}; leave retained resources intact. ${inspection.detail}`,
-            );
-          });
-        yield* this.ownershipEffect();
-        yield* this.settleAbsentCancelledLaunch(state, attempt, assignment);
-      }.bind(this),
-    );
-  }
-
-  private settleAbsentCancelledLaunch(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: WorkAssignment,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        if (attempt.resultId === undefined) yield* this.retain(state, attempt, assignment);
-        let current = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
-        if (current.cleanup?.state === "completed") return;
-        if (current.cleanup?.state === "blocked") {
-          yield* this.storeEffect((store) => store.retryCleanup(attempt.id));
-          current = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
-        }
-        if (current.cleanup === undefined) {
-          yield* this.beginCleanupIfNeeded(current, assignment);
-          current = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
-        }
-        if (current.cleanup?.state === "pending" && !current.cleanup.workerClosed)
-          yield* this.storeEffect((store) => store.markWorkerClosed(attempt.id));
-        yield* this.cleanup(attempt.id);
-      }.bind(this),
-    );
-  }
-
-  private recoverFailedImplementationProposal(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    input: {
-      action: "retry" | "retain_not_applied";
-      reason: string;
-      integratedRevision?: string;
-    },
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        if (input.action !== "retain_not_applied")
-          return yield* this.runtimeSync("validate failed proposal recovery", () => {
-            throw new Error(
-              "A failed implementation proposal can only be explicitly retained_not_applied.",
-            );
-          });
-        yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
-        yield* this.gitEffect((repository) => repository.assertClean());
-        const proposal = yield* this.gitEffect((repository) =>
-          repository.validateWorkerCommit(placementOf(attempt)),
-        );
-        const integratedRevision = yield* this.resolveIntegratedHead(
-          required(input.integratedRevision, "integrated revision"),
-        );
-        yield* this.ownershipEffect();
-        const retainedRef = yield* this.gitEffect((repository) =>
-          repository.retainCommit(state.id, attempt.id, proposal.commit),
-        );
-        yield* this.ownershipEffect();
-        yield* this.storeEffect((store) =>
-          store.retainFailedProposalNotApplied({
-            id: attempt.id,
-            commit: proposal.commit,
-            expectedHead: integratedRevision,
-            reason: input.reason,
-            retainedRef,
-            integratedRevision,
-          }),
-        );
-        const latest = yield* this.storeEffect((store) => store.load());
-        yield* this.resumeRetainedNotAppliedCleanup(state.id, findAttempt(latest, attempt.id));
-      }.bind(this),
-    );
-  }
-
-  private recoverRetainedNotApplied(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    input: {
-      action: "retry" | "retain_not_applied";
-      reason: string;
-      integratedRevision?: string;
-    },
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const composition = required(attempt.composition, "retained composition");
-        if (input.action === "retain_not_applied") {
-          const requested = yield* this.gitEffect((repository) =>
-            repository.resolveRevision(required(input.integratedRevision, "integrated revision")),
-          );
-          yield* this.runtimeSync("validate retained integrated revision", () => {
-            if (requested !== composition.integratedRevision)
-              throw new Error(
-                `Retained integrated revision is ${composition.integratedRevision}, not ${requested}.`,
-              );
-          });
-        }
-        yield* this.resumeRetainedNotAppliedCleanup(state.id, attempt);
-      }.bind(this),
-    );
-  }
-
-  private resumeRetainedNotAppliedCleanup(
-    workstreamId: string,
-    attempt: WorkAttempt,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const composition = required(attempt.composition, "retained composition");
-        if (attempt.cleanup?.state !== "completed" && attempt.cleanup?.workerClosed !== true)
-          yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
-        yield* this.ownershipEffect();
-        const retainedRef = yield* this.gitEffect((repository) =>
-          repository.retainCommit(workstreamId, attempt.id, composition.commit),
-        );
-        yield* this.ownershipEffect();
-        yield* this.runtimeSync("validate retained commit provenance", () => {
-          if (composition.retainedRef !== retainedRef)
-            throw new Error(
-              `Retained ref provenance changed from ${composition.retainedRef} to ${retainedRef}.`,
-            );
-        });
-        if (attempt.cleanup?.state === "completed") return;
-        if (attempt.cleanup?.state === "blocked")
-          yield* this.storeEffect((store) => store.retryCleanup(attempt.id));
-        let latest = yield* this.storeEffect((store) => store.load());
-        let current = findAttempt(latest, attempt.id);
-        if (current.cleanup === undefined) {
-          const expectedHead = yield* this.gitEffect((repository) =>
-            repository.head(placementOf(current).path),
-          );
-          yield* this.runtimeSync("validate retained proposal head", () => {
-            if (expectedHead !== composition.commit)
-              throw new Error(
-                `Retained proposal worktree HEAD is ${expectedHead}, expected ${composition.commit}.`,
-              );
-          });
-          yield* this.storeEffect((store) =>
-            store.beginCleanup({ id: attempt.id, expectedHead, discard: false }),
-          );
-          latest = yield* this.storeEffect((store) => store.load());
-          current = findAttempt(latest, attempt.id);
-        }
-        if (current.cleanup?.state === "pending") yield* this.cleanup(attempt.id);
-      }.bind(this),
-    );
-  }
-
-  private resolveIntegratedHead(requested: string): RuntimeEffect<string> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const integratedRevision = yield* this.gitEffect((repository) =>
-          repository.resolveRevision(requested),
-        );
-        const currentHead = yield* this.gitEffect((repository) => repository.head());
-        yield* this.runtimeSync("validate integrated revision", () => {
-          if (currentHead !== integratedRevision)
-            throw new Error(
-              `Integrated revision is ${integratedRevision}, but repository HEAD is ${currentHead}.`,
-            );
-        });
-        return integratedRevision;
-      }.bind(this),
-    );
-  }
-
-  private recoverBlockedComposition(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    input: {
-      action: "retry" | "retain_not_applied";
-      reason: string;
-      integratedRevision?: string;
-    },
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const composition = required(attempt.composition, "blocked composition");
-        const worker = required(attempt.worker, "worker identity");
-        yield* this.inspectRecoverableWorker(worker);
-        yield* this.gitEffect((repository) => repository.assertClean());
-        yield* this.gitEffect((repository) =>
-          repository.validateWorkerCommit(placementOf(attempt), composition.commit),
-        );
-        yield* this.ownershipEffect();
-        const retainedRef = yield* this.gitEffect((repository) =>
-          repository.retainCommit(state.id, attempt.id, composition.commit),
-        );
-        yield* this.runtimeSync("validate retained commit provenance", () => {
-          if (composition.retainedRef !== undefined && composition.retainedRef !== retainedRef)
-            throw new Error(
-              `Retained ref provenance changed from ${composition.retainedRef} to ${retainedRef}.`,
-            );
-        });
-        if (input.action === "retry")
-          yield* this.retryBlockedComposition(
-            attempt,
-            findAssignment(state, attempt.assignmentId),
-            retainedRef,
-          );
-        else yield* this.retainBlockedComposition(attempt, input, retainedRef);
-      }.bind(this),
-    );
-  }
-
-  private retryBlockedComposition(
-    attempt: WorkAttempt,
-    assignment: WorkAssignment,
-    retainedRef: string,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        yield* this.storeEffect((store) =>
-          store.retryComposition(attempt.id, undefined, retainedRef),
-        );
         let state = yield* this.storeEffect((store) => store.load());
-        yield* this.compose(state, findAttempt(state, attempt.id), assignment);
-        state = yield* this.storeEffect((store) => store.load());
-        yield* this.beginCleanupIfNeeded(findAttempt(state, attempt.id), assignment);
-        yield* this.cleanup(attempt.id);
-      }.bind(this),
-    );
-  }
-
-  private retainBlockedComposition(
-    attempt: WorkAttempt,
-    input: { reason: string; integratedRevision?: string },
-    retainedRef: string,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const requested = required(input.integratedRevision, "integrated revision");
-        const integratedRevision = yield* this.gitEffect((repository) =>
-          repository.resolveRevision(requested),
-        );
-        const currentHead = yield* this.gitEffect((repository) => repository.head());
-        yield* this.runtimeSync("validate integrated revision", () => {
-          if (currentHead !== integratedRevision)
-            throw new Error(
-              `Integrated revision is ${integratedRevision}, but repository HEAD is ${currentHead}.`,
-            );
-        });
-        yield* this.storeEffect((store) =>
-          store.retainCompositionNotApplied({
-            id: attempt.id,
-            reason: input.reason,
-            retainedRef,
-            integratedRevision,
-          }),
-        );
-        const state = yield* this.storeEffect((store) => store.load());
-        const latest = findAttempt(state, attempt.id);
-        if (latest.cleanup === undefined) {
-          const expectedHead = yield* this.gitEffect((repository) =>
-            repository.head(placementOf(attempt).path),
-          );
-          yield* this.storeEffect((store) =>
-            store.beginCleanup({
-              id: attempt.id,
-              expectedHead,
-              discard: false,
-            }),
-          );
-        }
-        yield* this.cleanup(attempt.id);
-      }.bind(this),
-    );
-  }
-
-  private recoverBlockedCleanup(attempt: WorkAttempt): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        if (attempt.cleanup?.workerClosed !== true)
-          yield* this.inspectRecoverableWorker(required(attempt.worker, "worker identity"));
-        yield* this.storeEffect((store) => store.retryCleanup(attempt.id));
-        yield* this.cleanup(attempt.id);
-      }.bind(this),
-    );
-  }
-
-  private inspectRecoverableWorker(
-    worker: NonNullable<WorkAttempt["worker"]>,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const inspection = yield* this.herdrEffect((workers) => workers.inspect(worker));
-        yield* this.runtimeSync("validate recovery inspection", () => {
+        let attempt = findAttempt(state, attemptId);
+        const assignment = findAssignment(state, attempt.assignmentId);
+        yield* this.runtimeSync("validate experiment release", () => {
           if (
-            inspection.status !== "absent" &&
-            inspection.status !== "idle" &&
-            inspection.status !== "done"
+            assignment.artifactIntent !== "disposable_experiment" ||
+            attempt.state !== "settled" ||
+            attempt.placement?.kind !== "isolated_worktree" ||
+            attempt.cleanup?.state !== "completed" ||
+            !attempt.cleanup.workerClosed
           )
             throw new Error(
-              `Recovery inspected worker ${inspection.status}; leave resources intact.`,
+              "Only a settled owned experiment with a closed worker can be released.",
             );
         });
+        if (attempt.experimentRelease?.state === "completed") return state;
+        const expectedHead =
+          attempt.experimentRelease?.expectedHead ??
+          (yield* this.gitEffect((repository) => repository.head(placementOf(attempt).path)));
+        yield* this.storeEffect((store) =>
+          store.beginExperimentRelease({ id: attemptId, expectedHead, reason }),
+        );
+        state = yield* this.storeEffect((store) => store.load());
+        attempt = findAttempt(state, attemptId);
+        const release = Effect.gen(
+          function* (this: WorkstreamRuntime) {
+            yield* this.ownershipEffect();
+            yield* this.gitEffect((repository) =>
+              repository.discardExperiment(placementOf(attempt), expectedHead),
+            );
+            yield* this.ownershipEffect();
+            yield* this.gitEffect((repository) =>
+              repository.cleanupWorktree(placementOf(attempt), expectedHead),
+            );
+            yield* this.storeEffect((store) => store.finishExperimentRelease(attemptId));
+          }.bind(this),
+        );
+        yield* release.pipe(
+          Effect.catch((error) =>
+            this.storeEffect((store) =>
+              store.blockExperimentRelease(attemptId, error.message),
+            ).pipe(Effect.andThen(Effect.fail(error))),
+          ),
+        );
+        return yield* this.storeEffect((store) => store.load());
       }.bind(this),
     );
   }
@@ -1901,8 +1361,7 @@ export class WorkstreamRuntime {
             yield* this.storeEffect((store) => store.load()),
             attemptId,
           );
-          const assignment = findAssignment(state, attempt.assignmentId);
-          yield* this.beginCleanupIfNeeded(cancelled, assignment);
+          yield* this.beginCleanupIfNeeded(cancelled);
           yield* this.storeEffect((store) => store.markWorkerClosed(attemptId));
           yield* this.cleanup(attemptId);
           return;
@@ -2002,15 +1461,6 @@ function selectedAttempts(
   });
 }
 
-function validateRecoveryInput(input: {
-  action: "retry" | "retain_not_applied";
-  reason: string;
-  integratedRevision?: string;
-}): void {
-  if (input.reason.trim() === "") throw new Error("Recovery reason is required.");
-  if (input.action === "retain_not_applied" && input.integratedRevision === undefined)
-    throw new Error("Retained-not-applied recovery requires the integrated revision.");
-}
 function blockedDetail(attempt: WorkAttempt): string | undefined {
   if (attempt.composition?.state === "blocked") return attempt.composition.error;
   if (attempt.cleanup?.state === "blocked") return attempt.cleanup.error;
@@ -2035,54 +1485,6 @@ function hasRetainedSession(attempt: WorkAttempt): boolean {
       attempt.state === "running" ||
       attempt.state === "cancel_requested") &&
     attempt.sessionFile !== undefined
-  );
-}
-function isIdentitylessCancelledLaunch(attempt: WorkAttempt): boolean {
-  return (
-    (attempt.state === "cancel_requested" || attempt.state === "cancelled") &&
-    attempt.submission === "not_sent" &&
-    attempt.launchPane !== undefined &&
-    attempt.sessionFile !== undefined &&
-    attempt.worker === undefined
-  );
-}
-function isUnlocatedCancelledLaunch(attempt: WorkAttempt): boolean {
-  return (
-    (attempt.state === "cancel_requested" || attempt.state === "cancelled") &&
-    attempt.submission === "not_sent" &&
-    attempt.launchPane === undefined &&
-    attempt.sessionFile !== undefined &&
-    attempt.worker === undefined
-  );
-}
-function identitylessLaunchInspectionRequest(attempt: WorkAttempt): WorkerLaunchInspectionRequest {
-  const launchPane = required(attempt.launchPane, "retained launch pane");
-  const request: WorkerLaunchInspectionRequest = {
-    workspaceId: launchPane.workspaceId,
-    paneId: launchPane.paneId,
-    sessionFile: required(attempt.sessionFile, "session file"),
-    cwd: required(attempt.placement, "attempt placement").path,
-  };
-  if (attempt.resource === undefined) return request;
-  if (
-    attempt.resource.workspaceId !== launchPane.workspaceId ||
-    attempt.resource.paneId !== launchPane.paneId
-  )
-    throw new Error("Retained launch pane and resource identities do not match.");
-  request.tabId = attempt.resource.tabId;
-  request.terminalId = attempt.resource.terminalId;
-  return request;
-}
-function isFailedImplementationProposal(state: WorkstreamState, attempt: WorkAttempt): boolean {
-  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
-  const result = state.results.find((item) => item.id === attempt.resultId);
-  return (
-    attempt.composition === undefined &&
-    assignment?.capability === "implement" &&
-    assignment.artifactIntent === "maintained_change" &&
-    result?.validity === "typed" &&
-    result.report.kind === "implementation" &&
-    result.report.status === "failed"
   );
 }
 function workerRecoveryRequest(
@@ -2138,8 +1540,7 @@ function shouldCompose(
     result.report.kind === "implementation" &&
     result.report.status === "completed" &&
     result.report.outcome === "changed" &&
-    attempt.state !== "cancelled" &&
-    attempt.composition?.state !== "retained_not_applied"
+    attempt.state !== "cancelled"
   );
 }
 function workerSessionRequest(
@@ -2268,24 +1669,6 @@ function findAssignment(state: WorkstreamState, id: string): WorkAssignment {
     `assignment ${id}`,
   );
 }
-function findAttemptByRetention(state: WorkstreamState, resultId: string): WorkAttempt {
-  return required(
-    state.attempts.find((item) => item.artifactRetention?.resultId === resultId),
-    `artifact retention for result ${resultId}`,
-  );
-}
-function sameRetentionCheckpoint(left: ArtifactRetention, right: ArtifactRetention): boolean {
-  return (
-    left.resultId === right.resultId &&
-    left.assignmentIntentVersion === right.assignmentIntentVersion &&
-    left.sourceRoot === right.sourceRoot &&
-    left.sourceIdentity === right.sourceIdentity &&
-    left.expectedHead === right.expectedHead &&
-    left.destinationRoot === right.destinationRoot &&
-    left.stagingRoot === right.stagingRoot &&
-    JSON.stringify(left.required) === JSON.stringify(right.required)
-  );
-}
 function required<T>(value: T | undefined, label: string): T {
   if (value === undefined) throw new Error(`Missing ${label}.`);
   return value;
@@ -2357,7 +1740,7 @@ function objectiveFor(
     common.push(
       `Permitted effects: ${assignment.permittedEffects.join("; ")}`,
       `Stop condition: ${assignment.stopCondition}`,
-      `Retain isolated-worktree-relative artifacts: ${assignment.artifactPolicy.retain.join(", ") || "none"}.`,
+      "The complete isolated worktree is retained after completion until the coordinator explicitly releases it.",
       "Experimental changes are not maintained product changes and must not be committed for composition.",
     );
   if (assignment.capability === "implement")

@@ -466,12 +466,6 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           ),
           permittedEffects: Type.Array(Type.String(), { minItems: 1 }),
           stopCondition: Type.String(),
-          retain: Type.Array(
-            Type.String({
-              description:
-                "Path relative to the experiment worktree, for example artifacts/probe.json; filenames may contain spaces.",
-            }),
-          ),
         }),
       ),
     }),
@@ -698,18 +692,10 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     description:
       "Suspend or resume work, or use an explicitly identified semantic task to cancel, steer, or recover a boundary. Repeated attempts require an explicit attempt handle; recovery is guarded and administrative.",
     parameters: Type.Object({
-      action: StringEnum([
-        "suspend",
-        "resume",
-        "cancel",
-        "steer",
-        "recover",
-        "retain_not_applied",
-      ] as const),
+      action: StringEnum(["suspend", "resume", "cancel", "steer", "release_experiment"] as const),
       reason: Type.String({ minLength: 1 }),
       task: Type.Optional(Type.String()),
       attempt: Type.Optional(Type.String()),
-      integratedRevision: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
     }),
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
@@ -843,13 +829,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   });
 }
 
-type ControlAction = "suspend" | "resume" | "cancel" | "steer" | "recover" | "retain_not_applied";
+type ControlAction = "suspend" | "resume" | "cancel" | "steer" | "release_experiment";
 type ControlParams = {
   action: ControlAction;
   reason: string;
   task?: string;
   attempt?: string;
-  integratedRevision?: string;
 };
 type ResultView = InspectView | ReturnType<typeof actionView>;
 
@@ -861,7 +846,6 @@ type ResearchParams = {
     authorityReceiptId?: string;
     permittedEffects: string[];
     stopCondition: string;
-    retain: string[];
   };
 };
 
@@ -972,10 +956,6 @@ function researchAssignment(
     authority,
     permittedEffects: params.experiment.permittedEffects,
     stopCondition: params.experiment.stopCondition,
-    artifactPolicy: {
-      retain: params.experiment.retain,
-      discardOthers: true,
-    },
   };
 }
 
@@ -1039,12 +1019,7 @@ function modelRates(models: string[], ctx: ExtensionContext) {
 }
 
 function isAttemptControl(action: ControlAction): boolean {
-  return (
-    action === "cancel" ||
-    action === "steer" ||
-    action === "recover" ||
-    action === "retain_not_applied"
-  );
+  return action === "cancel" || action === "steer" || action === "release_experiment";
 }
 
 function controlAttemptEffect(
@@ -1057,14 +1032,9 @@ function controlAttemptEffect(
     if (params.action === "cancel") yield* active.effects.cancel(attemptId);
     else if (params.action === "steer") yield* active.effects.steer(attemptId, params.reason);
     else {
-      const recovery: Parameters<WorkstreamRuntime["recoverAttempt"]>[0] = {
-        attemptId,
-        action: params.action === "recover" ? "retry" : "retain_not_applied",
-        reason: params.reason,
-      };
-      if (params.integratedRevision !== undefined)
-        recovery.integratedRevision = params.integratedRevision;
-      yield* active.effects.recoverAttempt(recovery);
+      if (params.attempt === undefined || params.attempt === "")
+        throw new Error("Experiment release requires an exact attempt handle.");
+      yield* active.effects.releaseExperiment(attemptId, params.reason);
     }
     return attemptId;
   });
@@ -1086,13 +1056,12 @@ function lifecycleControlEffect(
 
 function controlMessage(action: ControlAction): string {
   if (action === "steer") return "Steering submitted; application is not yet established.";
-  if (action === "recover" || action === "retain_not_applied")
-    return "Recovery inspected the exact boundary and recorded its outcome.";
+  if (action === "release_experiment") return "Released the exact retained experiment worktree.";
   return "Control request recorded.";
 }
 function controlOutcome(action: ControlAction): "submitted" | "inspected" | "recorded" {
   if (action === "steer") return "submitted";
-  if (action === "recover" || action === "retain_not_applied") return "inspected";
+  if (action === "release_experiment") return "recorded";
   return "recorded";
 }
 function requiredValue<T>(value: T | undefined, label: string): T {

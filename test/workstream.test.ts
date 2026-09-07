@@ -23,10 +23,8 @@ import {
   InvalidWorkstreamStateError,
   type SessionIdentity,
   UnsupportedWorkstreamStateError,
-  type WorkstreamState,
   WorkstreamStore,
 } from "../src/workstream.js";
-import { deriveCompletionAccounting } from "../src/workstream-transitions.js";
 import { parsePersistedObject } from "../src/workstream-validation.js";
 import { researchReport } from "./helpers.js";
 
@@ -210,104 +208,6 @@ function recordedAuthority(
     );
 }
 
-void test("workstream persists human-backed intent, local readiness, and retained experiment evidence", async () => {
-  const { parent, store } = await fixture();
-  try {
-    const { authority } = await recordedAuthority(store);
-    let state = await store.assign({
-      id: "research",
-      capability: "research",
-      artifactIntent: "evidence_only",
-      objective: "Inspect the fixture behavior.",
-      intentVersion: authority.intentVersion,
-      expectedEvidence: ["A direct fixture observation."],
-      now: dateAt(3_000),
-    });
-    assert.equal(state.assignments[0]?.capability, "research");
-
-    state = await store.assign({
-      id: "experiment",
-      capability: "research",
-      artifactIntent: "disposable_experiment",
-      objective: "Probe whether the fixture accepts the candidate input.",
-      intentVersion: authority.intentVersion,
-      authority,
-      permittedEffects: ["Write only under the disposable experiment directory."],
-      stopCondition: "The fixture either accepts or rejects the candidate input.",
-      expectedEvidence: ["The observed fixture output."],
-      artifactPolicy: { retain: ["experiment-log"], discardOthers: true },
-      now: dateAt(4_000),
-    });
-    assert.equal(state.assignments[1]?.artifactIntent, "disposable_experiment");
-
-    await assert.rejects(
-      store.retainResult({
-        id: "unplanned-experiment-result",
-        assignmentId: "experiment",
-        assignmentIntentVersion: authority.intentVersion,
-        validity: "typed",
-        report: researchReport("The probe produced an unplanned artifact."),
-        artifacts: [
-          {
-            id: "unplanned",
-            kind: "path",
-            reference: "artifacts/unplanned.log",
-            retention: "retained",
-            summary: "Not approved for retention.",
-          },
-        ],
-      }),
-      /exactly the artifacts named by its policy/,
-    );
-
-    state = await store.retainResult({
-      id: "experiment-result",
-      assignmentId: "experiment",
-      assignmentIntentVersion: authority.intentVersion,
-      validity: "typed",
-      report: researchReport("The disposable probe rejected the candidate."),
-      artifacts: [
-        {
-          id: "experiment-log",
-          kind: "path",
-          reference: "artifacts/experiment.log",
-          retention: "retained",
-          summary: "The bounded experiment output.",
-        },
-      ],
-      now: dateAt(5_000),
-    });
-    assert.equal(state.results[0]?.artifacts[0]?.retention, "retained");
-
-    state = await store.assign({
-      id: "review",
-      capability: "review",
-      artifactIntent: "evidence_only",
-      objective: "Review the experiment result.",
-      intentVersion: authority.intentVersion,
-      subject: {
-        kind: "artifact",
-        resultId: "experiment-result",
-        artifactId: "experiment-log",
-      },
-      concern: "Does the retained output support the proposed conclusion?",
-      now: dateAt(6_000),
-    });
-    assert.equal(state.assignments[2]?.capability, "review");
-
-    const persisted = await WorkstreamStore.inspect(state.statePath);
-    assert.deepEqual(
-      persisted.assignments.map((assignment) => assignment.id),
-      ["research", "experiment", "review"],
-    );
-    const experimentResult = persisted.results[0];
-    assert.ok(experimentResult && experimentResult.validity === "typed");
-    assert.equal(experimentResult.report.summary, "The disposable probe rejected the candidate.");
-  } finally {
-    await rm(parent, { recursive: true, force: true });
-  }
-});
-
 void test("workstream rejects extension or arbitrary authority and stale intent", async () => {
   const { parent, store } = await fixture();
   try {
@@ -343,7 +243,6 @@ void test("workstream rejects extension or arbitrary authority and stale intent"
         permittedEffects: ["Write an experiment file."],
         stopCondition: "The probe finishes.",
         expectedEvidence: ["Probe output."],
-        artifactPolicy: { retain: [], discardOthers: true },
       }),
       /retained human-backed intent/,
     );
@@ -515,7 +414,6 @@ void test("every independent attempt remains accounted for regardless of result 
         await store.beginCleanup({
           id: `attempt-${index}`,
           expectedHead: "a".repeat(40),
-          discard: false,
         });
         await store.markWorkerClosed(`attempt-${index}`);
         await store.finishCleanup(`attempt-${index}`);
@@ -763,168 +661,6 @@ void test("historical disposition semantics preserve unresolved judgments withou
     );
   } finally {
     await rm(invalidFixture.parent, { recursive: true, force: true });
-  }
-});
-
-void test("persisted authority, attempt, completion, and current terminal corruption are rejected", async () => {
-  const authorityFixture = await fixture();
-  try {
-    const { receipt, authority } = await recordedAuthority(authorityFixture.store);
-    await authorityFixture.store.assign({
-      id: "implementation",
-      capability: "implement",
-      artifactIntent: "maintained_change",
-      objective: "Apply the approved correction.",
-      intentVersion: authority.intentVersion,
-      authority,
-      acceptance: ["The correction is retained."],
-    });
-    await authorityFixture.store.reviseIntent({
-      authorityReceiptId: receipt.id,
-      statement: "A later approved correction.",
-      constraints: ["Retain the earlier assignment in history."],
-    });
-    const state = await authorityFixture.store.load();
-    const assignment = state.assignments[0];
-    assert.ok(assignment?.capability === "implement");
-    assignment.authority.intentVersion = 2;
-    await persistFixtureState(authorityFixture.store.path, state);
-    await assert.rejects(
-      WorkstreamStore.inspect(authorityFixture.store.path),
-      /authority belongs to another intent/,
-    );
-  } finally {
-    await rm(authorityFixture.parent, { recursive: true, force: true });
-  }
-
-  const attemptFixture = await fixture();
-  try {
-    await attemptFixture.store.enqueue(
-      {
-        id: "research",
-        capability: "research",
-        artifactIntent: "evidence_only",
-        objective: "Read the fixture.",
-        intentVersion: 0,
-        expectedEvidence: ["Fixture bytes."],
-      },
-      {
-        id: "attempt",
-        models: {
-          guide: { model: "fixture/research", thinking: "low" },
-          source: "policy",
-        },
-      },
-    );
-    const malformed = await attemptFixture.store.load();
-    const queued = malformed.attempts[0];
-    assert.ok(queued);
-    queued.sessionFile = "/tmp/impossible-session.jsonl";
-    await persistFixtureState(attemptFixture.store.path, malformed);
-    await assert.rejects(
-      WorkstreamStore.inspect(attemptFixture.store.path),
-      /Queued attempt attempt contains live or terminal fields/,
-    );
-  } finally {
-    await rm(attemptFixture.parent, { recursive: true, force: true });
-  }
-
-  const terminalFixture = await fixture();
-  try {
-    await terminalFixture.store.enqueue(
-      {
-        id: "research",
-        capability: "research",
-        artifactIntent: "evidence_only",
-        objective: "Read the fixture.",
-        intentVersion: 0,
-        expectedEvidence: ["Fixture bytes."],
-      },
-      {
-        id: "attempt",
-        models: {
-          guide: { model: "fixture/research", thinking: "low" },
-          source: "policy",
-        },
-      },
-    );
-    const terminal = await terminalFixture.store.load();
-    const completedAt = dateAt(10_000).toISOString();
-    terminal.lifecycle = { state: "completed", changedAt: completedAt, reason: "Malformed." };
-    terminal.completion = {
-      conclusion: "Malformed terminal state.",
-      evidence: [{ label: "fixture", observation: "A queued attempt remains." }],
-      limitations: ["The attempt remains live."],
-      accounting: deriveCompletionAccounting(terminal).map((item) => ({
-        ...item,
-        reason: "The queued assignment and attempt remain unresolved.",
-      })),
-      completedAt,
-    };
-    await persistFixtureState(terminalFixture.store.path, terminal);
-    await assert.rejects(
-      WorkstreamStore.inspect(terminalFixture.store.path),
-      /active attempt or unclean owned resource/,
-    );
-  } finally {
-    await rm(terminalFixture.parent, { recursive: true, force: true });
-  }
-
-  const accountingFixture = await fixture();
-  try {
-    await accountingFixture.store.assign({
-      id: "research",
-      capability: "research",
-      artifactIntent: "evidence_only",
-      objective: "Read the fixture.",
-      intentVersion: 0,
-      expectedEvidence: ["Fixture bytes."],
-    });
-    await accountingFixture.store.retainResult({
-      id: "result",
-      assignmentId: "research",
-      assignmentIntentVersion: 0,
-      validity: "typed",
-      report: researchReport("The fixture was read."),
-    });
-    const completed = await accountingFixture.store.complete({
-      conclusion: "The assignment is resolved.",
-      evidence: [{ label: "fixture", observation: "The report completed." }],
-      limitations: [],
-      reasons: [],
-    });
-    assert.ok(completed.completion);
-    completed.completion.accounting.push({
-      kind: "unresolved_assignment",
-      assignmentId: "research",
-      reason: "Invented unresolved accounting.",
-    });
-    await persistFixtureState(accountingFixture.store.path, completed);
-    await assert.rejects(
-      WorkstreamStore.inspect(accountingFixture.store.path),
-      /does not exactly match derived unresolved records/,
-    );
-
-    const currentText = await readFile(accountingFixture.store.path, "utf8");
-    await writeFile(
-      accountingFixture.store.path,
-      currentText.replace('"purpose": "Determine the safe fixture change.",', ""),
-    );
-    await assert.rejects(
-      WorkstreamStore.inspectForReattachment(accountingFixture.store.path),
-      InvalidWorkstreamStateError,
-    );
-
-    await writeFile(
-      accountingFixture.store.path,
-      currentText
-        .replace('"version": 4', '"version": 3')
-        .replace('"purpose": "Determine the safe fixture change.",', ""),
-    );
-    const historical = await WorkstreamStore.inspectForReattachment(accountingFixture.store.path);
-    assert.equal(historical.kind, "retained_terminal");
-  } finally {
-    await rm(accountingFixture.parent, { recursive: true, force: true });
   }
 });
 
@@ -1426,8 +1162,4 @@ function failureDetails(failure: Error): string {
         ? [failureDetails(failure.cause)]
         : [];
   return [failure.message, ...nested].join("\n");
-}
-
-function persistFixtureState(path: string, state: WorkstreamState): Promise<void> {
-  return writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
 }

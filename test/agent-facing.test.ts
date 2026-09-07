@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { inspectView, resolveAttemptHandle, resultNotification } from "../src/agent-facing.js";
+import { inspectView, resultNotification } from "../src/agent-facing.js";
 import type { WorkerReport } from "../src/types.js";
 import type {
   RetainedArtifact,
@@ -84,7 +84,7 @@ function state(
 ): WorkstreamState {
   return {
     format: "pi-workgraph-workstream",
-    version: 4,
+    version: 5,
     revision: 0,
     id: "agent-facing",
     purpose: "Test bounded agent-facing projections.",
@@ -183,7 +183,6 @@ void test("retained authority, complete assignments, and coordinator judgments r
     permittedEffects: ["Write one temporary probe"],
     stopCondition: "Stop after the first observation",
     expectedEvidence: ["Exact probe bytes"],
-    artifactPolicy: { retain: ["artifacts/probe.txt"], discardOthers: true },
     createdAt: timestamp,
   };
   const review: WorkAssignment = {
@@ -384,113 +383,6 @@ void test("pending attempt selection never broadens judgments to sibling outcome
       }),
     /has no retained outcome/,
   );
-});
-
-void test("recovery distinguishes prelaunch records and exact handles", () => {
-  const prelaunch = attempt("opaque-prelaunch", "prelaunch");
-  const current = state([assignment("prelaunch")], [prelaunch]);
-  const view = inspectView(current, { section: "recovery", attempt: prelaunch.id });
-  assert.equal(view.recordedFacts.launch, "never_launched");
-  assert.equal(view.recordedFacts.runtimeSettlement, "not_recorded");
-  assert.equal(view.recordedFacts.nativeOrGitStateFromTerminalStateAlone, false);
-
-  prelaunch.error = "Inspect uncertain launch before retrying.";
-  const other = assignment("other");
-  current.assignments.push(other);
-  current.attempts.push({ ...prelaunch, id: "other-attempt", assignmentId: other.id });
-  const recovery = inspectView(current, { section: "recovery", attempt: prelaunch.id });
-  assert.ok(recovery.guardedAction);
-  assert.equal(resolveAttemptHandle(current, recovery.guardedAction.attempt).id, prelaunch.id);
-});
-
-void test("settlement exposes blocked artifact retention without changing worker report validity", () => {
-  const experiment: WorkAssignment = {
-    id: "experiment",
-    capability: "research",
-    artifactIntent: "disposable_experiment",
-    objective: "Retain probe output",
-    intentVersion: 0,
-    authority: { receiptId: "human", intentVersion: 1 },
-    permittedEffects: ["Write probe output"],
-    stopCondition: "One output",
-    expectedEvidence: ["probe.txt"],
-    artifactPolicy: { retain: ["probe.txt"], discardOthers: true },
-    createdAt: timestamp,
-  };
-  const result = typedResult("experiment-result", experiment.id, researchReport("Probe done"));
-  const workerAttempt = attempt("experiment-attempt", experiment.id, "settled");
-  workerAttempt.resultId = result.id;
-  workerAttempt.artifactRetention = {
-    state: "blocked",
-    resultId: result.id,
-    assignmentIntentVersion: 0,
-    sourceRoot: "/tmp/probe-worktree",
-    sourceIdentity: "b".repeat(64),
-    expectedHead: "a".repeat(40),
-    destinationRoot: "/tmp/state/artifacts/experiment-result",
-    stagingRoot: "/tmp/state/artifact-staging/experiment-result",
-    required: ["probe.txt"],
-    error: "Required artifact is missing.",
-  };
-  const current = state([experiment], [workerAttempt], [result]);
-  const outcome = inspectView(current, { section: "outcome", result: result.id });
-  assert.equal("settlement" in outcome, true);
-  if (!("settlement" in outcome)) return;
-  assert.ok("status" in outcome.settlement.workerReport);
-  assert.equal(outcome.settlement.workerReport.status, "completed");
-  assert.equal(outcome.settlement.artifactRetention.state, "blocked");
-  assert.equal(outcome.settlement.artifactRetention.retained, 0);
-  assert.equal(current.dispositions.length, 0);
-  const recovery = inspectView(current, { section: "recovery", attempt: workerAttempt.id });
-  assert.match(recovery.blocker ?? "", /missing/);
-  assert.ok(recovery.guardedAction);
-});
-
-void test("pre-settlement retained reports expose their exact pending or blocked retention checkpoint", () => {
-  const experiment: WorkAssignment = {
-    id: "pre-settlement-experiment",
-    capability: "research",
-    artifactIntent: "disposable_experiment",
-    objective: "Retain probe output",
-    intentVersion: 0,
-    authority: { receiptId: "human", intentVersion: 1 },
-    permittedEffects: ["Write probe output"],
-    stopCondition: "One output",
-    expectedEvidence: ["probe.txt"],
-    artifactPolicy: { retain: ["probe.txt"], discardOthers: true },
-    createdAt: timestamp,
-  };
-  for (const retentionState of ["pending", "blocked"] as const) {
-    const result = typedResult(
-      `pre-settlement-${retentionState}`,
-      experiment.id,
-      researchReport("Probe done"),
-    );
-    const workerAttempt = attempt(`attempt-${retentionState}`, experiment.id, "running");
-    workerAttempt.artifactRetention = {
-      state: retentionState,
-      resultId: result.id,
-      assignmentIntentVersion: 0,
-      sourceRoot: "/tmp/probe-worktree",
-      sourceIdentity: "b".repeat(64),
-      expectedHead: "a".repeat(40),
-      destinationRoot: `/tmp/state/artifacts/${result.id}`,
-      stagingRoot: `/tmp/state/artifact-staging/${result.id}`,
-      required: ["probe.txt"],
-    };
-    if (retentionState === "blocked") workerAttempt.artifactRetention.error = "Copy interrupted.";
-    const current = state([experiment], [workerAttempt], [result]);
-    const outcome = inspectView(current, {
-      section: "outcome",
-      attempt: workerAttempt.id,
-      result: result.id,
-    });
-    assert.equal("settlement" in outcome, true);
-    if (!("settlement" in outcome)) continue;
-    assert.equal(outcome.settlement.artifactRetention.state, retentionState);
-    assert.equal(outcome.settlement.artifactRetention.required, 1);
-    assert.equal(outcome.settlement.recovery?.attempt, workerAttempt.id);
-  }
 });
 
 void test("typed report kinds and untyped or malformed reports remain inspectable", () => {

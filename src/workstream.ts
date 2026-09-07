@@ -16,7 +16,6 @@ import {
   type WorkstreamStoreRequirements,
 } from "./workstream-persistence.js";
 import {
-  type ArtifactRetention,
   AssignmentSchema,
   type AttemptPlacementSchema,
   type AuthorityReference,
@@ -59,7 +58,6 @@ import {
   type JsonValue,
   requireText,
   retainedTerminalInspection,
-  validateArtifactsForAssignment,
   validateAuthority,
   validateId,
   validateSession,
@@ -68,7 +66,6 @@ import {
 } from "./workstream-validation.js";
 
 export type {
-  ArtifactRetention,
   AuthorityReference,
   CompletionAccounting,
   HumanInputReceipt,
@@ -413,79 +410,13 @@ export class WorkstreamStoreEffects {
       () =>
         this.update(
           (draft, now) => {
-            const assignment = requireAssignment(draft, input.assignmentId);
+            requireAssignment(draft, input.assignmentId);
             const { now: _now, artifacts = [], ...fields } = input;
-            validateArtifactsForAssignment(
-              assignment,
-              artifacts,
-              input.validity === "typed" && input.report.status === "completed"
-                ? "typed"
-                : "absent",
-            );
             retainResultTransition(draft, {
               ...fields,
               artifacts,
               observedAt: (input.now ?? now).toISOString(),
             });
-          },
-          input.now,
-          ["active", "suspended"],
-        ),
-    );
-  }
-
-  retainResultPendingArtifacts(input: {
-    attemptId: string;
-    id: string;
-    assignmentId: string;
-    assignmentIntentVersion: number;
-    report: Extract<WorkResult, { validity: "typed" }>["report"];
-    sourceRoot: string;
-    sourceIdentity: string;
-    expectedHead: string;
-    destinationRoot: string;
-    stagingRoot: string;
-    required: string[];
-    now?: Date;
-  }): StoreEffect<WorkstreamState> {
-    return this.prepared(
-      () => validateId(input.id, "Result id"),
-      () =>
-        this.update(
-          (draft, now) => {
-            const attempt = draft.attempts.find((item) => item.id === input.attemptId);
-            if (!attempt) throw new Error(`Unknown attempt ${input.attemptId}.`);
-            const assignment = requireAssignment(draft, input.assignmentId);
-            if (
-              assignment.artifactIntent !== "disposable_experiment" ||
-              attempt.assignmentId !== assignment.id ||
-              input.assignmentIntentVersion !== assignment.intentVersion ||
-              input.report.status !== "completed" ||
-              !sameValue(input.required, assignment.artifactPolicy.retain)
-            )
-              throw new Error(
-                "Pending artifact retention does not match its experiment assignment.",
-              );
-            retainResultTransition(draft, {
-              id: input.id,
-              assignmentId: input.assignmentId,
-              assignmentIntentVersion: input.assignmentIntentVersion,
-              validity: "typed",
-              report: structuredClone(input.report),
-              artifacts: [],
-              observedAt: (input.now ?? now).toISOString(),
-            });
-            attempt.artifactRetention = {
-              state: "pending",
-              resultId: input.id,
-              assignmentIntentVersion: input.assignmentIntentVersion,
-              sourceRoot: input.sourceRoot,
-              sourceIdentity: input.sourceIdentity,
-              expectedHead: input.expectedHead,
-              destinationRoot: input.destinationRoot,
-              stagingRoot: input.stagingRoot,
-              required: [...input.required],
-            };
           },
           input.now,
           ["active", "suspended"],
@@ -711,111 +642,6 @@ export class WorkstreamStoreEffects {
     );
   }
 
-  retryComposition(id: string, now?: Date, retainedRef?: string): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      id,
-      (attempt) => {
-        const composition = attempt.composition;
-        if (composition?.state !== "blocked")
-          throw new Error(`Composition for ${id} is not blocked.`);
-        const nextComposition: NonNullable<WorkAttempt["composition"]> = {
-          state: "pending",
-          commit: composition.commit,
-          expectedHead: composition.expectedHead,
-        };
-        const nextRetainedRef = retainedRef ?? composition.retainedRef;
-        if (nextRetainedRef !== undefined) nextComposition.retainedRef = nextRetainedRef;
-        attempt.composition = nextComposition;
-      },
-      now,
-    );
-  }
-
-  retainFailedProposalNotApplied(input: {
-    id: string;
-    commit: string;
-    expectedHead: string;
-    reason: string;
-    retainedRef: string;
-    integratedRevision: string;
-    now?: Date;
-  }): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      input.id,
-      (attempt, draft) => {
-        requireText(input.commit, "Failed proposal commit");
-        requireText(input.expectedHead, "Failed proposal expected HEAD");
-        requireText(input.reason, "Failed proposal retention reason");
-        requireText(input.retainedRef, "Failed proposal retained ref");
-        requireText(input.integratedRevision, "Integrated revision");
-        if (attempt.composition !== undefined)
-          throw new Error(`Composition for ${input.id} is already recorded.`);
-        const assignment = requireAssignment(draft, attempt.assignmentId);
-        const result = draft.results.find((item) => item.id === attempt.resultId);
-        if (
-          assignment.capability !== "implement" ||
-          assignment.artifactIntent !== "maintained_change" ||
-          result?.validity !== "typed" ||
-          result.report.kind !== "implementation" ||
-          result.report.status !== "failed"
-        )
-          throw new Error(
-            `Attempt ${input.id} has no typed failed implementation proposal to retain.`,
-          );
-        if (result.artifacts.length > 0)
-          throw new Error(`Result ${result.id} already has retained artifacts.`);
-        const commit = input.commit.trim();
-        const retainedRef = input.retainedRef.trim();
-        attempt.composition = {
-          state: "retained_not_applied",
-          commit,
-          expectedHead: input.expectedHead.trim(),
-          reason: input.reason.trim(),
-          retainedRef,
-          integratedRevision: input.integratedRevision.trim(),
-        };
-        result.artifacts = [
-          {
-            id: "failed-proposal",
-            kind: "revision",
-            reference: commit,
-            retention: "retained",
-            summary: `Failed implementation proposal retained at ${retainedRef}; it was not applied.`,
-          },
-        ];
-      },
-      input.now,
-    );
-  }
-
-  retainCompositionNotApplied(input: {
-    id: string;
-    reason: string;
-    retainedRef: string;
-    integratedRevision: string;
-    now?: Date;
-  }): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      input.id,
-      (attempt) => {
-        requireText(input.reason, "Retained-not-applied reason");
-        requireText(input.retainedRef, "Retained commit ref");
-        requireText(input.integratedRevision, "Integrated revision");
-        const composition = attempt.composition;
-        if (composition?.state !== "blocked")
-          throw new Error(`Composition for ${input.id} is not blocked.`);
-        attempt.composition = {
-          ...composition,
-          state: "retained_not_applied",
-          reason: input.reason.trim(),
-          retainedRef: input.retainedRef.trim(),
-          integratedRevision: input.integratedRevision.trim(),
-        };
-      },
-      input.now,
-    );
-  }
-
   finishComposition(id: string, revision: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
@@ -858,7 +684,6 @@ export class WorkstreamStoreEffects {
   beginCleanup(input: {
     id: string;
     expectedHead?: string;
-    discard: boolean;
     now?: Date;
   }): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
@@ -871,9 +696,7 @@ export class WorkstreamStoreEffects {
   markWorkerClosed(id: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
-      (attempt, draft) => {
-        if (isLegacyArtifactRetentionFailure(draft, attempt))
-          throw new Error(legacyArtifactRetentionLimitation());
+      (attempt) => {
         if (attempt.cleanup?.state === "completed") return;
         if (attempt.cleanup?.state !== "pending")
           throw new Error(`Cleanup for ${id} is not pending.`);
@@ -884,91 +707,10 @@ export class WorkstreamStoreEffects {
     );
   }
 
-  retryArtifactRetention(id: string, now?: Date): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      id,
-      (attempt) => {
-        const retention = attempt.artifactRetention;
-        if (retention === undefined || retention.state !== "blocked")
-          throw new Error(`Artifact retention for ${id} is not blocked.`);
-        attempt.artifactRetention = { ...retention, state: "pending" };
-        delete attempt.artifactRetention.error;
-      },
-      now,
-    );
-  }
-
-  finishArtifactRetention(
-    id: string,
-    artifacts: RetainedArtifact[],
-    now?: Date,
-  ): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      id,
-      (attempt, draft) => {
-        const retention = attempt.artifactRetention;
-        if (retention?.state === "completed") {
-          const result = draft.results.find((item) => item.id === retention.resultId);
-          if (result && sameValue(result.artifacts, artifacts)) return;
-          throw new Error(`Artifact retention for ${id} has contradictory completion evidence.`);
-        }
-        if (retention?.state !== "pending")
-          throw new Error(`Artifact retention for ${id} is not pending.`);
-        const result = draft.results.find((item) => item.id === retention.resultId);
-        if (!result) throw new Error(`Unknown result ${retention.resultId}.`);
-        if (result.artifacts.length > 0 && !sameValue(result.artifacts, artifacts))
-          throw new Error(`Result ${result.id} artifacts are immutable after retention.`);
-        result.artifacts = structuredClone(artifacts);
-        attempt.artifactRetention = { ...retention, state: "completed" };
-        delete attempt.artifactRetention.error;
-      },
-      now,
-    );
-  }
-
-  blockArtifactRetention(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      id,
-      (attempt) => {
-        requireText(error, "Artifact retention error");
-        const retention = attempt.artifactRetention;
-        if (retention === undefined || retention.state === "completed")
-          throw new Error(`Artifact retention for ${id} is not blockable.`);
-        if (retention.state === "blocked" && retention.error === error.trim()) return;
-        if (retention.state === "blocked")
-          throw new Error(`Artifact retention for ${id} has contradictory failure evidence.`);
-        attempt.artifactRetention = {
-          ...retention,
-          state: "blocked",
-          error: error.trim(),
-        };
-      },
-      now,
-    );
-  }
-
-  retryCleanup(id: string, now?: Date): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      id,
-      (attempt, draft) => {
-        if (isLegacyArtifactRetentionFailure(draft, attempt))
-          throw new Error(legacyArtifactRetentionLimitation());
-        const cleanup = attempt.cleanup;
-        if (cleanup === undefined || cleanup.state !== "blocked")
-          throw new Error(`Cleanup for ${id} is not blocked.`);
-        attempt.cleanup = { ...cleanup, state: "pending" };
-        delete attempt.cleanup.error;
-      },
-      now,
-    );
-  }
-
   finishCleanup(id: string, now?: Date): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       id,
-      (attempt, draft) => {
-        if (isLegacyArtifactRetentionFailure(draft, attempt))
-          throw new Error(legacyArtifactRetentionLimitation());
+      (attempt) => {
         if (attempt.cleanup?.state === "completed") return;
         if (attempt.cleanup?.state !== "pending" || !attempt.cleanup.workerClosed)
           throw new Error(`Cleanup for ${id} requires a closed worker.`);
@@ -992,6 +734,73 @@ export class WorkstreamStoreEffects {
         }
         attempt.cleanup = {
           ...attempt.cleanup,
+          state: "blocked",
+          error: error.trim(),
+        };
+      },
+      now,
+    );
+  }
+
+  beginExperimentRelease(input: {
+    id: string;
+    expectedHead: string;
+    reason: string;
+    now?: Date;
+  }): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      input.id,
+      (attempt, draft) => {
+        requireText(input.reason, "Experiment release reason");
+        const assignment = requireAssignment(draft, attempt.assignmentId);
+        if (
+          assignment.artifactIntent !== "disposable_experiment" ||
+          attempt.state !== "settled" ||
+          attempt.placement?.kind !== "isolated_worktree" ||
+          attempt.cleanup?.state !== "completed" ||
+          !attempt.cleanup.workerClosed
+        )
+          throw new Error(
+            "Experiment release requires a settled owned experiment with a closed worker.",
+          );
+        if (attempt.experimentRelease?.state === "completed") return;
+        if (
+          attempt.experimentRelease !== undefined &&
+          attempt.experimentRelease.expectedHead !== input.expectedHead
+        )
+          throw new Error("Experiment release HEAD does not match its retained identity.");
+        attempt.experimentRelease = {
+          state: "pending",
+          expectedHead: input.expectedHead,
+          reason: input.reason.trim(),
+        };
+      },
+      input.now,
+    );
+  }
+
+  finishExperimentRelease(id: string, now?: Date): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        if (attempt.experimentRelease?.state === "completed") return;
+        if (attempt.experimentRelease?.state !== "pending")
+          throw new Error(`Experiment release for ${id} is not pending.`);
+        attempt.experimentRelease = { ...attempt.experimentRelease, state: "completed" };
+      },
+      now,
+    );
+  }
+
+  blockExperimentRelease(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        requireText(error, "Experiment release error");
+        if (attempt.experimentRelease?.state !== "pending")
+          throw new Error(`Experiment release for ${id} is not pending.`);
+        attempt.experimentRelease = {
+          ...attempt.experimentRelease,
           state: "blocked",
           error: error.trim(),
         };
@@ -1187,7 +996,7 @@ export class WorkstreamStoreEffects {
         throw new Error("Completion requires valid evidence.");
       requireTexts(input.limitations, "Completion limitations");
       requireActive(draft);
-      if (draft.attempts.some(hasActiveOrUncleanAttempt)) {
+      if (draft.attempts.some((attempt) => hasActiveOrUncleanAttempt(draft, attempt))) {
         throw new Error(
           "Complete only after workers and owned resources have settled and cleaned up.",
         );
@@ -1368,9 +1177,6 @@ function promiseFacade(effects: WorkstreamStoreEffects): WorkstreamStore {
     assign: promiseOperation((...args) => effects.assign(...args)),
     enqueue: promiseOperation((...args) => effects.enqueue(...args)),
     retainResult: promiseOperation((...args) => effects.retainResult(...args)),
-    retainResultPendingArtifacts: promiseOperation((...args) =>
-      effects.retainResultPendingArtifacts(...args),
-    ),
     startAttempt: promiseOperation((...args) => effects.startAttempt(...args)),
     recordSessionFile: promiseOperation((...args) => effects.recordSessionFile(...args)),
     recordLaunchPane: promiseOperation((...args) => effects.recordLaunchPane(...args)),
@@ -1381,25 +1187,17 @@ function promiseFacade(effects: WorkstreamStoreEffects): WorkstreamStore {
     recordAttention: promiseOperation((...args) => effects.recordAttention(...args)),
     clearAttention: promiseOperation((...args) => effects.clearAttention(...args)),
     beginComposition: promiseOperation((...args) => effects.beginComposition(...args)),
-    retryComposition: promiseOperation((...args) => effects.retryComposition(...args)),
-    retainFailedProposalNotApplied: promiseOperation((...args) =>
-      effects.retainFailedProposalNotApplied(...args),
-    ),
-    retainCompositionNotApplied: promiseOperation((...args) =>
-      effects.retainCompositionNotApplied(...args),
-    ),
     finishComposition: promiseOperation((...args) => effects.finishComposition(...args)),
     blockComposition: promiseOperation((...args) => effects.blockComposition(...args)),
     beginCleanup: promiseOperation((...args) => effects.beginCleanup(...args)),
     markWorkerClosed: promiseOperation((...args) => effects.markWorkerClosed(...args)),
-    retryArtifactRetention: promiseOperation((...args) => effects.retryArtifactRetention(...args)),
-    finishArtifactRetention: promiseOperation((...args) =>
-      effects.finishArtifactRetention(...args),
-    ),
-    blockArtifactRetention: promiseOperation((...args) => effects.blockArtifactRetention(...args)),
-    retryCleanup: promiseOperation((...args) => effects.retryCleanup(...args)),
     finishCleanup: promiseOperation((...args) => effects.finishCleanup(...args)),
     blockCleanup: promiseOperation((...args) => effects.blockCleanup(...args)),
+    beginExperimentRelease: promiseOperation((...args) => effects.beginExperimentRelease(...args)),
+    finishExperimentRelease: promiseOperation((...args) =>
+      effects.finishExperimentRelease(...args),
+    ),
+    blockExperimentRelease: promiseOperation((...args) => effects.blockExperimentRelease(...args)),
     recordSteering: promiseOperation((...args) => effects.recordSteering(...args)),
     cancelAttempt: promiseOperation((...args) => effects.cancelAttempt(...args)),
     requestDelivery: promiseOperation((...args) => effects.requestDelivery(...args)),
@@ -1476,36 +1274,12 @@ function describeJsonValue(value: JsonValue | undefined): string {
   return Array.isArray(value) ? "[array]" : "[object]";
 }
 
-export function isLegacyArtifactRetentionFailure(
-  state: WorkstreamState,
-  attempt: WorkAttempt,
-): boolean {
-  if (attempt.artifactRetention !== undefined || attempt.resultId === undefined) return false;
-  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
-  const result = state.results.find((item) => item.id === attempt.resultId);
-  return (
-    assignment?.artifactIntent === "disposable_experiment" &&
-    result?.validity === "invalid" &&
-    result.detail.startsWith("Artifact retention failed:")
-  );
-}
-
-export function legacyArtifactRetentionLimitation(): string {
-  return "Legacy artifact-retention failure has no independently retained report and source checkpoint; preserve it for inspection rather than inventing validity or retrying cleanup.";
-}
-
 function beginCleanupTransition(
   attempt: WorkAttempt,
-  input: { expectedHead?: string; discard: boolean; id: string },
+  input: { expectedHead?: string; id: string },
 ): void {
-  if (attempt.artifactRetention !== undefined && attempt.artifactRetention.state !== "completed")
-    throw new Error(`Cleanup for ${input.id} requires completed artifact retention.`);
   if (attempt.cleanup) {
-    if (
-      attempt.cleanup.state === "pending" &&
-      attempt.cleanup.expectedHead === input.expectedHead &&
-      attempt.cleanup.discard === input.discard
-    )
+    if (attempt.cleanup.state === "pending" && attempt.cleanup.expectedHead === input.expectedHead)
       return;
     throw new Error(`Cleanup for ${input.id} is already recorded.`);
   }
@@ -1513,12 +1287,9 @@ function beginCleanupTransition(
   if (!placement) throw new Error("Cleanup requires an attempt placement.");
   if (placement.kind === "isolated_worktree" && input.expectedHead === undefined)
     throw new Error("Isolated worktree cleanup requires its exact HEAD.");
-  if (placement.kind === "shared_project" && input.discard)
-    throw new Error("Shared project cleanup cannot discard files.");
   const cleanup: NonNullable<WorkAttempt["cleanup"]> = {
     state: "pending",
     workerClosed: false,
-    discard: input.discard,
   };
   if (input.expectedHead !== undefined) cleanup.expectedHead = input.expectedHead;
   attempt.cleanup = cleanup;

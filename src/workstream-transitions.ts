@@ -151,12 +151,10 @@ export function accountingIdentity(item: CompletionAccounting): string {
   return `${item.kind}:${item.resultId}`;
 }
 
-export function hasActiveOrUncleanAttempt(attempt: WorkAttempt): boolean {
-  return (
-    ["queued", "starting", "running", "cancel_requested"].includes(attempt.state) ||
-    (attempt.placement !== undefined &&
-      (attempt.cleanup?.state !== "completed" || attempt.cleanup.workerClosed !== true))
-  );
+export function hasActiveOrUncleanAttempt(_state: WorkstreamState, attempt: WorkAttempt): boolean {
+  if (["queued", "starting", "running", "cancel_requested"].includes(attempt.state)) return true;
+  if (attempt.placement === undefined) return false;
+  return attempt.cleanup?.state !== "completed" || attempt.cleanup.workerClosed !== true;
 }
 
 function assignmentResolved(state: WorkstreamState, assignment: WorkAssignment): boolean {

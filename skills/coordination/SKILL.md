@@ -54,8 +54,11 @@ Do not perform routine status/result polling or acknowledgement/disposition cere
 Pending notifications retry on reattachment, not every polling cycle; the same result identifier can recur after an interrupted delivery.
 Do not blindly resubmit an uncertain worker prompt.
 Inspect the retained native session and exact resource identities before deciding whether an operation needs recovery.
-Suspension stops new work and composition but preserves observations, results, and safe cleanup.
+Suspension stops new work and composition but preserves observations, results, and exact resources.
 Adoption preserves suspension and rejects competing or uncertain ownership.
 Keep blocked work and its evidence rather than rewriting state to claim cleanup or completion.
+A completed experiment retains its complete isolated worktree.
+Release it only when no longer needed, using `workgraph_control` with `action: "release_experiment"`, its exact attempt handle, and a reason.
+Do not treat worker completion as permission to remove experiment output or retry interrupted composition or cleanup automatically.
 
 When you need installation, tool, model-policy, or live-scenario details, read [README.md](../../README.md).

@@ -306,14 +306,17 @@ function validateExperiments(state: WorkstreamState) {
     if (attempt === undefined || result === undefined || attempt.composition !== undefined)
       problems.push(`experiment ${assignment.id} lacks attributable non-composed outcome`);
     if (result?.validity !== "typed") continue;
-    for (const artifactId of assignment.artifactPolicy.retain) {
-      if (
-        !result.artifacts.some(
-          (artifact) => artifact.id === artifactId && artifact.retention === "retained",
-        )
+    if (
+      attempt?.placement?.kind !== "isolated_worktree" ||
+      !result.artifacts.some(
+        (artifact) =>
+          artifact.id === "experiment-worktree" &&
+          artifact.kind === "path" &&
+          artifact.reference === attempt.placement?.path &&
+          artifact.retention === "retained",
       )
-        problems.push(`experiment ${assignment.id} did not retain declared artifact ${artifactId}`);
-    }
+    )
+      problems.push(`experiment ${assignment.id} did not retain its isolated worktree`);
   }
   const experiment: "verified" | "not-run" = assignments.length > 0 ? "verified" : "not-run";
   return { problems, experiment };

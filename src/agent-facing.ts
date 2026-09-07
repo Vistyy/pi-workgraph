@@ -97,10 +97,7 @@ function attemptHandle(state: WorkstreamState, attempt: WorkAttempt): string {
 }
 
 function resultOwnerAttempt(state: WorkstreamState, result: WorkResult): WorkAttempt | undefined {
-  return state.attempts.find(
-    (attempt) =>
-      attempt.resultId === result.id || attempt.artifactRetention?.resultId === result.id,
-  );
+  return state.attempts.find((attempt) => attempt.resultId === result.id);
 }
 
 function outcomeOrdinal(state: WorkstreamState, result: WorkResult): number {
@@ -196,7 +193,7 @@ function assertCompatibleSelection(
   attempt: WorkAttempt | undefined,
   outcome: WorkResult | undefined,
 ): void {
-  const retainedResultId = attempt?.resultId ?? attempt?.artifactRetention?.resultId;
+  const retainedResultId = attempt?.resultId;
   if (attempt === undefined || outcome === undefined || retainedResultId === outcome.id) return;
   if (retainedResultId === undefined)
     throw new Error(
@@ -219,12 +216,12 @@ function implicitOutcome(
   taskOutcomes: WorkResult[],
 ): WorkResult | undefined {
   if (outcome !== undefined) return outcome;
-  const retainedResultId = attempt?.resultId ?? attempt?.artifactRetention?.resultId;
+  const retainedResultId = attempt?.resultId;
   if (attempt !== undefined && request.result === undefined && retainedResultId !== undefined)
     return resultById(state, retainedResultId);
   if (request.attempt !== undefined) return undefined;
   const onlyAttempt = taskAttempts.length === 1 ? taskAttempts.at(0) : undefined;
-  const onlyAttemptResultId = onlyAttempt?.resultId ?? onlyAttempt?.artifactRetention?.resultId;
+  const onlyAttemptResultId = onlyAttempt?.resultId;
   if (onlyAttemptResultId !== undefined) {
     const result = resultById(state, onlyAttemptResultId);
     if (result !== undefined) return result;
@@ -357,23 +354,6 @@ function applicationProjection(attempt: WorkAttempt | undefined, result: WorkRes
       revision: composition.revision,
       reportedCommit: composition.commit,
     };
-  if (composition?.state === "retained_not_applied") {
-    const report = result.validity === "typed" ? result.report : undefined;
-    const commitAttribution =
-      report?.kind === "implementation" &&
-      report.status === "completed" &&
-      report.outcome === "changed" &&
-      report.commit === composition.commit
-        ? { reportedCommit: composition.commit }
-        : { validatedProposalCommit: composition.commit };
-    return {
-      state: "retained_not_applied" as const,
-      ...commitAttribution,
-      integratedRevision: composition.integratedRevision,
-      retainedRef: compactText(composition.retainedRef ?? "", 180),
-      reason: compactText(composition.reason ?? "", 280),
-    };
-  }
   if (composition !== undefined)
     return {
       state: composition.state,
@@ -390,14 +370,15 @@ function applicationProjection(attempt: WorkAttempt | undefined, result: WorkRes
   return { state: "not_applicable" as const };
 }
 
-function artifactRetentionProjection(attempt: WorkAttempt | undefined) {
-  const retention = attempt?.artifactRetention;
-  if (retention === undefined) return { state: "not_recorded" as const };
+function experimentRetentionProjection(attempt: WorkAttempt | undefined) {
+  const placement = attempt?.placement;
+  if (placement?.kind !== "isolated_worktree") return { state: "not_applicable" as const };
+  const release = attempt?.experimentRelease;
   return {
-    state: retention.state,
-    required: retention.required.length,
-    retained: retention.state === "completed" ? retention.required.length : 0,
-    blocker: retention.error === undefined ? undefined : compactText(retention.error, 280),
+    state: release?.state === "completed" ? ("released" as const) : ("retained" as const),
+    path: placement.path,
+    releaseState: release?.state,
+    blocker: release?.error === undefined ? undefined : compactText(release.error, 280),
   };
 }
 
@@ -430,7 +411,7 @@ function settlement(state: WorkstreamState, result: WorkResult) {
     blockers,
     blockerCount,
     application: applicationProjection(attempt, result),
-    artifactRetention: artifactRetentionProjection(attempt),
+    experimentWorktree: experimentRetentionProjection(attempt),
     cleanup: cleanupProjection(attempt),
     delivery: deliveryPreview(state, result),
     recovery:
@@ -468,7 +449,7 @@ function itemPage<T, U>(
 }
 
 function attemptPreview(state: WorkstreamState, attempt: WorkAttempt) {
-  const retainedResultId = attempt.resultId ?? attempt.artifactRetention?.resultId;
+  const retainedResultId = attempt.resultId;
   const result = retainedResultId === undefined ? undefined : resultById(state, retainedResultId);
   return {
     handle: attemptHandle(state, attempt),
@@ -596,7 +577,7 @@ function attention(state: WorkstreamState) {
   return state.attempts.flatMap((attempt) => {
     const blocker =
       attempt.error ??
-      attempt.artifactRetention?.error ??
+      attempt.experimentRelease?.error ??
       attempt.composition?.error ??
       attempt.cleanup?.error;
     if (blocker === undefined) return [];
@@ -772,7 +753,7 @@ function recordedCleanup(attempt: WorkAttempt) {
 }
 
 function recordedDelivery(state: WorkstreamState, attempt: WorkAttempt) {
-  const retainedResultId = attempt.resultId ?? attempt.artifactRetention?.resultId;
+  const retainedResultId = attempt.resultId;
   if (retainedResultId === undefined) return { state: "not_recorded" as const };
   const result = resultById(state, retainedResultId);
   if (result === undefined) return { state: "not_recorded" as const };
@@ -800,7 +781,7 @@ function recoveryView(
     launchPane: attempt.launchPane,
     submission: attempt.submission,
     composition: attempt.composition,
-    artifactRetention: attempt.artifactRetention,
+    experimentRelease: attempt.experimentRelease,
     cleanup: attempt.cleanup,
     attentionHistory: attempt.attentionHistory,
     models: attempt.models,
@@ -809,7 +790,7 @@ function recoveryView(
   };
   const blocker =
     attempt.error ??
-    attempt.artifactRetention?.error ??
+    attempt.experimentRelease?.error ??
     attempt.composition?.error ??
     attempt.cleanup?.error;
   const runtimeSettlementRecorded =
@@ -830,7 +811,7 @@ function recoveryView(
     },
     blocker: blocker === undefined ? undefined : compactText(blocker, 320),
     recordedFacts: {
-      attribution: "recorded_workstream_v4" as const,
+      attribution: "recorded_workstream_v5" as const,
       recordedAt: attempt.updatedAt,
       freshLiveObservation: false,
       launch: launchFact(attempt),
@@ -839,7 +820,7 @@ function recoveryView(
         : ("not_recorded" as const),
       nativeOrGitStateFromTerminalStateAlone: false,
       composition: recordedComposition(attempt),
-      artifactRetention: artifactRetentionProjection(attempt),
+      experimentWorktree: experimentRetentionProjection(attempt),
       cleanup: recordedCleanup(attempt),
       delivery: recordedDelivery(state, attempt),
       models: projectedModels(attempt),
@@ -853,16 +834,16 @@ function recoveryView(
     ),
     uncertainty,
     guardedAction:
-      blocker === undefined
-        ? undefined
-        : {
+      task.artifactIntent === "disposable_experiment" &&
+      attempt.state === "settled" &&
+      attempt.experimentRelease?.state !== "completed"
+        ? {
             tool: "workgraph_control" as const,
+            action: "release_experiment" as const,
             attempt: attempt.id,
-            actions:
-              attempt.artifactRetention?.state === "blocked"
-                ? (["recover"] as const)
-                : (["recover", "retain_not_applied"] as const),
-          },
+            requirement: "Provide a reason only after the retained worktree is no longer needed.",
+          }
+        : undefined,
   };
 }
 

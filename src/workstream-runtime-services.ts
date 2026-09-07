@@ -9,7 +9,6 @@ import {
   Layer,
   type Path,
 } from "effect";
-import { ArtifactStore } from "./artifact-store.js";
 import type { GitRepository, GitRepositoryEffects } from "./git.js";
 import type {
   HerdrInspection,
@@ -171,9 +170,6 @@ export interface RuntimeLayerOptions {
   readonly owner?: LeaseOwner | undefined;
   readonly priorOwnerLiveness?: "alive" | "dead" | "unknown" | undefined;
   readonly policy?: ModelPolicy | undefined;
-  readonly artifactStoreLayer?:
-    | Layer.Layer<ArtifactStore, never, FileSystem.FileSystem | Path.Path>
-    | undefined;
   readonly clock?: Clock.Clock | undefined;
   readonly onResult: (id: string, state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
   readonly onState: (state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
@@ -202,10 +198,7 @@ export function makeRuntimeLayer(options: RuntimeLayerOptions) {
     Layer.succeed(RuntimeHost, hostService(options)),
     ...(options.clock === undefined ? [] : [Layer.succeed(Clock.Clock, options.clock)]),
   );
-  return Layer.mergeAll(
-    options.artifactStoreLayer ?? ArtifactStore.layer,
-    leaseLayer(options),
-  ).pipe(Layer.provideMerge(base));
+  return leaseLayer(options).pipe(Layer.provideMerge(base));
 }
 
 function leaseLayer(options: RuntimeLayerOptions) {

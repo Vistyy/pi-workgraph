@@ -137,14 +137,11 @@ function retainedExperimentReferences(
     const result = state.results.find((item) => item.assignmentId === assignment.id);
     if (result?.validity !== "typed")
       throw new Error(`Experiment ${assignment.id} has no typed retained result.`);
-    for (const artifactId of assignment.artifactPolicy.retain) {
-      const artifact = result.artifacts.find(
-        (item) => item.id === artifactId && item.retention === "retained",
-      );
-      if (artifact === undefined)
-        throw new Error(`Experiment ${assignment.id} did not retain ${artifactId}.`);
-      references.push({ artifactId, reference: artifact.reference });
-    }
+    assert.ok(
+      result.artifacts.some(
+        (artifact) => artifact.id === "experiment-worktree" && artifact.retention === "retained",
+      ),
+    );
   }
   return references;
 }

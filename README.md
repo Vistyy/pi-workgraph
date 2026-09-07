@@ -49,7 +49,7 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 
 | Tool | Purpose |
 | --- | --- |
-| `workgraph_research` | Delegate focused evidence gathering, or an explicitly authorized disposable experiment with effects, stopping rules, and retained artifact paths. Optional repeated attempts use policy-selected models. |
+| `workgraph_research` | Delegate focused evidence gathering, or an explicitly authorized disposable experiment with effects and stopping rules. The complete experiment worktree is retained. Optional repeated attempts use policy-selected models. |
 | `workgraph_implement` | Delegate one bounded maintained slice with acceptance requirements under the established human-backed intent. Independent slices may share an exact base revision. |
 | `workgraph_review` | Independently inspect a retained result, artifact, exact revision, or comparison of retained results for a specified concern. |
 | `workgraph_intent` | Explicitly record the coordinator's changed semantic scope against an actual retained human input receipt. |
@@ -73,9 +73,9 @@ Routine mutation responses show the action outcome, workstream lifecycle, aggreg
 `workgraph_inspect` is the only normal inspection surface: use `section: overview` for remaining work, `context` for exact retained inputs and intent history, `task` for a semantic task, `assignment` for its complete delegation record, `outcome`, `evidence`, or `report` for retained worker content, `judgments` for dispositions and completion, and `recovery` for exact resource and settlement evidence.
 The `context`, `assignment`, `judgments`, `outcome`, `evidence`, and `report` sections return character-bounded content with a lossless `next` handle.
 An explicitly selected pending attempt has no outcome judgment; only task-level judgment selection may include sibling attempt dispositions.
-Notifications include a bounded actionable outcome, including evidence, limitations, applied versus merely reported revisions, blockers, uncertainty, and retained artifact locations.
+Notifications include a bounded actionable outcome, including evidence, limitations, applied versus merely reported revisions, blockers, uncertainty, and retained worktree locations.
 When a current attempt settles without a typed or untyped report, the retained absent result may identify a provider rate limit, native abort, or native provider error from current-generation native metadata without copying the raw provider error text into workstream state or notifications.
-When artifact details are truncated, follow the `retainedArtifacts.next` handle to recover them in full.
+When retained-resource details are truncated, follow the returned continuation handle to recover them in full.
 Use the returned `next` handle to retrieve every remaining character of typed, untyped, malformed, or large report content without silently selecting an ambiguous repeated attempt.
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic acceptance oracle.
 Completion derives mechanical unresolved accounting and accepts one explicit reason per unresolved semantic task only; it refuses live or blocked resources and never automatically accepts evidence.
@@ -85,7 +85,9 @@ The coordinator-only `workgraph_notepad` tool supports `read`, `add`, `update`, 
 Reload, resume, branch navigation, and compaction restore the latest valid persisted notepad snapshot and inject only a compact hidden context when the branch lacks it. The stable `[WORKGRAPH PENDING ITEMS]` prefix is kept cache-friendly, and notepad state never blocks `workgraph_complete`.
 Legacy response-note snapshots migrate only pending substance; presentation, draft, resolution, and supersession history are not continued.
 An explicit semantic scope revision leaves historical evidence intact and tied to its original intent, while stale maintained output cannot compose into the current intent.
-An experiment retains its named artifacts before scratch files are discarded; its code is never automatically composed.
+An experiment retains its complete isolated worktree and never composes it automatically.
+Worker settlement closes the worker but does not remove experiment output.
+Only `workgraph_control` with `action: "release_experiment"`, an exact attempt handle, and a reason removes that owned worktree after the coordinator decides it is no longer needed.
 
 Implementation uses Local Prewalk in the same worker session: a guide inspects the runtime-generated repository, placement, and exact base instructions and makes the first edit, then the executor continues.
 A bounded TODO is useful telemetry, not an artificial prerequisite for accepting a valid implementation.
@@ -116,7 +118,7 @@ Only one runtime instance can hold a workstream lease, including within the same
 An unsuccessful adoption leaves the current attachment intact.
 Expired ownership is not sufficient for takeover when the prior owner's liveness is unknown.
 
-Suspension stops new launches and composition, while observations, evidence retention, and safe cleanup continue.
+Suspension stops new launches and composition while retaining observations, evidence, and exact resources.
 Result notifications have stable identifiers and can recur after an interrupted delivery; this is not an exactly-once transport.
 The runtime records successful enqueue as delivery, but Pi exposes no supported selective cancellation or presentation/inspection receipt for one queued follow-up.
 The notice therefore describes retained-result availability, not new outstanding work; it may appear after inspection or workstream completion and must not cause reprocessing or reopening solely because it surfaced.
@@ -124,12 +126,12 @@ After a notification failure, inspect the result through `workgraph_inspect` or 
 The runtime does not repeatedly wake the coordinator on every poll.
 Completion always refuses unfinished or blocked owned work and derives exact structured accounting for unresolved assignments, attempts, results, and undelivered results from current state.
 The coordinator supplies one explicit reason by semantic task for actual unresolved exceptions; unknown or missing reasons are rejected.
-A blocked boundary is recoverable only through the guarded coordinator recovery operation after exact native and Git inspection.
-A conflicting implementation may be explicitly retained-not-applied under an owned reachable ref and reason, but is not reported as composed.
+A blocked or uncertain boundary retains its exact resources and recorded facts for coordinator-led diagnosis.
+The runtime does not automatically retry interrupted cleanup or composition, create retained-not-applied refs, or repair exceptional state.
 Routine completion does not require acknowledgement or disposition; inspection is read-only and semantic acceptance remains a separate coordinator judgment.
 Blocked work is preserved for inspection rather than force-deleted.
 
-`workgraph_control` supports guarded `recover` for an inspected transient cleanup or composition failure, and `retain_not_applied` with an exact integrated revision and reason for a deliberately un-applied conflicting commit.
+`workgraph_control` supports one destructive retained-output operation: `release_experiment` requires an exact attempt handle and reason and removes only that attempt’s verified owned worktree and branch.
 Use a semantic task handle for control; repeated attempts require an explicit attempt handle and never silently select one.
 Repeated inspections preserve delivery provenance and expose exact native, resource, cleanup, Git, applied-versus-reported revision, blocker, and uncertainty evidence.
 
@@ -143,7 +145,8 @@ pi-workgraph fork --parent-session-file SESSION_PATH --target-cwd REPOSITORY
 
 CLI results are JSON; failures exit nonzero.
 Historical state is inspected as uninterpreted JSON, without automatic migration or mutation.
-The active runtime uses workstream format version 4; earlier versions are not silently adopted.
+The active runtime uses workstream format version 5.
+Earlier active versions are preserved for offline inspection and are not migrated, rewritten, or silently adopted.
 Default shared research evidence describes live working files rather than an immutable committed snapshot.
 An explicit base revision is exact Git evidence; an exact-revision review must inspect that commit with Git rather than treating current working files as the revision.
 
@@ -187,7 +190,7 @@ Run live scenarios only from a Herdr-managed pane, against a clean committed can
 Shared research is separately expected to start with local tracked or untracked changes and leave those bytes untouched after native worker closure and retry.
 `smoke:herdr` starts idle Pi sessions without harness prompt submissions and checks native parent/fork identity, a distinct no-focus coordinator workspace, child tab-scoped workers, cleanup refusal for mismatched identity, and Herdr closure before Git removal.
 It does not claim to measure provider-side model requests.
-`smoke:coordinator` submits one authorized request through a normal visible Pi coordinator and observes automatic handling of research, experiment retention/non-composition, implementation with guide/executor messages, concurrent research, review launched against the exact implementation revision, and resource cleanup.
+`smoke:coordinator` submits one authorized request through a normal visible Pi coordinator and observes automatic handling of research, retained experiment worktrees/non-composition, implementation with guide/executor messages, concurrent research, review launched against the exact implementation revision, and resource cleanup.
 It requires authenticated configured models and does not supply later approval or progress nudges.
 Before either model-driven scenario submits its request, it prints and privately records selected models and the expected attempt shape without imposing automatic model or retry decisions.
 Available usage and cost attached to native assistant messages are recorded with an explicit limitation that provider-side requests or accounting may be unavailable.

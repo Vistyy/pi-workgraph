@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, symlink, unlink, writeFile } from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Runtime integration fixtures exercise real host filesystem, Git worktree, and session boundaries.
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Runtime integration fixtures exercise real host filesystem, Git worktree, and session boundaries.
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths identify real host repositories, worktrees, sessions, and retained artifacts.
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { Deferred, Effect, Layer } from "effect";
+import { Deferred, Effect } from "effect";
 import { TestClock } from "effect/testing";
-import { ArtifactStore } from "../src/artifact-store.js";
 import { GitRepository, runProcess } from "../src/git.js";
 import {
   type HerdrInspection,
@@ -345,6 +344,49 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
     const state = await f.store.load();
     assert.equal(state.assignments.length, retainedBefore);
     assert.equal(state.attempts.length, 2);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("experiment output remains until exact explicit coordinator release", async () => {
+  const f = await fixture();
+  try {
+    const active = f.runtime();
+    const authority = await f.authority(active);
+    f.workers.onWork = async (request) => {
+      await writeFile(join(request.cwd, "probe.txt"), "retained output\n");
+      return researchReport;
+    };
+    await active.queue({
+      id: "probe",
+      capability: "research",
+      artifactIntent: "disposable_experiment",
+      objective: "Run one isolated probe",
+      intentVersion: authority.intentVersion,
+      authority,
+      permittedEffects: ["Write probe.txt in the isolated worktree"],
+      stopCondition: "probe.txt is written",
+      expectedEvidence: ["retained output"],
+    });
+    await active.reconcile();
+    let state = await active.reconcile();
+    const attempt = required(state.attempts[0], "experiment attempt");
+    assert.equal(attempt.cleanup?.state, "completed");
+    assert.equal(
+      await readFile(join(required(attempt.placement, "placement").path, "probe.txt"), "utf8"),
+      "retained output\n",
+    );
+    assert.equal(state.results[0]?.artifacts[0]?.id, "experiment-worktree");
+    await active.releaseExperiment(attempt.id, "The retained observation has been reviewed.");
+    state = await active.reconcile();
+    assert.equal(state.attempts[0]?.experimentRelease?.state, "completed");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(
+        required(attempt.placement, "placement").path,
+      ),
+      false,
+    );
   } finally {
     await f.dispose();
   }
@@ -752,268 +794,6 @@ await test("maintained changes use guide/executor policy and review checks the r
   }
 });
 
-await test("experiments preserve valid reports while guarded retention repairs unsafe artifacts", async () => {
-  const f = await fixture();
-  try {
-    const active = f.runtime();
-    const authority = await f.authority(active);
-    const initial = await f.repository.head();
-    const input = (id: string) => ({
-      id,
-      capability: "research" as const,
-      artifactIntent: "disposable_experiment" as const,
-      objective: "Probe",
-      intentVersion: 1,
-      authority,
-      permittedEffects: ["Scratch edits in isolated worktree"],
-      stopCondition: "One observation",
-      expectedEvidence: ["Probe output"],
-      artifactPolicy: { retain: ["probe.txt"], discardOthers: true as const },
-    });
-    f.workers.onWork = async (request) => {
-      assert.equal(workerEnvironment(request, "PI_WORKGRAPH_EXPERIMENT"), "1");
-      await writeFile(join(request.cwd, "probe.txt"), "observed\n");
-      await writeFile(join(request.cwd, "scratch.txt"), "discardable\n");
-      return researchReport;
-    };
-    await active.queue(input("probe"));
-    await active.reconcile();
-    let state = await active.reconcile();
-    const artifact = state.results[0]?.artifacts[0];
-    assert.ok(artifact);
-    assert.equal(await readFile(artifact.reference, "utf8"), "observed\n");
-    assert.equal(state.attempts[0]?.artifactRetention?.state, "completed");
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-    assert.equal(await f.repository.head(), initial);
-
-    f.workers.onWork = async () => ({
-      ...researchReport,
-      status: "failed",
-      summary: "Probe failed before writing output",
-    });
-    await active.queue(input("failed-probe"));
-    await active.reconcile();
-    state = await active.reconcile();
-    assert.equal(state.results[1]?.validity, "typed");
-    assert.equal(state.results[1]?.artifacts.length, 0);
-    assert.equal(state.attempts[1]?.cleanup?.state, "completed");
-
-    f.workers.onWork = async (request) => {
-      await symlink(join(f.root, "value.txt"), join(request.cwd, "probe.txt"));
-      return researchReport;
-    };
-    await active.queue(input("unsafe-probe"));
-    await active.reconcile();
-    state = await active.reconcile();
-    const unsafeAttempt = state.attempts[2];
-    const unsafeResult = state.results[2];
-    assert.ok(unsafeAttempt && unsafeResult);
-    assert.equal(unsafeResult.validity, "typed");
-    assert.deepEqual(
-      unsafeResult.validity === "typed" ? unsafeResult.report : undefined,
-      researchReport,
-    );
-    assert.equal(unsafeAttempt.artifactRetention?.state, "blocked");
-    assert.match(unsafeAttempt.artifactRetention?.error ?? "", /Symlink artifact/);
-    assert.equal(unsafeAttempt.cleanup, undefined);
-    assert.equal(f.workers.cleanupCount, 2);
-    await active.recoverAttempt({
-      attemptId: unsafeAttempt.id,
-      action: "retry",
-      reason: "Recheck the exact required artifact without accepting its report.",
-    });
-    state = await f.store.load();
-    assert.equal(state.attempts[2]?.artifactRetention?.state, "blocked");
-    assert.equal(state.attempts[2]?.cleanup, undefined);
-
-    const unsafeSource = join(unsafeAttempt.placement?.path ?? "", "probe.txt");
-    await unlink(unsafeSource);
-    await writeFile(unsafeSource, "repaired evidence\n");
-    await active.recoverAttempt({
-      attemptId: unsafeAttempt.id,
-      action: "retry",
-      reason: "The exact owned source now contains a regular required artifact.",
-    });
-    state = await f.store.load();
-    const repaired = state.results[2]?.artifacts[0];
-    assert.ok(repaired);
-    assert.equal(await readFile(repaired.reference, "utf8"), "repaired evidence\n");
-    assert.equal(state.attempts[2]?.artifactRetention?.state, "completed");
-    assert.equal(state.attempts[2]?.cleanup?.state, "completed");
-    await active.recoverAttempt({
-      attemptId: unsafeAttempt.id,
-      action: "retry",
-      reason: "Repeat the guarded retry to prove completed retention is idempotent.",
-    });
-    assert.equal(await readFile(repaired.reference, "utf8"), "repaired evidence\n");
-    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("artifact retry reconciles interrupted copies and refuses missing, unsafe, or stale sources", async () => {
-  const f = await fixture();
-  try {
-    const active = f.runtime();
-    const authority = await f.authority(active);
-    const input = (id: string, retain: string[]) => ({
-      id,
-      capability: "research" as const,
-      artifactIntent: "disposable_experiment" as const,
-      objective: "Probe",
-      intentVersion: 1,
-      authority,
-      permittedEffects: ["Scratch edits in isolated worktree"],
-      stopCondition: "One observation",
-      expectedEvidence: ["Probe output"],
-      artifactPolicy: { retain, discardOthers: true as const },
-    });
-    f.workers.onWork = async () => researchReport;
-    await active.queue(input("missing-probe", ["probe.txt"]));
-    await active.reconcile();
-    let state = await active.reconcile();
-    const missingAttempt = state.attempts[0];
-    assert.ok(missingAttempt);
-    assert.equal(state.results[0]?.validity, "typed");
-    assert.equal(missingAttempt.artifactRetention?.state, "blocked");
-    assert.equal(missingAttempt.cleanup, undefined);
-    await active.recoverAttempt({
-      attemptId: missingAttempt.id,
-      action: "retry",
-      reason: "Verify that the required source is still missing.",
-    });
-    state = await f.store.load();
-    const retention =
-      state.attempts[0]?.artifactRetention ??
-      assert.fail("Artifact retention state must be present.");
-    const placement =
-      state.attempts[0]?.placement ?? assert.fail("Artifact placement must be present.");
-    assert.equal(retention.state, "blocked");
-    assert.equal(state.attempts[0]?.cleanup, undefined);
-
-    await writeFile(join(placement.path, "probe.txt"), "checkpointed evidence\n");
-    await mkdir(retention.destinationRoot, { recursive: true });
-    const target = join(retention.destinationRoot, "probe.txt");
-    await writeFile(target, "checkpointed evidence\n");
-    await active.recoverAttempt({
-      attemptId: missingAttempt.id,
-      action: "retry",
-      reason: "Preserve an unmarked legacy target while retaining an owned payload.",
-    });
-    state = await f.store.load();
-    const retained = state.results[0]?.artifacts[0];
-    assert.equal(state.attempts[0]?.artifactRetention?.state, "completed");
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-    assert.ok(retained);
-    assert.notEqual(retained.reference, target);
-    assert.equal(await readFile(retained.reference, "utf8"), "checkpointed evidence\n");
-    assert.equal(await readFile(target, "utf8"), "checkpointed evidence\n");
-
-    await active.queue(input("escaping-probe", ["../foreign.txt"]));
-    await active.reconcile();
-    state = await active.reconcile();
-    const escapingAttempt = state.attempts[1];
-    assert.ok(escapingAttempt);
-    assert.equal(state.results[1]?.validity, "typed");
-    assert.equal(escapingAttempt.artifactRetention?.state, "blocked");
-    assert.match(
-      escapingAttempt.artifactRetention?.error ?? "",
-      /non-metadata path|retained boundary/,
-    );
-    assert.equal(escapingAttempt.cleanup, undefined);
-    await submit(
-      active,
-      f.store.effects.reviseIntent({
-        authorityReceiptId: authority.receiptId,
-        statement: "A newer experiment constraint supersedes retries.",
-        constraints: ["Do not retry historical artifact retention."],
-      }),
-    );
-    await assert.rejects(
-      active.recoverAttempt({
-        attemptId: escapingAttempt.id,
-        action: "retry",
-        reason: "A stale intent must not authorize artifact recovery.",
-      }),
-      /stale intent/,
-    );
-    state = await f.store.load();
-    assert.equal(state.attempts[1]?.artifactRetention?.state, "blocked");
-    assert.equal(state.attempts[1]?.cleanup, undefined);
-    assert.ok(escapingAttempt.placement);
-    assert.match(await readFile(join(escapingAttempt.placement.path, ".git"), "utf8"), /gitdir/);
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("legacy conflated artifact failures remain immutable and cannot be repaired as valid reports", async () => {
-  const f = await fixture();
-  try {
-    const active = f.runtime();
-    const authority = await f.authority(active);
-    f.workers.onWork = async (request) => {
-      await symlink(join(f.root, "value.txt"), join(request.cwd, "probe.txt"));
-      return researchReport;
-    };
-    await active.queue({
-      id: "legacy-artifact-failure",
-      capability: "research",
-      artifactIntent: "disposable_experiment",
-      objective: "Retain probe output",
-      intentVersion: 1,
-      authority,
-      permittedEffects: ["Write isolated probe output"],
-      stopCondition: "One observation",
-      expectedEvidence: ["probe.txt"],
-      artifactPolicy: { retain: ["probe.txt"], discardOthers: true },
-    });
-    await active.reconcile();
-    const current = await active.reconcile();
-    const attempt = current.attempts[0];
-    const result = current.results[0];
-    assert.ok(attempt?.artifactRetention && result);
-    const legacy = structuredClone(current);
-    legacy.results.splice(0, 1, {
-      id: result.id,
-      assignmentId: result.assignmentId,
-      assignmentIntentVersion: result.assignmentIntentVersion,
-      artifacts: [],
-      observedAt: result.observedAt,
-      validity: "invalid",
-      detail: `Artifact retention failed: ${attempt.artifactRetention.error ?? "copy failed"}`,
-    });
-    const legacyAttempt = legacy.attempts[0];
-    assert.ok(legacyAttempt);
-    legacyAttempt.cleanup = {
-      state: "blocked",
-      expectedHead: attempt.artifactRetention.expectedHead,
-      workerClosed: false,
-      discard: false,
-      error: attempt.artifactRetention.error ?? "copy failed",
-    };
-    delete legacyAttempt.artifactRetention;
-    await writeFile(f.store.path, `${JSON.stringify(legacy, null, 2)}\n`, { mode: 0o600 });
-    const before = await readFile(f.store.path, "utf8");
-    await assert.rejects(
-      active.recoverAttempt({
-        attemptId: attempt.id,
-        action: "retry",
-        reason: "Legacy records must not invent the original valid report.",
-      }),
-      /Legacy artifact-retention failure has no independently retained report/,
-    );
-    assert.equal(await readFile(f.store.path, "utf8"), before);
-    const retainedLegacy = await f.store.load();
-    assert.equal(retainedLegacy.results[0]?.validity, "invalid");
-    assert.equal(retainedLegacy.attempts[0]?.cleanup?.state, "blocked");
-    assert.equal(f.workers.cleanupCount, 0);
-  } finally {
-    await f.dispose();
-  }
-});
-
 await test("wrong-mode and stale maintained results remain retained without composition or destructive cleanup", async () => {
   const f = await fixture();
   try {
@@ -1074,73 +854,6 @@ await test("wrong-mode and stale maintained results remain retained without comp
       ),
       /workers and owned resources/,
     );
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("recovery fences retained-ref writes after asynchronous worker inspection", async () => {
-  const f = await fixture();
-  try {
-    const active = f.runtime();
-    const authority = await f.authority(active);
-    f.workers.onWork = async (request) => {
-      await writeFile(join(request.cwd, "value.txt"), "recovered\n");
-      await git(request.cwd, "add", ".");
-      await git(request.cwd, "commit", "-m", "worker proposal");
-      return {
-        kind: "implementation",
-        status: "completed",
-        outcome: "changed",
-        summary: "Worker proposal",
-        evidence: [],
-        findings: [],
-        commit: await git(request.cwd, "rev-parse", "HEAD"),
-      };
-    };
-    await active.queue({
-      id: "fenced-recovery",
-      capability: "implement",
-      artifactIntent: "maintained_change",
-      objective: "Change value",
-      intentVersion: 1,
-      authority,
-      acceptance: ["value changes"],
-    });
-    await active.reconcile();
-    await writeFile(join(f.root, "unrelated.txt"), "temporary\n");
-    const state = await active.reconcile();
-    const attempt = required(state.attempts[0], "blocked composition attempt");
-    assert.equal(attempt.composition?.state, "blocked");
-    await rm(join(f.root, "unrelated.txt"));
-    const beforeHead = await f.repository.head();
-    await active.stop();
-    const recovered = f.runtime();
-    f.workers.onInspect = () => {
-      f.registry.db.prepare("DELETE FROM leases WHERE run_id=?").run("ws-fixture");
-    };
-    await assert.rejects(
-      recovered.recoverAttempt({
-        attemptId: attempt.id,
-        action: "retry",
-        reason: "Fence must hold through inspection",
-      }),
-      /no lease|live lease|owner/i,
-    );
-    const retained = await runProcess(
-      "git",
-      [
-        "-C",
-        f.root,
-        "show-ref",
-        "--verify",
-        "--quiet",
-        `refs/workgraph-retained/ws-fixture/${attempt.id}`,
-      ],
-      { cwd: f.root, timeoutMs: 30_000 },
-    );
-    assert.equal(retained.exitCode, 1, "ownership loss must precede retained-ref creation");
-    assert.equal(await f.repository.head(), beforeHead);
   } finally {
     await f.dispose();
   }
@@ -1344,52 +1057,6 @@ await test("Effect-owned fibers use deterministic cadence and stop before releas
   }
 });
 
-await test("fatal heartbeat failure disposes the lease and artifact scope before immediate reattachment", async (t) => {
-  const f = await fixture();
-  const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
-  await Effect.runPromise(clock.setTime(nativeLeaseTimestamp()));
-  let artifactReleased = false;
-  const artifactStoreLayer = Layer.merge(
-    ArtifactStore.layer,
-    Layer.effectDiscard(
-      Effect.acquireRelease(Effect.void, () =>
-        Effect.sync(() => {
-          artifactReleased = true;
-        }),
-      ),
-    ),
-  );
-  try {
-    const active = f.runtime(undefined, { clock, artifactStoreLayer });
-    active.start();
-    await submit(active, Effect.void);
-    const renew = t.mock.method(f.registry, "renew", () => {
-      throw new Error("fixture renewal failed before changing lease");
-    });
-    await Effect.runPromise(clock.adjust("5 seconds"));
-    for (let index = 0; index < 100; index++) {
-      if (
-        artifactReleased &&
-        f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture") === undefined
-      )
-        break;
-      await Effect.runPromise(Effect.yieldNow);
-    }
-    assert.equal(artifactReleased, true);
-    assert.equal(
-      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
-      undefined,
-    );
-    assert.match(f.errors.join("\n"), /renewal failed before changing lease/);
-    renew.mock.restore();
-    const reattached = f.runtime();
-    const state = await reattached.reconcile();
-    assert.equal(state.id, "ws-fixture");
-  } finally {
-    await f.dispose(true);
-  }
-});
-
 await test("heartbeat ownership loss reports once and interrupts scoped reconciliation", async () => {
   const f = await fixture();
   const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
@@ -1561,36 +1228,6 @@ await test("pre-session cancellation cleans only the known placement and never l
     assert.equal(state.attempts[0]?.state, "cancel_requested");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(f.workers.requests.length, 0);
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("pre-pane cancellation preserves unlocated native uncertainty without relaunch or fabricated absence", async () => {
-  const f = await fixture();
-  try {
-    const active = f.runtime();
-    f.workers.failBeforePane = true;
-    await active.queue(research("cancel-before-pane-checkpoint"));
-    await active.reconcile();
-    let state = await f.store.load();
-    const attempt = required(state.attempts[0], "pre-pane attempt");
-    assert.equal(attempt.sessionFile === undefined, false);
-    assert.equal(attempt.launchPane, undefined);
-    assert.equal(attempt.worker, undefined);
-    await active.cancel(attempt.id);
-    await assert.rejects(
-      active.recoverAttempt({
-        attemptId: attempt.id,
-        action: "retry",
-        reason: "Observe without inventing an absent pane.",
-      }),
-      /no pane locator|remains uncertain/i,
-    );
-    await active.reconcile();
-    state = await f.store.load();
-    assert.equal(state.attempts[0]?.cleanup, undefined);
-    assert.equal(f.workers.requests.length, 1);
   } finally {
     await f.dispose();
   }

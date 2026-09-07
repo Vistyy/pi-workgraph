@@ -53,6 +53,16 @@ Preserve genuine authority, input and model provenance, exact resource ownership
 Represent uncertainty explicitly, especially when an operation may have taken effect despite an interrupted response.
 Recovery should inspect authoritative state before retrying and should retain conflicting or blocked work when safe automatic settlement is not justified.
 
+### Retain experiments at their ownership boundary
+
+A disposable experiment retains its complete owned isolated worktree rather than publishing selected files into managed storage.
+Worker completion may close the worker but does not remove experiment output.
+The coordinator alone decides when the worktree is no longer needed and releases it through one exact-attempt operation with a recorded reason.
+That operation may remove only the verified owned worktree and branch; foreign, dirty-mismatched, or uncertain resources remain intact with useful diagnostics.
+
+Exceptional composition or cleanup state is evidence to inspect, not a specialized automatic repair pipeline.
+Reattachment may conservatively observe exact identities and postconditions, but it must not blindly retry or manufacture retained-not-applied state.
+
 ### Keep lifecycle ownership explicit
 
 Effect 4 provides one structured lifecycle and concurrency model for the active coordination runtime rather than a parallel public workflow interface.
