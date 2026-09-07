@@ -55,6 +55,18 @@ void test("timeout keeps the diagnostic result and escalates from SIGTERM to SIG
   assert.notEqual(result.exitCode, 0);
 });
 
+void test("timeout includes streams held by a child after the parent exits", async () => {
+  const result = await run(
+    node,
+    [
+      "-e",
+      "const { spawn } = require('node:child_process'); const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 350)'], { stdio: 'inherit' }); child.unref();",
+    ],
+    { cwd, timeoutMs: 50, killGraceMs: 50 },
+  );
+  assert.equal(result.timedOut, true);
+});
+
 void test("spawn failures are reported through the process error", async () => {
   await assert.rejects(
     run("/definitely/not/a/real/process", [], { cwd, timeoutMs: 1_000 }),
