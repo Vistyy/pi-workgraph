@@ -21,6 +21,7 @@ export interface CoordinatorNamingContext {
 const HERDR_AGENT_NAME_LIMIT = 32;
 const IDENTITY_SUFFIX_LENGTH = 6;
 const WORKER_TAB_LABEL_LIMIT = 18;
+const WORKER_TAB_PREFIX = "↳ ";
 const TAB_SUBJECT_LIMIT = 24;
 const GENERIC_ASSIGNMENT_IDS = new Set([
   "assignment",
@@ -64,7 +65,11 @@ export function legacyObjectiveHerdrWorkerName(request: WorkerNamingContext): st
 }
 
 export function herdrWorkerTabLabel(request: WorkerNamingContext): string {
-  return boundAtWord(workerSubject(request), WORKER_TAB_LABEL_LIMIT);
+  const subject = boundAtWord(
+    workerSubject(request),
+    WORKER_TAB_LABEL_LIMIT - WORKER_TAB_PREFIX.length,
+  );
+  return `${WORKER_TAB_PREFIX}${subject}`;
 }
 
 export function herdrCoordinatorNames(request: CoordinatorNamingContext) {

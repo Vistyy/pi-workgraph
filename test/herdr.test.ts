@@ -39,7 +39,7 @@ await test("worker tabs use concise task text while native names remain unique a
   const label = herdrWorkerTabLabel(request);
   assert.match(first, /^meaningful-agen[a-z]*-implement-[a-f0-9]{6}$/);
   assert.match(first, /^[a-z][a-z0-9_-]{0,31}$/);
-  assert.equal(label, "Meaningful agent");
+  assert.equal(label, "↳ Meaningful");
   assert.ok(label.length <= 18);
   assert.doesNotMatch(label, /implement|[a-f0-9]{6}/i);
   assert.equal(herdrWorkerTabLabel({ ...request, attemptId: "attempt-two" }), label);
@@ -49,7 +49,7 @@ await test("worker tabs use concise task text while native names remain unique a
     assignmentId: "assignment-123456789abcdef0",
     objective: "Implement parser support",
   });
-  assert.equal(fallback, "Implement parser");
+  assert.equal(fallback, "↳ Implement");
   assert.ok(fallback.length <= 18);
   assert.equal(
     herdrAgentName("run", "node", "attempt"),
@@ -62,7 +62,7 @@ await test("worker tabs use concise task text while native names remain unique a
     assignmentId: "tool-design",
     objective: "Implement the tool design",
   });
-  assert.equal(semanticId, "Tool design");
+  assert.equal(semanticId, "↳ Tool design");
   assert.ok(semanticId.length <= 18);
 });
 

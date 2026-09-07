@@ -294,6 +294,12 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", (_event, ctx) => {
+    // Workgraph workers must not be able to rename their Herdr tab. Preserve every
+    // other active tool, including tools supplied by the host or another extension.
+    const activeTools = pi.getActiveTools();
+    if (activeTools.includes("herdr_rename"))
+      pi.setActiveTools(activeTools.filter((toolName) => toolName !== "herdr_rename"));
+
     const attempt = latestAttemptState(ctx.sessionManager.getBranch());
     if (attempt !== undefined) reattachAttemptState(attempt);
   });

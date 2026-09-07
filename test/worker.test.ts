@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths identify real repository and session resources.
 import { join } from "node:path";
 import test from "node:test";
-import type { SessionManager } from "@earendil-works/pi-coding-agent";
+import type { ExtensionActions, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -51,7 +51,11 @@ function assistant(session: SessionManager, model = "gpt-4o") {
   });
 }
 
-async function fixture(mode: "implementation" | "research" | "review", continued = false) {
+async function fixture(
+  mode: "implementation" | "research" | "review",
+  continued = false,
+  actions: Partial<ExtensionActions> = {},
+) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
   const root = join(parent, "repo");
   await mkdir(root);
@@ -71,7 +75,14 @@ async function fixture(mode: "implementation" | "research" | "review", continued
     PI_WORKGRAPH_IMPLEMENTATION_START: continued ? "executor" : null,
     PI_WORKGRAPH_EXPERIMENT: null,
   });
-  const pi = await extensionFixture("worker", root, parent);
+  let activeTools = ["read", "bash", "edit", "write"];
+  const pi = await extensionFixture("worker", root, parent, {
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (toolNames) => {
+      activeTools = [...toolNames];
+    },
+    ...actions,
+  });
   return {
     ...pi,
     root,
@@ -181,6 +192,28 @@ void test("no-change implementation can report from the guide without manufactur
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "before\n");
   } finally {
     await f.dispose();
+  }
+});
+
+void test("every worker role excludes Herdr rename while preserving other active tools across reload", async () => {
+  for (const mode of ["implementation", "research", "review"] as const) {
+    let activeTools = ["read", "bash", "edit", "write", "herdr_rename"];
+    const f = await fixture(mode, false, {
+      getActiveTools: () => [...activeTools],
+      setActiveTools: (toolNames) => {
+        activeTools = [...toolNames];
+      },
+    });
+    try {
+      await f.runner.emit({ type: "session_start", reason: "startup" });
+      assert.deepEqual(activeTools, ["read", "bash", "edit", "write"]);
+
+      activeTools.push("herdr_rename");
+      await f.runner.emit({ type: "session_start", reason: "reload" });
+      assert.deepEqual(activeTools, ["read", "bash", "edit", "write"]);
+    } finally {
+      await f.dispose();
+    }
   }
 });
 
