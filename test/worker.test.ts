@@ -55,6 +55,7 @@ async function fixture(
   mode: "implementation" | "research" | "review",
   continued = false,
   actions: Partial<ExtensionActions> = {},
+  experiment = false,
 ) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
   const root = join(parent, "repo");
@@ -73,7 +74,7 @@ async function fixture(
     PI_WORKGRAPH_EXECUTOR_MODEL: "openai/gpt-4o",
     PI_WORKGRAPH_EXECUTOR_THINKING: "high",
     PI_WORKGRAPH_IMPLEMENTATION_START: continued ? "executor" : null,
-    PI_WORKGRAPH_EXPERIMENT: null,
+    PI_WORKGRAPH_EXPERIMENT: experiment ? "1" : null,
   });
   let activeTools = ["read", "bash", "edit", "write"];
   const pi = await extensionFixture("worker", root, parent, {
@@ -205,22 +206,37 @@ void test("no-change implementation can report from the guide without manufactur
   }
 });
 
-void test("every worker role excludes Herdr rename while preserving other active tools across reload", async () => {
-  for (const mode of ["implementation", "research", "review"] as const) {
-    let activeTools = ["read", "bash", "edit", "write", "herdr_rename"];
-    const f = await fixture(mode, false, {
-      getActiveTools: () => [...activeTools],
-      setActiveTools: (toolNames) => {
-        activeTools = [...toolNames];
+void test("worker tool availability follows assignment permissions across reload", async () => {
+  for (const [mode, experiment, canEdit] of [
+    ["implementation", false, true],
+    ["research", false, false],
+    ["review", false, false],
+    ["research", true, true],
+    ["review", true, false],
+  ] as const) {
+    const originalTools = ["read", "bash", "edit", "write", "herdr_rename", "custom_lookup"];
+    let activeTools = [...originalTools];
+    const f = await fixture(
+      mode,
+      false,
+      {
+        getActiveTools: () => [...activeTools],
+        setActiveTools: (toolNames) => {
+          activeTools = [...toolNames];
+        },
       },
-    });
+      experiment,
+    );
+    const expected = canEdit
+      ? ["read", "bash", "edit", "write", "custom_lookup"]
+      : ["read", "bash", "custom_lookup"];
     try {
       await f.runner.emit({ type: "session_start", reason: "startup" });
-      assert.deepEqual(activeTools, ["read", "bash", "edit", "write"]);
+      assert.deepEqual(activeTools, expected);
 
-      activeTools.push("herdr_rename");
+      activeTools = [...originalTools];
       await f.runner.emit({ type: "session_start", reason: "reload" });
-      assert.deepEqual(activeTools, ["read", "bash", "edit", "write"]);
+      assert.deepEqual(activeTools, expected);
     } finally {
       await f.dispose();
     }
