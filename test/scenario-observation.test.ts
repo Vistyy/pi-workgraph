@@ -4,13 +4,15 @@ import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
 import {
   observeCoordinatorTurn,
   observeDelegatedOutcome,
   observeDirectEffect,
   observeIsolatedGitResourceAbsence,
 } from "../scripts/live/scenario-observation.js";
-import { WorkstreamStore } from "../src/workstream.js";
+import { liveLayer } from "../src/node-platform.js";
+import { WorkstreamStoreEffects } from "../src/workstream.js";
 import { required } from "./decoders.js";
 import { usage } from "./helpers.js";
 
@@ -47,16 +49,18 @@ function failedAssistant(session: SessionManager, stopReason: "error" | "aborted
 async function baseState() {
   const root = `/tmp/natural-test-${randomUUID()}`;
   await mkdir(`${root}/.git`, { recursive: true });
-  return WorkstreamStore.create({
-    id: "natural-test",
-    purpose: "Test natural observation",
-    projectRoot: root,
-    gitCommonDir: `${root}/.git`,
-    coordinator: {
-      sessionId: "coordinator",
-      sessionFile: `${root}/coordinator.jsonl`,
-    },
-  });
+  return Effect.runPromise(
+    WorkstreamStoreEffects.create({
+      id: "natural-test",
+      purpose: "Test natural observation",
+      projectRoot: root,
+      gitCommonDir: `${root}/.git`,
+      coordinator: {
+        sessionId: "coordinator",
+        sessionFile: `${root}/coordinator.jsonl`,
+      },
+    }).pipe(Effect.provide(liveLayer)),
+  );
 }
 
 void test("direct native outcome accepts the authorized tracked edit and rejects untracked effects", () => {

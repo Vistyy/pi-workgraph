@@ -7,7 +7,7 @@ export default defineConfig({
   overrides: [
     {
       files: ["test/**/*.test.ts"],
-      // node:test callbacks and fake Promise adapters are framework contracts; all safety and Effect boundary rules remain enabled.
+      // node:test callbacks and standalone test runners are framework contracts; all safety and Effect boundary rules remain enabled.
       rules: { "effecttsgo/async-function": "off" },
     },
   ],

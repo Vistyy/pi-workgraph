@@ -13,7 +13,8 @@ import { Effect } from "effect";
 import type { InspectSection } from "../src/agent-facing.js";
 import { runCli } from "../src/cli.js";
 import { inspectSections, parseCliRequest } from "../src/cli-parse.js";
-import { WorkstreamStore } from "../src/workstream.js";
+import { liveLayer } from "../src/node-platform.js";
+import { WorkstreamStoreEffects } from "../src/workstream.js";
 import { git, persistentSession } from "./helpers.js";
 
 void test("CLI parser maps every inspection section and bounded option", () => {
@@ -106,13 +107,15 @@ void test("CLI inspect wires new context and judgments sections through the nati
   const gitCommonDir = join(parent, ".git");
   try {
     await mkdir(gitCommonDir);
-    const { state } = await WorkstreamStore.create({
-      id: "cli-inspect",
-      purpose: "Inspect every current top-level section",
-      projectRoot: parent,
-      gitCommonDir,
-      coordinator: { sessionId: "coordinator", sessionFile: join(parent, "session.jsonl") },
-    });
+    const { state } = await Effect.runPromise(
+      WorkstreamStoreEffects.create({
+        id: "cli-inspect",
+        purpose: "Inspect every current top-level section",
+        projectRoot: parent,
+        gitCommonDir,
+        coordinator: { sessionId: "coordinator", sessionFile: join(parent, "session.jsonl") },
+      }).pipe(Effect.provide(liveLayer)),
+    );
     for (const section of ["overview", "context", "judgments"] as const) {
       const result = await runCli(["inspect", "--state", state.statePath, "--section", section]);
       assert.equal(result.command, "inspect");

@@ -9,7 +9,6 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { liveLayer } from "../src/node-platform.js";
 import {
-  createWorkerSession,
   createWorkerSessionEffect,
   effectiveModelObservations,
   forkConversationSessionEffect,
@@ -22,11 +21,14 @@ import {
 } from "../src/pi-process.js";
 import { usage } from "./helpers.js";
 
+const runSession = (request: Parameters<typeof createWorkerSessionEffect>[0]) =>
+  Effect.runPromise(Effect.provide(createWorkerSessionEffect(request), liveLayer));
+
 await test("fresh worker context, explicit continuation, native generation markers and invalid reports remain distinct", async () => {
   const root = await mkdtemp(join(tmpdir(), "workgraph-session-"));
   const generation = { runId: "fixture", nodeId: "first" };
   try {
-    const file = await createWorkerSession({
+    const file = await runSession({
       ...generation,
       targetCwd: root,
       sessionDir: join(root, "sessions"),
@@ -80,7 +82,7 @@ await test("fresh worker context, explicit continuation, native generation marke
     });
     assert.equal(readWorkgraphReportResult(file, generation).invalid, true);
     const next = { ...generation, nodeId: "second" };
-    const continuation = await createWorkerSession({
+    const continuation = await runSession({
       ...next,
       targetCwd: root,
       sessionDir: join(root, "sessions"),
@@ -119,7 +121,7 @@ await test("session Effects distinguish provider persistence failures from nativ
     );
     assert.equal(providerFailure._tag, "PlatformError");
 
-    const parentFile = await createWorkerSession({
+    const parentFile = await runSession({
       ...generation,
       targetCwd: root,
       sessionDir: join(root, "sessions"),
@@ -147,7 +149,7 @@ await test("native failure observation is current-generation, latest-message, an
   const root = await mkdtemp(join(tmpdir(), "workgraph-native-failure-"));
   const first = { runId: "native-fixture", nodeId: "first" };
   try {
-    const file = await createWorkerSession({
+    const file = await runSession({
       ...first,
       targetCwd: root,
       sessionDir: join(root, "sessions"),
@@ -210,7 +212,7 @@ await test("native failure observation is current-generation, latest-message, an
     assert.equal(observeNativeFailure(file, first), "native-error");
 
     const next = { ...first, nodeId: "second" };
-    const continuation = await createWorkerSession({
+    const continuation = await runSession({
       ...next,
       targetCwd: root,
       sessionDir: join(root, "sessions"),

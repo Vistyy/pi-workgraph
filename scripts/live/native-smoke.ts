@@ -5,14 +5,15 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Config, ConfigProvider, Effect } from "effect";
 import { Type } from "typebox";
-import { GitRepository } from "../../src/git.js";
+import { openRepository } from "../../src/git.js";
 import {
   CoordinatorLaunchError,
   HerdrCliRuntime,
   herdrCoordinatorNames,
   herdrWorkerTabLabel,
 } from "../../src/herdr.js";
-import { createWorkerSession, forkConversationSession } from "../../src/pi-process.js";
+import { liveLayer } from "../../src/node-platform.js";
+import { createWorkerSessionEffect, forkConversationSessionEffect } from "../../src/pi-process.js";
 import {
   closeOwnedWorkspace,
   createFixtureCheckpoint,
@@ -47,24 +48,36 @@ try {
     PI_CODING_AGENT_DIR: f.agentDir,
   });
   await herdr(f.root, Type.Object({}), "agent", "rename", coordinator.paneId, "--clear");
-  const observed = await runtime.observeCurrentCoordinator({
-    paneId: coordinator.paneId,
-    sessionFile: coordinator.sessionFile,
-    cwd: f.root,
-  });
+  const observed = await Effect.runPromise(
+    runtime.effects.observeCurrentCoordinator({
+      paneId: coordinator.paneId,
+      sessionFile: coordinator.sessionFile,
+      cwd: f.root,
+    }),
+  );
   assert.equal(observed.agentName, undefined);
-  assert.equal(await runtime.coordinatorLiveness(coordinator.sessionFile), "alive");
+  assert.equal(
+    await Effect.runPromise(runtime.effects.coordinatorLiveness(coordinator.sessionFile)),
+    "alive",
+  );
   const parentTabsBeforeFork = (
     await herdr(f.root, tabsSchema, "tab", "list", "--workspace", f.workspaceId)
   ).tabs.map((tab) => tab.tab_id);
-  const childSessionFile = await forkConversationSession({
-    parentSessionFile: coordinator.sessionFile,
-    targetCwd: f.root,
-  });
-  const childCoordinator = await runtime.launchCoordinator({
-    cwd: f.root,
-    sessionFile: childSessionFile,
-  });
+  const childSessionFile = await Effect.runPromise(
+    Effect.provide(
+      forkConversationSessionEffect({
+        parentSessionFile: coordinator.sessionFile,
+        targetCwd: f.root,
+      }),
+      liveLayer,
+    ),
+  );
+  const childCoordinator = await Effect.runPromise(
+    runtime.effects.launchCoordinator({
+      cwd: f.root,
+      sessionFile: childSessionFile,
+    }),
+  );
   await registerOwnedWorkspace(checkpoint, {
     workspaceId: childCoordinator.workspaceId,
     paneId: childCoordinator.paneId,
@@ -91,11 +104,13 @@ try {
       sessionFile: childSessionFile,
     }).label,
   );
-  const childObserved = await runtime.observeCurrentCoordinator({
-    paneId: childCoordinator.paneId,
-    sessionFile: childSessionFile,
-    cwd: f.root,
-  });
+  const childObserved = await Effect.runPromise(
+    runtime.effects.observeCurrentCoordinator({
+      paneId: childCoordinator.paneId,
+      sessionFile: childSessionFile,
+      cwd: f.root,
+    }),
+  );
   assert.equal(childObserved.workspaceId, childCoordinator.workspaceId);
   assert.equal(childObserved.sessionFile, childSessionFile);
   assert.deepEqual(
@@ -112,16 +127,23 @@ try {
     coordinator.paneId,
     coordinator.agentName,
   );
-  const repository = await GitRepository.open(f.root);
-  const placement = await repository.createWorktree("herdr-smoke", "worker", f.base);
-  const sessionFile = await createWorkerSession({
-    runId: "herdr-smoke",
-    nodeId: "worker",
-    targetCwd: placement.path,
-    sessionDir: join(f.parent, "worker-sessions"),
-    mode: "research",
-    objective: "This boundary fixture remains idle. No model prompt will be submitted.",
-  });
+  const repository = await Effect.runPromise(openRepository(f.root));
+  const placement = await Effect.runPromise(
+    repository.effects.createWorktree("herdr-smoke", "worker", f.base),
+  );
+  const sessionFile = await Effect.runPromise(
+    Effect.provide(
+      createWorkerSessionEffect({
+        runId: "herdr-smoke",
+        nodeId: "worker",
+        targetCwd: placement.path,
+        sessionDir: join(f.parent, "worker-sessions"),
+        mode: "research",
+        objective: "This boundary fixture remains idle. No model prompt will be submitted.",
+      }),
+      liveLayer,
+    ),
+  );
   const workerNaming = {
     runId: "herdr-smoke",
     nodeId: "worker",
@@ -130,21 +152,26 @@ try {
     objective: "This boundary fixture remains idle. No model prompt will be submitted",
     role: "research" as const,
   };
-  const workerObservation = await runtime.launch({
-    workspaceId: childCoordinator.workspaceId,
-    ...workerNaming,
-    cwd: placement.path,
-    sessionFile,
-    env: {
-      PI_CODING_AGENT_DIR: f.agentDir,
-      PI_WORKGRAPH_MODE: "research",
-      PI_WORKGRAPH_RUN_ID: workerNaming.runId,
-      PI_WORKGRAPH_NODE_ID: workerNaming.nodeId,
-    },
-  });
+  const workerObservation = await Effect.runPromise(
+    Effect.provide(
+      runtime.effects.launch<never, never>({
+        workspaceId: childCoordinator.workspaceId,
+        ...workerNaming,
+        cwd: placement.path,
+        sessionFile,
+        env: {
+          PI_CODING_AGENT_DIR: f.agentDir,
+          PI_WORKGRAPH_MODE: "research",
+          PI_WORKGRAPH_RUN_ID: workerNaming.runId,
+          PI_WORKGRAPH_NODE_ID: workerNaming.nodeId,
+        },
+      }),
+      liveLayer,
+    ),
+  );
   const worker = await waitFor(
     () =>
-      runtime.observe(workerObservation.identity).then((current) => {
+      Effect.runPromise(runtime.effects.observe(workerObservation.identity)).then((current) => {
         if (current.status === "blocked")
           throw new Error("Worker requires operator action; no prompt submitted.");
         return ["idle", "done"].includes(current.status) ? current.identity : undefined;
@@ -161,13 +188,15 @@ try {
   assert.equal(workerObservation.identity.sessionFile, sessionFile);
   assert.notEqual(workerObservation.status, "blocked");
   await assert.rejects(
-    runtime.cleanup({ ...worker, cwd: join(f.parent, "different-worktree") }),
+    Effect.runPromise(
+      runtime.effects.cleanup({ ...worker, cwd: join(f.parent, "different-worktree") }),
+    ),
     /cwd/,
   );
-  const workerCleanup = await runtime.cleanup(worker);
+  const workerCleanup = await Effect.runPromise(runtime.effects.cleanup(worker));
   assert.equal(workerCleanup.state, "completed");
   assert.equal(workerCleanup.identity.tabId, worker.tabId);
-  const gitCleanup = await repository.cleanupWorktree(placement, f.base);
+  const gitCleanup = await Effect.runPromise(repository.effects.cleanupWorktree(placement, f.base));
   assert.equal(gitCleanup.state, "completed");
   const childFixture = {
     ...f,
@@ -194,7 +223,7 @@ try {
         gitCleanup,
         cleanup,
         checks:
-          "native parent and fork identity, meaningful native fork and worker labels, production runtime.launch without a harness prompt submission, child tab-scoped worker, identity-mismatch refusal, exact Herdr closure before Git removal, verified resource absence, and copied-agent-file cleanup",
+          "native parent and fork identity, meaningful native fork and worker labels, production runtime.effects.launch without a harness prompt submission, child tab-scoped worker, identity-mismatch refusal, exact Herdr closure before Git removal, verified resource absence, and copied-agent-file cleanup",
       },
       null,
       2,

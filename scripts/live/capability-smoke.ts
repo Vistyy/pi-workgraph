@@ -8,8 +8,9 @@ import { Config, ConfigProvider, Effect } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { loadModelPolicy } from "../../src/model-policy.js";
+import { liveLayer } from "../../src/node-platform.js";
 import { hasNativeAgentSettled } from "../../src/pi-process.js";
-import { type WorkstreamState, WorkstreamStore } from "../../src/workstream.js";
+import { type WorkstreamState, WorkstreamStoreEffects } from "../../src/workstream.js";
 import {
   closeOwnedWorkspace,
   command,
@@ -71,12 +72,18 @@ try {
       assert.equal(names.length, 1, "Scenario must stay in one workstream");
       const workstreamName = names[0];
       assert.ok(workstreamName !== undefined);
-      latest = await WorkstreamStore.inspect(join(directory, workstreamName, "workstream.json"));
-      if (latest.attempts.length > launchPlan.expectedAttempts)
+      const observed = await Effect.runPromise(
+        Effect.provide(
+          WorkstreamStoreEffects.inspect(join(directory, workstreamName, "workstream.json")),
+          liveLayer,
+        ),
+      );
+      latest = observed;
+      if (observed.attempts.length > launchPlan.expectedAttempts)
         throw new Error(
           `Fixed scenario exceeded ${launchPlan.expectedAttempts} expected attempts; no automatic retries are authorized.`,
         );
-      const blocked = latest.attempts.find(
+      const blocked = observed.attempts.find(
         (attempt) =>
           attempt.error !== undefined ||
           attempt.cleanup?.state === "blocked" ||
@@ -84,25 +91,25 @@ try {
       );
       if (blocked !== undefined)
         throw new Error(`Attempt requires reconciliation: ${JSON.stringify(blocked)}`);
-      if (latest.lifecycle.state !== "active" && latest.lifecycle.state !== "completed")
-        throw new Error(`Unexpected lifecycle ${latest.lifecycle.state}`);
-      const baseline = latest.results.find(
+      if (observed.lifecycle.state !== "active" && observed.lifecycle.state !== "completed")
+        throw new Error(`Unexpected lifecycle ${observed.lifecycle.state}`);
+      const baseline = observed.results.find(
         (result) => result.assignmentId === CAPABILITY_SCENARIO_IDS.baselineResearch,
       );
       if (baseline === undefined && latest.lifecycle.state === "completed")
         throw new Error(
-          `Completed state is missing required protocol assignment ${CAPABILITY_SCENARIO_IDS.baselineResearch}; observed assignments: ${latest.assignments.map((assignment) => assignment.id).join(", ")}.`,
+          `Completed state is missing required protocol assignment ${CAPABILITY_SCENARIO_IDS.baselineResearch}; observed assignments: ${observed.assignments.map((assignment) => assignment.id).join(", ")}.`,
         );
       const progressed =
         baseline !== undefined &&
         notificationDrivenProgress(
           SessionManager.open(coordinator.sessionFile).getBranch(),
-          latest.results.map((result) => result.id),
+          observed.results.map((result) => result.id),
           baseline.id,
         );
       // Completion can precede the last queued followUp. Observe its actual
       // message and assistant continuation, without accepting late-only progression.
-      return latest.lifecycle.state === "completed" && progressed ? latest : undefined;
+      return observed.lifecycle.state === "completed" && progressed ? observed : undefined;
     },
     timeoutMs,
     "notification-driven capability flow and actual assistant continuations; inspect retained coordinator session and workstream state",

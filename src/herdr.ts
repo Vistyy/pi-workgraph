@@ -21,7 +21,6 @@ import {
   resourceOf,
 } from "./herdr-identity.js";
 import {
-  adaptPromiseLaunchRequest,
   CoordinatorLaunchError,
   type CoordinatorLaunchRequest,
   type CoordinatorLaunchResource,
@@ -29,7 +28,6 @@ import {
   type WorkerLaunchEffectRequest,
   type WorkerLaunchError,
   WorkerLaunchReadinessError,
-  type WorkerLaunchRequest,
 } from "./herdr-launch.js";
 import { herdrCoordinatorNames } from "./herdr-naming.js";
 import {
@@ -50,11 +48,9 @@ export {
   CoordinatorLaunchError,
   type CoordinatorLaunchRequest,
   type CoordinatorLaunchResource,
-  PromiseCheckpointError,
   type WorkerLaunchEffectRequest,
   WorkerLaunchError,
   WorkerLaunchReadinessError,
-  type WorkerLaunchRequest,
 } from "./herdr-launch.js";
 export type { WorkerNamingContext, WorkerRole } from "./herdr-naming.js";
 export {
@@ -170,20 +166,6 @@ export interface WorkerCleanupResult {
   detail: string;
 }
 
-export interface VisibleWorkerRuntime {
-  readonly available: boolean;
-  launch(request: WorkerLaunchRequest): Promise<HerdrObservation>;
-  recover?(request: WorkerRecoveryRequest): Promise<HerdrObservation | undefined>;
-  inspectLaunch?(request: WorkerLaunchInspectionRequest): Promise<WorkerLaunchInspection>;
-  inspect(identity: WorkerIdentity): Promise<HerdrInspection>;
-  observe(identity: WorkerIdentity): Promise<HerdrObservation>;
-  interrupt(identity: WorkerIdentity): Promise<HerdrObservation>;
-  steer?(identity: WorkerIdentity, instruction: string): Promise<void>;
-  cleanup?(identity: WorkerIdentity): Promise<WorkerCleanupResult>;
-}
-
-type CommandResult = HerdrCommandResult;
-
 export interface HerdrEffects {
   readonly launchCoordinator: (
     request: CoordinatorLaunchRequest,
@@ -238,7 +220,7 @@ interface CoordinatorEnvironment extends Record<string, string> {
 
 const hostEnvironment: HerdrProcessEnvironment = process.env;
 
-export class HerdrCliRuntime implements VisibleWorkerRuntime {
+export class HerdrCliRuntime {
   readonly available: boolean;
   readonly effects: HerdrEffects;
   private readonly coordinatorEnvironment: Record<string, string>;
@@ -273,52 +255,6 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
       steer: (identity, instruction) => this.steerEffect(identity, instruction),
       cleanup: (identity) => this.cleanupEffect(identity),
     };
-  }
-
-  launchCoordinator(request: CoordinatorLaunchRequest): Promise<WorkerIdentity> {
-    return Effect.runPromise(this.effects.launchCoordinator(request));
-  }
-
-  coordinatorLiveness(sessionFile: string): Promise<"alive" | "dead" | "unknown"> {
-    return Effect.runPromise(this.effects.coordinatorLiveness(sessionFile));
-  }
-
-  observeCurrentCoordinator(
-    request: CoordinatorObservationRequest,
-  ): Promise<CoordinatorRuntimeIdentity> {
-    return Effect.runPromise(this.effects.observeCurrentCoordinator(request));
-  }
-
-  launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
-    return Effect.runPromise(this.effects.launch(adaptPromiseLaunchRequest(request)));
-  }
-
-  recover(request: WorkerRecoveryRequest): Promise<HerdrObservation | undefined> {
-    return Effect.runPromise(this.effects.recover(request));
-  }
-
-  inspectLaunch(request: WorkerLaunchInspectionRequest): Promise<WorkerLaunchInspection> {
-    return Effect.runPromise(this.effects.inspectLaunch(request));
-  }
-
-  inspect(identity: WorkerIdentity): Promise<HerdrInspection> {
-    return Effect.runPromise(this.effects.inspect(identity));
-  }
-
-  observe(identity: WorkerIdentity): Promise<HerdrObservation> {
-    return Effect.runPromise(this.effects.observe(identity));
-  }
-
-  interrupt(identity: WorkerIdentity): Promise<HerdrObservation> {
-    return Effect.runPromise(this.effects.interrupt(identity));
-  }
-
-  steer(identity: WorkerIdentity, instruction: string): Promise<void> {
-    return Effect.runPromise(this.effects.steer(identity, instruction));
-  }
-
-  cleanup(identity: WorkerIdentity): Promise<WorkerCleanupResult> {
-    return Effect.runPromise(this.effects.cleanup(identity));
   }
 
   private launchCoordinatorEffect(
@@ -810,7 +746,7 @@ export class HerdrCliRuntime implements VisibleWorkerRuntime {
   private spawnCommand(
     args: string[],
     timeoutMs: number,
-  ): Effect.Effect<CommandResult, HerdrProtocolError> {
+  ): Effect.Effect<HerdrCommandResult, HerdrProtocolError> {
     return this.transport.spawn(args, timeoutMs);
   }
 
@@ -843,7 +779,7 @@ function initialLaunchEvidence(
 
 function unavailablePaneInspection(
   request: WorkerLaunchInspectionRequest,
-  result: CommandResult,
+  result: HerdrCommandResult,
 ): WorkerLaunchInspection {
   const state = isNotFound(result, "pane_not_found") ? "absent" : "unknown";
   const detail =
@@ -892,7 +828,7 @@ function invalidPaneInspection(
 }
 
 function unavailableLaunchAgent(
-  result: CommandResult,
+  result: HerdrCommandResult,
   evidence: WorkerLaunchInspectionEvidence,
 ): WorkerLaunchInspection {
   evidence.agent = isNotFound(result, "agent_not_found")

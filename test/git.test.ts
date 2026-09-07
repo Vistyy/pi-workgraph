@@ -12,11 +12,18 @@ import {
   type GitProcessRunner,
   GitRepository,
   GitStateUncertainError,
+  openRepository,
   parseWorktreeList,
-  runProcess,
 } from "../src/git.js";
 import { ProcessExecutionError, type ProcessResult, processEffect } from "../src/process.js";
 import { git } from "./helpers.js";
+
+const runCommand = (
+  command: string,
+  args: readonly string[],
+  options: Parameters<typeof processEffect>[2],
+) => Effect.runPromise(processEffect(command, args, options));
+const runGit = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
 
 async function waitForFile(path: string): Promise<string> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -41,8 +48,8 @@ async function fixture() {
   await git(root, "add", ".");
   await git(root, "commit", "-m", "Initial fixture");
   await git(root, "commit", "--allow-empty", "-m", "Assigned base");
-  const repository = await GitRepository.open(root);
-  return { parent, root, repository, base: await repository.head() };
+  const repository = await Effect.runPromise(openRepository(root));
+  return { parent, root, repository, base: await runGit(repository.effects.head()) };
 }
 
 function processResult(
@@ -82,15 +89,15 @@ function processUnavailable(request: GitProcessRequest, message: string): Proces
 
 async function conflictFixture() {
   const f = await fixture();
-  const placement = await f.repository.createWorktree("run", "worker", f.base);
+  const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
   await writeFile(join(placement.path, "data.txt"), "worker\n");
   await git(placement.path, "add", ".");
   await git(placement.path, "commit", "-m", "Worker conflict");
-  const commit = await f.repository.head(placement.path);
+  const commit = await runGit(f.repository.effects.head(placement.path));
   await writeFile(join(f.root, "data.txt"), "coordinator\n");
   await git(f.root, "add", ".");
   await git(f.root, "commit", "-m", "Coordinator conflict");
-  return { ...f, commit, expectedHead: await f.repository.head() };
+  return { ...f, commit, expectedHead: await runGit(f.repository.effects.head()) };
 }
 
 void test("the effects port is the primary typed repository interface", async () => {
@@ -98,7 +105,7 @@ void test("the effects port is the primary typed repository interface", async ()
   try {
     assert.equal(await Effect.runPromise(f.repository.effects.head()), f.base);
     assert.equal(await Effect.runPromise(f.repository.effects.status()), "");
-    assert.equal(await f.repository.head(), f.base);
+    assert.equal(await runGit(f.repository.effects.head()), f.base);
   } finally {
     await rm(f.parent, { recursive: true, force: true });
   }
@@ -155,34 +162,49 @@ void test("Git placements preserve unknown data; cleanup requires exact clean id
     await mkdir(unknown, { recursive: true });
     await writeFile(join(unknown, "mine.txt"), "unattributed bytes");
     await assert.rejects(
-      () => f.repository.createWorktree("run", "unknown", f.base),
+      () => runGit(f.repository.effects.createWorktree("run", "unknown", f.base)),
       /Unregistered worktree path/,
     );
     assert.equal(await readFile(join(unknown, "mine.txt"), "utf8"), "unattributed bytes");
     await assert.rejects(
-      () => f.repository.createWorktree("../escape", "worker", f.base),
+      () => runGit(f.repository.effects.createWorktree("../escape", "worker", f.base)),
       /Invalid worktree identity/,
     );
 
-    const placement = await f.repository.createWorktree("run", "worker", f.base);
-    assert.deepEqual(await f.repository.createWorktree("run", "worker", f.base), placement);
+    const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
+    assert.deepEqual(
+      await runGit(f.repository.effects.createWorktree("run", "worker", f.base)),
+      placement,
+    );
     await writeFile(join(placement.path, "data.txt"), "maintained\n");
     await assert.rejects(
-      () => f.repository.createWorktree("run", "worker", f.base),
+      () => runGit(f.repository.effects.createWorktree("run", "worker", f.base)),
       /uncertain state/,
     );
-    await assert.rejects(() => f.repository.cleanupWorktree(placement, f.base), /dirty worktree/);
+    await assert.rejects(
+      () => runGit(f.repository.effects.cleanupWorktree(placement, f.base)),
+      /dirty worktree/,
+    );
     await git(placement.path, "add", ".");
     await git(placement.path, "commit", "-m", "Maintained change");
-    const commit = await f.repository.head(placement.path);
-    assert.deepEqual(await f.repository.validateWorkerCommit(placement, commit), {
+    const commit = await runGit(f.repository.effects.head(placement.path));
+    assert.deepEqual(await runGit(f.repository.effects.validateWorkerCommit(placement, commit)), {
       commit,
       changedFiles: ["data.txt"],
     });
-    await assert.rejects(() => f.repository.cleanupWorktree(placement, f.base), /HEAD is/);
+    await assert.rejects(
+      () => runGit(f.repository.effects.cleanupWorktree(placement, f.base)),
+      /HEAD is/,
+    );
     assert.equal(await readFile(join(placement.path, "data.txt"), "utf8"), "maintained\n");
-    assert.equal((await f.repository.cleanupWorktree(placement, commit)).state, "completed");
-    assert.equal((await f.repository.cleanupWorktree(placement, commit)).state, "completed");
+    assert.equal(
+      (await runGit(f.repository.effects.cleanupWorktree(placement, commit))).state,
+      "completed",
+    );
+    assert.equal(
+      (await runGit(f.repository.effects.cleanupWorktree(placement, commit))).state,
+      "completed",
+    );
     assert.equal(await readFile(join(unknown, "mine.txt"), "utf8"), "unattributed bytes");
   } finally {
     await rm(f.parent, { recursive: true, force: true });
@@ -193,12 +215,12 @@ void test("a real cherry-pick conflict is aborted only after ownership checks an
   const f = await conflictFixture();
   try {
     await assert.rejects(
-      () => f.repository.applyCommit(f.commit, f.expectedHead),
+      () => runGit(f.repository.effects.applyCommit(f.commit, f.expectedHead)),
       /Cherry-pick conflict/,
     );
-    assert.equal(await f.repository.head(), f.expectedHead);
-    assert.equal(await f.repository.status(), "");
-    const cherryPickState = await runProcess(
+    assert.equal(await runGit(f.repository.effects.head()), f.expectedHead);
+    assert.equal(await runGit(f.repository.effects.status()), "");
+    const cherryPickState = await runCommand(
       "git",
       ["-C", f.root, "rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"],
       { cwd: f.root, timeoutMs: 30_000 },
@@ -310,7 +332,7 @@ void test("timed-out and unavailable ref observations never remove a real worker
 
   for (const observationFailure of observationFailures) {
     const f = await fixture();
-    const placement = await f.repository.createWorktree("run", "worker", f.base);
+    const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
     const branchRef = `refs/heads/${placement.branch}`;
     const repository = new GitRepository(
       f.root,
@@ -345,7 +367,7 @@ void test("timed-out and unavailable ref observations never remove a real worker
 
 void test("cleanup independently rechecks the exact branch after worktree registration disappears", async () => {
   const f = await fixture();
-  const placement = await f.repository.createWorktree("run", "worker", f.base);
+  const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
   const branchRef = `refs/heads/${placement.branch}`;
   let refInspections = 0;
   const repository = new GitRepository(
@@ -361,7 +383,7 @@ void test("cleanup independently rechecks the exact branch after worktree regist
   );
   try {
     await assert.rejects(
-      () => repository.cleanupWorktree(placement, f.base),
+      () => runGit(repository.effects.cleanupWorktree(placement, f.base)),
       /Cleanup branch postcondition failed/,
     );
     assert.equal(await git(f.root, "rev-parse", branchRef), f.base);
@@ -377,23 +399,23 @@ void test("cleanup independently rechecks the exact branch after worktree regist
 void test("application recovery compares complete large patches and rejects non-direct worker commits", async () => {
   const f = await fixture();
   try {
-    const placement = await f.repository.createWorktree("run", "worker", f.base);
+    const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
     const suffix = "identical large suffix\n".repeat(8_000);
     await writeFile(join(placement.path, "data.txt"), `expected-prefix\n${suffix}`);
     await git(placement.path, "add", ".");
     await git(placement.path, "commit", "-m", "Worker output");
     const source = {
       baseCommit: f.base,
-      commit: await f.repository.head(placement.path),
+      commit: await runGit(f.repository.effects.head(placement.path)),
     };
     await writeFile(join(f.root, "data.txt"), `wrong-prefix\n${suffix}`);
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Unattributed output");
-    const rootDiff = await runProcess("git", ["diff", "--binary", f.base, "HEAD"], {
+    const rootDiff = await runCommand("git", ["diff", "--binary", f.base, "HEAD"], {
       cwd: f.root,
       timeoutMs: 30_000,
     });
-    const workerDiff = await runProcess("git", ["diff", "--binary", f.base, source.commit], {
+    const workerDiff = await runCommand("git", ["diff", "--binary", f.base, source.commit], {
       cwd: f.root,
       timeoutMs: 30_000,
     });
@@ -405,15 +427,15 @@ void test("application recovery compares complete large patches and rejects non-
       "The old diagnostic-tail comparison would falsely attribute this commit",
     );
     await assert.rejects(
-      () => f.repository.recoverApplication(f.base, source),
+      () => runGit(f.repository.effects.recoverApplication(f.base, source)),
       /Could not attribute/,
     );
 
     await git(f.root, "revert", "--no-edit", "HEAD");
-    const before = await f.repository.head();
-    assert.equal(await f.repository.recoverApplication(before, source), undefined);
-    const head = await f.repository.applyCommit(source.commit, before);
-    assert.deepEqual(await f.repository.recoverApplication(before, source), {
+    const before = await runGit(f.repository.effects.head());
+    assert.equal(await runGit(f.repository.effects.recoverApplication(before, source)), undefined);
+    const head = await runGit(f.repository.effects.applyCommit(source.commit, before));
+    assert.deepEqual(await runGit(f.repository.effects.recoverApplication(before, source)), {
       head,
     });
     assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), `expected-prefix\n${suffix}`);
@@ -433,7 +455,7 @@ void test("application recovery compares complete large patches and rejects non-
     await git(placement.path, "reset", "--hard", merge);
     assert.equal(await git(placement.path, "rev-list", "--count", `${f.base}..HEAD`), "1");
     await assert.rejects(
-      () => f.repository.validateWorkerCommit(placement, merge),
+      () => runGit(f.repository.effects.validateWorkerCommit(placement, merge)),
       /not directly based/,
     );
   } finally {

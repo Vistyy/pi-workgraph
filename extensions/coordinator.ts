@@ -36,7 +36,6 @@ import { EvidenceSchema } from "../src/report-schema.js";
 import {
   type SessionIdentity,
   type WorkstreamState,
-  WorkstreamStore,
   WorkstreamStoreEffects,
 } from "../src/workstream.js";
 import {
@@ -111,7 +110,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     });
   const attachOwned = (
     ctx: ExtensionContext,
-    target: WorkstreamStore,
+    target: WorkstreamStoreEffects,
     priorOwnerLiveness: "alive" | "dead" | "unknown" = "unknown",
   ): CoordinatorEffect<WorkstreamRuntime> =>
     Effect.suspend(() => {
@@ -120,7 +119,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         return attached.effects.submit(Effect.void).pipe(Effect.as(attached));
       return Effect.gen(function* () {
         const previous = runtime;
-        const state = yield* target.effects.load();
+        const state = yield* target.load();
         const { HERDR_WORKSPACE_ID: workspaceId } = process.env;
         let next: WorkstreamRuntime;
         next = yield* WorkstreamRuntime.acquire(
@@ -177,7 +176,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     });
   const attachEffect = (
     ctx: ExtensionContext,
-    target: WorkstreamStore,
+    target: WorkstreamStoreEffects,
     priorOwnerLiveness: "alive" | "dead" | "unknown" = "unknown",
   ): CoordinatorEffect<WorkstreamRuntime> =>
     attachmentSemaphore.withPermit(attachOwned(ctx, target, priorOwnerLiveness));
@@ -185,7 +184,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     hostSemaphore.withPermit(Effect.sync(() => [...pending])).pipe(
       Effect.flatMap((receipts) =>
         active.effects.submit(
-          Effect.forEach(receipts, (receipt) => active.store.effects.recordInputEvent(receipt), {
+          Effect.forEach(receipts, (receipt) => active.store.recordInputEvent(receipt), {
             discard: true,
           }),
         ),
@@ -209,14 +208,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       if (active === undefined) return Promise.resolve();
       return runCallback(
         active.effects
-          .submit(active.store.effects.load())
+          .submit(active.store.load())
           .pipe(
             Effect.flatMap((state) =>
               state.lifecycle.state !== "active" && state.lifecycle.state !== "suspended"
                 ? Effect.void
-                : active.effects.submit(
-                    active.store.effects.recordInputEvent(receipt).pipe(Effect.asVoid),
-                  ),
+                : active.effects.submit(active.store.recordInputEvent(receipt).pipe(Effect.asVoid)),
             ),
           ),
       );
@@ -248,7 +245,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     Effect.gen(function* () {
       if (runtime === undefined) return undefined;
       const attached = runtime;
-      const state = yield* attached.effects.submit(attached.store.effects.load());
+      const state = yield* attached.effects.submit(attached.store.load());
       if (state.lifecycle.state === "suspended")
         throw new Error("Workstream is suspended; resume explicitly before delegating.");
       if (state.lifecycle.state !== "active") {
@@ -278,7 +275,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         });
         const active = yield* attachOwned(
           ctx,
-          WorkstreamStore.open(created.store.path, owner(ctx)),
+          WorkstreamStoreEffects.open(created.store.path, owner(ctx)),
         );
         yield* importInputsEffect(active);
         yield* sdk("retain workstream pointer", () =>
@@ -293,11 +290,11 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     receiptId?: string,
   ): CoordinatorEffect<AuthorizationSelection> =>
     Effect.gen(function* () {
-      let state = yield* active.store.effects.load();
+      let state = yield* active.store.load();
       let intent = requiredValue(state.intents.at(-1), "workstream intent");
       const selected = selectWorkstreamAuthority(state, receiptId);
       if (intent.version === 0) {
-        state = yield* active.store.effects.reviseIntent({
+        state = yield* active.store.reviseIntent({
           authorityReceiptId: selected.receiptId,
           statement,
           constraints: intent.constraints,
@@ -341,9 +338,9 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         inspection.state.lifecycle.state === "abandoned"
       )
         return;
-      const active = yield* attachEffect(ctx, WorkstreamStore.open(path, identity));
+      const active = yield* attachEffect(ctx, WorkstreamStoreEffects.open(path, identity));
       yield* importInputsEffect(active);
-      const state = yield* active.effects.submit(active.store.effects.load());
+      const state = yield* active.effects.submit(active.store.load());
       yield* remember(state, ctx);
     }).pipe(
       Effect.catch((error) =>
@@ -499,7 +496,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
                   params.question,
                   params.experiment.authorityReceiptId,
                 );
-          const stateBefore = yield* active.effects.submit(active.store.effects.load());
+          const stateBefore = yield* active.effects.submit(active.store.load());
           const intent = stateBefore.intents.at(-1);
           if (intent === undefined) throw new Error("Missing intent.");
           const assignment = researchAssignment(params, intent.version, authority?.authority);
@@ -537,7 +534,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       return runCallback(
         Effect.gen(function* () {
           const active = current();
-          const state = yield* active.effects.submit(active.store.effects.reviseIntent(params));
+          const state = yield* active.effects.submit(active.store.reviseIntent(params));
           return mutationResult("Recorded intent revision.", yield* remember(state, ctx), {
             action: "workgraph_intent",
             outcome: "recorded",
@@ -637,7 +634,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       return runCallback(
         Effect.gen(function* () {
           const active = yield* ensureEffect(ctx, params.objective, params.targetRepository);
-          const before = yield* active.effects.submit(active.store.effects.load());
+          const before = yield* active.effects.submit(active.store.load());
           const intent = before.intents.at(-1);
           if (intent === undefined) throw new Error("Missing intent.");
           const state = yield* active.effects.queue(
@@ -693,7 +690,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       return runCallback(
         Effect.gen(function* () {
           const active = current();
-          const state = yield* active.effects.submit(active.store.effects.load());
+          const state = yield* active.effects.submit(active.store.load());
           const view = inspectView(state, { ...params, section: params.section });
           return {
             content: [{ type: "text" as const, text: formatInspection(view) }],
@@ -732,7 +729,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             ? yield* controlAttemptEffect(active, params)
             : yield* lifecycleControlEffect(active, params);
           const message = controlMessage(params.action);
-          const state = yield* active.effects.submit(active.store.effects.load());
+          const state = yield* active.effects.submit(active.store.load());
           const projection: Parameters<typeof actionView>[1] = {
             action: `workgraph_control:${params.action}`,
             message,
@@ -762,13 +759,13 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
             throw new Error("The retained workstream belongs to another repository.");
           const herdr = new HerdrCliRuntime();
           const liveness = yield* herdr.effects.coordinatorLiveness(state.coordinator.sessionFile);
-          const target = WorkstreamStore.open(params.statePath, state.coordinator);
+          const target = WorkstreamStoreEffects.open(params.statePath, state.coordinator);
           const active = yield* attachEffect(ctx, target, liveness);
           yield* sdk("retain adopted workstream pointer", () =>
             pi.appendEntry(POINTER, { path: target.path }),
           );
           yield* importInputsEffect(active);
-          const adopted = yield* active.effects.submit(active.store.effects.load());
+          const adopted = yield* active.effects.submit(active.store.load());
           return mutationResult(
             "Adopted without changing lifecycle.",
             yield* remember(adopted, ctx),
@@ -835,7 +832,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         Effect.gen(function* () {
           const active = current();
           const state = yield* active.effects.submit(
-            active.store.effects.complete({
+            active.store.complete({
               ...params,
               reasons: params.unresolved.map((item) => ({
                 taskId: item.task,
@@ -970,7 +967,7 @@ function researchAssignment(
   params: ResearchParams,
   intentVersion: number,
   authority: { receiptId: string; intentVersion: number } | undefined,
-): Parameters<WorkstreamStore["assign"]>[0] {
+): Parameters<WorkstreamStoreEffects["enqueue"]>[0] {
   const common = {
     id: params.id,
     capability: "research" as const,
@@ -1082,7 +1079,7 @@ function controlAttemptEffect(
   params: ControlParams,
 ): CoordinatorEffect<string, RuntimeError | Error> {
   return Effect.gen(function* () {
-    const state = yield* active.effects.submit(active.store.effects.load());
+    const state = yield* active.effects.submit(active.store.load());
     const attemptId = resolveControlAttempt(state, params.task, params.attempt);
     yield* executeAttemptControl(active, params, attemptId);
     return attemptId;
@@ -1124,7 +1121,7 @@ function lifecycleControlEffect(
 ): CoordinatorEffect<undefined> {
   return active.effects
     .submit(
-      active.store.effects.setLifecycle({
+      active.store.setLifecycle({
         state: params.action === "suspend" ? "suspended" : "active",
         reason: params.reason,
       }),

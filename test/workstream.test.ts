@@ -23,10 +23,67 @@ import {
   InvalidWorkstreamStateError,
   type SessionIdentity,
   UnsupportedWorkstreamStateError,
-  WorkstreamStore,
+  type WorkstreamState,
+  WorkstreamStoreEffects,
 } from "../src/workstream.js";
+import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
 import { parsePersistedObject } from "../src/workstream-validation.js";
 import { researchReport } from "./helpers.js";
+
+function runStore<A, E>(
+  effect: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>,
+): Promise<A> {
+  return Effect.runPromise(effect.pipe(Effect.provide(liveLayer))).catch((failure) => {
+    if (failure instanceof WorkstreamStoreOperationError) {
+      if (failure.cause instanceof PlatformError.PlatformError && "cause" in failure.cause.reason)
+        throw failure.cause.reason.cause;
+      throw failure.cause;
+    }
+    throw failure;
+  });
+}
+
+type AssignmentInput = Parameters<WorkstreamStoreEffects["enqueue"]>[0];
+type HistoricalStoreFixture = Pick<WorkstreamState, "dispositions">;
+
+async function enqueueFixtureAssignment(
+  store: WorkstreamStoreEffects,
+  input: AssignmentInput,
+  attemptId = `${input.id}-attempt`,
+): Promise<void> {
+  await runStore(
+    store.enqueue(input, {
+      id: attemptId,
+      models: { guide: { model: "fixture/model", thinking: "low" }, source: "policy" },
+    }),
+  );
+}
+
+async function settleFixtureAttempt(
+  store: WorkstreamStoreEffects,
+  attemptId: string,
+  resultId: string,
+): Promise<void> {
+  const projectRoot = (await runStore(store.load())).projectRoot;
+  await runStore(
+    store.startAttempt({
+      id: attemptId,
+      placement: { kind: "shared_project", path: projectRoot },
+      baseRevision: "a".repeat(40),
+    }),
+  );
+  await runStore(store.recordSessionFile(attemptId, `/tmp/${attemptId}.jsonl`));
+  await runStore(
+    store.settleAttempt({
+      id: attemptId,
+      resultId,
+      effectiveModels: [{ model: "fixture/model", thinking: "low" }],
+    }),
+  );
+  await runStore(store.beginCleanup({ id: attemptId }));
+  await runStore(store.markWorkerClosed(attemptId));
+  await runStore(store.finishCleanup(attemptId));
+}
 
 function dateAt(milliseconds: number): Date {
   return DateTime.toDate(DateTime.makeUnsafe(milliseconds));
@@ -35,7 +92,7 @@ function dateAt(milliseconds: number): Date {
 void test("accepted historical research closes its original scope after intent changes, without invented limitations", async () => {
   const { parent, store } = await fixture();
   try {
-    await store.assign({
+    await enqueueFixtureAssignment(store, {
       id: "baseline",
       capability: "research",
       artifactIntent: "evidence_only",
@@ -43,28 +100,28 @@ void test("accepted historical research closes its original scope after intent c
       intentVersion: 0,
       expectedEvidence: ["Baseline bytes"],
     });
-    await store.retainResult({
-      id: "baseline-result",
-      assignmentId: "baseline",
-      assignmentIntentVersion: 0,
-      validity: "typed",
-      report: researchReport("Baseline observed"),
-    });
-    await store.disposition({
-      resultId: "baseline-result",
-      status: "accepted",
-      reason: "Answers the original baseline question",
-    });
+    await runStore(
+      store.retainResult({
+        id: "baseline-result",
+        assignmentId: "baseline",
+        assignmentIntentVersion: 0,
+        validity: "typed",
+        report: researchReport("Baseline observed"),
+      }),
+    );
+    await settleFixtureAttempt(store, "baseline-attempt", "baseline-result");
     await recordedAuthority(store);
-    const revised = await store.load();
+    const revised = await runStore(store.load());
     assert.equal(store.isResultCurrent(revised, "baseline-result"), false);
     assert.equal(revised.results[0]?.assignmentIntentVersion, 0);
-    const state = await store.complete({
-      conclusion: "Baseline research is resolved in its original scope",
-      evidence: [{ label: "Baseline", observation: "Evidence predates the new intent" }],
-      limitations: [],
-      reasons: [],
-    });
+    const state = await runStore(
+      store.complete({
+        conclusion: "Baseline research is resolved in its original scope",
+        evidence: [{ label: "Baseline", observation: "Evidence predates the new intent" }],
+        limitations: [],
+        reasons: [],
+      }),
+    );
     assert.deepEqual(state.completion?.accounting, []);
   } finally {
     await rm(parent, { recursive: true, force: true });
@@ -77,7 +134,7 @@ void test("accepting a failed report or unapplied stale implementation as eviden
     try {
       const { receipt, authority } = await recordedAuthority(store);
       if (capability === "research")
-        await store.assign({
+        await enqueueFixtureAssignment(store, {
           id: "work",
           capability,
           artifactIntent: "evidence_only",
@@ -86,7 +143,7 @@ void test("accepting a failed report or unapplied stale implementation as eviden
           expectedEvidence: ["Bytes"],
         });
       else
-        await store.assign({
+        await enqueueFixtureAssignment(store, {
           id: "work",
           capability,
           artifactIntent: "maintained_change",
@@ -95,34 +152,34 @@ void test("accepting a failed report or unapplied stale implementation as eviden
           authority,
           acceptance: ["Correct bytes"],
         });
-      await store.retainResult({
-        id: "result",
-        assignmentId: "work",
-        assignmentIntentVersion: 1,
-        validity: "typed",
-        report:
-          capability === "research"
-            ? { ...researchReport("Could not read"), status: "failed" }
-            : {
-                kind: "implementation",
-                status: "completed",
-                outcome: "changed",
-                summary: "Old change",
-                commit: "a".repeat(40),
-                evidence: [],
-                findings: [],
-              },
-      });
-      await store.disposition({
-        resultId: "result",
-        status: "accepted",
-        reason: "Accepted as evidence, not proof of current completion",
-      });
-      await store.reviseIntent({
-        authorityReceiptId: receipt.id,
-        statement: "Changed requirements",
-        constraints: ["New constraint"],
-      });
+      await runStore(
+        store.retainResult({
+          id: "result",
+          assignmentId: "work",
+          assignmentIntentVersion: 1,
+          validity: "typed",
+          report:
+            capability === "research"
+              ? { ...researchReport("Could not read"), status: "failed" }
+              : {
+                  kind: "implementation",
+                  status: "completed",
+                  outcome: "changed",
+                  summary: "Old change",
+                  commit: "a".repeat(40),
+                  evidence: [],
+                  findings: [],
+                },
+        }),
+      );
+      await settleFixtureAttempt(store, "work-attempt", "result");
+      await runStore(
+        store.reviseIntent({
+          authorityReceiptId: receipt.id,
+          statement: "Changed requirements",
+          constraints: ["New constraint"],
+        }),
+      );
       const completion = {
         conclusion: "Known unresolved work",
         evidence: [{ label: "Result", observation: "The assignment is not fulfilled" }],
@@ -130,30 +187,34 @@ void test("accepting a failed report or unapplied stale implementation as eviden
         reasons: [],
       };
       await assert.rejects(
-        store.complete(completion),
+        runStore(store.complete(completion)),
         /Completion requires exactly one reason per unresolved semantic task/,
       );
-      const state = await store.complete({
-        ...completion,
-        limitations: [
-          capability === "research" ? "The read failed" : "The stale change was never applied",
-        ],
-        reasons: [
-          {
-            taskId: "work",
-            reason: "The assignment and its result are unresolved.",
-          },
-        ],
-      });
+      const state = await runStore(
+        store.complete({
+          ...completion,
+          limitations: [
+            capability === "research" ? "The read failed" : "The stale change was never applied",
+          ],
+          reasons: [
+            {
+              taskId: "work",
+              reason: "The assignment and its result are unresolved.",
+            },
+          ],
+        }),
+      );
       assert.deepEqual(
         state.completion?.accounting.map((item) =>
           item.kind === "unresolved_assignment"
             ? item.assignmentId
-            : item.kind === "unresolved_result"
-              ? item.resultId
-              : "",
+            : item.kind === "unresolved_attempt"
+              ? item.attemptId
+              : item.kind === "unresolved_result"
+                ? item.resultId
+                : "",
         ),
-        capability === "research" ? ["work", "result"] : ["work"],
+        capability === "research" ? ["work", "work-attempt", "result"] : ["work", "work-attempt"],
       );
     } finally {
       await rm(parent, { recursive: true, force: true });
@@ -166,103 +227,119 @@ const coordinator: SessionIdentity = {
   sessionFile: "/sessions/coordinator.jsonl",
 };
 
-async function fixture(): Promise<{ parent: string; store: WorkstreamStore }> {
+async function fixture(): Promise<{ parent: string; store: WorkstreamStoreEffects }> {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-workstream-"));
   const projectRoot = join(parent, "project");
   const gitCommonDir = join(projectRoot, ".git");
   await mkdir(gitCommonDir, { recursive: true });
-  const { store } = await WorkstreamStore.create({
-    id: "workstream",
-    purpose: "Determine the safe fixture change.",
-    projectRoot,
-    gitCommonDir,
-    coordinator,
-    now: dateAt(0),
-  });
+  const { store } = await runStore(
+    WorkstreamStoreEffects.create({
+      id: "workstream",
+      purpose: "Determine the safe fixture change.",
+      projectRoot,
+      gitCommonDir,
+      coordinator,
+      now: dateAt(0),
+    }),
+  );
   return { parent, store };
 }
 
 function recordedAuthority(
-  store: WorkstreamStore,
+  store: WorkstreamStoreEffects,
 ): Promise<{ receipt: HumanInputReceipt; authority: AuthorityReference }> {
-  return store
-    .recordInputEvent({
+  return runStore(
+    store.recordInputEvent({
       ...coordinator,
       source: "interactive",
       text: "I approve the bounded fixture experiment and maintained correction.",
       now: dateAt(1_000),
-    })
-    .then(({ receipt }) =>
-      store
-        .reviseIntent({
-          authorityReceiptId: receipt.id,
-          statement: "Establish and correct the fixture behavior.",
-          constraints: ["Keep the fixture local."],
-          now: dateAt(2_000),
-        })
-        .then((revised) => {
-          const intent = revised.intents.at(-1);
-          if (!intent) throw new Error("Fixture intent was not recorded.");
-          return { receipt, authority: { receiptId: receipt.id, intentVersion: intent.version } };
-        }),
-    );
+    }),
+  ).then(({ receipt }) =>
+    runStore(
+      store.reviseIntent({
+        authorityReceiptId: receipt.id,
+        statement: "Establish and correct the fixture behavior.",
+        constraints: ["Keep the fixture local."],
+        now: dateAt(2_000),
+      }),
+    ).then((revised) => {
+      const intent = revised.intents.at(-1);
+      if (!intent) throw new Error("Fixture intent was not recorded.");
+      return { receipt, authority: { receiptId: receipt.id, intentVersion: intent.version } };
+    }),
+  );
 }
 
 void test("workstream rejects extension or arbitrary authority and stale intent", async () => {
   const { parent, store } = await fixture();
   try {
     await assert.rejects(
-      store.recordInputEvent({
-        ...coordinator,
-        source: "extension",
-        text: "approved",
-      }),
+      runStore(
+        store.recordInputEvent({
+          ...coordinator,
+          source: "extension",
+          text: "approved",
+        }),
+      ),
       /Extension-generated input/,
     );
     await assert.rejects(
-      store.reviseIntent({
-        authorityReceiptId: "invented",
-        statement: "Mutate the fixture.",
-        constraints: [],
-      }),
+      runStore(
+        store.reviseIntent({
+          authorityReceiptId: "invented",
+          statement: "Mutate the fixture.",
+          constraints: [],
+        }),
+      ),
       /Unknown human input receipt/,
     );
 
     const { receipt, authority } = await recordedAuthority(store);
     await assert.rejects(
-      store.assign({
-        id: "invalid-experiment",
-        capability: "research",
-        artifactIntent: "disposable_experiment",
-        objective: "Run an unauthorized probe.",
-        intentVersion: authority.intentVersion,
-        authority: {
-          receiptId: "invented",
+      enqueueFixtureAssignment(
+        store,
+        {
+          id: "invalid-experiment",
+          capability: "research",
+          artifactIntent: "disposable_experiment",
+          objective: "Run an unauthorized probe.",
           intentVersion: authority.intentVersion,
+          authority: {
+            receiptId: "invented",
+            intentVersion: authority.intentVersion,
+          },
+          permittedEffects: ["Write an experiment file."],
+          stopCondition: "The probe finishes.",
+          expectedEvidence: ["Probe output."],
         },
-        permittedEffects: ["Write an experiment file."],
-        stopCondition: "The probe finishes.",
-        expectedEvidence: ["Probe output."],
-      }),
+        "invalid-experiment-attempt",
+      ),
       /retained human-backed intent/,
     );
 
-    const changed = await store.reviseIntent({
-      authorityReceiptId: receipt.id,
-      statement: "Correct the fixture with the newly added constraint.",
-      constraints: ["Do not alter the fixture API."],
-    });
+    const changed = await runStore(
+      store.reviseIntent({
+        authorityReceiptId: receipt.id,
+        statement: "Correct the fixture with the newly added constraint.",
+        constraints: ["Do not alter the fixture API."],
+      }),
+    );
     assert.equal(changed.intents.at(-1)?.version, authority.intentVersion + 1);
     await assert.rejects(
-      store.assign({
-        id: "stale-implementation",
-        capability: "implement",
-        artifactIntent: "maintained_change",
-        objective: "Apply the old correction.",
-        intentVersion: authority.intentVersion,
-        authority,
-        acceptance: ["The fixture passes."],
-      }),
+      enqueueFixtureAssignment(
+        store,
+        {
+          id: "stale-implementation",
+          capability: "implement",
+          artifactIntent: "maintained_change",
+          objective: "Apply the old correction.",
+          intentVersion: authority.intentVersion,
+          authority,
+          acceptance: ["The fixture passes."],
+        },
+        "stale-implementation-attempt",
+      ),
       /stale/,
     );
   } finally {
@@ -270,11 +347,11 @@ void test("workstream rejects extension or arbitrary authority and stale intent"
   }
 });
 
-void test("workstream keeps worker validity, disposition, limitations, and stale results distinct", async () => {
+void test("workstream keeps worker validity, limitations, and stale results distinct", async () => {
   const { parent, store } = await fixture();
   try {
     const { receipt, authority } = await recordedAuthority(store);
-    await store.assign({
+    await enqueueFixtureAssignment(store, {
       id: "research",
       capability: "research",
       artifactIntent: "evidence_only",
@@ -282,54 +359,57 @@ void test("workstream keeps worker validity, disposition, limitations, and stale
       intentVersion: authority.intentVersion,
       expectedEvidence: ["Direct fixture evidence."],
     });
-    let state = await store.retainResult({
-      id: "research-result",
-      assignmentId: "research",
-      assignmentIntentVersion: authority.intentVersion,
-      validity: "typed",
-      report: researchReport("The fixture currently accepts the input."),
-    });
+    let state = await runStore(
+      store.retainResult({
+        id: "research-result",
+        assignmentId: "research",
+        assignmentIntentVersion: authority.intentVersion,
+        validity: "typed",
+        report: researchReport("The fixture currently accepts the input."),
+      }),
+    );
+    await settleFixtureAttempt(store, "research-attempt", "research-result");
+    state = await runStore(store.load());
     assert.equal(store.isResultCurrent(state, "research-result"), true);
-    state = await store.disposition({
-      resultId: "research-result",
-      status: "accepted",
-      reason: "The evidence answers the bounded question.",
-    });
-    assert.equal(state.dispositions[0]?.status, "accepted");
-
-    state = await store.reviseIntent({
-      authorityReceiptId: receipt.id,
-      statement: "Determine behavior under the new fixture constraint.",
-      constraints: ["Exercise a second fixture input."],
-    });
+    state = await runStore(
+      store.reviseIntent({
+        authorityReceiptId: receipt.id,
+        statement: "Determine behavior under the new fixture constraint.",
+        constraints: ["Exercise a second fixture input."],
+      }),
+    );
     assert.equal(store.isResultCurrent(state, "research-result"), false);
-    state = await store.retainResult({
-      id: "stale-result",
-      assignmentId: "research",
-      assignmentIntentVersion: authority.intentVersion,
-      validity: "untyped",
-      text: "Old worker prose.",
-    });
+    state = await runStore(
+      store.retainResult({
+        id: "stale-result",
+        assignmentId: "research",
+        assignmentIntentVersion: authority.intentVersion,
+        validity: "untyped",
+        text: "Old worker prose.",
+      }),
+    );
     assert.equal(store.isResultCurrent(state, "stale-result"), false);
 
-    state = await store.complete({
-      conclusion:
-        "The earlier fixture answer is retained but does not answer the revised question.",
-      evidence: [
-        {
-          label: "retained result",
-          observation: "The first result was produced under intent version 1.",
-          class: "unknown",
-        },
-      ],
-      limitations: ["The revised constraint has no accepted result yet."],
-      reasons: [
-        {
-          taskId: "research",
-          reason: "The revised assignment and stale result are unresolved.",
-        },
-      ],
-    });
+    state = await runStore(
+      store.complete({
+        conclusion:
+          "The earlier fixture answer is retained but does not answer the revised question.",
+        evidence: [
+          {
+            label: "retained result",
+            observation: "The first result was produced under intent version 1.",
+            class: "unknown",
+          },
+        ],
+        limitations: ["The revised constraint has no accepted result yet."],
+        reasons: [
+          {
+            taskId: "research",
+            reason: "The revised assignment and stale result are unresolved.",
+          },
+        ],
+      }),
+    );
     assert.equal(state.lifecycle.state, "completed");
     assert.deepEqual(
       state.completion?.accounting.map((item) =>
@@ -339,7 +419,7 @@ void test("workstream keeps worker validity, disposition, limitations, and stale
             ? item.resultId
             : "",
       ),
-      ["research", "stale-result"],
+      ["stale-result"],
     );
     assert.equal(state.completion?.evidence[0]?.class, "unknown");
   } finally {
@@ -354,96 +434,116 @@ void test("every independent attempt remains accounted for regardless of result 
   ]) {
     const { parent, store } = await fixture();
     try {
-      const queued = await store.enqueue(
-        {
-          id: "comparison",
-          capability: "research",
-          artifactIntent: "evidence_only",
-          objective: "Compare independent observations",
-          intentVersion: 0,
-          expectedEvidence: ["Observation"],
-        },
-        order.map((_, index) => ({
-          id: `attempt-${index}`,
-          models: {
-            guide: { model: "fixture/research", thinking: "low" },
-            source: "policy" as const,
+      const queued = await runStore(
+        store.enqueue(
+          {
+            id: "comparison",
+            capability: "research",
+            artifactIntent: "evidence_only",
+            objective: "Compare independent observations",
+            intentVersion: 0,
+            expectedEvidence: ["Observation"],
           },
-        })),
+          order.map((_, index) => ({
+            id: `attempt-${index}`,
+            models: {
+              guide: { model: "fixture/research", thinking: "low" },
+              source: "policy" as const,
+            },
+          })),
+        ),
       );
       for (let index = 0; index < order.length; index++) {
-        await store.startAttempt({
-          id: `attempt-${index}`,
-          worktreePath: `/tmp/worktree-${index}`,
-          branch: `branch-${index}`,
-          baseRevision: "a".repeat(40),
-        });
-        await store.recordLaunchPane(`attempt-${index}`, {
-          workspaceId: "fixture",
-          paneId: `pane-${index}`,
-        });
-        await store.recordResource(`attempt-${index}`, {
-          workspaceId: "fixture",
-          tabId: `tab-${index}`,
-          paneId: `pane-${index}`,
-          terminalId: `terminal-${index}`,
-          agentName: `agent-${index}`,
-          cwd: `/tmp/worktree-${index}`,
-        });
-        await store.recordSessionFile(`attempt-${index}`, `/tmp/session-${index}`);
-        await store.markSubmission(`attempt-${index}`, "uncertain");
-        await store.markSubmission(`attempt-${index}`, "submitted");
-        await store.retainResult({
-          id: `result-${index}`,
-          assignmentId: "comparison",
-          assignmentIntentVersion: 0,
-          validity: "typed",
-          report: {
-            kind: "research" as const,
-            status: order[index] === "success" ? ("completed" as const) : ("failed" as const),
-            summary: `${order[index]} observation`,
-            evidence: [],
-            findings: [],
-          },
-        });
-        await store.settleAttempt({
-          id: `attempt-${index}`,
-          resultId: `result-${index}`,
-          effectiveModels: [{ model: "fixture/research", thinking: "low" }],
-        });
-        await store.beginCleanup({
-          id: `attempt-${index}`,
-          expectedHead: "a".repeat(40),
-        });
-        await store.markWorkerClosed(`attempt-${index}`);
-        await store.finishCleanup(`attempt-${index}`);
-        await assert.doesNotReject(
+        await runStore(
+          store.startAttempt({
+            id: `attempt-${index}`,
+            worktreePath: `/tmp/worktree-${index}`,
+            branch: `branch-${index}`,
+            baseRevision: "a".repeat(40),
+          }),
+        );
+        await runStore(
           store.recordLaunchPane(`attempt-${index}`, {
             workspaceId: "fixture",
             paneId: `pane-${index}`,
           }),
         );
-        await assert.rejects(
-          store.recordLaunchPane(`attempt-${index}`, {
+        await runStore(
+          store.recordResource(`attempt-${index}`, {
             workspaceId: "fixture",
-            paneId: "contradictory",
+            tabId: `tab-${index}`,
+            paneId: `pane-${index}`,
+            terminalId: `terminal-${index}`,
+            agentName: `agent-${index}`,
+            cwd: `/tmp/worktree-${index}`,
           }),
+        );
+        await runStore(store.recordSessionFile(`attempt-${index}`, `/tmp/session-${index}`));
+        await runStore(store.markSubmission(`attempt-${index}`, "uncertain"));
+        await runStore(store.markSubmission(`attempt-${index}`, "submitted"));
+        await runStore(
+          store.retainResult({
+            id: `result-${index}`,
+            assignmentId: "comparison",
+            assignmentIntentVersion: 0,
+            validity: "typed",
+            report: {
+              kind: "research" as const,
+              status: order[index] === "success" ? ("completed" as const) : ("failed" as const),
+              summary: `${order[index]} observation`,
+              evidence: [],
+              findings: [],
+            },
+          }),
+        );
+        await runStore(
+          store.settleAttempt({
+            id: `attempt-${index}`,
+            resultId: `result-${index}`,
+            effectiveModels: [{ model: "fixture/research", thinking: "low" }],
+          }),
+        );
+        await runStore(
+          store.beginCleanup({
+            id: `attempt-${index}`,
+            expectedHead: "a".repeat(40),
+          }),
+        );
+        await runStore(store.markWorkerClosed(`attempt-${index}`));
+        await runStore(store.finishCleanup(`attempt-${index}`));
+        await assert.doesNotReject(
+          runStore(
+            store.recordLaunchPane(`attempt-${index}`, {
+              workspaceId: "fixture",
+              paneId: `pane-${index}`,
+            }),
+          ),
+        );
+        await assert.rejects(
+          runStore(
+            store.recordLaunchPane(`attempt-${index}`, {
+              workspaceId: "fixture",
+              paneId: "contradictory",
+            }),
+          ),
           /contradictory|not accepting/,
         );
         await assert.rejects(
-          store.blockCleanup(`attempt-${index}`, "late cleanup failure"),
+          runStore(store.blockCleanup(`attempt-${index}`, "late cleanup failure")),
           /already completed/,
         );
       }
-      const state = await store.load();
+      const state = await runStore(store.load());
       assert.equal(queued.attempts.length, 2);
       await assert.rejects(
-        store.complete({
-          conclusion: "One contribution failed",
-          evidence: [{ label: "comparison", observation: "Both attempts retained" }],
-          limitations: ["The failed attempt remains unresolved."],
-          reasons: [],
-        }),
+        runStore(
+          store.complete({
+            conclusion: "One contribution failed",
+            evidence: [{ label: "comparison", observation: "Both attempts retained" }],
+            limitations: ["The failed attempt remains unresolved."],
+            reasons: [],
+          }),
+        ),
         /Completion requires exactly one reason per unresolved semantic task/,
       );
       const failed = state.attempts.find((attempt) =>
@@ -452,17 +552,19 @@ void test("every independent attempt remains accounted for regardless of result 
       assert.ok(failed);
       const failedResult = state.results.find((result) => result.id === failed.resultId);
       assert.ok(failedResult);
-      const completed = await store.complete({
-        conclusion: "One contribution failed",
-        evidence: [{ label: "comparison", observation: "Both attempts retained" }],
-        limitations: ["The failed attempt remains unresolved."],
-        reasons: [
-          {
-            taskId: "comparison",
-            reason: "One independent attempt and its result failed.",
-          },
-        ],
-      });
+      const completed = await runStore(
+        store.complete({
+          conclusion: "One contribution failed",
+          evidence: [{ label: "comparison", observation: "Both attempts retained" }],
+          limitations: ["The failed attempt remains unresolved."],
+          reasons: [
+            {
+              taskId: "comparison",
+              reason: "One independent attempt and its result failed.",
+            },
+          ],
+        }),
+      );
       assert.deepEqual(
         completed.completion?.accounting.map((item) =>
           item.kind === "unresolved_assignment"
@@ -495,7 +597,7 @@ void test("malformed state diagnostics identify a bounded field path without ech
         .replace('"revision": 0', '"revision": "invalid"'),
     );
     await assert.rejects(
-      WorkstreamStore.inspect(store.path),
+      runStore(WorkstreamStoreEffects.inspect(store.path)),
       (error: Error) =>
         error instanceof InvalidWorkstreamStateError &&
         error.message.includes("/revision") &&
@@ -510,45 +612,59 @@ void test("workstream serializes receipt writes and rejects corrupt or foreign h
   const { parent, store } = await fixture();
   try {
     await Promise.all([
-      store.recordInputEvent({
-        ...coordinator,
-        source: "interactive",
-        text: "First human constraint.",
-      }),
-      store.recordInputEvent({
-        ...coordinator,
-        source: "rpc",
-        text: "Second human constraint.",
-      }),
-      store.recordInputEvent({
-        ...coordinator,
-        source: "interactive",
-        text: "Third human constraint.",
-      }),
+      runStore(
+        store.recordInputEvent({
+          ...coordinator,
+          source: "interactive",
+          text: "First human constraint.",
+        }),
+      ),
+      runStore(
+        store.recordInputEvent({
+          ...coordinator,
+          source: "rpc",
+          text: "Second human constraint.",
+        }),
+      ),
+      runStore(
+        store.recordInputEvent({
+          ...coordinator,
+          source: "interactive",
+          text: "Third human constraint.",
+        }),
+      ),
     ]);
-    let state = await store.load();
+    let state = await runStore(store.load());
     assert.equal(state.revision, 3);
     assert.equal(new Set(state.inputs.map((input) => input.id)).size, 3);
-    state = await store.setLifecycle({
-      state: "suspended",
-      reason: "Coordinator is offline.",
-    });
+    state = await runStore(
+      store.setLifecycle({
+        state: "suspended",
+        reason: "Coordinator is offline.",
+      }),
+    );
     assert.equal(state.lifecycle.state, "suspended");
     await assert.rejects(
-      store.assign({
-        id: "blocked",
-        capability: "research",
-        artifactIntent: "evidence_only",
-        objective: "Do not queue while suspended.",
-        intentVersion: 0,
-        expectedEvidence: ["No worker."],
-      }),
+      enqueueFixtureAssignment(
+        store,
+        {
+          id: "blocked",
+          capability: "research",
+          artifactIntent: "evidence_only",
+          objective: "Do not queue while suspended.",
+          intentVersion: 0,
+          expectedEvidence: ["No worker."],
+        },
+        "blocked-attempt",
+      ),
       /suspended/,
     );
-    state = await store.setLifecycle({
-      state: "active",
-      reason: "Coordinator resumed.",
-    });
+    state = await runStore(
+      store.setLifecycle({
+        state: "active",
+        reason: "Coordinator resumed.",
+      }),
+    );
     assert.equal(state.lifecycle.state, "active");
 
     const foreignPath = join(parent, "foreign.json");
@@ -556,31 +672,40 @@ void test("workstream serializes receipt writes and rejects corrupt or foreign h
       foreignPath,
       JSON.stringify({ version: 7, runId: "old-run", phase: "discovery" }),
     );
-    await assert.rejects(WorkstreamStore.inspect(foreignPath), UnsupportedWorkstreamStateError);
+    await assert.rejects(
+      runStore(WorkstreamStoreEffects.inspect(foreignPath)),
+      UnsupportedWorkstreamStateError,
+    );
     const foreignObject = parsePersistedObject(await readFile(foreignPath, "utf8"));
     const runIdKey = "runId";
     assert.equal(foreignObject[runIdKey], "old-run");
 
     const copiedPath = join(parent, "copied.json");
     await writeFile(copiedPath, await readFile(state.statePath, "utf8"));
-    await assert.rejects(WorkstreamStore.inspect(copiedPath), InvalidWorkstreamStateError);
+    await assert.rejects(
+      runStore(WorkstreamStoreEffects.inspect(copiedPath)),
+      InvalidWorkstreamStateError,
+    );
     const copiedObject = parsePersistedObject(await readFile(copiedPath, "utf8"));
     const statePathKey = "statePath";
     assert.equal(copiedObject[statePathKey], state.statePath);
 
     const corruptPath = join(parent, "corrupt.json");
     await writeFile(corruptPath, "not JSON");
-    await assert.rejects(WorkstreamStore.inspect(corruptPath), InvalidWorkstreamStateError);
+    await assert.rejects(
+      runStore(WorkstreamStoreEffects.inspect(corruptPath)),
+      InvalidWorkstreamStateError,
+    );
     assert.equal(await readFile(corruptPath, "utf8"), "not JSON");
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
 });
 
-void test("historical disposition semantics preserve unresolved judgments without curing invalid evidence", async () => {
+void test("historical disposition evidence remains readonly and invalid evidence stays unresolved", async () => {
   const { parent, store } = await fixture();
   try {
-    await store.assign({
+    await enqueueFixtureAssignment(store, {
       id: "research",
       capability: "research",
       artifactIntent: "evidence_only",
@@ -588,40 +713,52 @@ void test("historical disposition semantics preserve unresolved judgments withou
       intentVersion: 0,
       expectedEvidence: ["Retained bytes."],
     });
-    await store.retainResult({
-      id: "result",
-      assignmentId: "research",
-      assignmentIntentVersion: 0,
-      validity: "typed",
-      report: researchReport("The bytes were retained."),
-    });
-    await store.disposition({
-      resultId: "result",
-      status: "rejected",
-      reason: "The first review found a gap.",
-    });
-    await store.disposition({
-      resultId: "result",
-      status: "accepted",
-      reason: "A later review accepted the retained evidence.",
-    });
-    const completed = await store.complete({
-      conclusion: "The historical rejection remains unresolved under version 4 semantics.",
-      evidence: [{ label: "result", observation: "The completed report was retained." }],
-      limitations: ["The historical rejection remains part of the authoritative judgment."],
-      reasons: [
-        {
-          taskId: "research",
-          reason: "The assignment and result retain a non-accepted disposition.",
-        },
-      ],
-    });
+    await runStore(
+      store.retainResult({
+        id: "result",
+        assignmentId: "research",
+        assignmentIntentVersion: 0,
+        validity: "typed",
+        report: researchReport("The bytes were retained."),
+      }),
+    );
+    await settleFixtureAttempt(store, "research-attempt", "result");
+    // SAFETY: The store was initialized and updated through WorkstreamStoreEffects immediately above; this test only replaces its validated historical disposition list.
+    const historical = JSON.parse(await readFile(store.path, "utf8")) as HistoricalStoreFixture;
+    historical.dispositions = [
+      {
+        resultId: "result",
+        status: "rejected",
+        reason: "The first review found a gap.",
+        recordedAt: dateAt(3_000).toISOString(),
+      },
+      {
+        resultId: "result",
+        status: "accepted",
+        reason: "A later review accepted the retained evidence.",
+        recordedAt: dateAt(4_000).toISOString(),
+      },
+    ];
+    await writeFile(store.path, `${JSON.stringify(historical, null, 2)}\n`);
+    const completed = await runStore(
+      store.complete({
+        conclusion: "The historical rejection remains unresolved under retained semantics.",
+        evidence: [{ label: "result", observation: "The completed report was retained." }],
+        limitations: ["The historical rejection remains part of the authoritative judgment."],
+        reasons: [
+          {
+            taskId: "research",
+            reason: "The assignment and result retain a non-accepted disposition.",
+          },
+        ],
+      }),
+    );
     assert.deepEqual(
       completed.completion?.accounting.map((item) => item.kind),
-      ["unresolved_assignment", "unresolved_result"],
+      ["unresolved_assignment", "unresolved_attempt", "unresolved_result"],
     );
     const persisted = await readFile(store.path, "utf8");
-    const inspected = await WorkstreamStore.inspect(store.path);
+    const inspected = await runStore(WorkstreamStoreEffects.inspect(store.path));
     assert.deepEqual(inspected.completion, completed.completion);
     assert.equal(await readFile(store.path, "utf8"), persisted);
   } finally {
@@ -630,7 +767,7 @@ void test("historical disposition semantics preserve unresolved judgments withou
 
   const invalidFixture = await fixture();
   try {
-    await invalidFixture.store.assign({
+    await enqueueFixtureAssignment(invalidFixture.store, {
       id: "research",
       capability: "research",
       artifactIntent: "evidence_only",
@@ -638,25 +775,25 @@ void test("historical disposition semantics preserve unresolved judgments withou
       intentVersion: 0,
       expectedEvidence: ["Retained bytes."],
     });
-    await invalidFixture.store.retainResult({
-      id: "result",
-      assignmentId: "research",
-      assignmentIntentVersion: 0,
-      validity: "invalid",
-      detail: "The report did not satisfy its schema.",
-    });
-    await invalidFixture.store.disposition({
-      resultId: "result",
-      status: "accepted",
-      reason: "The prose was useful but remains invalid evidence.",
-    });
-    await assert.rejects(
-      invalidFixture.store.complete({
-        conclusion: "Invalid evidence remains unresolved.",
-        evidence: [{ label: "result", observation: "The retained result is invalid." }],
-        limitations: ["No valid report was retained."],
-        reasons: [],
+    await runStore(
+      invalidFixture.store.retainResult({
+        id: "result",
+        assignmentId: "research",
+        assignmentIntentVersion: 0,
+        validity: "invalid",
+        detail: "The report did not satisfy its schema.",
       }),
+    );
+    await settleFixtureAttempt(invalidFixture.store, "research-attempt", "result");
+    await assert.rejects(
+      runStore(
+        invalidFixture.store.complete({
+          conclusion: "Invalid evidence remains unresolved.",
+          evidence: [{ label: "result", observation: "The retained result is invalid." }],
+          limitations: ["No valid report was retained."],
+          reasons: [],
+        }),
+      ),
       /exactly one reason per unresolved semantic task/,
     );
   } finally {
@@ -667,7 +804,7 @@ void test("historical disposition semantics preserve unresolved judgments withou
 void test("Effect store port fences both reads and renames and cleans unique 0600 temp state", async () => {
   const { parent, store } = await fixture();
   try {
-    const initial = await runLiveStoreEffect(store.effects.load());
+    const initial = await runLiveStoreEffect(store.load());
     assert.equal(initial.revision, 0);
 
     const aborted = new AbortController();
@@ -675,7 +812,7 @@ void test("Effect store port fences both reads and renames and cleans unique 060
     await assert.rejects(
       Effect.runPromise(
         Effect.provide(
-          store.effects.recordInputEvent({
+          store.recordInputEvent({
             ...coordinator,
             source: "interactive",
             text: "This interrupted write must not be retained.",
@@ -685,7 +822,7 @@ void test("Effect store port fences both reads and renames and cleans unique 060
         { signal: aborted.signal },
       ),
     );
-    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
 
     let guardCalls = 0;
     store.bindMutationGuard(() => {
@@ -693,15 +830,17 @@ void test("Effect store port fences both reads and renames and cleans unique 060
       if (guardCalls === 2) throw new Error("lease fence changed before rename");
     });
     await assert.rejects(
-      store.recordInputEvent({
-        ...coordinator,
-        source: "interactive",
-        text: "This fenced write must not be retained.",
-      }),
+      runStore(
+        store.recordInputEvent({
+          ...coordinator,
+          source: "interactive",
+          text: "This fenced write must not be retained.",
+        }),
+      ),
       /lease fence changed before rename/,
     );
     assert.equal(guardCalls, 2);
-    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
     assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
     assert.equal((await stat(store.path)).mode & 0o777, 0o600);
   } finally {
@@ -735,7 +874,7 @@ void test("interruption in exclusive acquisition records ownership and removes t
     const abort = new AbortController();
     let settled = false;
     const pending = runStoreEffect(
-      store.effects.recordInputEvent({
+      store.recordInputEvent({
         ...coordinator,
         source: "interactive",
         text: "Interrupt after exclusive creation but before open returns.",
@@ -759,7 +898,7 @@ void test("interruption in exclusive acquisition records ownership and removes t
       stat(temporaryPath),
       (error: NodeJS.ErrnoException) => error.code === "ENOENT",
     );
-    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
     assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
   } finally {
     await rm(parent, { recursive: true, force: true });
@@ -811,7 +950,7 @@ void test("interruption during temporary preparation waits for native release an
     const abort = new AbortController();
     let settled = false;
     const pending = runStoreEffect(
-      store.effects.recordInputEvent({
+      store.recordInputEvent({
         ...coordinator,
         source: "interactive",
         text: "This delayed write must be interrupted before publication.",
@@ -831,7 +970,7 @@ void test("interruption during temporary preparation waits for native release an
     await Effect.runPromise(Effect.sleep("20 millis"));
 
     assert.equal(handleReleased, true);
-    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
     assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
   } finally {
     await rm(parent, { recursive: true, force: true });
@@ -850,14 +989,16 @@ void test("new storage is private across umasks and existing shared directories 
       await mkdir(gitCommonDir, { recursive: true, mode: 0o755 });
       await chmod(gitCommonDir, 0o755);
       process.umask(mask);
-      const { state } = await WorkstreamStore.create({
-        id: "private-store",
-        purpose: "Verify private persistence modes.",
-        projectRoot: join(parent, name),
-        gitCommonDir,
-        coordinator,
-        now: dateAt(0),
-      });
+      const { state } = await runStore(
+        WorkstreamStoreEffects.create({
+          id: "private-store",
+          purpose: "Verify private persistence modes.",
+          projectRoot: join(parent, name),
+          gitCommonDir,
+          coordinator,
+          now: dateAt(0),
+        }),
+      );
       process.umask(originalUmask);
 
       for (const directory of [
@@ -873,14 +1014,16 @@ void test("new storage is private across umasks and existing shared directories 
     const sharedStorage = join(gitCommonDir, "pi-workgraph");
     await mkdir(sharedStorage, { recursive: true, mode: 0o755 });
     await chmod(sharedStorage, 0o755);
-    await WorkstreamStore.create({
-      id: "compatible-store",
-      purpose: "Preserve a legitimate shared storage parent.",
-      projectRoot: join(parent, "shared"),
-      gitCommonDir,
-      coordinator,
-      now: dateAt(0),
-    });
+    await runStore(
+      WorkstreamStoreEffects.create({
+        id: "compatible-store",
+        purpose: "Preserve a legitimate shared storage parent.",
+        projectRoot: join(parent, "shared"),
+        gitCommonDir,
+        coordinator,
+        now: dateAt(0),
+      }),
+    );
     assert.equal((await lstat(sharedStorage)).mode & 0o777, 0o755);
   } finally {
     process.umask(originalUmask);
@@ -898,14 +1041,16 @@ void test("missing or invalid common roots are rejected without external mutatio
     const missingCommonDir = join(missingProject, "nested", ".git");
 
     await assert.rejects(
-      WorkstreamStore.create({
-        id: "missing-root",
-        purpose: "A missing common root must not be created.",
-        projectRoot: missingProject,
-        gitCommonDir: missingCommonDir,
-        coordinator,
-        now: dateAt(0),
-      }),
+      runStore(
+        WorkstreamStoreEffects.create({
+          id: "missing-root",
+          purpose: "A missing common root must not be created.",
+          projectRoot: missingProject,
+          gitCommonDir: missingCommonDir,
+          coordinator,
+          now: dateAt(0),
+        }),
+      ),
       /Git common directory does not exist/,
     );
     assert.deepEqual(await readdir(existingAncestor), []);
@@ -918,14 +1063,16 @@ void test("missing or invalid common roots are rejected without external mutatio
     const commonFile = join(existingAncestor, "common-file");
     await writeFile(commonFile, "foreign common root");
     await assert.rejects(
-      WorkstreamStore.create({
-        id: "file-root",
-        purpose: "A file common root must remain untouched.",
-        projectRoot: existingAncestor,
-        gitCommonDir: commonFile,
-        coordinator,
-        now: dateAt(0),
-      }),
+      runStore(
+        WorkstreamStoreEffects.create({
+          id: "file-root",
+          purpose: "A file common root must remain untouched.",
+          projectRoot: existingAncestor,
+          gitCommonDir: commonFile,
+          coordinator,
+          now: dateAt(0),
+        }),
+      ),
       /not an ordinary directory/,
     );
     assert.equal(await readFile(commonFile, "utf8"), "foreign common root");
@@ -935,14 +1082,16 @@ void test("missing or invalid common roots are rejected without external mutatio
     await mkdir(external);
     await symlink(external, commonLink, "dir");
     await assert.rejects(
-      WorkstreamStore.create({
-        id: "link-root",
-        purpose: "A symlink common root must remain untouched.",
-        projectRoot: existingAncestor,
-        gitCommonDir: commonLink,
-        coordinator,
-        now: dateAt(0),
-      }),
+      runStore(
+        WorkstreamStoreEffects.create({
+          id: "link-root",
+          purpose: "A symlink common root must remain untouched.",
+          projectRoot: existingAncestor,
+          gitCommonDir: commonLink,
+          coordinator,
+          now: dateAt(0),
+        }),
+      ),
       /not an ordinary directory/,
     );
     assert.equal((await lstat(commonLink)).isSymbolicLink(), true);
@@ -965,14 +1114,16 @@ void test("state creation refuses static storage redirection before mutation", a
     await symlink(external, workstreamsDirectory, "dir");
 
     await assert.rejects(
-      WorkstreamStore.create({
-        id: "redirected",
-        purpose: "This must not leave the Git storage boundary.",
-        projectRoot: join(parent, "project"),
-        gitCommonDir,
-        coordinator,
-        now: dateAt(0),
-      }),
+      runStore(
+        WorkstreamStoreEffects.create({
+          id: "redirected",
+          purpose: "This must not leave the Git storage boundary.",
+          projectRoot: join(parent, "project"),
+          gitCommonDir,
+          coordinator,
+          now: dateAt(0),
+        }),
+      ),
       /not an ordinary directory/,
     );
     assert.equal((await lstat(workstreamsDirectory)).isSymbolicLink(), true);
@@ -981,14 +1132,16 @@ void test("state creation refuses static storage redirection before mutation", a
     await rm(workstreamsDirectory);
     await writeFile(workstreamsDirectory, "foreign component");
     await assert.rejects(
-      WorkstreamStore.create({
-        id: "not-a-directory",
-        purpose: "This must not traverse a file component.",
-        projectRoot: join(parent, "project"),
-        gitCommonDir,
-        coordinator,
-        now: dateAt(0),
-      }),
+      runStore(
+        WorkstreamStoreEffects.create({
+          id: "not-a-directory",
+          purpose: "This must not traverse a file component.",
+          projectRoot: join(parent, "project"),
+          gitCommonDir,
+          coordinator,
+          now: dateAt(0),
+        }),
+      ),
       /not an ordinary directory/,
     );
     assert.equal(await readFile(workstreamsDirectory, "utf8"), "foreign component");
@@ -1003,32 +1156,38 @@ void test("legitimate existing storage supports new ids and preserves claimed-di
   try {
     const gitCommonDir = join(parent, "project", ".git");
     await mkdir(gitCommonDir, { recursive: true });
-    const first = await WorkstreamStore.create({
-      id: "first",
-      purpose: "Create the shared storage hierarchy.",
-      projectRoot: join(parent, "project"),
-      gitCommonDir,
-      coordinator,
-      now: dateAt(0),
-    });
-    const firstBytes = await readFile(first.state.statePath, "utf8");
-    await WorkstreamStore.create({
-      id: "second",
-      purpose: "Reuse the legitimate shared storage hierarchy.",
-      projectRoot: join(parent, "project"),
-      gitCommonDir,
-      coordinator,
-      now: dateAt(0),
-    });
-    await assert.rejects(
-      WorkstreamStore.create({
+    const first = await runStore(
+      WorkstreamStoreEffects.create({
         id: "first",
-        purpose: "Do not adopt an existing directory claim.",
+        purpose: "Create the shared storage hierarchy.",
         projectRoot: join(parent, "project"),
         gitCommonDir,
         coordinator,
         now: dateAt(0),
       }),
+    );
+    const firstBytes = await readFile(first.state.statePath, "utf8");
+    await runStore(
+      WorkstreamStoreEffects.create({
+        id: "second",
+        purpose: "Reuse the legitimate shared storage hierarchy.",
+        projectRoot: join(parent, "project"),
+        gitCommonDir,
+        coordinator,
+        now: dateAt(0),
+      }),
+    );
+    await assert.rejects(
+      runStore(
+        WorkstreamStoreEffects.create({
+          id: "first",
+          purpose: "Do not adopt an existing directory claim.",
+          projectRoot: join(parent, "project"),
+          gitCommonDir,
+          coordinator,
+          now: dateAt(0),
+        }),
+      ),
       /EEXIST/,
     );
     assert.equal(await readFile(first.state.statePath, "utf8"), firstBytes);
@@ -1052,7 +1211,7 @@ void test("each execution uses a unique temporary identity and preserves unowned
           .pipe(Effect.andThen(fileSystem.open(path, options)));
       },
     };
-    const operation = store.effects.recordInputEvent({
+    const operation = store.recordInputEvent({
       ...coordinator,
       source: "interactive",
       text: "This collision must not be retained.",
@@ -1067,7 +1226,7 @@ void test("each execution uses a unique temporary identity and preserves unowned
     assert.equal(new Set(collisionPaths).size, 2);
     for (const collisionPath of collisionPaths)
       assert.equal(await readFile(collisionPath, "utf8"), "unowned collision bytes");
-    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -1102,7 +1261,7 @@ void test("temporary cleanup failure is observable without replacing the origina
 
     await assert.rejects(
       runStoreEffect(
-        store.effects.recordInputEvent({
+        store.recordInputEvent({
           ...coordinator,
           source: "interactive",
           text: "This fenced write must expose cleanup failure.",
@@ -1118,7 +1277,7 @@ void test("temporary cleanup failure is observable without replacing the origina
         );
       },
     );
-    assert.equal((await WorkstreamStore.inspect(store.path)).revision, 0);
+    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

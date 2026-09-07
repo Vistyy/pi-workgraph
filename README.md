@@ -80,7 +80,7 @@ Use the returned `next` handle to retrieve every remaining character of typed, u
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic acceptance oracle.
 Completion derives mechanical unresolved accounting and accepts one explicit reason per unresolved semantic task only; it refuses live or blocked resources and never automatically accepts evidence.
 Extension notifications and worker reports do not grant authority.
-The coordinator also keeps a session-owned pending-items notepad independently of Calm and WorkstreamStore state.
+The coordinator also keeps a session-owned pending-items notepad independently of Calm and WorkstreamStoreEffects state.
 The coordinator-only `workgraph_notepad` tool supports `read`, `add`, `update`, and `remove` for current id/text items. It is not a receipt, acknowledgment detector, delivery ledger, disposition, authority mutation, or auto-expiring notebook; mistaken items may be removed without presentation or receipt resolution.
 Reload, resume, branch navigation, and compaction restore the latest valid persisted notepad snapshot and inject only a compact hidden context when the branch lacks it. The stable `[WORKGRAPH PENDING ITEMS]` prefix is kept cache-friendly, and notepad state never blocks `workgraph_complete`.
 Legacy response-note snapshots migrate only pending substance; presentation, draft, resolution, and supersession history are not continued.
@@ -154,9 +154,9 @@ An explicit base revision is exact Git evidence; an exact-revision review must i
 
 Effect `4.0.0-rc.112` is a runtime dependency used for structured lifecycle, concurrency, timing, configuration, and typed failures.
 `WorkstreamRuntime` owns one scoped Effect `ManagedRuntime`, its serialized operation queue, lease lifetime, heartbeat, reconciliation fibers, and shutdown.
-The `processEffect` adapter owns child acquisition, bounded output, timeout, interruption, and release, while `runProcess` preserves the outward Promise contract used by Git and Herdr callers.
-`WorkstreamStore` owns validated workstream files, serializes mutations with an Effect semaphore, and publishes updates by atomic replacement; `WorkgraphRegistry` remains the SQLite owner of the workstream index and fenced leases.
-Promise-returning Pi, Herdr, Git, and store APIs are compatibility boundaries around those owners rather than a second lifecycle system.
+The `processEffect` owner handles child acquisition, bounded output, timeout, interruption, and release.
+`WorkstreamStoreEffects` owns validated workstream files, serializes mutations with an Effect semaphore, and publishes updates by atomic replacement; `WorkgraphRegistry` remains the SQLite owner of the workstream index and fenced leases.
+Git, Herdr, Pi, and store internals use their Effect-native ports; Promise conversion remains only at Pi tool/event, CLI, and standalone test or live-runner boundaries.
 
 ## Source-checkout development and live verification
 
@@ -177,7 +177,7 @@ Development quality preparation runs `effect-tsgo patch --oxlint --no-typescript
 The optional `msgpackr-extract` native build is explicitly allowed in `pnpm-workspace.yaml`; Effect still works with its JavaScript fallback when the optional native package is unavailable.
 `pnpm check` is the GitHub Actions entry point and runs quality preparation, Biome with warnings rejected, the type-aware Oxlint configuration, and every deterministic `node:test` test.
 Oxlint owns the full TypeScript-aware check for this source selection, while `pnpm typecheck` remains an independent `tsc --noEmit` diagnostic and is not duplicated in `pnpm check`.
-Only `effecttsgo/async-function` is disabled for `test/**/*.test.ts`, where `node:test` callbacks and fake Promise adapters must preserve framework contracts; every other shared and Effect rule remains enabled.
+Only `effecttsgo/async-function` is disabled for `test/**/*.test.ts`, where `node:test` callbacks and standalone test runners preserve framework contracts; every other shared and Effect rule remains enabled.
 The shared blocking policy rejects non-null assertions, assertions to `never`, and chained assertions through the configured Biome and Oxlint checks.
 
 A natural-use verification request should state the desired outcome, constraints, and uncertainty to resolve without naming Workgraph tools, worker counts, or model panels.

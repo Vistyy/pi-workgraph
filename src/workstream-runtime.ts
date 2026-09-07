@@ -48,7 +48,6 @@ import type {
   WorkAttempt,
   WorkResult,
   WorkstreamState,
-  WorkstreamStore,
   WorkstreamStoreEffects,
   WorkstreamStoreError,
 } from "./workstream.js";
@@ -126,7 +125,7 @@ export type RuntimeEffect<A, E = RuntimeError> = Effect.Effect<
 export interface WorkstreamRuntimeEffects {
   readonly submit: <A, E>(effect: RuntimeEffect<A, E>) => RuntimeEffect<A, E | RuntimeError>;
   readonly queue: (
-    input: Parameters<WorkstreamStore["assign"]>[0],
+    input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
     options?: QueueOptions,
   ) => RuntimeEffect<WorkstreamState>;
   readonly reconcile: RuntimeEffect<WorkstreamState>;
@@ -150,7 +149,7 @@ export class WorkstreamRuntime {
   readonly effects: WorkstreamRuntimeEffects;
 
   private constructor(
-    readonly store: WorkstreamStore,
+    readonly store: WorkstreamStoreEffects,
     readonly repository: GitRepository,
     readonly workers: RuntimeWorkerPort,
     readonly launch: WorkstreamLaunch,
@@ -188,7 +187,7 @@ export class WorkstreamRuntime {
   }
 
   static acquire(
-    store: WorkstreamStore,
+    store: WorkstreamStoreEffects,
     repository: GitRepository,
     workers: RuntimeWorkerPort,
     launch: WorkstreamLaunch,
@@ -315,7 +314,7 @@ export class WorkstreamRuntime {
   private storeEffect<A>(
     run: (store: WorkstreamStoreEffects) => StoreEffect<A>,
   ): RuntimeEffect<A, WorkstreamStoreError | LeaseDecisionRequiredError> {
-    return run(this.store.effects).pipe(
+    return run(this.store).pipe(
       Effect.mapError((error) =>
         error instanceof WorkstreamStoreOperationError &&
         error.cause instanceof LeaseDecisionRequiredError
@@ -412,7 +411,7 @@ export class WorkstreamRuntime {
   }
 
   private queueEffect(
-    input: Parameters<WorkstreamStore["assign"]>[0],
+    input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
     options: QueueOptions,
   ): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
@@ -430,7 +429,7 @@ export class WorkstreamRuntime {
   }
 
   private resolveQueueBaseEffect(
-    input: Parameters<WorkstreamStore["assign"]>[0],
+    input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
     options: QueueOptions,
   ): RuntimeEffect<string | undefined> {
     return Effect.gen(
@@ -719,7 +718,7 @@ export class WorkstreamRuntime {
     if (attempt.cleanup !== undefined || attempt.placement === undefined) return Effect.void;
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const input: Parameters<WorkstreamStore["beginCleanup"]>[0] = {
+        const input: Parameters<WorkstreamStoreEffects["beginCleanup"]>[0] = {
           id: attempt.id,
         };
         if (attempt.placement?.kind === "isolated_worktree")
@@ -752,7 +751,7 @@ export class WorkstreamRuntime {
             )
           : undefined;
         const workerCwd = placement?.path ?? this.repository.root;
-        const start: Parameters<WorkstreamStore["startAttempt"]>[0] = {
+        const start: Parameters<WorkstreamStoreEffects["startAttempt"]>[0] = {
           id: attempt.id,
           placement:
             placement === undefined
@@ -917,7 +916,7 @@ export class WorkstreamRuntime {
             detail: `No-change validation failed: ${error.message}`,
           }),
         );
-        const cleanup: Parameters<WorkstreamStore["beginCleanup"]>[0] = {
+        const cleanup: Parameters<WorkstreamStoreEffects["beginCleanup"]>[0] = {
           id: attempt.id,
         };
         if (attempt.placement?.kind === "isolated_worktree")
@@ -1475,7 +1474,7 @@ function workerLaunchRequest(
   sessionFile: string,
   models: NonNullable<WorkAttempt["models"]>,
   baseRevision: string | undefined,
-  store: WorkstreamStore,
+  store: WorkstreamStoreEffects,
 ): WorkerLaunchEffectRequest<WorkstreamStoreError, FileSystem.FileSystem | Path.Path> {
   const environment = new Map<string, string>([
     ["PI_WORKGRAPH_MODE", modeFor(assignment)],
@@ -1509,14 +1508,13 @@ function workerLaunchRequest(
     model: models.guide.model,
     thinking: models.guide.thinking,
     env,
-    onTab: (pane) => store.effects.recordLaunchPane(attempt.id, pane).pipe(Effect.asVoid),
-    onResource: (resource) =>
-      store.effects.recordResource(attempt.id, resource).pipe(Effect.asVoid),
+    onTab: (pane) => store.recordLaunchPane(attempt.id, pane).pipe(Effect.asVoid),
+    onResource: (resource) => store.recordResource(attempt.id, resource).pipe(Effect.asVoid),
     onIdentity: (worker) =>
-      store.effects
+      store
         .recordWorker(attempt.id, worker)
-        .pipe(Effect.andThen(store.effects.markSubmission(attempt.id, "uncertain")), Effect.asVoid),
-    onSubmitted: () => store.effects.markSubmission(attempt.id, "submitted").pipe(Effect.asVoid),
+        .pipe(Effect.andThen(store.markSubmission(attempt.id, "uncertain")), Effect.asVoid),
+    onSubmitted: () => store.markSubmission(attempt.id, "submitted").pipe(Effect.asVoid),
   };
 }
 function isNoChangeImplementation(

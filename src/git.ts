@@ -5,8 +5,6 @@ import { basename, dirname, join, resolve } from "node:path";
 import { Data, Effect } from "effect";
 import { ProcessExecutionError, type ProcessResult, processEffect } from "./process.js";
 
-export { runProcess } from "./process.js";
-
 export interface RepositoryInfo {
   root: string;
   commonDir: string;
@@ -160,40 +158,16 @@ export class GitRepository {
     };
   }
 
-  static inspect(cwd: string): Promise<RepositoryInfo> {
-    return runGitPromise(inspectRepository(cwd));
-  }
-
-  static open(cwd: string): Promise<GitRepository> {
-    return runGitPromise(openRepository(cwd));
-  }
-
-  head(cwd = this.root): Promise<string> {
-    return runGitPromise(this.effects.head(cwd));
-  }
-
   private headEffect(cwd: string): GitEffect<string> {
     return this.git.text(cwd, ["rev-parse", "HEAD"]);
-  }
-
-  resolveRevision(revision: string): Promise<string> {
-    return runGitPromise(this.effects.resolveRevision(revision));
   }
 
   private resolveRevisionEffect(revision: string): GitEffect<string> {
     return resolveRevision(this.git, this.root, revision);
   }
 
-  status(cwd = this.root): Promise<string> {
-    return runGitPromise(this.effects.status(cwd));
-  }
-
   private statusEffect(cwd: string): GitEffect<string> {
     return this.git.text(cwd, ["status", "--porcelain", "--untracked-files=all"], true);
-  }
-
-  retainCommit(runId: string, attemptId: string, commit: string): Promise<string> {
-    return runGitPromise(this.effects.retainCommit(runId, attemptId, commit));
   }
 
   private retainCommitEffect(runId: string, attemptId: string, commit: string): GitEffect<string> {
@@ -226,16 +200,8 @@ export class GitRepository {
     });
   }
 
-  assertClean(cwd = this.root): Promise<void> {
-    return runGitPromise(this.effects.assertClean(cwd));
-  }
-
   private assertCleanEffect(cwd: string): GitEffect<void> {
     return assertClean(this.git, cwd);
-  }
-
-  createWorktree(runId: string, nodeId: string, baseCommit: string): Promise<WorktreePlacement> {
-    return runGitPromise(this.effects.createWorktree(runId, nodeId, baseCommit));
   }
 
   private createWorktreeEffect(
@@ -263,13 +229,6 @@ export class GitRepository {
       yield* createUnregisteredWorktree(git, root, identity, nodeId);
       return identity.placement;
     });
-  }
-
-  validateWorkerNoChange(
-    placement: WorktreePlacement,
-    reportedRevision: string,
-  ): Promise<{ revision: string; changedFiles: string[] }> {
-    return runGitPromise(this.effects.validateWorkerNoChange(placement, reportedRevision));
   }
 
   private validateWorkerNoChangeEffect(
@@ -302,13 +261,6 @@ export class GitRepository {
       yield* assertStableCleanHead(git, placement.path, revision, "No-change validation");
       return { revision, changedFiles: [] };
     });
-  }
-
-  validateWorkerCommit(
-    placement: WorktreePlacement,
-    reportedCommit?: string,
-  ): Promise<ValidatedCommit> {
-    return runGitPromise(this.effects.validateWorkerCommit(placement, reportedCommit));
   }
 
   private validateWorkerCommitEffect(
@@ -365,13 +317,6 @@ export class GitRepository {
     });
   }
 
-  recoverApplication(
-    expectedHead: string,
-    source: { baseCommit: string; commit: string },
-  ): Promise<{ head: string } | undefined> {
-    return runGitPromise(this.effects.recoverApplication(expectedHead, source));
-  }
-
   private recoverApplicationEffect(
     expectedHead: string,
     source: { baseCommit: string; commit: string },
@@ -396,10 +341,6 @@ export class GitRepository {
       yield* assertStableCleanHead(git, root, head, "Application recovery");
       return { head };
     });
-  }
-
-  applyCommit(commit: string, expectedHead: string): Promise<string> {
-    return runGitPromise(this.effects.applyCommit(commit, expectedHead));
   }
 
   private applyCommitEffect(commit: string, expectedHead: string): GitEffect<string> {
@@ -451,10 +392,6 @@ export class GitRepository {
   }
 
   /** Discard only an explicitly disposable, stopped experiment at its recorded identity. */
-  discardExperiment(placement: WorktreePlacement, expectedHead: string): Promise<void> {
-    return runGitPromise(this.effects.discardExperiment(placement, expectedHead));
-  }
-
   private discardExperimentEffect(
     placement: WorktreePlacement,
     expectedHead: string,
@@ -496,13 +433,6 @@ export class GitRepository {
         }),
       );
     });
-  }
-
-  cleanupWorktree(
-    placement: WorktreePlacement,
-    expectedHead: string,
-  ): Promise<WorktreeCleanupResult> {
-    return runGitPromise(this.effects.cleanupWorktree(placement, expectedHead));
   }
 
   private cleanupWorktreeEffect(
@@ -552,11 +482,6 @@ export function inspectRepository(cwd: string): GitEffect<RepositoryInfo> {
 
 export function openRepository(cwd: string): GitEffect<GitRepository> {
   return Effect.map(inspectRepository(cwd), (info) => new GitRepository(info.root, info.commonDir));
-}
-
-/** The single outward conversion boundary preserving GitRepository's Promise API. */
-function runGitPromise<A>(operation: GitEffect<A>): Promise<A> {
-  return Effect.runPromise(operation);
 }
 
 function retainedRef(runId: string, attemptId: string): GitEffect<string> {

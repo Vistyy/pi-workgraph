@@ -7,8 +7,9 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Effect } from "effect";
 import { Type } from "typebox";
 import { loadModelPolicy } from "../../src/model-policy.js";
+import { liveLayer } from "../../src/node-platform.js";
 import { hasNativeAgentSettled } from "../../src/pi-process.js";
-import { WorkstreamStore } from "../../src/workstream.js";
+import { type WorkstreamState, WorkstreamStoreEffects } from "../../src/workstream.js";
 import {
   closeOwnedWorkspace,
   command,
@@ -66,7 +67,12 @@ function inspectWorkstream(root: string) {
         if (names.length === 0) return undefined;
         const workstreamName = names[0];
         assert.ok(workstreamName !== undefined);
-        return WorkstreamStore.inspect(join(directory, workstreamName, "workstream.json"));
+        return Effect.runPromise(
+          Effect.provide(
+            WorkstreamStoreEffects.inspect(join(directory, workstreamName, "workstream.json")),
+            liveLayer,
+          ),
+        );
       })
   );
 }
@@ -102,10 +108,7 @@ function assertNativeCoordinatorIdentity(
   });
 }
 
-function verifyDelegatedSettlements(
-  workspaceId: string,
-  state: Awaited<ReturnType<typeof WorkstreamStore.inspect>>,
-): void {
+function verifyDelegatedSettlements(workspaceId: string, state: WorkstreamState): void {
   for (const attempt of state.attempts) {
     if (
       attempt.sessionFile === undefined ||
@@ -127,7 +130,7 @@ function verifyDelegatedSettlements(
 }
 
 function retainedExperimentReferences(
-  state: Awaited<ReturnType<typeof WorkstreamStore.inspect>>,
+  state: WorkstreamState,
 ): Array<{ artifactId: string; reference: string }> {
   const references: Array<{ artifactId: string; reference: string }> = [];
   const experiments = state.assignments.filter(
@@ -147,9 +150,7 @@ function retainedExperimentReferences(
   return references;
 }
 
-function verifyRetainedExperiments(
-  state: Awaited<ReturnType<typeof WorkstreamStore.inspect>>,
-): Promise<void> {
+function verifyRetainedExperiments(state: WorkstreamState): Promise<void> {
   return Promise.all(
     retainedExperimentReferences(state).map(({ artifactId, reference }) =>
       readFile(reference)
@@ -164,10 +165,7 @@ function verifyRetainedExperiments(
 }
 
 // oxlint-disable-next-line effecttsgo/async-function -- This live oracle independently queries native Git worktree and ref state.
-async function verifyIsolatedGitResourcesAbsent(
-  root: string,
-  state: Awaited<ReturnType<typeof WorkstreamStore.inspect>>,
-) {
+async function verifyIsolatedGitResourcesAbsent(root: string, state: WorkstreamState) {
   const placements = state.attempts.flatMap((attempt) =>
     attempt.placement?.kind === "isolated_worktree" ? [attempt.placement] : [],
   );
@@ -191,7 +189,7 @@ const smokeTimeout = Effect.runSync(
 
 const checkpoint = createFixtureCheckpoint("Workgraph optional natural UX observation");
 let fixture: Awaited<ReturnType<typeof createLiveFixture>> | undefined;
-let latest: Awaited<ReturnType<typeof WorkstreamStore.inspect>> | undefined;
+let latest: WorkstreamState | undefined;
 try {
   fixture = await createLiveFixture("Workgraph optional natural UX observation", checkpoint);
   const f = fixture;

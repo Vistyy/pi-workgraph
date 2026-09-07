@@ -8,48 +8,110 @@ import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { resultNotification } from "../src/agent-facing.js";
-import { GitRepository } from "../src/git.js";
+import { openRepository } from "../src/git.js";
 import {
-  type HerdrInspection,
   type HerdrObservation,
+  HerdrProtocolError,
   herdrAgentName,
-  type VisibleWorkerRuntime,
-  type WorkerLaunchRequest,
+  type WorkerLaunchEffectRequest,
+  WorkerLaunchError,
 } from "../src/herdr.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity } from "../src/types.js";
-import { WorkstreamStore } from "../src/workstream.js";
+import { WorkstreamStoreEffects } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
+import type { RuntimeWorkerPort } from "../src/workstream-runtime-services.js";
 import { git, persistentSession, researchReport, usage } from "./helpers.js";
-import { promiseWorkerEffects } from "./runtime-worker-port.js";
 
 const RAW_SECRET = "Bearer fixture-secret at https://provider.example/private";
 
-class NativeFailureWorker implements VisibleWorkerRuntime {
-  readonly available = true;
-  readonly effects = promiseWorkerEffects(this);
+type NativeFailureRequest = Pick<
+  WorkerLaunchEffectRequest,
+  "sessionFile" | "runId" | "nodeId" | "assignmentId"
+>;
 
-  async launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
-    const identity: WorkerIdentity = {
-      workspaceId: request.workspaceId,
-      tabId: `tab-${request.attemptId}`,
-      paneId: `pane-${request.attemptId}`,
-      terminalId: `terminal-${request.attemptId}`,
-      agentName: herdrAgentName(request.runId, request.nodeId, request.attemptId),
-      sessionFile: request.sessionFile,
-      cwd: request.cwd,
-    };
-    await request.onResource?.({
-      workspaceId: identity.workspaceId,
-      tabId: identity.tabId,
-      paneId: identity.paneId,
-      terminalId: identity.terminalId,
-      agentName: identity.agentName,
-      cwd: identity.cwd,
-    });
-    await request.onIdentity?.(identity);
+function fixtureCheckpoint<E, R, A>(
+  phase: WorkerLaunchError<E>["phase"],
+  checkpoint: ((value: A) => Effect.Effect<void, E, R>) | undefined,
+  value: A,
+  locator: WorkerLaunchError<E>["locator"],
+): Effect.Effect<void, WorkerLaunchError<E>, R> {
+  if (checkpoint === undefined) return Effect.void;
+  return checkpoint(value).pipe(
+    Effect.mapError(
+      (cause) =>
+        new WorkerLaunchError({
+          phase,
+          locator,
+          resource: "terminalId" in locator ? locator : undefined,
+          cause,
+        }),
+    ),
+  );
+}
+
+class NativeFailureWorker {
+  readonly available = true;
+  readonly effects: RuntimeWorkerPort["effects"] = {
+    launch: <E, R>(request: WorkerLaunchEffectRequest<E, R>) => {
+      const writeSession = (input: NativeFailureRequest) => this.writeSession(input);
+      const observe = (input: WorkerIdentity) => this.observation(input);
+      return Effect.gen(function* () {
+        const identity: WorkerIdentity = {
+          workspaceId: request.workspaceId,
+          tabId: `tab-${request.attemptId}`,
+          paneId: `pane-${request.attemptId}`,
+          terminalId: `terminal-${request.attemptId}`,
+          agentName: herdrAgentName(request.runId, request.nodeId, request.attemptId),
+          sessionFile: request.sessionFile,
+          cwd: request.cwd,
+        };
+        const resource = {
+          workspaceId: identity.workspaceId,
+          tabId: identity.tabId,
+          paneId: identity.paneId,
+          terminalId: identity.terminalId,
+          agentName: identity.agentName,
+          cwd: identity.cwd,
+        };
+        yield* fixtureCheckpoint("onResource", request.onResource, resource, resource);
+        yield* fixtureCheckpoint("onIdentity", request.onIdentity, identity, identity);
+        writeSession(request);
+        const onSubmitted = request.onSubmitted;
+        yield* fixtureCheckpoint(
+          "onSubmitted",
+          onSubmitted === undefined ? undefined : () => onSubmitted(),
+          undefined,
+          resource,
+        );
+        return observe(identity);
+      });
+    },
+    recover: () => Effect.as(Effect.void, undefined),
+    inspectLaunch: () =>
+      Effect.fail(
+        new HerdrProtocolError({
+          operation: "inspect fixture launch",
+          reason: "process",
+          detail: "No launch inspection.",
+        }),
+      ),
+    inspect: (identity) => Effect.succeed(this.observation(identity)),
+    observe: (identity) => Effect.succeed(this.observation(identity)),
+    interrupt: (identity) => Effect.succeed(this.observation(identity)),
+    steer: () => Effect.void,
+    cleanup: (identity) =>
+      Effect.succeed({
+        state: "completed" as const,
+        identity,
+        observedAt: "2026-01-01T00:00:00.000Z",
+        detail: "Native fixture closed.",
+      }),
+  };
+
+  private writeSession(request: NativeFailureRequest): void {
     const session = SessionManager.open(request.sessionFile);
     const generation = { runId: request.runId, nodeId: request.nodeId };
     session.appendCustomEntry("pi-workgraph-agent-running", generation);
@@ -82,7 +144,7 @@ class NativeFailureWorker implements VisibleWorkerRuntime {
         timestamp: 2,
       });
     }
-    if (request.assignmentId === "typed") {
+    if (request.assignmentId === "typed")
       session.appendMessage({
         role: "toolResult",
         toolCallId: "report",
@@ -92,31 +154,7 @@ class NativeFailureWorker implements VisibleWorkerRuntime {
         isError: false,
         timestamp: 3,
       });
-    }
     session.appendCustomEntry("pi-workgraph-agent-settled", generation);
-    await request.onSubmitted?.();
-    return this.observation(identity);
-  }
-
-  async inspect(identity: WorkerIdentity): Promise<HerdrInspection> {
-    return this.observation(identity);
-  }
-
-  async observe(identity: WorkerIdentity): Promise<HerdrObservation> {
-    return this.observation(identity);
-  }
-
-  async interrupt(identity: WorkerIdentity): Promise<HerdrObservation> {
-    return this.observation(identity);
-  }
-
-  async cleanup(identity: WorkerIdentity) {
-    return {
-      state: "completed" as const,
-      identity,
-      observedAt: "2026-01-01T00:00:00.000Z",
-      detail: "Native fixture closed.",
-    };
   }
 
   private observation(identity: WorkerIdentity): HerdrObservation {
@@ -137,17 +175,19 @@ await test("absent native failures project sanitized actionable notifications wi
     await writeFile(join(root, "value.txt"), "fixture\n");
     await git(root, "add", ".");
     await git(root, "commit", "-m", "fixture");
-    const repository = await GitRepository.open(root);
+    const repository = await Effect.runPromise(openRepository(root));
     const coordinator = persistentSession(root, join(parent, "coordinator-sessions"));
     const coordinatorFile = coordinator.getSessionFile();
     assert.ok(coordinatorFile !== undefined);
-    const { store } = await WorkstreamStore.create({
-      id: "native-failure-fixture",
-      purpose: "Observe bounded native failure outcomes",
-      projectRoot: root,
-      gitCommonDir: repository.commonDir,
-      coordinator: { sessionId: coordinator.getSessionId(), sessionFile: coordinatorFile },
-    });
+    const { store } = await Effect.runPromise(
+      WorkstreamStoreEffects.create({
+        id: "native-failure-fixture",
+        purpose: "Observe bounded native failure outcomes",
+        projectRoot: root,
+        gitCommonDir: repository.commonDir,
+        coordinator: { sessionId: coordinator.getSessionId(), sessionFile: coordinatorFile },
+      }).pipe(Effect.provide(liveLayer)),
+    );
     registry = new WorkgraphRegistry(join(parent, "registry.sqlite"));
     const notifications: string[] = [];
     runtime = await Effect.runPromise(

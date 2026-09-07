@@ -1,10 +1,9 @@
 import { randomUUID } from "node:crypto";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Workstream paths are pure host paths and do not require an Effect service.
 import { resolve } from "node:path";
-import { DateTime, Effect, PlatformError, Semaphore } from "effect";
+import { DateTime, Effect, Semaphore } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { runNodePlatformPromise } from "./node-platform.js";
 import { EvidenceSchema } from "./report-schema.js";
 import {
   AtomicWorkstreamFile,
@@ -348,10 +347,6 @@ export class WorkstreamStoreEffects {
           });
         }, input.now),
     );
-  }
-
-  assign(input: AssignmentInput & { now?: Date }): StoreEffect<WorkstreamState> {
-    return this.update((draft, now) => addAssignment(draft, input, now), input.now);
   }
 
   enqueue(
@@ -957,45 +952,6 @@ export class WorkstreamStoreEffects {
     );
   }
 
-  acknowledge(resultId: string, acknowledgment: string, now?: Date): StoreEffect<WorkstreamState> {
-    return this.update(
-      (draft, current) => {
-        requireText(acknowledgment, "Acknowledgment");
-        const delivery = draft.deliveries.find((candidate) => candidate.resultId === resultId);
-        if (!delivery) throw new Error(`Unknown delivery ${resultId}.`);
-        if (delivery.state === "acknowledged") return;
-        // Explicit receipt also covers evidence read through status after an uncertain notification.
-        // Do not invent deliveredAt: notification transport and coordinator receipt are different facts.
-        delivery.state = "acknowledged";
-        delete delivery.error;
-        delivery.acknowledgedAt = (now ?? current).toISOString();
-        delivery.acknowledgment = acknowledgment.trim();
-      },
-      now,
-      ["active", "suspended"],
-    );
-  }
-
-  disposition(input: {
-    resultId: string;
-    status: ResultDisposition["status"];
-    reason: string;
-    now?: Date;
-  }): StoreEffect<WorkstreamState> {
-    return this.update((draft, now) => {
-      requireText(input.reason, "Disposition reason");
-      requireActive(draft);
-      if (!draft.results.some((result) => result.id === input.resultId))
-        throw new Error(`Unknown result ${input.resultId}.`);
-      draft.dispositions.push({
-        resultId: input.resultId,
-        status: input.status,
-        reason: input.reason.trim(),
-        recordedAt: (input.now ?? now).toISOString(),
-      });
-    }, input.now);
-  }
-
   complete(input: {
     conclusion: string;
     evidence: Static<typeof EvidenceSchema>[];
@@ -1127,119 +1083,6 @@ export class WorkstreamStoreEffects {
   private write(state: WorkstreamState): StoreEffect<void> {
     return this.file.writeState(state);
   }
-}
-
-type EffectOperationKeys = {
-  [Key in keyof WorkstreamStoreEffects]: WorkstreamStoreEffects[Key] extends (
-    ...args: never[]
-  ) => StoreEffect<unknown>
-    ? Key
-    : never;
-}[keyof WorkstreamStoreEffects];
-
-type PromiseOperation<Operation> = Operation extends (
-  ...args: infer Args
-) => Effect.Effect<infer Success, infer _Error, infer _Requirements>
-  ? (...args: Args) => Promise<Success>
-  : never;
-
-type WorkstreamPromiseOperations = {
-  [Key in EffectOperationKeys]: PromiseOperation<WorkstreamStoreEffects[Key]>;
-};
-
-export type WorkstreamStore = WorkstreamPromiseOperations &
-  Pick<
-    WorkstreamStoreEffects,
-    "path" | "bindMutationGuard" | "isAssignmentCurrent" | "isResultCurrent"
-  > & {
-    /** Primary typed store port. Promise methods on this facade are temporary outward adapters. */
-    readonly effects: WorkstreamStoreEffects;
-  };
-
-type CreateInput = Parameters<typeof WorkstreamStoreEffects.create>[0];
-
-interface WorkstreamStoreStatic {
-  pathFor(gitCommonDir: string, id: string): string;
-  create(input: CreateInput): Promise<{ store: WorkstreamStore; state: WorkstreamState }>;
-  open(path: string, owner: SessionIdentity): WorkstreamStore;
-  inspect(path: string): Promise<WorkstreamState>;
-  inspectForReattachment(path: string): Promise<WorkstreamReattachmentInspection>;
-}
-
-export const WorkstreamStore: WorkstreamStoreStatic = {
-  pathFor: (gitCommonDir, id) => WorkstreamStoreEffects.pathFor(gitCommonDir, id),
-  create: (input) =>
-    runStorePromise(WorkstreamStoreEffects.create(input)).then(({ store, state }) => ({
-      store: promiseFacade(store),
-      state,
-    })),
-  open: (path, owner) => promiseFacade(WorkstreamStoreEffects.open(path, owner)),
-  inspect: (path) => runStorePromise(WorkstreamStoreEffects.inspect(path)),
-  inspectForReattachment: (path) =>
-    runStorePromise(WorkstreamStoreEffects.inspectForReattachment(path)),
-};
-
-function promiseFacade(effects: WorkstreamStoreEffects): WorkstreamStore {
-  return {
-    effects,
-    path: effects.path,
-    bindMutationGuard: (guard) => effects.bindMutationGuard(guard),
-    isAssignmentCurrent: (state, assignmentId) => effects.isAssignmentCurrent(state, assignmentId),
-    isResultCurrent: (state, resultId) => effects.isResultCurrent(state, resultId),
-    adopt: promiseOperation((...args) => effects.adopt(...args)),
-    load: promiseOperation((...args) => effects.load(...args)),
-    recordInputEvent: promiseOperation((...args) => effects.recordInputEvent(...args)),
-    setLifecycle: promiseOperation((...args) => effects.setLifecycle(...args)),
-    reviseIntent: promiseOperation((...args) => effects.reviseIntent(...args)),
-    assign: promiseOperation((...args) => effects.assign(...args)),
-    enqueue: promiseOperation((...args) => effects.enqueue(...args)),
-    retainResult: promiseOperation((...args) => effects.retainResult(...args)),
-    startAttempt: promiseOperation((...args) => effects.startAttempt(...args)),
-    recordSessionFile: promiseOperation((...args) => effects.recordSessionFile(...args)),
-    recordLaunchPane: promiseOperation((...args) => effects.recordLaunchPane(...args)),
-    recordResource: promiseOperation((...args) => effects.recordResource(...args)),
-    recordWorker: promiseOperation((...args) => effects.recordWorker(...args)),
-    markSubmission: promiseOperation((...args) => effects.markSubmission(...args)),
-    settleAttempt: promiseOperation((...args) => effects.settleAttempt(...args)),
-    recordAttention: promiseOperation((...args) => effects.recordAttention(...args)),
-    clearAttention: promiseOperation((...args) => effects.clearAttention(...args)),
-    beginApplication: promiseOperation((...args) => effects.beginApplication(...args)),
-    finishApplication: promiseOperation((...args) => effects.finishApplication(...args)),
-    blockApplication: promiseOperation((...args) => effects.blockApplication(...args)),
-    beginCleanup: promiseOperation((...args) => effects.beginCleanup(...args)),
-    markWorkerClosed: promiseOperation((...args) => effects.markWorkerClosed(...args)),
-    finishCleanup: promiseOperation((...args) => effects.finishCleanup(...args)),
-    blockCleanup: promiseOperation((...args) => effects.blockCleanup(...args)),
-    beginOutputRelease: promiseOperation((...args) => effects.beginOutputRelease(...args)),
-    finishOutputRelease: promiseOperation((...args) => effects.finishOutputRelease(...args)),
-    blockOutputRelease: promiseOperation((...args) => effects.blockOutputRelease(...args)),
-    recordSteering: promiseOperation((...args) => effects.recordSteering(...args)),
-    cancelAttempt: promiseOperation((...args) => effects.cancelAttempt(...args)),
-    requestDelivery: promiseOperation((...args) => effects.requestDelivery(...args)),
-    deliveryAttempt: promiseOperation((...args) => effects.deliveryAttempt(...args)),
-    addResultArtifacts: promiseOperation((...args) => effects.addResultArtifacts(...args)),
-    markDelivered: promiseOperation((...args) => effects.markDelivered(...args)),
-    acknowledge: promiseOperation((...args) => effects.acknowledge(...args)),
-    disposition: promiseOperation((...args) => effects.disposition(...args)),
-    complete: promiseOperation((...args) => effects.complete(...args)),
-  };
-}
-
-function promiseOperation<Args extends readonly unknown[], Success>(
-  operation: (...args: Args) => StoreEffect<Success>,
-): (...args: Args) => Promise<Success> {
-  return (...args) => runStorePromise(operation(...args));
-}
-
-function runStorePromise<A>(operation: StoreEffect<A>): Promise<A> {
-  return runNodePlatformPromise(operation).catch((failure) => {
-    if (failure instanceof WorkstreamStoreOperationError) {
-      if (failure.cause instanceof PlatformError.PlatformError && "cause" in failure.cause.reason)
-        throw failure.cause.reason.cause;
-      throw failure.cause;
-    }
-    throw failure;
-  });
 }
 
 function inspectReattachmentValue(

@@ -14,7 +14,7 @@ import {
 import { Clock, Effect } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { runProcess } from "../src/git.js";
+import { processEffect } from "../src/process.js";
 import type { WorkerReport } from "../src/types.js";
 import { WorkstreamStateSchema } from "../src/workstream.js";
 
@@ -43,10 +43,12 @@ export function researchReport(summary = "Evidence found."): WorkerReport {
 
 // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 export async function git(cwd: string, ...args: string[]): Promise<string> {
-  const result = await runProcess("git", ["-C", cwd, ...args], {
-    cwd,
-    timeoutMs: 30_000,
-  });
+  const result = await Effect.runPromise(
+    processEffect("git", ["-C", cwd, ...args], {
+      cwd,
+      timeoutMs: 30_000,
+    }),
+  );
   assert.equal(result.exitCode, 0, result.stderr);
   return result.stdout.trim();
 }

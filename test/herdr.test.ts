@@ -19,11 +19,12 @@ import {
   herdrWorkerTabLabel,
   legacyHerdrAgentName,
   legacyObjectiveHerdrWorkerName,
-  PromiseCheckpointError,
   WorkerLaunchError,
   WorkerLaunchPlacementError,
 } from "../src/herdr.js";
 import type { WorkerIdentity, WorkerResourceIdentity } from "../src/types.js";
+
+const runEffect = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
 
 await test("worker tabs use concise task text while native names remain unique and role-specific", () => {
   const request = {
@@ -115,13 +116,13 @@ await test("Herdr identity validation rejects missing and mismatched native sess
     const missingSession = structuredClone(valid) as Partial<typeof valid>;
     delete missingSession.agent_session;
     await writeFile(responsePath, JSON.stringify(missingSession));
-    await assert.rejects(() => runtime.observe(identity), /agent_session/);
+    await assert.rejects(() => runEffect(runtime.effects.observe(identity)), /agent_session/);
 
     // SAFETY: The fixture line is JSON.parse output and the surrounding test validates its command-record shape.
     const missingCwd = structuredClone(valid) as Partial<typeof valid>;
     delete missingCwd.cwd;
     await writeFile(responsePath, JSON.stringify(missingCwd));
-    await assert.rejects(() => runtime.observe(identity), /cwd/);
+    await assert.rejects(() => runEffect(runtime.effects.observe(identity)), /cwd/);
 
     await writeFile(
       responsePath,
@@ -130,13 +131,16 @@ await test("Herdr identity validation rejects missing and mismatched native sess
         agent_session: { value: join(parent, "other.jsonl") },
       }),
     );
-    await assert.rejects(() => runtime.observe(identity), /native Pi session changed/);
+    await assert.rejects(
+      () => runEffect(runtime.effects.observe(identity)),
+      /native Pi session changed/,
+    );
 
     await writeFile(
       responsePath,
       JSON.stringify({ ...valid, cwd: join(parent, "other-worktree") }),
     );
-    await assert.rejects(() => runtime.observe(identity), /worker cwd changed/);
+    await assert.rejects(() => runEffect(runtime.effects.observe(identity)), /worker cwd changed/);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -166,15 +170,18 @@ await test("current-session coordinator observation accepts an unnamed detected 
       HERDR_ENV: "1",
       HERDR_WORKSPACE_ID: "workspace-1",
     });
-    const coordinator = await runtime.observeCurrentCoordinator({
-      paneId: agent.pane_id,
-      sessionFile,
-      cwd,
-    });
+    const coordinator = await runEffect(
+      runtime.effects.observeCurrentCoordinator({
+        paneId: agent.pane_id,
+        sessionFile,
+        cwd,
+      }),
+    );
     assert.equal(coordinator.agentName, undefined);
     assert.equal(coordinator.sessionFile, sessionFile);
     await assert.rejects(
-      () => runtime.observe({ ...coordinator, agentName: "required-worker-name" }),
+      () =>
+        runEffect(runtime.effects.observe({ ...coordinator, agentName: "required-worker-name" })),
       /omitted string name/,
     );
   } finally {
@@ -230,7 +237,7 @@ await test("exact worker recover succeeds despite unrelated unnamed snapshot ent
   };
   try {
     await writeFile(responsePath, JSON.stringify([unrelatedUnnamed, exactWorker]));
-    const recovered = await runtime.recover(request);
+    const recovered = await runEffect(runtime.effects.recover(request));
     assert.deepEqual(recovered?.identity, identity);
     assert.equal(recovered?.status, "working");
 
@@ -238,17 +245,20 @@ await test("exact worker recover succeeds despite unrelated unnamed snapshot ent
       responsePath,
       JSON.stringify([unrelatedUnnamed, { ...exactWorker, name: "foreign-worker" }]),
     );
-    assert.equal(await runtime.recover(request), undefined);
+    assert.equal(await runEffect(runtime.effects.recover(request)), undefined);
 
     await writeFile(responsePath, JSON.stringify([]));
-    assert.equal(await runtime.recover({ ...request, resource: identity }), undefined);
+    assert.equal(
+      await runEffect(runtime.effects.recover({ ...request, resource: identity })),
+      undefined,
+    );
 
     // SAFETY: This mutable partial fixture intentionally removes native session evidence.
     const noNativeIdentity = structuredClone(exactWorker) as Partial<typeof exactWorker>;
     delete noNativeIdentity.agent_session;
     await writeFile(responsePath, JSON.stringify([unrelatedUnnamed, noNativeIdentity]));
     await assert.rejects(
-      () => runtime.recover({ ...request, resource: identity }),
+      () => runEffect(runtime.effects.recover({ ...request, resource: identity })),
       /still has no native Pi session identity/,
     );
 
@@ -256,7 +266,10 @@ await test("exact worker recover succeeds despite unrelated unnamed snapshot ent
     const malformedWorker = structuredClone(exactWorker) as Partial<typeof exactWorker>;
     delete malformedWorker.terminal_id;
     await writeFile(responsePath, JSON.stringify([unrelatedUnnamed, malformedWorker]));
-    await assert.rejects(() => runtime.recover(request), /snapshot response omitted valid agents/);
+    await assert.rejects(
+      () => runEffect(runtime.effects.recover(request)),
+      /snapshot response omitted valid agents/,
+    );
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -299,7 +312,7 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       PI_WORKGRAPH_EXECUTOR_MODEL: "private-model",
       PI_WORKGRAPH_EXECUTOR_THINKING: "high",
     });
-    const identity = await runtime.launchCoordinator({ cwd, sessionFile });
+    const identity = await runEffect(runtime.effects.launchCoordinator({ cwd, sessionFile }));
     assert.deepEqual(identity, {
       workspaceId: "child-workspace",
       tabId: "child-workspace:tab-1",
@@ -369,7 +382,7 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       HERDR_WORKSPACE_ID: "parent-workspace",
     });
     await assert.rejects(
-      () => runtime.launchCoordinator({ cwd, sessionFile }),
+      () => runEffect(runtime.effects.launchCoordinator({ cwd, sessionFile })),
       (error) => {
         assert.ok(error instanceof CoordinatorLaunchError);
         const resource = error.resource;
@@ -428,14 +441,14 @@ await test("cleanup rejects mismatched cwd, verifies exact tab absence and toler
       HERDR_WORKSPACE_ID: identity.workspaceId,
     });
     await assert.rejects(
-      () => runtime.cleanup({ ...identity, cwd: `${cwd}-different` }),
+      () => runEffect(runtime.effects.cleanup({ ...identity, cwd: `${cwd}-different` })),
       /worker cwd changed/,
     );
-    const result = await runtime.cleanup(identity);
+    const result = await runEffect(runtime.effects.cleanup(identity));
     assert.equal(result.state, "completed");
     assert.match(result.detail, /Closed and verified exact Herdr tab/);
     assert.equal(existsSync(closed), true);
-    assert.equal((await runtime.cleanup(identity)).state, "completed");
+    assert.equal((await runEffect(runtime.effects.cleanup(identity))).state, "completed");
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -478,27 +491,29 @@ await test("the Herdr adapter launches without waiting and validates exact ident
     });
     let retained: WorkerIdentity | undefined;
     const callbackSequence: string[] = [];
-    const observation = await runtime.launch({
-      workspaceId: "workspace-1",
-      ...naming,
-      cwd,
-      sessionFile,
-      prompt: "Continue now.",
-      env: { PI_WORKGRAPH_MODE: "implementation" },
-      onTab(tab) {
-        callbackSequence.push(`tab:${tab.paneId}`);
-      },
-      onResource(resource) {
-        callbackSequence.push(`resource:${resource.terminalId}`);
-      },
-      onIdentity(identity) {
-        retained = identity;
-        callbackSequence.push(`identity:${identity.sessionFile}`);
-      },
-      onSubmitted() {
-        callbackSequence.push("submitted");
-      },
-    });
+    const observation = await runEffect(
+      runtime.effects.launch({
+        workspaceId: "workspace-1",
+        ...naming,
+        cwd,
+        sessionFile,
+        prompt: "Continue now.",
+        env: { PI_WORKGRAPH_MODE: "implementation" },
+        onTab: (tab) =>
+          Effect.sync(() => callbackSequence.push(`tab:${tab.paneId}`)).pipe(Effect.asVoid),
+        onResource: (resource) =>
+          Effect.sync(() => callbackSequence.push(`resource:${resource.terminalId}`)).pipe(
+            Effect.asVoid,
+          ),
+        onIdentity: (identity) =>
+          Effect.sync(() => {
+            retained = identity;
+            callbackSequence.push(`identity:${identity.sessionFile}`);
+          }).pipe(Effect.asVoid),
+        onSubmitted: () =>
+          Effect.sync(() => callbackSequence.push("submitted")).pipe(Effect.asVoid),
+      }),
+    );
     assert.deepEqual(retained, observation.identity);
     assert.equal(observation.identity.workspaceId, "workspace-1");
     assert.equal(observation.identity.paneId, "workspace-1:pane-1");
@@ -509,24 +524,26 @@ await test("the Herdr adapter launches without waiting and validates exact ident
       `identity:${sessionFile}`,
       "submitted",
     ]);
-    const recovered = await runtime.recover({
-      workspaceId: "workspace-1",
-      agentName: herdrWorkerName({
-        runId: "run",
-        nodeId: "node",
-        attemptId: "attempt",
-        assignmentId: "assignment",
-        objective: "Inspect the node",
-        role: "research",
+    const recovered = await runEffect(
+      runtime.effects.recover({
+        workspaceId: "workspace-1",
+        agentName: herdrWorkerName({
+          runId: "run",
+          nodeId: "node",
+          attemptId: "attempt",
+          assignmentId: "assignment",
+          objective: "Inspect the node",
+          role: "research",
+        }),
+        compatibleAgentNames: [observation.identity.agentName],
+        sessionFile,
+        cwd,
       }),
-      compatibleAgentNames: [observation.identity.agentName],
-      sessionFile,
-      cwd,
-    });
+    );
     assert.deepEqual(recovered?.identity, observation.identity);
     assert.equal(recovered?.status, "working");
-    await runtime.interrupt(observation.identity);
-    const pendingCleanup = await runtime.cleanup(observation.identity);
+    await runEffect(runtime.effects.interrupt(observation.identity));
+    const pendingCleanup = await runEffect(runtime.effects.cleanup(observation.identity));
     assert.equal(pendingCleanup.state, "pending");
     // SAFETY: Each fixture process writes only JSON-encoded string argument arrays to this private log.
     const calls = (await readFile(log, "utf8"))
@@ -590,21 +607,25 @@ else console.log(JSON.stringify({result:{accepted:true}}));
     });
     let retainedResource: WorkerResourceIdentity | undefined;
     let retainedIdentity: WorkerIdentity | undefined;
-    const observation = await runtime.launch({
-      workspaceId: "workspace-1",
-      runId: "run",
-      nodeId: "node",
-      attemptId: "attempt",
-      cwd,
-      sessionFile,
-      env: {},
-      onResource(resourceValue) {
-        retainedResource = resourceValue;
-      },
-      onIdentity(identity) {
-        retainedIdentity = identity;
-      },
-    });
+    const observation = await runEffect(
+      runtime.effects.launch({
+        workspaceId: "workspace-1",
+        runId: "run",
+        nodeId: "node",
+        attemptId: "attempt",
+        cwd,
+        sessionFile,
+        env: {},
+        onResource: (resourceValue) =>
+          Effect.sync(() => {
+            retainedResource = resourceValue;
+          }).pipe(Effect.asVoid),
+        onIdentity: (identity) =>
+          Effect.sync(() => {
+            retainedIdentity = identity;
+          }).pipe(Effect.asVoid),
+      }),
+    );
     assert.deepEqual(retainedResource, {
       workspaceId: "workspace-1",
       tabId: "workspace-1:tab-1",
@@ -664,19 +685,22 @@ else console.log(JSON.stringify({result:{accepted:true}}));
     let retainedResource: WorkerResourceIdentity | undefined;
     await assert.rejects(
       () =>
-        runtime.launch({
-          workspaceId: "workspace-1",
-          runId: "run",
-          nodeId: "node",
-          attemptId: "attempt",
-          cwd,
-          sessionFile,
-          prompt: "Do not submit.",
-          env: {},
-          onResource(resource) {
-            retainedResource = resource;
-          },
-        }),
+        runEffect(
+          runtime.effects.launch({
+            workspaceId: "workspace-1",
+            runId: "run",
+            nodeId: "node",
+            attemptId: "attempt",
+            cwd,
+            sessionFile,
+            prompt: "Do not submit.",
+            env: {},
+            onResource: (resource) =>
+              Effect.sync(() => {
+                retainedResource = resource;
+              }).pipe(Effect.asVoid),
+          }),
+        ),
       /operator action is required/,
     );
     assert.deepEqual(retainedResource, {
@@ -751,39 +775,43 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       HERDR_WORKSPACE_ID: request.workspaceId,
     });
     await writeFile(modePath, "live");
-    const live = await runtime.inspectLaunch(request);
+    const live = await runEffect(runtime.effects.inspectLaunch(request));
     assert.equal(live.state, "live");
     if (live.state === "live") {
       assert.equal(live.identity.agentName, agentName);
       assert.equal(live.evidence.process.state, "observed");
     }
-    const launchPaneOnly = await runtime.inspectLaunch({
-      workspaceId: request.workspaceId,
-      paneId: request.paneId,
-      sessionFile: request.sessionFile,
-      cwd: request.cwd,
-    });
+    const launchPaneOnly = await runEffect(
+      runtime.effects.inspectLaunch({
+        workspaceId: request.workspaceId,
+        paneId: request.paneId,
+        sessionFile: request.sessionFile,
+        cwd: request.cwd,
+      }),
+    );
     assert.equal(launchPaneOnly.state, "live");
     if (launchPaneOnly.state === "live") {
       assert.equal(launchPaneOnly.identity.tabId, request.tabId);
       assert.equal(launchPaneOnly.identity.terminalId, request.terminalId);
     }
     await writeFile(modePath, "process-unknown");
-    const liveWithoutProcessEvidence = await runtime.inspectLaunch(request);
+    const liveWithoutProcessEvidence = await runEffect(runtime.effects.inspectLaunch(request));
     assert.equal(liveWithoutProcessEvidence.state, "live");
     assert.equal(liveWithoutProcessEvidence.evidence.process.state, "unknown");
     await writeFile(modePath, "agent-absent");
-    const paneWithoutAgent = await runtime.inspectLaunch(request);
+    const paneWithoutAgent = await runEffect(runtime.effects.inspectLaunch(request));
     assert.equal(paneWithoutAgent.state, "unknown");
     assert.equal(paneWithoutAgent.evidence.process.state, "observed");
     assert.equal(paneWithoutAgent.evidence.agent.state, "absent");
     assert.match(paneWithoutAgent.detail, /no relaunch or cleanup is authorized/);
     await writeFile(modePath, "absent");
-    const absent = await runtime.inspectLaunch(request);
+    const absent = await runEffect(runtime.effects.inspectLaunch(request));
     assert.equal(absent.state, "absent");
     assert.match(absent.detail, /pane .* absent/);
     await writeFile(modePath, "live");
-    const mismatch = await runtime.inspectLaunch({ ...request, cwd: `${cwd}-expected` });
+    const mismatch = await runEffect(
+      runtime.effects.inspectLaunch({ ...request, cwd: `${cwd}-expected` }),
+    );
     assert.equal(mismatch.state, "unknown");
     assert.match(mismatch.detail, /does not match/);
     assert.match(JSON.stringify(mismatch.evidence), /workspace-1/);
@@ -985,19 +1013,22 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   try {
     await assert.rejects(
       () =>
-        runtime.launch({
-          workspaceId: "workspace-1",
-          runId: "run",
-          nodeId: "node",
-          attemptId: "attempt",
-          cwd,
-          sessionFile: join(parent, "worker.jsonl"),
-          prompt: "must not be sent",
-          env: {},
-          onResource() {
-            adopted = true;
-          },
-        }),
+        runEffect(
+          runtime.effects.launch({
+            workspaceId: "workspace-1",
+            runId: "run",
+            nodeId: "node",
+            attemptId: "attempt",
+            cwd,
+            sessionFile: join(parent, "worker.jsonl"),
+            prompt: "must not be sent",
+            env: {},
+            onResource: () =>
+              Effect.sync(() => {
+                adopted = true;
+              }).pipe(Effect.asVoid),
+          }),
+        ),
       (error) => {
         assert.ok(error instanceof HerdrProtocolError);
         assert.equal(error.reason, "identity");
@@ -1050,18 +1081,25 @@ console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-created
   try {
     await assert.rejects(
       () =>
-        runtime.launch({
-          workspaceId: "workspace-1",
-          runId: "run",
-          nodeId: "node",
-          attemptId: "attempt",
-          cwd: parent,
-          sessionFile: join(parent, "worker.jsonl"),
-          env: {},
-          onTab() {
-            throw new Error("durable pane write failed");
-          },
-        }),
+        runEffect(
+          runtime.effects.launch({
+            workspaceId: "workspace-1",
+            runId: "run",
+            nodeId: "node",
+            attemptId: "attempt",
+            cwd: parent,
+            sessionFile: join(parent, "worker.jsonl"),
+            env: {},
+            onTab: () =>
+              Effect.fail(
+                new HerdrProtocolError({
+                  operation: "fixture onTab",
+                  reason: "process",
+                  detail: "durable pane write failed",
+                }),
+              ),
+          }),
+        ),
       (error) => {
         assert.ok(error instanceof WorkerLaunchError);
         assert.equal(error.phase, "onTab");
@@ -1070,8 +1108,8 @@ console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-created
           paneId: "workspace-1:pane-created",
         });
         assert.equal(error.resource, undefined);
-        assert.ok(error.cause instanceof PromiseCheckpointError);
-        assert.match(String(error.cause.cause), /durable pane write failed/);
+        assert.ok(error.cause instanceof Error);
+        assert.match(error.cause.message, /durable pane write failed/);
         return true;
       },
     );

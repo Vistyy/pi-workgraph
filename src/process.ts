@@ -20,7 +20,6 @@ export interface ProcessOptions {
   readonly cwd?: string;
   readonly timeoutMs: number;
   readonly env?: NodeJS.ProcessEnv;
-  readonly signal?: AbortSignal;
   readonly digestStdout?: boolean;
   /** External JSON protocols can opt out; Git diagnostics use the 50 KiB default. */
   readonly outputLimit?: number | false;
@@ -68,11 +67,11 @@ interface OwnedProcess {
   spawnError: Error | undefined;
 }
 
-/** Effect-native process boundary; callers may use the Promise adapter below during migration. */
+/** Owns each child through completion, timeout, or Effect interruption. */
 export function processEffect(
   command: string,
   args: readonly string[],
-  options: Omit<ProcessOptions, "signal">,
+  options: ProcessOptions,
 ): Effect.Effect<ProcessResult, ProcessExecutionError> {
   const outputLimit = resolveOutputLimit(options.outputLimit);
   const processError = (cause: unknown): ProcessExecutionError =>
@@ -120,24 +119,10 @@ export function processEffect(
   );
 }
 
-/** Temporary outward adapter for Git and Herdr callers that still expose Promises. */
-export function runProcess(
-  command: string,
-  args: string[],
-  options: ProcessOptions,
-): Promise<ProcessResult> {
-  if (options.signal?.aborted === true) {
-    return Effect.runPromise(Effect.interrupt);
-  }
-  return Effect.runPromise(processEffect(command, args, options), {
-    signal: options.signal,
-  });
-}
-
 function acquireProcess(
   command: string,
   args: readonly string[],
-  options: Omit<ProcessOptions, "signal">,
+  options: ProcessOptions,
   outputLimit: number | undefined,
   completion: Deferred.Deferred<ProcessClose>,
 ): OwnedProcess {

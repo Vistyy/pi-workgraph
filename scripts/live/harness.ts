@@ -18,9 +18,10 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Clock, Config, ConfigProvider, Effect, Option } from "effect";
 import { type StaticDecode, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
-import { runProcess } from "../../src/git.js";
+import { liveLayer } from "../../src/node-platform.js";
+import { processEffect } from "../../src/process.js";
 import type { WorkerIdentity } from "../../src/types.js";
-import { type WorkstreamState, WorkstreamStore } from "../../src/workstream.js";
+import { type WorkstreamState, WorkstreamStoreEffects } from "../../src/workstream.js";
 
 const LiveEnvironmentConfig = Config.all({
   herdrEnvironment: Config.string("HERDR_ENV").pipe(Config.withDefault("")),
@@ -43,7 +44,7 @@ export function command(
 ): Promise<string> {
   return Effect.runPromise(
     Effect.gen(function* () {
-      const result = yield* Effect.promise(() => runProcess(executable, args, { cwd, timeoutMs }));
+      const result = yield* processEffect(executable, args, { cwd, timeoutMs });
       if (result.exitCode !== 0)
         throw new Error(
           `${executable} ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
@@ -423,7 +424,12 @@ function projectWorkstreamState(state: WorkstreamState) {
 async function inspectRetainedStateFile(directory: string, name: string) {
   try {
     return projectWorkstreamState(
-      await WorkstreamStore.inspect(join(directory, name, "workstream.json")),
+      await Effect.runPromise(
+        Effect.provide(
+          WorkstreamStoreEffects.inspect(join(directory, name, "workstream.json")),
+          liveLayer,
+        ),
+      ),
     );
   } catch (error) {
     return { name, diagnostic: error instanceof Error ? error.message : String(error) };

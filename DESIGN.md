@@ -17,7 +17,7 @@ The human request is the source of authority, and the coordinating agent decides
 Delegated research, experiments, implementation, review, and integration are capabilities, not mandatory phases or an approval pipeline.
 Mechanical receipts, validation, and settlement must not manufacture authority or replace human judgment.
 
-Coordinator pending items are session-owned compact id/text reminders for future coordination, persisted independently of WorkstreamStore and injected only as a cache-friendly hidden snapshot when needed.
+Coordinator pending items are session-owned compact id/text reminders for future coordination, persisted independently of WorkstreamStoreEffects and injected only as a cache-friendly hidden snapshot when needed.
 The coordinator-only notepad exposes read, add, update, and remove; removing a mistaken item is ordinary editing, with no receipt, presentation, acknowledgment, auto-expiry, or authority semantics.
 Pending items do not replace genuine human input receipts, Workstream delivery acknowledgment, evidence disposition, or intent authority, and never block workstream completion.
 Legacy response-note snapshots migrate only their currently pending substance into the notepad; presentation, draft, resolution, and supersession ledger metadata are not continued.
@@ -58,7 +58,7 @@ Recovery should inspect authoritative state before retrying and should retain co
 A stopped worker closes independently of whether its report is successful, malformed, or failed and independently of whether its owned output remains useful.
 A disposable experiment and an unapplied implementation retain their complete owned isolated worktree; report settlement never mutates the destination repository.
 The coordinator may apply current maintained output only through one explicit action carrying the exact attempt, reported source commit, and freshly observed destination HEAD. Existing Git cleanliness, direct-commit, ownership, and current-intent checks remain authoritative; the recorded application revision is an observed postcondition, not an approval ledger.
-The coordinator releases unselected retained output through one exact-attempt operation with a recorded destructive reason. Cancellation itself releases disposable experiment output after worker closure. Intentionally retained output may outlive semantic coordination completion and remains releasable under the same serialized, fenced runtime without launching or resuming work.
+The coordinator releases unselected retained output through one exact-attempt operation with a recorded destructive reason. Cancellation closes the worker but preserves disposable experiment output until the coordinator explicitly releases it. Intentionally retained output may outlive semantic coordination completion and remains releasable under the same serialized, fenced runtime without launching or resuming work.
 Release may remove only the verified owned worktree and branch; foreign, dirty-mismatched, unknown-presence, or uncertain resources remain intact with useful diagnostics.
 
 Exceptional application or output-release state is evidence to inspect, not a specialized automatic repair pipeline.
@@ -72,7 +72,7 @@ Its acquisition is eager and returns only after the lease-backed handle is ready
 An Effect semaphore serializes mutations, caller interruption cancels queued or running coordinator operations through ordinary fiber interruption, and a scoped FiberSet interrupts and joins owned operations before lease release.
 Owned-worker cancellation is a separate durable boundary: it records the cancellation request, interrupts a retained worker when possible, and settles without a report only after cleanup verifies idle-worker closure or exact external absence; unknown presence remains blocked.
 One idempotent close boundary handles explicit shutdown and fatal lease loss; custom request queues, request settlement signals, and separate ready/start/fatal lifecycle channels are unnecessary because the Effect primitives already provide those guarantees.
-The process adapter owns each child from acquisition through timeout, interruption, and release, with a Promise adapter only at host-facing boundaries.
+The Effect-native process owner owns each child from acquisition through timeout, interruption, and release; host-facing boundaries are the only places that convert it to a Promise.
 The workstream store owns serialized atomic state-file mutation, while the registry owns only the durable index and fenced lease records.
 These boundaries keep resource lifetime and persistence responsibility with the component that can verify their postconditions.
 

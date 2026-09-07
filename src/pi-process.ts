@@ -3,7 +3,6 @@ import { Data, Effect, FileSystem } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { runNodePlatformPromise } from "./node-platform.js";
 import { isWorkerReport } from "./report-schema.js";
 import type { WorkerMode, WorkerReport } from "./types.js";
 
@@ -71,11 +70,6 @@ export function forkConversationSessionEffect(
       });
     return file;
   });
-}
-
-/** Promise facade for current Pi host callers. */
-export function forkConversationSession(request: ForkConversationRequest): Promise<string> {
-  return runNodePlatformPromise(forkConversationSessionEffect(request));
 }
 
 type CreateWorkerRequest = Generation & {
@@ -150,11 +144,6 @@ export function createWorkerSessionEffect(
       });
     return file;
   });
-}
-
-/** Promise facade for current Pi host callers. */
-export function createWorkerSession(request: CreateWorkerRequest): Promise<string> {
-  return runNodePlatformPromise(createWorkerSessionEffect(request));
 }
 
 function nativeSession<A>(

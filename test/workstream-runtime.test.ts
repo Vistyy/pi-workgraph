@@ -7,38 +7,40 @@ import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Deferred, Effect } from "effect";
 import { TestClock } from "effect/testing";
-import { GitRepository, runProcess } from "../src/git.js";
+import { openRepository } from "../src/git.js";
 import {
-  type HerdrInspection,
   type HerdrObservation,
+  HerdrProtocolError,
   herdrAgentName,
-  type VisibleWorkerRuntime,
-  type WorkerLaunchRequest,
-  type WorkerRecoveryRequest,
+  type WorkerLaunchEffectRequest,
+  WorkerLaunchError,
 } from "../src/herdr.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
+import { processEffect } from "../src/process.js";
 import { type Lease, WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity, WorkerReport } from "../src/types.js";
-import { type WorkstreamState, WorkstreamStore } from "../src/workstream.js";
+import { type WorkstreamState, WorkstreamStoreEffects } from "../src/workstream.js";
 import {
   type RuntimeEffect,
   type RuntimeOwnership,
   WorkstreamRuntime,
 } from "../src/workstream-runtime.js";
+import type { RuntimeWorkerPort } from "../src/workstream-runtime-services.js";
 import { RuntimeHostError } from "../src/workstream-runtime-services.js";
 import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
 import { required } from "./decoders.js";
-import { promiseWorkerEffects } from "./runtime-worker-port.js";
 
 const FIXTURE_TIMESTAMP = 1_700_000_000_000;
 const FIXTURE_OBSERVED_AT = "2023-11-14T22:13:20.000Z";
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
-  const result = await runProcess("git", ["-C", cwd, ...args], {
-    cwd,
-    timeoutMs: 30_000,
-  });
+  const result = await Effect.runPromise(
+    processEffect("git", ["-C", cwd, ...args], {
+      cwd,
+      timeoutMs: 30_000,
+    }),
+  );
   assert.equal(result.exitCode, 0, result.stderr);
   return result.stdout.trim();
 }
@@ -49,8 +51,23 @@ type WorkerEnvironmentVariable =
   | "PI_WORKGRAPH_EXPERIMENT"
   | "PI_WORKGRAPH_MODE";
 
+type FixtureLaunchRequest = Pick<
+  WorkerLaunchEffectRequest,
+  | "runId"
+  | "nodeId"
+  | "attemptId"
+  | "assignmentId"
+  | "objective"
+  | "role"
+  | "cwd"
+  | "sessionFile"
+  | "prompt"
+  | "model"
+  | "env"
+>;
+
 function workerEnvironment(
-  request: WorkerLaunchRequest,
+  request: FixtureLaunchRequest,
   variable: WorkerEnvironmentVariable,
 ): string {
   return required(request.env[variable], `${variable} environment variable`);
@@ -76,11 +93,31 @@ const researchReport: WorkerReport = {
   findings: [],
 };
 
-class Worker implements VisibleWorkerRuntime {
+function fixtureCheckpoint<E, R, A>(
+  phase: WorkerLaunchError<E>["phase"],
+  checkpoint: ((value: A) => Effect.Effect<void, E, R>) | undefined,
+  value: A,
+  locator: WorkerLaunchError<E>["locator"],
+): Effect.Effect<void, WorkerLaunchError<E>, R> {
+  if (checkpoint === undefined) return Effect.void;
+  return checkpoint(value).pipe(
+    Effect.mapError(
+      (cause) =>
+        new WorkerLaunchError({
+          phase,
+          locator,
+          resource: "terminalId" in locator ? locator : undefined,
+          cause,
+        }),
+    ),
+  );
+}
+
+class Worker {
   readonly available = true;
-  readonly effects = promiseWorkerEffects(this);
-  readonly requests: WorkerLaunchRequest[] = [];
+  readonly requests: FixtureLaunchRequest[] = [];
   readonly identities = new Map<string, WorkerIdentity>();
+  private readonly producers = new Map<string, () => Promise<void>>();
   promptCount = 0;
   cleanupCount = 0;
   interruptCount = 0;
@@ -90,11 +127,170 @@ class Worker implements VisibleWorkerRuntime {
   failBeforePane = false;
   failBeforeSubmission = false;
   failAfterSubmission = false;
-  onWork: (request: WorkerLaunchRequest) => Promise<WorkerReport | undefined> = async () =>
+  onWork: (request: FixtureLaunchRequest) => Promise<WorkerReport | undefined> = async () =>
     researchReport;
   onInspect: () => void = () => {};
+  readonly effects: RuntimeWorkerPort["effects"] = {
+    launch: <E, R>(request: WorkerLaunchEffectRequest<E, R>) =>
+      Effect.gen(
+        function* (this: Worker) {
+          const index = this.requests.length + 1;
+          this.requests.push(request);
+          const identity: WorkerIdentity = {
+            workspaceId: request.workspaceId,
+            tabId: `w1:t${index}`,
+            paneId: `w1:p${index}`,
+            terminalId: `term${index}`,
+            agentName: herdrAgentName(request.runId, request.nodeId, request.attemptId),
+            sessionFile: request.sessionFile,
+            cwd: request.cwd,
+          };
+          const resource = {
+            workspaceId: identity.workspaceId,
+            tabId: identity.tabId,
+            paneId: identity.paneId,
+            terminalId: identity.terminalId,
+            agentName: identity.agentName,
+            cwd: identity.cwd,
+          };
+          this.producers.set(request.sessionFile, () => this.produce(request));
+          if (this.failBeforePane)
+            return yield* new HerdrProtocolError({
+              operation: "launch fixture worker",
+              reason: "process",
+              detail: "fixture tab creation response interrupted",
+            });
+          const pane = { workspaceId: identity.workspaceId, paneId: identity.paneId };
+          yield* fixtureCheckpoint("onTab", request.onTab, pane, pane);
+          this.identities.set(identity.agentName, identity);
+          yield* fixtureCheckpoint("onResource", request.onResource, resource, resource);
+          if (this.failBeforeSubmission)
+            return yield* new HerdrProtocolError({
+              operation: "launch fixture worker",
+              reason: "process",
+              detail: "fixture readiness interruption",
+            });
+          yield* fixtureCheckpoint("onIdentity", request.onIdentity, identity, identity);
+          yield* this.deferWork ? Effect.void : this.produceEffect(request.sessionFile);
+          if (this.failAfterSubmission)
+            return yield* new HerdrProtocolError({
+              operation: "launch fixture worker",
+              reason: "process",
+              detail: "fixture uncertain prompt acknowledgment",
+            });
+          const onSubmitted = request.onSubmitted;
+          yield* fixtureCheckpoint(
+            "onSubmitted",
+            onSubmitted === undefined ? undefined : () => onSubmitted(),
+            undefined,
+            resource,
+          );
+          return { identity, status: "working" as const, observedAt: FIXTURE_OBSERVED_AT };
+        }.bind(this),
+      ),
+    recover: (request) => {
+      const names = new Set([request.agentName, ...(request.compatibleAgentNames ?? [])]);
+      const identity = [...this.identities.values()].find((item) => names.has(item.agentName));
+      return identity === undefined
+        ? Effect.as(Effect.void, undefined)
+        : this.effects.observe(identity);
+    },
+    inspectLaunch: () =>
+      Effect.fail(
+        new HerdrProtocolError({
+          operation: "inspect fixture launch",
+          reason: "process",
+          detail: "No launch inspection.",
+        }),
+      ),
+    inspect: (identity) =>
+      Effect.sync(() => {
+        this.onInspect();
+        return this.absent
+          ? {
+              identity,
+              status: "absent" as const,
+              observedAt: FIXTURE_OBSERVED_AT,
+              detail: "Exact fixture worker is absent.",
+            }
+          : this.observation(identity);
+      }),
+    observe: (identity) =>
+      this.absent
+        ? Effect.fail(
+            new HerdrProtocolError({
+              operation: "observe fixture worker",
+              reason: "process",
+              detail: "Exact fixture worker is absent.",
+            }),
+          )
+        : Effect.succeed(this.observation(identity)),
+    interrupt: (identity) =>
+      Effect.sync(() => {
+        this.interruptCount++;
+        return this.observation(identity);
+      }),
+    steer: (identity) => {
+      const produce = this.producers.get(identity.sessionFile);
+      if (produce === undefined)
+        return Effect.fail(
+          new HerdrProtocolError({
+            operation: "steer fixture worker",
+            reason: "process",
+            detail: "No fixture worker request exists for the identity.",
+          }),
+        );
+      return this.produceEffect(identity.sessionFile);
+    },
+    cleanup: (identity) =>
+      Effect.sync(() => {
+        this.cleanupCount++;
+        if (this.status === "working")
+          return {
+            state: "pending" as const,
+            identity,
+            observedAt: FIXTURE_OBSERVED_AT,
+            detail: "Fixture worker is still working.",
+          };
+        if (this.status === "blocked" || this.status === "unknown")
+          return {
+            state: "blocked" as const,
+            identity,
+            observedAt: FIXTURE_OBSERVED_AT,
+            detail: `Fixture worker is ${this.status}.`,
+          };
+        return {
+          state: "completed" as const,
+          identity,
+          observedAt: FIXTURE_OBSERVED_AT,
+          detail: this.absent ? "Exact fixture worker is absent." : "Exact fixture worker closed.",
+        };
+      }),
+  };
 
-  async produce(request: WorkerLaunchRequest): Promise<void> {
+  produceEffect(sessionFile: string): Effect.Effect<void, HerdrProtocolError> {
+    const produce = this.producers.get(sessionFile);
+    if (produce === undefined)
+      return Effect.fail(
+        new HerdrProtocolError({
+          operation: "produce fixture worker",
+          reason: "process",
+          detail: "No fixture worker request exists for the identity.",
+        }),
+      );
+    return Effect.tryPromise({
+      try: produce,
+      catch: (cause) =>
+        new HerdrProtocolError({
+          operation: "produce fixture worker",
+          reason: "process",
+          detail: cause instanceof Error ? cause.message : String(cause),
+          cause,
+        }),
+    });
+  }
+
+  private async produce<E, R>(request: WorkerLaunchEffectRequest<E, R>): Promise<void> {
     this.promptCount++;
     const session = SessionManager.open(request.sessionFile);
     session.appendCustomEntry("pi-workgraph-agent-running", {
@@ -127,95 +323,9 @@ class Worker implements VisibleWorkerRuntime {
       nodeId: request.nodeId,
     });
   }
-  async launch(request: WorkerLaunchRequest): Promise<HerdrObservation> {
-    this.requests.push(request);
-    const index = this.requests.length;
-    const identity = {
-      workspaceId: request.workspaceId,
-      tabId: `w1:t${index}`,
-      paneId: `w1:p${index}`,
-      terminalId: `term${index}`,
-      agentName: herdrAgentName(request.runId, request.nodeId, request.attemptId),
-      sessionFile: request.sessionFile,
-      cwd: request.cwd,
-    };
-    if (this.failBeforePane) throw new Error("fixture tab creation response interrupted");
-    await request.onTab?.({ workspaceId: identity.workspaceId, paneId: identity.paneId });
-    this.identities.set(identity.agentName, identity);
-    await request.onResource?.({
-      workspaceId: identity.workspaceId,
-      tabId: identity.tabId,
-      paneId: identity.paneId,
-      terminalId: identity.terminalId,
-      agentName: identity.agentName,
-      cwd: identity.cwd,
-    });
-    if (this.failBeforeSubmission) throw new Error("fixture readiness interruption");
-    await request.onIdentity?.(identity);
-    if (!this.deferWork) await this.produce(request);
-    if (this.failAfterSubmission) throw new Error("fixture uncertain prompt acknowledgment");
-    await request.onSubmitted?.();
-    return {
-      identity,
-      status: "working",
-      observedAt: FIXTURE_OBSERVED_AT,
-    };
-  }
-  async inspect(identity: WorkerIdentity): Promise<HerdrInspection> {
-    this.onInspect();
-    if (this.absent)
-      return {
-        identity,
-        status: "absent",
-        observedAt: FIXTURE_OBSERVED_AT,
-        detail: "Exact fixture worker is absent.",
-      };
-    return this.observe(identity);
-  }
-  async observe(identity: WorkerIdentity): Promise<HerdrObservation> {
-    if (this.absent) throw new Error("Exact fixture worker is absent.");
-    return {
-      identity,
-      status: this.status,
-      observedAt: FIXTURE_OBSERVED_AT,
-    };
-  }
-  async recover(request: WorkerRecoveryRequest): Promise<HerdrObservation | undefined> {
-    const names = new Set([request.agentName, ...(request.compatibleAgentNames ?? [])]);
-    const identity = [...this.identities.values()].find((item) => names.has(item.agentName));
-    return identity ? this.observe(identity) : undefined;
-  }
-  async steer(identity: WorkerIdentity, _instruction: string): Promise<void> {
-    const request = this.requests.find((item) => item.sessionFile === identity.sessionFile);
-    assert.ok(request);
-    await this.produce(request);
-  }
-  async interrupt(identity: WorkerIdentity): Promise<HerdrObservation> {
-    this.interruptCount++;
-    return this.observe(identity);
-  }
-  async cleanup(identity: WorkerIdentity) {
-    this.cleanupCount++;
-    if (this.status === "working")
-      return {
-        state: "pending" as const,
-        identity,
-        observedAt: FIXTURE_OBSERVED_AT,
-        detail: "Fixture worker is still working.",
-      };
-    if (this.status === "blocked" || this.status === "unknown")
-      return {
-        state: "blocked" as const,
-        identity,
-        observedAt: FIXTURE_OBSERVED_AT,
-        detail: `Fixture worker is ${this.status}.`,
-      };
-    return {
-      state: "completed" as const,
-      identity,
-      observedAt: FIXTURE_OBSERVED_AT,
-      detail: this.absent ? "Exact fixture worker is absent." : "Exact fixture worker closed.",
-    };
+
+  private observation(identity: WorkerIdentity): HerdrObservation {
+    return { identity, status: this.status, observedAt: FIXTURE_OBSERVED_AT };
   }
 }
 
@@ -229,7 +339,7 @@ async function fixture() {
   await writeFile(join(root, "value.txt"), "initial\n");
   await git(root, "add", ".");
   await git(root, "commit", "-m", "fixture");
-  const repository = await GitRepository.open(root);
+  const repository = await Effect.runPromise(openRepository(root));
   const session = SessionManager.create(root, join(parent, "sessions"));
   session.appendMessage({
     role: "user",
@@ -248,13 +358,15 @@ async function fixture() {
   });
   const sessionFile = session.getSessionFile() ?? assert.fail("Fixture session must persist.");
   const owner = { sessionId: session.getSessionId(), sessionFile };
-  const { store } = await WorkstreamStore.create({
-    id: "ws-fixture",
-    purpose: "Investigate and implement the authorized fixture",
-    projectRoot: root,
-    gitCommonDir: repository.commonDir,
-    coordinator: owner,
-  });
+  const { store } = await Effect.runPromise(
+    WorkstreamStoreEffects.create({
+      id: "ws-fixture",
+      purpose: "Investigate and implement the authorized fixture",
+      projectRoot: root,
+      gitCommonDir: repository.commonDir,
+      coordinator: owner,
+    }).pipe(Effect.provide(liveLayer)),
+  );
   const registry = new WorkgraphRegistry(join(parent, "registry.sqlite"));
   const workers = new Worker();
   const delivered: string[] = [];
@@ -290,12 +402,12 @@ async function fixture() {
     return submit(
       active,
       Effect.gen(function* () {
-        const recorded = yield* store.effects.recordInputEvent({
+        const recorded = yield* store.recordInputEvent({
           ...owner,
           source: "interactive",
           text: "Implement value.txt and run bounded disposable experiments in this repository.",
         });
-        yield* store.effects.reviseIntent({
+        yield* store.reviseIntent({
           authorityReceiptId: recorded.receipt.id,
           statement: "Change fixture safely",
           constraints: [],
@@ -354,7 +466,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
       { model: "fixture/research-second", thinking: "high" },
     ];
     const active = await f.runtime(undefined, { policy });
-    const initial = await f.repository.head();
+    const initial = await runRuntime(f.repository.effects.head());
     const queued = await runRuntime(
       active.effects.queue(research("shared-base"), {
         selection: { count: 2, diversity: "distinct-models" },
@@ -367,9 +479,9 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
     await writeFile(join(f.root, "moved.txt"), "moved\n");
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "move head");
-    const moved = await f.repository.head();
+    const moved = await runRuntime(f.repository.effects.head());
     assert.notEqual(moved, initial);
-    const retainedBefore = (await f.store.load()).assignments.length;
+    const retainedBefore = (await runRuntime(f.store.load())).assignments.length;
     await assert.rejects(
       runRuntime(
         active.effects.queue(
@@ -387,7 +499,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
       ),
       /conflicts with its exact subject/,
     );
-    const state = await f.store.load();
+    const state = await runRuntime(f.store.load());
     assert.equal(state.assignments.length, retainedBefore);
     assert.equal(state.attempts.length, 2);
   } finally {
@@ -429,7 +541,7 @@ await test("experiment output remains releasable after semantic completion", asy
     assert.equal(state.results[0]?.artifacts[0]?.id, "retained-output-worktree");
     state = await submit(
       active,
-      f.store.effects.complete({
+      f.store.complete({
         conclusion: "The experiment answered the bounded question.",
         evidence: [{ label: "probe", observation: "Output remains at the exact owned path." }],
         limitations: [],
@@ -495,8 +607,7 @@ await test("new runtime drives fresh research through native evidence, durable r
     assert.equal(state.results.length, 1);
     assert.equal(state.deliveries[0]?.state, "delivered");
     assert.deepEqual(f.delivered, [state.results[0]?.id]);
-    const deliveredResult = required(state.results[0], "delivered result");
-    await submit(next, f.store.effects.acknowledge(deliveredResult.id, "Read evidence"));
+    assert.ok(state.results[0], "delivered result");
     await runRuntime(next.effects.reconcile);
     assert.equal(f.delivered.length, 1);
     assert.equal(f.workers.cleanupCount, 1);
@@ -556,7 +667,7 @@ await test("cleaned history has constant reconciliation reads while error cleari
       ),
     );
     await submit(active, Effect.void);
-    const reads = t.mock.method(f.store.effects, "load");
+    const reads = t.mock.method(f.store, "load");
     await runRuntime(active.effects.reconcile);
     const emptyReads = reads.mock.callCount();
     for (let index = 0; index < 4; index++)
@@ -573,8 +684,8 @@ await test("cleaned history has constant reconciliation reads while error cleari
       "Cleaned attempts must not add per-attempt durable loads",
     );
     const id = required(state.attempts[0], "cleaned attempt").id;
-    await submit(active, f.store.effects.recordAttention(id, "retained stale attention"));
-    const updates = t.mock.method(f.store.effects, "clearAttention");
+    await submit(active, f.store.recordAttention(id, "retained stale attention"));
+    const updates = t.mock.method(f.store, "clearAttention");
     state = await runRuntime(active.effects.reconcile);
     assert.equal(updates.mock.callCount(), 1);
     assert.equal(state.attempts[0]?.error, undefined);
@@ -603,7 +714,7 @@ await test("completed no-change implementations retain explicit attribution, ski
   try {
     const active = await f.runtime();
     const authority = await f.authority(active);
-    const base = await f.repository.head();
+    const base = await runRuntime(f.repository.effects.head());
     const before = await readFile(join(f.root, "value.txt"), "utf8");
     f.workers.onWork = async (request) => ({
       kind: "implementation",
@@ -642,7 +753,7 @@ await test("completed no-change implementations retain explicit attribution, ski
     assert.equal(attempt.application, undefined);
     assert.equal(attempt.cleanup?.state, "completed");
     assert.equal(f.workers.cleanupCount, 1);
-    assert.equal(await f.repository.head(), base);
+    assert.equal(await runRuntime(f.repository.effects.head()), base);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), before);
     const worktrees = await git(f.root, "worktree", "list", "--porcelain");
     assert.equal(worktrees.includes(attempt.placement?.path ?? ""), false);
@@ -656,7 +767,7 @@ await test("dirty isolated trees cannot settle a successful no-change implementa
   try {
     const active = await f.runtime();
     const authority = await f.authority(active);
-    const base = await f.repository.head();
+    const base = await runRuntime(f.repository.effects.head());
     f.workers.onWork = async (request) => {
       await writeFile(join(request.cwd, "unreported.txt"), "dirty\n");
       return {
@@ -686,7 +797,7 @@ await test("dirty isolated trees cannot settle a successful no-change implementa
     assert.equal(state.results[0]?.validity, "invalid");
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
-    assert.equal(await f.repository.head(), base);
+    assert.equal(await runRuntime(f.repository.effects.head()), base);
   } finally {
     await f.dispose();
   }
@@ -697,7 +808,7 @@ await test("advanced isolated trees cannot settle a successful no-change impleme
   try {
     const active = await f.runtime();
     const authority = await f.authority(active);
-    const base = await f.repository.head();
+    const base = await runRuntime(f.repository.effects.head());
     f.workers.onWork = async (request) => {
       await writeFile(join(request.cwd, "value.txt"), "advanced\n");
       await git(request.cwd, "add", "value.txt");
@@ -729,7 +840,7 @@ await test("advanced isolated trees cannot settle a successful no-change impleme
     assert.equal(state.results[0]?.validity, "invalid");
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
-    assert.equal(await f.repository.head(), base);
+    assert.equal(await runRuntime(f.repository.effects.head()), base);
   } finally {
     await f.dispose();
   }
@@ -925,7 +1036,7 @@ await test("wrong-mode and stale maintained results remain retained without appl
     await runRuntime(active.effects.reconcile);
     await submit(
       active,
-      f.store.effects.reviseIntent({
+      f.store.reviseIntent({
         authorityReceiptId: authority.receiptId,
         statement: "New constraints",
         constraints: ["Do not apply old value"],
@@ -940,7 +1051,7 @@ await test("wrong-mode and stale maintained results remain retained without appl
     await assert.rejects(
       submit(
         active,
-        f.store.effects.complete({
+        f.store.complete({
           conclusion: "done",
           evidence: [{ label: "limit", observation: "Not done" }],
           limitations: ["stale"],
@@ -985,12 +1096,9 @@ await test("exclusive lease fences same-session duplicates and dead-owner adopti
     await f.authority(first);
     await runRuntime(first.effects.queue(research("inspect", 1)));
     await runRuntime(first.effects.reconcile);
-    const receipts = (await f.store.load()).inputs;
+    const receipts = (await runRuntime(f.store.load())).inputs;
     await assert.rejects(f.runtime(), /already has a runtime owner/);
-    await submit(
-      first,
-      f.store.effects.setLifecycle({ state: "suspended", reason: "Keep stopped" }),
-    );
+    await submit(first, f.store.setLifecycle({ state: "suspended", reason: "Keep stopped" }));
     f.registry.db
       .prepare("UPDATE leases SET expires_at=? WHERE run_id=?")
       .run("2000-01-01T00:00:00.000Z", "ws-fixture");
@@ -1046,7 +1154,7 @@ await test("worker continuation uses an isolated new workspace and current gener
   }
 });
 
-await test("failed notification is not retried by polling and manual observed receipt permits completion without claiming transport success", async () => {
+await test("failed notification is not retried by polling and pending delivery remains explicit", async () => {
   const f = await fixture();
   try {
     let notifications = 0;
@@ -1064,14 +1172,6 @@ await test("failed notification is not retried by polling and manual observed re
     const state = await runRuntime(active.effects.reconcile);
     const result = state.results[0];
     assert.ok(result);
-    await submit(
-      active,
-      f.store.effects.disposition({
-        resultId: result.id,
-        status: "accepted",
-        reason: "Read the exact retained evidence through status",
-      }),
-    );
     const completion = {
       conclusion: "The bounded question is answered",
       evidence: [{ label: "Read", observation: "value.txt says initial" }],
@@ -1079,23 +1179,18 @@ await test("failed notification is not retried by polling and manual observed re
       reasons: [],
     };
     await assert.rejects(
-      submit(active, f.store.effects.complete(completion)),
+      submit(active, f.store.complete(completion)),
       /Completion requires exactly one reason per unresolved semantic task|Pending result delivery/,
     );
     await runRuntime(active.effects.reconcile);
     await runRuntime(active.effects.reconcile);
     assert.equal(notifications, 1);
-    await submit(
-      active,
-      f.store.effects.acknowledge(result.id, "Read the retained report through status"),
-    );
-    const acknowledged = await runRuntime(active.effects.reconcile);
-    assert.equal(acknowledged.deliveries[0]?.state, "acknowledged");
-    assert.equal(acknowledged.deliveries[0]?.deliveredAt, undefined);
+    const pending = await runRuntime(active.effects.reconcile);
+    assert.equal(pending.deliveries[0]?.state, "pending");
     assert.equal(notifications, 1);
-    assert.equal(
-      (await submit(active, f.store.effects.complete(completion))).lifecycle.state,
-      "completed",
+    await assert.rejects(
+      submit(active, f.store.complete(completion)),
+      /exactly one reason per unresolved semantic task|Pending result delivery/,
     );
   } finally {
     await f.dispose();
@@ -1106,7 +1201,7 @@ await test("partial adoption failure releases the acquired lease before runtime 
   const f = await fixture();
   try {
     const adoptionFailure = new Error("fixture adoption failure");
-    const adopt = t.mock.method(f.store.effects, "adopt", () =>
+    const adopt = t.mock.method(f.store, "adopt", () =>
       Effect.fail(
         new WorkstreamStoreOperationError({
           code: "workstream_store_operation_failed",
@@ -1229,7 +1324,7 @@ await test("close interrupts a suspended store operation and fails queued replie
     const active = await f.runtime();
     await submit(active, Effect.void);
     const entered = Deferred.makeUnsafe<void>();
-    t.mock.method(f.store.effects, "load", () =>
+    t.mock.method(f.store, "load", () =>
       Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
     );
     const running = runRuntime(active.effects.reconcile);
@@ -1301,10 +1396,10 @@ await test("owned idle-worker cancellation closes without a model turn or fabric
     const active = await f.runtime();
     await runRuntime(active.effects.queue(research("cancel-idle-no-turn")));
     await runRuntime(active.effects.reconcile);
-    const attempt = required((await f.store.load()).attempts[0], "idle worker attempt");
+    const attempt = required((await runRuntime(f.store.load())).attempts[0], "idle worker attempt");
     assert.equal(f.workers.promptCount, 0);
     await runRuntime(active.effects.cancel(attempt.id));
-    const state = await f.store.load();
+    const state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.results.length, 0);
@@ -1335,14 +1430,14 @@ await test("cancelling a disposable experiment retains output through reconcilia
       }),
     );
     await runRuntime(active.effects.reconcile);
-    const attempt = required((await f.store.load()).attempts[0], "experiment attempt");
+    const attempt = required((await runRuntime(f.store.load())).attempts[0], "experiment attempt");
     const placement = required(attempt.placement, "experiment placement");
     if (placement.kind !== "isolated_worktree")
       throw new Error("Experiment placement must be isolated.");
     const retainedFile = join(placement.path, "cancelled-output.txt");
     await writeFile(retainedFile, "retained after cancellation\n");
     await runRuntime(active.effects.cancel(attempt.id));
-    let state = await f.store.load();
+    let state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
@@ -1365,7 +1460,7 @@ await test("cancelling a disposable experiment retains output through reconcilia
 
     state = await submit(
       active,
-      f.store.effects.complete({
+      f.store.complete({
         conclusion: "The cancelled experiment remains available for inspection.",
         evidence: [{ label: "retained output", observation: "The cancelled worktree is intact." }],
         limitations: [],
@@ -1409,8 +1504,11 @@ await test("reconcile settles cancellation only after proven external worker abs
     const active = await f.runtime();
     await runRuntime(active.effects.queue(research("cancel-externally-absent")));
     await runRuntime(active.effects.reconcile);
-    const attempt = required((await f.store.load()).attempts[0], "absent worker attempt");
-    await submit(active, f.store.effects.cancelAttempt(attempt.id));
+    const attempt = required(
+      (await runRuntime(f.store.load())).attempts[0],
+      "absent worker attempt",
+    );
+    await submit(active, f.store.cancelAttempt(attempt.id));
     f.workers.absent = true;
     const state = await runRuntime(active.effects.reconcile);
     assert.equal(state.attempts[0]?.state, "cancelled");
@@ -1428,8 +1526,11 @@ await test("unknown worker state remains blocked rather than becoming absent", a
     const active = await f.runtime();
     await runRuntime(active.effects.queue(research("cancel-unknown-worker")));
     await runRuntime(active.effects.reconcile);
-    const attempt = required((await f.store.load()).attempts[0], "unknown worker attempt");
-    await submit(active, f.store.effects.cancelAttempt(attempt.id));
+    const attempt = required(
+      (await runRuntime(f.store.load())).attempts[0],
+      "unknown worker attempt",
+    );
+    await submit(active, f.store.cancelAttempt(attempt.id));
     f.workers.status = "unknown";
     const state = await runRuntime(active.effects.reconcile);
     assert.equal(state.attempts[0]?.state, "cancel_requested");
@@ -1446,7 +1547,7 @@ await test("pre-session cancellation cleans only the known placement and never l
     const active = await f.runtime();
     const authority = await f.authority(active);
     const checkpointFailure = new Error("fixture session checkpoint failure");
-    t.mock.method(f.store.effects, "recordSessionFile", () =>
+    t.mock.method(f.store, "recordSessionFile", () =>
       Effect.fail(
         new WorkstreamStoreOperationError({
           code: "workstream_store_operation_failed",
@@ -1469,14 +1570,14 @@ await test("pre-session cancellation cleans only the known placement and never l
       }),
     );
     await runRuntime(active.effects.reconcile);
-    let state = await f.store.load();
+    let state = await runRuntime(f.store.load());
     const attempt = required(state.attempts[0], "pre-session attempt");
     assert.equal(attempt.state, "starting");
     assert.equal(attempt.sessionFile, undefined);
     assert.equal(attempt.launchPane, undefined);
     assert.equal(f.workers.requests.length, 0);
     await runRuntime(active.effects.cancel(attempt.id));
-    state = await f.store.load();
+    state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.outputRelease, undefined);
@@ -1521,7 +1622,7 @@ await test("healthy startup/running is quiet; a blocked boundary is recorded onc
     state = await runRuntime(active.effects.reconcile);
     assert.equal(state.attempts[0]?.error, undefined);
     assert.equal(state.attempts[0]?.attentionHistory?.length, 1);
-    await f.workers.produce(request);
+    await runRuntime(f.workers.produceEffect(request.sessionFile));
     f.workers.status = "idle";
     state = await runRuntime(active.effects.reconcile);
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");

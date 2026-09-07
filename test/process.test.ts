@@ -7,10 +7,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
-import { ProcessExecutionError, processEffect, runProcess } from "../src/process.js";
+import { ProcessExecutionError, processEffect } from "../src/process.js";
 
+type ProcessRunOptions = Parameters<typeof processEffect>[2];
 const node = process.execPath;
 const cwd = process.cwd();
+const run = (command: string, args: readonly string[], options: ProcessRunOptions) =>
+  Effect.runPromise(processEffect(command, args, options));
 
 void test("the Effect process owner returns normal output through its native API", async () => {
   const result = await Effect.runPromise(
@@ -31,7 +34,7 @@ void test("the Effect process owner returns normal output through its native API
 
 void test("bounded diagnostics do not change the complete stdout fingerprint", async () => {
   const full = `prefix-${"x".repeat(100_000)}-suffix`;
-  const result = await runProcess(node, ["-e", `process.stdout.write(${JSON.stringify(full)})`], {
+  const result = await run(node, ["-e", `process.stdout.write(${JSON.stringify(full)})`], {
     cwd,
     timeoutMs: 1_000,
     digestStdout: true,
@@ -43,7 +46,7 @@ void test("bounded diagnostics do not change the complete stdout fingerprint", a
 });
 
 void test("timeout keeps the diagnostic result and escalates from SIGTERM to SIGKILL", async () => {
-  const result = await runProcess(
+  const result = await run(
     node,
     ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)"],
     { cwd, timeoutMs: 25, killGraceMs: 50 },
@@ -54,14 +57,14 @@ void test("timeout keeps the diagnostic result and escalates from SIGTERM to SIG
 
 void test("spawn failures are reported through the process error", async () => {
   await assert.rejects(
-    runProcess("/definitely/not/a/real/process", [], { cwd, timeoutMs: 1_000 }),
+    run("/definitely/not/a/real/process", [], { cwd, timeoutMs: 1_000 }),
     (error: Error) => error instanceof ProcessExecutionError,
   );
 });
 
 void test("bounded output retains a valid UTF-8 suffix within the byte limit", async () => {
   const full = "🙂".repeat(1_000);
-  const result = await runProcess(node, ["-e", `process.stdout.write(${JSON.stringify(full)})`], {
+  const result = await run(node, ["-e", `process.stdout.write(${JSON.stringify(full)})`], {
     cwd,
     timeoutMs: 1_000,
     outputLimit: 7,
@@ -73,7 +76,7 @@ void test("bounded output retains a valid UTF-8 suffix within the byte limit", a
 });
 
 void test("malformed bytes stay within the display byte limit and preserve the raw digest", async () => {
-  const result = await runProcess(
+  const result = await run(
     node,
     ["-e", "process.stdout.write(Buffer.from([0xff])); process.stderr.write(Buffer.from([0xfe]))"],
     {
@@ -100,7 +103,7 @@ void test("malformed bytes stay within the display byte limit and preserve the r
 void test("decoded malformed suffixes are bounded for both output streams", async () => {
   const stdout = Buffer.from([0x41, 0xff, 0xf0, 0x9f, 0x98, 0x80]);
   const stderr = Buffer.from([0xc3, 0x28, 0xe2, 0x82, 0xac]);
-  const result = await runProcess(
+  const result = await run(
     node,
     [
       "-e",
@@ -132,7 +135,7 @@ void test("interrupting the Effect waits for the owned process to close", async 
       ),
       { signal: controller.signal },
     );
-    // oxlint-disable-next-line effecttsgo/global-timers -- A native timer deliberately races the child-process adapter under test.
+    // oxlint-disable-next-line effecttsgo/global-timers -- A native timer deliberately races the Effect process owner under test.
     setTimeout(() => controller.abort(), 150).unref();
     await assert.rejects(running);
     assert.equal(await readFile(marker, "utf8"), "closed");
@@ -145,22 +148,27 @@ void test("a pre-aborted signal does not launch a process", async () => {
   const controller = new AbortController();
   controller.abort();
   await assert.rejects(
-    runProcess("/definitely/not/a/real/process", [], {
-      cwd,
-      timeoutMs: 1_000,
-      signal: controller.signal,
-    }),
+    Effect.runPromise(
+      processEffect("/definitely/not/a/real/process", [], {
+        cwd,
+        timeoutMs: 1_000,
+      }),
+      { signal: controller.signal },
+    ),
   );
 });
 
 void test("interrupting the Effect cancels the owned process", async () => {
   const controller = new AbortController();
-  const running = runProcess(
-    node,
-    ["-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1_000)"],
-    { cwd, timeoutMs: 10_000, signal: controller.signal },
+  const running = Effect.runPromise(
+    processEffect(
+      node,
+      ["-e", "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1_000)"],
+      { cwd, timeoutMs: 10_000 },
+    ),
+    { signal: controller.signal },
   );
-  // oxlint-disable-next-line effecttsgo/global-timers -- A native timer deliberately interrupts the Promise adapter under test.
+  // oxlint-disable-next-line effecttsgo/global-timers -- A native timer deliberately interrupts the Effect process owner under test.
   setTimeout(() => controller.abort(), 25).unref();
   await assert.rejects(running);
 });

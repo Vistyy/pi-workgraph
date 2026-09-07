@@ -1,17 +1,6 @@
 import type { FileSystem, Path, Scope } from "effect";
 import { Cause, Data, DateTime, Effect } from "effect";
-import type {
-  HerdrInspection,
-  HerdrObservation,
-  HerdrProtocolError,
-  WorkerCleanupResult,
-  WorkerLaunchEffectRequest,
-  WorkerLaunchInspection,
-  WorkerLaunchInspectionRequest,
-  WorkerLaunchReadinessError,
-  WorkerRecoveryRequest,
-} from "./herdr.js";
-import type { WorkerLaunchError } from "./herdr-launch.js";
+import type { HerdrEffects } from "./herdr.js";
 import {
   createWorkerSessionEffect,
   effectiveModelObservations,
@@ -27,43 +16,21 @@ import {
   type LeaseOwner,
   WorkgraphRegistry,
 } from "./registry.js";
-import type { WorkerIdentity } from "./types.js";
-import type { WorkstreamStore, WorkstreamStoreError } from "./workstream.js";
+import type { WorkstreamStoreEffects, WorkstreamStoreError } from "./workstream.js";
 
-export interface RuntimeHerdrEffects {
-  readonly launch: (
-    request: WorkerLaunchEffectRequest<WorkstreamStoreError, FileSystem.FileSystem | Path.Path>,
-  ) => Effect.Effect<
-    HerdrObservation,
-    HerdrProtocolError | WorkerLaunchReadinessError | WorkerLaunchError<WorkstreamStoreError>,
-    FileSystem.FileSystem | Path.Path
-  >;
-  readonly recover: (
-    request: WorkerRecoveryRequest,
-  ) => Effect.Effect<HerdrObservation | undefined, HerdrProtocolError | WorkerLaunchReadinessError>;
-  readonly inspectLaunch: (
-    request: WorkerLaunchInspectionRequest,
-  ) => Effect.Effect<WorkerLaunchInspection, HerdrProtocolError>;
-  readonly inspect: (
-    identity: WorkerIdentity,
-  ) => Effect.Effect<HerdrInspection, HerdrProtocolError>;
-  readonly observe: (
-    identity: WorkerIdentity,
-  ) => Effect.Effect<HerdrObservation, HerdrProtocolError>;
-  readonly interrupt: (
-    identity: WorkerIdentity,
-  ) => Effect.Effect<HerdrObservation, HerdrProtocolError>;
-  readonly steer: (
-    identity: WorkerIdentity,
-    instruction: string,
-  ) => Effect.Effect<void, HerdrProtocolError>;
-  readonly cleanup: (
-    identity: WorkerIdentity,
-  ) => Effect.Effect<WorkerCleanupResult, HerdrProtocolError>;
-}
 export type RuntimeWorkerPort = {
   readonly available: boolean;
-  readonly effects: RuntimeHerdrEffects;
+  readonly effects: Pick<
+    HerdrEffects,
+    | "launch"
+    | "recover"
+    | "inspectLaunch"
+    | "inspect"
+    | "observe"
+    | "interrupt"
+    | "steer"
+    | "cleanup"
+  >;
 };
 
 export class RuntimeRegistryError extends Data.TaggedError("RuntimeRegistryError")<{
@@ -99,7 +66,7 @@ export interface RuntimeLeaseHandle {
 }
 
 export interface RuntimeLeaseOptions {
-  readonly store: WorkstreamStore;
+  readonly store: WorkstreamStoreEffects;
   readonly registry?: WorkgraphRegistry | undefined;
   readonly owner?: LeaseOwner | undefined;
   readonly priorOwnerLiveness?: "alive" | "dead" | "unknown" | undefined;
@@ -124,7 +91,7 @@ export function acquireRuntimeLease(
           ? finalizer("close workstream registry", () => value.close(), options.onFinalizerError)
           : Effect.void,
     );
-    const state = yield* options.store.effects.load();
+    const state = yield* options.store.load();
     yield* registryEffect("index workstream", () =>
       registry.indexWorkstream({
         ...state,
@@ -169,12 +136,12 @@ export function acquireRuntimeLease(
         }),
       ),
     };
-    options.store.effects.bindMutationGuard(handle.assert);
+    options.store.bindMutationGuard(handle.assert);
     if (
       owner.sessionId !== state.coordinator.sessionId ||
       owner.sessionFile !== state.coordinator.sessionFile
     )
-      yield* options.store.effects.adopt(owner);
+      yield* options.store.adopt(owner);
     return handle;
   });
 }

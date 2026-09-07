@@ -523,7 +523,7 @@ export class WorkstreamStoreOperationError extends Data.TaggedError(
 )<{
   readonly code: "workstream_store_operation_failed";
   readonly message: string;
-  /** Original rejection retained for the outward Promise compatibility boundary. */
+  /** Original rejection retained as an opaque cause for inspection and recovery. */
   readonly cause: unknown;
 }> {}
 

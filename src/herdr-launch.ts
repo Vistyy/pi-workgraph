@@ -38,14 +38,6 @@ export interface WorkerPaneLocator {
 
 export type WorkerLaunchLocator = WorkerPaneLocator | WorkerResourceIdentity;
 
-/** Promise-facing compatibility request retained until the workstream runtime adopts effects. */
-export interface WorkerLaunchRequest extends WorkerLaunchBaseRequest {
-  onTab?: (tab: WorkerPaneLocator) => void | Promise<void>;
-  onResource?: (resource: WorkerResourceIdentity) => void | Promise<void>;
-  onIdentity?: (identity: WorkerIdentity) => void | Promise<void>;
-  onSubmitted?: () => void | Promise<void>;
-}
-
 /** Primary launch port. Checkpoint failures and requirements remain typed in the returned Effect. */
 export interface WorkerLaunchEffectRequest<E = never, R = never> extends WorkerLaunchBaseRequest {
   onTab?: (tab: WorkerPaneLocator) => Effect.Effect<void, E, R>;
@@ -212,20 +204,6 @@ export class HerdrWorkerLauncher {
   }
 }
 
-/** Adapts legacy Promise checkpoints only at the outward Promise launch facade. */
-export function adaptPromiseLaunchRequest(
-  request: WorkerLaunchRequest,
-): WorkerLaunchEffectRequest<PromiseCheckpointError> {
-  const { onTab, onResource, onIdentity, onSubmitted, ...base } = request;
-  const adapted: WorkerLaunchEffectRequest<PromiseCheckpointError> = { ...base };
-  if (onTab !== undefined) adapted.onTab = promiseCheckpoint(onTab);
-  if (onResource !== undefined) adapted.onResource = promiseCheckpoint(onResource);
-  if (onIdentity !== undefined) adapted.onIdentity = promiseCheckpoint(onIdentity);
-  if (onSubmitted !== undefined)
-    adapted.onSubmitted = () => promiseCheckpoint(onSubmitted)(undefined);
-  return adapted;
-}
-
 function checkpointAfterRemote<A, E, R, Locator extends WorkerLaunchLocator>(
   remote: Effect.Effect<A, HerdrProtocolError | WorkerLaunchReadinessError, R>,
   phase: WorkerLaunchError["phase"],
@@ -259,20 +237,6 @@ function invokeCheckpoint<A, E, R>(
         }),
     ),
   );
-}
-
-export class PromiseCheckpointError extends Data.TaggedError("PromiseCheckpointError")<{
-  readonly cause: unknown;
-}> {}
-
-function promiseCheckpoint<A>(
-  checkpoint: (value: A) => void | Promise<void>,
-): (value: A) => Effect.Effect<void, PromiseCheckpointError> {
-  return (value) =>
-    Effect.tryPromise({
-      try: () => Promise.resolve(checkpoint(value)),
-      catch: (cause) => new PromiseCheckpointError({ cause }),
-    });
 }
 
 function envArgs(env: Record<string, string>): string[] {

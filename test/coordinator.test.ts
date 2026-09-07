@@ -7,11 +7,11 @@ import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
 import { Type } from "typebox";
-import { GitRepository } from "../src/git.js";
+import { openRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { liveLayer } from "../src/node-platform.js";
 import { WorkgraphRegistry } from "../src/registry.js";
-import { WorkstreamStore } from "../src/workstream.js";
+import { type StoreEffect, WorkstreamStoreEffects } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
 import {
   configureFixtureEnvironment,
@@ -20,6 +20,35 @@ import {
   restoreFixtureEnvironment,
 } from "./decoders.js";
 import { extensionFixture, git, researchReport, resultState } from "./helpers.js";
+
+function runStore<A>(effect: StoreEffect<A>): Promise<A> {
+  return Effect.runPromise(effect.pipe(Effect.provide(liveLayer)));
+}
+
+async function settleFixtureAttempt(
+  store: WorkstreamStoreEffects,
+  attemptId: string,
+  resultId: string,
+): Promise<void> {
+  const projectRoot = (await runStore(store.load())).projectRoot;
+  await runStore(
+    store.startAttempt({
+      id: attemptId,
+      placement: { kind: "shared_project", path: projectRoot },
+    }),
+  );
+  await runStore(store.recordSessionFile(attemptId, `/tmp/${attemptId}.jsonl`));
+  await runStore(
+    store.settleAttempt({
+      id: attemptId,
+      resultId,
+      effectiveModels: [{ model: "fixture/model", thinking: "low" }],
+    }),
+  );
+  await runStore(store.beginCleanup({ id: attemptId }));
+  await runStore(store.markWorkerClosed(attemptId));
+  await runStore(store.finishCleanup(attemptId));
+}
 
 const textContentSchema = Type.Object({ type: Type.Literal("text"), text: Type.String() });
 const actionDetailsSchema = Type.Object({
@@ -122,17 +151,19 @@ async function fixture() {
 }
 
 async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
-  const repository = await GitRepository.open(f.root);
-  const created = await WorkstreamStore.create({
-    id: "empty-fixture",
-    purpose: "Fixture workstream",
-    projectRoot: f.root,
-    gitCommonDir: repository.commonDir,
-    coordinator: {
-      sessionId: f.session.getSessionId(),
-      sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
-    },
-  });
+  const repository = await Effect.runPromise(openRepository(f.root));
+  const created = await runStore(
+    WorkstreamStoreEffects.create({
+      id: "empty-fixture",
+      purpose: "Fixture workstream",
+      projectRoot: f.root,
+      gitCommonDir: repository.commonDir,
+      coordinator: {
+        sessionId: f.session.getSessionId(),
+        sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
+      },
+    }),
+  );
   f.session.appendCustomEntry("pi-workgraph-workstream", {
     path: created.store.path,
   });
@@ -449,18 +480,20 @@ void test("failed registered adoption preserves the attached runtime lease; same
   const registry = new WorkgraphRegistry(join(f.parent, "agent", "workgraph", "registry.sqlite"));
   try {
     const a = await emptyWorkstream(f);
-    const repository = await GitRepository.open(f.root);
+    const repository = await Effect.runPromise(openRepository(f.root));
     const otherOwner = {
       sessionId: "other",
       sessionFile: join(f.parent, "other.jsonl"),
     };
-    const { store } = await WorkstreamStore.create({
-      id: "other-work",
-      purpose: "Other work",
-      projectRoot: f.root,
-      gitCommonDir: repository.commonDir,
-      coordinator: otherOwner,
-    });
+    const { store } = await runStore(
+      WorkstreamStoreEffects.create({
+        id: "other-work",
+        purpose: "Other work",
+        projectRoot: f.root,
+        gitCommonDir: repository.commonDir,
+        coordinator: otherOwner,
+      }),
+    );
     competing = await Effect.runPromise(
       WorkstreamRuntime.acquire(
         store,
@@ -524,16 +557,24 @@ void test("mutation responses stay action-focused while retaining handles, model
       sessionId: f.session.getSessionId(),
       sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
     };
-    const store = WorkstreamStore.open(initial.statePath, owner);
+    const store = WorkstreamStoreEffects.open(initial.statePath, owner);
     for (let index = 0; index < 12; index++) {
-      await store.assign({
-        id: `unrelated-${index}`,
-        capability: "research",
-        artifactIntent: "evidence_only",
-        objective: `Unrelated history ${index}`,
-        intentVersion: 0,
-        expectedEvidence: ["bytes"],
-      });
+      await runStore(
+        store.enqueue(
+          {
+            id: `unrelated-${index}`,
+            capability: "research",
+            artifactIntent: "evidence_only",
+            objective: `Unrelated history ${index}`,
+            intentVersion: 0,
+            expectedEvidence: ["bytes"],
+          },
+          {
+            id: `unrelated-${index}-attempt`,
+            models: { guide: { model: "fixture/model", thinking: "low" }, source: "policy" },
+          },
+        ),
+      );
     }
     const later = await f.call("workgraph_inspect", {
       section: "overview",
@@ -557,35 +598,46 @@ void test("registered status stays compact and focused result retrieval projects
       sessionId: f.session.getSessionId(),
       sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
     };
-    const store = WorkstreamStore.open(initial.statePath, owner);
+    const store = WorkstreamStoreEffects.open(initial.statePath, owner);
     const longObjective = `Retain bounded evidence ${"full assignment brief ".repeat(500)}`;
-    await store.assign({
-      id: "large-result",
-      capability: "research",
-      artifactIntent: "evidence_only",
-      objective: longObjective,
-      intentVersion: 0,
-      expectedEvidence: ["evidence"],
-    });
-    await store.retainResult({
-      id: "large-result-1",
-      assignmentId: "large-result",
-      assignmentIntentVersion: 0,
-      validity: "typed",
-      report: {
-        ...researchReport("A bounded summary"),
-        evidence: Array.from({ length: 6 }, (_, index) => ({
-          label: `evidence-${index}`,
-          observation: `observation-${index}`,
-        })),
-        findings: Array.from({ length: 4 }, (_, index) => ({
-          severity: "info" as const,
-          title: `finding-${index}`,
-          detail: `detail-${index}`,
-          envelopeImpact: "none" as const,
-        })),
-      },
-    });
+    await runStore(
+      store.enqueue(
+        {
+          id: "large-result",
+          capability: "research",
+          artifactIntent: "evidence_only",
+          objective: longObjective,
+          intentVersion: 0,
+          expectedEvidence: ["evidence"],
+        },
+        {
+          id: "large-result-attempt",
+          models: { guide: { model: "fixture/model", thinking: "low" }, source: "policy" },
+        },
+      ),
+    );
+    await runStore(
+      store.retainResult({
+        id: "large-result-1",
+        assignmentId: "large-result",
+        assignmentIntentVersion: 0,
+        validity: "typed",
+        report: {
+          ...researchReport("A bounded summary"),
+          evidence: Array.from({ length: 6 }, (_, index) => ({
+            label: `evidence-${index}`,
+            observation: `observation-${index}`,
+          })),
+          findings: Array.from({ length: 4 }, (_, index) => ({
+            severity: "info" as const,
+            title: `finding-${index}`,
+            detail: `detail-${index}`,
+            envelopeImpact: "none" as const,
+          })),
+        },
+      }),
+    );
+    await settleFixtureAttempt(store, "large-result-attempt", "large-result-1");
     const status = await f.call("workgraph_inspect", { section: "overview" });
     const statusText = decodeTestValue(textContentSchema, status.content[0]).text;
     assert.match(statusText, /large-result/);
@@ -669,17 +721,19 @@ void test("registered status stays compact and focused result retrieval projects
 
 void test("registered session_start safely inspects retained and pointed workstreams", async () => {
   async function createState(f: Awaited<ReturnType<typeof fixture>>, id: string) {
-    const repository = await GitRepository.open(f.root);
-    return WorkstreamStore.create({
-      id,
-      purpose: "Startup inspection fixture",
-      projectRoot: f.root,
-      gitCommonDir: repository.commonDir,
-      coordinator: {
-        sessionId: f.session.getSessionId(),
-        sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
-      },
-    });
+    const repository = await Effect.runPromise(openRepository(f.root));
+    return runStore(
+      WorkstreamStoreEffects.create({
+        id,
+        purpose: "Startup inspection fixture",
+        projectRoot: f.root,
+        gitCommonDir: repository.commonDir,
+        coordinator: {
+          sessionId: f.session.getSessionId(),
+          sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
+        },
+      }),
+    );
   }
 
   {
@@ -709,14 +763,16 @@ void test("registered session_start safely inspects retained and pointed workstr
       await writeFile(state.statePath, `${JSON.stringify(legacy, null, 2)}\n`);
       const before = await readFile(state.statePath);
       await assert.rejects(
-        WorkstreamStore.inspect(state.statePath),
+        runStore(WorkstreamStoreEffects.inspect(state.statePath)),
         /Unsupported workstream state/,
       );
       f.session.appendCustomEntry("pi-workgraph-workstream", {
         path: state.statePath,
       });
       await f.runner.emit({ type: "session_start", reason: "reload" });
-      const inspection = await WorkstreamStore.inspectForReattachment(state.statePath);
+      const inspection = await runStore(
+        WorkstreamStoreEffects.inspectForReattachment(state.statePath),
+      );
       assert.equal(inspection.kind, "retained_terminal");
       assert.equal(
         f.notifications.some((notification) => notification.type === "warning"),
@@ -843,11 +899,11 @@ void test("registered session_start safely inspects retained and pointed workstr
     const f = await fixture();
     try {
       const { state: created } = await createState(f, "current-terminal");
-      const state = await WorkstreamStore.open(created.statePath, created.coordinator).setLifecycle(
-        {
+      const state = await runStore(
+        WorkstreamStoreEffects.open(created.statePath, created.coordinator).setLifecycle({
           state: "abandoned",
           reason: "Current terminal startup fixture.",
-        },
+        }),
       );
       f.session.appendCustomEntry("pi-workgraph-workstream", {
         path: state.statePath,
