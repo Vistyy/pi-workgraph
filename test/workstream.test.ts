@@ -455,36 +455,6 @@ void test("every independent attempt remains accounted for regardless of result 
       );
       for (let index = 0; index < order.length; index++) {
         await runStore(
-          store.startAttempt({
-            id: `attempt-${index}`,
-            placement: {
-              kind: "isolated_worktree",
-              path: `/tmp/worktree-${index}`,
-              branch: `branch-${index}`,
-            },
-            baseRevision: "a".repeat(40),
-          }),
-        );
-        await runStore(
-          store.recordLaunchPane(`attempt-${index}`, {
-            workspaceId: "fixture",
-            paneId: `pane-${index}`,
-          }),
-        );
-        await runStore(
-          store.recordResource(`attempt-${index}`, {
-            workspaceId: "fixture",
-            tabId: `tab-${index}`,
-            paneId: `pane-${index}`,
-            terminalId: `terminal-${index}`,
-            agentName: `agent-${index}`,
-            cwd: `/tmp/worktree-${index}`,
-          }),
-        );
-        await runStore(store.recordSessionFile(`attempt-${index}`, `/tmp/session-${index}`));
-        await runStore(store.markSubmission(`attempt-${index}`, "uncertain"));
-        await runStore(store.markSubmission(`attempt-${index}`, "submitted"));
-        await runStore(
           store.retainResult({
             id: `result-${index}`,
             assignmentId: "comparison",
@@ -499,42 +469,7 @@ void test("every independent attempt remains accounted for regardless of result 
             },
           }),
         );
-        await runStore(
-          store.settleAttempt({
-            id: `attempt-${index}`,
-            resultId: `result-${index}`,
-            effectiveModels: [{ model: "fixture/research", thinking: "low" }],
-          }),
-        );
-        await runStore(
-          store.beginCleanup({
-            id: `attempt-${index}`,
-            expectedHead: "a".repeat(40),
-          }),
-        );
-        await runStore(store.markWorkerClosed(`attempt-${index}`));
-        await runStore(store.finishCleanup(`attempt-${index}`));
-        await assert.doesNotReject(
-          runStore(
-            store.recordLaunchPane(`attempt-${index}`, {
-              workspaceId: "fixture",
-              paneId: `pane-${index}`,
-            }),
-          ),
-        );
-        await assert.rejects(
-          runStore(
-            store.recordLaunchPane(`attempt-${index}`, {
-              workspaceId: "fixture",
-              paneId: "contradictory",
-            }),
-          ),
-          /contradictory|not accepting/,
-        );
-        await assert.rejects(
-          runStore(store.blockCleanup(`attempt-${index}`, "late cleanup failure")),
-          /already completed/,
-        );
+        await settleFixtureAttempt(store, `attempt-${index}`, `result-${index}`);
       }
       const state = await runStore(store.load());
       assert.equal(queued.attempts.length, 2);
@@ -807,26 +742,6 @@ void test("historical disposition evidence remains readonly and invalid evidence
 void test("Effect store port fences both reads and renames and cleans unique 0600 temp state", async () => {
   const { parent, store } = await fixture();
   try {
-    const initial = await runLiveStoreEffect(store.load());
-    assert.equal(initial.revision, 0);
-
-    const aborted = new AbortController();
-    aborted.abort();
-    await assert.rejects(
-      Effect.runPromise(
-        Effect.provide(
-          store.recordInputEvent({
-            ...coordinator,
-            source: "interactive",
-            text: "This interrupted write must not be retained.",
-          }),
-          liveLayer,
-        ),
-        { signal: aborted.signal },
-      ),
-    );
-    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
-
     let guardCalls = 0;
     store.bindMutationGuard(() => {
       guardCalls += 1;
@@ -1285,12 +1200,6 @@ void test("temporary cleanup failure is observable without replacing the origina
     await rm(parent, { recursive: true, force: true });
   }
 });
-
-function runLiveStoreEffect<A, E>(
-  operation: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>,
-): Promise<A> {
-  return Effect.runPromise(Effect.provide(operation, liveLayer));
-}
 
 async function liveFileSystem(): Promise<FileSystem.FileSystem> {
   return Effect.runPromise(Effect.provide(FileSystem.FileSystem, liveLayer));

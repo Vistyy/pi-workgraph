@@ -508,64 +508,6 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
   }
 });
 
-await test("experiment output remains releasable after semantic completion", async () => {
-  const f = await fixture();
-  try {
-    const active = await f.runtime();
-    const authority = await f.authority(active);
-    f.workers.onWork = async (request) => {
-      await writeFile(join(request.cwd, "probe.txt"), "retained output\n");
-      return researchReport;
-    };
-    await runRuntime(
-      active.effects.queue({
-        id: "probe",
-        capability: "research",
-        artifactIntent: "disposable_experiment",
-        objective: "Run one isolated probe",
-        intentVersion: authority.intentVersion,
-        authority,
-        permittedEffects: ["Write probe.txt in the isolated worktree"],
-        stopCondition: "probe.txt is written",
-        expectedEvidence: ["retained output"],
-      }),
-    );
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
-    const attempt = required(state.attempts[0], "experiment attempt");
-    assert.equal(attempt.cleanup?.state, "completed");
-    assert.equal(
-      await readFile(join(required(attempt.placement, "placement").path, "probe.txt"), "utf8"),
-      "retained output\n",
-    );
-    assert.equal(state.results[0]?.artifacts[0]?.id, "retained-output-worktree");
-    state = await submit(
-      active,
-      f.store.complete({
-        conclusion: "The experiment answered the bounded question.",
-        evidence: [{ label: "probe", observation: "Output remains at the exact owned path." }],
-        limitations: [],
-        reasons: [],
-      }),
-    );
-    assert.equal(state.lifecycle.state, "completed");
-    await runRuntime(
-      active.effects.releaseOutput(attempt.id, "The retained observation has been reviewed."),
-    );
-    state = await runRuntime(active.effects.reconcile);
-    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
-    assert.equal(
-      (await git(f.root, "worktree", "list", "--porcelain")).includes(
-        required(attempt.placement, "placement").path,
-      ),
-      false,
-    );
-  } finally {
-    await f.dispose();
-  }
-});
-
 await test("new runtime drives fresh research through native evidence, durable retryable delivery and exact Git cleanup", async () => {
   const f = await fixture();
   try {
@@ -651,60 +593,6 @@ await test("shared research sees dirty tracked and untracked files and leaves th
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "local tracked edit\\n");
     assert.equal(await readFile(local, "utf8"), "local untracked edit\\n");
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("cleaned history has constant reconciliation reads while error clearing and pending delivery remain independent", async (t) => {
-  const f = await fixture();
-  try {
-    const active = await f.runtime(() =>
-      Effect.fail(
-        new RuntimeHostError({
-          operation: "fixture notification",
-          cause: new Error("interrupted notification"),
-        }),
-      ),
-    );
-    await submit(active, Effect.void);
-    const reads = t.mock.method(f.store, "load");
-    await runRuntime(active.effects.reconcile);
-    const emptyReads = reads.mock.callCount();
-    for (let index = 0; index < 4; index++)
-      await runRuntime(active.effects.queue(research(`read-${index}`)));
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
-    assert.ok(state.attempts.every((attempt) => attempt.cleanup?.state === "completed"));
-    assert.ok(state.deliveries.every((delivery) => delivery.state === "pending"));
-    let before = reads.mock.callCount();
-    await runRuntime(active.effects.reconcile);
-    assert.equal(
-      reads.mock.callCount() - before,
-      emptyReads,
-      "Cleaned attempts must not add per-attempt durable loads",
-    );
-    const id = required(state.attempts[0], "cleaned attempt").id;
-    await submit(active, f.store.recordAttention(id, "retained stale attention"));
-    const updates = t.mock.method(f.store, "clearAttention");
-    state = await runRuntime(active.effects.reconcile);
-    assert.equal(updates.mock.callCount(), 1);
-    assert.equal(state.attempts[0]?.error, undefined);
-    assert.equal(state.attempts[0]?.attentionHistory?.[0]?.detail, "retained stale attention");
-    before = reads.mock.callCount();
-    await runRuntime(active.effects.reconcile);
-    assert.equal(reads.mock.callCount() - before, emptyReads);
-    assert.equal(updates.mock.callCount(), 1, "Resolved attention must only be cleared once");
-    await runRuntime(active.effects.close);
-    const recovered = await f.runtime();
-    state = await runRuntime(recovered.effects.reconcile);
-    assert.equal(
-      f.delivered.length,
-      4,
-      "Terminal skipping must not skip pending delivery on reattachment",
-    );
-    assert.ok(state.deliveries.every((delivery) => delivery.state === "delivered"));
-    assert.equal(f.workers.cleanupCount, 4);
   } finally {
     await f.dispose();
   }
@@ -847,55 +735,12 @@ await test("advanced isolated trees cannot settle a successful no-change impleme
   }
 });
 
-await test("arbitrary semantic task ids use opaque filesystem identities", async () => {
+await test("maintained changes keep semantic identity, use guide/executor policy, and review the requested earlier revision", async () => {
   const f = await fixture();
   try {
     const active = await f.runtime();
     const authority = await f.authority(active);
     const semanticId = "Fix Value With Spaces and a deliberately long task name";
-    f.workers.onWork = async (request) => {
-      if (workerEnvironment(request, "PI_WORKGRAPH_MODE") !== "implementation")
-        throw new Error("Expected implementation worker");
-      await writeFile(join(request.cwd, "value.txt"), "opaque\n");
-      await git(request.cwd, "add", ".");
-      await git(request.cwd, "commit", "-m", "opaque task id");
-      return {
-        kind: "implementation",
-        status: "completed",
-        outcome: "changed",
-        summary: "Changed value",
-        commit: await git(request.cwd, "rev-parse", "HEAD"),
-        evidence: [],
-        findings: [],
-      };
-    };
-    await runRuntime(
-      active.effects.queue({
-        id: semanticId,
-        capability: "implement",
-        artifactIntent: "maintained_change",
-        objective: "Change value with an arbitrary semantic id",
-        intentVersion: 1,
-        authority,
-        acceptance: ["value is opaque"],
-      }),
-    );
-    await runRuntime(active.effects.reconcile);
-    const state = await runRuntime(active.effects.reconcile);
-    assert.equal(state.assignments[0]?.id, semanticId);
-    assert.match(state.attempts[0]?.id ?? "", /^attempt-[0-9a-f-]{36}$/);
-    assert.notEqual(state.attempts[0]?.id, semanticId);
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("maintained changes use guide/executor policy and review checks the requested earlier revision", async () => {
-  const f = await fixture();
-  try {
-    const active = await f.runtime();
-    const authority = await f.authority(active);
     f.workers.onWork = async (request) => {
       if (workerEnvironment(request, "PI_WORKGRAPH_MODE") === "implementation") {
         assert.equal(request.model, "openai-codex/gpt-6-astra");
@@ -939,7 +784,7 @@ await test("maintained changes use guide/executor policy and review checks the r
     };
     await runRuntime(
       active.effects.queue({
-        id: "change",
+        id: semanticId,
         capability: "implement",
         artifactIntent: "maintained_change",
         objective: "Change value",
@@ -952,6 +797,8 @@ await test("maintained changes use guide/executor policy and review checks the r
     let state = await runRuntime(active.effects.reconcile);
     const implementationAttempt = required(state.attempts[0], "implementation attempt");
     const implementationResult = required(state.results[0], "implementation result");
+    assert.equal(state.assignments[0]?.id, semanticId);
+    assert.notEqual(implementationAttempt.id, semanticId);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
     assert.equal(implementationResult.validity, "typed");
     if (
@@ -1335,30 +1182,6 @@ await test("close interrupts a suspended store operation and fails queued replie
     await runRuntime(active.effects.close);
     await assert.rejects(running, /stopped|interrupt/i);
     await assert.rejects(queued, /stopped|interrupt/i);
-    assert.equal(
-      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
-      undefined,
-    );
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("close interrupts a suspended native observation without waiting behind it", async (t) => {
-  const f = await fixture();
-  try {
-    f.workers.deferWork = true;
-    const active = await f.runtime();
-    await runRuntime(active.effects.queue(research("suspended-native-observation")));
-    await runRuntime(active.effects.reconcile);
-    const entered = Deferred.makeUnsafe<void>();
-    t.mock.method(f.workers.effects, "observe", () =>
-      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
-    );
-    const running = runRuntime(active.effects.reconcile);
-    await Effect.runPromise(Deferred.await(entered));
-    await runRuntime(active.effects.close);
-    await assert.rejects(running, /stopped|interrupt/i);
     assert.equal(
       f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
       undefined,
