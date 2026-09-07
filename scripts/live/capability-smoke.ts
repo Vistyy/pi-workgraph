@@ -29,6 +29,7 @@ import {
   CAPABILITY_SCENARIO_IDS,
   capabilityScenarioPrompt,
   notificationDrivenProgress,
+  observeIsolatedGitResourceAbsence,
 } from "./scenario-observation.js";
 
 const smokeTimeout = Effect.runSync(
@@ -38,6 +39,8 @@ const smokeTimeout = Effect.runSync(
 );
 
 const checkpoint = createFixtureCheckpoint("Workgraph capability scenario");
+const retainedOutputReleaseReason =
+  "The harness recorded the exact BEFORE newline bytes and no longer needs this disposable output.";
 let fixture: LiveFixture | undefined;
 let latest: WorkstreamState | undefined;
 try {
@@ -151,11 +154,50 @@ try {
     (result) => result.assignmentId === CAPABILITY_SCENARIO_IDS.uppercaseExperiment,
   );
   const artifact = experiment?.artifacts.find(
-    (item) => item.id === "probe.txt" && item.retention === "retained",
+    (item) =>
+      item.id === "retained-output-worktree" &&
+      item.kind === "path" &&
+      item.retention === "retained",
   );
   assert.ok(artifact);
-  assert.equal(await readFile(artifact.reference, "utf8"), "BEFORE\n");
+  const experimentAttempt = state.attempts.find(
+    (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.uppercaseExperiment,
+  );
+  assert.ok(experimentAttempt !== undefined);
+  const experimentPlacement = experimentAttempt.placement;
+  assert.ok(experimentPlacement?.kind === "isolated_worktree");
+  assert.equal(artifact.reference, experimentPlacement.path);
+  const retainedProbe = join(experimentPlacement.path, "probe.txt");
+  assert.deepEqual(await readFile(retainedProbe), Buffer.from("BEFORE\n"));
+  const retainedWorktreeHead = await command(experimentPlacement.path, "git", [
+    "rev-parse",
+    "HEAD",
+  ]);
+  await writeFile(
+    join(f.parent, "retained-output-before-release.json"),
+    JSON.stringify(
+      {
+        candidateRevision: f.revision,
+        workstreamId: state.id,
+        attemptId: experimentAttempt.id,
+        worktree: experimentPlacement.path,
+        branch: experimentPlacement.branch,
+        probePath: retainedProbe,
+        probeBytes: "BEFORE\n",
+        release: "not yet requested; bytes established before explicit release",
+      },
+      null,
+      2,
+    ),
+  );
   await assert.rejects(readFile(join(f.root, "probe.txt")), /ENOENT/);
+  const retainedResources = observeIsolatedGitResourceAbsence(
+    [experimentPlacement],
+    await command(f.root, "git", ["worktree", "list", "--porcelain"]),
+    await command(f.root, "git", ["for-each-ref", "--format=%(refname)", "refs/heads"]),
+  );
+  assert.equal(retainedResources.resources[0]?.worktreeAbsent, false);
+  assert.equal(retainedResources.resources[0]?.branchAbsent, false);
   assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "after\n");
   assert.equal(await command(f.root, "node", ["verify.mjs"]), "value verified");
   assert.equal(await command(f.root, "git", ["status", "--porcelain"]), "");
@@ -217,10 +259,85 @@ try {
         ].includes(entry.message.toolName),
     ),
   );
-  assert.equal(
-    (await command(f.root, "git", ["worktree", "list", "--porcelain"])).split("worktree ").length -
-      1,
-    1,
+  const releasePrompt = `The capability scenario is already completed and all five existing attempts are settled. Do not delegate, retry, inspect through another tool, alter any file, apply any output, or change intent. The harness has already established the exact retained bytes BEFORE followed by one newline at ${retainedProbe}. Invoke exactly one supported coordinator action now: workgraph_control with action release_output, attempt ${experimentAttempt.id}, and destructive reason "${retainedOutputReleaseReason}". Use that exact internal attempt id, not a task handle. Return only after the action result is recorded.`;
+  await writeFile(join(f.parent, "release-request.txt"), releasePrompt);
+  await herdr(f.root, Type.Object({}), "agent", "prompt", coordinator.agentName, releasePrompt);
+  const releasedState = await waitFor(
+    // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
+    async () => {
+      const directory = join(f.root, ".git", "pi-workgraph", "workstreams");
+      const names = await readdir(directory);
+      assert.equal(names.length, 1, "Release continuation must stay in one workstream");
+      const workstreamName = names[0];
+      assert.ok(workstreamName !== undefined);
+      const observed = await Effect.runPromise(
+        Effect.provide(
+          WorkstreamStoreEffects.inspect(join(directory, workstreamName, "workstream.json")),
+          liveLayer,
+        ),
+      );
+      latest = observed;
+      const attempt = observed.attempts.find((item) => item.id === experimentAttempt.id);
+      assert.ok(attempt !== undefined);
+      if (attempt.outputRelease?.state === "blocked")
+        throw new Error(
+          `Retained output release is blocked: ${JSON.stringify(attempt.outputRelease)}`,
+        );
+      return attempt.outputRelease?.state === "completed" ? observed : undefined;
+    },
+    timeoutMs,
+    "post-completion exact retained-output release and recorded state transition",
+  );
+  assert.equal(releasedState.lifecycle.state, "completed");
+  assert.equal(releasedState.attempts.length, state.attempts.length);
+  assert.deepEqual(
+    releasedState.assignments.map((assignment) => assignment.id).sort(),
+    state.assignments.map((assignment) => assignment.id).sort(),
+  );
+  assert.equal(releasedState.results.length, state.results.length);
+  assert.equal(releasedState.deliveries.length, state.deliveries.length);
+  const releasedAttempt = releasedState.attempts.find(
+    (attempt) => attempt.id === experimentAttempt.id,
+  );
+  assert.ok(releasedAttempt !== undefined);
+  assert.equal(releasedAttempt.outputRelease?.state, "completed");
+  assert.equal(releasedAttempt.outputRelease?.expectedHead, retainedWorktreeHead);
+  assert.equal(releasedAttempt.outputRelease?.reason, retainedOutputReleaseReason);
+  await writeFile(
+    join(f.parent, "release-state-observation.json"),
+    JSON.stringify(releasedState, null, 2),
+  );
+  const releaseEntries = SessionManager.open(coordinator.sessionFile).getBranch();
+  assert.ok(
+    releaseEntries.some(
+      (entry) =>
+        entry.type === "message" &&
+        entry.message.role === "assistant" &&
+        entry.message.content.some(
+          (block) =>
+            block.type === "toolCall" &&
+            block.name === "workgraph_control" &&
+            Value.Check(
+              Type.Object({
+                action: Type.Literal("release_output"),
+                attempt: Type.Literal(experimentAttempt.id),
+                reason: Type.String({ minLength: 1 }),
+              }),
+              block.arguments,
+            ),
+        ),
+    ),
+    "No exact coordinator release_output action was observed",
+  );
+  await assert.rejects(readFile(retainedProbe), /ENOENT/);
+  const releasedResources = observeIsolatedGitResourceAbsence(
+    [experimentPlacement],
+    await command(f.root, "git", ["worktree", "list", "--porcelain"]),
+    await command(f.root, "git", ["for-each-ref", "--format=%(refname)", "refs/heads"]),
+  );
+  assert.ok(
+    releasedResources.valid,
+    `Released experiment Git resources remain: ${JSON.stringify(releasedResources.resources)}`,
   );
   const usage = observeNativeSessionUsage([
     coordinator.sessionFile,
@@ -241,7 +358,7 @@ try {
         usage,
         cleanup,
         checks:
-          "normal package loading, fresh worker isolation, actual notification-driven baseline-to-experiment progression and assistant continuations for every result, experiment retention/non-composition, maintained bytes/scope, model messages and Prewalk transition, concurrent research, review launched against the exact implementation revision, native settlement, resource cleanup, and copied-agent-file cleanup",
+          "normal package loading, fresh worker isolation, actual notification-driven baseline-to-experiment progression and assistant continuations for every result, experiment retention/non-composition, retained bytes before explicit post-completion release, maintained bytes/scope, model messages and Prewalk transition, concurrent research, review launched against the exact implementation revision, native settlement, exact Git release cleanup, resource cleanup, and copied-agent-file cleanup",
       },
       null,
       2,
