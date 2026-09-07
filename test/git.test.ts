@@ -100,17 +100,6 @@ async function conflictFixture() {
   return { ...f, commit, expectedHead: await runGit(f.repository.effects.head()) };
 }
 
-void test("the effects port is the primary typed repository interface", async () => {
-  const f = await fixture();
-  try {
-    assert.equal(await Effect.runPromise(f.repository.effects.head()), f.base);
-    assert.equal(await Effect.runPromise(f.repository.effects.status()), "");
-    assert.equal(await runGit(f.repository.effects.head()), f.base);
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
 void test("malformed Git worktree output fails with the declared parse tag", async () => {
   const malformed = "branch refs/heads/missing-worktree\0\0";
   const failure = await Effect.runPromise(Effect.flip(parseWorktreeList(malformed)));

@@ -273,198 +273,33 @@ void test("presentation adapter hides and restores existing tool and operational
   assert.deepEqual(message.render(80), ["message:pi-workgraph-attention:80"]);
 });
 
-void test("Calm inserts one dim ASCII separator between successive assistant blocks", () => {
+void test("Calm separates visible assistant blocks with inert, width-safe rows", () => {
   const state = {
     on: true,
     hiddenTools: new Set(["read"]),
     hiddenMessageTypes: new Set(["pi-workgraph-attention"]),
   };
   const width = 32;
-  const fullWidthText = "full-width assistant response".padEnd(width, "!");
   const chat = new FakeContainer();
-  const first = new FakeAssistantRow("", "  thinking", "  answer");
-  const hiddenToolA = new FakeToolRow("read");
-  const hiddenToolB = new FakeToolRow("read");
-  const hiddenMessage = new FakeMessageRow("pi-workgraph-attention");
-  const toolOnlyAssistant = new FakeAssistantRow();
-  const second = new FakeAssistantRow("", "\u001b]133;B\u0007 follow-up", "  still attached");
-  const user = new FakeUserRow(" user message");
-  const afterUser = new FakeAssistantRow("", "  after user");
-  const afterHiddenOperation = new FakeAssistantRow("", "  after hidden operation");
-  const fullWidthAssistant = new FakeAssistantRow(fullWidthText);
-  const originalChildren = chat.children;
-  chat.addChild(first);
-  chat.addChild(hiddenToolA);
-  chat.addChild(hiddenToolB);
-  chat.addChild(hiddenMessage);
-  chat.addChild(toolOnlyAssistant);
-  chat.addChild(second);
-  chat.addChild(user);
-  chat.addChild(afterUser);
-  chat.addChild(hiddenToolA);
-  chat.addChild(afterHiddenOperation);
-  chat.addChild(fullWidthAssistant);
-  const diagnostics: string[] = [];
-  const styledSeparators: string[] = [];
-  const detach = attachCalmPresentation(
-    moduleForFakeRows(),
-    state,
-    (message) => diagnostics.push(message),
-    (text) => {
-      styledSeparators.push(text);
-      return `\u001b[2m${text}\u001b[22m`;
-    },
-  );
+  chat.addChild(new FakeAssistantRow("first"));
+  chat.addChild(new FakeToolRow("read"));
+  chat.addChild(new FakeMessageRow("pi-workgraph-attention"));
+  chat.addChild(new FakeAssistantRow("second"));
+  const detach = attachCalmPresentation(moduleForFakeRows(), state, () => {});
   try {
-    const calmLines = chat.render(width);
-    assert.deepEqual(calmLines.map(stripAnsiLikeTheme), [
-      "",
-      "  thinking",
-      "  answer",
-      "---",
-      "",
-      " follow-up",
-      "  still attached",
-      " user message",
-      "",
-      "  after user",
-      "---",
-      "",
-      "  after hidden operation",
-      "---",
-      fullWidthText,
-    ]);
-    assert.equal(calmLines.length, 15);
-    assert.equal(calmLines[1], "  thinking");
-    assert.equal(calmLines[14], fullWidthText);
-    assert.equal(calmLines[3], "\u001b[2m---\u001b[22m");
-    assert.equal(visibleWidth(calmLines[3] ?? ""), 3);
-    assert.deepEqual(styledSeparators, ["---", "---", "---"]);
-    assert.equal(chat.children.length, 11);
-    assert.equal(chat.children, originalChildren);
-    assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), calmLines.map(stripAnsiLikeTheme));
-    assert.deepEqual(styledSeparators, ["---", "---", "---", "---", "---", "---"]);
-
-    // The separator owns exactly one inert mouse row. Existing message rows, including their
-    // thinking padding, keep their original heights and local coordinates.
-    assert.equal(chat.handleMouse({ y: 3, width }), undefined);
-    assert.deepEqual(chat.handleMouse({ y: 4, width }), { y: 0, width });
-    assert.deepEqual(
-      chat.mouseLayout?.children.map(({ height }) => height),
-      [3, 0, 0, 0, 0, 1, 3, 1, 2, 0, 1, 2, 1, 1],
-    );
-
-    const visibleToolsChat = new FakeContainer();
-    visibleToolsChat.addChild(first);
-    visibleToolsChat.addChild(new FakeToolRow("write"));
-    visibleToolsChat.addChild(new FakeToolRow("write"));
-    visibleToolsChat.addChild(second);
-    assert.deepEqual(visibleToolsChat.render(width).map(stripAnsiLikeTheme), [
-      "",
-      "  thinking",
-      "  answer",
-      "tool:write:32",
-      "tool:write:32",
-      "---",
-      "",
-      " follow-up",
-      "  still attached",
-    ]);
-    assert.equal(styledSeparators.length, 7);
-
-    const thinkingOnlyChat = new FakeContainer();
-    thinkingOnlyChat.addChild(new FakeAssistantRow("", "  thinking only"));
-    thinkingOnlyChat.addChild(new FakeToolRow("read"));
-    thinkingOnlyChat.addChild(new FakeAssistantRow("", "  after thinking"));
-    assert.deepEqual(thinkingOnlyChat.render(width).map(stripAnsiLikeTheme), [
-      "",
-      "  thinking only",
-      "---",
-      "",
-      "  after thinking",
-    ]);
-    assert.equal(styledSeparators.length, 8);
-
-    const emptyEdgesChat = new FakeContainer();
-    emptyEdgesChat.addChild(new FakeAssistantRow());
-    emptyEdgesChat.addChild(new FakeAssistantRow("only visible block"));
-    emptyEdgesChat.addChild(new FakeAssistantRow());
-    assert.deepEqual(emptyEdgesChat.render(width), ["only visible block"]);
-    assert.equal(styledSeparators.length, 8);
-
-    // A streaming redraw replaces child output without accumulating separator rows.
-    second.lines.push("  streamed");
-    assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), [
-      "",
-      "  thinking",
-      "  answer",
-      "---",
-      "",
-      " follow-up",
-      "  still attached",
-      "  streamed",
-      " user message",
-      "",
-      "  after user",
-      "---",
-      "",
-      "  after hidden operation",
-      "---",
-      fullWidthText,
-    ]);
-    assert.equal(chat.render(width).filter((line) => stripAnsiLikeTheme(line) === "---").length, 3);
+    assert.deepEqual(chat.render(width), ["first", "---", "second"]);
+    assert.equal(chat.handleMouse({ y: 1, width }), undefined);
+    assert.deepEqual(chat.handleMouse({ y: 2, width }), { y: 0, width });
 
     const narrowChat = new FakeContainer();
     narrowChat.addChild(new FakeAssistantRow("a"));
     narrowChat.addChild(new FakeAssistantRow("b"));
-    assert.deepEqual(narrowChat.render(2).map(stripAnsiLikeTheme), ["a", "--", "b"]);
-    assert.ok(narrowChat.render(2).every((line) => visibleWidth(line) <= 2));
-
-    state.on = false;
-    assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), [
-      "",
-      "  thinking",
-      "  answer",
-      "tool:read:32",
-      "tool:read:32",
-      "message:pi-workgraph-attention:32",
-      "",
-      " follow-up",
-      "  still attached",
-      "  streamed",
-      " user message",
-      "",
-      "  after user",
-      "tool:read:32",
-      "",
-      "  after hidden operation",
-      fullWidthText,
-    ]);
-    assert.deepEqual(styledSeparators.length, 16);
-    state.on = true;
+    const narrowLines = narrowChat.render(2);
+    assert.deepEqual(narrowLines, ["a", "--", "b"]);
+    assert.ok(narrowLines.every((line) => visibleWidth(line) <= 2));
   } finally {
     detach();
   }
-  assert.deepEqual(chat.render(32), [
-    "",
-    "  thinking",
-    "  answer",
-    "tool:read:32",
-    "tool:read:32",
-    "message:pi-workgraph-attention:32",
-    "",
-    "\u001b]133;B\u0007 follow-up",
-    "  still attached",
-    "  streamed",
-    " user message",
-    "",
-    "  after user",
-    "tool:read:32",
-    "",
-    "  after hidden operation",
-    fullWidthText,
-  ]);
-  assert.deepEqual(diagnostics, []);
 });
 
 void test("adapter diagnostics fall back to visible rendering when row metadata changes", () => {

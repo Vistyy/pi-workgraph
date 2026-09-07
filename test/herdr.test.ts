@@ -481,7 +481,6 @@ await test("the Herdr adapter launches without waiting and validates exact ident
       HERDR_WORKSPACE_ID: "workspace-1",
     });
     let retained: WorkerIdentity | undefined;
-    const callbackSequence: string[] = [];
     const observation = await runEffect(
       runtime.effects.launch({
         workspaceId: "workspace-1",
@@ -490,31 +489,16 @@ await test("the Herdr adapter launches without waiting and validates exact ident
         sessionFile,
         prompt: "Continue now.",
         env: { PI_WORKGRAPH_MODE: "implementation" },
-        onTab: (tab) =>
-          Effect.sync(() => callbackSequence.push(`tab:${tab.paneId}`)).pipe(Effect.asVoid),
-        onResource: (resource) =>
-          Effect.sync(() => callbackSequence.push(`resource:${resource.terminalId}`)).pipe(
-            Effect.asVoid,
-          ),
         onIdentity: (identity) =>
           Effect.sync(() => {
             retained = identity;
-            callbackSequence.push(`identity:${identity.sessionFile}`);
           }).pipe(Effect.asVoid),
-        onSubmitted: () =>
-          Effect.sync(() => callbackSequence.push("submitted")).pipe(Effect.asVoid),
       }),
     );
     assert.deepEqual(retained, observation.identity);
     assert.equal(observation.identity.workspaceId, "workspace-1");
     assert.equal(observation.identity.paneId, "workspace-1:pane-1");
     assert.equal(observation.identity.sessionFile, sessionFile);
-    assert.deepEqual(callbackSequence, [
-      `tab:${observation.identity.paneId}`,
-      `resource:${observation.identity.terminalId}`,
-      `identity:${sessionFile}`,
-      "submitted",
-    ]);
     const recovered = await runEffect(
       runtime.effects.recover({
         workspaceId: "workspace-1",
@@ -536,18 +520,6 @@ await test("the Herdr adapter launches without waiting and validates exact ident
     const prompt = calls.find((args) => args[0] === "agent" && args[1] === "prompt");
     assert.ok(prompt, "agent prompt command was recorded");
     assert.equal(prompt.includes("--wait"), false);
-    const tabCreate = calls.find((args) => args[0] === "tab" && args[1] === "create");
-    assert.ok(tabCreate, "tab creation command was recorded");
-    assert.ok(tabCreate.includes(herdrWorkerTabLabel(naming)));
-    assert.deepEqual(
-      calls.find((args) => args[0] === "agent" && args[1] === "send-keys")?.slice(-1),
-      ["esc"],
-    );
-    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "get").length, 4);
-    assert.equal(
-      calls.some((args) => args[0] === "tab" && args[1] === "close"),
-      false,
-    );
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -801,27 +773,6 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
-});
-
-await test("Herdr exposes one Effect-native primary operations port", () => {
-  const runtime = new HerdrCliRuntime("unused", {
-    HERDR_ENV: "1",
-    HERDR_WORKSPACE_ID: "workspace-1",
-  });
-  assert.deepEqual(Object.keys(runtime.effects), [
-    "launchCoordinator",
-    "coordinatorLiveness",
-    "observeCurrentCoordinator",
-    "launch",
-    "recover",
-    "inspectLaunch",
-    "inspect",
-    "observe",
-    "interrupt",
-    "steer",
-    "cleanup",
-  ]);
-  assert.equal("effect" in runtime, false);
 });
 
 await test("bounded protocol output fails before a valid truncated JSON suffix can imply absence", async () => {

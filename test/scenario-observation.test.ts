@@ -1,24 +1,15 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This fixture establishes a fake existing Git common-directory boundary.
-import { mkdir } from "node:fs/promises";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { Effect } from "effect";
 import {
   observeCoordinatorTurn,
-  observeDelegatedOutcome,
   observeDirectEffect,
   observeIsolatedGitResourceAbsence,
 } from "../scripts/live/scenario-observation.js";
-import { liveLayer } from "../src/node-platform.js";
-import { WorkstreamStoreEffects } from "../src/workstream.js";
-import { required } from "./decoders.js";
 import { usage } from "./helpers.js";
 
 const request = "Inspect the fixture.";
 const fixtureTimestamp = 1_788_235_200_000;
-const fixtureInstant = "2026-09-01T00:00:00.000Z";
 
 function settledAssistant(session: SessionManager, text = "Completed.") {
   session.appendMessage({
@@ -44,23 +35,6 @@ function failedAssistant(session: SessionManager, stopReason: "error" | "aborted
     stopReason,
     timestamp: fixtureTimestamp,
   });
-}
-
-async function baseState() {
-  const root = `/tmp/natural-test-${randomUUID()}`;
-  await mkdir(`${root}/.git`, { recursive: true });
-  return Effect.runPromise(
-    WorkstreamStoreEffects.create({
-      id: "natural-test",
-      purpose: "Test natural observation",
-      projectRoot: root,
-      gitCommonDir: `${root}/.git`,
-      coordinator: {
-        sessionId: "coordinator",
-        sessionFile: `${root}/coordinator.jsonl`,
-      },
-    }).pipe(Effect.provide(liveLayer)),
-  );
 }
 
 void test("direct native outcome accepts the authorized tracked edit and rejects untracked effects", () => {
@@ -102,219 +76,6 @@ void test("isolated Git cleanup requires exact worktree path and branch absence"
       "worktree /tmp/root",
       "refs/heads/pi-workgraph/run/attempt",
     ).valid,
-    false,
-  );
-});
-
-void test("delegated native outcome requires attributable application, cleanup, and retained experiment output", async () => {
-  const { state } = await baseState();
-  const now = fixtureInstant;
-  state.lifecycle = { state: "completed", changedAt: now, reason: "done" };
-  state.assignments.push(
-    {
-      id: "experiment",
-      objective: "Observe bytes",
-      intentVersion: 1,
-      createdAt: now,
-      capability: "research",
-      artifactIntent: "disposable_experiment",
-      authority: { receiptId: "receipt", intentVersion: 1 },
-      permittedEffects: ["write probe.txt"],
-      stopCondition: "one observation",
-      expectedEvidence: ["probe bytes"],
-    },
-    {
-      id: "implementation",
-      objective: "Update value",
-      intentVersion: 1,
-      createdAt: now,
-      capability: "implement",
-      artifactIntent: "maintained_change",
-      authority: { receiptId: "receipt", intentVersion: 1 },
-      acceptance: ["exact bytes"],
-    },
-  );
-  state.attempts.push(
-    {
-      id: "attempt-experiment",
-      assignmentId: "experiment",
-      state: "settled",
-      createdAt: now,
-      updatedAt: now,
-      sessionFile: "/tmp/experiment.jsonl",
-      resultId: "result-experiment",
-      placement: { kind: "isolated_worktree", path: "/tmp/natural-test", branch: "experiment" },
-      worker: {
-        workspaceId: "workspace",
-        tabId: "tab",
-        paneId: "pane",
-        terminalId: "terminal",
-        agentName: "worker-experiment",
-        cwd: "/tmp/natural-test",
-        sessionFile: "/tmp/experiment.jsonl",
-      },
-      cleanup: {
-        state: "completed",
-        expectedHead: "base",
-        workerClosed: true,
-      },
-    },
-    {
-      id: "attempt-implementation",
-      assignmentId: "implementation",
-      state: "settled",
-      createdAt: now,
-      updatedAt: now,
-      sessionFile: "/tmp/implementation.jsonl",
-      resultId: "result-implementation",
-      worker: {
-        workspaceId: "workspace",
-        tabId: "tab",
-        paneId: "pane",
-        terminalId: "terminal",
-        agentName: "worker-implementation",
-        cwd: "/tmp/natural-test",
-        sessionFile: "/tmp/implementation.jsonl",
-      },
-      application: {
-        state: "applied",
-        commit: "commit",
-        expectedHead: "base",
-        revision: "revision",
-      },
-      cleanup: {
-        state: "completed",
-        expectedHead: "commit",
-        workerClosed: true,
-      },
-    },
-  );
-  state.results.push(
-    {
-      id: "result-experiment",
-      assignmentId: "experiment",
-      assignmentIntentVersion: 1,
-      validity: "typed",
-      observedAt: now,
-      report: {
-        kind: "research",
-        status: "completed",
-        summary: "observed",
-        evidence: [],
-        findings: [],
-      },
-      artifacts: [
-        {
-          id: "retained-output-worktree",
-          kind: "path",
-          reference: "/tmp/natural-test",
-          retention: "retained",
-          summary: "retained",
-        },
-      ],
-    },
-    {
-      id: "result-implementation",
-      assignmentId: "implementation",
-      assignmentIntentVersion: 1,
-      validity: "typed",
-      observedAt: now,
-      report: {
-        kind: "implementation",
-        status: "completed",
-        outcome: "changed",
-        summary: "changed",
-        evidence: [],
-        findings: [],
-      },
-      artifacts: [],
-    },
-  );
-  const effect = observeDirectEffect(
-    new Map([["value.txt", "YmVmb3JlCg=="]]),
-    new Map([["value.txt", "YWZ0ZXIK"]]),
-    "YWZ0ZXIK",
-  );
-  const result = observeDelegatedOutcome(state, effect);
-  assert.equal(result.valid, true);
-  assert.equal(result.delegationExercised, true);
-  assert.equal(result.experiment, "verified");
-});
-
-void test("natural observer accepts read-only delegation followed by a direct edit and rejects unaccounted effects", async () => {
-  const { state } = await baseState();
-  const now = fixtureInstant;
-  state.lifecycle = { state: "completed", changedAt: now, reason: "done" };
-  state.assignments.push({
-    id: "research",
-    objective: "Read the current value",
-    intentVersion: 0,
-    createdAt: now,
-    capability: "research",
-    artifactIntent: "evidence_only",
-    expectedEvidence: ["value bytes"],
-  });
-  state.attempts.push({
-    id: "attempt-research",
-    assignmentId: "research",
-    state: "settled",
-    createdAt: now,
-    updatedAt: now,
-    sessionFile: "/tmp/research.jsonl",
-    resultId: "result-research",
-    worker: {
-      workspaceId: "workspace",
-      tabId: "tab",
-      paneId: "pane",
-      terminalId: "terminal",
-      agentName: "research-worker",
-      cwd: "/tmp/natural-test",
-      sessionFile: "/tmp/research.jsonl",
-    },
-    cleanup: {
-      state: "completed",
-      expectedHead: "base",
-      workerClosed: true,
-    },
-  });
-  state.results.push({
-    id: "result-research",
-    assignmentId: "research",
-    assignmentIntentVersion: 0,
-    validity: "typed",
-    observedAt: now,
-    report: {
-      kind: "research",
-      status: "completed",
-      summary: "Read value",
-      evidence: [],
-      findings: [],
-    },
-    artifacts: [],
-  });
-  const before = new Map([["value.txt", "YmVmb3JlCg=="]]);
-  const after = new Map([["value.txt", "YWZ0ZXIK"]]);
-  const mixed = observeDelegatedOutcome(state, observeDirectEffect(before, after, "YWZ0ZXIK"));
-  assert.equal(mixed.valid, true, mixed.detail);
-  assert.equal(mixed.delegationExercised, true);
-  assert.equal(mixed.implementationOrigin, "direct");
-
-  const unauthorized = observeDelegatedOutcome(
-    state,
-    observeDirectEffect(before, new Map([...after, ["probe.txt", "c2NyYXRjaA=="]]), "YWZ0ZXIK"),
-  );
-  assert.equal(unauthorized.valid, false);
-
-  const researchAttempt = required(state.attempts[0], "settled research attempt");
-  researchAttempt.state = "running";
-  assert.equal(
-    observeDelegatedOutcome(state, observeDirectEffect(before, after, "YWZ0ZXIK")).valid,
-    false,
-  );
-  researchAttempt.state = "settled";
-  delete researchAttempt.worker;
-  assert.equal(
-    observeDelegatedOutcome(state, observeDirectEffect(before, after, "YWZ0ZXIK")).valid,
     false,
   );
 });

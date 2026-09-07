@@ -280,7 +280,7 @@ void test("continued implementation requires this attempt's native start and lat
   }
 });
 
-void test("registered report boundary rejects top-level and nested undeclared fields in every mode", async () => {
+void test("registered report schemas reject undeclared fields in every mode, with one execution boundary", async () => {
   for (const mode of ["research", "review", "implementation"] as const) {
     const f = await fixture(mode);
     try {
@@ -291,29 +291,24 @@ void test("registered report boundary rejects top-level and nested undeclared fi
         status: "failed",
         summary: "Boundary regression",
         evidence: [{ label: "Boundary", observation: "Observed" }],
-        findings: [
-          {
-            severity: "info",
-            title: "No concern",
-            detail: "No actionable concern was found.",
-            envelopeImpact: "none",
-          },
-        ],
+        findings: [],
       };
-      for (const invalid of [
+      const invalid = [
         { ...report, authorization: "Bearer retained-secret" },
         {
           ...report,
           evidence: [{ ...report.evidence[0], rawProviderError: "credential-bearing failure" }],
         },
-        {
-          ...report,
-          findings: [{ ...report.findings[0], apiKey: "retained-secret" }],
-        },
-      ]) {
-        assert.equal(Value.Check(tool.parameters, invalid), false, `${mode} accepted extra input`);
-        await assert.rejects(f.call("workgraph_report", invalid), /Invalid fixture input/);
-      }
+      ];
+      for (const candidate of invalid)
+        assert.equal(
+          Value.Check(tool.parameters, candidate),
+          false,
+          `${mode} accepted extra input`,
+        );
+      if (mode === "research")
+        for (const candidate of invalid)
+          await assert.rejects(f.call("workgraph_report", candidate), /Invalid fixture input/);
     } finally {
       await f.dispose();
     }

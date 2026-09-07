@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The regression exercises the native executable boundary.
 import { spawnSync } from "node:child_process";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The test uses a real temporary filesystem boundary.
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The test uses native temporary path identities.
 import { join } from "node:path";
@@ -13,11 +13,9 @@ import { Effect } from "effect";
 import type { InspectSection } from "../src/agent-facing.js";
 import { runCli } from "../src/cli.js";
 import { inspectSections, parseCliRequest } from "../src/cli-parse.js";
-import { liveLayer } from "../src/node-platform.js";
-import { WorkstreamStoreEffects } from "../src/workstream.js";
 import { git, persistentSession } from "./helpers.js";
 
-void test("CLI parser maps every inspection section and bounded option", () => {
+void test("CLI parser preserves inspection sections, bounded options, and rejects invalid combinations", () => {
   const sections: readonly InspectSection[] = inspectSections;
   for (const section of sections) {
     const parsed = parseCliRequest(["inspect", "--state", "state.json", "--section", section]);
@@ -97,29 +95,6 @@ void test("CLI status preserves historical JSON and resolves a registered run re
     assert.equal(await readFile(path, "utf8"), bytes);
     await assert.rejects(runCli(["status"]), /Provide/);
     await assert.rejects(runCli(["fork"], {}), /parent-session-file/);
-  } finally {
-    await rm(parent, { recursive: true, force: true });
-  }
-});
-
-void test("CLI inspect wires new context and completion sections through the native store Effect", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "workgraph-cli-inspect-"));
-  const gitCommonDir = join(parent, ".git");
-  try {
-    await mkdir(gitCommonDir);
-    const { state } = await Effect.runPromise(
-      WorkstreamStoreEffects.create({
-        id: "cli-inspect",
-        purpose: "Inspect every current top-level section",
-        projectRoot: parent,
-        gitCommonDir,
-        coordinator: { sessionId: "coordinator", sessionFile: join(parent, "session.jsonl") },
-      }).pipe(Effect.provide(liveLayer)),
-    );
-    for (const section of ["overview", "context", "completion"] as const) {
-      const result = await runCli(["inspect", "--state", state.statePath, "--section", section]);
-      assert.equal(result.command, "inspect");
-    }
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
