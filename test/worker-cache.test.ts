@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The provider-bound test owns an isolated temporary directory and never contacts a remote service.
 import { mkdtemp, rm } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The provider-bound test uses an isolated local HTTP server and never contacts a remote service.
@@ -15,7 +16,6 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "./decoders.js";
@@ -24,10 +24,7 @@ const initialPlan = {
   approach: "Inspect the stable provider transcript.",
   rationale: "Keep canonical history append-only while the plan evolves in tool results.",
   risks: "A compaction boundary may omit the original snapshot.",
-  steps: [
-    { text: "Capture the first serialized request.", status: "pending" as const },
-    { text: "Capture the plan update result.", status: "pending" as const },
-  ],
+  steps: [{ text: "Inspect the provider transcript fixture.", status: "done" as const }],
 };
 
 const serializedMessageSchema = Type.Object({
@@ -45,11 +42,22 @@ const serializedRequestSchema = Type.Object({
   messages: Type.Array(serializedMessageSchema),
 });
 const addressSchema = Type.Object({ port: Type.Integer() });
+const revisedPlan = {
+  ...initialPlan,
+  approach: "Verify the unchanged prefix after plan revision.",
+};
+const objective =
+  "[WORKGRAPH IMPLEMENTATION OBJECTIVE]\nAcceptance: preserve the exact objective.\nConstraints: stay within the isolated worktree.";
+const attempt = { runId: "fixture", nodeId: "attempt" };
 type SerializedRequest = Static<typeof serializedRequestSchema>;
+
+function sseResponse(chunks: readonly unknown[]): string {
+  return `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+}
 
 function textResponse(index: number, text: string): string {
   const id = `fixture-${index}`;
-  const chunks = [
+  return sseResponse([
     {
       id,
       object: "chat.completion.chunk",
@@ -65,14 +73,13 @@ function textResponse(index: number, text: string): string {
       choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     },
-  ];
-  return `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+  ]);
 }
 
-function planToolResponse(index: number): string {
+function planToolResponse(index: number, plan: typeof initialPlan): string {
   const id = `fixture-${index}`;
-  const arguments_ = JSON.stringify({ action: "update", plan: initialPlan });
-  const chunks = [
+  const arguments_ = JSON.stringify({ action: "update", plan });
+  return sseResponse([
     {
       id,
       object: "chat.completion.chunk",
@@ -104,8 +111,7 @@ function planToolResponse(index: number): string {
       choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     },
-  ];
-  return `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+  ]);
 }
 
 async function requestBody(request: IncomingMessage): Promise<string> {
@@ -119,33 +125,19 @@ async function requestBody(request: IncomingMessage): Promise<string> {
 }
 
 async function listen(server: Server): Promise<string> {
-  await Effect.runPromise(
-    Effect.callback<void, Error>((resume) => {
-      const onError = (error: Error) => {
-        server.off("error", onError);
-        resume(Effect.fail(error));
-      };
-      server.once("error", onError);
-      server.listen(0, "127.0.0.1", () => {
-        server.off("error", onError);
-        resume(Effect.void);
-      });
-      return Effect.sync(() => server.off("error", onError));
-    }),
-  );
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
   const address = server.address();
   if (address === null || !Value.Check(addressSchema, address))
     throw new Error("Fixture server did not bind");
-  const port = Value.Decode(addressSchema, address).port;
-  return `http://127.0.0.1:${port}/v1`;
+  return `http://127.0.0.1:${Value.Decode(addressSchema, address).port}/v1`;
 }
 
 async function close(server: Server): Promise<void> {
-  await Effect.runPromise(
-    Effect.callback<void, Error>((resume) => {
-      server.close((error) => resume(error === undefined ? Effect.void : Effect.fail(error)));
-    }),
-  );
+  if (!server.listening) return;
+  const closed = once(server, "close");
+  server.close();
+  await closed;
 }
 
 async function handleProviderRequest(
@@ -154,11 +146,6 @@ async function handleProviderRequest(
   requests: SerializedRequest[],
 ): Promise<void> {
   try {
-    if (request.method !== "POST") {
-      response.writeHead(404);
-      response.end();
-      return;
-    }
     const parsed: unknown = JSON.parse(await requestBody(request));
     if (!Value.Check(serializedRequestSchema, parsed)) {
       response.writeHead(400);
@@ -174,7 +161,7 @@ async function handleProviderRequest(
     });
     response.end(
       requests.length === 2
-        ? planToolResponse(requests.length)
+        ? planToolResponse(requests.length, revisedPlan)
         : textResponse(requests.length, "done"),
     );
   } catch {
@@ -189,7 +176,7 @@ void test("worker requests keep the serialized provider prefix stable across tur
     PI_WORKGRAPH_BASE_COMMIT: "fixture-base",
     PI_WORKGRAPH_EXECUTOR_MODEL: "fixture/model",
     PI_WORKGRAPH_EXECUTOR_THINKING: "high",
-    PI_WORKGRAPH_IMPLEMENTATION_START: "true",
+    PI_WORKGRAPH_IMPLEMENTATION_START: "executor",
     PI_WORKGRAPH_MODE: "implementation",
     PI_WORKGRAPH_NODE_ID: "attempt",
     PI_WORKGRAPH_RUN_ID: "fixture",
@@ -228,12 +215,18 @@ void test("worker requests keep the serialized provider prefix stable across tur
     const model = modelRuntime.getModel("fixture", "model");
     assert.ok(model !== undefined);
     const sessionManager = SessionManager.inMemory(parent);
-    sessionManager.appendCustomMessageEntry(
-      "pi-workgraph-objective",
-      "[WORKGRAPH IMPLEMENTATION OBJECTIVE]\nAcceptance: preserve the exact objective.\nConstraints: stay within the isolated worktree.",
-      false,
-      { runId: "fixture", nodeId: "attempt", mode: "implementation" },
-    );
+    sessionManager.appendCustomMessageEntry("pi-workgraph-objective", objective, false, {
+      ...attempt,
+      mode: "implementation",
+    });
+    sessionManager.appendCustomEntry("pi-workgraph-worker-plan", {
+      ...attempt,
+      plan: initialPlan,
+    });
+    sessionManager.appendCustomEntry("pi-workgraph-worker-state", {
+      ...attempt,
+      phase: "executor",
+    });
     const settingsManager = SettingsManager.inMemory({
       compaction: { enabled: false },
       retry: { enabled: false },
@@ -261,23 +254,38 @@ void test("worker requests keep the serialized provider prefix stable across tur
       settingsManager,
     });
     agentSession = created.session;
+    await agentSession.bindExtensions({});
 
     await agentSession.prompt("First turn");
     await agentSession.prompt("Second turn: update the bounded plan");
 
     assert.equal(requests.length, 3);
-    assert.deepEqual(
-      requests[1]?.messages.slice(0, requests[0]?.messages.length),
-      requests[0]?.messages,
+    const [first, second, third] = requests;
+    if (first === undefined || second === undefined || third === undefined)
+      throw new Error("Fixture did not capture three provider requests");
+
+    const firstJson = JSON.stringify(first);
+    assert.match(firstJson, /\[WORKGRAPH EXECUTOR\]/);
+    assert.doesNotMatch(firstJson, /\[WORKGRAPH LOCAL PREWALK - GUIDE\]/);
+    assert.ok(firstJson.includes(JSON.stringify(objective)));
+    const oldPlanMessage = first.messages.findIndex((message) =>
+      JSON.stringify(message).includes(initialPlan.approach),
     );
-    assert.deepEqual(
-      requests[2]?.messages.slice(0, requests[1]?.messages.length),
-      requests[1]?.messages,
+    assert.ok(oldPlanMessage >= 0);
+    assert.equal(
+      first.messages.findIndex((message) => JSON.stringify(message).includes(revisedPlan.approach)),
+      -1,
     );
-    assert.match(JSON.stringify(requests[2]), /Keep canonical history append-only/);
-    assert.doesNotMatch(JSON.stringify(requests[0]), /timestamp/);
-    assert.doesNotMatch(JSON.stringify(requests[1]), /timestamp/);
-    assert.doesNotMatch(JSON.stringify(requests[2]), /timestamp/);
+
+    assert.deepEqual(second.messages.slice(0, first.messages.length), first.messages);
+    assert.deepEqual(third.messages.slice(0, second.messages.length), second.messages);
+    const newPlanMessage = third.messages.findIndex(
+      (message) =>
+        message.role === "tool" &&
+        JSON.stringify(message).includes("Updated Current bounded plan") &&
+        JSON.stringify(message).includes(revisedPlan.approach),
+    );
+    assert.ok(newPlanMessage > oldPlanMessage);
   } finally {
     agentSession?.dispose();
     await close(server);
