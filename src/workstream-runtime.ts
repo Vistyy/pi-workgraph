@@ -1265,7 +1265,6 @@ export class WorkstreamRuntime {
         yield* this.beginCleanupIfNeeded(cancelled);
         yield* this.storeEffect((store) => store.markWorkerClosed(attemptId));
         yield* this.cleanup(attemptId);
-        yield* this.releaseCancelledExperiment(attemptId);
       }.bind(this),
     );
   }
@@ -1290,30 +1289,9 @@ export class WorkstreamRuntime {
         if (cancelled.placement === undefined) return;
         yield* this.beginCleanupIfNeeded(cancelled);
         yield* this.cleanup(attemptId);
-        yield* this.releaseCancelledExperiment(attemptId);
         const latest = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
         if (interruptionError !== undefined && latest.cleanup?.state !== "completed")
           yield* this.recordAttemptFailure(attemptId, interruptionError);
-      }.bind(this),
-    );
-  }
-
-  private releaseCancelledExperiment(attemptId: string): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const state = yield* this.storeEffect((store) => store.load());
-        const attempt = findAttempt(state, attemptId);
-        const assignment = findAssignment(state, attempt.assignmentId);
-        if (
-          attempt.state === "cancelled" &&
-          attempt.cleanup?.state === "completed" &&
-          attempt.placement?.kind === "isolated_worktree" &&
-          assignment.artifactIntent === "disposable_experiment"
-        )
-          yield* this.releaseOutputEffect(
-            attemptId,
-            "Cancellation discards this disposable experiment output.",
-          );
       }.bind(this),
     );
   }

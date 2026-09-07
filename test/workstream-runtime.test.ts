@@ -1315,7 +1315,7 @@ await test("owned idle-worker cancellation closes without a model turn or fabric
   }
 });
 
-await test("cancelling a disposable experiment closes its worker and releases its output", async () => {
+await test("cancelling a disposable experiment retains output through reconciliation and completion until explicit release", async () => {
   const f = await fixture();
   try {
     f.workers.deferWork = true;
@@ -1337,16 +1337,66 @@ await test("cancelling a disposable experiment closes its worker and releases it
     await runRuntime(active.effects.reconcile);
     const attempt = required((await f.store.load()).attempts[0], "experiment attempt");
     const placement = required(attempt.placement, "experiment placement");
+    if (placement.kind !== "isolated_worktree")
+      throw new Error("Experiment placement must be isolated.");
+    const retainedFile = join(placement.path, "cancelled-output.txt");
+    await writeFile(retainedFile, "retained after cancellation\n");
     await runRuntime(active.effects.cancel(attempt.id));
-    const state = await f.store.load();
+    let state = await f.store.load();
     assert.equal(state.attempts[0]?.state, "cancelled");
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
-    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
+    assert.equal(state.attempts[0]?.outputRelease, undefined);
+    assert.equal(await readFile(retainedFile, "utf8"), "retained after cancellation\n");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      true,
+    );
+    assert.equal(
+      (await git(f.root, "branch", "--list", placement.branch)).includes(placement.branch),
+      true,
+    );
     assert.equal(f.workers.promptCount, 0);
+
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.state, "cancelled");
+    assert.equal(state.attempts[0]?.outputRelease, undefined);
+    assert.equal(await readFile(retainedFile, "utf8"), "retained after cancellation\n");
+
+    state = await submit(
+      active,
+      f.store.effects.complete({
+        conclusion: "The cancelled experiment remains available for inspection.",
+        evidence: [{ label: "retained output", observation: "The cancelled worktree is intact." }],
+        limitations: [],
+        reasons: [
+          {
+            taskId: "cancel-experiment",
+            reason: "Cancellation stopped the probe before it produced a result.",
+          },
+        ],
+      }),
+    );
+    assert.equal(state.lifecycle.state, "completed");
+    assert.equal(await readFile(retainedFile, "utf8"), "retained after cancellation\n");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      true,
+    );
+
+    state = await runRuntime(
+      active.effects.releaseOutput(
+        attempt.id,
+        "The cancelled experiment output is no longer needed.",
+      ),
+    );
+    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
+    await assert.rejects(readFile(retainedFile, "utf8"));
     assert.equal(
       (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
       false,
     );
+    assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
   } finally {
     await f.dispose();
   }
@@ -1408,12 +1458,14 @@ await test("pre-session cancellation cleans only the known placement and never l
     await runRuntime(
       active.effects.queue({
         id: "cancel-before-session-checkpoint",
-        capability: "implement",
-        artifactIntent: "maintained_change",
+        capability: "research",
+        artifactIntent: "disposable_experiment",
         objective: "Cancel before the session checkpoint",
-        intentVersion: 1,
+        intentVersion: authority.intentVersion,
         authority,
-        acceptance: ["No native worker is launched"],
+        permittedEffects: ["Write only inside the isolated worktree"],
+        stopCondition: "Cancellation requested",
+        expectedEvidence: ["No native worker is launched"],
       }),
     );
     await runRuntime(active.effects.reconcile);
@@ -1427,7 +1479,13 @@ await test("pre-session cancellation cleans only the known placement and never l
     state = await f.store.load();
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.outputRelease, undefined);
     assert.equal(f.workers.requests.length, 0);
+    assert.ok(attempt.placement);
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(attempt.placement.path),
+      true,
+    );
   } finally {
     await f.dispose();
   }

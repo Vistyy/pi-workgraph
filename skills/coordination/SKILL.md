@@ -59,7 +59,7 @@ Adoption preserves suspension and rejects competing or uncertain ownership.
 Keep blocked work and its evidence rather than rewriting state to claim cleanup or completion.
 Worker settlement never applies output. Close a proven stopped worker even when its report is failed or malformed; inspect retained output separately.
 Apply selected current maintained output only with `workgraph_control` action `apply`, its exact attempt, exact reported `sourceCommit`, and freshly observed current `destinationHead`. This uses existing human authority and is not another approval or mandatory-review step.
-Experiments and unapplied implementations retain their complete isolated worktree. Release unselected output only when no longer needed with action `release_output`, its exact attempt, and a destructive reason; this remains available after semantic completion. Cancellation releases disposable experiment output after closure.
+Experiments and unapplied implementations retain their complete isolated worktree. Release unselected output only when no longer needed with action `release_output`, its exact attempt, and a destructive reason; this remains available after semantic completion. Cancellation closes the worker after independently proven closure but retains disposable experiment output until an explicit `release_output`.
 Do not retry interrupted application or release automatically. Unknown or foreign resources remain retained with explicit diagnostics.
 
 When you need installation, tool, model-policy, or live-scenario details, read [README.md](../../README.md).
