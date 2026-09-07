@@ -124,7 +124,7 @@ function stringField(value: JsonObject, key: string): string | undefined {
 }
 
 export function isKnownHistoricalWorkstreamVersion(value: JsonValue | undefined): boolean {
-  return value === 1 || value === 2 || value === 3 || value === 4;
+  return value === 1 || value === 2 || value === 3 || value === 4 || value === 5;
 }
 
 export function isActiveHistoricalState(value: JsonObject): boolean {
@@ -466,20 +466,10 @@ function validateAttemptPlacement(state: WorkstreamState, attempt: WorkAttempt):
     throw new InvalidWorkstreamStateError(
       `Attempt ${attempt.id} shared placement must be the project root.`,
     );
-  if (placement.kind === "isolated_worktree") {
-    if (attempt.baseRevision === undefined)
-      throw new InvalidWorkstreamStateError(
-        `Attempt ${attempt.id} isolated placement has no base revision.`,
-      );
-    if (attempt.worktreePath !== placement.path || attempt.branch !== placement.branch)
-      throw new InvalidWorkstreamStateError(
-        `Attempt ${attempt.id} isolated placement compatibility fields disagree.`,
-      );
-  } else if (attempt.worktreePath !== undefined || attempt.branch !== undefined) {
+  if (placement.kind === "isolated_worktree" && attempt.baseRevision === undefined)
     throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} shared placement has isolated compatibility fields.`,
+      `Attempt ${attempt.id} isolated placement has no base revision.`,
     );
-  }
 }
 
 function validateDeliveries(state: WorkstreamState, resultIds: Set<string>): void {

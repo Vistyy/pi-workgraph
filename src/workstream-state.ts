@@ -7,7 +7,7 @@ import { Value } from "typebox/value";
 import { ModelTargetSchema } from "./model-policy.js";
 import { EvidenceSchema, WorkerReportSchema } from "./report-schema.js";
 
-export const WORKSTREAM_STATE_VERSION = 5 as const;
+export const WORKSTREAM_STATE_VERSION = 6 as const;
 export const WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
 
 export function pathForWorkstream(gitCommonDir: string, id: string): string {
@@ -152,8 +152,6 @@ export const ArtifactSchema = Type.Object(
 );
 const ResultBase = {
   id: NonEmptyStringSchema,
-  /** Stable UUID retained for recovery and compatibility; semantic ids are the normal handle. */
-  uuidAlias: Type.Optional(NonEmptyStringSchema),
   assignmentId: NonEmptyStringSchema,
   assignmentIntentVersion: Type.Integer({ minimum: 0 }),
   artifacts: Type.Array(ArtifactSchema),
@@ -255,8 +253,6 @@ export const AttemptPlacementSchema = Type.Union([
 export const AttemptSchema = Type.Object(
   {
     id: NonEmptyStringSchema,
-    /** Stable UUID retained for recovery and compatibility; semantic ids are the normal handle. */
-    uuidAlias: Type.Optional(NonEmptyStringSchema),
     assignmentId: NonEmptyStringSchema,
     state: StringEnum([
       "queued",
@@ -336,10 +332,6 @@ export const AttemptSchema = Type.Object(
     ),
     sessionFile: Type.Optional(NonEmptyStringSchema),
     placement: Type.Optional(AttemptPlacementSchema),
-    /** @deprecated Derived only for isolated placement compatibility views. */
-    worktreePath: Type.Optional(NonEmptyStringSchema),
-    /** @deprecated Derived only for isolated placement compatibility views. */
-    branch: Type.Optional(NonEmptyStringSchema),
     baseRevision: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
     worker: Type.Optional(
       Type.Object(
@@ -443,6 +435,7 @@ export const RetainedTerminalEnvelopeSchema = Type.Object(
       Type.Literal(2),
       Type.Literal(3),
       Type.Literal(4),
+      Type.Literal(5),
       Type.Literal(WORKSTREAM_STATE_VERSION),
     ]),
     revision: Type.Integer({ minimum: 0 }),

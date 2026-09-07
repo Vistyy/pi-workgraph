@@ -12,7 +12,7 @@ import { openRepository } from "../src/git.js";
 import {
   type HerdrObservation,
   HerdrProtocolError,
-  herdrAgentName,
+  herdrWorkerName,
   type WorkerLaunchEffectRequest,
   WorkerLaunchError,
 } from "../src/herdr.js";
@@ -64,7 +64,7 @@ class NativeFailureWorker {
           tabId: `tab-${request.attemptId}`,
           paneId: `pane-${request.attemptId}`,
           terminalId: `terminal-${request.attemptId}`,
-          agentName: herdrAgentName(request.runId, request.nodeId, request.attemptId),
+          agentName: herdrWorkerName(request),
           sessionFile: request.sessionFile,
           cwd: request.cwd,
         };

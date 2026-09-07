@@ -39,27 +39,10 @@ const GENERIC_ASSIGNMENT_IDS = new Set([
 ]);
 
 export function herdrWorkerName(request: WorkerNamingContext): string {
-  if (
-    request.assignmentId === undefined &&
-    request.objective === undefined &&
-    request.role === undefined
-  )
-    return herdrAgentName(request.runId, request.nodeId ?? "worker", request.attemptId);
   const role = request.role ?? "research";
   return readableIdentityName(
     readableSlug(workerSubject(request)) || "task",
     role,
-    workerIdentity(request),
-  );
-}
-
-/** Compatibility identity for workers launched by the first task-first release. */
-export function legacyObjectiveHerdrWorkerName(request: WorkerNamingContext): string {
-  const assignmentId = request.assignmentId ?? request.nodeId ?? "assignment";
-  const objective = request.objective ?? request.nodeId ?? assignmentId;
-  return readableIdentityName(
-    readableSlug(objective) || readableSlug(assignmentId) || "task",
-    request.role ?? "research",
     workerIdentity(request),
   );
 }
@@ -116,17 +99,6 @@ function sentenceCase(value: string): string {
   return value ? `${value[0]?.toUpperCase()}${value.slice(1)}` : value;
 }
 
-/** Compatibility identity for resources launched before task-first names. */
-export function legacyHerdrAgentName(runId: string, nodeId: string, attemptId: string): string {
-  const node = legacySlug(nodeId).slice(0, 12) || "worker";
-  return `wg-${node}-${identitySuffix(`${runId}\0${nodeId}\0${attemptId}`, 12)}`;
-}
-
-/** @deprecated Use herdrWorkerName with assignment context for new launches. */
-export function herdrAgentName(runId: string, nodeId: string, attemptId: string): string {
-  return legacyHerdrAgentName(runId, nodeId, attemptId);
-}
-
 function readableIdentityName(
   subject: string,
   role: WorkerRole | "coordinator",
@@ -170,14 +142,6 @@ function readableSlug(value: string): string {
     .toLowerCase()
     .replace(/[’']/g, "")
     .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^[^a-z]+/, "")
-    .replace(/-+$/g, "");
-}
-
-function legacySlug(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, "-")
     .replace(/^[^a-z]+/, "")
     .replace(/-+$/g, "");
 }

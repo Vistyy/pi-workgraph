@@ -11,7 +11,7 @@ import { openRepository } from "../src/git.js";
 import {
   type HerdrObservation,
   HerdrProtocolError,
-  herdrAgentName,
+  herdrWorkerName,
   type WorkerLaunchEffectRequest,
   WorkerLaunchError,
 } from "../src/herdr.js";
@@ -141,7 +141,7 @@ class Worker {
             tabId: `w1:t${index}`,
             paneId: `w1:p${index}`,
             terminalId: `term${index}`,
-            agentName: herdrAgentName(request.runId, request.nodeId, request.attemptId),
+            agentName: herdrWorkerName(request),
             sessionFile: request.sessionFile,
             cwd: request.cwd,
           };
@@ -189,8 +189,9 @@ class Worker {
         }.bind(this),
       ),
     recover: (request) => {
-      const names = new Set([request.agentName, ...(request.compatibleAgentNames ?? [])]);
-      const identity = [...this.identities.values()].find((item) => names.has(item.agentName));
+      const identity = [...this.identities.values()].find(
+        (item) => item.agentName === request.agentName,
+      );
       return identity === undefined
         ? Effect.as(Effect.void, undefined)
         : this.effects.observe(identity);

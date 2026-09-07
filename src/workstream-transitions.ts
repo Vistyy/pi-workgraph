@@ -75,13 +75,6 @@ export function startAttemptTransition(
   if (attempt.state !== "queued") throw new Error(`Attempt ${input.id} is not awaiting launch.`);
   attempt.state = "starting";
   attempt.placement = structuredClone(input.placement);
-  if (input.placement.kind === "isolated_worktree") {
-    attempt.worktreePath = input.placement.path;
-    attempt.branch = input.placement.branch;
-  } else {
-    delete attempt.worktreePath;
-    delete attempt.branch;
-  }
   if (input.baseRevision !== undefined) attempt.baseRevision = input.baseRevision;
   else delete attempt.baseRevision;
   attempt.submission = "not_sent";

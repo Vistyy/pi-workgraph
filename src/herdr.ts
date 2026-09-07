@@ -54,12 +54,9 @@ export {
 } from "./herdr-launch.js";
 export type { WorkerNamingContext, WorkerRole } from "./herdr-naming.js";
 export {
-  herdrAgentName,
   herdrCoordinatorNames,
   herdrWorkerName,
   herdrWorkerTabLabel,
-  legacyHerdrAgentName,
-  legacyObjectiveHerdrWorkerName,
 } from "./herdr-naming.js";
 export { HERDR_PROTOCOL_OUTPUT_LIMIT, HerdrProtocolError } from "./herdr-protocol.js";
 
@@ -90,7 +87,6 @@ export type HerdrInspection = HerdrObservation | HerdrAbsentObservation;
 export interface WorkerRecoveryRequest {
   workspaceId: string;
   agentName: string;
-  compatibleAgentNames?: readonly string[];
   sessionFile: string;
   cwd: string;
   resource?: WorkerResourceIdentity;
@@ -397,10 +393,6 @@ export class HerdrCliRuntime {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
         const agents = yield* this.transport.call(["api", "snapshot"], decodeSnapshotResponse);
-        const compatibleAgentNames = new Set([
-          request.agentName,
-          ...(request.compatibleAgentNames ?? []),
-        ]);
         const matches = agents.filter((candidate) => {
           if (candidate.name === undefined) return false;
           const sessionFile = candidate.agent_session?.value;
@@ -413,7 +405,7 @@ export class HerdrCliRuntime {
               candidate.name === resource.agentName &&
               candidate.cwd === resource.cwd
             : candidate.workspace_id === request.workspaceId &&
-              compatibleAgentNames.has(candidate.name) &&
+              candidate.name === request.agentName &&
               candidate.cwd === request.cwd;
           return (
             resourceMatches &&

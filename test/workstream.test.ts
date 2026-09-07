@@ -457,8 +457,11 @@ void test("every independent attempt remains accounted for regardless of result 
         await runStore(
           store.startAttempt({
             id: `attempt-${index}`,
-            worktreePath: `/tmp/worktree-${index}`,
-            branch: `branch-${index}`,
+            placement: {
+              kind: "isolated_worktree",
+              path: `/tmp/worktree-${index}`,
+              branch: `branch-${index}`,
+            },
             baseRevision: "a".repeat(40),
           }),
         );

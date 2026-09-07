@@ -13,12 +13,9 @@ import {
   HERDR_PROTOCOL_OUTPUT_LIMIT,
   HerdrCliRuntime,
   HerdrProtocolError,
-  herdrAgentName,
   herdrCoordinatorNames,
   herdrWorkerName,
   herdrWorkerTabLabel,
-  legacyHerdrAgentName,
-  legacyObjectiveHerdrWorkerName,
   WorkerLaunchError,
   WorkerLaunchPlacementError,
 } from "../src/herdr.js";
@@ -52,12 +49,6 @@ await test("worker tabs use concise task text while native names remain unique a
   });
   assert.equal(fallback, "↳ Implement");
   assert.ok(fallback.length <= 18);
-  assert.equal(
-    herdrAgentName("run", "node", "attempt"),
-    legacyHerdrAgentName("run", "node", "attempt"),
-  );
-  assert.notEqual(legacyObjectiveHerdrWorkerName(request), herdrWorkerName(request));
-
   const semanticId = herdrWorkerTabLabel({
     ...request,
     assignmentId: "tool-design",
@@ -88,7 +79,7 @@ await test("Herdr identity validation rejects missing and mismatched native sess
     tabId: "workspace-1:tab-1",
     paneId: "workspace-1:pane-1",
     terminalId: "terminal-1",
-    agentName: herdrAgentName("run", "node", "attempt"),
+    agentName: herdrWorkerName({ runId: "run", nodeId: "node", attemptId: "attempt" }),
     sessionFile: join(parent, "worker.jsonl"),
     cwd: join(parent, "worktree"),
   };
@@ -527,15 +518,7 @@ await test("the Herdr adapter launches without waiting and validates exact ident
     const recovered = await runEffect(
       runtime.effects.recover({
         workspaceId: "workspace-1",
-        agentName: herdrWorkerName({
-          runId: "run",
-          nodeId: "node",
-          attemptId: "attempt",
-          assignmentId: "assignment",
-          objective: "Inspect the node",
-          role: "research",
-        }),
-        compatibleAgentNames: [observation.identity.agentName],
+        agentName,
         sessionFile,
         cwd,
       }),
@@ -576,7 +559,7 @@ await test("the Herdr launch can wait for native session identity without submit
   const command = join(parent, "fake-herdr-readiness.mjs");
   const cwd = join(parent, "worktree");
   const sessionFile = join(parent, "worker.jsonl");
-  const agentName = herdrAgentName("run", "node", "attempt");
+  const agentName = herdrWorkerName({ runId: "run", nodeId: "node", attemptId: "attempt" });
   const resource = {
     workspace_id: "workspace-1",
     tab_id: "workspace-1:tab-1",
@@ -655,7 +638,7 @@ await test("the Herdr launch retains a blocked resource without submitting an as
   const command = join(parent, "fake-herdr-blocked.mjs");
   const cwd = join(parent, "worktree");
   const sessionFile = join(parent, "worker.jsonl");
-  const agentName = herdrAgentName("run", "node", "attempt");
+  const agentName = herdrWorkerName({ runId: "run", nodeId: "node", attemptId: "attempt" });
   const agent = {
     workspace_id: "workspace-1",
     tab_id: "workspace-1:tab-1",
@@ -739,7 +722,7 @@ await test("read-only startup inspection distinguishes exact live, absent, and m
     sessionFile,
     cwd,
   };
-  const agentName = herdrAgentName("run", "node", "attempt");
+  const agentName = herdrWorkerName({ runId: "run", nodeId: "node", attemptId: "attempt" });
   const pane = {
     workspace_id: request.workspaceId,
     tab_id: request.tabId,
@@ -920,7 +903,7 @@ await test("cancelling Effect-native readiness terminates its owned native child
   const terminated = join(parent, "terminated");
   const cwd = join(parent, "worktree");
   const sessionFile = join(parent, "worker.jsonl");
-  const agentName = herdrAgentName("run", "node", "attempt");
+  const agentName = herdrWorkerName({ runId: "run", nodeId: "node", attemptId: "attempt" });
   const resource = {
     workspace_id: "workspace-1",
     tab_id: "workspace-1:tab-1",
@@ -990,7 +973,7 @@ await test("launch rejects conflicting returned placement without adopting or pr
     pane_id: "foreign-workspace:pane-9",
     terminal_id: "foreign-terminal",
     agent_status: "idle",
-    name: herdrAgentName("run", "node", "attempt"),
+    name: herdrWorkerName({ runId: "run", nodeId: "node", attemptId: "attempt" }),
     cwd: join(parent, "foreign-worktree"),
   };
   await writeFile(
@@ -1128,7 +1111,7 @@ await test("cancellation waits for every Effect checkpoint and starts no later o
   const durable = join(parent, "durable.jsonl");
   const cwd = join(parent, "worktree");
   const sessionFile = join(parent, "worker.jsonl");
-  const agentName = herdrAgentName("run", "node", "attempt");
+  const agentName = herdrWorkerName({ runId: "run", nodeId: "node", attemptId: "attempt" });
   const agent = {
     workspace_id: "workspace-1",
     tab_id: "workspace-1:tab-1",

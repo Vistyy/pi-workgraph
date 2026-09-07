@@ -113,11 +113,7 @@ function outcomeHandle(state: WorkstreamState, result: WorkResult): string {
 }
 
 function attemptMatches(state: WorkstreamState, attempt: WorkAttempt, handle: string): boolean {
-  return (
-    attempt.id === handle ||
-    attempt.uuidAlias === handle ||
-    attemptHandle(state, attempt) === handle
-  );
+  return attempt.id === handle || attemptHandle(state, attempt) === handle;
 }
 
 export function resolveAttemptHandle(
@@ -143,9 +139,7 @@ export function resolveAttemptHandle(
 }
 
 function resultMatches(state: WorkstreamState, result: WorkResult, handle: string): boolean {
-  return (
-    result.id === handle || result.uuidAlias === handle || outcomeHandle(state, result) === handle
-  );
+  return result.id === handle || outcomeHandle(state, result) === handle;
 }
 
 function resolveResultHandle(state: WorkstreamState, handle: string, taskId?: string): WorkResult {
@@ -772,7 +766,6 @@ function recoveryView(
     throw new Error("Recovery inspection requires a task or attempt handle.");
   const exactRecord = {
     storageAttemptId: attempt.id,
-    legacyUuidAlias: attempt.uuidAlias,
     taskId: task.id,
     resource: attempt.resource,
     worker: attempt.worker,
@@ -1013,9 +1006,7 @@ export function actionView(state: WorkstreamState, options: ActionProjectionOpti
       : state.assignments.find((item) => item.id === options.assignmentId);
   const affectedAttempt =
     options.attemptId !== undefined
-      ? state.attempts.find(
-          (item) => item.id === options.attemptId || item.uuidAlias === options.attemptId,
-        )
+      ? state.attempts.find((item) => item.id === options.attemptId)
       : affectedTask === undefined
         ? undefined
         : state.attempts.findLast((item) => item.assignmentId === affectedTask.id);

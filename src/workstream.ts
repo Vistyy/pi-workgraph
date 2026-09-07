@@ -354,14 +354,12 @@ export class WorkstreamStoreEffects {
     attempts:
       | {
           id: string;
-          uuidAlias?: string;
           models: NonNullable<WorkAttempt["models"]>;
           continuationOf?: string;
           baseRevision?: string;
         }
       | Array<{
           id: string;
-          uuidAlias?: string;
           models: NonNullable<WorkAttempt["models"]>;
           continuationOf?: string;
           baseRevision?: string;
@@ -421,30 +419,19 @@ export class WorkstreamStoreEffects {
 
   startAttempt(input: {
     id: string;
-    placement?: Static<typeof AttemptPlacementSchema>;
-    worktreePath?: string;
-    branch?: string;
+    placement: Static<typeof AttemptPlacementSchema>;
     baseRevision?: string;
     now?: Date;
   }): StoreEffect<WorkstreamState> {
-    return this.prepared(
-      () =>
-        input.placement ?? {
-          kind: "isolated_worktree" as const,
-          path: requireTextValue(input.worktreePath, "worktree"),
-          branch: requireTextValue(input.branch, "branch"),
-        },
-      (placement) =>
-        this.changeAttempt(
-          input.id,
-          (attempt) =>
-            startAttemptTransition(attempt, {
-              id: input.id,
-              placement,
-              baseRevision: input.baseRevision,
-            }),
-          input.now,
-        ),
+    return this.changeAttempt(
+      input.id,
+      (attempt) =>
+        startAttemptTransition(attempt, {
+          id: input.id,
+          placement: input.placement,
+          baseRevision: input.baseRevision,
+        }),
+      input.now,
     );
   }
 
@@ -1241,11 +1228,6 @@ function sameValue<T>(left: T, right: T): boolean {
 function requireActive(state: WorkstreamState): void {
   if (state.lifecycle.state !== "active")
     throw new Error(`Workstream is ${state.lifecycle.state}.`);
-}
-
-function requireTextValue(value: string | undefined, label: string): string {
-  if (value === undefined || value.trim().length === 0) throw new Error(`${label} is required.`);
-  return value;
 }
 
 function requireTexts(values: string[], label: string): void {

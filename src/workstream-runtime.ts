@@ -21,8 +21,6 @@ import type { GitFailure, GitRepository, WorktreePlacement } from "./git.js";
 import {
   type HerdrProtocolError,
   herdrWorkerName,
-  legacyHerdrAgentName,
-  legacyObjectiveHerdrWorkerName,
   type WorkerLaunchEffectRequest,
   type WorkerLaunchReadinessError,
   type WorkerRecoveryRequest,
@@ -1426,17 +1424,6 @@ function workerRecoveryRequest(
       objective: assignment.objective,
       role: assignment.capability,
     }),
-    compatibleAgentNames: [
-      legacyObjectiveHerdrWorkerName({
-        runId: state.id,
-        nodeId: attempt.id,
-        attemptId: attempt.id,
-        assignmentId: assignment.id,
-        objective: assignment.objective,
-        role: assignment.capability,
-      }),
-      legacyHerdrAgentName(state.id, attempt.id, attempt.id),
-    ],
     cwd: attempt.placement?.path ?? state.projectRoot,
     sessionFile: required(attempt.sessionFile, "session file"),
   };

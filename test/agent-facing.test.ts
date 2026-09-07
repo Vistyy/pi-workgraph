@@ -84,7 +84,7 @@ function state(
 ): WorkstreamState {
   return {
     format: "pi-workgraph-workstream",
-    version: 5,
+    version: 6,
     revision: 0,
     id: "agent-facing",
     purpose: "Test bounded agent-facing projections.",
