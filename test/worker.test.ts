@@ -17,6 +17,7 @@ import { extensionFixture, git, usage } from "./helpers.js";
 
 const fixtureTimestamp = 1_788_235_200_000;
 const planStepSchema = Type.Object({
+  id: Type.String(),
   text: Type.String(),
   status: Type.Union([
     Type.Literal("pending"),
@@ -34,7 +35,13 @@ const workerPlanSchema = Type.Object({
   steps: Type.Array(planStepSchema),
 });
 const planToolDetailsSchema = Type.Object({
-  action: Type.Union([Type.Literal("get"), Type.Literal("update")]),
+  action: Type.Union([
+    Type.Literal("get"),
+    Type.Literal("update"),
+    Type.Literal("update_step"),
+    Type.Literal("add_step"),
+    Type.Literal("remove_step"),
+  ]),
   plan: Type.Optional(workerPlanSchema),
   planStatus: Type.Union([
     Type.Literal("absent"),
@@ -355,7 +362,87 @@ void test("worker guidance is persisted once per phase and restored once after c
   }
 });
 
-void test("executor can inspect and revise the current plan without bypassing the first-edit handoff", async () => {
+void test("guide update assigns stable IDs; executor uses targeted edits and cannot replace the full plan", async () => {
+  const f = await fixture("implementation");
+  try {
+    const created = await f.call("workgraph_plan", { action: "update", plan: initialPlan });
+    const stored = decodeTestValue(planToolDetailsSchema, created.details).plan;
+    assert.ok(stored !== undefined);
+    assert.deepEqual(
+      stored?.steps.map((step) => step.id),
+      ["step-1", "step-2"],
+    );
+    assert.equal(stored?.approach, initialPlan.approach);
+    assistant(f.session);
+    await writeFile(join(f.root, "value.txt"), "after\n");
+    await f.runner.emit({
+      type: "tool_execution_end",
+      toolCallId: "opaque",
+      toolName: "custom_mutation",
+      result: {},
+      isError: false,
+    });
+    assert.deepEqual(f.selected, ["openai/gpt-4o"]);
+    await assert.rejects(
+      f.call("workgraph_plan", { action: "update", plan: initialPlan }),
+      /Only the guide phase may replace the full plan/,
+    );
+    const kept = decodeTestValue(
+      planToolDetailsSchema,
+      (await f.call("workgraph_plan", { action: "get" })).details,
+    ).plan;
+    assert.equal(kept?.approach, initialPlan.approach);
+    const stepped = await f.call("workgraph_plan", {
+      action: "update_step",
+      id: "step-1",
+      patch: { status: "in_progress", note: "Executor owns this note." },
+    });
+    const steppedPlan = decodeTestValue(planToolDetailsSchema, stepped.details).plan;
+    assert.equal(steppedPlan?.steps[0]?.status, "in_progress");
+    assert.equal(steppedPlan?.steps[0]?.note, "Executor owns this note.");
+    assert.equal(steppedPlan?.steps[0]?.text, kept?.steps[0]?.text);
+    assert.equal(steppedPlan?.approach, initialPlan.approach);
+    const added = await f.call("workgraph_plan", {
+      action: "add_step",
+      text: "Verify the isolated diff and focused checks.",
+      after_id: "step-1",
+    });
+    const addedPlan = decodeTestValue(planToolDetailsSchema, added.details).plan;
+    assert.deepEqual(
+      addedPlan?.steps.map((step) => step.id),
+      ["step-1", "step-3", "step-2"],
+    );
+    assert.equal(addedPlan?.steps[1]?.status, "pending");
+    const removed = await f.call("workgraph_plan", {
+      action: "remove_step",
+      id: "step-2",
+      reason: "Superseded by the narrower verification step.",
+    });
+    const removedPlan = decodeTestValue(planToolDetailsSchema, removed.details).plan;
+    assert.equal(removedPlan?.steps.length, 3);
+    assert.equal(removedPlan?.steps[2]?.status, "superseded");
+    assert.equal(removedPlan?.steps[2]?.note, "Superseded by the narrower verification step.");
+    const restored = await f.call("workgraph_plan", {
+      action: "update_step",
+      id: "step-2",
+      patch: { status: "pending" },
+    });
+    const restoredPlan = decodeTestValue(planToolDetailsSchema, restored.details).plan;
+    assert.equal(restoredPlan?.steps[2]?.status, "pending");
+    assert.equal(restoredPlan?.steps[2]?.note, "Superseded by the narrower verification step.");
+    const current = decodeTestValue(
+      planToolDetailsSchema,
+      (await f.call("workgraph_plan", { action: "get" })).details,
+    );
+    assert.deepEqual(current.plan, restoredPlan);
+    assert.equal(current.attempt.runId, "fixture");
+    assert.equal(current.attempt.nodeId, "attempt");
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("targeted edits reject invalid requests atomically and enforce the retained bound", async () => {
   const f = await fixture("implementation");
   try {
     await f.call("workgraph_plan", { action: "update", plan: initialPlan });
@@ -368,36 +455,242 @@ void test("executor can inspect and revise the current plan without bypassing th
       result: {},
       isError: false,
     });
-    assert.deepEqual(f.selected, ["openai/gpt-4o"]);
-    const revisedPlan = {
-      ...initialPlan,
-      rationale: "The first edit exposed a smaller verification seam than expected.",
-      steps: [
-        {
-          text: "Keep the implementation change and inspect its exact diff.",
-          status: "done" as const,
-        },
-        {
-          text: "Run focused deterministic tests and the project checks.",
-          status: "in_progress" as const,
-          note: "The full check remains before terminal reporting.",
-        },
-        {
-          text: "Reconcile any blocked native boundary with the coordinator.",
-          status: "blocked" as const,
-        },
-      ],
+    const unchangedAfterInvalid = async (operation: () => Promise<object>, pattern: RegExp) => {
+      const before = decodeTestValue(
+        planToolDetailsSchema,
+        (await f.call("workgraph_plan", { action: "get" })).details,
+      ).plan;
+      const beforeEntries = f.session
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-worker-plan",
+        ).length;
+      await assert.rejects(operation(), pattern);
+      const after = decodeTestValue(
+        planToolDetailsSchema,
+        (await f.call("workgraph_plan", { action: "get" })).details,
+      ).plan;
+      const afterEntries = f.session
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-worker-plan",
+        ).length;
+      assert.deepEqual(after, before);
+      assert.equal(afterEntries, beforeEntries);
     };
-    const result = await f.call("workgraph_plan", { action: "update", plan: revisedPlan });
-    const resultDetails = decodeTestValue(planToolDetailsSchema, result.details);
-    assert.deepEqual(resultDetails.plan, revisedPlan);
-    const current = await f.call("workgraph_plan", { action: "get" });
-    const currentDetails = decodeTestValue(planToolDetailsSchema, current.details);
-    assert.deepEqual(currentDetails.plan, revisedPlan);
-    assert.equal(currentDetails.attempt.runId, "fixture");
-    assert.equal(currentDetails.attempt.nodeId, "attempt");
+    await unchangedAfterInvalid(
+      () =>
+        f.call("workgraph_plan", {
+          action: "update_step",
+          id: "step-8",
+          patch: { status: "done" },
+        }),
+      /Unknown step id/,
+    );
+    await unchangedAfterInvalid(
+      () => f.call("workgraph_plan", { action: "update_step", id: "step-1", patch: {} }),
+      /at least one of text, status, or note/,
+    );
+    const tool = f.runner.getToolDefinition("workgraph_plan");
+    assert.ok(tool !== undefined);
+    assert.equal(
+      Value.Check(tool.parameters, {
+        action: "update_step",
+        id: "step-1",
+        patch: { status: "superseded" },
+      }),
+      false,
+    );
+    await unchangedAfterInvalid(
+      () =>
+        f.call("workgraph_plan", {
+          action: "add_step",
+          text: "Anchor against a missing step.",
+          after_id: "step-8",
+        }),
+      /Unknown anchor step id/,
+    );
+    await unchangedAfterInvalid(
+      () =>
+        f.call("workgraph_plan", {
+          action: "remove_step",
+          id: "step-8",
+          reason: "Missing.",
+        }),
+      /Unknown step id/,
+    );
+    assert.equal(
+      Value.Check(tool.parameters, {
+        action: "update_step",
+        id: "step-1",
+        patch: { status: "done", unexpected: true },
+      }),
+      false,
+    );
+    for (let index = 3; index <= 8; index += 1)
+      await f.call("workgraph_plan", {
+        action: "add_step",
+        text: `Retained filler step number ${index}.`,
+      });
+    const full = decodeTestValue(
+      planToolDetailsSchema,
+      (await f.call("workgraph_plan", { action: "get" })).details,
+    ).plan;
+    assert.equal(full?.steps.length, 8);
+    await assert.rejects(
+      f.call("workgraph_plan", { action: "add_step", text: "Ninth retained step is rejected." }),
+      /already retains 8 total steps/,
+    );
+    const after = decodeTestValue(
+      planToolDetailsSchema,
+      (await f.call("workgraph_plan", { action: "get" })).details,
+    ).plan;
+    assert.deepEqual(
+      after?.steps.map((step) => step.id),
+      full?.steps.map((step) => step.id),
+    );
+    assert.deepEqual(after, full);
   } finally {
     await f.dispose();
+  }
+});
+
+void test("plan persistence publishes before state and leaves the old plan on append failure", async () => {
+  let session: SessionManager | undefined;
+  let failAppend = false;
+  let persistedEntries = 0;
+  const f = await fixture("implementation", false, {
+    appendEntry(type, data) {
+      if (failAppend) throw new Error("Injected plan append failure");
+      if (type === "pi-workgraph-worker-plan") persistedEntries += 1;
+      session?.appendCustomEntry(type, data);
+    },
+  });
+  session = f.session;
+  try {
+    await f.call("workgraph_plan", { action: "update", plan: initialPlan });
+    const before = decodeTestValue(
+      planToolDetailsSchema,
+      (await f.call("workgraph_plan", { action: "get" })).details,
+    );
+    assert.equal(persistedEntries, 1);
+    failAppend = true;
+    await assert.rejects(
+      f.call("workgraph_plan", {
+        action: "update_step",
+        id: "step-1",
+        patch: { status: "done" },
+      }),
+      /Injected plan append failure/,
+    );
+    const after = decodeTestValue(
+      planToolDetailsSchema,
+      (await f.call("workgraph_plan", { action: "get" })).details,
+    );
+    assert.deepEqual(after, before);
+    assert.equal(persistedEntries, 1);
+    assert.equal(
+      f.session
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-worker-plan",
+        ).length,
+      1,
+    );
+  } finally {
+    session = undefined;
+    await f.dispose();
+  }
+});
+
+void test("legacy id-less plans restore deterministically; mixed and duplicate identities stay malformed", async () => {
+  const f = await fixture("implementation");
+  try {
+    f.session.appendCustomEntry("pi-workgraph-worker-plan", {
+      runId: "fixture",
+      nodeId: "attempt",
+      plan: initialPlan,
+    });
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    const restored = decodeTestValue(
+      planToolDetailsSchema,
+      (await f.call("workgraph_plan", { action: "get" })).details,
+    );
+    assert.equal(restored.planStatus, "valid");
+    assert.deepEqual(
+      restored.plan?.steps.map((step) => step.id),
+      ["step-1", "step-2"],
+    );
+    const first = decodeTestValue(
+      planToolDetailsSchema,
+      (await f.call("workgraph_plan", { action: "get" })).details,
+    ).plan;
+    assert.ok(first !== undefined);
+    const firstStep = first.steps[0];
+    assert.ok(firstStep !== undefined);
+    firstStep.text = "Mutated through the returned reference.";
+    const second = decodeTestValue(
+      planToolDetailsSchema,
+      (await f.call("workgraph_plan", { action: "get" })).details,
+    ).plan;
+    assert.notEqual(second?.steps[0]?.text, "Mutated through the returned reference.");
+    assert.notEqual(first, second);
+  } finally {
+    await f.dispose();
+  }
+  for (const invalid of [
+    {
+      runId: "fixture",
+      nodeId: "attempt",
+      plan: {
+        ...initialPlan,
+        steps: [
+          { id: "step-1", text: "First retained step.", status: "pending" },
+          { text: "Second step without an identity.", status: "pending" },
+        ],
+      },
+    },
+    {
+      runId: "fixture",
+      nodeId: "attempt",
+      plan: {
+        ...initialPlan,
+        steps: [
+          { id: "step-1", text: "First retained step.", status: "pending" },
+          { id: "step-1", text: "Duplicate retained identity.", status: "pending" },
+        ],
+      },
+    },
+    {
+      runId: "fixture",
+      nodeId: "attempt",
+      plan: {
+        ...initialPlan,
+        steps: [{ id: "step-9", text: "Outside the bounded identity domain.", status: "pending" }],
+      },
+    },
+    {
+      runId: "fixture",
+      nodeId: "attempt",
+      plan: {
+        ...initialPlan,
+        steps: [{ id: "step-9007199254740992", text: "Unsafe identity.", status: "pending" }],
+      },
+    },
+  ]) {
+    const g = await fixture("implementation");
+    try {
+      g.session.appendCustomEntry("pi-workgraph-worker-plan", invalid);
+      await g.runner.emit({ type: "session_start", reason: "reload" });
+      const current = decodeTestValue(
+        planToolDetailsSchema,
+        (await g.call("workgraph_plan", { action: "get" })).details,
+      );
+      assert.equal(current.planStatus, "malformed");
+      assert.equal(current.plan, undefined);
+    } finally {
+      await g.dispose();
+    }
   }
 });
 

@@ -24,7 +24,14 @@ const initialPlan = {
   approach: "Inspect the stable provider transcript.",
   rationale: "Keep canonical history append-only while the plan evolves in tool results.",
   risks: "A compaction boundary may omit the original snapshot.",
-  steps: [{ text: "Inspect the provider transcript fixture.", status: "done" as const }],
+  steps: [
+    { id: "step-1", text: "Inspect the provider transcript fixture.", status: "done" as const },
+    {
+      id: "step-2",
+      text: "Confirm the serialized prefix stays stable.",
+      status: "blocked" as const,
+    },
+  ],
 };
 
 const serializedMessageSchema = Type.Object({
@@ -42,37 +49,69 @@ const serializedRequestSchema = Type.Object({
   messages: Type.Array(serializedMessageSchema),
 });
 const addressSchema = Type.Object({ port: Type.Integer() });
-const revisedPlan = {
-  ...initialPlan,
-  approach: "Verify the unchanged prefix after plan revision.",
-};
 const objective =
   "[WORKGRAPH IMPLEMENTATION OBJECTIVE]\nAcceptance: preserve the exact objective.\nConstraints: stay within the isolated worktree.";
 const attempt = { runId: "fixture", nodeId: "attempt" };
 type SerializedRequest = Static<typeof serializedRequestSchema>;
+type ProviderEnvelope = { messages: unknown[]; tools?: unknown };
+const providerToolResultSchema = Type.Object(
+  { tool_call_id: Type.String() },
+  { additionalProperties: true },
+);
 
-function providerResponse(index: number, updatePlan: boolean): string {
-  const delta = updatePlan
-    ? {
-        role: "assistant",
-        tool_calls: [
-          {
-            index: 0,
-            id: "plan-call",
-            type: "function",
-            function: {
-              name: "workgraph_plan",
-              arguments: JSON.stringify({ action: "update", plan: revisedPlan }),
+function targetedArguments(index: number) {
+  if (index === 2)
+    return {
+      action: "update_step",
+      id: "step-1",
+      patch: { note: "Executor records progress in notes." },
+    };
+  if (index === 3)
+    return {
+      action: "add_step",
+      text: "Record the second targeted mutation.",
+      after_id: "step-1",
+    };
+  if (index === 4)
+    return {
+      action: "update_step",
+      id: "step-3",
+      patch: { status: "done" },
+    };
+  if (index === 5)
+    return {
+      action: "remove_step",
+      id: "step-2",
+      reason: "Superseded by the narrower recorded step.",
+    };
+  return undefined;
+}
+
+function providerResponse(index: number): string {
+  const targeted = targetedArguments(index);
+  const delta =
+    targeted === undefined
+      ? { role: "assistant", content: "done" }
+      : {
+          role: "assistant",
+          tool_calls: [
+            {
+              index: 0,
+              id: `plan-call-${index}`,
+              type: "function",
+              function: {
+                name: "workgraph_plan",
+                arguments: JSON.stringify(targeted),
+              },
             },
-          },
-        ],
-      }
-    : { role: "assistant", content: "done" };
+          ],
+        };
+  const toolCall = targeted !== undefined;
   const chunks = [
     { delta, finish_reason: null, usage: undefined },
     {
       delta: {},
-      finish_reason: updatePlan ? "tool_calls" : "stop",
+      finish_reason: toolCall ? "tool_calls" : "stop",
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     },
   ].map(({ delta, finish_reason, usage }) => {
@@ -120,9 +159,11 @@ async function handleProviderRequest(
   request: IncomingMessage,
   response: ServerResponse,
   requests: SerializedRequest[],
+  rawRequests: string[],
 ): Promise<void> {
   try {
-    const parsed: unknown = JSON.parse(await requestBody(request));
+    const raw = await requestBody(request);
+    const parsed: unknown = JSON.parse(raw);
     if (!Value.Check(serializedRequestSchema, parsed)) {
       response.writeHead(400);
       response.end();
@@ -130,18 +171,19 @@ async function handleProviderRequest(
     }
     const body = Value.Decode(serializedRequestSchema, parsed);
     requests.push(body);
+    rawRequests.push(raw);
     response.writeHead(200, {
       "cache-control": "no-cache",
       "content-type": "text/event-stream",
       connection: "keep-alive",
     });
-    response.end(providerResponse(requests.length, requests.length === 2));
+    response.end(providerResponse(requests.length));
   } catch {
     response.destroy();
   }
 }
 
-void test("worker requests keep the serialized provider prefix stable across turns and plan updates", async () => {
+void test("worker requests keep the serialized provider prefix stable across turns and targeted edits", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-cache-"));
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
@@ -154,8 +196,9 @@ void test("worker requests keep the serialized provider prefix stable across tur
     PI_WORKGRAPH_RUN_ID: "fixture",
   });
   const requests: SerializedRequest[] = [];
+  const rawRequests: string[] = [];
   const server = createServer((request, response) => {
-    void handleProviderRequest(request, response, requests);
+    void handleProviderRequest(request, response, requests, rawRequests);
   });
   let agentSession: AgentSession | undefined;
   try {
@@ -229,12 +272,20 @@ void test("worker requests keep the serialized provider prefix stable across tur
     await agentSession.bindExtensions({});
 
     await agentSession.prompt("First turn");
-    await agentSession.prompt("Second turn: update the bounded plan");
+    await agentSession.prompt("Second turn: apply targeted step edits");
 
-    assert.equal(requests.length, 3);
-    const [first, second, third] = requests;
-    if (first === undefined || second === undefined || third === undefined)
-      throw new Error("Fixture did not capture three provider requests");
+    assert.equal(requests.length, 6);
+    assert.equal(rawRequests.length, 6);
+    const [first, second, third, fourth, fifth, sixth] = requests;
+    if (
+      first === undefined ||
+      second === undefined ||
+      third === undefined ||
+      fourth === undefined ||
+      fifth === undefined ||
+      sixth === undefined
+    )
+      throw new Error("Fixture did not capture six provider requests");
 
     const firstJson = JSON.stringify(first);
     assert.match(firstJson, /\[WORKGRAPH EXECUTOR\]/);
@@ -244,20 +295,45 @@ void test("worker requests keep the serialized provider prefix stable across tur
       JSON.stringify(message).includes(initialPlan.approach),
     );
     assert.ok(oldPlanMessage >= 0);
-    assert.equal(
-      first.messages.findIndex((message) => JSON.stringify(message).includes(revisedPlan.approach)),
-      -1,
-    );
 
-    assert.deepEqual(second.messages.slice(0, first.messages.length), first.messages);
-    assert.deepEqual(third.messages.slice(0, second.messages.length), second.messages);
-    const newPlanMessage = third.messages.findIndex(
-      (message) =>
-        message.role === "tool" &&
-        JSON.stringify(message).includes("Updated Current bounded plan") &&
-        JSON.stringify(message).includes(revisedPlan.approach),
-    );
-    assert.ok(newPlanMessage > oldPlanMessage);
+    const rawBodies = rawRequests.map((raw) => {
+      // SAFETY: rawRequests are JSON bodies captured from the isolated local provider fixture.
+      return JSON.parse(raw) as ProviderEnvelope;
+    });
+    const firstBody = rawBodies[0];
+    assert.ok(firstBody !== undefined);
+    const serializedTools = JSON.stringify(firstBody.tools);
+    const serializedSystem = JSON.stringify(firstBody.messages[0]);
+    assert.match(serializedSystem, /"role":"system"/);
+    assert.match(serializedTools, /workgraph_plan/);
+    const rawMessages = rawBodies.map((body) => body.messages);
+    for (let index = 0; index < rawBodies.length; index += 1) {
+      const body = rawBodies[index];
+      const messages = rawMessages[index];
+      assert.ok(body !== undefined && messages !== undefined);
+      assert.equal(JSON.stringify(body.tools), serializedTools);
+      assert.equal(JSON.stringify(messages[0]), serializedSystem);
+      if (index === 0) continue;
+      const previous = rawMessages[index - 1];
+      assert.ok(previous !== undefined);
+      assert.ok(messages.length >= previous.length);
+      assert.deepEqual(messages.slice(0, previous.length), previous);
+    }
+    const sixthJson = JSON.stringify(rawBodies[5]);
+    assert.ok(sixthJson.includes(initialPlan.approach));
+    const toolResult = (index: number, callId: string): string => {
+      const found = rawMessages[index]?.find(
+        (message) =>
+          Value.Check(providerToolResultSchema, message) &&
+          Value.Decode(providerToolResultSchema, message).tool_call_id === callId,
+      );
+      assert.ok(found !== undefined, `Missing tool result ${callId}`);
+      return JSON.stringify(found);
+    };
+    assert.match(toolResult(2, "plan-call-2"), /Executor records progress in notes/);
+    assert.match(toolResult(3, "plan-call-3"), /Record the second targeted mutation/);
+    assert.match(toolResult(4, "plan-call-4"), /step-3 done/);
+    assert.match(toolResult(5, "plan-call-5"), /Superseded by the narrower recorded step/);
   } finally {
     agentSession?.dispose();
     await close(server);
