@@ -24,11 +24,11 @@ The coordinator extension registers `/calm` to toggle hiding operational tool ro
 The default is initially off and is stored atomically in `workgraph/calm-default` beneath Pi's agent directory (normally `~/.pi/agent`, respecting `PI_CODING_AGENT_DIR`).
 Each session retains its own choice across reload and resume; new and forked sessions start from the saved default.
 The preference is session metadata, not a model message, and does not modify conversation content, tool execution, or worker tabs.
-Both Calm and non-Calm show one compact activity line with a gently pulsing dot and readable status text; Calm additionally hides the configured operational rows.
+Both Calm and non-Calm show one compact activity line with a gently pulsing dot and readable status text; Calm additionally hides the configured operational rows and places a short dim separator between distinct visible assistant blocks. The separator is presentation-only, appears once across hidden operational rows, and disappears when Calm is off.
 This replaces the ordinary working row instead of stacking another spinner above it, and truncates safely in narrow terminals.
 The default hidden tool-name list covers Pi builtins, installed search tools, Workgraph tools, and `herdr_rename`.
 Override it with `PI_WORKGRAPH_CALM_HIDDEN_TOOLS=tool_a,tool_b` before starting Pi.
-The internal adapter targets Pi's exported `ToolExecutionComponent` and `CustomMessageComponent` render seams, so it is compatibility-limited to Pi versions exposing those classes.
+The internal adapter targets Pi's exported `ToolExecutionComponent`, `CustomMessageComponent`, and `AssistantMessageComponent` render seams, so it is compatibility-limited to Pi versions exposing those classes.
 If the seam is unavailable or changes shape, Calm stays visible and emits a warning rather than hiding content or changing execution.
 Activity labels distinguish coordinating, active worker counts, and genuine blocking extension UI prompts awaiting input; a pending notepad item alone does not imply that work is blocked.
 The display clears when no activity remains, and shutdown restores Pi's ordinary working indicator.

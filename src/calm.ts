@@ -19,6 +19,7 @@ import {
   isCalmActivityActive,
 } from "./calm-activity.js";
 import { type CalmPreferences, calmPreferences } from "./calm-preferences.js";
+import { attachCalmSeparators } from "./calm-separators.js";
 
 export { calmActivityLines, isCalmActivityActive } from "./calm-activity.js";
 
@@ -83,6 +84,7 @@ type PresentationConstructor = {
 export interface CalmPresentationModule {
   readonly ToolExecutionComponent: PresentationConstructor;
   readonly CustomMessageComponent: PresentationConstructor;
+  readonly AssistantMessageComponent: PresentationConstructor;
 }
 
 export interface CalmPresentationState {
@@ -119,6 +121,7 @@ export function attachCalmPresentation(
   module: CalmPresentationModule,
   state: CalmPresentationState,
   diagnostic: Diagnostic,
+  separatorStyle: (text: string) => string = (text) => text,
 ): Detach {
   const detachTool = patchPrototype(
     module.ToolExecutionComponent.prototype,
@@ -137,10 +140,22 @@ export function attachCalmPresentation(
       state,
       diagnostic,
     );
-    return () => {
+    try {
+      const detachSeparators = attachCalmSeparators(
+        module.AssistantMessageComponent.prototype,
+        () => state.on,
+        separatorStyle,
+        diagnostic,
+      );
+      return () => {
+        detachSeparators();
+        detachMessage();
+        detachTool();
+      };
+    } catch (error) {
       detachMessage();
-      detachTool();
-    };
+      throw error;
+    }
   } catch (error) {
     detachTool();
     throw error;
@@ -312,7 +327,12 @@ export function installCalmMode(
         const presentation = decodePresentationModule(loaded);
         if (presentation === undefined)
           throw new Error("this Pi version does not expose the expected component classes.");
-        detach = attachCalmPresentation(presentation, state, diagnose);
+        detach = attachCalmPresentation(
+          presentation,
+          state,
+          diagnose,
+          (text) => ui?.theme.fg("dim", text) ?? text,
+        );
         adapterReady = true;
         syncChrome();
       })
@@ -490,8 +510,18 @@ function patchPrototype(
 function decodePresentationModule(value: unknown): CalmPresentationModule | undefined {
   const tool = readProperty(value, "ToolExecutionComponent");
   const custom = readProperty(value, "CustomMessageComponent");
-  if (!isPresentationConstructor(tool) || !isPresentationConstructor(custom)) return undefined;
-  return { ToolExecutionComponent: tool, CustomMessageComponent: custom };
+  const assistant = readProperty(value, "AssistantMessageComponent");
+  if (
+    !isPresentationConstructor(tool) ||
+    !isPresentationConstructor(custom) ||
+    !isPresentationConstructor(assistant)
+  )
+    return undefined;
+  return {
+    ToolExecutionComponent: tool,
+    CustomMessageComponent: custom,
+    AssistantMessageComponent: assistant,
+  };
 }
 
 function isPresentationConstructor(value: unknown): value is PresentationConstructor {
@@ -554,7 +584,9 @@ function loadPiPresentation(): Promise<unknown> {
     .then((candidates) => {
       const match = candidates.find(
         ({ source }) =>
-          source.includes("ToolExecutionComponent") && source.includes("CustomMessageComponent"),
+          source.includes("ToolExecutionComponent") &&
+          source.includes("CustomMessageComponent") &&
+          source.includes("AssistantMessageComponent"),
       );
       return match === undefined
         ? import("@earendil-works/pi-coding-agent")

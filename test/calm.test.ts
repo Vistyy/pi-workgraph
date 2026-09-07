@@ -22,6 +22,8 @@ import {
 } from "../src/calm.js";
 
 type FakeMouseEvent = {
+  readonly y?: number;
+  readonly width?: number;
   readonly [key: string]: string | number | boolean | undefined;
 };
 
@@ -37,6 +39,75 @@ class FakeToolRow {
   }
 
   handleMouse(event: FakeMouseEvent): FakeMouseEvent {
+    return event;
+  }
+}
+
+class FakeContainer {
+  children: Array<{
+    render(width: number): string[];
+    handleMouse?: (event: FakeMouseEvent) => FakeMouseEvent;
+  }> = [];
+  mouseLayout?: {
+    width: number;
+    children: Array<{
+      component: {
+        render(width: number): string[];
+        handleMouse?: (event: FakeMouseEvent) => FakeMouseEvent;
+      };
+      height: number;
+    }>;
+  };
+
+  addChild(component: (typeof this.children)[number]): void {
+    this.children.push(component);
+  }
+
+  render(width: number): string[] {
+    const lines: string[] = [];
+    const children = this.children.map((component) => {
+      const rendered = component.render(width);
+      lines.push(...rendered);
+      return { component, height: rendered.length };
+    });
+    this.mouseLayout = { width, children };
+    return lines;
+  }
+
+  handleMouse(event: FakeMouseEvent): FakeMouseEvent | undefined {
+    const eventWidth = event.width ?? 0;
+    const eventY = event.y ?? -1;
+    const layout = this.mouseLayout;
+    const children =
+      layout?.width === eventWidth
+        ? layout.children
+        : this.children.map((component) => ({
+            component,
+            height: component.render(eventWidth).length,
+          }));
+    let childY = 0;
+    for (const { component, height } of children) {
+      if (eventY >= childY && eventY < childY + height)
+        return component.handleMouse?.({ ...event, y: eventY - childY });
+      childY += height;
+    }
+    return undefined;
+  }
+}
+
+class FakeAssistantRow extends FakeContainer {
+  readonly lines: string[];
+
+  constructor(...lines: string[]) {
+    super();
+    this.lines = lines;
+  }
+
+  override render(_width: number): string[] {
+    return [...this.lines];
+  }
+
+  override handleMouse(event: FakeMouseEvent): FakeMouseEvent {
     return event;
   }
 }
@@ -132,6 +203,7 @@ function moduleForFakeRows() {
   return {
     ToolExecutionComponent: FakeToolRow,
     CustomMessageComponent: FakeMessageRow,
+    AssistantMessageComponent: FakeAssistantRow,
   };
 }
 
@@ -181,6 +253,120 @@ void test("presentation adapter hides and restores existing tool and operational
   }
   assert.deepEqual(tool.render(80), ["tool:read:80"]);
   assert.deepEqual(message.render(80), ["message:pi-workgraph-attention:80"]);
+});
+
+void test("Calm separates visible assistant blocks across hidden rows without mutating the chat", () => {
+  const state = {
+    on: true,
+    hiddenTools: new Set(["read"]),
+    hiddenMessageTypes: new Set(["pi-workgraph-attention"]),
+  };
+  const chat = new FakeContainer();
+  const first = new FakeAssistantRow("thinking", "answer");
+  const hiddenToolA = new FakeToolRow("read");
+  const hiddenToolB = new FakeToolRow("read");
+  const hiddenMessage = new FakeMessageRow("pi-workgraph-attention");
+  const toolOnlyAssistant = new FakeAssistantRow();
+  const second = new FakeAssistantRow("follow-up");
+  const originalChildren = chat.children;
+  chat.addChild(first);
+  chat.addChild(hiddenToolA);
+  chat.addChild(hiddenToolB);
+  chat.addChild(hiddenMessage);
+  chat.addChild(toolOnlyAssistant);
+  chat.addChild(second);
+  const diagnostics: string[] = [];
+  const styledRules: string[] = [];
+  const detach = attachCalmPresentation(
+    moduleForFakeRows(),
+    state,
+    (message) => diagnostics.push(message),
+    (text) => {
+      styledRules.push(text);
+      return `\u001b[2m${text}\u001b[22m`;
+    },
+  );
+  try {
+    const width = 32;
+    const calmLines = chat.render(width);
+    assert.deepEqual(stripAnsiLikeTheme(calmLines[3] ?? ""), "────────");
+    assert.deepEqual(calmLines.map(stripAnsiLikeTheme), [
+      "thinking",
+      "answer",
+      "",
+      "────────",
+      "",
+      "follow-up",
+    ]);
+    assert.equal(visibleWidth(calmLines[3] ?? ""), 8);
+    assert.deepEqual(styledRules, ["────────"]);
+    assert.equal(chat.children.length, 6);
+    assert.equal(chat.children, originalChildren);
+    assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), calmLines.map(stripAnsiLikeTheme));
+    assert.deepEqual(styledRules, ["────────", "────────"]);
+    assert.equal(chat.handleMouse({ y: 3, width }), undefined);
+    assert.deepEqual(chat.handleMouse({ y: 5, width }), { y: 0, width });
+
+    const visibleToolsChat = new FakeContainer();
+    visibleToolsChat.addChild(first);
+    visibleToolsChat.addChild(new FakeToolRow("write"));
+    visibleToolsChat.addChild(new FakeToolRow("write"));
+    visibleToolsChat.addChild(second);
+    assert.deepEqual(visibleToolsChat.render(width).map(stripAnsiLikeTheme), [
+      "thinking",
+      "answer",
+      "tool:write:32",
+      "tool:write:32",
+      "",
+      "────────",
+      "",
+      "follow-up",
+    ]);
+    assert.equal(styledRules.length, 3);
+
+    const thinkingOnlyChat = new FakeContainer();
+    thinkingOnlyChat.addChild(new FakeAssistantRow("thinking only"));
+    thinkingOnlyChat.addChild(new FakeToolRow("read"));
+    thinkingOnlyChat.addChild(new FakeAssistantRow("after thinking"));
+    assert.deepEqual(thinkingOnlyChat.render(width).map(stripAnsiLikeTheme), [
+      "thinking only",
+      "",
+      "────────",
+      "",
+      "after thinking",
+    ]);
+    assert.equal(styledRules.length, 4);
+
+    const emptyEdgesChat = new FakeContainer();
+    emptyEdgesChat.addChild(new FakeAssistantRow());
+    emptyEdgesChat.addChild(new FakeAssistantRow("only visible block"));
+    emptyEdgesChat.addChild(new FakeAssistantRow());
+    assert.deepEqual(emptyEdgesChat.render(width), ["only visible block"]);
+    assert.equal(styledRules.length, 4);
+
+    state.on = false;
+    assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), [
+      "thinking",
+      "answer",
+      "tool:read:32",
+      "tool:read:32",
+      "message:pi-workgraph-attention:32",
+      "follow-up",
+    ]);
+    assert.deepEqual(styledRules, ["────────", "────────", "────────", "────────"]);
+    state.on = true;
+  } finally {
+    detach();
+  }
+  assert.deepEqual(chat.render(32), [
+    "thinking",
+    "answer",
+    "tool:read:32",
+    "tool:read:32",
+    "message:pi-workgraph-attention:32",
+    "follow-up",
+  ]);
+  assert.deepEqual(diagnostics, []);
 });
 
 void test("adapter diagnostics fall back to visible rendering when row metadata changes", () => {
