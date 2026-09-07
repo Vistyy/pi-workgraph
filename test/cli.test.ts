@@ -13,6 +13,7 @@ import { Effect } from "effect";
 import type { InspectSection } from "../src/agent-facing.js";
 import { runCli } from "../src/cli.js";
 import { inspectSections, parseCliRequest } from "../src/cli-parse.js";
+
 import { git, persistentSession } from "./helpers.js";
 
 void test("CLI parser preserves inspection sections, bounded options, and rejects invalid combinations", () => {
@@ -75,8 +76,14 @@ void test("CLI status preserves historical JSON and resolves a registered run re
   try {
     await writeFile(path, bytes);
     const registry = new DatabaseSync(registryPath);
-    registry.exec("CREATE TABLE runs (run_id TEXT PRIMARY KEY, state_path TEXT NOT NULL)");
+    registry.exec(`
+      CREATE TABLE runs (run_id TEXT PRIMARY KEY, state_path TEXT NOT NULL);
+      CREATE TABLE workgraph_locators (run_id TEXT PRIMARY KEY, state_path TEXT NOT NULL UNIQUE);
+    `);
     registry.prepare("INSERT INTO runs(run_id, state_path) VALUES (?, ?)").run("registered", path);
+    registry
+      .prepare("INSERT INTO workgraph_locators(run_id, state_path) VALUES (?, ?)")
+      .run("current", path);
     registry.close();
 
     const direct = await runCli(["status", "--state", path], { PI_CODING_AGENT_DIR: parent });
@@ -92,6 +99,9 @@ void test("CLI status preserves historical JSON and resolves a registered run re
     ]);
     assert.equal(registered.command, "status");
     if (registered.command === "status") assert.equal(registered.statePath, path);
+    const current = await runCli(["status", "--run-id", "current", "--registry", registryPath]);
+    assert.equal(current.command, "status");
+    if (current.command === "status") assert.equal(current.statePath, path);
     assert.equal(await readFile(path, "utf8"), bytes);
     await assert.rejects(runCli(["status"]), /Provide/);
     await assert.rejects(runCli(["fork"], {}), /parent-session-file/);

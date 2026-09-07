@@ -13,6 +13,8 @@ import { liveLayer } from "../src/node-platform.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { type StoreEffect, WorkstreamStoreEffects } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
+import { legacyPathForWorkstream } from "../src/workstream-state.js";
+import { parsePersistedObject } from "../src/workstream-validation.js";
 import {
   configureFixtureEnvironment,
   decodeTestValue,
@@ -150,11 +152,11 @@ async function fixture() {
   };
 }
 
-async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
+async function createUnattachedWorkstream(f: Awaited<ReturnType<typeof fixture>>, id: string) {
   const repository = await Effect.runPromise(openRepository(f.root));
-  const created = await runStore(
+  return runStore(
     WorkstreamStoreEffects.create({
-      id: "empty-fixture",
+      id,
       purpose: "Fixture workstream",
       projectRoot: f.root,
       gitCommonDir: repository.commonDir,
@@ -164,6 +166,10 @@ async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
       },
     }),
   );
+}
+
+async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
+  const created = await createUnattachedWorkstream(f, "empty-fixture");
   f.session.appendCustomEntry("pi-workgraph-workstream", {
     path: created.store.path,
   });
@@ -511,7 +517,15 @@ void test("failed registered adoption preserves the attached runtime lease; same
       resultState((await f.call("workgraph_inspect", { section: "overview" })).details).id,
       a.id,
     );
-    assert.throws(() => registry.acquire(a.id, a.coordinator), /runtime owner/);
+    const competingLocator = WorkstreamStoreEffects.open(a.statePath, a.coordinator);
+    try {
+      assert.throws(
+        () => Effect.runSync(competingLocator.acquireLease(a.coordinator)),
+        /runtime owner/,
+      );
+    } finally {
+      competingLocator.close();
+    }
     const same = resultState((await f.call("workgraph_adopt", { statePath: a.statePath })).details);
     assert.equal(same.id, a.id);
     await f.call("workgraph_control", {
@@ -524,8 +538,13 @@ void test("failed registered adoption preserves the attached runtime lease; same
     );
     assert.equal(adopted.id, "other-work");
     assert.equal(adopted.coordinator.sessionId, f.session.getSessionId());
-    const released = registry.acquire(a.id, a.coordinator);
-    registry.release(released);
+    const releasedLocator = WorkstreamStoreEffects.open(a.statePath, a.coordinator);
+    try {
+      const released = Effect.runSync(releasedLocator.acquireLease(a.coordinator));
+      Effect.runSync(releasedLocator.releaseLease(released));
+    } finally {
+      releasedLocator.close();
+    }
   } finally {
     if (competing !== undefined) await Effect.runPromise(competing.effects.close);
     registry.close();
@@ -536,6 +555,31 @@ void test("failed registered adoption preserves the attached runtime lease; same
 void test("mutation responses stay action-focused while retaining handles, models, and exact read paths", async () => {
   const f = await fixture();
   try {
+    const seeded = await createUnattachedWorkstream(f, "focused-fixture");
+    const lease = await runStore(seeded.store.acquireLease(seeded.state.coordinator));
+    for (let index = 0; index < 12; index++) {
+      await runStore(
+        seeded.store.enqueue(
+          {
+            id: `unrelated-${index}`,
+            capability: "research",
+            artifactIntent: "evidence_only",
+            objective: `Unrelated history ${index}`,
+            intentVersion: 0,
+            expectedEvidence: ["bytes"],
+          },
+          {
+            id: `unrelated-${index}-attempt`,
+            models: { guide: { model: "fixture/model", thinking: "low" }, source: "policy" },
+          },
+        ),
+      );
+    }
+    await runStore(seeded.store.releaseLease(lease));
+    seeded.store.close();
+    f.session.appendCustomEntry("pi-workgraph-workstream", { path: seeded.state.statePath });
+    await f.runner.emit({ type: "session_start", reason: "new" });
+
     const first = await f.call("workgraph_research", {
       id: "focused-research",
       question: "Inspect the focused fixture",
@@ -552,30 +596,6 @@ void test("mutation responses stay action-focused while retaining handles, model
     assert.match(firstText, /focused-research/);
     assert.doesNotMatch(firstText, /"assignments":\s*\[/);
 
-    const initial = resultState(first.details);
-    const owner = {
-      sessionId: f.session.getSessionId(),
-      sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
-    };
-    const store = WorkstreamStoreEffects.open(initial.statePath, owner);
-    for (let index = 0; index < 12; index++) {
-      await runStore(
-        store.enqueue(
-          {
-            id: `unrelated-${index}`,
-            capability: "research",
-            artifactIntent: "evidence_only",
-            objective: `Unrelated history ${index}`,
-            intentVersion: 0,
-            expectedEvidence: ["bytes"],
-          },
-          {
-            id: `unrelated-${index}-attempt`,
-            models: { guide: { model: "fixture/model", thinking: "low" }, source: "policy" },
-          },
-        ),
-      );
-    }
     const later = await f.call("workgraph_inspect", {
       section: "overview",
     });
@@ -593,12 +613,9 @@ void test("mutation responses stay action-focused while retaining handles, model
 void test("registered status stays compact and focused result retrieval projects bounded sections", async () => {
   const f = await fixture();
   try {
-    const initial = await emptyWorkstream(f);
-    const owner = {
-      sessionId: f.session.getSessionId(),
-      sessionFile: required(f.session.getSessionFile(), "coordinator session file"),
-    };
-    const store = WorkstreamStoreEffects.open(initial.statePath, owner);
+    const created = await createUnattachedWorkstream(f, "status-fixture");
+    const store = created.store;
+    const lease = await runStore(store.acquireLease(created.state.coordinator));
     const longObjective = `Retain bounded evidence ${"full assignment brief ".repeat(500)}`;
     await runStore(
       store.enqueue(
@@ -638,6 +655,10 @@ void test("registered status stays compact and focused result retrieval projects
       }),
     );
     await settleFixtureAttempt(store, "large-result-attempt", "large-result-1");
+    await runStore(store.releaseLease(lease));
+    store.close();
+    f.session.appendCustomEntry("pi-workgraph-workstream", { path: created.state.statePath });
+    await f.runner.emit({ type: "session_start", reason: "new" });
     const status = await f.call("workgraph_inspect", { section: "overview" });
     const statusText = decodeTestValue(textContentSchema, status.content[0]).text;
     assert.match(statusText, /large-result/);
@@ -736,10 +757,21 @@ void test("registered session_start safely inspects retained and pointed workstr
     );
   }
 
+  async function createLegacyState(f: Awaited<ReturnType<typeof fixture>>, id: string) {
+    const created = await createState(f, id);
+    const path = legacyPathForWorkstream(created.state.gitCommonDir, created.state.id);
+    const current = parsePersistedObject(
+      await runStore(WorkstreamStoreEffects.readRaw(created.state.statePath)),
+    );
+    const state = { ...current, statePath: path };
+    await writeFile(path, `${JSON.stringify(state, null, 2)}\n`);
+    return { ...created, state: { ...created.state, statePath: path } };
+  }
+
   {
     const f = await fixture();
     try {
-      const { state } = await createState(f, "legacy-terminal");
+      const { state } = await createLegacyState(f, "legacy-terminal");
       const current = decodeTestValue(
         persistedHeaderSchema,
         JSON.parse(await readFile(state.statePath, "utf8")),
@@ -798,7 +830,7 @@ void test("registered session_start safely inspects retained and pointed workstr
   {
     const f = await fixture();
     try {
-      const { state } = await createState(f, "legacy-active");
+      const { state } = await createLegacyState(f, "legacy-active");
       const current = decodeTestValue(
         persistedHeaderSchema,
         JSON.parse(await readFile(state.statePath, "utf8")),
@@ -898,13 +930,15 @@ void test("registered session_start safely inspects retained and pointed workstr
   {
     const f = await fixture();
     try {
-      const { state: created } = await createState(f, "current-terminal");
+      const { state: created, store } = await createState(f, "current-terminal");
+      const lease = await runStore(store.acquireLease(created.coordinator));
       const state = await runStore(
-        WorkstreamStoreEffects.open(created.statePath, created.coordinator).setLifecycle({
+        store.setLifecycle({
           state: "abandoned",
           reason: "Current terminal startup fixture.",
         }),
       );
+      await runStore(store.releaseLease(lease));
       f.session.appendCustomEntry("pi-workgraph-workstream", {
         path: state.statePath,
       });

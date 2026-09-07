@@ -13,7 +13,7 @@ State and worker sessions live under Git's common directory. Tools return the ex
 pi-workgraph status --state STATE_PATH
 ```
 
-Historical formats remain inspectable without mutation; unsupported active formats are not automatically migrated or adopted.
+Historical JSON remains inspectable without mutation. Current JSON state is read-only until explicit `workgraph_adopt` proves the prior coordinator dead; that bounded import preserves the source, requires the exact identity-derived `.sqlite` destination to be absent, and verifies the source readback. Startup reattachment never migrates a live JSON owner.
 
 ## Recover uncertain work
 

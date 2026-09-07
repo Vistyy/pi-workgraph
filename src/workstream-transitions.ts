@@ -9,8 +9,6 @@ import type {
   WorkstreamState,
 } from "./workstream-state.js";
 
-export type WorkstreamMutator = (draft: WorkstreamState, now: Date) => void;
-
 export function recordInputTransition(
   draft: WorkstreamState,
   input: {
@@ -78,20 +76,6 @@ export function startAttemptTransition(
   if (input.baseRevision !== undefined) attempt.baseRevision = input.baseRevision;
   else delete attempt.baseRevision;
   attempt.submission = "not_sent";
-}
-
-/** Apply one domain transition without performing I/O. */
-export function transitionWorkstreamState(
-  current: WorkstreamState,
-  mutator: WorkstreamMutator,
-  now: Date,
-): WorkstreamState {
-  const draft = structuredClone(current);
-  mutator(draft, now);
-  if (sameValue(draft, current)) return structuredClone(current);
-  draft.revision = current.revision + 1;
-  draft.updatedAt = now.toISOString();
-  return draft;
 }
 
 /** Mechanical completion entries derived from retained domain facts. */

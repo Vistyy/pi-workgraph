@@ -76,7 +76,7 @@ function state(
     purpose: "Test bounded agent-facing projections.",
     projectRoot: "/tmp/project",
     gitCommonDir: "/tmp/project/.git",
-    statePath: "/tmp/project/.git/pi-workgraph/workstreams/agent-facing/workstream.json",
+    statePath: "/tmp/project/.git/pi-workgraph/workstreams/agent-facing/workstream.sqlite",
     coordinator: {
       sessionId: "agent-facing-test",
       sessionFile: "/tmp/agent-facing-test.jsonl",

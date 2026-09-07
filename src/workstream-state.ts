@@ -11,7 +11,15 @@ export const WORKSTREAM_STATE_VERSION = 7 as const;
 export const WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
 
 export function pathForWorkstream(gitCommonDir: string, id: string): string {
+  return join(resolve(gitCommonDir), "pi-workgraph", "workstreams", id, "workstream.sqlite");
+}
+
+export function legacyPathForWorkstream(gitCommonDir: string, id: string): string {
   return join(resolve(gitCommonDir), "pi-workgraph", "workstreams", id, "workstream.json");
+}
+
+export function isLegacyWorkstreamPath(path: string): boolean {
+  return path.endsWith("/workstream.json") || path.endsWith("\\workstream.json");
 }
 
 const NonEmptyStringSchema = Type.String({ minLength: 1 });
@@ -484,6 +492,7 @@ export type CompletionAccounting = Static<typeof CompletionAccountingSchema>;
 export type WorkstreamState = Static<typeof WorkstreamStateSchema>;
 export type WorkstreamReattachmentInspection =
   | { kind: "current"; state: WorkstreamState }
+  | { kind: "legacy_current"; state: WorkstreamState }
   | {
       kind: "retained_terminal";
       id: string;

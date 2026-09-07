@@ -420,13 +420,17 @@ function projectWorkstreamState(state: WorkstreamState) {
   };
 }
 
+export function canonicalWorkstreamPath(root: string, id: string): string {
+  return WorkstreamStoreEffects.pathFor(join(root, ".git"), id);
+}
+
 // oxlint-disable-next-line effecttsgo/async-function -- One state inspection is normalized into retained failure evidence.
-async function inspectRetainedStateFile(directory: string, name: string) {
+async function inspectRetainedStateFile(root: string, name: string) {
   try {
     return projectWorkstreamState(
       await Effect.runPromise(
         Effect.provide(
-          WorkstreamStoreEffects.inspect(join(directory, name, "workstream.json")),
+          WorkstreamStoreEffects.inspect(canonicalWorkstreamPath(root, name)),
           liveLayer,
         ),
       ),
@@ -440,7 +444,7 @@ async function inspectRetainedStateFile(directory: string, name: string) {
 async function inspectRetainedState(root: string) {
   const directory = join(root, ".git", "pi-workgraph", "workstreams");
   const names = await readdir(directory);
-  return Promise.all(names.map((name) => inspectRetainedStateFile(directory, name)));
+  return Promise.all(names.map((name) => inspectRetainedStateFile(root, name)));
 }
 
 function reconciliationInstructions(checkpoint: LiveFixtureCheckpoint): string[] {

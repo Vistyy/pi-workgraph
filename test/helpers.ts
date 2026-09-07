@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { ExtensionActions } from "@earendil-works/pi-coding-agent";
 import {
   discoverAndLoadExtensions,
@@ -12,16 +13,19 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Clock, Effect } from "effect";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { processEffect } from "../src/process.js";
 import type { WorkerReport } from "../src/types.js";
 import { WorkstreamStateSchema } from "../src/workstream.js";
+import { isNativeSqliteFile } from "../src/workstream-persistence.js";
+import { parsePersistedObject } from "../src/workstream-validation.js";
 
 const ResultDetailsSchema = Type.Object({
   workstream: Type.Optional(WorkstreamStateSchema),
   statePath: Type.Optional(Type.String()),
 });
+const PersistedSqliteRowSchema = Type.Object({ state_json: Type.String() });
 
 export const usage = {
   input: 0,
@@ -183,8 +187,28 @@ export function resultState(details: unknown) {
   assert.ok(Value.Check(ResultDetailsSchema, details), "Invalid Pi tool result details");
   const record = Value.Decode(ResultDetailsSchema, details);
   const persisted: unknown =
-    record.statePath === undefined ? undefined : JSON.parse(readFileSync(record.statePath, "utf8"));
+    record.statePath === undefined ? undefined : readPersistedState(record.statePath);
   const state = record.workstream ?? persisted;
   assert.ok(Value.Check(WorkstreamStateSchema, state));
   return Value.Decode(WorkstreamStateSchema, state);
+}
+
+function readPersistedState(path: string): Static<typeof WorkstreamStateSchema> {
+  let value: ReturnType<typeof parsePersistedObject>;
+  if (!isNativeSqliteFile(path)) value = parsePersistedObject(readFileSync(path, "utf8"));
+  else {
+    const database = new DatabaseSync(path, { readOnly: true });
+    try {
+      const row = database
+        .prepare("SELECT state_json FROM workstream_state WHERE singleton=1")
+        .get();
+      if (!Value.Check(PersistedSqliteRowSchema, row))
+        throw new Error("Missing persisted SQLite aggregate.");
+      value = parsePersistedObject(Value.Decode(PersistedSqliteRowSchema, row).state_json);
+    } finally {
+      database.close();
+    }
+  }
+  assert.ok(Value.Check(WorkstreamStateSchema, value), "Invalid persisted workstream state");
+  return Value.Decode(WorkstreamStateSchema, value);
 }

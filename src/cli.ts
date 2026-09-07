@@ -2,7 +2,7 @@
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath } from "node:url";
-import { Config, ConfigProvider, Data, Effect, FileSystem, Option, Path } from "effect";
+import { Config, ConfigProvider, Data, Effect, type FileSystem, Option, Path } from "effect";
 import type { ConfigError } from "effect/Config";
 import type { PlatformError } from "effect/PlatformError";
 import { Type } from "typebox";
@@ -109,10 +109,9 @@ function statusEffect(
   environment: CliEnvironment,
 ): CliEffect<Extract<CliResult, { command: "status" }>> {
   return Effect.gen(function* () {
-    const fileSystem = yield* FileSystem.FileSystem;
     const paths = yield* Path.Path;
     const statePath = yield* resolveStatePath(request, environment);
-    const text = yield* fileSystem.readFileString(paths.resolve(statePath));
+    const text = yield* WorkstreamStoreEffects.readRaw(paths.resolve(statePath));
     // Status deliberately preserves uninterpreted historical JSON without migration.
     // oxlint-disable-next-line anti-slop/no-unknown-returns -- This command intentionally returns historical JSON without schema interpretation or migration.
     const state = yield* operationEffect((): unknown => JSON.parse(text));
@@ -186,6 +185,14 @@ function lookupStatePath(
   return operationEffect(() => {
     const registry = new DatabaseSync(registryPath, { readOnly: true });
     try {
+      try {
+        const current = registry
+          .prepare("SELECT state_path FROM workgraph_locators WHERE run_id=?")
+          .get(runId);
+        if (current !== undefined) return current;
+      } catch (cause) {
+        if (!(cause instanceof Error) || !cause.message.includes("no such table")) throw cause;
+      }
       return registry.prepare("SELECT state_path FROM runs WHERE run_id=?").get(runId);
     } finally {
       registry.close();

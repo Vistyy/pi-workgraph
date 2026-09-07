@@ -67,13 +67,14 @@ Reattachment may conservatively observe exact identities and postconditions, but
 ### Keep lifecycle ownership explicit
 
 Effect 4 provides one structured lifecycle and concurrency model for the active coordination runtime rather than a parallel public workflow interface.
-The workstream runtime owns its scoped registry and lease, serialized operations, background fibers, and shutdown.
+The workstream runtime owns its scoped discovery locator and private lease, serialized operations, background fibers, and shutdown.
 Its acquisition is eager and returns only after the lease-backed handle is ready; acquisition failures therefore fail attachment directly rather than leaving a lazy, partially initialized runtime.
 An Effect semaphore serializes mutations, caller interruption cancels queued or running coordinator operations through ordinary fiber interruption, and a scoped FiberSet interrupts and joins owned operations before lease release.
 Owned-worker cancellation is a separate durable boundary: it records the cancellation request, interrupts a retained worker when possible, and settles without a report only after cleanup verifies idle-worker closure or exact external absence; unknown presence remains blocked.
 One idempotent close boundary handles explicit shutdown and fatal lease loss; custom request queues, request settlement signals, and separate ready/start/fatal lifecycle channels are unnecessary because the Effect primitives already provide those guarantees.
 The Effect-native process owner owns each child from acquisition through timeout, interruption, and release; host-facing boundaries are the only places that convert it to a Promise.
-The workstream store owns serialized atomic state-file mutation, while the registry owns only the durable index and fenced lease records.
+Each workstream owns one private `workstream.sqlite` database at its canonical state path. Its validated workstream state is one JSON aggregate row and its fenced lease is a sibling row; one SQLite transaction performs the read, validation, mutation, lease predicate, write, and commit. The global registry is only a run-id to state-path locator. Existing registries with historical lifecycle/project/phase columns retain their old tables and rows untouched; a small same-file current-locator table records new workstreams, and neither table is used for ownership.
+Current JSON state is a read-only historical source. An explicit adoption may import one exact current JSON path to its derived SQLite path only after authoritative prior-owner death and a source readback check; startup reattachment never migrates a live JSON owner. Terminal JSON history remains lossless and inspectable.
 These boundaries keep resource lifetime and persistence responsibility with the component that can verify their postconditions.
 
 ### Evolve one cohesive system

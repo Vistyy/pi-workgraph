@@ -7,7 +7,6 @@ import {
   readdir,
   readFile,
   rm,
-  stat,
   symlink,
   writeFile,
 } from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Fixtures intentionally use real host storage at the node:test boundary.
@@ -15,7 +14,9 @@ import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are host filesystem identities.
 import { join } from "node:path";
 import test from "node:test";
-import { DateTime, Deferred, Effect, FileSystem, Path, PlatformError } from "effect";
+import { DateTime, Effect, type FileSystem, type Path, PlatformError } from "effect";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import { liveLayer } from "../src/node-platform.js";
 import {
   type AuthorityReference,
@@ -25,9 +26,11 @@ import {
   UnsupportedWorkstreamStateError,
   WorkstreamStoreEffects,
 } from "../src/workstream.js";
-import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
+import { legacyPathForWorkstream, WorkstreamStoreOperationError } from "../src/workstream-state.js";
 import { parsePersistedObject } from "../src/workstream-validation.js";
 import { researchReport } from "./helpers.js";
+
+const PersistedSqliteRowSchema = Type.Object({ state_json: Type.String() });
 
 function runStore<A, E>(
   effect: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>,
@@ -239,6 +242,7 @@ async function fixture(): Promise<{ parent: string; store: WorkstreamStoreEffect
       now: dateAt(0),
     }),
   );
+  await runStore(store.acquireLease(coordinator));
   return { parent, store };
 }
 
@@ -518,16 +522,21 @@ void test("every independent attempt remains accounted for regardless of result 
 void test("malformed state diagnostics identify a bounded field path without echoing payloads", async () => {
   const { parent, store } = await fixture();
   try {
-    const original = await readFile(store.path, "utf8");
-    await writeFile(
-      store.path,
-      original
-        .replace(
-          '"purpose": "Determine the safe fixture change."',
-          '"purpose": "credential=redacted-secret"',
-        )
-        .replace('"revision": 0', '"revision": "invalid"'),
-    );
+    const originalRow = store.db
+      .prepare("SELECT state_json FROM workstream_state WHERE singleton=1")
+      .get();
+    assert.ok(Value.Check(PersistedSqliteRowSchema, originalRow));
+    const original = Value.Decode(PersistedSqliteRowSchema, originalRow);
+    store.db
+      .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
+      .run(
+        original.state_json
+          .replace(
+            '"purpose": "Determine the safe fixture change."',
+            '"purpose": "credential=redacted-secret"',
+          )
+          .replace('"revision": 0', '"revision": "invalid"'),
+      );
     await assert.rejects(
       runStore(WorkstreamStoreEffects.inspect(store.path)),
       (error: Error) =>
@@ -612,13 +621,15 @@ void test("workstream serializes receipt writes and rejects corrupt or foreign h
     const runIdKey = "runId";
     assert.equal(foreignObject[runIdKey], "old-run");
 
-    const copiedPath = join(parent, "copied.json");
-    await writeFile(copiedPath, await readFile(state.statePath, "utf8"));
+    const copiedPath = join(parent, "copied.sqlite");
+    await writeFile(copiedPath, await readFile(state.statePath));
     await assert.rejects(
       runStore(WorkstreamStoreEffects.inspect(copiedPath)),
       InvalidWorkstreamStateError,
     );
-    const copiedObject = parsePersistedObject(await readFile(copiedPath, "utf8"));
+    const copiedObject = parsePersistedObject(
+      await runStore(WorkstreamStoreEffects.readRaw(copiedPath)),
+    );
     const statePathKey = "statePath";
     assert.equal(copiedObject[statePathKey], state.statePath);
 
@@ -671,157 +682,25 @@ void test("invalid evidence remains unresolved", async () => {
   }
 });
 
-void test("Effect store port fences both reads and renames and cleans unique 0600 temp state", async () => {
+void test("legacy current JSON imports only after dead-owner proof and preserves the source", async () => {
   const { parent, store } = await fixture();
   try {
-    let guardCalls = 0;
-    store.bindMutationGuard(() => {
-      guardCalls += 1;
-      if (guardCalls === 2) throw new Error("lease fence changed before rename");
-    });
+    const state = await runStore(store.load());
+    const legacyPath = legacyPathForWorkstream(state.gitCommonDir, state.id);
+    const raw = await runStore(WorkstreamStoreEffects.readRaw(state.statePath));
+    const legacy = { ...parsePersistedObject(raw), statePath: legacyPath };
+    store.close();
+    await rm(state.statePath, { force: true });
+    await writeFile(legacyPath, `${JSON.stringify(legacy, null, 2)}\n`);
+    const before = await readFile(legacyPath);
     await assert.rejects(
-      runStore(
-        store.recordInputEvent({
-          ...coordinator,
-          source: "interactive",
-          text: "This fenced write must not be retained.",
-        }),
-      ),
-      /lease fence changed before rename/,
+      runStore(WorkstreamStoreEffects.migrateLegacy(legacyPath, "unknown")),
+      /dead/,
     );
-    assert.equal(guardCalls, 2);
-    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
-    assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
-    assert.equal((await stat(store.path)).mode & 0o777, 0o600);
-  } finally {
-    await rm(parent, { recursive: true, force: true });
-  }
-});
-
-void test("interruption in exclusive acquisition records ownership and removes the real tempfile", async () => {
-  const { parent, store } = await fixture();
-  try {
-    const fileSystem = await liveFileSystem();
-    const acquisitionGate = Deferred.makeUnsafe<void>();
-    const acquisitionObserved = Deferred.makeUnsafe<string>();
-    let handleReleased = false;
-    const delayedFileSystem: FileSystem.FileSystem = {
-      ...fileSystem,
-      open: (path, options) =>
-        Effect.gen(function* () {
-          const file = yield* fileSystem.open(path, options);
-          if (options?.flag !== "wx") return file;
-          yield* Effect.addFinalizer(() =>
-            Effect.sync(() => {
-              handleReleased = true;
-            }),
-          );
-          yield* Deferred.succeed(acquisitionObserved, path);
-          yield* Deferred.await(acquisitionGate);
-          return file;
-        }),
-    };
-    const abort = new AbortController();
-    let settled = false;
-    const pending = runStoreEffect(
-      store.recordInputEvent({
-        ...coordinator,
-        source: "interactive",
-        text: "Interrupt after exclusive creation but before open returns.",
-      }),
-      delayedFileSystem,
-      abort.signal,
-    ).finally(() => {
-      settled = true;
-    });
-
-    const temporaryPath = await Effect.runPromise(Deferred.await(acquisitionObserved));
-    assert.equal((await stat(temporaryPath)).isFile(), true);
-    abort.abort();
-    await Effect.runPromise(Effect.sleep("20 millis"));
-    assert.equal(settled, false);
-    await Effect.runPromise(Deferred.succeed(acquisitionGate, undefined));
-    await assert.rejects(pending);
-
-    assert.equal(handleReleased, true);
-    await assert.rejects(
-      stat(temporaryPath),
-      (error: NodeJS.ErrnoException) => error.code === "ENOENT",
-    );
-    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
-    assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
-  } finally {
-    await rm(parent, { recursive: true, force: true });
-  }
-});
-
-void test("interruption during temporary preparation waits for native release and leaves no delayed file", async () => {
-  const { parent, store } = await fixture();
-  try {
-    const fileSystem = await liveFileSystem();
-    const writeGate = Deferred.makeUnsafe<void>();
-    const writeObserved = Deferred.makeUnsafe<string>();
-    let observedTemporaryPath: string | undefined;
-    let handleReleased = false;
-    const delayedFileSystem: FileSystem.FileSystem = {
-      ...fileSystem,
-      open: (path, options) =>
-        Effect.gen(function* () {
-          yield* Effect.addFinalizer(() =>
-            Effect.sync(() => {
-              handleReleased = true;
-            }),
-          );
-          const file = yield* fileSystem.open(path, options);
-          if (options?.flag !== "wx") return file;
-          return {
-            [FileSystem.FileTypeId]: FileSystem.FileTypeId,
-            get stat() {
-              return file.stat;
-            },
-            seek: (offset, from) => file.seek(offset, from),
-            get sync() {
-              return file.sync;
-            },
-            read: (buffer) => file.read(buffer),
-            readAlloc: (size) => file.readAlloc(size),
-            truncate: (length) => file.truncate(length),
-            write: (buffer) => file.write(buffer),
-            writeAll: (buffer) => {
-              observedTemporaryPath = path;
-              return Deferred.succeed(writeObserved, path).pipe(
-                Effect.andThen(Deferred.await(writeGate)),
-                Effect.andThen(file.writeAll(buffer)),
-              );
-            },
-          };
-        }),
-    };
-    const abort = new AbortController();
-    let settled = false;
-    const pending = runStoreEffect(
-      store.recordInputEvent({
-        ...coordinator,
-        source: "interactive",
-        text: "This delayed write must be interrupted before publication.",
-      }),
-      delayedFileSystem,
-      abort.signal,
-    ).finally(() => {
-      settled = true;
-    });
-
-    assert.equal(await Effect.runPromise(Deferred.await(writeObserved)), observedTemporaryPath);
-    abort.abort();
-    await Effect.runPromise(Effect.sleep("20 millis"));
-    assert.equal(settled, false);
-    await Effect.runPromise(Deferred.succeed(writeGate, undefined));
-    await assert.rejects(pending);
-    await Effect.runPromise(Effect.sleep("20 millis"));
-
-    assert.equal(handleReleased, true);
-    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
-    assert.deepEqual(await readdir(join(store.path, "..")), ["workstream.json"]);
+    const migrated = await runStore(WorkstreamStoreEffects.migrateLegacy(legacyPath, "dead"));
+    assert.equal(migrated.state.statePath, state.statePath);
+    assert.deepEqual(await readFile(legacyPath), before);
+    assert.equal((await runStore(WorkstreamStoreEffects.inspect(state.statePath))).id, state.id);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -1045,124 +924,3 @@ void test("legitimate existing storage supports new ids and preserves claimed-di
     await rm(parent, { recursive: true, force: true });
   }
 });
-
-void test("each execution uses a unique temporary identity and preserves unowned collisions", async () => {
-  const { parent, store } = await fixture();
-  try {
-    const fileSystem = await liveFileSystem();
-    const collisionPaths: string[] = [];
-    const collisionFileSystem: FileSystem.FileSystem = {
-      ...fileSystem,
-      open: (path, options) => {
-        if (options?.flag !== "wx") return fileSystem.open(path, options);
-        collisionPaths.push(path);
-        return fileSystem
-          .writeFileString(path, "unowned collision bytes", { mode: 0o600 })
-          .pipe(Effect.andThen(fileSystem.open(path, options)));
-      },
-    };
-    const operation = store.recordInputEvent({
-      ...coordinator,
-      source: "interactive",
-      text: "This collision must not be retained.",
-    });
-
-    for (let execution = 0; execution < 2; execution += 1)
-      await assert.rejects(
-        runStoreEffect(operation, collisionFileSystem),
-        /exclusively acquire temporary workstream state/,
-      );
-    assert.equal(collisionPaths.length, 2);
-    assert.equal(new Set(collisionPaths).size, 2);
-    for (const collisionPath of collisionPaths)
-      assert.equal(await readFile(collisionPath, "utf8"), "unowned collision bytes");
-    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
-  } finally {
-    await rm(parent, { recursive: true, force: true });
-  }
-});
-
-void test("temporary cleanup failure is observable without replacing the original state", async () => {
-  const { parent, store } = await fixture();
-  try {
-    const fileSystem = await liveFileSystem();
-    const cleanupFailure = new Error("injected owned temporary cleanup failure");
-    const failingCleanupFileSystem: FileSystem.FileSystem = {
-      ...fileSystem,
-      remove: (path, options) =>
-        path.endsWith(".tmp")
-          ? Effect.fail(
-              PlatformError.systemError({
-                _tag: "PermissionDenied",
-                module: "FileSystem",
-                method: "remove",
-                pathOrDescriptor: path,
-                cause: cleanupFailure,
-                description: cleanupFailure.message,
-              }),
-            )
-          : fileSystem.remove(path, options),
-    };
-    let guardCalls = 0;
-    store.bindMutationGuard(() => {
-      guardCalls += 1;
-      if (guardCalls === 2) throw new Error("injected lease loss");
-    });
-
-    await assert.rejects(
-      runStoreEffect(
-        store.recordInputEvent({
-          ...coordinator,
-          source: "interactive",
-          text: "This fenced write must expose cleanup failure.",
-        }),
-        failingCleanupFileSystem,
-      ),
-      (error: Error) => {
-        const details = failureDetails(error);
-        return (
-          details.includes("injected lease loss") &&
-          details.includes("remove owned temporary workstream state") &&
-          details.includes(cleanupFailure.message)
-        );
-      },
-    );
-    assert.equal((await runStore(WorkstreamStoreEffects.inspect(store.path))).revision, 0);
-  } finally {
-    await rm(parent, { recursive: true, force: true });
-  }
-});
-
-async function liveFileSystem(): Promise<FileSystem.FileSystem> {
-  return Effect.runPromise(Effect.provide(FileSystem.FileSystem, liveLayer));
-}
-
-async function livePath(): Promise<Path.Path> {
-  return Effect.runPromise(Effect.provide(Path.Path, liveLayer));
-}
-
-async function runStoreEffect<A, E>(
-  operation: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>,
-  fileSystem: FileSystem.FileSystem,
-  signal?: AbortSignal,
-): Promise<A> {
-  const paths = await livePath();
-  return Effect.runPromise(
-    Effect.provideService(
-      Effect.provideService(operation, FileSystem.FileSystem, fileSystem),
-      Path.Path,
-      paths,
-    ),
-    signal === undefined ? undefined : { signal },
-  );
-}
-
-function failureDetails(failure: Error): string {
-  const nested =
-    failure instanceof AggregateError
-      ? failure.errors.filter((item): item is Error => item instanceof Error).map(failureDetails)
-      : failure.cause instanceof Error
-        ? [failureDetails(failure.cause)]
-        : [];
-  return [failure.message, ...nested].join("\n");
-}

@@ -22,7 +22,7 @@ Process ownership claims require real child-process checks for normal completion
 The pinned `@effect/platform-node-shared` rc112 Windows spawner unconditionally invokes `taskkill /T /F` even with `detached: false`, so it cannot replace this native process boundary without reintroducing a Windows ownership regression. Keep the `node:child_process` adapter inside the existing Effect scope so one owner controls termination and close without a second backend.
 Promise-level success or rejection alone does not establish that the scoped Effect owner released the native process.
 Runtime scheduling tests may inject Effect's `TestClock`, but fenced lease checks still cross the native SQLite and wall-clock boundary and must align their fixture time explicitly.
-Workstream persistence claims require real temporary state files and real isolated SQLite storage because an in-memory adapter cannot establish mutation serialization, atomic replacement, or fenced ownership.
+Workstream persistence claims require real temporary private per-workstream SQLite storage because an in-memory adapter cannot establish transaction serialization, aggregate/lease atomicity, rollback, or fenced ownership. The canonical database must be `0600` inside `0700` workstream directories, and rollback-journal/WAL sidecars must not become a privacy escape. Historical JSON checks read raw bytes without rewriting them; current JSON import checks exact identity, authoritative dead-owner proof, source readback, and collision refusal.
 
 ## Persistence and external effects
 
@@ -41,7 +41,7 @@ When a current native attempt has no report text, `test/pi-process.test.ts` esta
 Those checks must establish that raw provider errors and credentials do not enter retained state or notifications and that typed or untyped results remain authoritative when present.
 The bounded category is actionable context, not proof of the provider's underlying cause.
 
-Lease and ownership checks use real isolated SQLite storage.
+Lease and ownership checks use real isolated per-workstream SQLite storage. The global registry records fresh locators in its current table, reads historical locator rows as a fallback, and leaves historical tables untouched; it must not contain or decide a live lease.
 Git safety checks use disposable real repositories and preserve mismatched or unattributed resources.
 Shared read-only workers use the live project cwd, including dirty tracked and untracked files, and their settlement and recovery must not invoke Git cleanup or discard.
 Human authority tests enter through Pi's registered input/tool path, including rejection of extension-generated authority.

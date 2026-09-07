@@ -12,6 +12,7 @@ import { liveLayer } from "../../src/node-platform.js";
 import { hasNativeAgentSettled } from "../../src/pi-process.js";
 import { type WorkstreamState, WorkstreamStoreEffects } from "../../src/workstream.js";
 import {
+  canonicalWorkstreamPath,
   closeOwnedWorkspace,
   command,
   createFixtureCheckpoint,
@@ -77,7 +78,7 @@ try {
       assert.ok(workstreamName !== undefined);
       const observed = await Effect.runPromise(
         Effect.provide(
-          WorkstreamStoreEffects.inspect(join(directory, workstreamName, "workstream.json")),
+          WorkstreamStoreEffects.inspect(canonicalWorkstreamPath(f.root, workstreamName)),
           liveLayer,
         ),
       );
@@ -268,7 +269,7 @@ try {
       assert.ok(workstreamName !== undefined);
       const observed = await Effect.runPromise(
         Effect.provide(
-          WorkstreamStoreEffects.inspect(join(directory, workstreamName, "workstream.json")),
+          WorkstreamStoreEffects.inspect(canonicalWorkstreamPath(f.root, workstreamName)),
           liveLayer,
         ),
       );

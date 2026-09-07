@@ -38,7 +38,7 @@ import type {
   NativeFailureCategory,
   PiSessionError,
 } from "./pi-process.js";
-import { LeaseDecisionRequiredError, type LeaseOwner, type WorkgraphRegistry } from "./registry.js";
+import type { WorkgraphRegistry } from "./registry.js";
 import type { ThinkingLevel, WorkerIdentity } from "./types.js";
 import type {
   StoreEffect,
@@ -49,6 +49,7 @@ import type {
   WorkstreamStoreEffects,
   WorkstreamStoreError,
 } from "./workstream.js";
+import { LeaseDecisionRequiredError, type LeaseOwner } from "./workstream-persistence.js";
 import {
   acquireRuntimeLease,
   type PiObservationError,
@@ -343,7 +344,7 @@ export class WorkstreamRuntime {
       catch: (cause) =>
         cause instanceof LeaseDecisionRequiredError
           ? cause
-          : new RuntimeRegistryError({ operation: "assert registry lease", cause }),
+          : new RuntimeRegistryError({ operation: "assert workstream lease", cause }),
     });
   }
 
@@ -358,7 +359,7 @@ export class WorkstreamRuntime {
           const fatal =
             failure instanceof LeaseDecisionRequiredError || failure instanceof RuntimeRegistryError
               ? failure
-              : new RuntimeRegistryError({ operation: "renew registry lease", cause: failure });
+              : new RuntimeRegistryError({ operation: "renew workstream lease", cause: failure });
           return this.terminate(fatal);
         },
       ),

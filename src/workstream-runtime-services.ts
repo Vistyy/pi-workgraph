@@ -1,5 +1,5 @@
 import type { FileSystem, Path, Scope } from "effect";
-import { Cause, Data, DateTime, Effect } from "effect";
+import { Cause, Data, Effect } from "effect";
 import type { HerdrEffects } from "./herdr.js";
 import {
   createWorkerSessionEffect,
@@ -10,13 +10,14 @@ import {
   readTerminalText,
   readWorkgraphReportResult,
 } from "./pi-process.js";
+import { WorkgraphRegistry } from "./registry.js";
+import type { WorkstreamStoreEffects, WorkstreamStoreError } from "./workstream.js";
 import {
   type Lease,
   LeaseDecisionRequiredError,
   type LeaseOwner,
-  WorkgraphRegistry,
-} from "./registry.js";
-import type { WorkstreamStoreEffects, WorkstreamStoreError } from "./workstream.js";
+} from "./workstream-persistence.js";
+import { legacyPathForWorkstream } from "./workstream-state.js";
 
 export type RuntimeWorkerPort = {
   readonly available: boolean;
@@ -75,7 +76,7 @@ export interface RuntimeLeaseOptions {
     | undefined;
 }
 
-/** Acquire the runtime's fenced lease and registry in the caller's scope. */
+/** Acquire the runtime's private per-workstream lease and optional discovery locator. */
 export function acquireRuntimeLease(
   options: RuntimeLeaseOptions,
 ): Effect.Effect<
@@ -92,30 +93,35 @@ export function acquireRuntimeLease(
           : Effect.void,
     );
     const state = yield* options.store.load();
-    yield* registryEffect("index workstream", () =>
+    yield* registryEffect("index workstream discovery path", () =>
       registry.indexWorkstream({
-        ...state,
         runId: state.id,
-        lifecycle: state.lifecycle.state,
+        statePath: state.statePath,
+        gitCommonDir: state.gitCommonDir,
+        legacyStatePath: legacyPathForWorkstream(state.gitCommonDir, state.id),
       }),
     );
-    const now = yield* DateTime.nowAsDate;
     const owner = options.owner ?? state.coordinator;
     let current: Lease | undefined = yield* Effect.acquireRelease(
-      registryEffect("claim registry lease", () =>
-        registry.acquire(state.id, owner, now, options.priorOwnerLiveness ?? "unknown"),
-      ),
+      options.store
+        .acquireLease(owner, options.priorOwnerLiveness ?? "unknown")
+        .pipe(Effect.mapError((error) => leaseAcquisitionError("claim workstream lease", error))),
       (lease) =>
-        finalizer(
-          "release registry lease",
-          () => registry.release(lease),
-          options.onFinalizerError,
-        ).pipe(
+        options.store.releaseLease(lease).pipe(
+          Effect.mapError((error) => leaseAcquisitionError("release workstream lease", error)),
           Effect.ensuring(
             Effect.sync(() => {
-              current = undefined;
+              if (current?.token === lease.token) current = undefined;
             }),
           ),
+          Effect.catchCause((cause) => {
+            const error = new RuntimeRegistryError({
+              operation: "release workstream lease",
+              cause: Cause.squash(cause),
+            });
+            const report = options.onFinalizerError?.(error) ?? Effect.void;
+            return report.pipe(Effect.ignore, Effect.andThen(Effect.die(error)));
+          }),
         ),
     );
     const handle: RuntimeLeaseHandle = {
@@ -124,24 +130,29 @@ export function acquireRuntimeLease(
           throw new LeaseDecisionRequiredError(
             `Workstream ${state.id} no longer holds a live lease.`,
           );
-        registry.assertLease(current);
+        options.store.assertLease(current);
       },
-      renew: Effect.suspend(() =>
-        registryEffect("renew registry lease", () => {
-          if (current === undefined)
-            throw new LeaseDecisionRequiredError(
-              `Workstream ${state.id} no longer holds a live lease.`,
-            );
-          current = registry.renew(current);
-        }),
-      ),
+      renew: Effect.suspend(() => {
+        if (current === undefined)
+          return Effect.fail(
+            new LeaseDecisionRequiredError(`Workstream ${state.id} no longer holds a live lease.`),
+          );
+        return options.store.renewLease(current).pipe(
+          Effect.map((lease) => {
+            current = lease;
+            return undefined;
+          }),
+          Effect.mapError((error) => leaseAcquisitionError("renew workstream lease", error)),
+        );
+      }),
     };
-    options.store.bindMutationGuard(handle.assert);
     if (
       owner.sessionId !== state.coordinator.sessionId ||
       owner.sessionFile !== state.coordinator.sessionFile
     )
-      yield* options.store.adopt(owner);
+      yield* options.store
+        .adopt(owner)
+        .pipe(Effect.mapError((error) => leaseAcquisitionError("adopt workstream owner", error)));
     return handle;
   });
 }
@@ -160,6 +171,14 @@ export const runtimePi = {
   started: hasNativeAgentStarted,
   settled: hasNativeAgentSettled,
 };
+
+function leaseAcquisitionError(
+  operation: string,
+  error: WorkstreamStoreError,
+): RuntimeRegistryError | LeaseDecisionRequiredError {
+  if (error instanceof LeaseDecisionRequiredError) return error;
+  return new RuntimeRegistryError({ operation, cause: error });
+}
 
 function registryEffect<A>(operation: string, run: () => A) {
   return Effect.try({

@@ -18,9 +18,10 @@ import {
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import { processEffect } from "../src/process.js";
-import { type Lease, WorkgraphRegistry } from "../src/registry.js";
+import { WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity, WorkerReport } from "../src/types.js";
 import { type WorkstreamState, WorkstreamStoreEffects } from "../src/workstream.js";
+import type { Lease } from "../src/workstream-persistence.js";
 import {
   type RuntimeEffect,
   type RuntimeOwnership,
@@ -947,9 +948,9 @@ await test("exclusive lease fences same-session duplicates and dead-owner adopti
     const receipts = (await runRuntime(f.store.load())).inputs;
     await assert.rejects(f.runtime(), /already has a runtime owner/);
     await submit(first, f.store.setLifecycle({ state: "suspended", reason: "Keep stopped" }));
-    f.registry.db
-      .prepare("UPDATE leases SET expires_at=? WHERE run_id=?")
-      .run("2000-01-01T00:00:00.000Z", "ws-fixture");
+    f.store.db
+      .prepare("UPDATE lease SET expires_at=? WHERE singleton=1")
+      .run("2000-01-01T00:00:00.000Z");
     const nextOwner = {
       sessionId: "new-owner",
       sessionFile: join(f.parent, "new-session.jsonl"),
@@ -1068,10 +1069,7 @@ await test("partial adoption failure releases the acquired lease before runtime 
       /adoption failure/,
     );
     assert.equal(adopt.mock.callCount(), 1);
-    assert.equal(
-      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
-      undefined,
-    );
+    assert.equal(f.store.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(), undefined);
   } finally {
     await f.dispose();
   }
@@ -1103,14 +1101,11 @@ await test("fatal heartbeat loss releases ownership and permits a clean reattach
   try {
     const active = await f.runtime(undefined, { clock });
     await submit(active, Effect.void);
-    f.registry.db.prepare("DELETE FROM leases WHERE run_id=?").run("ws-fixture");
+    f.store.db.prepare("DELETE FROM lease WHERE singleton=1").run();
     await Effect.runPromise(clock.adjust("5 seconds"));
     assert.equal(f.errors.length, 1);
     assert.match(f.errors[0] ?? "", /lease|owner/i);
-    assert.equal(
-      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
-      undefined,
-    );
+    assert.equal(f.store.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(), undefined);
     const reattached = await f.runtime();
     await submit(reattached, Effect.void);
     await runRuntime(active.effects.close);
@@ -1182,31 +1177,27 @@ await test("close interrupts a suspended store operation and fails queued replie
     await runRuntime(active.effects.close);
     await assert.rejects(running, /stopped|interrupt/i);
     await assert.rejects(queued, /stopped|interrupt/i);
-    assert.equal(
-      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
-      undefined,
-    );
+    assert.equal(f.store.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(), undefined);
   } finally {
     await f.dispose();
   }
 });
 
-await test("close surfaces registry release failures after attempting the exact release", async (t) => {
+await test("close surfaces private lease release failures after attempting the exact release", async (t) => {
   const f = await fixture();
   const active = await f.runtime();
   await submit(active, Effect.void);
-  const release = f.registry.release.bind(f.registry);
-  t.mock.method(f.registry, "release", (lease: Lease) => {
-    release(lease);
-    throw new Error("fixture registry release failure");
-  });
+  const release = f.store.releaseLease.bind(f.store);
+  t.mock.method(f.store, "releaseLease", (lease: Lease) =>
+    release(lease).pipe(
+      // oxlint-disable-next-line effecttsgo/global-error-in-effect-failure -- This test deliberately injects an untyped host finalizer failure.
+      Effect.andThen(Effect.fail(new Error("fixture private lease release failure"))),
+    ),
+  );
   try {
-    await assert.rejects(runRuntime(active.effects.close), /registry release failure/);
-    assert.match(f.errors[0] ?? "", /registry release failure/);
-    assert.equal(
-      f.registry.db.prepare("SELECT 1 FROM leases WHERE run_id=?").get("ws-fixture"),
-      undefined,
-    );
+    await assert.rejects(runRuntime(active.effects.close), /private lease release failure/);
+    assert.match(f.errors[0] ?? "", /private lease release failure/);
+    assert.equal(f.store.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(), undefined);
   } finally {
     f.registry.close();
     await rm(f.parent, { recursive: true, force: true });

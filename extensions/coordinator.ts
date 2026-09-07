@@ -45,6 +45,7 @@ import {
   WorkstreamRuntime,
 } from "../src/workstream-runtime.js";
 import { RuntimeHostError } from "../src/workstream-runtime-services.js";
+import { isLegacyWorkstreamPath } from "../src/workstream-state.js";
 
 const POINTER = "pi-workgraph-workstream";
 const INPUT = "pi-workgraph-human-input";
@@ -334,6 +335,15 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           ctx.ui.notify(
             `Workstream reattachment skipped: ${inspection.lifecycle.state} older history ${inspection.id} was preserved and not attached.`,
             "info",
+          ),
+        );
+        return;
+      }
+      if (inspection.kind === "legacy_current") {
+        yield* sdk("report legacy workstream migration requirement", () =>
+          ctx.ui.notify(
+            `Workstream reattachment skipped: active JSON state at ${path} is retained read-only; use workgraph_adopt after the prior owner is proven dead to perform the bounded SQLite import.`,
+            "warning",
           ),
         );
         return;
@@ -762,13 +772,22 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
         Effect.gen(function* () {
-          const state = yield* WorkstreamStoreEffects.inspect(params.statePath);
+          let state = yield* WorkstreamStoreEffects.inspect(params.statePath);
           const repository = yield* inspectRepository(state.projectRoot);
           if (repository.commonDir !== state.gitCommonDir)
             throw new Error("The retained workstream belongs to another repository.");
           const herdr = new HerdrCliRuntime();
           const liveness = yield* herdr.effects.coordinatorLiveness(state.coordinator.sessionFile);
-          const target = WorkstreamStoreEffects.open(params.statePath, state.coordinator);
+          let targetPath = params.statePath;
+          if (isLegacyWorkstreamPath(state.statePath)) {
+            const migrated = yield* WorkstreamStoreEffects.migrateLegacy(
+              params.statePath,
+              liveness,
+            );
+            state = migrated.state;
+            targetPath = migrated.path;
+          }
+          const target = WorkstreamStoreEffects.open(targetPath, state.coordinator);
           const active = yield* attachEffect(ctx, target, liveness);
           yield* sdk("retain adopted workstream pointer", () =>
             pi.appendEntry(POINTER, { path: target.path }),

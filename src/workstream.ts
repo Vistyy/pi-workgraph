@@ -1,15 +1,23 @@
 import { randomUUID } from "node:crypto";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Workstream paths are pure host paths and do not require an Effect service.
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Legacy source readback is a host filesystem identity check.
+import { readFileSync } from "node:fs";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Canonical workstream paths use host path identity at the synchronous store boundary.
 import { resolve } from "node:path";
-import { DateTime, Effect, Semaphore } from "effect";
+import { DateTime, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { EvidenceSchema } from "./report-schema.js";
 import {
-  AtomicWorkstreamFile,
+  assertLegacySourceFile,
   claimWorkstreamDirectory,
   domainEffect,
-  removeWorkstreamDirectory,
+  isNativeSqliteFile,
+  type Lease,
+  LeaseDecisionRequiredError,
+  readLegacyCurrentState,
+  readLegacyObject,
+  readLegacyText,
+  SqliteWorkstreamDatabase,
   type StoreEffect,
   type WorkstreamStoreError,
   type WorkstreamStoreRequirements,
@@ -23,6 +31,7 @@ import {
   type HumanInputSource,
   type Intent,
   InvalidWorkstreamStateError,
+  isLegacyWorkstreamPath,
   pathForWorkstream,
   ResultSchema,
   type ResultSubject,
@@ -46,14 +55,15 @@ import {
   hasActiveOrUncleanAttempt,
   recordInputTransition,
   startAttemptTransition,
-  transitionWorkstreamState,
 } from "./workstream-transitions.js";
 import {
+  decodeLegacyState,
   decodeState,
   isActiveHistoricalState,
   isKnownHistoricalWorkstreamVersion,
   type JsonObject,
   type JsonValue,
+  parsePersistedObject,
   requireText,
   retainedTerminalInspection,
   validateAuthority,
@@ -90,40 +100,44 @@ type ResultInput = OmitEach<WorkResult, "observedAt" | "artifacts"> & {
 };
 
 export class WorkstreamStoreEffects {
-  private readonly writeSemaphore = Semaphore.makeUnsafe(1);
-
-  private mutationGuard: (() => void) | undefined;
-
-  private readonly file: AtomicWorkstreamFile;
+  private readonly database: SqliteWorkstreamDatabase;
+  private readonly leases = new Map<string, Lease>();
+  private lease: Lease | undefined;
 
   private constructor(
     readonly path: string,
     private owner: SessionIdentity,
+    database: SqliteWorkstreamDatabase,
   ) {
-    this.file = new AtomicWorkstreamFile(path, () => this.mutationGuard);
+    this.database = database;
   }
 
-  bindMutationGuard(guard: () => void): void {
-    this.mutationGuard = guard;
+  /** The SQLite handle is exposed for focused boundary checks, not as a second store API. */
+  get db(): SqliteWorkstreamDatabase["db"] {
+    return this.database.db;
   }
 
   adopt(owner: SessionIdentity): StoreEffect<WorkstreamState> {
     return this.prepared(
       () => validateSession(owner),
       () =>
-        this.update(
-          (draft) => {
+        domainEffect(() => {
+          const lease = this.lease;
+          if (lease === undefined)
+            throw new LeaseDecisionRequiredError("Workstream adoption requires its fenced lease.");
+          if (
+            lease.owner.sessionId !== owner.sessionId ||
+            lease.owner.sessionFile !== owner.sessionFile
+          )
+            throw new LeaseDecisionRequiredError(
+              "Workstream adoption owner does not hold its lease.",
+            );
+          const state = this.database.update(lease, (draft) => {
             draft.coordinator = { ...owner };
-          },
-          undefined,
-          ["active", "suspended"],
-        ).pipe(
-          Effect.tap(() =>
-            domainEffect(() => {
-              this.owner = { ...owner };
-            }),
-          ),
-        ),
+          });
+          this.owner = { ...owner };
+          return state;
+        }),
     );
   }
 
@@ -180,30 +194,41 @@ export class WorkstreamStoreEffects {
         createdAt: now,
         updatedAt: now,
       };
-      return { path, state, store: new WorkstreamStoreEffects(path, input.coordinator) };
+      return { path, state };
     }).pipe(
-      Effect.flatMap(({ path, state, store }) =>
+      Effect.flatMap(({ path, state }) =>
         claimWorkstreamDirectory(path).pipe(
-          Effect.andThen(
-            store.write(state).pipe(
-              Effect.catch((error) =>
-                removeWorkstreamDirectory(path).pipe(
-                  Effect.matchEffect({
-                    onFailure: (cleanupError) =>
-                      Effect.fail(
-                        new WorkstreamStoreOperationError({
-                          code: "workstream_store_operation_failed",
-                          message: "Workstream creation and cleanup both failed.",
-                          cause: new AggregateError([error, cleanupError]),
-                        }),
-                      ),
-                    onSuccess: () => Effect.fail(error),
-                  }),
+          Effect.flatMap(() =>
+            domainEffect(() => SqliteWorkstreamDatabase.create(path)).pipe(
+              Effect.flatMap((database) =>
+                domainEffect(() => database.initialize(state)).pipe(
+                  Effect.catch((error) =>
+                    Effect.sync(() => database.close()).pipe(
+                      Effect.matchEffect({
+                        onFailure: (closeError) =>
+                          Effect.fail(
+                            new WorkstreamStoreOperationError({
+                              code: "workstream_store_operation_failed",
+                              message:
+                                "Workstream initialization failed and its SQLite handle could not be closed; the private artifact was retained for inspection.",
+                              cause: new AggregateError([error, closeError]),
+                            }),
+                          ),
+                        onSuccess: () => Effect.fail(error),
+                      }),
+                    ),
+                  ),
+                  Effect.map(
+                    () =>
+                      ({
+                        store: new WorkstreamStoreEffects(path, input.coordinator, database),
+                        state: structuredClone(state),
+                      }) as const,
+                  ),
                 ),
               ),
             ),
           ),
-          Effect.as({ store, state: structuredClone(state) }),
         ),
       ),
     );
@@ -211,34 +236,136 @@ export class WorkstreamStoreEffects {
 
   static open(path: string, owner: SessionIdentity): WorkstreamStoreEffects {
     validateSession(owner);
-    return new WorkstreamStoreEffects(resolve(path), owner);
+    const resolvedPath = resolve(path);
+    if (!isNativeSqliteFile(resolvedPath))
+      throw new Error(
+        `Legacy JSON workstream state is read-only; explicitly migrate it after proving the prior owner is dead: ${resolvedPath}.`,
+      );
+    return new WorkstreamStoreEffects(
+      resolvedPath,
+      owner,
+      SqliteWorkstreamDatabase.open(resolvedPath),
+    );
   }
 
   static inspect(path: string): StoreEffect<WorkstreamState> {
     const resolvedPath = resolve(path);
-    return new AtomicWorkstreamFile(resolvedPath, () => undefined).readState();
+    return isNativeSqliteFile(resolvedPath)
+      ? sqliteEffect(resolvedPath, (database) => database.state())
+      : readLegacyCurrentState(resolvedPath);
+  }
+
+  static readRaw(path: string): StoreEffect<string> {
+    const resolvedPath = resolve(path);
+    return isNativeSqliteFile(resolvedPath)
+      ? sqliteEffect(resolvedPath, (database) => database.rawState())
+      : readLegacyText(resolvedPath);
   }
 
   /**
-   * Read a startup pointer without writes or ownership changes.
-   * A canonical terminal envelope from a known workstream version may be retained
-   * without applying the current mutable schema or adopting its ownership.
+   * Read a startup pointer without writes or ownership changes. Historical JSON is
+   * retained losslessly; active JSON is reported as legacy and is never attached.
    */
   static inspectForReattachment(path: string): StoreEffect<WorkstreamReattachmentInspection> {
     const resolvedPath = resolve(path);
-    return new AtomicWorkstreamFile(resolvedPath, () => undefined)
-      .readObject()
-      .pipe(
-        Effect.flatMap((value) =>
-          domainEffect(() => inspectReattachmentValue(value, resolvedPath)),
-        ),
+    if (isNativeSqliteFile(resolvedPath))
+      return sqliteEffect(resolvedPath, (database) => ({
+        kind: "current" as const,
+        state: database.state(),
+      }));
+    return readLegacyObject(resolvedPath).pipe(
+      Effect.flatMap((value) => domainEffect(() => inspectReattachmentValue(value, resolvedPath))),
+    );
+  }
+
+  /**
+   * Import one quiescent current JSON state into its exact derived SQLite path.
+   * The source is not removed or rewritten. This is intentionally explicit: a
+   * live JSON owner is never migrated merely because a pointer was observed.
+   */
+  static migrateLegacy(
+    path: string,
+    priorOwnerLiveness: "alive" | "dead" | "unknown",
+  ): StoreEffect<{ path: string; state: WorkstreamState }> {
+    const resolvedPath = resolve(path);
+    if (priorOwnerLiveness !== "dead")
+      return domainEffect(() => {
+        throw new LeaseDecisionRequiredError(
+          "Legacy workstream migration requires authoritative proof that the prior owner is dead.",
+        );
+      });
+    return Effect.gen(function* () {
+      const source = yield* readLegacyText(resolvedPath);
+      const legacy = yield* domainEffect(() => {
+        const value = parsePersistedObject(source);
+        if (value.format !== WORKSTREAM_FORMAT || value.version !== WORKSTREAM_STATE_VERSION)
+          throw new UnsupportedWorkstreamStateError(value.format, value.version);
+        return decodeLegacyState(value, resolvedPath);
+      });
+      const targetPath = pathForWorkstream(legacy.gitCommonDir, legacy.id);
+      yield* domainEffect(() => assertLegacySourceFile(resolvedPath));
+      yield* claimWorkstreamDirectory(targetPath, true);
+      const imported = { ...structuredClone(legacy), statePath: targetPath };
+      return yield* Effect.acquireUseRelease(
+        domainEffect(() => SqliteWorkstreamDatabase.create(targetPath)),
+        (database) =>
+          domainEffect(() => {
+            database.initialize(imported);
+            if (readFileSync(resolvedPath, "utf8") !== source)
+              throw new Error(
+                `Legacy workstream source changed during bounded import; source was left untouched and the canonical artifact was retained at ${targetPath}.`,
+              );
+            return { path: targetPath, state: imported };
+          }),
+        (database) => Effect.sync(() => database.close()),
       );
+    });
   }
 
   load(): StoreEffect<WorkstreamState> {
-    return this.file
-      .readState()
-      .pipe(Effect.tap((state) => domainEffect(() => this.assertOwner(state))));
+    return domainEffect(() => this.database.state()).pipe(
+      Effect.tap((state) => domainEffect(() => this.assertOwner(state))),
+    );
+  }
+
+  acquireLease(
+    owner: SessionIdentity,
+    liveness: "alive" | "dead" | "unknown" = "unknown",
+  ): StoreEffect<Lease, never> {
+    return domainEffect(() => {
+      validateSession(owner);
+      const lease = this.database.claimLease(owner, liveness);
+      this.leases.set(lease.token, lease);
+      this.lease = lease;
+      return lease;
+    });
+  }
+
+  assertLease(lease: Lease, now?: Date): void {
+    this.database.assertLease(lease, now);
+  }
+
+  renewLease(lease: Lease): StoreEffect<Lease, never> {
+    return domainEffect(() => {
+      this.assertLocalLease(lease);
+      const renewed = this.database.renewLease(lease);
+      this.leases.set(renewed.token, renewed);
+      if (this.lease?.token === lease.token) this.lease = renewed;
+      return renewed;
+    });
+  }
+
+  releaseLease(lease: Lease): StoreEffect<void, never> {
+    return domainEffect(() => {
+      this.assertLocalLease(lease);
+      this.database.releaseLease(lease);
+      this.leases.delete(lease.token);
+      if (this.lease?.token === lease.token) this.lease = undefined;
+    });
+  }
+
+  close(): void {
+    this.database.close();
   }
 
   recordInputEvent(input: {
@@ -1013,35 +1140,16 @@ export class WorkstreamStoreEffects {
     suppliedNow?: Date,
     allowedLifecycleStates: WorkstreamState["lifecycle"]["state"][] = ["active"],
   ): StoreEffect<WorkstreamState> {
-    return this.writeSemaphore.withPermit(
-      this.performUpdate(mutator, suppliedNow, allowedLifecycleStates),
-    );
-  }
-
-  private performUpdate(
-    mutator: (draft: WorkstreamState, now: Date) => void,
-    suppliedNow: Date | undefined,
-    allowedLifecycleStates: WorkstreamState["lifecycle"]["state"][],
-  ): StoreEffect<WorkstreamState> {
-    return domainEffect(() => this.mutationGuard?.()).pipe(
-      Effect.andThen(this.file.readState()),
-      Effect.flatMap((current) =>
-        domainEffect(() => {
-          this.assertOwner(current);
-          if (!allowedLifecycleStates.includes(current.lifecycle.state))
-            throw new Error(`Workstream is ${current.lifecycle.state}.`);
-          return transitionWorkstreamState(current, mutator, suppliedNow ?? currentDate());
-        }).pipe(Effect.flatMap((draft) => this.persistTransition(current, draft))),
-      ),
-    );
-  }
-
-  private persistTransition(
-    current: WorkstreamState,
-    draft: WorkstreamState,
-  ): StoreEffect<WorkstreamState> {
-    if (draft.revision === current.revision) return Effect.succeed(draft);
-    return this.write(draft).pipe(Effect.as(structuredClone(draft)));
+    return domainEffect(() => {
+      const lease = this.lease;
+      if (lease === undefined)
+        throw new LeaseDecisionRequiredError("Workstream mutation requires its fenced lease.");
+      return this.database.update(lease, mutator, {
+        expectedOwner: this.owner,
+        suppliedNow,
+        allowedLifecycleStates,
+      });
+    });
   }
 
   private assertOwner(state: WorkstreamState): void {
@@ -1053,8 +1161,15 @@ export class WorkstreamStoreEffects {
     }
   }
 
-  private write(state: WorkstreamState): StoreEffect<void> {
-    return this.file.writeState(state);
+  private assertLocalLease(lease: Lease): void {
+    const bound = this.leases.get(lease.token);
+    if (
+      bound === undefined ||
+      bound.runId !== lease.runId ||
+      bound.owner.sessionId !== lease.owner.sessionId ||
+      bound.owner.sessionFile !== lease.owner.sessionFile
+    )
+      throw new LeaseDecisionRequiredError("Workstream lease is not bound to this store.");
   }
 }
 
@@ -1075,9 +1190,28 @@ function inspectCurrentReattachment(
   value: JsonObject,
   resolvedPath: string,
 ): WorkstreamReattachmentInspection {
-  const state = decodeState(value);
-  validateStoredPath(state, resolvedPath);
-  return { kind: "current", state: structuredClone(state) };
+  try {
+    const state = decodeState(value);
+    validateStoredPath(state, resolvedPath);
+    return { kind: "current", state: structuredClone(state) };
+  } catch (cause) {
+    if (isLegacyWorkstreamPath(resolvedPath)) {
+      const state = decodeLegacyState(value, resolvedPath);
+      return { kind: "legacy_current", state: structuredClone(state) };
+    }
+    throw cause;
+  }
+}
+
+function sqliteEffect<A>(
+  path: string,
+  run: (database: SqliteWorkstreamDatabase) => A,
+): StoreEffect<A, never> {
+  return Effect.acquireUseRelease(
+    domainEffect(() => SqliteWorkstreamDatabase.openReadOnly(path)),
+    (database) => domainEffect(() => run(database)),
+    (database) => Effect.sync(() => database.close()),
+  );
 }
 
 function inspectHistoricalReattachment(

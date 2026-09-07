@@ -6,6 +6,7 @@ import {
   type AuthorityReference,
   type CompletionAccounting,
   InvalidWorkstreamStateError,
+  legacyPathForWorkstream,
   pathForWorkstream,
   type ResultSubject,
   RetainedTerminalEnvelopeSchema,
@@ -103,7 +104,8 @@ export function retainedTerminalInspection(
   const reason = stringField(lifecycle, "reason");
   if (
     statePath !== resolvedPath ||
-    statePath !== pathForWorkstream(gitCommonDir, id) ||
+    (statePath !== pathForWorkstream(gitCommonDir, id) &&
+      statePath !== legacyPathForWorkstream(gitCommonDir, id)) ||
     (lifecycleState !== "completed" &&
       lifecycleState !== "abandoned" &&
       lifecycleState !== "archived") ||
@@ -147,6 +149,22 @@ export function decodeState(value: JsonObject): WorkstreamState {
   // SAFETY: Value.Check established the complete WorkstreamStateSchema contract immediately above.
   const state = value as WorkstreamState;
   validateState(state);
+  return state;
+}
+
+export function decodeLegacyState(value: JsonObject, resolvedPath: string): WorkstreamState {
+  if (!Value.Check(WorkstreamStateSchema, value))
+    throw new InvalidWorkstreamStateError(schemaDiagnostic(value));
+  // SAFETY: Value.Check established the complete WorkstreamStateSchema contract immediately above.
+  const state = value as WorkstreamState;
+  if (
+    state.statePath !== resolvedPath ||
+    state.statePath !== legacyPathForWorkstream(state.gitCommonDir, state.id)
+  )
+    throw new InvalidWorkstreamStateError(
+      `Legacy workstream state identity does not match its exact path: ${resolvedPath}.`,
+    );
+  validateState({ ...state, statePath: pathForWorkstream(state.gitCommonDir, state.id) });
   return state;
 }
 
