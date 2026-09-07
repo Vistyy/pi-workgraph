@@ -112,6 +112,23 @@ class FakeAssistantRow extends FakeContainer {
   }
 }
 
+class FakeUserRow extends FakeContainer {
+  readonly lines: string[];
+
+  constructor(...lines: string[]) {
+    super();
+    this.lines = lines;
+  }
+
+  override render(_width: number): string[] {
+    return [...this.lines];
+  }
+
+  override handleMouse(event: FakeMouseEvent): FakeMouseEvent {
+    return event;
+  }
+}
+
 class FakeMessageRow {
   message: { customType: string };
 
@@ -204,6 +221,7 @@ function moduleForFakeRows() {
     ToolExecutionComponent: FakeToolRow,
     CustomMessageComponent: FakeMessageRow,
     AssistantMessageComponent: FakeAssistantRow,
+    UserMessageComponent: FakeUserRow,
   };
 }
 
@@ -255,19 +273,25 @@ void test("presentation adapter hides and restores existing tool and operational
   assert.deepEqual(message.render(80), ["message:pi-workgraph-attention:80"]);
 });
 
-void test("Calm separates visible assistant blocks across hidden rows without mutating the chat", () => {
+void test("Calm marks successive assistant blocks on their existing first row", () => {
   const state = {
     on: true,
     hiddenTools: new Set(["read"]),
     hiddenMessageTypes: new Set(["pi-workgraph-attention"]),
   };
+  const width = 32;
+  const fullWidthText = "full-width assistant response".padEnd(width, "!");
   const chat = new FakeContainer();
-  const first = new FakeAssistantRow("thinking", "answer");
+  const first = new FakeAssistantRow("", "  thinking", "  answer");
   const hiddenToolA = new FakeToolRow("read");
   const hiddenToolB = new FakeToolRow("read");
   const hiddenMessage = new FakeMessageRow("pi-workgraph-attention");
   const toolOnlyAssistant = new FakeAssistantRow();
-  const second = new FakeAssistantRow("follow-up");
+  const second = new FakeAssistantRow("", "\u001b]133;B\u0007 follow-up", "  still attached");
+  const user = new FakeUserRow(" user message");
+  const afterUser = new FakeAssistantRow("", "  after user");
+  const afterHiddenOperation = new FakeAssistantRow("", "  after hidden operation");
+  const fullWidthAssistant = new FakeAssistantRow(fullWidthText);
   const originalChildren = chat.children;
   chat.addChild(first);
   chat.addChild(hiddenToolA);
@@ -275,37 +299,57 @@ void test("Calm separates visible assistant blocks across hidden rows without mu
   chat.addChild(hiddenMessage);
   chat.addChild(toolOnlyAssistant);
   chat.addChild(second);
+  chat.addChild(user);
+  chat.addChild(afterUser);
+  chat.addChild(hiddenToolA);
+  chat.addChild(afterHiddenOperation);
+  chat.addChild(fullWidthAssistant);
   const diagnostics: string[] = [];
-  const styledRules: string[] = [];
+  const styledMarkers: string[] = [];
   const detach = attachCalmPresentation(
     moduleForFakeRows(),
     state,
     (message) => diagnostics.push(message),
     (text) => {
-      styledRules.push(text);
+      styledMarkers.push(text);
       return `\u001b[2m${text}\u001b[22m`;
     },
   );
   try {
-    const width = 32;
     const calmLines = chat.render(width);
-    assert.deepEqual(stripAnsiLikeTheme(calmLines[3] ?? ""), "────────");
     assert.deepEqual(calmLines.map(stripAnsiLikeTheme), [
-      "thinking",
-      "answer",
       "",
-      "────────",
+      "  thinking",
+      "  answer",
       "",
-      "follow-up",
+      "·follow-up",
+      "  still attached",
+      " user message",
+      "",
+      "  after user",
+      "",
+      "· after hidden operation",
+      fullWidthText,
     ]);
-    assert.equal(visibleWidth(calmLines[3] ?? ""), 8);
-    assert.deepEqual(styledRules, ["────────"]);
-    assert.equal(chat.children.length, 6);
+    assert.equal(calmLines.length, 12);
+    assert.equal(calmLines[1], "  thinking");
+    assert.equal(calmLines[11], fullWidthText);
+    assert.equal(visibleWidth(calmLines[4] ?? ""), visibleWidth(" follow-up"));
+    assert.equal(calmLines[4], "\u001b]133;B\u0007\u001b[2m·\u001b[22mfollow-up");
+    assert.deepEqual(styledMarkers, ["·", "·"]);
+    assert.equal(chat.children.length, 11);
     assert.equal(chat.children, originalChildren);
     assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), calmLines.map(stripAnsiLikeTheme));
-    assert.deepEqual(styledRules, ["────────", "────────"]);
-    assert.equal(chat.handleMouse({ y: 3, width }), undefined);
-    assert.deepEqual(chat.handleMouse({ y: 5, width }), { y: 0, width });
+    assert.deepEqual(styledMarkers, ["·", "·", "·", "·"]);
+
+    // The marker consumes the existing one-column output padding, so child and mouse rows do not
+    // move. The blank prefix in the second assistant remains attached to its thinking/content.
+    assert.deepEqual(chat.handleMouse({ y: 3, width }), { y: 0, width });
+    assert.deepEqual(chat.handleMouse({ y: 4, width }), { y: 1, width });
+    assert.deepEqual(
+      chat.mouseLayout?.children.map(({ height }) => height),
+      [3, 0, 0, 0, 0, 3, 1, 2, 0, 2, 1],
+    );
 
     const visibleToolsChat = new FakeContainer();
     visibleToolsChat.addChild(first);
@@ -313,58 +357,77 @@ void test("Calm separates visible assistant blocks across hidden rows without mu
     visibleToolsChat.addChild(new FakeToolRow("write"));
     visibleToolsChat.addChild(second);
     assert.deepEqual(visibleToolsChat.render(width).map(stripAnsiLikeTheme), [
-      "thinking",
-      "answer",
+      "",
+      "  thinking",
+      "  answer",
       "tool:write:32",
       "tool:write:32",
       "",
-      "────────",
-      "",
-      "follow-up",
+      "·follow-up",
+      "  still attached",
     ]);
-    assert.equal(styledRules.length, 3);
+    assert.equal(styledMarkers.length, 5);
 
     const thinkingOnlyChat = new FakeContainer();
-    thinkingOnlyChat.addChild(new FakeAssistantRow("thinking only"));
+    thinkingOnlyChat.addChild(new FakeAssistantRow("", "  thinking only"));
     thinkingOnlyChat.addChild(new FakeToolRow("read"));
-    thinkingOnlyChat.addChild(new FakeAssistantRow("after thinking"));
+    thinkingOnlyChat.addChild(new FakeAssistantRow("", "  after thinking"));
     assert.deepEqual(thinkingOnlyChat.render(width).map(stripAnsiLikeTheme), [
-      "thinking only",
       "",
-      "────────",
+      "  thinking only",
       "",
-      "after thinking",
+      "· after thinking",
     ]);
-    assert.equal(styledRules.length, 4);
+    assert.equal(styledMarkers.length, 6);
 
     const emptyEdgesChat = new FakeContainer();
     emptyEdgesChat.addChild(new FakeAssistantRow());
     emptyEdgesChat.addChild(new FakeAssistantRow("only visible block"));
     emptyEdgesChat.addChild(new FakeAssistantRow());
     assert.deepEqual(emptyEdgesChat.render(width), ["only visible block"]);
-    assert.equal(styledRules.length, 4);
+    assert.equal(styledMarkers.length, 6);
 
     state.on = false;
     assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), [
-      "thinking",
-      "answer",
+      "",
+      "  thinking",
+      "  answer",
       "tool:read:32",
       "tool:read:32",
       "message:pi-workgraph-attention:32",
-      "follow-up",
+      "",
+      " follow-up",
+      "  still attached",
+      " user message",
+      "",
+      "  after user",
+      "tool:read:32",
+      "",
+      "  after hidden operation",
+      fullWidthText,
     ]);
-    assert.deepEqual(styledRules, ["────────", "────────", "────────", "────────"]);
+    assert.deepEqual(styledMarkers, ["·", "·", "·", "·", "·", "·"]);
     state.on = true;
   } finally {
     detach();
   }
   assert.deepEqual(chat.render(32), [
-    "thinking",
-    "answer",
+    "",
+    "  thinking",
+    "  answer",
     "tool:read:32",
     "tool:read:32",
     "message:pi-workgraph-attention:32",
-    "follow-up",
+    "",
+    "\u001b]133;B\u0007 follow-up",
+    "  still attached",
+    " user message",
+    "",
+    "  after user",
+    "tool:read:32",
+    "",
+    "  after hidden operation",
+    fullWidthText,
   ]);
   assert.deepEqual(diagnostics, []);
 });

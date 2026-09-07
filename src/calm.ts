@@ -85,6 +85,7 @@ export interface CalmPresentationModule {
   readonly ToolExecutionComponent: PresentationConstructor;
   readonly CustomMessageComponent: PresentationConstructor;
   readonly AssistantMessageComponent: PresentationConstructor;
+  readonly UserMessageComponent: PresentationConstructor;
 }
 
 export interface CalmPresentationState {
@@ -143,6 +144,7 @@ export function attachCalmPresentation(
     try {
       const detachSeparators = attachCalmSeparators(
         module.AssistantMessageComponent.prototype,
+        module.UserMessageComponent.prototype,
         () => state.on,
         separatorStyle,
         diagnostic,
@@ -511,16 +513,19 @@ function decodePresentationModule(value: unknown): CalmPresentationModule | unde
   const tool = readProperty(value, "ToolExecutionComponent");
   const custom = readProperty(value, "CustomMessageComponent");
   const assistant = readProperty(value, "AssistantMessageComponent");
+  const user = readProperty(value, "UserMessageComponent");
   if (
     !isPresentationConstructor(tool) ||
     !isPresentationConstructor(custom) ||
-    !isPresentationConstructor(assistant)
+    !isPresentationConstructor(assistant) ||
+    !isPresentationConstructor(user)
   )
     return undefined;
   return {
     ToolExecutionComponent: tool,
     CustomMessageComponent: custom,
     AssistantMessageComponent: assistant,
+    UserMessageComponent: user,
   };
 }
 
@@ -586,7 +591,8 @@ function loadPiPresentation(): Promise<unknown> {
         ({ source }) =>
           source.includes("ToolExecutionComponent") &&
           source.includes("CustomMessageComponent") &&
-          source.includes("AssistantMessageComponent"),
+          source.includes("AssistantMessageComponent") &&
+          source.includes("UserMessageComponent"),
       );
       return match === undefined
         ? import("@earendil-works/pi-coding-agent")

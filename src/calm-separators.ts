@@ -1,11 +1,10 @@
-import type { Component } from "@earendil-works/pi-tui";
+import { type Component, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 
 // SAFETY: This is the guarded internal Pi Container compatibility boundary. The prototype
 // comes from the installed assistant class, not a potentially different extension dependency.
 // oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-reflect-get
 const OWNER = Symbol.for("@vistyy/pi-workgraph/calm-separators");
-const RULE_WIDTH = 8;
-const RULE_CHARACTER = "─";
+const MESSAGE_MARKER = "·";
 
 type MouseLayout = {
   readonly width: number;
@@ -36,19 +35,60 @@ function isContainerPrototype(value: unknown): value is ContainerPrototype {
   );
 }
 
-function isAssistantPrototype(prototype: PrototypeOwner, component: Component): boolean {
-  return Object.prototype.isPrototypeOf.call(prototype, component);
+function isPrototypeInstance(prototype: PrototypeOwner | undefined, component: Component): boolean {
+  return prototype !== undefined && Object.prototype.isPrototypeOf.call(prototype, component);
 }
 
 function hasComponentChildren(container: CalmContainer): boolean {
   return Array.isArray(container.children);
 }
 
-function separatorComponent(lines: readonly string[]): Component {
-  return {
-    render: () => [...lines],
-    invalidate() {},
-  };
+function firstVisibleRow(lines: readonly string[]): number | undefined {
+  const index = lines.findIndex((line) => {
+    const visible = stripTerminalSequences(line).trim();
+    return visible !== "" && visibleWidth(visible) > 0;
+  });
+  return index === -1 ? undefined : index;
+}
+
+function csiSequenceLength(line: string, index: number): number | undefined {
+  const final = /[\u0040-\u007e]/u.exec(line.slice(index + 2));
+  return final === null ? undefined : final.index + 3;
+}
+
+function terminatedSequenceLength(line: string, index: number): number | undefined {
+  const bell = line.indexOf("\u0007", index + 2);
+  const stringTerminator = line.indexOf("\u001b\\", index + 2);
+  if (bell === -1) return stringTerminator === -1 ? undefined : stringTerminator + 2 - index;
+  if (stringTerminator === -1 || bell < stringTerminator) return bell + 1 - index;
+  return stringTerminator + 2 - index;
+}
+
+function terminalSequenceLength(line: string, index: number): number | undefined {
+  if (line[index] !== "\u001b") return undefined;
+  const kind = line[index + 1];
+  if (kind === "[") return csiSequenceLength(line, index);
+  if (kind === "]" || kind === "_") return terminatedSequenceLength(line, index);
+  return undefined;
+}
+
+function leadingPaddingIndex(line: string): number | undefined {
+  let index = 0;
+  while (index < line.length) {
+    const sequenceLength = terminalSequenceLength(line, index);
+    if (sequenceLength !== undefined) {
+      index += sequenceLength;
+      continue;
+    }
+    return line[index] === " " ? index : undefined;
+  }
+  return undefined;
+}
+
+function markFirstVisibleRow(line: string, style: (text: string) => string): string {
+  const paddingIndex = leadingPaddingIndex(line);
+  if (paddingIndex === undefined) return line;
+  return `${line.slice(0, paddingIndex)}${style(MESSAGE_MARKER)}${line.slice(paddingIndex + 1)}`;
 }
 
 type CalmRender = {
@@ -59,6 +99,7 @@ type CalmRender = {
 function renderCalmChildren(
   sourceChildren: readonly Component[],
   assistantPrototype: PrototypeOwner,
+  userPrototype: PrototypeOwner,
   width: number,
   style: (text: string) => string,
 ): CalmRender {
@@ -67,29 +108,29 @@ function renderCalmChildren(
   let hasVisibleAssistant = false;
   for (const child of sourceChildren) {
     const rendered = child.render(width);
-    const assistant = isAssistantPrototype(assistantPrototype, child);
-    if (assistant && rendered.length > 0) {
-      if (hasVisibleAssistant && width > 0) {
-        const rule = style(
-          RULE_CHARACTER.repeat(Math.min(RULE_WIDTH, Math.max(1, Math.floor(width)))),
-        );
-        const separatorLines = ["", rule, ""];
-        lines.push(...separatorLines);
-        children.push({
-          component: separatorComponent(separatorLines),
-          height: separatorLines.length,
-        });
+    const visibleRow = firstVisibleRow(rendered);
+    const assistant = isPrototypeInstance(assistantPrototype, child);
+    if (isPrototypeInstance(userPrototype, child) && visibleRow !== undefined) {
+      // A user's background already separates the next assistant block from the previous one.
+      hasVisibleAssistant = false;
+    }
+    let childLines = rendered;
+    if (assistant && visibleRow !== undefined) {
+      if (hasVisibleAssistant) {
+        childLines = [...rendered];
+        childLines[visibleRow] = markFirstVisibleRow(childLines[visibleRow] ?? "", style);
       }
       hasVisibleAssistant = true;
     }
     children.push({ component: child, height: rendered.length });
-    lines.push(...rendered);
+    lines.push(...childLines);
   }
   return { lines, children };
 }
 
 export function attachCalmSeparators(
   assistantPrototype: PrototypeOwner,
+  userPrototype: PrototypeOwner,
   enabled: () => boolean,
   style: (text: string) => string,
   diagnostic: (message: string) => void,
@@ -107,15 +148,21 @@ export function attachCalmSeparators(
     if (
       !enabled() ||
       !hasComponentChildren(this) ||
-      !this.children.some((child) => isAssistantPrototype(assistantPrototype, child))
+      !this.children.some((child) => isPrototypeInstance(assistantPrototype, child))
     )
       return original.call(this, width);
 
-    // Match Pi's Container layout, adding only ephemeral rows. Never insert children or touch
-    // messages; the parent-local layout is recomputed on every redraw.
-    const rendered = renderCalmChildren(this.children, assistantPrototype, width, style);
+    // Match Pi's Container layout, changing only ephemeral line strings. Never insert children or
+    // touch messages; the parent-local layout is recomputed on every redraw.
+    const rendered = renderCalmChildren(
+      this.children,
+      assistantPrototype,
+      userPrototype,
+      width,
+      style,
+    );
     // When the host Container has a mouse layout, its dispatcher consumes this render-owned
-    // layout. Separator rows absorb events while original children retain their local coordinates.
+    // layout. Original child heights and local coordinates remain unchanged.
     if (hasMouseLayout) this.mouseLayout = { width, children: rendered.children };
     return rendered.lines;
   };
