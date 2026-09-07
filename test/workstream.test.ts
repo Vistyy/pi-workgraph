@@ -527,6 +527,94 @@ void test("completion accounting resolves only exact applied candidate ancestors
   }
 });
 
+void test("integration-root candidate accounting excludes its superseded source", async () => {
+  const f = await candidateAccountingFixture();
+  try {
+    const integrated = structuredClone(f.state);
+    const destination = "d".repeat(40);
+    const integrationCommit = "e".repeat(40);
+    const sourceAssignment = requiredValue(
+      integrated.assignments.find((item) => item.id === "correction-candidate"),
+      "correction assignment",
+    );
+    const sourceAttempt = requiredValue(
+      integrated.attempts.find((item) => item.id === f.correctionAttemptId),
+      "correction attempt",
+    );
+    const sourceResult = requiredValue(
+      integrated.results.find((item) => item.id === "correction-result"),
+      "correction result",
+    );
+    const integrationAssignment = structuredClone(sourceAssignment);
+    integrationAssignment.id = "integration-candidate";
+    const integrationAttempt = structuredClone(sourceAttempt);
+    integrationAttempt.id = "integration-attempt";
+    integrationAttempt.assignmentId = integrationAssignment.id;
+    integrationAttempt.resultId = "integration-result";
+    integrationAttempt.baseRevision = destination;
+    integrationAttempt.candidate = {
+      kind: "integration",
+      rootCommit: destination,
+      parentAttemptId: f.firstAttemptId,
+      parentCommit: f.firstCommit,
+    };
+    const integrationResult = structuredClone(sourceResult);
+    integrationResult.id = "integration-result";
+    integrationResult.assignmentId = integrationAssignment.id;
+    if (
+      integrationResult.validity !== "typed" ||
+      integrationResult.report.kind !== "implementation" ||
+      integrationResult.report.status !== "completed" ||
+      integrationResult.report.outcome !== "changed"
+    )
+      assert.fail("Expected a typed changed implementation result.");
+    integrationResult.report.commit = integrationCommit;
+    integrated.assignments.push(integrationAssignment);
+    integrated.attempts.push(integrationAttempt);
+    integrated.results.push(integrationResult);
+
+    sourceAttempt.baseRevision = integrationCommit;
+    sourceAttempt.candidate = {
+      kind: "correction",
+      rootCommit: destination,
+      parentAttemptId: integrationAttempt.id,
+      parentCommit: integrationCommit,
+    };
+    sourceAttempt.application = {
+      state: "applied",
+      commit: f.correctionCommit,
+      expectedHead: destination,
+      rootCommit: destination,
+      commits: [integrationCommit, f.correctionCommit],
+      revision: f.correctionCommit,
+    };
+
+    const unresolvedAttempts = (state: WorkstreamState) =>
+      deriveCompletionAccounting(state)
+        .filter((item) => item.kind === "unresolved_attempt")
+        .map((item) => item.attemptId);
+    assert.deepEqual(unresolvedAttempts(integrated), [f.firstAttemptId]);
+
+    const crossRoot = structuredClone(integrated);
+    const crossRootApplication = requiredValue(
+      crossRoot.attempts.find((item) => item.id === f.correctionAttemptId)?.application,
+      "correction application",
+    );
+    crossRootApplication.rootCommit = f.base;
+    assert.deepEqual(unresolvedAttempts(crossRoot), [f.firstAttemptId, integrationAttempt.id]);
+
+    const partial = structuredClone(integrated);
+    const partialApplication = requiredValue(
+      partial.attempts.find((item) => item.id === f.correctionAttemptId)?.application,
+      "correction application",
+    );
+    partialApplication.commits = [f.correctionCommit];
+    assert.deepEqual(unresolvedAttempts(partial), [f.firstAttemptId, integrationAttempt.id]);
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
 function recordedAuthority(
   store: WorkstreamStoreEffects,
 ): Promise<{ receipt: HumanInputReceipt; authority: AuthorityReference }> {

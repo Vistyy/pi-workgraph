@@ -17,6 +17,11 @@ import {
   Semaphore,
 } from "effect";
 import type { PlatformError } from "effect/PlatformError";
+import {
+  candidateApplicationIssue,
+  candidateLineageForAttempt,
+  retainedCandidate,
+} from "./candidate.js";
 import type {
   CandidateApplicationSource,
   GitFailure,
@@ -553,37 +558,17 @@ export class WorkstreamRuntime {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const assignment = findAssignment(state, parent.assignmentId);
-        const candidate = candidateLineageForAttempt(parent);
-        const result =
-          parent.resultId === undefined
-            ? undefined
-            : state.results.find((item) => item.id === parent.resultId);
         const source = yield* this.runtimeSync("validate retained candidate lineage", () => {
-          if (
-            assignment.capability !== "implement" ||
-            !this.store.isAssignmentCurrent(state, assignment.id) ||
-            parent.state !== "settled" ||
-            parent.cleanup?.state !== "completed" ||
-            !parent.cleanup.workerClosed ||
-            parent.placement?.kind !== "isolated_worktree" ||
-            parent.outputRelease !== undefined ||
-            (parent.application !== undefined && parent.application.state !== "blocked") ||
-            candidate === undefined
-          )
+          if (!this.store.isAssignmentCurrent(state, assignment.id))
             throw new Error(
               "Candidate parent must be a current, settled, closed, unapplied isolated implementation with retained output.",
             );
-          if (
-            result?.validity !== "typed" ||
-            result.report.kind !== "implementation" ||
-            result.report.status !== "completed" ||
-            result.report.outcome !== "changed" ||
-            result.report.commit === undefined
-          )
-            throw new Error("Candidate parent has no completed changed implementation report.");
-          if (candidate.parentAttemptId !== undefined && candidate.parentAttemptId === parent.id)
-            throw new Error("Candidate lineage cannot point to itself.");
-          return { candidate, commit: result.report.commit };
+          const retained = retainedCandidate(state, parent, assignment.intentVersion);
+          if (retained === undefined)
+            throw new Error(
+              "Candidate parent must be a current, settled, closed, unapplied isolated implementation with retained output.",
+            );
+          return retained;
         });
         const validated = yield* this.gitEffect((repository) =>
           repository.validateCandidate(
@@ -1084,13 +1069,12 @@ export class WorkstreamRuntime {
         const assignment = findAssignment(state, attempt.assignmentId);
         const result = state.results.find((item) => item.id === attempt.resultId);
         const reportedCommit = validApplicationCommit(result);
-        const candidate = candidateForApplication(attempt);
+        const candidate = required(candidateLineageForAttempt(attempt), "candidate base revision");
         yield* this.runtimeSync("validate explicit application", () =>
           validateExplicitApplication(
             state,
             attempt,
             assignment,
-            candidate,
             reportedCommit,
             sourceCommit,
             destinationHead,
@@ -1726,7 +1710,6 @@ function validateExplicitApplication(
   state: WorkstreamState,
   attempt: WorkAttempt,
   assignment: WorkAssignment,
-  candidate: CandidateLineage,
   reportedCommit: string,
   sourceCommit: string,
   destinationHead: string,
@@ -1744,93 +1727,8 @@ function validateExplicitApplication(
     throw new Error("Application requires the freshly observed exact destination HEAD.");
   if (attempt.application !== undefined)
     throw new Error("Application already has a recorded checkpoint; inspect it before recovery.");
-  validateCandidateMetadata(state, attempt, candidate, sourceCommit);
-}
-
-function validateCandidateMetadata(
-  state: WorkstreamState,
-  attempt: WorkAttempt,
-  candidate: CandidateLineage,
-  sourceCommit: string,
-): void {
-  const base = required(attempt.baseRevision, "candidate base revision");
-  if (candidate.kind === "initial") {
-    validateInitialCandidate(candidate, base);
-    return;
-  }
-  const parent = validateCandidateParentMetadata(state, candidate);
-  validateCandidateRelationMetadata(candidate, parent, base);
-  if (sourceCommit === candidate.parentCommit)
-    throw new Error("Candidate application source must be newer than its parent candidate.");
-}
-
-function validateInitialCandidate(candidate: CandidateLineage, base: string): void {
-  if (
-    candidate.rootCommit !== base ||
-    candidate.parentAttemptId !== undefined ||
-    candidate.parentCommit !== undefined
-  )
-    throw new Error("Initial candidate lineage is inconsistent with its assigned base.");
-}
-
-function validateCandidateParentMetadata(
-  state: WorkstreamState,
-  candidate: CandidateLineage,
-): WorkAttempt {
-  if (candidate.parentAttemptId === undefined || candidate.parentCommit === undefined)
-    throw new Error("Retained candidate lineage is missing its exact parent.");
-  const parent = findAttempt(state, candidate.parentAttemptId);
-  const parentAssignment = findAssignment(state, parent.assignmentId);
-  const parentResult =
-    parent.resultId === undefined
-      ? undefined
-      : state.results.find((result) => result.id === parent.resultId);
-  if (
-    parentAssignment.capability !== "implement" ||
-    parent.state !== "settled" ||
-    parent.cleanup?.state !== "completed" ||
-    !parent.cleanup.workerClosed ||
-    parent.placement?.kind !== "isolated_worktree" ||
-    parent.outputRelease !== undefined ||
-    (parent.application !== undefined && parent.application.state !== "blocked") ||
-    candidateLineageForAttempt(parent) === undefined ||
-    parentResult?.validity !== "typed" ||
-    parentResult.report.kind !== "implementation" ||
-    parentResult.report.status !== "completed" ||
-    parentResult.report.outcome !== "changed" ||
-    parentResult.report.commit !== candidate.parentCommit
-  )
-    throw new Error("Retained candidate lineage parent is no longer an exact live candidate.");
-  return parent;
-}
-
-function validateCandidateRelationMetadata(
-  candidate: CandidateLineage,
-  parent: WorkAttempt,
-  base: string,
-): void {
-  const parentCandidate = candidateLineageForAttempt(parent);
-  if (candidate.kind === "correction") {
-    if (candidate.rootCommit !== parentCandidate?.rootCommit || base !== candidate.parentCommit)
-      throw new Error("Correction candidate lineage is not rooted at its direct parent.");
-  } else if (candidate.rootCommit !== base) {
-    throw new Error(
-      "Integration candidate lineage is not rooted at its assigned destination base.",
-    );
-  }
-}
-
-function candidateLineageForAttempt(
-  attempt: Pick<WorkAttempt, "baseRevision" | "candidate">,
-): CandidateLineage | undefined {
-  if (attempt.candidate !== undefined) return attempt.candidate;
-  if (attempt.baseRevision !== undefined && /^[0-9a-f]{40,64}$/.test(attempt.baseRevision))
-    return { kind: "initial", rootCommit: attempt.baseRevision };
-  return undefined;
-}
-
-function candidateForApplication(attempt: WorkAttempt): CandidateLineage {
-  return required(candidateLineageForAttempt(attempt), "candidate base revision");
+  const issue = candidateApplicationIssue(state, assignment, attempt, sourceCommit);
+  if (issue !== undefined) throw new Error(issue);
 }
 
 function sameCommitChain(left: readonly string[], right: readonly string[]): boolean {

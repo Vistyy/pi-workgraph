@@ -1,3 +1,4 @@
+import { candidateLineageForAttempt } from "./candidate.js";
 import type { WorkAssignment, WorkAttempt, WorkResult, WorkstreamState } from "./workstream.js";
 
 const DEFAULT_CHARS = 3_000;
@@ -340,11 +341,7 @@ function deliveryPreview(state: WorkstreamState, result: WorkResult) {
 }
 
 function candidateProjection(attempt: WorkAttempt | undefined) {
-  const candidate =
-    attempt?.candidate ??
-    (attempt?.baseRevision !== undefined && /^[0-9a-f]{40,64}$/.test(attempt.baseRevision)
-      ? { kind: "initial" as const, rootCommit: attempt.baseRevision }
-      : undefined);
+  const candidate = attempt === undefined ? undefined : candidateLineageForAttempt(attempt);
   if (candidate === undefined) return undefined;
   return {
     kind: candidate.kind,

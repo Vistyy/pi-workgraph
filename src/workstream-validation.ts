@@ -2,10 +2,9 @@
 import { resolve } from "node:path";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import { applicationRecordIssue, candidateLineageIssue } from "./candidate.js";
 import {
   type AuthorityReference,
-  CandidateLineageSchema,
-  CommitSchema,
   type CompletionAccounting,
   InvalidWorkstreamStateError,
   legacyPathForWorkstream,
@@ -297,143 +296,21 @@ function validateAttempts(
 }
 
 function validateCandidateRecord(state: WorkstreamState, attempt: WorkAttempt): void {
-  const candidate = attempt.candidate;
-  if (candidate === undefined) return;
-  validateCandidateShape(attempt, candidate);
+  if (attempt.candidate === undefined) return;
   const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
-  if (assignment?.capability !== "implement")
+  if (assignment === undefined)
     throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} candidate lineage is outside maintained implementation.`,
+      `Attempt ${attempt.id} references an unknown assignment.`,
     );
-  validateCandidateAcyclic(state, attempt);
-  if (candidate.kind === "initial") return;
-  const parent = candidateParent(state, attempt, candidate.parentAttemptId);
-  validateCandidateParentResult(state, attempt, parent, candidate.parentCommit);
-  const parentCandidate = candidateLineageForAttempt(parent);
-  if (candidate.kind === "correction") {
-    if (
-      parentCandidate === undefined ||
-      candidate.rootCommit !== parentCandidate.rootCommit ||
-      attempt.baseRevision !== candidate.parentCommit
-    )
-      throw new InvalidWorkstreamStateError(
-        `Attempt ${attempt.id} correction candidate lineage is not directly rooted at its parent.`,
-      );
-  } else if (candidate.rootCommit !== attempt.baseRevision) {
-    throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} integration candidate lineage is not rooted at its base.`,
-    );
-  }
-}
-
-function validateCandidateAcyclic(state: WorkstreamState, attempt: WorkAttempt): void {
-  const visited = new Set<string>();
-  let current: WorkAttempt | undefined = attempt;
-  while (current !== undefined) {
-    const lineage = candidateLineageForAttempt(current);
-    if (lineage?.kind === "initial") return;
-    if (visited.has(current.id))
-      throw new InvalidWorkstreamStateError(
-        `Attempt ${attempt.id} candidate lineage contains a cycle.`,
-      );
-    visited.add(current.id);
-    current = state.attempts.find((item) => item.id === lineage?.parentAttemptId);
-  }
-}
-
-function validateCandidateShape(
-  attempt: WorkAttempt,
-  candidate: NonNullable<WorkAttempt["candidate"]>,
-): void {
-  if (!Value.Check(CandidateLineageSchema, candidate))
-    throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} has invalid candidate lineage.`);
-  if (attempt.baseRevision === undefined || !Value.Check(CommitSchema, attempt.baseRevision))
-    throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} candidate lineage has no exact assigned base.`,
-    );
-  if (
-    candidate.kind === "initial" &&
-    (candidate.rootCommit !== attempt.baseRevision ||
-      candidate.parentAttemptId !== undefined ||
-      candidate.parentCommit !== undefined)
-  )
-    throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} initial candidate lineage is inconsistent with its base.`,
-    );
-  if (
-    candidate.kind !== "initial" &&
-    (candidate.parentAttemptId === undefined || candidate.parentCommit === undefined)
-  )
-    throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} candidate lineage has no exact parent.`,
-    );
-}
-
-function candidateParent(
-  state: WorkstreamState,
-  attempt: WorkAttempt,
-  parentAttemptId: string | undefined,
-): WorkAttempt {
-  const parent = state.attempts.find((item) => item.id === parentAttemptId);
-  if (parent === undefined || parent.id === attempt.id)
-    throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} candidate lineage references an invalid parent.`,
-    );
-  return parent;
-}
-
-function validateCandidateParentResult(
-  state: WorkstreamState,
-  attempt: WorkAttempt,
-  parent: WorkAttempt,
-  parentCommit: string | undefined,
-): void {
-  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
-  const parentAssignment = state.assignments.find((item) => item.id === parent.assignmentId);
-  const parentResult =
-    parent.resultId === undefined
-      ? undefined
-      : state.results.find((item) => item.id === parent.resultId);
-  if (
-    assignment === undefined ||
-    parentAssignment?.capability !== "implement" ||
-    parentAssignment.intentVersion !== assignment.intentVersion ||
-    candidateLineageForAttempt(parent) === undefined ||
-    parentResult?.validity !== "typed" ||
-    parentResult.report.kind !== "implementation" ||
-    parentResult.report.status !== "completed" ||
-    parentResult.report.outcome !== "changed" ||
-    parentResult.report.commit !== parentCommit
-  )
-    throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} candidate lineage parent is not an exact implementation result.`,
-    );
-}
-
-function candidateLineageForAttempt(
-  attempt: Pick<WorkAttempt, "baseRevision" | "candidate">,
-): NonNullable<WorkAttempt["candidate"]> | undefined {
-  if (attempt.candidate !== undefined) return attempt.candidate;
-  if (attempt.baseRevision !== undefined && Value.Check(CommitSchema, attempt.baseRevision))
-    return { kind: "initial", rootCommit: attempt.baseRevision };
-  return undefined;
+  const issue = candidateLineageIssue(state, assignment, attempt);
+  if (issue !== undefined) throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} ${issue}`);
 }
 
 function validateApplicationRecord(attempt: WorkAttempt): void {
   const application = attempt.application;
   if (application === undefined) return;
-  if ((application.rootCommit === undefined) !== (application.commits === undefined))
-    throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} application lineage is incomplete.`,
-    );
-  if (application.rootCommit === undefined || application.commits === undefined) return;
-  if (
-    !Value.Check(CommitSchema, application.rootCommit) ||
-    application.commits.at(-1) !== application.commit
-  )
-    throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} application lineage does not end at its source commit.`,
-    );
+  const issue = applicationRecordIssue(application);
+  if (issue !== undefined) throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} ${issue}`);
 }
 
 function validateAttemptFields(attempt: WorkAttempt): void {

@@ -119,6 +119,27 @@ function researchReport(summary: string): WorkerReport {
   };
 }
 
+void test("candidate projection uses the canonical historical initial lineage", () => {
+  const baseRevision = "a".repeat(40);
+  const current = state(undefined, [
+    {
+      id: "attempt",
+      assignmentId: "task",
+      state: "queued",
+      baseRevision,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+  ]);
+  const view = inspectView(current, { section: "task", task: "task" });
+  assert.deepEqual(view.latestAttempt?.candidate, {
+    kind: "initial",
+    rootCommit: baseRevision,
+    parentAttemptId: undefined,
+    parentCommit: undefined,
+  });
+});
+
 void test("overview task index recovers every arbitrary task id", () => {
   const ids = [
     "task 0 with spaces",

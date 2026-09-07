@@ -18,11 +18,6 @@ import {
 import { ProcessExecutionError, type ProcessResult, processEffect } from "../src/process.js";
 import { git } from "./helpers.js";
 
-const runCommand = (
-  command: string,
-  args: readonly string[],
-  options: Parameters<typeof processEffect>[2],
-) => Effect.runPromise(processEffect(command, args, options));
 const runGit = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
 
 async function waitForFile(path: string): Promise<string> {
@@ -85,19 +80,6 @@ function processUnavailable(request: GitProcessRequest, message: string): Proces
     args: ["-C", request.cwd, ...request.args],
     cause: new Error(message),
   });
-}
-
-async function conflictFixture() {
-  const f = await fixture();
-  const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
-  await writeFile(join(placement.path, "data.txt"), "worker\n");
-  await git(placement.path, "add", ".");
-  await git(placement.path, "commit", "-m", "Worker conflict");
-  const commit = await runGit(f.repository.effects.head(placement.path));
-  await writeFile(join(f.root, "data.txt"), "coordinator\n");
-  await git(f.root, "add", ".");
-  await git(f.root, "commit", "-m", "Coordinator conflict");
-  return { ...f, commit, expectedHead: await runGit(f.repository.effects.head()) };
 }
 
 void test("malformed Git worktree output fails with the declared parse tag", async () => {
@@ -197,110 +179,6 @@ void test("Git placements preserve unknown data; cleanup requires exact clean id
     assert.equal(await readFile(join(unknown, "mine.txt"), "utf8"), "unattributed bytes");
   } finally {
     await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("a real cherry-pick conflict is aborted only after ownership checks and reaches a clean HEAD", async () => {
-  const f = await conflictFixture();
-  try {
-    await assert.rejects(
-      () => runGit(f.repository.effects.applyCommit(f.commit, f.expectedHead)),
-      /Cherry-pick conflict/,
-    );
-    assert.equal(await runGit(f.repository.effects.head()), f.expectedHead);
-    assert.equal(await runGit(f.repository.effects.status()), "");
-    const cherryPickState = await runCommand(
-      "git",
-      ["-C", f.root, "rev-parse", "--verify", "--quiet", "CHERRY_PICK_HEAD"],
-      { cwd: f.root, timeoutMs: 30_000 },
-    );
-    assert.equal(cherryPickState.timedOut, false);
-    assert.equal(cherryPickState.exitCode, 1);
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("an unavailable HEAD after a real cherry-pick conflict prevents abort and retains both diagnostics", async () => {
-  const f = await conflictFixture();
-  let headObservations = 0;
-  let aborts = 0;
-  const repository = new GitRepository(
-    f.root,
-    f.repository.commonDir,
-    interceptProcess((request) => {
-      if (request.args.join("\0") === "rev-parse\0HEAD") {
-        headObservations += 1;
-        if (headObservations === 2) {
-          return Effect.fail(processUnavailable(request, "HEAD observation unavailable"));
-        }
-      }
-      if (request.args.join("\0") === "cherry-pick\0--abort") aborts += 1;
-      return undefined;
-    }),
-  );
-  try {
-    const failure = await Effect.runPromise(
-      Effect.flip(repository.effects.applyCommit(f.commit, f.expectedHead)),
-    );
-    assert.ok(failure instanceof GitStateUncertainError);
-    assert.match(failure.message, /resulting HEAD is unavailable/);
-    assert.match(failure.operationDiagnostic, /Cherry-pick conflict or failure/);
-    assert.match(failure.operationDiagnostic, /exit code 1/);
-    assert.match(failure.followupDiagnostic, /HEAD observation unavailable/);
-    assert.equal(aborts, 0);
-    assert.equal(await git(f.root, "rev-parse", "CHERRY_PICK_HEAD"), f.commit);
-    assert.notEqual(await git(f.root, "status", "--porcelain"), "");
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("real cherry-pick conflicts retain nonzero, timed-out, and spawn rollback failures", async () => {
-  const rollbackFailures = [
-    {
-      name: "nonzero",
-      run: () => Effect.succeed(processResult({ exitCode: 7, stderr: "abort rejected" })),
-      expected: /abort rejected/,
-    },
-    {
-      name: "timeout",
-      run: () => Effect.succeed(processResult({ exitCode: 1, timedOut: true })),
-      expected: /timed out before a reliable result/,
-    },
-    {
-      name: "spawn",
-      run: (request: GitProcessRequest) =>
-        Effect.fail(processUnavailable(request, "abort executable unavailable")),
-      expected: /abort executable unavailable/,
-    },
-  ] as const;
-
-  for (const rollbackFailure of rollbackFailures) {
-    const f = await conflictFixture();
-    const repository = new GitRepository(
-      f.root,
-      f.repository.commonDir,
-      interceptProcess((request) =>
-        request.args.join("\0") === "cherry-pick\0--abort"
-          ? rollbackFailure.run(request)
-          : undefined,
-      ),
-    );
-    try {
-      const failure = await Effect.runPromise(
-        Effect.flip(repository.effects.applyCommit(f.commit, f.expectedHead)),
-      );
-      assert.ok(
-        failure instanceof GitStateUncertainError,
-        `${rollbackFailure.name} rollback was not typed as uncertain`,
-      );
-      assert.match(failure.operationDiagnostic, /Cherry-pick conflict or failure/);
-      assert.match(failure.followupDiagnostic, rollbackFailure.expected);
-      assert.equal(await git(f.root, "rev-parse", "CHERRY_PICK_HEAD"), f.commit);
-    } finally {
-      await rm(f.parent, { recursive: true, force: true });
-    }
   }
 });
 
@@ -412,6 +290,40 @@ void test("candidate validation retains the complete direct history and refuses 
       commits: [first, second],
     });
     const source = { rootCommit: f.base, commit: second, commits: [first, second] };
+    assert.equal(
+      await runGit(f.repository.effects.recoverCandidateApplication(f.base, source)),
+      undefined,
+    );
+    await assert.rejects(
+      () => runGit(f.repository.effects.applyCandidate({ ...source, commits: [f.base] }, f.base)),
+      /Candidate source commit chain changed before application/,
+    );
+    assert.equal(await runGit(f.repository.effects.head()), f.base);
+    const mergeHead = join(f.repository.commonDir, "MERGE_HEAD");
+    await writeFile(mergeHead, `${first}\n`);
+    try {
+      await assert.rejects(
+        () => runGit(f.repository.effects.applyCandidate(source, f.base)),
+        /pre-existing merge state/,
+      );
+      assert.equal(await runGit(f.repository.effects.head()), f.base);
+    } finally {
+      await rm(mergeHead, { force: true });
+    }
+    const unchangedFailureRepository = new GitRepository(
+      f.root,
+      f.repository.commonDir,
+      interceptProcess((request) =>
+        request.args.join("\\0") === `merge\\0--ff-only\\0--no-edit\\0${second}`
+          ? Effect.succeed(processResult({ exitCode: 7, stderr: "merge failed" }))
+          : undefined,
+      ),
+    );
+    await assert.rejects(
+      () => runGit(unchangedFailureRepository.effects.applyCandidate(source, f.base)),
+      /Fast-forward application.*failed/,
+    );
+    assert.equal(await runGit(f.repository.effects.head()), f.base);
     assert.equal(await runGit(f.repository.effects.applyCandidate(source, f.base)), second);
     assert.equal(await runGit(f.repository.effects.head()), second);
     assert.equal(await git(f.root, "rev-list", "--count", `${f.base}..HEAD`), "2");
@@ -442,6 +354,53 @@ void test("candidate validation retains the complete direct history and refuses 
     assert.match(
       await git(f.root, "worktree", "list", "--porcelain"),
       new RegExp(secondPlacement.path),
+    );
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("unavailable post-failure HEAD leaves candidate application uncertain without recovery mutation", async () => {
+  const f = await fixture();
+  const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
+  try {
+    await writeFile(join(placement.path, "data.txt"), "candidate\n");
+    await git(placement.path, "add", ".");
+    await git(placement.path, "commit", "-m", "Candidate output");
+    const commit = await runGit(f.repository.effects.head(placement.path));
+    const source = { rootCommit: f.base, commit, commits: [commit] };
+    let headObservations = 0;
+    let mergeAttempts = 0;
+    const repository = new GitRepository(
+      f.root,
+      f.repository.commonDir,
+      interceptProcess((request) => {
+        const args = request.args.join("\\0");
+        if (args === "rev-parse\\0HEAD") {
+          headObservations += 1;
+          if (headObservations === 2)
+            return Effect.fail(processUnavailable(request, "destination HEAD unavailable"));
+        }
+        if (args === `merge\\0--ff-only\\0--no-edit\\0${commit}`) {
+          mergeAttempts += 1;
+          return Effect.succeed(processResult({ exitCode: 7, stderr: "transport lost" }));
+        }
+        return undefined;
+      }),
+    );
+    const failure = await Effect.runPromise(
+      Effect.flip(repository.effects.applyCandidate(source, f.base)),
+    );
+    assert.ok(failure instanceof GitStateUncertainError);
+    assert.match(failure.message, /resulting HEAD is unavailable/);
+    assert.match(failure.operationDiagnostic, /Fast-forward application/);
+    assert.match(failure.followupDiagnostic, /destination HEAD unavailable/);
+    assert.equal(mergeAttempts, 1);
+    assert.equal(await runGit(f.repository.effects.head()), f.base);
+    assert.equal(await runGit(f.repository.effects.status()), "");
+    assert.equal(
+      await runGit(repository.effects.recoverCandidateApplication(f.base, source)),
+      undefined,
     );
   } finally {
     await rm(f.parent, { recursive: true, force: true });
@@ -479,73 +438,6 @@ void test("uncertain candidate application is attributed only after exact postco
     assert.deepEqual(await runGit(repository.effects.recoverCandidateApplication(f.base, source)), {
       head: commit,
     });
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("application recovery compares complete large patches and rejects non-direct worker commits", async () => {
-  const f = await fixture();
-  try {
-    const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
-    const suffix = "identical large suffix\n".repeat(8_000);
-    await writeFile(join(placement.path, "data.txt"), `expected-prefix\n${suffix}`);
-    await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Worker output");
-    const source = {
-      baseCommit: f.base,
-      commit: await runGit(f.repository.effects.head(placement.path)),
-    };
-    await writeFile(join(f.root, "data.txt"), `wrong-prefix\n${suffix}`);
-    await git(f.root, "add", ".");
-    await git(f.root, "commit", "-m", "Unattributed output");
-    const rootDiff = await runCommand("git", ["diff", "--binary", f.base, "HEAD"], {
-      cwd: f.root,
-      timeoutMs: 30_000,
-    });
-    const workerDiff = await runCommand("git", ["diff", "--binary", f.base, source.commit], {
-      cwd: f.root,
-      timeoutMs: 30_000,
-    });
-    assert.equal(rootDiff.stdoutTruncated, true);
-    assert.equal(workerDiff.stdoutTruncated, true);
-    assert.equal(
-      rootDiff.stdout,
-      workerDiff.stdout,
-      "The old diagnostic-tail comparison would falsely attribute this commit",
-    );
-    await assert.rejects(
-      () => runGit(f.repository.effects.recoverApplication(f.base, source)),
-      /Could not attribute/,
-    );
-
-    await git(f.root, "revert", "--no-edit", "HEAD");
-    const before = await runGit(f.repository.effects.head());
-    assert.equal(await runGit(f.repository.effects.recoverApplication(before, source)), undefined);
-    const head = await runGit(f.repository.effects.applyCommit(source.commit, before));
-    assert.deepEqual(await runGit(f.repository.effects.recoverApplication(before, source)), {
-      head,
-    });
-    assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), `expected-prefix\n${suffix}`);
-
-    const tree = await git(f.root, "rev-parse", `${source.commit}^{tree}`);
-    const merge = await git(
-      f.root,
-      "commit-tree",
-      tree,
-      "-p",
-      f.base,
-      "-p",
-      `${f.base}^`,
-      "-m",
-      "Non-direct worker output",
-    );
-    await git(placement.path, "reset", "--hard", merge);
-    assert.equal(await git(placement.path, "rev-list", "--count", `${f.base}..HEAD`), "1");
-    await assert.rejects(
-      () => runGit(f.repository.effects.validateWorkerCommit(placement, merge)),
-      /not directly based/,
-    );
   } finally {
     await rm(f.parent, { recursive: true, force: true });
   }

@@ -6,6 +6,12 @@ import { resolve } from "node:path";
 import { DateTime, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import {
+  applicationRecordIssue,
+  candidateLineageIssue,
+  candidateParent,
+  retainedCandidate,
+} from "./candidate.js";
 import { EvidenceSchema } from "./report-schema.js";
 import {
   assertLegacySourceFile,
@@ -100,6 +106,13 @@ type OmitEach<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never
 type AssignmentInput = OmitEach<WorkAssignment, "createdAt">;
 type ResultInput = OmitEach<WorkResult, "observedAt" | "artifacts"> & {
   artifacts?: RetainedArtifact[];
+};
+type QueuedAttempt = {
+  id: string;
+  models: NonNullable<WorkAttempt["models"]>;
+  continuationOf?: string;
+  candidate?: CandidateLineage;
+  baseRevision?: string;
 };
 
 export class WorkstreamStoreEffects {
@@ -473,44 +486,14 @@ export class WorkstreamStoreEffects {
 
   enqueue(
     input: AssignmentInput,
-    attempts:
-      | {
-          id: string;
-          models: NonNullable<WorkAttempt["models"]>;
-          continuationOf?: string;
-          candidate?: CandidateLineage;
-          baseRevision?: string;
-        }
-      | Array<{
-          id: string;
-          models: NonNullable<WorkAttempt["models"]>;
-          continuationOf?: string;
-          candidate?: CandidateLineage;
-          baseRevision?: string;
-        }>,
+    attempts: QueuedAttempt | QueuedAttempt[],
   ): StoreEffect<WorkstreamState> {
     return this.update((draft, now) => {
       addAssignment(draft, input, now);
       const entries = Array.isArray(attempts) ? attempts : [attempts];
       if (entries.length === 0) throw new Error("At least one attempt is required.");
       for (const attempt of entries) {
-        validateId(attempt.id, "Attempt id");
-        if (draft.attempts.some((item) => item.id === attempt.id))
-          throw new Error("Duplicate attempt.");
-        if (
-          attempt.continuationOf !== undefined &&
-          !draft.attempts.some(
-            (item) =>
-              item.id === attempt.continuationOf &&
-              item.state === "settled" &&
-              item.cleanup?.state === "completed" &&
-              item.sessionFile !== undefined,
-          )
-        )
-          throw new Error(
-            "Continuation requires a settled, cleaned worker trajectory; retained blocked work must be inspected first.",
-          );
-        validateCandidateLineage(draft, input, attempt);
+        validateQueuedAttempt(draft, input, attempt);
         draft.attempts.push({
           ...attempt,
           assignmentId: input.id,
@@ -1280,6 +1263,38 @@ function retainResultTransition(draft: WorkstreamState, result: WorkResult): voi
   draft.results.push(result);
 }
 
+function validateQueuedAttempt(
+  draft: WorkstreamState,
+  assignment: AssignmentInput,
+  attempt: QueuedAttempt,
+): void {
+  validateId(attempt.id, "Attempt id");
+  if (draft.attempts.some((item) => item.id === attempt.id)) throw new Error("Duplicate attempt.");
+  const continuationValid =
+    attempt.continuationOf === undefined ||
+    draft.attempts.some(
+      (item) =>
+        item.id === attempt.continuationOf &&
+        item.state === "settled" &&
+        item.cleanup?.state === "completed" &&
+        item.sessionFile !== undefined,
+    );
+  if (!continuationValid)
+    throw new Error(
+      "Continuation requires a settled, cleaned worker trajectory; retained blocked work must be inspected first.",
+    );
+  const candidateIssue = candidateLineageIssue(draft, assignment, attempt);
+  if (candidateIssue !== undefined) throw new Error(candidateIssue);
+  if (attempt.candidate !== undefined && attempt.candidate.kind !== "initial") {
+    const parent = candidateParent(draft, attempt.candidate);
+    if (
+      parent === undefined ||
+      retainedCandidate(draft, parent, assignment.intentVersion) === undefined
+    )
+      throw new Error("Candidate parent must be a settled retained isolated candidate.");
+  }
+}
+
 function currentDate(): Date {
   return DateTime.toDate(DateTime.nowUnsafe());
 }
@@ -1333,132 +1348,8 @@ function validateApplicationHistory(
   rootCommit: string | undefined,
   commits: string[] | undefined,
 ): void {
-  if (!Value.Check(CommitSchema, commit))
-    throw new Error("Application source requires an exact commit id.");
-  if ((rootCommit === undefined) !== (commits === undefined))
-    throw new Error("Application lineage requires both rootCommit and commits.");
-  if (
-    (rootCommit !== undefined && !Value.Check(CommitSchema, rootCommit)) ||
-    (commits !== undefined &&
-      (!Value.Check(Type.Array(CommitSchema, { minItems: 1 }), commits) ||
-        commits.at(-1) !== commit))
-  )
-    throw new Error("Application lineage does not match the exact candidate history.");
-}
-
-function validateCandidateLineage(
-  draft: WorkstreamState,
-  assignment: AssignmentInput,
-  attempt: { baseRevision?: string; candidate?: CandidateLineage },
-): void {
-  const candidate = attempt.candidate;
-  if (candidate === undefined) return;
-  validateCandidateBasics(assignment, attempt, candidate);
-  if (candidate.kind === "initial") return;
-  const parent = findCandidateParent(draft, candidate);
-  validateCandidateParent(draft, assignment, parent, candidate.parentCommit);
-  validateCandidateRelation(attempt, parent, candidate);
-}
-
-function validateCandidateBasics(
-  assignment: AssignmentInput,
-  attempt: { baseRevision?: string; candidate?: CandidateLineage },
-  candidate: CandidateLineage,
-): void {
-  if (assignment.capability !== "implement")
-    throw new Error("Candidate lineage is available only for maintained implementations.");
-  if (attempt.baseRevision === undefined || !Value.Check(CommitSchema, attempt.baseRevision))
-    throw new Error("Candidate lineage requires an exact assigned base revision.");
-  if (!Value.Check(CommitSchema, candidate.rootCommit))
-    throw new Error("Candidate lineage requires an exact root commit.");
-  if (
-    candidate.kind === "initial" &&
-    (candidate.parentAttemptId !== undefined ||
-      candidate.parentCommit !== undefined ||
-      candidate.rootCommit !== attempt.baseRevision)
-  )
-    throw new Error("Initial candidate lineage must be rooted at its assigned base.");
-  if (
-    candidate.kind !== "initial" &&
-    (candidate.parentAttemptId === undefined || candidate.parentCommit === undefined)
-  )
-    throw new Error(`${candidate.kind} candidate lineage requires a parent attempt and commit.`);
-}
-
-function findCandidateParent(draft: WorkstreamState, candidate: CandidateLineage): WorkAttempt {
-  const parent = draft.attempts.find((item) => item.id === candidate.parentAttemptId);
-  if (parent === undefined)
-    throw new Error(
-      `Candidate lineage references unknown parent attempt ${candidate.parentAttemptId}.`,
-    );
-  return parent;
-}
-
-function validateCandidateParent(
-  draft: WorkstreamState,
-  assignment: AssignmentInput,
-  parent: WorkAttempt,
-  parentCommit: string | undefined,
-): void {
-  const parentAssignment = requireAssignment(draft, parent.assignmentId);
-  if (
-    parentAssignment.capability !== "implement" ||
-    parentAssignment.intentVersion !== assignment.intentVersion
-  )
-    throw new Error("Candidate parent is outside the current maintained implementation scope.");
-  if (
-    parent.state !== "settled" ||
-    parent.cleanup?.state !== "completed" ||
-    !parent.cleanup.workerClosed ||
-    parent.placement?.kind !== "isolated_worktree" ||
-    parent.outputRelease !== undefined ||
-    (parent.application !== undefined && parent.application.state !== "blocked")
-  )
-    throw new Error("Candidate parent must be a settled retained isolated candidate.");
-  const parentResult =
-    parent.resultId === undefined
-      ? undefined
-      : draft.results.find((result) => result.id === parent.resultId);
-  if (
-    parentResult?.validity !== "typed" ||
-    parentResult.report.kind !== "implementation" ||
-    parentResult.report.status !== "completed" ||
-    parentResult.report.outcome !== "changed" ||
-    parentResult.report.commit !== parentCommit
-  )
-    throw new Error(
-      "Candidate parent commit does not exactly match its retained implementation report.",
-    );
-  const parentCandidate = candidateLineageForAttempt(parent);
-  if (parentCandidate === undefined)
-    throw new Error("Candidate parent has no exact assigned base revision.");
-}
-
-function validateCandidateRelation(
-  attempt: { baseRevision?: string },
-  parent: WorkAttempt,
-  candidate: CandidateLineage,
-): void {
-  const parentCandidate = candidateLineageForAttempt(parent);
-  if (candidate.kind === "correction") {
-    if (
-      parentCandidate === undefined ||
-      candidate.rootCommit !== parentCandidate.rootCommit ||
-      attempt.baseRevision !== candidate.parentCommit
-    )
-      throw new Error("Correction candidate must continue directly from its retained parent.");
-  } else if (attempt.baseRevision !== candidate.rootCommit) {
-    throw new Error("Integration candidate must be rooted at its assigned destination base.");
-  }
-}
-
-function candidateLineageForAttempt(
-  attempt: Pick<WorkAttempt, "baseRevision" | "candidate">,
-): CandidateLineage | undefined {
-  if (attempt.candidate !== undefined) return attempt.candidate;
-  if (attempt.baseRevision !== undefined && Value.Check(CommitSchema, attempt.baseRevision))
-    return { kind: "initial", rootCommit: attempt.baseRevision };
-  return undefined;
+  const issue = applicationRecordIssue({ commit, rootCommit, commits });
+  if (issue !== undefined) throw new Error(issue);
 }
 
 function currentIntent(state: WorkstreamState): Intent {

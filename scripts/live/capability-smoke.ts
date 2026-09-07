@@ -15,7 +15,6 @@ import {
   canonicalWorkstreamPath,
   closeOwnedWorkspace,
   command,
-  createAuthorizedDestinationDrift,
   createFixtureCheckpoint,
   createLiveFixture,
   finalizeSuccessfulFixture,
@@ -45,15 +44,7 @@ const retainedOutputReleaseReason =
   "The harness recorded the exact BEFORE newline bytes and no longer needs this disposable output.";
 let fixture: LiveFixture | undefined;
 let latest: WorkstreamState | undefined;
-let driftPromise: Promise<{ path: string; revision: string } | undefined> | undefined;
-let driftFailure: Error | undefined;
-const driftAbort = new AbortController();
-
-function sleepForDrift(signal: AbortSignal): Promise<void> {
-  return Effect.runPromise(Effect.sleep("100 millis"), { signal });
-}
-
-// oxlint-disable-next-line effecttsgo/async-function -- This exact native smoke boundary observes the model-driven state before creating the one authorized disposable destination commit.
+// oxlint-disable-next-line effecttsgo/async-function -- This exact native smoke boundary observes the model-driven state without coordinator polling tools.
 async function singleWorkstreamName(directory: string): Promise<string | undefined> {
   let names: string[];
   try {
@@ -80,34 +71,6 @@ async function inspectSingleWorkstream(f: LiveFixture): Promise<WorkstreamState 
   );
 }
 
-// oxlint-disable-next-line effecttsgo/async-function -- This exact native smoke boundary waits for the coordinator's retained turn before submitting its next fixture event.
-async function waitForCoordinatorIdle(
-  f: LiveFixture,
-  coordinator: { paneId: string; terminalId: string; cwd: string; sessionFile: string },
-  timeoutMs: number,
-  description: string,
-): Promise<void> {
-  const agentSchema = Type.Object({
-    agent: Type.Object({
-      agent_session: Type.Object({ value: Type.String() }),
-      terminal_id: Type.String(),
-      cwd: Type.String(),
-      agent_status: Type.String(),
-    }),
-  });
-  await waitFor(
-    () =>
-      herdr(f.root, agentSchema, "agent", "get", coordinator.paneId).then((result) => {
-        assert.equal(result.agent.agent_session.value, coordinator.sessionFile);
-        assert.equal(result.agent.terminal_id, coordinator.terminalId);
-        assert.equal(result.agent.cwd, coordinator.cwd);
-        return ["idle", "done"].includes(result.agent.agent_status) ? true : undefined;
-      }),
-    Math.min(timeoutMs, 120_000),
-    description,
-  );
-}
-
 function changedImplementationCommit(state: WorkstreamState, assignmentId: string): string {
   const result = state.results.find((item) => item.assignmentId === assignmentId);
   if (
@@ -119,47 +82,6 @@ function changedImplementationCommit(state: WorkstreamState, assignmentId: strin
   )
     throw new Error(`Missing changed implementation result for ${assignmentId}`);
   return result.report.commit;
-}
-
-// oxlint-disable-next-line effecttsgo/async-function -- This exact native smoke boundary observes the model-driven state before creating the one authorized disposable destination commit.
-async function waitForCorrectionAndCreateDrift(
-  f: LiveFixture,
-  correctionAssignmentId: string,
-  timeoutMs: number,
-  signal: AbortSignal,
-): Promise<{ path: string; revision: string }> {
-  const directory = join(f.root, ".git", "pi-workgraph", "workstreams");
-  const polls = Math.max(1, Math.ceil(timeoutMs / 100));
-  for (let poll = 0; poll < polls; poll += 1) {
-    if (signal.aborted) throw new Error("Destination drift observation was interrupted.");
-    const workstreamName = await singleWorkstreamName(directory);
-    if (workstreamName === undefined) {
-      await sleepForDrift(signal);
-      continue;
-    }
-    const observed = await Effect.runPromise(
-      Effect.provide(
-        WorkstreamStoreEffects.inspect(canonicalWorkstreamPath(f.root, workstreamName)),
-        liveLayer,
-      ),
-    );
-    const correction = observed.attempts.find(
-      (attempt) => attempt.assignmentId === correctionAssignmentId,
-    );
-    if (correction?.application?.state === "applied") {
-      assert.equal(correction.application.expectedHead, f.base);
-      assert.ok(correction.application.revision !== undefined);
-      assert.equal(
-        await command(f.root, "git", ["rev-parse", "HEAD"]),
-        correction.application.revision,
-      );
-      return createAuthorizedDestinationDrift(f);
-    }
-    await sleepForDrift(signal);
-  }
-  throw new Error(
-    `Timed out waiting for correction ${correctionAssignmentId} application before creating fixture drift.`,
-  );
 }
 
 try {
@@ -180,17 +102,7 @@ try {
   await herdr(f.root, Type.Object({}), "agent", "prompt", coordinator.agentName, prompt);
   const timeoutMs = smokeTimeout;
   assert.ok(Number.isFinite(timeoutMs) && timeoutMs > 0);
-  driftPromise = waitForCorrectionAndCreateDrift(
-    f,
-    CAPABILITY_SCENARIO_IDS.correctionCandidate,
-    timeoutMs,
-    driftAbort.signal,
-    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Native background failure is normalized before the smoke boundary observes it.
-  ).catch((error: unknown) => {
-    driftFailure = error instanceof Error ? error : new Error(String(error));
-    return undefined;
-  });
-  await waitFor(
+  const state = await waitFor(
     // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
     async () => {
       const observed = await inspectSingleWorkstream(f);
@@ -199,10 +111,6 @@ try {
       if (observed.attempts.length > launchPlan.expectedAttempts)
         throw new Error(
           `Fixed scenario exceeded ${launchPlan.expectedAttempts} expected attempts; no automatic retries are authorized.`,
-        );
-      if (observed.lifecycle.state !== "active")
-        throw new Error(
-          `Expected the scenario to remain active before the harness drift event, found ${observed.lifecycle.state}`,
         );
       const initial = observed.attempts.find(
         (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
@@ -227,163 +135,37 @@ try {
         correction?.application?.state === "applied" &&
         correction.application.expectedHead === f.base &&
         correction.application.commits?.length === 2;
-      return completeChainApplied &&
-        review?.cleanup?.state === "completed" &&
-        initial?.application === undefined &&
-        progressed
-        ? observed
-        : undefined;
-    },
-    timeoutMs,
-    "notification-driven capability flow through complete-chain correction application before the harness drift event",
-  );
-  assert.ok(driftPromise !== undefined);
-  const drift = await driftPromise;
-  if (drift === undefined)
-    throw driftFailure ?? new Error("Destination drift was not created after correction apply.");
-  await waitForCoordinatorIdle(
-    f,
-    coordinator,
-    timeoutMs,
-    "coordinator settlement before the harness drift-refusal continuation",
-  );
-  const driftRefusalPrompt = `The fixture harness has now completed its one authorized destination drift event. Do not create or modify drift.txt. Its exact path is ${drift.path} and its exact destination HEAD is ${drift.revision}. Continue the retained-candidate scenario now with exactly one next decision: inspect the retained initial-candidate attempt and apply it through workgraph_control with its exact reported sourceCommit and freshly observed destinationHead ${drift.revision}. The application must refuse without changing the moved destination and remain durably blocked. Do not queue integration in this turn, do not retry the blocked application, and do not delegate any other assignment; end after the refusal is recorded so the next continuation can handle integration.`;
-  await writeFile(join(f.parent, "drift-refusal-request.txt"), driftRefusalPrompt);
-  await herdr(
-    f.root,
-    Type.Object({}),
-    "agent",
-    "prompt",
-    coordinator.agentName,
-    driftRefusalPrompt,
-  );
-  const refusedState = await waitFor(
-    // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
-    async () => {
-      const observed = await inspectSingleWorkstream(f);
-      if (observed === undefined) return undefined;
-      latest = observed;
-      if (observed.attempts.length > launchPlan.expectedAttempts)
-        throw new Error(
-          `Fixed scenario exceeded ${launchPlan.expectedAttempts} expected attempts; no automatic retries are authorized.`,
-        );
-      const initial = observed.attempts.find(
-        (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
-      );
-      return initial?.application?.state === "blocked" ? observed : undefined;
-    },
-    timeoutMs,
-    "model-driven destination-drift refusal for the retained initial candidate",
-  );
-  const initialAttempt = refusedState.attempts.find(
-    (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
-  );
-  assert.ok(initialAttempt !== undefined);
-  const existingIntegration = refusedState.attempts.find(
-    (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.integrationCandidate,
-  );
-  if (existingIntegration?.application?.state !== "applied") {
-    await waitForCoordinatorIdle(
-      f,
-      coordinator,
-      timeoutMs,
-      "coordinator settlement before the moved-base integration continuation",
-    );
-    const integrationPrompt = `The retained initial candidate application is now durably blocked because destination HEAD moved to exact revision ${drift.revision}; do not retry it. Continue the same scenario without creating any other assignment. If moved-integration is not already queued, invoke workgraph_implement with id ${CAPABILITY_SCENARIO_IDS.integrationCandidate}, candidateOf set to the exact retained initial attempt ${initialAttempt.id}, and baseRevision set to exact current destination ${drift.revision}. Its isolated worker must preserve candidate.txt and value.txt=after followed by one newline, create integration.txt=INTEGRATED followed by one newline, and report one clean direct current-base commit. After that result settles, explicitly apply moved-integration with its exact reported sourceCommit and freshly observed destinationHead; leave the workstream active because the initial refusal remains a deliberate blocker. Do not retry the blocked initial candidate or delegate any other assignment.`;
-    await writeFile(join(f.parent, "integration-request.txt"), integrationPrompt);
-    await herdr(
-      f.root,
-      Type.Object({}),
-      "agent",
-      "prompt",
-      coordinator.agentName,
-      integrationPrompt,
-    );
-  }
-  const state = await waitFor(
-    // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
-    async () => {
-      const observed = await inspectSingleWorkstream(f);
-      if (observed === undefined) return undefined;
-      latest = observed;
-      if (observed.attempts.length > launchPlan.expectedAttempts)
-        throw new Error(
-          `Fixed scenario exceeded ${launchPlan.expectedAttempts} expected attempts; no automatic retries are authorized.`,
-        );
-      if (observed.lifecycle.state !== "active")
-        throw new Error(
-          `Expected the scenario to remain active with its preserved drift blocker, found ${observed.lifecycle.state}`,
-        );
-      const driftAttempt = observed.attempts.find(
-        (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
-      );
-      const unexpected = observed.attempts.find(
-        (attempt) =>
-          attempt.assignmentId !== CAPABILITY_SCENARIO_IDS.updateValue &&
-          (attempt.error !== undefined ||
-            attempt.cleanup?.state === "blocked" ||
-            attempt.application?.state === "blocked"),
-      );
-      if (unexpected !== undefined)
-        throw new Error(`Attempt requires reconciliation: ${JSON.stringify(unexpected)}`);
-      const correction = observed.attempts.find(
-        (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.correctionCandidate,
-      );
-      const integration = observed.attempts.find(
-        (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.integrationCandidate,
-      );
-      const completeChainApplied =
-        correction?.application?.state === "applied" &&
-        correction.application.expectedHead === f.base &&
-        correction.application.commits?.length === 2;
-      const driftRefused = driftAttempt?.application?.state === "blocked";
-      const integrationApplied = integration?.application?.state === "applied";
-      const nonRetainedOutputsReleased =
-        correction?.outputRelease?.state === "completed" &&
-        integration?.outputRelease?.state === "completed";
       const allAttemptsClosed =
         observed.attempts.length === launchPlan.expectedAttempts &&
         observed.attempts.every(
           (attempt) => attempt.state === "settled" && attempt.cleanup?.state === "completed",
         );
-      const baseline = observed.results.find(
-        (result) => result.assignmentId === CAPABILITY_SCENARIO_IDS.baselineResearch,
-      );
-      const progressed =
-        baseline !== undefined &&
-        notificationDrivenProgress(
-          SessionManager.open(coordinator.sessionFile).getBranch(),
-          observed.results.map((result) => result.id),
-          baseline.id,
-        );
-      // The preserved blocked attempt intentionally prevents semantic completion.
       return completeChainApplied &&
-        driftRefused &&
-        integrationApplied &&
-        nonRetainedOutputsReleased &&
+        correction?.outputRelease?.state === "completed" &&
+        review?.cleanup?.state === "completed" &&
+        initial?.application === undefined &&
         allAttemptsClosed &&
         progressed
         ? observed
         : undefined;
     },
     timeoutMs,
-    "notification-driven capability flow and actual assistant continuations; inspect retained coordinator session and workstream state",
+    "notification-driven capability flow through complete-chain correction application and exact review",
   );
   await writeFile(join(f.parent, "state-observation.json"), JSON.stringify(state, null, 2));
   assert.deepEqual(
     state.assignments.map((assignment) => assignment.id).sort(),
     Object.values(CAPABILITY_SCENARIO_IDS).sort(),
   );
-  assert.equal(state.attempts.length, 7);
-  assert.equal(state.results.length, 7);
+  assert.equal(state.attempts.length, 6);
+  assert.equal(state.results.length, 6);
   assert.ok(
     state.results.every(
       (result) => result.validity === "typed" && result.report.status === "completed",
     ),
   );
-  assert.equal(state.deliveries.length, 7);
+  assert.equal(state.deliveries.length, 6);
   assert.ok(state.deliveries.every((delivery) => delivery.state !== "pending"));
-  assert.equal(state.completion, undefined);
   for (const attempt of state.attempts) {
     assert.equal(attempt.state, "settled");
     assert.equal(attempt.cleanup?.state, "completed");
@@ -453,13 +235,11 @@ try {
   assert.equal(retainedResources.resources[0]?.branchAbsent, false);
   assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "after\n");
   assert.equal(await readFile(join(f.root, "candidate.txt"), "utf8"), "candidate\n");
-  assert.equal(await readFile(join(f.root, "drift.txt"), "utf8"), "DRIFT\n");
-  assert.equal(await readFile(join(f.root, "integration.txt"), "utf8"), "INTEGRATED\n");
   assert.equal(await command(f.root, "node", ["verify.mjs"]), "value verified");
   assert.equal(await command(f.root, "git", ["status", "--porcelain"]), "");
   assert.equal(
     await command(f.root, "git", ["diff", "--name-only", f.base, "HEAD"]),
-    "candidate.txt\ndrift.txt\nintegration.txt\nvalue.txt",
+    "candidate.txt\nvalue.txt",
   );
   const initial = state.attempts.find(
     (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.updateValue,
@@ -470,22 +250,17 @@ try {
   const review = state.attempts.find(
     (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.exactRevisionReview,
   );
-  const integration = state.attempts.find(
-    (attempt) => attempt.assignmentId === CAPABILITY_SCENARIO_IDS.integrationCandidate,
-  );
   const concurrent = state.assignments.find(
     (assignment) => assignment.id === CAPABILITY_SCENARIO_IDS.concurrentReadme,
   );
   assert.ok(initial !== undefined);
   assert.ok(correction !== undefined);
   assert.ok(review !== undefined);
-  assert.ok(integration !== undefined);
   assert.ok(concurrent !== undefined);
   const changedCommit = (assignmentId: string): string =>
     changedImplementationCommit(state, assignmentId);
   const initialCommit = changedCommit(CAPABILITY_SCENARIO_IDS.updateValue);
   const correctionCommit = changedCommit(CAPABILITY_SCENARIO_IDS.correctionCandidate);
-  const integrationCommit = changedCommit(CAPABILITY_SCENARIO_IDS.integrationCandidate);
   assert.deepEqual(initial.candidate, { kind: "initial", rootCommit: f.base });
   assert.deepEqual(correction.candidate, {
     kind: "correction",
@@ -503,31 +278,8 @@ try {
     "2",
   );
   assert.equal(await command(f.root, "git", ["rev-parse", `${correctionCommit}^`]), initialCommit);
-  assert.equal(initial.application?.state, "blocked");
-  assert.equal(initial.application?.commit, initialCommit);
-  assert.equal(initial.application?.expectedHead, drift.revision);
-  assert.equal(await readFile(drift.path, "utf8"), "DRIFT\n");
-  assert.deepEqual(integration.candidate, {
-    kind: "integration",
-    rootCommit: drift.revision,
-    parentAttemptId: initial.id,
-    parentCommit: initialCommit,
-  });
-  assert.equal(integration.baseRevision, drift.revision);
-  assert.equal(integration.application?.state, "applied");
-  assert.equal(integration.application.rootCommit, drift.revision);
-  assert.deepEqual(integration.application.commits, [integrationCommit]);
-  assert.equal(integration.application.revision, integrationCommit);
-  assert.equal(
-    await command(f.root, "git", [
-      "rev-list",
-      "--count",
-      `${drift.revision}..${integrationCommit}`,
-    ]),
-    "1",
-  );
+  assert.equal(initial.application, undefined);
   assert.equal(correction.outputRelease?.state, "completed");
-  assert.equal(integration.outputRelease?.state, "completed");
   assert.equal(initial.outputRelease, undefined);
   assert.equal(review.baseRevision, correctionCommit);
   assert.equal(review.placement?.kind, "isolated_worktree");
@@ -541,7 +293,7 @@ try {
     concurrent.createdAt < initialResult.observedAt,
     "Research must be queued before the initial candidate settles",
   );
-  for (const implementation of [initial, correction, integration]) {
+  for (const implementation of [initial, correction]) {
     for (const role of ["implementation.guide", "implementation.executor"] as const) {
       assert.ok(
         implementation.effectiveModels?.some(
@@ -580,7 +332,7 @@ try {
   assert.ok(initial.placement?.kind === "isolated_worktree");
   assert.match(worktreePorcelain, new RegExp(initial.placement.path));
   assert.match(worktreePorcelain, new RegExp(artifact.reference));
-  const releasePrompt = `The capability scenario has all seven existing attempts settled, but the workstream remains active because its deliberate moved-destination refusal is preserved. Do not delegate, retry, inspect through another tool, alter any file, apply any output, or change intent. The harness has already established the exact retained bytes BEFORE followed by one newline at ${retainedProbe}. Invoke exactly one supported coordinator action now: workgraph_control with action release_output, attempt ${experimentAttempt.id}, and destructive reason "${retainedOutputReleaseReason}". Use that exact internal attempt id, not a task handle. Return only after the action result is recorded.`;
+  const releasePrompt = `The capability scenario has all six existing attempts settled. The workstream may remain active while the retained experiment output is released. Do not delegate, retry, inspect through another tool, alter any file, apply any output, or change intent. The harness has already established the exact retained bytes BEFORE followed by one newline at ${retainedProbe}. Invoke exactly one supported coordinator action now: workgraph_control with action release_output, attempt ${experimentAttempt.id}, and destructive reason "${retainedOutputReleaseReason}". Use that exact internal attempt id, not a task handle. Return only after the action result is recorded.`;
   await writeFile(join(f.parent, "release-request.txt"), releasePrompt);
   await herdr(f.root, Type.Object({}), "agent", "prompt", coordinator.agentName, releasePrompt);
   const releasedState = await waitFor(
@@ -600,8 +352,6 @@ try {
     timeoutMs,
     "exact retained-output release and recorded state transition",
   );
-  assert.equal(releasedState.lifecycle.state, "active");
-  assert.equal(releasedState.completion, undefined);
   assert.equal(releasedState.attempts.length, state.attempts.length);
   assert.deepEqual(
     releasedState.assignments.map((assignment) => assignment.id).sort(),
@@ -666,13 +416,12 @@ try {
     JSON.stringify(
       {
         candidateRevision: f.revision,
-        implementationRevision: integrationCommit,
-        destinationDrift: drift,
+        implementationRevision: correctionCommit,
         launchPlan,
         usage,
         cleanup,
         checks:
-          "normal package loading, fresh worker isolation, actual notification-driven baseline-to-correction progression and assistant continuations for every result, disposable experiment retention/non-composition, destination unchanged until explicit complete-chain correction application, exact isolated pre-apply review, preserved drift refusal, moved-base integration, candidate history, model messages and Prewalk transitions, native settlement, retained output resources, Herdr cleanup, and copied-agent-file cleanup",
+          "normal package loading, fresh worker isolation, actual notification-driven baseline-to-correction progression and assistant continuations for every result, disposable experiment retention/non-composition, destination unchanged until explicit complete-chain correction application, exact isolated pre-apply review, candidate history, model messages and Prewalk transitions, native settlement, retained output resources, Herdr cleanup, and copied-agent-file cleanup",
       },
       null,
       2,
@@ -686,7 +435,6 @@ try {
     })}\n`,
   );
 } catch (error) {
-  driftAbort.abort();
   if (fixture && latest)
     await writeFile(
       join(fixture.parent, "state-observation.json"),

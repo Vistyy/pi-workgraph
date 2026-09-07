@@ -127,10 +127,6 @@ export interface GitRepositoryEffects {
     rootCommit: string,
     reportedCommit?: string,
   ) => GitEffect<ValidatedCandidate>;
-  readonly recoverApplication: (
-    expectedHead: string,
-    source: { baseCommit: string; commit: string },
-  ) => GitEffect<{ head: string } | undefined>;
   readonly recoverCandidateApplication: (
     expectedHead: string,
     source: CandidateApplicationSource,
@@ -139,7 +135,6 @@ export interface GitRepositoryEffects {
     source: CandidateApplicationSource,
     expectedHead: string,
   ) => GitEffect<string>;
-  readonly applyCommit: (commit: string, expectedHead: string) => GitEffect<string>;
   readonly discardExperiment: (
     placement: WorktreePlacement,
     expectedHead: string,
@@ -174,12 +169,9 @@ export class GitRepository {
         this.validateWorkerCommitEffect(placement, reportedCommit),
       validateCandidate: (placement, rootCommit, reportedCommit) =>
         this.validateCandidateEffect(placement, rootCommit, reportedCommit),
-      recoverApplication: (expectedHead, source) =>
-        this.recoverApplicationEffect(expectedHead, source),
       recoverCandidateApplication: (expectedHead, source) =>
         this.recoverCandidateApplicationEffect(expectedHead, source),
       applyCandidate: (source, expectedHead) => this.applyCandidateEffect(source, expectedHead),
-      applyCommit: (commit, expectedHead) => this.applyCommitEffect(commit, expectedHead),
       discardExperiment: (placement, expectedHead) =>
         this.discardExperimentEffect(placement, expectedHead),
       cleanupWorktree: (placement, expectedHead) =>
@@ -361,32 +353,6 @@ export class GitRepository {
       ),
     );
   }
-  private recoverApplicationEffect(
-    expectedHead: string,
-    source: { baseCommit: string; commit: string },
-  ): GitEffect<{ head: string } | undefined> {
-    const root = this.root;
-    const git = this.git;
-    return Effect.gen(function* () {
-      yield* assertClean(git, root);
-      const head = yield* git.text(root, ["rev-parse", "HEAD"]);
-      if (head === expectedHead) return undefined;
-      const parents = yield* git.text(root, ["rev-list", "--parents", "-n", "1", head]);
-      if (parents !== `${head} ${expectedHead}`) {
-        return yield* fail("Recovery requires one direct unrecorded application commit.");
-      }
-      const rootDiff = yield* diffFingerprint(git, root, expectedHead, head);
-      const workerDiff = yield* diffFingerprint(git, root, source.baseCommit, source.commit);
-      if (workerDiff !== rootDiff) {
-        return yield* fail(
-          `Could not attribute unrecorded application HEAD ${head} to ${source.commit}.`,
-        );
-      }
-      yield* assertStableCleanHead(git, root, head, "Application recovery");
-      return { head };
-    });
-  }
-
   private recoverCandidateApplicationEffect(
     expectedHead: string,
     source: CandidateApplicationSource,
@@ -496,54 +462,6 @@ export class GitRepository {
     });
   }
 
-  private applyCommitEffect(commit: string, expectedHead: string): GitEffect<string> {
-    const root = this.root;
-    const git = this.git;
-    return Effect.gen(function* () {
-      yield* assertClean(git, root);
-      const resolvedCommit = yield* resolveRevision(git, root, commit);
-      const before = yield* git.text(root, ["rev-parse", "HEAD"]);
-      if (before !== expectedHead) {
-        return yield* fail(`Application HEAD changed: expected ${expectedHead}, found ${before}.`);
-      }
-      const priorCherryPick = yield* inspectRef(
-        git,
-        root,
-        "CHERRY_PICK_HEAD",
-        (result) => `Could not inspect pre-application cherry-pick state: ${diagnostic(result)}`,
-      );
-      if (priorCherryPick.state === "present") {
-        return yield* fail(
-          `Application found pre-existing cherry-pick state at ${priorCherryPick.head}; no mutation was attempted.`,
-        );
-      }
-      return yield* Effect.uninterruptible(
-        Effect.gen(function* () {
-          const result = yield* git.process(root, ["cherry-pick", resolvedCommit], 120_000);
-          if (!processSucceeded(result)) {
-            return yield* rollbackFailedCherryPick(
-              git,
-              root,
-              resolvedCommit,
-              before,
-              expectedHead,
-              result,
-            );
-          }
-          yield* assertClean(git, root);
-          const head = yield* git.text(root, ["rev-parse", "HEAD"]);
-          const parents = yield* git.text(root, ["rev-list", "--parents", "-n", "1", head]);
-          if (parents !== `${head} ${expectedHead}`) {
-            return yield* fail(
-              `Cherry-pick completed after application HEAD changed from ${expectedHead}; inspect repository state before retrying.`,
-            );
-          }
-          return head;
-        }),
-      );
-    });
-  }
-
   /** Discard only an explicitly disposable, stopped experiment at its recorded identity. */
   private discardExperimentEffect(
     placement: WorktreePlacement,
@@ -642,112 +560,6 @@ function retainedRef(runId: string, attemptId: string): GitEffect<string> {
     return fail("Invalid retained commit identity.");
   }
   return Effect.succeed(`refs/workgraph-retained/${runId}/${attemptId}`);
-}
-
-function rollbackFailedCherryPick(
-  git: GitClient,
-  root: string,
-  resolvedCommit: string,
-  before: string,
-  expectedHead: string,
-  result: ProcessResult,
-): GitEffect<never> {
-  const operationDiagnostic = `Cherry-pick conflict or failure for ${resolvedCommit}: ${diagnostic(result)}`;
-  return Effect.gen(function* () {
-    const headAfterFailure = yield* git
-      .text(root, ["rev-parse", "HEAD"])
-      .pipe(
-        Effect.catch((error) =>
-          uncertain(
-            "Cherry-pick failed and the resulting HEAD is unavailable; no abort was attempted.",
-            operationDiagnostic,
-            failureDiagnostic(error),
-          ),
-        ),
-      );
-    if (headAfterFailure !== before) {
-      return yield* uncertain(
-        "Cherry-pick returned failure after HEAD changed; no abort was attempted.",
-        operationDiagnostic,
-        `Observed HEAD ${headAfterFailure}, expected unchanged HEAD ${before}.`,
-      );
-    }
-
-    const cherryPickHead = yield* inspectRef(
-      git,
-      root,
-      "CHERRY_PICK_HEAD",
-      (inspection) => `Could not inspect cherry-pick ownership: ${diagnostic(inspection)}`,
-    ).pipe(
-      Effect.catch((error) =>
-        uncertain(
-          "Cherry-pick failed but its ownership evidence is unavailable; no abort was attempted.",
-          operationDiagnostic,
-          failureDiagnostic(error),
-        ),
-      ),
-    );
-    if (cherryPickHead.state === "absent") {
-      return yield* fail(`${operationDiagnostic}; no cherry-pick state required rollback.`);
-    }
-    if (cherryPickHead.head !== resolvedCommit) {
-      return yield* uncertain(
-        "Cherry-pick state does not belong to the requested commit; no abort was attempted.",
-        operationDiagnostic,
-        `CHERRY_PICK_HEAD is ${cherryPickHead.head}, expected ${resolvedCommit}.`,
-      );
-    }
-
-    const abort = yield* git
-      .process(root, ["cherry-pick", "--abort"])
-      .pipe(
-        Effect.catch((error) =>
-          uncertain(
-            "Cherry-pick rollback could not be executed.",
-            operationDiagnostic,
-            failureDiagnostic(error),
-          ),
-        ),
-      );
-    if (!processSucceeded(abort)) {
-      return yield* uncertain(
-        "Cherry-pick rollback did not complete successfully.",
-        operationDiagnostic,
-        diagnostic(abort),
-      );
-    }
-    const remainingState = yield* inspectRef(
-      git,
-      root,
-      "CHERRY_PICK_HEAD",
-      (inspection) => `Could not verify cherry-pick rollback state: ${diagnostic(inspection)}`,
-    ).pipe(
-      Effect.catch((error) =>
-        uncertain(
-          "Cherry-pick rollback completed but its state could not be verified.",
-          operationDiagnostic,
-          failureDiagnostic(error),
-        ),
-      ),
-    );
-    if (remainingState.state === "present") {
-      return yield* uncertain(
-        "Cherry-pick rollback left operation state behind.",
-        operationDiagnostic,
-        `CHERRY_PICK_HEAD remains at ${remainingState.head}.`,
-      );
-    }
-    yield* assertStableCleanHead(git, root, expectedHead, "Cherry-pick rollback").pipe(
-      Effect.catch((error) =>
-        uncertain(
-          "Cherry-pick rollback failed its clean HEAD postcondition.",
-          operationDiagnostic,
-          failureDiagnostic(error),
-        ),
-      ),
-    );
-    return yield* fail(operationDiagnostic);
-  });
 }
 
 function inspectRef(
@@ -1187,26 +999,6 @@ function nextCandidateCommit(line: string, parent: string): string | undefined {
   const parts = line.split(" ");
   const current = parts.length === 2 && parts[1] === parent ? parts[0] : undefined;
   return current !== undefined && /^[0-9a-f]{40,64}$/.test(current) ? current : undefined;
-}
-
-function diffFingerprint(
-  git: GitClient,
-  cwd: string,
-  base: string,
-  head: string,
-): GitEffect<string> {
-  return Effect.gen(function* () {
-    const result = yield* git.process(
-      cwd,
-      ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--no-renames", base, head],
-      30_000,
-      true,
-    );
-    if (!processSucceeded(result) || result.stdoutDigest === undefined) {
-      return yield* fail(`Could not fingerprint Git change: ${diagnostic(result)}`);
-    }
-    return result.stdoutDigest;
-  });
 }
 
 const liveGitProcessRunner: GitProcessRunner = ({ cwd, args, timeoutMs, digestStdout }) =>
