@@ -24,6 +24,16 @@ export function isLegacyWorkstreamPath(path: string): boolean {
 
 const NonEmptyStringSchema = Type.String({ minLength: 1 });
 const TimestampSchema = Type.String({ minLength: 1 });
+export const CommitSchema = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
+export const CandidateLineageSchema = Type.Object(
+  {
+    kind: StringEnum(["initial", "correction", "integration"] as const),
+    rootCommit: CommitSchema,
+    parentAttemptId: Type.Optional(NonEmptyStringSchema),
+    parentCommit: Type.Optional(CommitSchema),
+  },
+  { additionalProperties: false },
+);
 const SessionIdentitySchema = Type.Object(
   {
     sessionId: NonEmptyStringSchema,
@@ -276,6 +286,8 @@ const AttemptSchema = Type.Object(
       ),
     ),
     continuationOf: Type.Optional(NonEmptyStringSchema),
+    /** Content lineage is separate from continuationOf, which names session trajectory. */
+    candidate: Type.Optional(CandidateLineageSchema),
     launchPane: Type.Optional(
       Type.Object(
         { workspaceId: NonEmptyStringSchema, paneId: NonEmptyStringSchema },
@@ -301,6 +313,8 @@ const AttemptSchema = Type.Object(
           state: StringEnum(["pending", "applied", "blocked"] as const),
           commit: NonEmptyStringSchema,
           expectedHead: NonEmptyStringSchema,
+          rootCommit: Type.Optional(CommitSchema),
+          commits: Type.Optional(Type.Array(CommitSchema, { minItems: 1 })),
           revision: Type.Optional(NonEmptyStringSchema),
           error: Type.Optional(NonEmptyStringSchema),
         },
@@ -478,6 +492,7 @@ export const WorkstreamStateSchema = Type.Object(
 );
 
 export type SessionIdentity = Static<typeof SessionIdentitySchema>;
+export type CandidateLineage = Static<typeof CandidateLineageSchema>;
 export type HumanInputSource = "interactive" | "rpc" | "extension";
 export type HumanInputReceipt = Static<typeof HumanInputReceiptSchema>;
 export type Intent = Static<typeof IntentSchema>;

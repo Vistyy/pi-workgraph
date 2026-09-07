@@ -23,6 +23,17 @@ export interface ValidatedCommit {
   changedFiles: string[];
 }
 
+export interface ValidatedCandidate extends ValidatedCommit {
+  rootCommit: string;
+  commits: string[];
+}
+
+export interface CandidateApplicationSource {
+  rootCommit: string;
+  commit: string;
+  commits: string[];
+}
+
 export interface WorktreeCleanupResult {
   state: "completed" | "blocked";
   path: string;
@@ -111,10 +122,23 @@ export interface GitRepositoryEffects {
     placement: WorktreePlacement,
     reportedCommit?: string,
   ) => GitEffect<ValidatedCommit>;
+  readonly validateCandidate: (
+    placement: WorktreePlacement,
+    rootCommit: string,
+    reportedCommit?: string,
+  ) => GitEffect<ValidatedCandidate>;
   readonly recoverApplication: (
     expectedHead: string,
     source: { baseCommit: string; commit: string },
   ) => GitEffect<{ head: string } | undefined>;
+  readonly recoverCandidateApplication: (
+    expectedHead: string,
+    source: CandidateApplicationSource,
+  ) => GitEffect<{ head: string } | undefined>;
+  readonly applyCandidate: (
+    source: CandidateApplicationSource,
+    expectedHead: string,
+  ) => GitEffect<string>;
   readonly applyCommit: (commit: string, expectedHead: string) => GitEffect<string>;
   readonly discardExperiment: (
     placement: WorktreePlacement,
@@ -148,8 +172,13 @@ export class GitRepository {
         this.validateWorkerNoChangeEffect(placement, reportedRevision),
       validateWorkerCommit: (placement, reportedCommit) =>
         this.validateWorkerCommitEffect(placement, reportedCommit),
+      validateCandidate: (placement, rootCommit, reportedCommit) =>
+        this.validateCandidateEffect(placement, rootCommit, reportedCommit),
       recoverApplication: (expectedHead, source) =>
         this.recoverApplicationEffect(expectedHead, source),
+      recoverCandidateApplication: (expectedHead, source) =>
+        this.recoverCandidateApplicationEffect(expectedHead, source),
+      applyCandidate: (source, expectedHead) => this.applyCandidateEffect(source, expectedHead),
       applyCommit: (commit, expectedHead) => this.applyCommitEffect(commit, expectedHead),
       discardExperiment: (placement, expectedHead) =>
         this.discardExperimentEffect(placement, expectedHead),
@@ -317,6 +346,21 @@ export class GitRepository {
     });
   }
 
+  private validateCandidateEffect(
+    placement: WorktreePlacement,
+    rootCommit: string,
+    reportedCommit?: string,
+  ): GitEffect<ValidatedCandidate> {
+    if (!/^[0-9a-f]{40,64}$/.test(rootCommit))
+      return fail("Candidate root must be an exact commit id.");
+    return this.validateWorkerCommitEffect(placement, reportedCommit).pipe(
+      Effect.flatMap((validated) =>
+        candidateCommitChain(this.git, this.root, rootCommit, validated.commit).pipe(
+          Effect.map((commits) => ({ ...validated, rootCommit, commits })),
+        ),
+      ),
+    );
+  }
   private recoverApplicationEffect(
     expectedHead: string,
     source: { baseCommit: string; commit: string },
@@ -340,6 +384,115 @@ export class GitRepository {
       }
       yield* assertStableCleanHead(git, root, head, "Application recovery");
       return { head };
+    });
+  }
+
+  private recoverCandidateApplicationEffect(
+    expectedHead: string,
+    source: CandidateApplicationSource,
+  ): GitEffect<{ head: string } | undefined> {
+    const root = this.root;
+    const git = this.git;
+    return Effect.gen(function* () {
+      yield* assertClean(git, root);
+      const head = yield* git.text(root, ["rev-parse", "HEAD"]);
+      if (head === expectedHead) return undefined;
+      if (expectedHead !== source.rootCommit || head !== source.commit) {
+        return yield* fail(
+          `Could not attribute unrecorded candidate application HEAD ${head} to ${source.commit} rooted at ${source.rootCommit}.`,
+        );
+      }
+      const commits = yield* candidateCommitChain(git, root, source.rootCommit, source.commit);
+      if (!sameCommitChain(commits, source.commits)) {
+        return yield* fail("Candidate application recovery found a changed commit chain.");
+      }
+      yield* assertStableCleanHead(git, root, head, "Candidate application recovery");
+      return { head };
+    });
+  }
+
+  private applyCandidateEffect(
+    source: CandidateApplicationSource,
+    expectedHead: string,
+  ): GitEffect<string> {
+    const root = this.root;
+    const git = this.git;
+    return Effect.gen(function* () {
+      yield* assertClean(git, root);
+      if (!/^[0-9a-f]{40,64}$/.test(expectedHead))
+        return yield* fail("Application destination must be an exact commit id.");
+      const resolvedRoot = yield* resolveRevision(git, root, source.rootCommit);
+      const resolvedCommit = yield* resolveRevision(git, root, source.commit);
+      if (resolvedRoot !== source.rootCommit || resolvedCommit !== source.commit)
+        return yield* fail("Candidate application requires exact source revisions.");
+      const commits = yield* candidateCommitChain(git, root, source.rootCommit, source.commit);
+      if (!sameCommitChain(commits, source.commits))
+        return yield* fail("Candidate source commit chain changed before application.");
+      const before = yield* git.text(root, ["rev-parse", "HEAD"]);
+      if (before !== expectedHead)
+        return yield* fail(`Application HEAD changed: expected ${expectedHead}, found ${before}.`);
+      if (before !== source.rootCommit)
+        return yield* fail(
+          `Destination HEAD ${before} does not equal candidate root ${source.rootCommit}; integrate the retained candidate onto the moved destination first.`,
+        );
+      const priorMerge = yield* inspectRef(
+        git,
+        root,
+        "MERGE_HEAD",
+        (result) => `Could not inspect pre-application merge state: ${diagnostic(result)}`,
+      );
+      if (priorMerge.state === "present")
+        return yield* fail(
+          `Application found pre-existing merge state at ${priorMerge.head}; no mutation was attempted.`,
+        );
+      return yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          const result = yield* git.process(
+            root,
+            ["merge", "--ff-only", "--no-edit", source.commit],
+            120_000,
+          );
+          if (!processSucceeded(result)) {
+            const after = yield* git
+              .text(root, ["rev-parse", "HEAD"])
+              .pipe(
+                Effect.catch((error) =>
+                  uncertain(
+                    "Fast-forward application failed and the resulting HEAD is unavailable; no recovery mutation was attempted.",
+                    `Fast-forward application of ${source.commit}: ${diagnostic(result)}`,
+                    failureDiagnostic(error),
+                  ),
+                ),
+              );
+            if (after === before) {
+              yield* assertStableCleanHead(
+                git,
+                root,
+                before,
+                "Fast-forward application failure",
+              ).pipe(
+                Effect.catch((error) =>
+                  uncertain(
+                    "Fast-forward application failed and its unchanged destination state is uncertain.",
+                    `Fast-forward application of ${source.commit}: ${diagnostic(result)}`,
+                    failureDiagnostic(error),
+                  ),
+                ),
+              );
+              return yield* fail(
+                `Fast-forward application of ${source.commit} failed: ${diagnostic(result)}`,
+              );
+            }
+            return yield* uncertain(
+              "Fast-forward application returned failure after destination state changed; no rollback was attempted.",
+              `Fast-forward application of ${source.commit}: ${diagnostic(result)}`,
+              `Observed HEAD ${after}, expected unchanged ${before} or final ${source.commit}.`,
+            );
+          }
+          yield* assertStableCleanHead(git, root, source.commit, "Fast-forward application");
+          return source.commit;
+        }),
+      );
     });
   }
 
@@ -993,6 +1146,47 @@ function gitText(
     }
     return result.stdout;
   });
+}
+
+function candidateCommitChain(
+  git: GitClient,
+  root: string,
+  rootCommit: string,
+  commit: string,
+): GitEffect<string[]> {
+  return Effect.gen(function* () {
+    if (rootCommit === commit) return yield* fail("Candidate must contain at least one commit.");
+    const text = yield* git.text(
+      root,
+      ["rev-list", "--reverse", "--parents", `${rootCommit}..${commit}`],
+      true,
+    );
+    const lines = text.length === 0 ? [] : text.split("\n");
+    const commits: string[] = [];
+    let parent = rootCommit;
+    for (const line of lines) {
+      const current = nextCandidateCommit(line, parent);
+      if (current === undefined)
+        return yield* fail(
+          `Candidate ${commit} is not a complete linear history rooted at ${rootCommit}.`,
+        );
+      commits.push(current);
+      parent = current;
+    }
+    if (commits.at(-1) !== commit)
+      return yield* fail(`Candidate history does not terminate at exact source ${commit}.`);
+    return commits;
+  });
+}
+
+function sameCommitChain(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((commit, index) => commit === right[index]);
+}
+
+function nextCandidateCommit(line: string, parent: string): string | undefined {
+  const parts = line.split(" ");
+  const current = parts.length === 2 && parts[1] === parent ? parts[0] : undefined;
+  return current !== undefined && /^[0-9a-f]{40,64}$/.test(current) ? current : undefined;
 }
 
 function diffFingerprint(

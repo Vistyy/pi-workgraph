@@ -13,7 +13,7 @@ Use a separate coordinator conversation for unrelated work.
 Give research a question and required observations, disposable experiments explicitly authorized effects and a stopping condition, and maintained changes concrete acceptance requirements.
 Make assignments bounded enough that their results can be judged independently.
 Choose separate assignments for different concerns or maintained slices; multiple attempts provide independent views of the same assignment, including across models.
-Workers start fresh; request continuation only when a settled worker's retained trajectory is useful.
+Workers start fresh; request continuation only when a settled worker's retained trajectory is useful. `continuationOf` names that session trajectory only; it must not identify content lineage. Use the explicit maintained-implementation `candidateOf` path when a retained isolated candidate needs correction or integration.
 
 ## Own change quality
 
@@ -43,7 +43,7 @@ Review and verify the identified revision, not changing live files or the implem
 ## Handle returned work
 
 Use actionable notifications for ordinary decisions; retrieve more evidence when missing detail could change the decision.
-Choose whether to apply maintained output or retain it for further work; settlement does not apply it or require acceptance.
+Choose whether to apply maintained output or retain it for further work; settlement does not apply it or require acceptance. Application validates the candidate root and complete ordered direct history, then fast-forwards through every unchanged candidate commit; it refuses a moved destination without mutation. To continue a retained candidate, use `candidateOf` for an isolated correction from its parent commit, or `candidateOf` plus the freshly observed exact `baseRevision` for an explicit isolated integration onto a moved destination.
 Release unselected output only when it is no longer useful.
 For uncertain launches, application, release, or ownership, inspect exact retained identities and resulting effects before retrying; preserve blocked work rather than manufacturing cleanup or completion.
 Before recovery or adoption, read [OPERATIONS.md](../../OPERATIONS.md).

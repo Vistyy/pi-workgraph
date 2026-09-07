@@ -17,7 +17,13 @@ import {
   Semaphore,
 } from "effect";
 import type { PlatformError } from "effect/PlatformError";
-import type { GitFailure, GitRepository, WorktreePlacement } from "./git.js";
+import type {
+  CandidateApplicationSource,
+  GitFailure,
+  GitRepository,
+  ValidatedCandidate,
+  WorktreePlacement,
+} from "./git.js";
 import {
   type HerdrProtocolError,
   herdrWorkerName,
@@ -41,6 +47,7 @@ import type {
 import type { WorkgraphRegistry } from "./registry.js";
 import type { ThinkingLevel, WorkerIdentity } from "./types.js";
 import type {
+  CandidateLineage,
   StoreEffect,
   WorkAssignment,
   WorkAttempt,
@@ -72,8 +79,15 @@ export interface QueueOptions {
   thinking?: ThinkingLevel;
   executor?: { model: string; thinking: ThinkingLevel };
   continuationOf?: string;
+  /** Content lineage; unlike continuationOf this never names a Pi session trajectory. */
+  candidateOf?: string;
   baseRevision?: string;
 }
+type QueueBase = {
+  revision?: string;
+  candidate?: CandidateLineage;
+};
+
 export interface RuntimeOwnership {
   registry?: WorkgraphRegistry;
   owner?: LeaseOwner;
@@ -416,11 +430,11 @@ export class WorkstreamRuntime {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const policy = yield* this.policy;
-        const baseRevision = yield* this.resolveQueueBaseEffect(input, options);
+        const base = yield* this.resolveQueueBaseEffect(input, options);
         const attempts = yield* this.runtimeSync("prepare queued attempt", () =>
           input.capability === "implement"
-            ? implementationAttempt(policy, options, baseRevision)
-            : selectedAttempts(input.capability, policy, options, baseRevision),
+            ? implementationAttempt(policy, options, base)
+            : selectedAttempts(input.capability, policy, options, base.revision),
         );
         return yield* this.storeEffect((store) => store.enqueue(input, attempts));
       }.bind(this),
@@ -430,13 +444,10 @@ export class WorkstreamRuntime {
   private resolveQueueBaseEffect(
     input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
     options: QueueOptions,
-  ): RuntimeEffect<string | undefined> {
+  ): RuntimeEffect<QueueBase> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const subjectRevision =
-          input.capability === "review" && input.subject.kind === "revision"
-            ? input.subject.revision
-            : undefined;
+        const subjectRevision = exactReviewRevision(input);
         if (
           subjectRevision !== undefined &&
           options.baseRevision !== undefined &&
@@ -445,8 +456,84 @@ export class WorkstreamRuntime {
           return yield* this.runtimeSync("validate review base", () => {
             throw new Error("Review base revision conflicts with its exact subject.");
           });
-        const isolated =
-          input.capability === "implement" || input.artifactIntent === "disposable_experiment";
+        if (options.candidateOf !== undefined)
+          return yield* this.resolveCandidateQueueBaseEffect(input, options);
+        const revision = yield* this.resolveQueueRevisionEffect(input, options, subjectRevision);
+        if (input.capability === "implement" && revision !== undefined)
+          return {
+            revision,
+            candidate: { kind: "initial" as const, rootCommit: revision },
+          };
+        return revision === undefined ? {} : { revision };
+      }.bind(this),
+    );
+  }
+
+  private resolveCandidateQueueBaseEffect(
+    input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
+    options: QueueOptions,
+  ): RuntimeEffect<QueueBase> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        if (input.capability !== "implement")
+          return yield* this.runtimeSync("validate candidate lineage", () => {
+            throw new Error("Candidate lineage is available only for maintained implementations.");
+          });
+        if (options.continuationOf !== undefined)
+          return yield* this.runtimeSync("validate candidate lineage", () => {
+            throw new Error(
+              "Candidate content lineage cannot be combined with a session continuation; choose the explicit trajectory separately.",
+            );
+          });
+        const state = yield* this.storeEffect((store) => store.load());
+        const parent = findAttemptHandle(state, required(options.candidateOf, "candidate parent"));
+        const parentCandidate = yield* this.validateRetainedCandidate(state, parent);
+        const requested = options.baseRevision ?? parentCandidate.commit;
+        const baseRevision = yield* this.gitEffect((repository) =>
+          repository.resolveRevision(requested),
+        );
+        const correction = baseRevision === parentCandidate.commit;
+        if (!correction) yield* this.validateIntegrationBaseEffect(baseRevision);
+        return {
+          revision: baseRevision,
+          candidate: {
+            kind: correction ? ("correction" as const) : ("integration" as const),
+            rootCommit: correction ? parentCandidate.rootCommit : baseRevision,
+            parentAttemptId: parent.id,
+            parentCommit: parentCandidate.commit,
+          },
+        };
+      }.bind(this),
+    );
+  }
+
+  private validateIntegrationBaseEffect(baseRevision: string): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const destination = yield* this.gitEffect((repository) => repository.head());
+        if (destination !== baseRevision)
+          return yield* this.runtimeSync("validate integration base", () => {
+            throw new Error(
+              `Integration base ${baseRevision} is not the current destination HEAD ${destination}.`,
+            );
+          });
+        yield* this.gitEffect((repository) => repository.assertClean());
+      }.bind(this),
+    );
+  }
+
+  private resolveQueueRevisionEffect(
+    input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
+    options: QueueOptions,
+    subjectRevision: string | undefined,
+  ): RuntimeEffect<string | undefined> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const isolated = requiresIsolatedPlacement(
+          input.capability,
+          input.artifactIntent,
+          input.capability === "review" ? input.subject.kind : undefined,
+        );
         const repositoryHead =
           options.baseRevision === undefined && subjectRevision === undefined && isolated
             ? yield* this.gitEffect((repository) => repository.head())
@@ -455,6 +542,61 @@ export class WorkstreamRuntime {
         return requested === undefined
           ? undefined
           : yield* this.gitEffect((repository) => repository.resolveRevision(requested));
+      }.bind(this),
+    );
+  }
+
+  private validateRetainedCandidate(
+    state: WorkstreamState,
+    parent: WorkAttempt,
+  ): RuntimeEffect<ValidatedCandidate> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const assignment = findAssignment(state, parent.assignmentId);
+        const candidate = candidateLineageForAttempt(parent);
+        const result =
+          parent.resultId === undefined
+            ? undefined
+            : state.results.find((item) => item.id === parent.resultId);
+        const source = yield* this.runtimeSync("validate retained candidate lineage", () => {
+          if (
+            assignment.capability !== "implement" ||
+            !this.store.isAssignmentCurrent(state, assignment.id) ||
+            parent.state !== "settled" ||
+            parent.cleanup?.state !== "completed" ||
+            !parent.cleanup.workerClosed ||
+            parent.placement?.kind !== "isolated_worktree" ||
+            parent.outputRelease !== undefined ||
+            (parent.application !== undefined && parent.application.state !== "blocked") ||
+            candidate === undefined
+          )
+            throw new Error(
+              "Candidate parent must be a current, settled, closed, unapplied isolated implementation with retained output.",
+            );
+          if (
+            result?.validity !== "typed" ||
+            result.report.kind !== "implementation" ||
+            result.report.status !== "completed" ||
+            result.report.outcome !== "changed" ||
+            result.report.commit === undefined
+          )
+            throw new Error("Candidate parent has no completed changed implementation report.");
+          if (candidate.parentAttemptId !== undefined && candidate.parentAttemptId === parent.id)
+            throw new Error("Candidate lineage cannot point to itself.");
+          return { candidate, commit: result.report.commit };
+        });
+        const validated = yield* this.gitEffect((repository) =>
+          repository.validateCandidate(
+            placementOf(parent),
+            source.candidate.rootCommit,
+            source.commit,
+          ),
+        );
+        if (validated.commit !== source.commit)
+          return yield* this.runtimeSync("validate retained candidate source", () => {
+            throw new Error("Retained candidate source changed during validation.");
+          });
+        return validated;
       }.bind(this),
     );
   }
@@ -736,9 +878,11 @@ export class WorkstreamRuntime {
   ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const isolated =
-          assignment.capability === "implement" ||
-          assignment.artifactIntent === "disposable_experiment";
+        const isolated = requiresIsolatedPlacement(
+          assignment.capability,
+          assignment.artifactIntent,
+          assignment.capability === "review" ? assignment.subject.kind : undefined,
+        );
         const baseRevision = attempt.baseRevision;
         const placement = isolated
           ? yield* this.gitEffect((repository) =>
@@ -940,20 +1084,29 @@ export class WorkstreamRuntime {
         const assignment = findAssignment(state, attempt.assignmentId);
         const result = state.results.find((item) => item.id === attempt.resultId);
         const reportedCommit = validApplicationCommit(result);
+        const candidate = candidateForApplication(attempt);
         yield* this.runtimeSync("validate explicit application", () =>
           validateExplicitApplication(
             state,
             attempt,
             assignment,
+            candidate,
             reportedCommit,
             sourceCommit,
+            destinationHead,
             this.store.isAssignmentCurrent(state, assignment.id),
           ),
         );
-        yield* this.applyMaintainedOutput(attempt, assignment, sourceCommit, destinationHead).pipe(
-          Effect.catch((error) =>
-            this.recoverApplication(attempt, sourceCommit, destinationHead, error),
-          ),
+        const validated = yield* this.gitEffect((repository) =>
+          repository.validateCandidate(placementOf(attempt), candidate.rootCommit, sourceCommit),
+        );
+        const source: CandidateApplicationSource = {
+          rootCommit: validated.rootCommit,
+          commit: validated.commit,
+          commits: validated.commits,
+        };
+        yield* this.applyMaintainedOutput(attempt, assignment, source, destinationHead).pipe(
+          Effect.catch((error) => this.recoverApplication(attempt, source, destinationHead, error)),
         );
         const applied = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
         if (applied.application?.state !== "applied")
@@ -974,16 +1127,26 @@ export class WorkstreamRuntime {
   private applyMaintainedOutput(
     attempt: WorkAttempt,
     assignment: WorkAssignment,
-    commit: string,
+    source: CandidateApplicationSource,
     expectedHead: string,
   ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        yield* this.gitEffect((repository) =>
-          repository.validateWorkerCommit(placementOf(attempt), commit),
+        const validated = yield* this.gitEffect((repository) =>
+          repository.validateCandidate(placementOf(attempt), source.rootCommit, source.commit),
         );
+        yield* this.runtimeSync("validate candidate application history", () => {
+          if (!sameCommitChain(validated.commits, source.commits))
+            throw new Error("Candidate history changed between application checks.");
+        });
         yield* this.storeEffect((store) =>
-          store.beginApplication({ id: attempt.id, commit, expectedHead }),
+          store.beginApplication({
+            id: attempt.id,
+            commit: source.commit,
+            expectedHead,
+            rootCommit: source.rootCommit,
+            commits: source.commits,
+          }),
         );
         const state = yield* this.storeEffect((store) => store.load());
         yield* this.runtimeSync("validate current application intent", () => {
@@ -994,17 +1157,21 @@ export class WorkstreamRuntime {
         });
         yield* this.ownershipEffect();
         const revision = yield* this.gitEffect((repository) =>
-          repository.applyCommit(commit, expectedHead),
+          repository.applyCandidate(source, expectedHead),
         );
         yield* this.storeEffect((store) => store.finishApplication(attempt.id, revision));
-        yield* this.recordApplicationArtifact(attempt, revision, `Applied ${commit}.`);
+        yield* this.recordApplicationArtifact(
+          attempt,
+          revision,
+          `Applied candidate history through ${source.commit} (${source.commits.length} commit${source.commits.length === 1 ? "" : "s"}).`,
+        );
       }.bind(this),
     );
   }
 
   private recoverApplication(
     attempt: WorkAttempt,
-    commit: string,
+    source: CandidateApplicationSource,
     expectedHead: string,
     originalError: RuntimeError,
   ): RuntimeEffect<void> {
@@ -1012,10 +1179,7 @@ export class WorkstreamRuntime {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const recovery = yield* this.gitEffect((repository) =>
-          repository.recoverApplication(expectedHead, {
-            baseCommit: required(attempt.baseRevision, "base revision"),
-            commit,
-          }),
+          repository.recoverCandidateApplication(expectedHead, source),
         ).pipe(Effect.option);
         if (Option.isNone(recovery) || recovery.value === undefined) {
           yield* this.storeEffect((store) =>
@@ -1028,7 +1192,7 @@ export class WorkstreamRuntime {
         yield* this.recordApplicationArtifact(
           attempt,
           recovered.head,
-          `Recovered application of ${commit}.`,
+          `Recovered application of candidate history through ${source.commit}.`,
         );
       }.bind(this),
     );
@@ -1299,6 +1463,7 @@ type EnqueuedAttempt = {
   id: string;
   models: NonNullable<WorkAttempt["models"]>;
   continuationOf?: string;
+  candidate?: CandidateLineage;
   baseRevision?: string;
 };
 type WorkerReport = Extract<WorkResult, { validity: "typed" }>["report"];
@@ -1306,7 +1471,7 @@ type WorkerReport = Extract<WorkResult, { validity: "typed" }>["report"];
 function implementationAttempt(
   policy: ModelPolicy,
   options: QueueOptions,
-  baseRevision: string | undefined,
+  base: QueueBase,
 ): EnqueuedAttempt {
   const guide = policy.roles["implementation.guide"];
   const hasGuideOverride = options.model !== undefined || options.thinking !== undefined;
@@ -1326,7 +1491,8 @@ function implementationAttempt(
   );
   const attempt: EnqueuedAttempt = { id: `attempt-${randomUUID()}`, models };
   if (options.continuationOf !== undefined) attempt.continuationOf = options.continuationOf;
-  if (baseRevision !== undefined) attempt.baseRevision = baseRevision;
+  if (base.revision !== undefined) attempt.baseRevision = base.revision;
+  if (base.candidate !== undefined) attempt.candidate = base.candidate;
   return attempt;
 }
 
@@ -1392,6 +1558,43 @@ function requiresLaunch(attempt: WorkAttempt): boolean {
   return attempt.state === "queued";
 }
 
+function exactReviewRevision(
+  input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
+): string | undefined {
+  return input.capability === "review" && input.subject.kind === "revision"
+    ? input.subject.revision
+    : undefined;
+}
+
+function requiresIsolatedPlacement(
+  capability: WorkAssignment["capability"],
+  artifactIntent: WorkAssignment["artifactIntent"],
+  subjectKind?: string,
+): boolean {
+  return (
+    capability === "implement" ||
+    artifactIntent === "disposable_experiment" ||
+    (capability === "review" && subjectKind === "revision")
+  );
+}
+
+function findAttemptHandle(state: WorkstreamState, handle: string): WorkAttempt {
+  const matches = state.attempts.filter((attempt) => {
+    const ordinal =
+      state.attempts
+        .filter((candidate) => candidate.assignmentId === attempt.assignmentId)
+        .indexOf(attempt) + 1;
+    return attempt.id === handle || `attempt-${ordinal}` === handle;
+  });
+  const match = matches.at(0);
+  if (match === undefined) throw new Error(`Unknown candidate attempt ${handle}.`);
+  if (matches.length > 1)
+    throw new Error(
+      `Candidate attempt ${handle} is ambiguous; use its exact stored attempt id: ${matches.map((item) => item.id).join(", ")}.`,
+    );
+  return match;
+}
+
 /** A missing session checkpoint proves Herdr launch was never invoked by this sequence. */
 function hasProvenNoNativeLaunch(attempt: WorkAttempt): boolean {
   return (
@@ -1441,7 +1644,7 @@ function workerSessionRequest(
   const request: Parameters<typeof createWorkerSessionEffect>[0] = {
     targetCwd: workerCwd,
     sessionDir: join(dirname(state.statePath), "sessions"),
-    objective: objectiveFor(state, assignment, workerCwd, baseRevision),
+    objective: objectiveFor(state, attempt, assignment, workerCwd, baseRevision),
     mode: modeFor(assignment),
     runId: state.id,
     nodeId: attempt.id,
@@ -1492,7 +1695,7 @@ function workerLaunchRequest(
     role: assignment.capability,
     cwd,
     sessionFile,
-    prompt: workerPrompt(state, assignment, cwd, baseRevision),
+    prompt: workerPrompt(state, attempt, assignment, cwd, baseRevision),
     model: models.guide.model,
     thinking: models.guide.thinking,
     env,
@@ -1523,8 +1726,10 @@ function validateExplicitApplication(
   state: WorkstreamState,
   attempt: WorkAttempt,
   assignment: WorkAssignment,
+  candidate: CandidateLineage,
   reportedCommit: string,
   sourceCommit: string,
+  destinationHead: string,
   current: boolean,
 ): void {
   if (state.lifecycle.state !== "active")
@@ -1535,8 +1740,101 @@ function validateExplicitApplication(
     throw new Error("Intent changed; retained implementation is stale and cannot be applied.");
   if (reportedCommit !== sourceCommit)
     throw new Error("Source commit does not exactly match the worker report.");
+  if (!/^[0-9a-f]{40,64}$/.test(destinationHead))
+    throw new Error("Application requires the freshly observed exact destination HEAD.");
   if (attempt.application !== undefined)
     throw new Error("Application already has a recorded checkpoint; inspect it before recovery.");
+  validateCandidateMetadata(state, attempt, candidate, sourceCommit);
+}
+
+function validateCandidateMetadata(
+  state: WorkstreamState,
+  attempt: WorkAttempt,
+  candidate: CandidateLineage,
+  sourceCommit: string,
+): void {
+  const base = required(attempt.baseRevision, "candidate base revision");
+  if (candidate.kind === "initial") {
+    validateInitialCandidate(candidate, base);
+    return;
+  }
+  const parent = validateCandidateParentMetadata(state, candidate);
+  validateCandidateRelationMetadata(candidate, parent, base);
+  if (sourceCommit === candidate.parentCommit)
+    throw new Error("Candidate application source must be newer than its parent candidate.");
+}
+
+function validateInitialCandidate(candidate: CandidateLineage, base: string): void {
+  if (
+    candidate.rootCommit !== base ||
+    candidate.parentAttemptId !== undefined ||
+    candidate.parentCommit !== undefined
+  )
+    throw new Error("Initial candidate lineage is inconsistent with its assigned base.");
+}
+
+function validateCandidateParentMetadata(
+  state: WorkstreamState,
+  candidate: CandidateLineage,
+): WorkAttempt {
+  if (candidate.parentAttemptId === undefined || candidate.parentCommit === undefined)
+    throw new Error("Retained candidate lineage is missing its exact parent.");
+  const parent = findAttempt(state, candidate.parentAttemptId);
+  const parentAssignment = findAssignment(state, parent.assignmentId);
+  const parentResult =
+    parent.resultId === undefined
+      ? undefined
+      : state.results.find((result) => result.id === parent.resultId);
+  if (
+    parentAssignment.capability !== "implement" ||
+    parent.state !== "settled" ||
+    parent.cleanup?.state !== "completed" ||
+    !parent.cleanup.workerClosed ||
+    parent.placement?.kind !== "isolated_worktree" ||
+    parent.outputRelease !== undefined ||
+    (parent.application !== undefined && parent.application.state !== "blocked") ||
+    candidateLineageForAttempt(parent) === undefined ||
+    parentResult?.validity !== "typed" ||
+    parentResult.report.kind !== "implementation" ||
+    parentResult.report.status !== "completed" ||
+    parentResult.report.outcome !== "changed" ||
+    parentResult.report.commit !== candidate.parentCommit
+  )
+    throw new Error("Retained candidate lineage parent is no longer an exact live candidate.");
+  return parent;
+}
+
+function validateCandidateRelationMetadata(
+  candidate: CandidateLineage,
+  parent: WorkAttempt,
+  base: string,
+): void {
+  const parentCandidate = candidateLineageForAttempt(parent);
+  if (candidate.kind === "correction") {
+    if (candidate.rootCommit !== parentCandidate?.rootCommit || base !== candidate.parentCommit)
+      throw new Error("Correction candidate lineage is not rooted at its direct parent.");
+  } else if (candidate.rootCommit !== base) {
+    throw new Error(
+      "Integration candidate lineage is not rooted at its assigned destination base.",
+    );
+  }
+}
+
+function candidateLineageForAttempt(
+  attempt: Pick<WorkAttempt, "baseRevision" | "candidate">,
+): CandidateLineage | undefined {
+  if (attempt.candidate !== undefined) return attempt.candidate;
+  if (attempt.baseRevision !== undefined && /^[0-9a-f]{40,64}$/.test(attempt.baseRevision))
+    return { kind: "initial", rootCommit: attempt.baseRevision };
+  return undefined;
+}
+
+function candidateForApplication(attempt: WorkAttempt): CandidateLineage {
+  return required(candidateLineageForAttempt(attempt), "candidate base revision");
+}
+
+function sameCommitChain(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((commit, index) => commit === right[index]);
 }
 
 function validApplicationCommit(result: WorkResult | undefined): string {
@@ -1605,8 +1903,34 @@ function modeFor(assignment: WorkAssignment) {
       ? "review"
       : "research";
 }
+function appendCandidatePrompt(
+  lines: string[],
+  state: WorkstreamState,
+  attempt: WorkAttempt,
+): void {
+  const candidate = attempt.candidate;
+  if (candidate === undefined) return;
+  lines.push(`Candidate lineage: ${candidate.kind}; root commit ${candidate.rootCommit}.`);
+  if (candidate.parentAttemptId === undefined || candidate.parentCommit === undefined) return;
+  lines.push(
+    `Retained parent candidate: attempt ${candidate.parentAttemptId}, exact commit ${candidate.parentCommit}.`,
+  );
+  if (candidate.kind === "correction")
+    lines.push(
+      "This is an isolated correction: continue the retained candidate history from the parent commit and preserve a direct commit.",
+    );
+  else
+    lines.push(
+      "This is an explicit isolated integration: integrate the retained parent candidate's content into the assigned current destination base, then report only the new candidate commit and its current-base evidence.",
+    );
+  const parent = state.attempts.find((item) => item.id === candidate.parentAttemptId);
+  if (parent?.placement?.kind === "isolated_worktree")
+    lines.push(`Retained parent worktree: ${parent.placement.path}.`);
+}
+
 function workerPrompt(
   state: WorkstreamState,
+  attempt: WorkAttempt,
   assignment: WorkAssignment,
   workerCwd: string,
   baseRevision?: string,
@@ -1617,6 +1941,7 @@ function workerPrompt(
     `Assigned working directory: ${workerCwd}`,
   ];
   if (baseRevision !== undefined) lines.push(`Exact base/review revision: ${baseRevision}`);
+  appendCandidatePrompt(lines, state, attempt);
   if (assignment.capability === "implement")
     lines.push(
       "For a changed result, use the assigned worktree, create exactly one direct commit on the exact base, and leave it clean; report that commit. For no change, report the unchanged exact base without a commit. Do not integrate into the coordinator repository or push; application remains a coordinator decision.",
@@ -1630,6 +1955,7 @@ function workerPrompt(
 }
 function objectiveFor(
   state: WorkstreamState,
+  attempt: WorkAttempt,
   assignment: WorkAssignment,
   workerCwd: string,
   baseRevision?: string,
@@ -1646,6 +1972,7 @@ function objectiveFor(
     common.push(
       `${assignment.capability === "implement" || assignment.artifactIntent === "disposable_experiment" ? "Exact isolated base revision" : "Exact requested Git revision"}: ${baseRevision}`,
     );
+  appendCandidatePrompt(common, state, attempt);
   if (assignment.capability === "research")
     common.push(`Expected evidence: ${assignment.expectedEvidence.join("; ")}`);
   if (assignment.artifactIntent === "disposable_experiment")

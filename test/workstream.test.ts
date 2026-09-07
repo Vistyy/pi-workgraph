@@ -24,9 +24,11 @@ import {
   InvalidWorkstreamStateError,
   type SessionIdentity,
   UnsupportedWorkstreamStateError,
+  type WorkstreamState,
   WorkstreamStoreEffects,
 } from "../src/workstream.js";
 import { legacyPathForWorkstream, WorkstreamStoreOperationError } from "../src/workstream-state.js";
+import { deriveCompletionAccounting } from "../src/workstream-transitions.js";
 import { parsePersistedObject } from "../src/workstream-validation.js";
 import { researchReport } from "./helpers.js";
 
@@ -88,6 +90,11 @@ async function settleFixtureAttempt(
 
 function dateAt(milliseconds: number): Date {
   return DateTime.toDate(DateTime.makeUnsafe(milliseconds));
+}
+
+function requiredValue<T>(value: T | undefined, label: string): T {
+  if (value === undefined) throw new Error(`Missing ${label}.`);
+  return value;
 }
 
 void test("historical research closes its original scope after intent changes, without invented limitations", async () => {
@@ -246,6 +253,280 @@ async function fixture(): Promise<{ parent: string; store: WorkstreamStoreEffect
   return { parent, store };
 }
 
+async function candidateAccountingFixture(): Promise<{
+  parent: string;
+  store: WorkstreamStoreEffects;
+  state: WorkstreamState;
+  base: string;
+  firstCommit: string;
+  correctionCommit: string;
+  firstAttemptId: string;
+  correctionAttemptId: string;
+}> {
+  const { parent, store } = await fixture();
+  const { authority } = await recordedAuthority(store);
+  const base = "a".repeat(40);
+  const firstCommit = "b".repeat(40);
+  const correctionCommit = "c".repeat(40);
+  const models = {
+    guide: { model: "fixture/implementation", thinking: "low" as const },
+    source: "policy" as const,
+  };
+  await runStore(
+    store.enqueue(
+      {
+        id: "initial-candidate",
+        capability: "implement",
+        artifactIntent: "maintained_change",
+        objective: "Create the initial candidate.",
+        intentVersion: authority.intentVersion,
+        authority,
+        acceptance: ["The candidate is retained."],
+      },
+      {
+        id: "initial-attempt",
+        models,
+        baseRevision: base,
+        candidate: { kind: "initial", rootCommit: base },
+      },
+    ),
+  );
+  await runStore(
+    store.startAttempt({
+      id: "initial-attempt",
+      placement: {
+        kind: "isolated_worktree",
+        path: "/tmp/workgraph-accounting-initial",
+        branch: "pi-workgraph/accounting-initial",
+      },
+      baseRevision: base,
+    }),
+  );
+  await runStore(store.recordSessionFile("initial-attempt", "/tmp/accounting-initial.jsonl"));
+  await runStore(
+    store.retainResult({
+      id: "initial-result",
+      assignmentId: "initial-candidate",
+      assignmentIntentVersion: authority.intentVersion,
+      validity: "typed",
+      report: {
+        kind: "implementation",
+        status: "completed",
+        outcome: "changed",
+        summary: "Initial candidate",
+        commit: firstCommit,
+        evidence: [],
+        findings: [],
+      },
+    }),
+  );
+  await runStore(
+    store.settleAttempt({
+      id: "initial-attempt",
+      resultId: "initial-result",
+      effectiveModels: [models.guide],
+    }),
+  );
+  await runStore(store.beginCleanup({ id: "initial-attempt", expectedHead: firstCommit }));
+  await runStore(store.markWorkerClosed("initial-attempt"));
+  await runStore(store.finishCleanup("initial-attempt"));
+
+  await runStore(
+    store.enqueue(
+      {
+        id: "correction-candidate",
+        capability: "implement",
+        artifactIntent: "maintained_change",
+        objective: "Correct the initial candidate.",
+        intentVersion: authority.intentVersion,
+        authority,
+        acceptance: ["The correction is retained."],
+      },
+      {
+        id: "correction-attempt",
+        models,
+        baseRevision: firstCommit,
+        candidate: {
+          kind: "correction",
+          rootCommit: base,
+          parentAttemptId: "initial-attempt",
+          parentCommit: firstCommit,
+        },
+      },
+    ),
+  );
+  await runStore(
+    store.startAttempt({
+      id: "correction-attempt",
+      placement: {
+        kind: "isolated_worktree",
+        path: "/tmp/workgraph-accounting-correction",
+        branch: "pi-workgraph/accounting-correction",
+      },
+      baseRevision: firstCommit,
+    }),
+  );
+  await runStore(store.recordSessionFile("correction-attempt", "/tmp/accounting-correction.jsonl"));
+  await runStore(
+    store.retainResult({
+      id: "correction-result",
+      assignmentId: "correction-candidate",
+      assignmentIntentVersion: authority.intentVersion,
+      validity: "typed",
+      report: {
+        kind: "implementation",
+        status: "completed",
+        outcome: "changed",
+        summary: "Correction candidate",
+        commit: correctionCommit,
+        evidence: [],
+        findings: [],
+      },
+    }),
+  );
+  await runStore(
+    store.settleAttempt({
+      id: "correction-attempt",
+      resultId: "correction-result",
+      effectiveModels: [models.guide],
+    }),
+  );
+  await runStore(store.beginCleanup({ id: "correction-attempt", expectedHead: correctionCommit }));
+  await runStore(store.markWorkerClosed("correction-attempt"));
+  await runStore(store.finishCleanup("correction-attempt"));
+  return {
+    parent,
+    store,
+    state: await runStore(store.load()),
+    base,
+    firstCommit,
+    correctionCommit,
+    firstAttemptId: "initial-attempt",
+    correctionAttemptId: "correction-attempt",
+  };
+}
+
+function appliedCandidateState(
+  source: WorkstreamState,
+  correctionAttemptId: string,
+  rootCommit: string,
+  correctionCommit: string,
+  commits: string[],
+  state: "applied" | "blocked" = "applied",
+): WorkstreamState {
+  const result = structuredClone(source);
+  const attempt = result.attempts.find((item) => item.id === correctionAttemptId);
+  assert.ok(attempt !== undefined);
+  attempt.application = {
+    state,
+    commit: correctionCommit,
+    expectedHead: rootCommit,
+    rootCommit,
+    commits,
+    ...(state === "applied" ? { revision: correctionCommit } : { error: "application refused" }),
+  };
+  return result;
+}
+
+void test("completion accounting resolves only exact applied candidate ancestors", async () => {
+  const f = await candidateAccountingFixture();
+  try {
+    const successful = appliedCandidateState(
+      f.state,
+      f.correctionAttemptId,
+      f.base,
+      f.correctionCommit,
+      [f.firstCommit, f.correctionCommit],
+    );
+    assert.deepEqual(deriveCompletionAccounting(successful), []);
+
+    const failed = appliedCandidateState(
+      f.state,
+      f.correctionAttemptId,
+      f.base,
+      f.correctionCommit,
+      [f.firstCommit, f.correctionCommit],
+      "blocked",
+    );
+    assert.ok(
+      deriveCompletionAccounting(failed).some(
+        (item) => item.kind === "unresolved_attempt" && item.attemptId === f.firstAttemptId,
+      ),
+    );
+
+    const stale = appliedCandidateState(
+      f.state,
+      f.correctionAttemptId,
+      f.base,
+      f.correctionCommit,
+      [f.firstCommit, f.correctionCommit],
+    );
+    const staleAssignment = stale.assignments.find((item) => item.id === "initial-candidate");
+    assert.ok(staleAssignment !== undefined);
+    staleAssignment.intentVersion += 1;
+    assert.ok(
+      deriveCompletionAccounting(stale).some(
+        (item) => item.kind === "unresolved_attempt" && item.attemptId === f.firstAttemptId,
+      ),
+    );
+
+    const unrelated = appliedCandidateState(
+      f.state,
+      f.correctionAttemptId,
+      f.base,
+      f.correctionCommit,
+      [f.firstCommit, f.correctionCommit],
+    );
+    const initialAssignment = requiredValue(
+      unrelated.assignments.find((item) => item.id === "initial-candidate"),
+      "initial assignment",
+    );
+    const initialAttempt = requiredValue(
+      unrelated.attempts.find((item) => item.id === f.firstAttemptId),
+      "initial attempt",
+    );
+    const initialResult = requiredValue(
+      unrelated.results.find((item) => item.id === "initial-result"),
+      "initial result",
+    );
+    unrelated.assignments.push({
+      ...structuredClone(initialAssignment),
+      id: "unrelated-candidate",
+    });
+    unrelated.attempts.push({
+      ...structuredClone(initialAttempt),
+      id: "unrelated-attempt",
+      assignmentId: "unrelated-candidate",
+      resultId: "unrelated-result",
+    });
+    unrelated.results.push({
+      ...structuredClone(initialResult),
+      id: "unrelated-result",
+      assignmentId: "unrelated-candidate",
+    });
+    assert.ok(
+      deriveCompletionAccounting(unrelated).some(
+        (item) => item.kind === "unresolved_attempt" && item.attemptId === "unrelated-attempt",
+      ),
+    );
+
+    const partial = appliedCandidateState(
+      f.state,
+      f.correctionAttemptId,
+      f.base,
+      f.correctionCommit,
+      [f.correctionCommit],
+    );
+    assert.ok(
+      deriveCompletionAccounting(partial).some(
+        (item) => item.kind === "unresolved_attempt" && item.attemptId === f.firstAttemptId,
+      ),
+    );
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
 function recordedAuthority(
   store: WorkstreamStoreEffects,
 ): Promise<{ receipt: HumanInputReceipt; authority: AuthorityReference }> {
@@ -343,6 +624,154 @@ void test("workstream rejects extension or arbitrary authority and stale intent"
       ),
       /stale/,
     );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("workstream rejects broken and cross-intent candidate lineage before enqueue", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const { authority } = await recordedAuthority(store);
+    const base = "a".repeat(40);
+    const parentCommit = "b".repeat(40);
+    const models = {
+      guide: { model: "fixture/implementation", thinking: "low" as const },
+      source: "policy" as const,
+    };
+    await runStore(
+      store.enqueue(
+        {
+          id: "parent-task",
+          capability: "implement",
+          artifactIntent: "maintained_change",
+          objective: "Retain a candidate",
+          intentVersion: authority.intentVersion,
+          authority,
+          acceptance: ["Candidate exists"],
+        },
+        {
+          id: "parent-attempt",
+          models,
+          baseRevision: base,
+        },
+      ),
+    );
+    await runStore(
+      store.startAttempt({
+        id: "parent-attempt",
+        placement: {
+          kind: "isolated_worktree",
+          path: "/tmp/workgraph-parent-candidate",
+          branch: "pi-workgraph-parent",
+        },
+        baseRevision: base,
+      }),
+    );
+    await runStore(store.recordSessionFile("parent-attempt", "/tmp/parent-session.jsonl"));
+    await runStore(store.markSubmission("parent-attempt", "uncertain"));
+    await runStore(store.markSubmission("parent-attempt", "submitted"));
+    await runStore(
+      store.retainResult({
+        id: "parent-result",
+        assignmentId: "parent-task",
+        assignmentIntentVersion: authority.intentVersion,
+        validity: "typed",
+        report: {
+          kind: "implementation",
+          status: "completed",
+          outcome: "changed",
+          summary: "Retained candidate",
+          commit: parentCommit,
+          evidence: [],
+          findings: [],
+        },
+      }),
+    );
+    await runStore(
+      store.settleAttempt({
+        id: "parent-attempt",
+        resultId: "parent-result",
+        effectiveModels: [models.guide],
+      }),
+    );
+    await runStore(store.beginCleanup({ id: "parent-attempt", expectedHead: parentCommit }));
+    await runStore(store.markWorkerClosed("parent-attempt"));
+    await runStore(store.finishCleanup("parent-attempt"));
+    const beforeBroken = await runStore(store.load());
+    await assert.rejects(
+      runStore(
+        store.enqueue(
+          {
+            id: "broken-task",
+            capability: "implement",
+            artifactIntent: "maintained_change",
+            objective: "Use a wrong parent commit",
+            intentVersion: authority.intentVersion,
+            authority,
+            acceptance: ["Rejected"],
+          },
+          {
+            id: "broken-attempt",
+            models,
+            baseRevision: parentCommit,
+            candidate: {
+              kind: "correction",
+              rootCommit: base,
+              parentAttemptId: "parent-attempt",
+              parentCommit: "c".repeat(40),
+            },
+          },
+        ),
+      ),
+      /exactly match/,
+    );
+    assert.deepEqual(await runStore(store.load()), beforeBroken);
+
+    const input = await runStore(
+      store.recordInputEvent({
+        ...coordinator,
+        source: "interactive",
+        text: "Change the maintained scope for the candidate.",
+      }),
+    );
+    const receipt = input.receipt;
+    await runStore(
+      store.reviseIntent({
+        authorityReceiptId: receipt.id,
+        statement: "Use a new maintained scope.",
+        constraints: ["New scope"],
+      }),
+    );
+    const beforeCrossIntent = await runStore(store.load());
+    await assert.rejects(
+      runStore(
+        store.enqueue(
+          {
+            id: "cross-intent-task",
+            capability: "implement",
+            artifactIntent: "maintained_change",
+            objective: "Use an old intent candidate",
+            intentVersion: 2,
+            authority: { receiptId: receipt.id, intentVersion: 2 },
+            acceptance: ["Rejected"],
+          },
+          {
+            id: "cross-intent-attempt",
+            models,
+            baseRevision: parentCommit,
+            candidate: {
+              kind: "correction",
+              rootCommit: base,
+              parentAttemptId: "parent-attempt",
+              parentCommit,
+            },
+          },
+        ),
+      ),
+      /current maintained implementation scope/,
+    );
+    assert.deepEqual(await runStore(store.load()), beforeCrossIntent);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

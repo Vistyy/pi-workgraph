@@ -32,7 +32,7 @@ A direct answer can be better than delegation, and one well-bounded delegation c
 
 A workstream has one explicit target repository. Its root and Git common directory are inspected once when the workstream is created, retained in state, and compared on subsequent explicit target requests.
 Coordinator cwd is only the default when no target is supplied; it is not an authority or placement identity. Adoption and runtime construction use the retained project root, so a coordinator may live in another directory.
-Base revisions, isolated worktrees, shared placements, exact-revision review instructions, worker working directories, commit requirements, and recovery checks are generated from that fixed repository and persisted attempt state rather than task-prose parsing.
+Base revisions, isolated worktrees, shared placements, exact-revision review instructions, worker working directories, commit requirements, and recovery checks are generated from that fixed repository and persisted attempt state rather than task-prose parsing. Exact-revision reviews use owned worktrees at the requested SHA; ordinary shared research and non-revision review keep their live-project behavior.
 
 ### Present outcomes, retain substance
 
@@ -58,7 +58,7 @@ Recovery should inspect authoritative state before retrying and should retain co
 
 A stopped worker closes independently of whether its report is successful, malformed, or failed and independently of whether its owned output remains useful.
 A disposable experiment and an unapplied implementation retain their complete owned isolated worktree; report settlement never mutates the destination repository.
-The coordinator may apply current maintained output only through one explicit action carrying the exact attempt, reported source commit, and freshly observed destination HEAD. Existing Git cleanliness, direct-commit, ownership, and current-intent checks remain authoritative; the recorded application revision is an observed postcondition, not an approval ledger.
+The coordinator may apply current maintained output only through one explicit action carrying the exact attempt, reported source commit, and freshly observed destination HEAD. Existing Git cleanliness, direct-commit, ownership, and current-intent checks remain authoritative; the recorded application revision is an observed postcondition, not an approval ledger. A retained maintained candidate may produce isolated correction attempts through separate content-lineage metadata, distinct from session `continuationOf`; the final candidate carries its root and every direct correction commit, and application fast-forwards that complete unchanged history. If the destination moved, application refuses without mutation; only an explicit isolated integration attempt rooted at the freshly observed destination may produce a new candidate scoped to that base.
 The coordinator releases unselected retained output through one exact-attempt operation with a recorded destructive reason. Cancellation closes the worker but preserves disposable experiment output until the coordinator explicitly releases it. Intentionally retained output may outlive semantic coordination completion and remains releasable under the same serialized, fenced runtime without launching or resuming work.
 Release may remove only the verified owned worktree and branch; foreign, dirty-mismatched, unknown-presence, or uncertain resources remain intact with useful diagnostics.
 

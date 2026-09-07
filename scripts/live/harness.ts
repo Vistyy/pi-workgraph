@@ -258,6 +258,41 @@ export async function createLiveFixture(label: string, checkpoint: LiveFixtureCh
 }
 export type LiveFixture = Awaited<ReturnType<typeof createLiveFixture>>;
 
+/** Create the one fixture-owned disposable destination drift used by the capability scenario. */
+// oxlint-disable-next-line effecttsgo/async-function -- This exact native smoke boundary preserves the explicitly authorized disposable Git commit used to test drift refusal.
+export async function createAuthorizedDestinationDrift(
+  fixture: LiveFixture,
+): Promise<{ path: string; revision: string }> {
+  assert.equal(
+    await command(fixture.root, "git", ["status", "--porcelain"]),
+    "",
+    "Fixture destination drift requires a clean destination",
+  );
+  const path = join(fixture.root, "drift.txt");
+  await writeFile(path, "DRIFT\n");
+  await command(fixture.root, "git", ["add", "drift.txt"]);
+  await command(fixture.root, "git", ["commit", "-m", "Disposable destination drift"]);
+  const revision = await command(fixture.root, "git", ["rev-parse", "HEAD"]);
+  assert.equal(
+    await command(fixture.root, "git", ["diff", "--name-only", "HEAD^", "HEAD"]),
+    "drift.txt",
+  );
+  await writeFile(
+    join(fixture.parent, "destination-drift.json"),
+    JSON.stringify(
+      {
+        path,
+        revision,
+        authorization:
+          "Fixture-owned disposable drift commit; no coordinator or worker was authorized to create this destination change.",
+      },
+      null,
+      2,
+    ),
+  );
+  return { path, revision };
+}
+
 // oxlint-disable-next-line effecttsgo/async-function -- This exact native smoke boundary preserves host payload, Promise, filesystem, timing, and cleanup semantics.
 export async function startCoordinator(f: LiveFixture): Promise<WorkerIdentity> {
   const session = SessionManager.create(f.root, join(f.parent, "coordinator-sessions"));
@@ -353,6 +388,7 @@ export async function startCoordinator(f: LiveFixture): Promise<WorkerIdentity> 
 export async function closeOwnedWorkspace(
   f: LiveFixture,
   coordinator?: WorkerIdentity,
+  coordinatorTimeoutMs = 120_000,
 ): Promise<void> {
   if (coordinator !== undefined) {
     const agentSchema = Type.Object({
@@ -372,7 +408,7 @@ export async function closeOwnedWorkspace(
           assert.equal(agent.cwd, coordinator.cwd);
           return ["idle", "done"].includes(agent.agent_status) ? true : undefined;
         }),
-      30_000,
+      coordinatorTimeoutMs,
       "coordinator settlement before exact workspace closure",
     );
   }

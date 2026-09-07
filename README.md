@@ -21,9 +21,9 @@ The first delegation creates a workstream. It defaults to the coordinator's repo
 
 ## How work is handled
 
-- **Research and review** are read-only assignments in the selected repository. They can see uncommitted files; exact-revision reviews must inspect the named Git revision.
+- **Research and ordinary review** are read-only assignments in the selected repository and can see uncommitted files. An exact-revision review instead runs in an owned worktree at the named Git revision and must inspect that revision.
 - **Implementation and experiments** run in isolated Git worktrees. This is not a filesystem or security sandbox.
-- **Results are retained, not automatically applied.** The coordinator judges the evidence and explicitly applies selected maintained output to a clean destination.
+- **Results are retained, not automatically applied.** The coordinator judges the evidence and explicitly applies selected maintained output to a clean destination. A retained candidate can be corrected with `workgraph_implement` and `candidateOf`, or explicitly integrated onto a moved destination with `candidateOf` and an exact current `baseRevision`; applying a correction fast-forwards its complete direct history without squashing.
 - **Unselected output stays available** until explicitly released. Stopping a worker does not mean accepting its result or discarding its experiment.
 
 Tool descriptions explain arguments and restrictions. For delegation and quality judgment, see the [coordination skill](skills/workgraph-coordination/SKILL.md).

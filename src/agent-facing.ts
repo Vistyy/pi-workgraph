@@ -339,18 +339,50 @@ function deliveryPreview(state: WorkstreamState, result: WorkResult) {
   };
 }
 
+function candidateProjection(attempt: WorkAttempt | undefined) {
+  const candidate =
+    attempt?.candidate ??
+    (attempt?.baseRevision !== undefined && /^[0-9a-f]{40,64}$/.test(attempt.baseRevision)
+      ? { kind: "initial" as const, rootCommit: attempt.baseRevision }
+      : undefined);
+  if (candidate === undefined) return undefined;
+  return {
+    kind: candidate.kind,
+    rootCommit: candidate.rootCommit,
+    parentAttemptId: candidate.parentAttemptId,
+    parentCommit: candidate.parentCommit,
+  };
+}
+
+function boundedCommitChain(commits: string[] | undefined) {
+  if (commits === undefined) return {};
+  const preview = commits.slice(0, 8);
+  return {
+    commits: preview,
+    commitCount: commits.length,
+    commitsTruncated: preview.length < commits.length,
+  };
+}
+
 function applicationProjection(attempt: WorkAttempt | undefined, result: WorkResult) {
   const application = attempt?.application;
+  const candidate = candidateProjection(attempt);
   if (application?.state === "applied")
     return {
       state: "applied" as const,
       revision: application.revision,
       reportedCommit: application.commit,
+      candidate,
+      rootCommit: application.rootCommit,
+      ...boundedCommitChain(application.commits),
     };
   if (application !== undefined)
     return {
       state: application.state,
       reportedCommit: application.commit,
+      candidate,
+      rootCommit: application.rootCommit,
+      ...boundedCommitChain(application.commits),
       blocker: application.error === undefined ? undefined : compactText(application.error, 280),
     };
   const report = result.validity === "typed" ? result.report : undefined;
@@ -449,6 +481,7 @@ function attemptPreview(state: WorkstreamState, attempt: WorkAttempt) {
     state: attempt.state,
     outcome: result === undefined ? undefined : outcomeHandle(state, result),
     blocker: attempt.error === undefined ? undefined : compactText(attempt.error, 280),
+    candidate: candidateProjection(attempt),
     recovery: { section: "recovery" as const, attempt: attempt.id },
   };
 }
@@ -706,6 +739,8 @@ function recordedApplication(attempt: WorkAttempt) {
     state: application.state,
     revision: application.revision,
     commit: application.commit,
+    rootCommit: application.rootCommit,
+    ...boundedCommitChain(application.commits),
     blocker: application.error === undefined ? undefined : compactText(application.error, 280),
   };
 }
@@ -745,6 +780,8 @@ function recoveryView(
     worker: attempt.worker,
     sessionFile: attempt.sessionFile,
     placement: attempt.placement,
+    baseRevision: attempt.baseRevision,
+    candidate: attempt.candidate,
     launchPane: attempt.launchPane,
     submission: attempt.submission,
     application: attempt.application,
@@ -787,6 +824,7 @@ function recoveryView(
         : ("not_recorded" as const),
       nativeOrGitStateFromTerminalStateAlone: false,
       application: recordedApplication(attempt),
+      candidate: candidateProjection(attempt),
       retainedOutput: retainedOutputProjection(attempt),
       cleanup: recordedCleanup(attempt),
       delivery: recordedDelivery(state, attempt),

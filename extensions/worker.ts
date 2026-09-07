@@ -595,9 +595,9 @@ function handleWorkerReport(
       return yield* contractFailure(`Report must satisfy the ${execution.mode} contract.`);
     if (params.kind !== "implementation" || params.status !== "completed") {
       // Read-only is an instruction and authority boundary, not a filesystem sandbox.
-      // Shared research and review deliberately observe the live project cwd, including
-      // tracked and untracked local changes. Do not claim an immutable base unless the
-      // report records exact Git evidence for the requested revision.
+      // Shared research and non-revision review deliberately observe the live project cwd,
+      // including tracked and untracked local changes. Exact-revision review is launched in
+      // an owned worktree at its requested SHA; do not confuse either cwd with another revision.
       return terminalReport(params, {
         plan: execution.plan,
         planStatus: execution.planStatus,
@@ -738,7 +738,7 @@ const researchInstructions =
 const experimentInstructions =
   "[WORKGRAPH EXPERIMENT]\nAnswer the question within the explicitly permitted effects and stop condition in this disposable worktree. Leave all outputs in the assigned worktree and report direct observations, failures and limits; the coordinator decides when to release the worktree. Do not compose, publish, or delegate another worker. Finish with workgraph_report.";
 const reviewInstructions =
-  "[WORKGRAPH REVIEW]\nReview only the identified subject and concern. For an exact revision subject, inspect that exact commit with Git (for example git show, git diff, and git ls-tree) and cite the revision in evidence; do not silently treat live working files as that commit. Do not claim tests against current working files validate another revision. Execute verification only when it genuinely targets the requested subject. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
+  "[WORKGRAPH REVIEW]\nReview only the identified subject and concern. Ordinary result, artifact, and comparison reviews may observe the live project cwd. An exact revision review runs in an owned worktree checked out at the requested SHA; inspect that exact commit with Git (for example git show, git diff, and git ls-tree) and cite that revision in evidence. Do not silently treat live working files as that commit or claim tests against another revision. Execute verification only when it genuinely targets the requested subject. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
 const guideInstructions =
   "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current isolated worktree. If the requirement already holds, verify it and report no_change with the inspected base revision and reason; no edit or executor turn is required. If a change is needed, use workgraph_plan once to record one concise bounded plan grounded in inspected code, with rationale and constraints, concrete risks or unknowns, and implementation and meaningful verification steps. Then make the first useful implementation edit yourself. Recording or revising the plan does not switch models. The first successful edit or observed Git change triggers the executor switch; do not stop or wait for a handoff after planning. Changed work must complete through the executor. Missing plan state does not block truthful implementation, failure, or escalation. If required work crosses the authorized scope, report escalation without editing.";
 function executorInstructions(): string {

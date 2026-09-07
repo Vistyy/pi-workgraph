@@ -577,6 +577,12 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         }),
       ),
       acceptance: Type.Array(Type.String(), { minItems: 1 }),
+      candidateOf: Type.Optional(
+        Type.String({
+          description:
+            "Retained candidate attempt to correct, or explicitly integrate onto the supplied current destination base.",
+        }),
+      ),
       ...ModelOptions,
       executor: Type.Optional(Target),
       modelReason: Type.Optional(Type.String()),
@@ -724,7 +730,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_control",
     label: "Workgraph Control",
     description:
-      "Suspend/resume work, cancel/steer a worker, apply retained maintained output, or release retained output. Settlement never applies output; cancel preserves experiment output. Apply requires exact attempt, reported source commit, and freshly observed destination HEAD under current intent. Release deletes verified owned retained output, requires exact attempt and a destructive reason, and remains available after completion. Inspect resulting effects before retrying uncertain application or release.",
+      "Suspend/resume work, cancel/steer a worker, apply retained maintained output, or release retained output. Settlement never applies output; cancel preserves experiment output. Apply requires exact attempt, reported source commit, and freshly observed destination HEAD under current intent. Maintained implementation delegation can name candidateOf for an isolated correction or candidateOf plus an exact current base for explicit integration after destination drift. Release deletes verified owned retained output, requires exact attempt and a destructive reason, and remains available after completion. Inspect resulting effects before retrying uncertain application or release.",
     parameters: Type.Object({
       action: StringEnum([
         "suspend",
@@ -737,8 +743,8 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       reason: Type.String({ minLength: 1 }),
       task: Type.Optional(Type.String()),
       attempt: Type.Optional(Type.String()),
-      sourceCommit: Type.Optional(Type.String()),
-      destinationHead: Type.Optional(Type.String()),
+      sourceCommit: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
+      destinationHead: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
     }),
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
@@ -1241,6 +1247,7 @@ function queueOptions(params: {
   modelReason?: string;
   thinking?: QueueOptions["thinking"];
   continuationOf?: string;
+  candidateOf?: string;
   baseRevision?: string;
 }): QueueOptions {
   const options: QueueOptions = {};
@@ -1251,6 +1258,8 @@ function queueOptions(params: {
   if (params.thinking !== undefined) options.thinking = params.thinking;
   if (params.continuationOf !== undefined && params.continuationOf !== "")
     options.continuationOf = params.continuationOf;
+  if (params.candidateOf !== undefined && params.candidateOf !== "")
+    options.candidateOf = params.candidateOf;
   if (params.baseRevision !== undefined && params.baseRevision !== "")
     options.baseRevision = params.baseRevision;
   return options;

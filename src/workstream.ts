@@ -26,6 +26,8 @@ import {
   AssignmentSchema,
   type AttemptPlacementSchema,
   type AuthorityReference,
+  type CandidateLineage,
+  CommitSchema,
   type CompletionAccounting,
   type HumanInputReceipt,
   type HumanInputSource,
@@ -75,6 +77,7 @@ import {
 
 export type {
   AuthorityReference,
+  CandidateLineage,
   CompletionAccounting,
   HumanInputReceipt,
   HumanInputSource,
@@ -475,12 +478,14 @@ export class WorkstreamStoreEffects {
           id: string;
           models: NonNullable<WorkAttempt["models"]>;
           continuationOf?: string;
+          candidate?: CandidateLineage;
           baseRevision?: string;
         }
       | Array<{
           id: string;
           models: NonNullable<WorkAttempt["models"]>;
           continuationOf?: string;
+          candidate?: CandidateLineage;
           baseRevision?: string;
         }>,
   ): StoreEffect<WorkstreamState> {
@@ -505,6 +510,7 @@ export class WorkstreamStoreEffects {
           throw new Error(
             "Continuation requires a settled, cleaned worker trajectory; retained blocked work must be inspected first.",
           );
+        validateCandidateLineage(draft, input, attempt);
         draft.attempts.push({
           ...attempt,
           assignmentId: input.id,
@@ -719,25 +725,28 @@ export class WorkstreamStoreEffects {
     id: string;
     commit: string;
     expectedHead: string;
+    rootCommit?: string;
+    commits?: string[];
     now?: Date;
   }): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       input.id,
       (attempt) => {
-        if (attempt.application) {
-          if (
-            attempt.application.state === "pending" &&
-            attempt.application.commit === input.commit &&
-            attempt.application.expectedHead === input.expectedHead
-          )
-            return;
+        if (attempt.application !== undefined) {
+          if (samePendingApplication(attempt.application, input)) return;
           throw new Error(`Application for ${input.id} is already recorded.`);
         }
-        attempt.application = {
+        if (!Value.Check(CommitSchema, input.expectedHead))
+          throw new Error("Application destination requires an exact commit id.");
+        validateApplicationHistory(input.commit, input.rootCommit, input.commits);
+        const application: NonNullable<WorkAttempt["application"]> = {
           state: "pending",
           commit: input.commit,
           expectedHead: input.expectedHead,
         };
+        if (input.rootCommit !== undefined) application.rootCommit = input.rootCommit;
+        if (input.commits !== undefined) application.commits = [...input.commits];
+        attempt.application = application;
       },
       input.now,
     );
@@ -1304,6 +1313,152 @@ function addAssignment(
   if (!Value.Check(AssignmentSchema, assignment))
     throw new Error("Assignment input does not satisfy its capability contract.");
   draft.assignments.push(assignment);
+}
+
+function samePendingApplication(
+  application: NonNullable<WorkAttempt["application"]>,
+  input: { commit: string; expectedHead: string; rootCommit?: string; commits?: string[] },
+): boolean {
+  return (
+    application.state === "pending" &&
+    application.commit === input.commit &&
+    application.expectedHead === input.expectedHead &&
+    application.rootCommit === input.rootCommit &&
+    sameValue(application.commits, input.commits)
+  );
+}
+
+function validateApplicationHistory(
+  commit: string,
+  rootCommit: string | undefined,
+  commits: string[] | undefined,
+): void {
+  if (!Value.Check(CommitSchema, commit))
+    throw new Error("Application source requires an exact commit id.");
+  if ((rootCommit === undefined) !== (commits === undefined))
+    throw new Error("Application lineage requires both rootCommit and commits.");
+  if (
+    (rootCommit !== undefined && !Value.Check(CommitSchema, rootCommit)) ||
+    (commits !== undefined &&
+      (!Value.Check(Type.Array(CommitSchema, { minItems: 1 }), commits) ||
+        commits.at(-1) !== commit))
+  )
+    throw new Error("Application lineage does not match the exact candidate history.");
+}
+
+function validateCandidateLineage(
+  draft: WorkstreamState,
+  assignment: AssignmentInput,
+  attempt: { baseRevision?: string; candidate?: CandidateLineage },
+): void {
+  const candidate = attempt.candidate;
+  if (candidate === undefined) return;
+  validateCandidateBasics(assignment, attempt, candidate);
+  if (candidate.kind === "initial") return;
+  const parent = findCandidateParent(draft, candidate);
+  validateCandidateParent(draft, assignment, parent, candidate.parentCommit);
+  validateCandidateRelation(attempt, parent, candidate);
+}
+
+function validateCandidateBasics(
+  assignment: AssignmentInput,
+  attempt: { baseRevision?: string; candidate?: CandidateLineage },
+  candidate: CandidateLineage,
+): void {
+  if (assignment.capability !== "implement")
+    throw new Error("Candidate lineage is available only for maintained implementations.");
+  if (attempt.baseRevision === undefined || !Value.Check(CommitSchema, attempt.baseRevision))
+    throw new Error("Candidate lineage requires an exact assigned base revision.");
+  if (!Value.Check(CommitSchema, candidate.rootCommit))
+    throw new Error("Candidate lineage requires an exact root commit.");
+  if (
+    candidate.kind === "initial" &&
+    (candidate.parentAttemptId !== undefined ||
+      candidate.parentCommit !== undefined ||
+      candidate.rootCommit !== attempt.baseRevision)
+  )
+    throw new Error("Initial candidate lineage must be rooted at its assigned base.");
+  if (
+    candidate.kind !== "initial" &&
+    (candidate.parentAttemptId === undefined || candidate.parentCommit === undefined)
+  )
+    throw new Error(`${candidate.kind} candidate lineage requires a parent attempt and commit.`);
+}
+
+function findCandidateParent(draft: WorkstreamState, candidate: CandidateLineage): WorkAttempt {
+  const parent = draft.attempts.find((item) => item.id === candidate.parentAttemptId);
+  if (parent === undefined)
+    throw new Error(
+      `Candidate lineage references unknown parent attempt ${candidate.parentAttemptId}.`,
+    );
+  return parent;
+}
+
+function validateCandidateParent(
+  draft: WorkstreamState,
+  assignment: AssignmentInput,
+  parent: WorkAttempt,
+  parentCommit: string | undefined,
+): void {
+  const parentAssignment = requireAssignment(draft, parent.assignmentId);
+  if (
+    parentAssignment.capability !== "implement" ||
+    parentAssignment.intentVersion !== assignment.intentVersion
+  )
+    throw new Error("Candidate parent is outside the current maintained implementation scope.");
+  if (
+    parent.state !== "settled" ||
+    parent.cleanup?.state !== "completed" ||
+    !parent.cleanup.workerClosed ||
+    parent.placement?.kind !== "isolated_worktree" ||
+    parent.outputRelease !== undefined ||
+    (parent.application !== undefined && parent.application.state !== "blocked")
+  )
+    throw new Error("Candidate parent must be a settled retained isolated candidate.");
+  const parentResult =
+    parent.resultId === undefined
+      ? undefined
+      : draft.results.find((result) => result.id === parent.resultId);
+  if (
+    parentResult?.validity !== "typed" ||
+    parentResult.report.kind !== "implementation" ||
+    parentResult.report.status !== "completed" ||
+    parentResult.report.outcome !== "changed" ||
+    parentResult.report.commit !== parentCommit
+  )
+    throw new Error(
+      "Candidate parent commit does not exactly match its retained implementation report.",
+    );
+  const parentCandidate = candidateLineageForAttempt(parent);
+  if (parentCandidate === undefined)
+    throw new Error("Candidate parent has no exact assigned base revision.");
+}
+
+function validateCandidateRelation(
+  attempt: { baseRevision?: string },
+  parent: WorkAttempt,
+  candidate: CandidateLineage,
+): void {
+  const parentCandidate = candidateLineageForAttempt(parent);
+  if (candidate.kind === "correction") {
+    if (
+      parentCandidate === undefined ||
+      candidate.rootCommit !== parentCandidate.rootCommit ||
+      attempt.baseRevision !== candidate.parentCommit
+    )
+      throw new Error("Correction candidate must continue directly from its retained parent.");
+  } else if (attempt.baseRevision !== candidate.rootCommit) {
+    throw new Error("Integration candidate must be rooted at its assigned destination base.");
+  }
+}
+
+function candidateLineageForAttempt(
+  attempt: Pick<WorkAttempt, "baseRevision" | "candidate">,
+): CandidateLineage | undefined {
+  if (attempt.candidate !== undefined) return attempt.candidate;
+  if (attempt.baseRevision !== undefined && Value.Check(CommitSchema, attempt.baseRevision))
+    return { kind: "initial", rootCommit: attempt.baseRevision };
+  return undefined;
 }
 
 function currentIntent(state: WorkstreamState): Intent {

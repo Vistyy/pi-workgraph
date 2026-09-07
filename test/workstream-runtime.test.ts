@@ -7,6 +7,8 @@ import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Deferred, Effect } from "effect";
 import { TestClock } from "effect/testing";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import { openRepository } from "../src/git.js";
 import {
   type HerdrObservation,
@@ -34,6 +36,7 @@ import { required } from "./decoders.js";
 
 const FIXTURE_TIMESTAMP = 1_700_000_000_000;
 const FIXTURE_OBSERVED_AT = "2023-11-14T22:13:20.000Z";
+const PersistedSqliteRowSchema = Type.Object({ state_json: Type.String() });
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await Effect.runPromise(
@@ -774,7 +777,12 @@ await test("maintained changes keep semantic identity, use guide/executor policy
         ),
         "maintained",
       );
-      assert.equal(await readFile(join(request.cwd, "value.txt"), "utf8"), "later\n");
+      assert.notEqual(request.cwd, f.root);
+      assert.equal(
+        await git(request.cwd, "rev-parse", "HEAD"),
+        workerEnvironment(request, "PI_WORKGRAPH_BASE_COMMIT"),
+      );
+      assert.equal(await readFile(join(request.cwd, "value.txt"), "utf8"), "maintained\n");
       return {
         kind: "review",
         status: "completed",
@@ -839,9 +847,358 @@ await test("maintained changes keep semantic identity, use guide/executor policy
     await runRuntime(active.effects.reconcile);
     state = await runRuntime(active.effects.reconcile);
     assert.equal(state.attempts[1]?.baseRevision, revision);
-    assert.equal(state.attempts[1]?.placement?.kind, "shared_project");
+    assert.equal(state.attempts[1]?.placement?.kind, "isolated_worktree");
     assert.equal(state.results[1]?.validity, "typed");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "later\n");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(
+        state.attempts[1]?.placement?.path ?? "",
+      ),
+      false,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("unapplied candidate revisions are reviewed in their retained exact worktree", async () => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    f.workers.onWork = async (request) => {
+      if (workerEnvironment(request, "PI_WORKGRAPH_MODE") === "review") {
+        assert.notEqual(request.cwd, f.root);
+        assert.equal(
+          await git(request.cwd, "rev-parse", "HEAD"),
+          workerEnvironment(request, "PI_WORKGRAPH_BASE_COMMIT"),
+        );
+        assert.equal(await readFile(join(request.cwd, "value.txt"), "utf8"), "candidate\n");
+        return {
+          kind: "review",
+          status: "completed",
+          summary: "Reviewed retained candidate",
+          evidence: [],
+          findings: [],
+        };
+      }
+      await writeFile(join(request.cwd, "value.txt"), "candidate\n");
+      await git(request.cwd, "add", ".");
+      await git(request.cwd, "commit", "-m", "Candidate");
+      return {
+        kind: "implementation",
+        status: "completed",
+        outcome: "changed",
+        summary: "Created candidate",
+        commit: await git(request.cwd, "rev-parse", "HEAD"),
+        evidence: [],
+        findings: [],
+      };
+    };
+    await runRuntime(
+      active.effects.queue({
+        id: "candidate",
+        capability: "implement",
+        artifactIntent: "maintained_change",
+        objective: "Create a candidate",
+        intentVersion: 1,
+        authority,
+        acceptance: ["candidate exists"],
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(active.effects.reconcile);
+    const result = required(state.results[0], "candidate result");
+    const commit =
+      result.validity === "typed" &&
+      result.report.kind === "implementation" &&
+      result.report.status === "completed" &&
+      result.report.outcome === "changed"
+        ? required(result.report.commit, "candidate commit")
+        : assert.fail("Expected a changed candidate.");
+    await runRuntime(
+      active.effects.queue({
+        id: "candidate-review",
+        capability: "review",
+        artifactIntent: "evidence_only",
+        objective: "Review the unapplied candidate",
+        intentVersion: 1,
+        subject: { kind: "revision", revision: commit },
+        concern: "Candidate bytes",
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[1]?.baseRevision, commit);
+    assert.equal(state.attempts[1]?.placement?.kind, "isolated_worktree");
+    assert.equal(state.attempts[1]?.cleanup?.state, "completed");
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("retained candidate corrections apply their complete history and keep the parent output", async () => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    f.workers.onWork = async (request) => {
+      if (workerEnvironment(request, "PI_WORKGRAPH_MODE") === "review")
+        return {
+          kind: "review",
+          status: "completed",
+          summary: "Reviewed candidate revision",
+          evidence: [],
+          findings: [],
+        };
+      const value = f.workers.requests.length === 1 ? "first\n" : "corrected\n";
+      await writeFile(join(request.cwd, "value.txt"), value);
+      await git(request.cwd, "add", ".");
+      await git(request.cwd, "commit", "-m", value.trim());
+      return {
+        kind: "implementation",
+        status: "completed",
+        outcome: "changed",
+        summary: "Changed value",
+        commit: await git(request.cwd, "rev-parse", "HEAD"),
+        evidence: [],
+        findings: [],
+      };
+    };
+    const base = await runRuntime(f.repository.effects.head());
+    await runRuntime(
+      active.effects.queue({
+        id: "first",
+        capability: "implement",
+        artifactIntent: "maintained_change",
+        objective: "Make the first candidate",
+        intentVersion: 1,
+        authority,
+        acceptance: ["value changes"],
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(active.effects.reconcile);
+    const firstAttempt = required(state.attempts[0], "first candidate attempt");
+    const firstResult = required(state.results[0], "first candidate result");
+    const firstCommit =
+      firstResult.validity === "typed" &&
+      firstResult.report.kind === "implementation" &&
+      firstResult.report.status === "completed" &&
+      firstResult.report.outcome === "changed"
+        ? required(firstResult.report.commit, "first candidate commit")
+        : assert.fail("First candidate must be a changed implementation.");
+    assert.deepEqual(firstAttempt.candidate, { kind: "initial", rootCommit: base });
+    const parentPath =
+      firstAttempt.placement?.kind === "isolated_worktree"
+        ? firstAttempt.placement.path
+        : assert.fail("First candidate must retain an isolated worktree.");
+
+    // SAFETY: This fixture updates only the known SQLite aggregate row to remove optional candidate metadata.
+    const persistedRow = f.store.db
+      .prepare("SELECT state_json FROM workstream_state WHERE singleton=1")
+      .get();
+    assert.ok(Value.Check(PersistedSqliteRowSchema, persistedRow));
+    // SAFETY: The validated SQLite aggregate row contains the JSON object whose attempts array is inspected only to remove optional metadata.
+    const persisted = JSON.parse(
+      Value.Decode(PersistedSqliteRowSchema, persistedRow).state_json,
+    ) as {
+      attempts: Array<{ id: string; candidate?: unknown }>;
+    };
+    const persistedParent = persisted.attempts.find((attempt) => attempt.id === firstAttempt.id);
+    assert.ok(persistedParent !== undefined);
+    delete persistedParent.candidate;
+    f.store.db
+      .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
+      .run(JSON.stringify(persisted));
+
+    await runRuntime(
+      active.effects.queue(
+        {
+          id: "correction",
+          capability: "implement",
+          artifactIntent: "maintained_change",
+          objective: "Correct the first candidate",
+          intentVersion: 1,
+          authority,
+          acceptance: ["value is corrected"],
+        },
+        { candidateOf: firstAttempt.id },
+      ),
+    );
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.effects.reconcile);
+    const correctionAttempt = required(state.attempts[1], "correction attempt");
+    const correctionResult = required(state.results[1], "correction result");
+    const correctionCommit =
+      correctionResult.validity === "typed" &&
+      correctionResult.report.kind === "implementation" &&
+      correctionResult.report.status === "completed" &&
+      correctionResult.report.outcome === "changed"
+        ? required(correctionResult.report.commit, "correction commit")
+        : assert.fail("Correction must be a changed implementation.");
+    assert.deepEqual(correctionAttempt.candidate, {
+      kind: "correction",
+      rootCommit: base,
+      parentAttemptId: firstAttempt.id,
+      parentCommit: firstCommit,
+    });
+    assert.equal(correctionAttempt.baseRevision, firstCommit);
+    assert.equal(await runRuntime(f.repository.effects.head()), base);
+
+    await runRuntime(
+      active.effects.queue({
+        id: "correction-review",
+        capability: "review",
+        artifactIntent: "evidence_only",
+        objective: "Review the retained correction before application",
+        intentVersion: 1,
+        subject: { kind: "revision", revision: correctionCommit },
+        concern: "Exact correction history",
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[2]?.cleanup?.state, "completed");
+    assert.equal(state.results[2]?.validity, "typed");
+
+    state = await runRuntime(active.effects.apply(correctionAttempt.id, correctionCommit, base));
+    assert.equal(await runRuntime(f.repository.effects.head()), correctionCommit);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "corrected\n");
+    assert.equal(await git(f.root, "rev-list", "--count", `${base}..HEAD`), "2");
+    assert.equal(await git(f.root, "rev-parse", `${correctionCommit}^`), firstCommit);
+    assert.deepEqual(state.attempts[1]?.application?.commits, [firstCommit, correctionCommit]);
+    assert.equal(state.attempts[1]?.application?.rootCommit, base);
+    assert.equal(state.attempts[0]?.candidate, undefined);
+    assert.equal(state.attempts[1]?.outputRelease?.state, "completed");
+    const completed = await runRuntime(
+      active.effects.submit(
+        f.store.complete({
+          conclusion: "The correction chain is complete.",
+          evidence: [
+            { label: "chain", observation: "The applied candidate retained both commits." },
+          ],
+          limitations: [],
+          reasons: [],
+        }),
+      ),
+    );
+    assert.equal(completed.lifecycle.state, "completed");
+    assert.deepEqual(completed.completion?.accounting, []);
+    assert.match(await git(f.root, "worktree", "list", "--porcelain"), new RegExp(parentPath));
+    assert.doesNotMatch(
+      await git(f.root, "worktree", "list", "--porcelain"),
+      new RegExp(state.attempts[1]?.placement?.path ?? "\\bdoes-not-exist\\b"),
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("moved candidate application is blocked without mutation and supports explicit integration from current base", async () => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    f.workers.onWork = async (request) => {
+      const value = f.workers.requests.length === 1 ? "candidate\n" : "integrated\n";
+      await writeFile(join(request.cwd, "value.txt"), value);
+      await git(request.cwd, "add", ".");
+      await git(request.cwd, "commit", "-m", value.trim());
+      return {
+        kind: "implementation",
+        status: "completed",
+        outcome: "changed",
+        summary: "Changed value",
+        commit: await git(request.cwd, "rev-parse", "HEAD"),
+        evidence: [],
+        findings: [],
+      };
+    };
+    const original = await runRuntime(f.repository.effects.head());
+    await runRuntime(
+      active.effects.queue({
+        id: "candidate",
+        capability: "implement",
+        artifactIntent: "maintained_change",
+        objective: "Make a candidate",
+        intentVersion: 1,
+        authority,
+        acceptance: ["candidate value"],
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(active.effects.reconcile);
+    const parent = required(state.attempts[0], "retained candidate");
+    const result = required(state.results[0], "retained candidate result");
+    const parentCommit =
+      result.validity === "typed" &&
+      result.report.kind === "implementation" &&
+      result.report.status === "completed" &&
+      result.report.outcome === "changed"
+        ? required(result.report.commit, "retained candidate commit")
+        : assert.fail("Expected changed candidate.");
+    const parentPath =
+      parent.placement?.kind === "isolated_worktree"
+        ? parent.placement.path
+        : assert.fail("Candidate must retain its worktree.");
+
+    await writeFile(join(f.root, "value.txt"), "moved\n");
+    await git(f.root, "add", ".");
+    await git(f.root, "commit", "-m", "Move destination");
+    const moved = await runRuntime(f.repository.effects.head());
+    await assert.rejects(
+      runRuntime(active.effects.apply(parent.id, parentCommit, moved)),
+      /Application did not establish/,
+    );
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.application?.state, "blocked");
+    assert.equal(await runRuntime(f.repository.effects.head()), moved);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "moved\n");
+    assert.match(await git(f.root, "worktree", "list", "--porcelain"), new RegExp(parentPath));
+
+    await runRuntime(
+      active.effects.queue(
+        {
+          id: "integration",
+          capability: "implement",
+          artifactIntent: "maintained_change",
+          objective: "Integrate candidate content into the moved base",
+          intentVersion: 1,
+          authority,
+          acceptance: ["integrated value"],
+        },
+        { candidateOf: parent.id, baseRevision: moved },
+      ),
+    );
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.effects.reconcile);
+    const integration = required(state.attempts[1], "integration attempt");
+    const integrationResult = required(state.results[1], "integration result");
+    const integrationCommit =
+      integrationResult.validity === "typed" &&
+      integrationResult.report.kind === "implementation" &&
+      integrationResult.report.status === "completed" &&
+      integrationResult.report.outcome === "changed"
+        ? required(integrationResult.report.commit, "integration commit")
+        : assert.fail("Expected changed integration.");
+    assert.deepEqual(integration.candidate, {
+      kind: "integration",
+      rootCommit: moved,
+      parentAttemptId: parent.id,
+      parentCommit,
+    });
+    assert.equal(integration.baseRevision, moved);
+    assert.equal(await runRuntime(f.repository.effects.head()), moved);
+    state = await runRuntime(active.effects.apply(integration.id, integrationCommit, moved));
+    assert.equal(await runRuntime(f.repository.effects.head()), integrationCommit);
+    assert.equal(await git(f.root, "rev-list", "--count", `${moved}..HEAD`), "1");
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "integrated\n");
+    assert.equal(state.attempts[1]?.application?.rootCommit, moved);
+    assert.deepEqual(state.attempts[1]?.application?.commits, [integrationCommit]);
+    assert.match(await git(f.root, "worktree", "list", "--porcelain"), new RegExp(parentPath));
+    assert.notEqual(original, moved);
   } finally {
     await f.dispose();
   }
