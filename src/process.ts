@@ -1,8 +1,7 @@
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This module is the Node child-process adapter.
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, type Hash } from "node:crypto";
-import { Data, Effect, Fiber, Scope, Stream } from "effect";
-import * as ChildProcess from "effect/unstable/process/ChildProcess";
-import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
-import { liveLayer } from "./node-platform.js";
+import { Data, Deferred, Effect } from "effect";
 
 const OUTPUT_LIMIT = 50 * 1024;
 const DEFAULT_KILL_GRACE_MS = 5_000;
@@ -47,127 +46,165 @@ interface CapturedText {
   readonly truncated: boolean;
 }
 
-/** Runs a bounded child with the platform's scoped process owner and this module's diagnostic policy. */
+interface ProcessClose {
+  readonly code: number | null;
+  readonly signal: NodeJS.Signals | null;
+  readonly error: Error | undefined;
+}
+
+interface OwnedProcess {
+  readonly child: ChildProcess;
+  readonly completion: Deferred.Deferred<ProcessClose>;
+  readonly stdout: OutputCapture;
+  readonly stderr: OutputCapture;
+  readonly onStdout: (chunk: Buffer) => void;
+  readonly onStderr: (chunk: Buffer) => void;
+  readonly onError: (error: Error) => void;
+  readonly onExit: () => void;
+  readonly onClose: (code: number | null, signal: NodeJS.Signals | null) => void;
+  closed: boolean;
+  exited: boolean;
+  spawnError: Error | undefined;
+}
+
+/** Owns each child through completion, timeout, or Effect interruption. */
 export function processEffect(
   command: string,
   args: readonly string[],
   options: ProcessOptions,
 ): Effect.Effect<ProcessResult, ProcessExecutionError> {
   const outputLimit = resolveOutputLimit(options.outputLimit);
-  const killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   const processError = (cause: unknown): ProcessExecutionError =>
     new ProcessExecutionError({ command, args, cause });
 
-  const operation = Effect.scoped(
+  return Effect.scoped(
     Effect.gen(function* () {
-      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const parentScope = yield* Effect.scope;
-      // The process scope is registered after the stdio scope so its platform finalizer
-      // terminates the child before the stdio finalizer waits for both pipes to close.
-      const stdioScope = yield* Scope.fork(parentScope, "sequential");
-      const processScope = yield* Scope.fork(parentScope, "sequential");
-      const handle = yield* Scope.provide(processScope)(
-        spawner
-          .spawn(
-            ChildProcess.make(command, [...args], {
-              cwd: options.cwd,
-              env: options.env,
-              extendEnv: false,
-              shell: false,
-              detached: false,
-              windowsHide: false,
-              stdin: "ignore",
-              stdout: "pipe",
-              stderr: "pipe",
-              killSignal: "SIGTERM",
-              forceKillAfter: killGraceMs,
-            }),
-          )
-          .pipe(Effect.mapError(processError)),
+      const completion = yield* Deferred.make<ProcessClose>();
+      const owned = yield* Effect.acquireRelease(
+        Effect.try({
+          try: () => acquireProcess(command, args, options, outputLimit, completion),
+          catch: processError,
+        }),
+        (process) => releaseProcess(process, options.killGraceMs ?? DEFAULT_KILL_GRACE_MS),
       );
 
-      const stdoutCapture = makeCapture(outputLimit, options.digestStdout === true);
-      const stderrCapture = makeCapture(outputLimit, false);
-      const stdoutFiber = yield* Scope.provide(stdioScope)(
-        Effect.forkScoped(
-          Stream.runFold(
-            handle.stdout,
-            () => stdoutCapture,
-            (capture, chunk) => {
-              appendCapture(capture, chunk);
-              return capture;
-            },
-          ),
-        ),
+      const timedOut = yield* Effect.race(
+        Deferred.await(owned.completion).pipe(Effect.as(false)),
+        Effect.sleep(options.timeoutMs).pipe(Effect.as(true)),
       );
-      const stderrFiber = yield* Scope.provide(stdioScope)(
-        Effect.forkScoped(
-          Stream.runFold(
-            handle.stderr,
-            () => stderrCapture,
-            (capture, chunk) => {
-              appendCapture(capture, chunk);
-              return capture;
-            },
-          ),
-        ),
-      );
-      // forkScoped's normal interruption finalizers must run after this join. The
-      // process scope closes first, so this preserves the native close fence even
-      // when a descendant still owns one of the inherited stdio pipes.
-      yield* Scope.addFinalizer(
-        stdioScope,
-        Effect.uninterruptible(
-          Effect.all([Fiber.join(stdoutFiber), Fiber.join(stderrFiber)], {
-            concurrency: "unbounded",
-          }).pipe(Effect.ignore),
-        ),
-      );
-
-      // The platform handle reports signal exits as failures. The native API exposed
-      // those as a successful result with code 1, so normalize before the completion
-      // race while still waiting for both output streams.
-      const completion = Effect.all(
-        [
-          handle.exitCode.pipe(Effect.orElseSucceed(() => 1)),
-          Fiber.join(stdoutFiber).pipe(Effect.mapError(processError)),
-          Fiber.join(stderrFiber).pipe(Effect.mapError(processError)),
-        ],
-        { concurrency: "unbounded" },
-      );
-      const raced = yield* Effect.race(
-        completion.pipe(Effect.map((result) => ({ timedOut: false as const, result }))),
-        Effect.sleep(options.timeoutMs).pipe(Effect.as({ timedOut: true as const })),
-      );
-      const timedOut = raced.timedOut;
-      let completionResult: readonly [number, OutputCapture, OutputCapture];
       if (timedOut) {
-        yield* Effect.uninterruptible(
-          handle.kill({ killSignal: "SIGTERM", forceKillAfter: killGraceMs }).pipe(Effect.ignore),
-        );
-        completionResult = yield* completion;
-      } else {
-        completionResult = raced.result;
+        yield* terminateAndAwait(owned, options.killGraceMs ?? DEFAULT_KILL_GRACE_MS);
       }
-      const [exitCode, stdout, stderr] = completionResult;
-      const capturedStdout = captureText(stdout);
-      const capturedStderr = captureText(stderr);
+
+      const close = yield* Deferred.await(owned.completion);
+      if (close.error !== undefined) {
+        return yield* processError(close.error);
+      }
+
+      const stdout = captureText(owned.stdout);
+      const stderr = captureText(owned.stderr);
       const result: ProcessResult = {
-        exitCode: Number(exitCode),
-        stdout: capturedStdout.text,
-        stdoutTruncated: capturedStdout.truncated,
-        stderr: capturedStderr.text,
-        stderrTruncated: capturedStderr.truncated,
+        exitCode: close.code ?? 1,
+        stdout: stdout.text,
+        stdoutTruncated: stdout.truncated,
+        stderr: stderr.text,
+        stderrTruncated: stderr.truncated,
         timedOut,
       };
-      if (stdout.digest !== undefined) {
-        result.stdoutDigest = stdout.digest.digest("hex");
+      if (owned.stdout.digest !== undefined) {
+        result.stdoutDigest = owned.stdout.digest.digest("hex");
       }
       return result;
     }),
   );
+}
 
-  return Effect.provide(operation, liveLayer);
+function acquireProcess(
+  command: string,
+  args: readonly string[],
+  options: ProcessOptions,
+  outputLimit: number | undefined,
+  completion: Deferred.Deferred<ProcessClose>,
+): OwnedProcess {
+  const child = spawn(command, [...args], {
+    cwd: options.cwd,
+    env: options.env,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout = makeCapture(outputLimit, options.digestStdout === true);
+  const stderr = makeCapture(outputLimit, false);
+  const owned: OwnedProcess = {
+    child,
+    completion,
+    stdout,
+    stderr,
+    closed: false,
+    exited: child.exitCode !== null || child.signalCode !== null,
+    spawnError: undefined,
+    onStdout: (chunk: Buffer) => appendCapture(stdout, chunk),
+    onStderr: (chunk: Buffer) => appendCapture(stderr, chunk),
+    onError: (error: Error) => {
+      owned.spawnError = error;
+    },
+    onExit: () => {
+      owned.exited = true;
+    },
+    onClose: (code: number | null, signal: NodeJS.Signals | null) => {
+      owned.exited = true;
+      owned.closed = true;
+      Deferred.doneUnsafe(completion, Effect.succeed({ code, signal, error: owned.spawnError }));
+    },
+  };
+
+  child.stdout?.on("data", owned.onStdout);
+  child.stderr?.on("data", owned.onStderr);
+  child.on("error", owned.onError);
+  child.on("exit", owned.onExit);
+  child.on("close", owned.onClose);
+  return owned;
+}
+
+function releaseProcess(owned: OwnedProcess, killGraceMs: number): Effect.Effect<void> {
+  return Effect.gen(function* () {
+    yield* terminateAndAwait(owned, killGraceMs);
+    cleanupProcess(owned);
+  });
+}
+
+function terminateAndAwait(owned: OwnedProcess, killGraceMs: number): Effect.Effect<void> {
+  return Effect.uninterruptible(
+    Effect.gen(function* () {
+      if (owned.closed) return;
+      if (!owned.exited) {
+        safeKill(owned.child, "SIGTERM");
+        const closedDuringGrace = yield* Effect.race(
+          Deferred.await(owned.completion).pipe(Effect.as(true)),
+          Effect.sleep(killGraceMs).pipe(Effect.as(false)),
+        );
+        if (!closedDuringGrace && !owned.closed && !owned.exited) {
+          safeKill(owned.child, "SIGKILL");
+        }
+      }
+      yield* Deferred.await(owned.completion);
+    }),
+  );
+}
+
+function cleanupProcess(owned: OwnedProcess): void {
+  owned.child.stdout?.off("data", owned.onStdout);
+  owned.child.stderr?.off("data", owned.onStderr);
+  owned.child.off("error", owned.onError);
+  owned.child.off("exit", owned.onExit);
+  owned.child.off("close", owned.onClose);
+}
+
+function safeKill(child: ChildProcess, signal: NodeJS.Signals): void {
+  try {
+    child.kill(signal);
+  } catch {
+    // A concurrent exit is observed by the one close completion owned by the scope.
+  }
 }
 
 function resolveOutputLimit(outputLimit: number | false | undefined): number | undefined {
@@ -186,14 +223,13 @@ function makeCapture(limit: number | undefined, digest: boolean): OutputCapture 
   };
 }
 
-function appendCapture(capture: OutputCapture, chunk: Uint8Array): void {
-  const bytes = Buffer.from(chunk);
-  capture.totalBytes += bytes.length;
-  capture.digest?.update(bytes);
+function appendCapture(capture: OutputCapture, chunk: Buffer): void {
+  capture.totalBytes += chunk.length;
+  capture.digest?.update(chunk);
   if (capture.limit === 0) return;
 
-  capture.chunks.push(bytes);
-  capture.retainedBytes += bytes.length;
+  capture.chunks.push(chunk);
+  capture.retainedBytes += chunk.length;
   if (capture.limit === undefined) return;
 
   let overflow = capture.retainedBytes - capture.limit;

@@ -19,6 +19,7 @@ A focused test file can establish its own behavior but cannot replace the full s
 ## Effect lifecycle boundaries
 
 Process ownership claims require real child-process checks for normal completion, spawn failure, bounded output and digesting, timeout escalation, pre-aborted launch prevention, and interruption that waits for close.
+The pinned `@effect/platform-node-shared` rc112 Windows spawner unconditionally invokes `taskkill /T /F` even with `detached: false`, so it cannot replace this native process boundary without reintroducing a Windows ownership regression. Keep the `node:child_process` adapter inside the existing Effect scope so one owner controls termination and close without a second backend.
 Promise-level success or rejection alone does not establish that the scoped Effect owner released the native process.
 Runtime scheduling tests may inject Effect's `TestClock`, but fenced lease checks still cross the native SQLite and wall-clock boundary and must align their fixture time explicitly.
 Workstream persistence claims require real temporary state files and real isolated SQLite storage because an in-memory adapter cannot establish mutation serialization, atomic replacement, or fenced ownership.
