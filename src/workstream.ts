@@ -711,10 +711,14 @@ export class WorkstreamStoreEffects {
     return this.changeAttempt(
       id,
       (attempt) => {
-        if (attempt.cleanup?.state === "completed") return;
+        if (attempt.cleanup?.state === "completed") {
+          if (attempt.state === "cancel_requested") attempt.state = "cancelled";
+          return;
+        }
         if (attempt.cleanup?.state !== "pending" || !attempt.cleanup.workerClosed)
           throw new Error(`Cleanup for ${id} requires a closed worker.`);
         attempt.cleanup = { ...attempt.cleanup, state: "completed" };
+        if (attempt.state === "cancel_requested") attempt.state = "cancelled";
       },
       now,
     );

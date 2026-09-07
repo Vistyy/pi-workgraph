@@ -9,6 +9,7 @@ import { Effect } from "effect";
 import { Type } from "typebox";
 import { GitRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
+import { liveLayer } from "../src/node-platform.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { WorkstreamStore } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
@@ -372,6 +373,34 @@ void test("registered delegation keeps established scope until explicit intent r
   }
 });
 
+void test("concurrent first registered tools acquire one attached runtime", async () => {
+  const f = await fixture();
+  try {
+    const [first, second] = await Promise.all([
+      f.call("workgraph_research", {
+        id: "concurrent-first",
+        question: "Inspect the first concurrent boundary",
+        expectedEvidence: ["One shared runtime"],
+      }),
+      f.call("workgraph_research", {
+        id: "concurrent-second",
+        question: "Inspect the second concurrent boundary",
+        expectedEvidence: ["One shared runtime"],
+      }),
+    ]);
+    const firstState = resultState(first.details);
+    const secondState = resultState(second.details);
+    assert.equal(firstState.id, secondState.id);
+    assert.equal(firstState.statePath, secondState.statePath);
+    assert.deepEqual(secondState.assignments.map((assignment) => assignment.id).sort(), [
+      "concurrent-first",
+      "concurrent-second",
+    ]);
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("registered AbortSignal interrupts native coordinator work", async () => {
   const f = await fixture();
   let previousEnvironment: NodeJS.ProcessEnv | undefined;
@@ -432,16 +461,18 @@ void test("failed registered adoption preserves the attached runtime lease; same
       gitCommonDir: repository.commonDir,
       coordinator: otherOwner,
     });
-    competing = new WorkstreamRuntime(
-      store,
-      repository,
-      new HerdrCliRuntime(),
-      { workspaceId: "" },
-      () => Effect.void,
-      () => Effect.void,
-      { registry },
+    competing = await Effect.runPromise(
+      WorkstreamRuntime.acquire(
+        store,
+        repository,
+        new HerdrCliRuntime(),
+        { workspaceId: "" },
+        () => Effect.void,
+        () => Effect.void,
+        { registry },
+      ).pipe(Effect.provide(liveLayer)),
     );
-    await Effect.runPromise(competing.effects.submit(Effect.void));
+    await Effect.runPromise(competing.effects.submit(Effect.void).pipe(Effect.provide(liveLayer)));
     await assert.rejects(f.call("workgraph_adopt", { statePath: store.path }), /runtime owner/);
     assert.equal(
       resultState((await f.call("workgraph_inspect", { section: "overview" })).details).id,
@@ -454,7 +485,7 @@ void test("failed registered adoption preserves the attached runtime lease; same
       action: "suspend",
       reason: "Existing runtime is still usable",
     });
-    await competing.stop();
+    await Effect.runPromise(competing.effects.close);
     const adopted = resultState(
       (await f.call("workgraph_adopt", { statePath: store.path })).details,
     );
@@ -463,7 +494,7 @@ void test("failed registered adoption preserves the attached runtime lease; same
     const released = registry.acquire(a.id, a.coordinator);
     registry.release(released);
   } finally {
-    await competing?.stop();
+    if (competing !== undefined) await Effect.runPromise(competing.effects.close);
     registry.close();
     await f.dispose();
   }

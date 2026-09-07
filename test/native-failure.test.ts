@@ -17,6 +17,7 @@ import {
   type WorkerLaunchRequest,
 } from "../src/herdr.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
+import { liveLayer } from "../src/node-platform.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity } from "../src/types.js";
 import { WorkstreamStore } from "../src/workstream.js";
@@ -149,30 +150,38 @@ await test("absent native failures project sanitized actionable notifications wi
     });
     registry = new WorkgraphRegistry(join(parent, "registry.sqlite"));
     const notifications: string[] = [];
-    runtime = new WorkstreamRuntime(
-      store,
-      repository,
-      new NativeFailureWorker(),
-      { workspaceId: "fixture-workspace" },
-      (resultId, state) =>
-        Effect.sync(() => {
-          notifications.push(resultNotification(state, resultId));
-        }),
-      (error) => Effect.sync(() => assert.fail(error.message)),
-      { registry, policy: DEFAULT_MODEL_POLICY },
+    runtime = await Effect.runPromise(
+      WorkstreamRuntime.acquire(
+        store,
+        repository,
+        new NativeFailureWorker(),
+        { workspaceId: "fixture-workspace" },
+        (resultId, state) =>
+          Effect.sync(() => {
+            notifications.push(resultNotification(state, resultId));
+          }),
+        (error) => Effect.sync(() => assert.fail(error.message)),
+        { registry, policy: DEFAULT_MODEL_POLICY },
+      ).pipe(Effect.provide(liveLayer)),
     );
     for (const id of ["rate-limit", "abort", "generic", "fallback", "untyped", "typed"])
-      await runtime.queue({
-        id,
-        capability: "research",
-        artifactIntent: "evidence_only",
-        objective: `Observe ${id}`,
-        intentVersion: 0,
-        expectedEvidence: ["Native metadata"],
-      });
+      await Effect.runPromise(
+        runtime.effects
+          .queue({
+            id,
+            capability: "research",
+            artifactIntent: "evidence_only",
+            objective: `Observe ${id}`,
+            intentVersion: 0,
+            expectedEvidence: ["Native metadata"],
+          })
+          .pipe(Effect.provide(liveLayer)),
+      );
 
-    await runtime.reconcile();
-    const state = await runtime.reconcile();
+    await Effect.runPromise(runtime.effects.reconcile.pipe(Effect.provide(liveLayer)));
+    const state = await Effect.runPromise(
+      runtime.effects.reconcile.pipe(Effect.provide(liveLayer)),
+    );
     const rateLimit = state.results.find((result) => result.assignmentId === "rate-limit");
     const aborted = state.results.find((result) => result.assignmentId === "abort");
     const generic = state.results.find((result) => result.assignmentId === "generic");
@@ -216,7 +225,7 @@ await test("absent native failures project sanitized actionable notifications wi
     assert.equal(projected.includes(RAW_SECRET), false);
     assert.equal(JSON.stringify(state).includes(RAW_SECRET), false);
   } finally {
-    if (runtime !== undefined) await runtime.stop();
+    if (runtime !== undefined) await Effect.runPromise(runtime.effects.close);
     registry?.close();
     await rm(parent, { recursive: true, force: true });
   }

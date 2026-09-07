@@ -72,6 +72,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   let runtime: WorkstreamRuntime | undefined;
   let pending: Static<typeof InputReceipt>[] = [];
   const hostSemaphore = Semaphore.makeUnsafe(1);
+  const attachmentSemaphore = Semaphore.makeUnsafe(1);
   const sdk = <T>(operation: string, run: () => T): Effect.Effect<T, RuntimeHostError> =>
     Effect.try({
       try: run,
@@ -106,71 +107,78 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       updateCalmWorkers(calm, state);
       return state;
     });
+  const attachOwned = (
+    ctx: ExtensionContext,
+    target: WorkstreamStore,
+    priorOwnerLiveness: "alive" | "dead" | "unknown" = "unknown",
+  ): CoordinatorEffect<WorkstreamRuntime> =>
+    Effect.suspend(() => {
+      const attached = runtime;
+      if (attached?.store.path === target.path)
+        return attached.effects.submit(Effect.void).pipe(Effect.as(attached));
+      return Effect.gen(function* () {
+        const previous = runtime;
+        const state = yield* target.effects.load();
+        const { HERDR_WORKSPACE_ID: workspaceId } = process.env;
+        let next: WorkstreamRuntime;
+        next = yield* WorkstreamRuntime.acquire(
+          target,
+          new GitRepository(state.projectRoot, state.gitCommonDir),
+          new HerdrCliRuntime(),
+          { workspaceId: workspaceId ?? "" },
+          (resultId, latest) =>
+            sdk("deliver workstream result", () => {
+              if (ctx.sessionManager.getSessionId() !== latest.coordinator.sessionId)
+                throw new Error("Coordinator session changed before result delivery.");
+              pi.sendMessage(
+                {
+                  customType: POINTER,
+                  content: resultNotification(latest, resultId),
+                  display: true,
+                  details: { resultId, statePath: latest.statePath },
+                },
+                { triggerTurn: true, deliverAs: "followUp" },
+              );
+            }),
+          (error) =>
+            sdk("report workstream error", () => {
+              ctx.ui.notify(`Workgraph: ${error.message}`, "warning");
+              pi.sendMessage(
+                {
+                  customType: "pi-workgraph-attention",
+                  content: `Workgraph requires reconciliation: ${error.message}. Use workgraph_inspect for retained evidence; this notification does not authorize new scope.`,
+                  display: true,
+                },
+                { triggerTurn: true, deliverAs: "followUp" },
+              );
+            }),
+          {
+            owner: owner(ctx),
+            priorOwnerLiveness,
+            onState: (latest) =>
+              sdk("publish workstream state", () => updateCalmWorkers(calm, latest)),
+            onStopped: () =>
+              hostSemaphore.withPermit(
+                sdk("clear stopped runtime pointer", () => {
+                  if (runtime === next) runtime = undefined;
+                }),
+              ),
+          },
+        );
+        if (previous !== undefined)
+          yield* previous.effects.close.pipe(
+            Effect.onError(() => next.effects.close.pipe(Effect.ignore)),
+          );
+        runtime = next;
+        return next;
+      });
+    });
   const attachEffect = (
     ctx: ExtensionContext,
     target: WorkstreamStore,
     priorOwnerLiveness: "alive" | "dead" | "unknown" = "unknown",
-  ): CoordinatorEffect<WorkstreamRuntime> => {
-    const attached = runtime;
-    if (attached?.store.path === target.path)
-      return attached.effects.submit(Effect.void).pipe(Effect.as(attached));
-    return Effect.gen(function* () {
-      const previous = runtime;
-      const state = yield* target.effects.load();
-      const { HERDR_WORKSPACE_ID: workspaceId } = process.env;
-      const next = new WorkstreamRuntime(
-        target,
-        new GitRepository(state.projectRoot, state.gitCommonDir),
-        new HerdrCliRuntime(),
-        { workspaceId: workspaceId ?? "" },
-        (resultId, latest) =>
-          sdk("deliver workstream result", () => {
-            if (ctx.sessionManager.getSessionId() !== latest.coordinator.sessionId)
-              throw new Error("Coordinator session changed before result delivery.");
-            pi.sendMessage(
-              {
-                customType: POINTER,
-                content: resultNotification(latest, resultId),
-                display: true,
-                details: { resultId, statePath: latest.statePath },
-              },
-              { triggerTurn: true, deliverAs: "followUp" },
-            );
-          }),
-        (error) =>
-          sdk("report workstream error", () => {
-            ctx.ui.notify(`Workgraph: ${error.message}`, "warning");
-            pi.sendMessage(
-              {
-                customType: "pi-workgraph-attention",
-                content: `Workgraph requires reconciliation: ${error.message}. Use workgraph_inspect for retained evidence; this notification does not authorize new scope.`,
-                display: true,
-              },
-              { triggerTurn: true, deliverAs: "followUp" },
-            );
-          }),
-        {
-          owner: owner(ctx),
-          priorOwnerLiveness,
-          onState: (latest) =>
-            sdk("publish workstream state", () => updateCalmWorkers(calm, latest)),
-          onStopped: () =>
-            hostSemaphore.withPermit(
-              sdk("clear stopped runtime pointer", () => {
-                if (runtime === next) runtime = undefined;
-              }),
-            ),
-        },
-      );
-      yield* next.effects
-        .submit(Effect.void)
-        .pipe(Effect.catch((error) => next.effects.stop.pipe(Effect.andThen(Effect.fail(error)))));
-      if (previous !== undefined) yield* previous.effects.stop;
-      runtime = next;
-      next.start();
-      return next;
-    });
-  };
+  ): CoordinatorEffect<WorkstreamRuntime> =>
+    attachmentSemaphore.withPermit(attachOwned(ctx, target, priorOwnerLiveness));
   const importInputsEffect = (active: WorkstreamRuntime): CoordinatorEffect<void> =>
     hostSemaphore.withPermit(Effect.sync(() => [...pending])).pipe(
       Effect.flatMap((receipts) =>
@@ -197,13 +205,19 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       pending.push(receipt);
       const active = runtime;
       if (active === undefined) return Promise.resolve();
-      return Effect.runPromise(active.effects.submit(active.store.effects.load())).then((state) => {
-        if (state.lifecycle.state !== "active" && state.lifecycle.state !== "suspended")
-          return undefined;
-        return Effect.runPromise(
-          active.effects.submit(active.store.effects.recordInputEvent(receipt).pipe(Effect.asVoid)),
-        ).then(() => undefined);
-      });
+      return runCallback(
+        active.effects
+          .submit(active.store.effects.load())
+          .pipe(
+            Effect.flatMap((state) =>
+              state.lifecycle.state !== "active" && state.lifecycle.state !== "suspended"
+                ? Effect.void
+                : active.effects.submit(
+                    active.store.effects.recordInputEvent(receipt).pipe(Effect.asVoid),
+                  ),
+            ),
+          ),
+      );
     },
   });
   const validateTargetEffect = (
@@ -236,10 +250,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       if (state.lifecycle.state === "suspended")
         throw new Error("Workstream is suspended; resume explicitly before delegating.");
       if (state.lifecycle.state !== "active") {
-        yield* Effect.tryPromise({
-          try: () => attached.stop(),
-          catch: (cause) => new RuntimeHostError({ operation: "stop terminal runtime", cause }),
-        });
+        yield* attached.effects.close;
         if (runtime === attached) runtime = undefined;
         return undefined;
       }
@@ -251,24 +262,29 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     purpose: string,
     targetRepository?: string,
   ): CoordinatorEffect<WorkstreamRuntime> =>
-    Effect.gen(function* () {
-      const existing = yield* reuseOrStopEffect(targetRepository);
-      if (existing !== undefined) return existing;
-      const repository = yield* inspectRepository(targetRepository ?? ctx.cwd);
-      const created = yield* WorkstreamStoreEffects.create({
-        id: `ws-${randomUUID()}`,
-        purpose,
-        projectRoot: repository.root,
-        gitCommonDir: repository.commonDir,
-        coordinator: owner(ctx),
-      });
-      const active = yield* attachEffect(ctx, WorkstreamStore.open(created.store.path, owner(ctx)));
-      yield* importInputsEffect(active);
-      yield* sdk("retain workstream pointer", () =>
-        pi.appendEntry(POINTER, { path: created.store.path }),
-      );
-      return active;
-    });
+    attachmentSemaphore.withPermit(
+      Effect.gen(function* () {
+        const existing = yield* reuseOrStopEffect(targetRepository);
+        if (existing !== undefined) return existing;
+        const repository = yield* inspectRepository(targetRepository ?? ctx.cwd);
+        const created = yield* WorkstreamStoreEffects.create({
+          id: `ws-${randomUUID()}`,
+          purpose,
+          projectRoot: repository.root,
+          gitCommonDir: repository.commonDir,
+          coordinator: owner(ctx),
+        });
+        const active = yield* attachOwned(
+          ctx,
+          WorkstreamStore.open(created.store.path, owner(ctx)),
+        );
+        yield* importInputsEffect(active);
+        yield* sdk("retain workstream pointer", () =>
+          pi.appendEntry(POINTER, { path: created.store.path }),
+        );
+        return active;
+      }),
+    );
   const authorizeStore = (
     active: WorkstreamRuntime,
     statement: string,
@@ -342,7 +358,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     runCallback(
       Effect.gen(function* () {
         const active = runtime;
-        if (active !== undefined) yield* active.effects.stop;
+        if (active !== undefined) yield* active.effects.close;
         runtime = undefined;
         const identity = owner(ctx);
         const entries = ctx.sessionManager.getBranch();
@@ -375,7 +391,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   );
   pi.on("session_shutdown", () => {
     const active = runtime;
-    return runCallback(active === undefined ? Effect.void : active.effects.stop);
+    return runCallback(active === undefined ? Effect.void : active.effects.close);
   });
   pi.on("before_agent_start", () => ({
     message: {
@@ -816,7 +832,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
               })),
             }),
           );
-          yield* active.effects.stop;
+          yield* active.effects.close;
           runtime = undefined;
           return mutationResult("Completed workstream.", yield* remember(state, ctx), {
             action: "workgraph_complete",
@@ -940,7 +956,7 @@ function researchAssignment(
   params: ResearchParams,
   intentVersion: number,
   authority: { receiptId: string; intentVersion: number } | undefined,
-): Parameters<WorkstreamRuntime["queue"]>[0] {
+): Parameters<WorkstreamStore["assign"]>[0] {
   const common = {
     id: params.id,
     capability: "research" as const,
@@ -1025,7 +1041,7 @@ function isAttemptControl(action: ControlAction): boolean {
 function controlAttemptEffect(
   active: WorkstreamRuntime,
   params: ControlParams,
-): Effect.Effect<string, RuntimeError> {
+): CoordinatorEffect<string> {
   return Effect.gen(function* () {
     const state = yield* active.effects.submit(active.store.effects.load());
     const attemptId = resolveControlAttempt(state, params.task, params.attempt);
@@ -1043,7 +1059,7 @@ function controlAttemptEffect(
 function lifecycleControlEffect(
   active: WorkstreamRuntime,
   params: ControlParams,
-): Effect.Effect<undefined, RuntimeError> {
+): CoordinatorEffect<undefined> {
   return active.effects
     .submit(
       active.store.effects.setLifecycle({

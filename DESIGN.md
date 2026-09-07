@@ -67,6 +67,10 @@ Reattachment may conservatively observe exact identities and postconditions, but
 
 Effect 4 provides one structured lifecycle and concurrency model for the active coordination runtime rather than a parallel public workflow interface.
 The workstream runtime owns its scoped registry and lease, serialized operations, background fibers, and shutdown.
+Its acquisition is eager and returns only after the lease-backed handle is ready; acquisition failures therefore fail attachment directly rather than leaving a lazy, partially initialized runtime.
+An Effect semaphore serializes mutations, caller interruption cancels queued or running coordinator operations through ordinary fiber interruption, and a scoped FiberSet interrupts and joins owned operations before lease release.
+Owned-worker cancellation is a separate durable boundary: it records the cancellation request, interrupts a retained worker when possible, and settles without a report only after cleanup verifies idle-worker closure or exact external absence; unknown presence remains blocked.
+One idempotent close boundary handles explicit shutdown and fatal lease loss; custom request queues, request settlement signals, and separate ready/start/fatal lifecycle channels are unnecessary because the Effect primitives already provide those guarantees.
 The process adapter owns each child from acquisition through timeout, interruption, and release, with a Promise adapter only at host-facing boundaries.
 The workstream store owns serialized atomic state-file mutation, while the registry owns only the durable index and fenced lease records.
 These boundaries keep resource lifetime and persistence responsibility with the component that can verify their postconditions.

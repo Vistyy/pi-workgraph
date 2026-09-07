@@ -1,15 +1,5 @@
-import {
-  Cause,
-  Clock,
-  Context,
-  Data,
-  DateTime,
-  Effect,
-  type FileSystem,
-  Layer,
-  type Path,
-} from "effect";
-import type { GitRepository, GitRepositoryEffects } from "./git.js";
+import type { FileSystem, Path, Scope } from "effect";
+import { Cause, Data, DateTime, Effect } from "effect";
 import type {
   HerdrInspection,
   HerdrObservation,
@@ -22,8 +12,6 @@ import type {
   WorkerRecoveryRequest,
 } from "./herdr.js";
 import type { WorkerLaunchError } from "./herdr-launch.js";
-import { loadModelPolicyEffect, type ModelPolicy } from "./model-policy.js";
-import { liveLayer } from "./node-platform.js";
 import {
   createWorkerSessionEffect,
   effectiveModelObservations,
@@ -40,12 +28,7 @@ import {
   WorkgraphRegistry,
 } from "./registry.js";
 import type { WorkerIdentity } from "./types.js";
-import type {
-  WorkstreamState,
-  WorkstreamStore,
-  WorkstreamStoreEffects,
-  WorkstreamStoreError,
-} from "./workstream.js";
+import type { WorkstreamStore, WorkstreamStoreError } from "./workstream.js";
 
 export interface RuntimeHerdrEffects {
   readonly launch: (
@@ -110,164 +93,106 @@ export class PiObservationError extends Data.TaggedError("PiObservationError")<{
   }
 }
 
-export class RuntimeStore extends Context.Service<
-  RuntimeStore,
-  { readonly effects: WorkstreamStoreEffects }
->()("@vistyy/pi-workgraph/RuntimeStore") {}
-
-export class RuntimeGit extends Context.Service<
-  RuntimeGit,
-  { readonly effects: GitRepositoryEffects }
->()("@vistyy/pi-workgraph/RuntimeGit") {}
-
-export class RuntimeHerdr extends Context.Service<RuntimeHerdr, RuntimeWorkerPort>()(
-  "@vistyy/pi-workgraph/RuntimeHerdr",
-) {}
-
-export class RuntimePolicy extends Context.Service<
-  RuntimePolicy,
-  {
-    readonly policy: ReturnType<typeof loadModelPolicyEffect>;
-  }
->()("@vistyy/pi-workgraph/RuntimePolicy") {}
-
-export class RuntimePi extends Context.Service<
-  RuntimePi,
-  {
-    readonly createSession: typeof createWorkerSessionEffect;
-    readonly readReport: typeof readWorkgraphReportResultEffect;
-    readonly readText: typeof readTerminalTextEffect;
-    readonly observeFailure: typeof observeNativeFailureEffect;
-    readonly models: typeof effectiveModelObservationsEffect;
-    readonly started: typeof hasNativeAgentStarted;
-    readonly settled: typeof hasNativeAgentSettled;
-  }
->()("@vistyy/pi-workgraph/RuntimePi") {}
-
-export class RuntimeHost extends Context.Service<
-  RuntimeHost,
-  {
-    readonly deliver: (id: string, state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
-    readonly state: (state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
-    readonly error: (error: Error) => Effect.Effect<void, RuntimeHostError>;
-  }
->()("@vistyy/pi-workgraph/RuntimeHost") {}
-
 export interface RuntimeLeaseHandle {
-  readonly registry: WorkgraphRegistry;
   readonly assert: () => void;
   readonly renew: Effect.Effect<void, RuntimeRegistryError | LeaseDecisionRequiredError>;
 }
-export class RuntimeLease extends Context.Service<RuntimeLease, RuntimeLeaseHandle>()(
-  "@vistyy/pi-workgraph/RuntimeLease",
-) {}
 
-export interface RuntimeLayerOptions {
+export interface RuntimeLeaseOptions {
   readonly store: WorkstreamStore;
-  readonly repository: GitRepository;
-  readonly workers: RuntimeWorkerPort;
   readonly registry?: WorkgraphRegistry | undefined;
   readonly owner?: LeaseOwner | undefined;
   readonly priorOwnerLiveness?: "alive" | "dead" | "unknown" | undefined;
-  readonly policy?: ModelPolicy | undefined;
-  readonly clock?: Clock.Clock | undefined;
-  readonly onResult: (id: string, state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
-  readonly onState: (state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
-  readonly onError: (error: Error) => Effect.Effect<void, RuntimeHostError>;
+  readonly onFinalizerError?:
+    | ((error: RuntimeRegistryError) => Effect.Effect<void, RuntimeHostError>)
+    | undefined;
 }
 
-export function makeRuntimeLayer(options: RuntimeLayerOptions) {
-  const base = Layer.mergeAll(
-    liveLayer,
-    Layer.succeed(RuntimeStore, { effects: options.store.effects }),
-    Layer.succeed(RuntimeGit, { effects: options.repository.effects }),
-    Layer.succeed(RuntimeHerdr, options.workers),
-    Layer.succeed(RuntimePolicy, {
-      policy:
-        options.policy === undefined ? loadModelPolicyEffect() : Effect.succeed(options.policy),
-    }),
-    Layer.succeed(RuntimePi, {
-      createSession: createWorkerSessionEffect,
-      readReport: readWorkgraphReportResultEffect,
-      readText: readTerminalTextEffect,
-      observeFailure: observeNativeFailureEffect,
-      models: effectiveModelObservationsEffect,
-      started: hasNativeAgentStarted,
-      settled: hasNativeAgentSettled,
-    }),
-    Layer.succeed(RuntimeHost, hostService(options)),
-    ...(options.clock === undefined ? [] : [Layer.succeed(Clock.Clock, options.clock)]),
-  );
-  return leaseLayer(options).pipe(Layer.provideMerge(base));
-}
-
-function leaseLayer(options: RuntimeLayerOptions) {
-  return Layer.effect(
-    RuntimeLease,
-    Effect.gen(function* () {
-      const store = yield* RuntimeStore;
-      const registry = yield* Effect.acquireRelease(
-        registryEffect(
-          "open workstream registry",
-          () => options.registry ?? new WorkgraphRegistry(),
-        ),
-        (value) =>
-          options.registry === undefined
-            ? finalizer("close workstream registry", () => value.close())
-            : Effect.void,
-      );
-      const state = yield* store.effects.load();
-      yield* registryEffect("index workstream", () =>
-        registry.indexWorkstream({
-          ...state,
-          runId: state.id,
-          lifecycle: state.lifecycle.state,
-        }),
-      );
-      const now = yield* DateTime.nowAsDate;
-      const owner = options.owner ?? state.coordinator;
-      let current: Lease | undefined = yield* Effect.acquireRelease(
-        registryEffect("claim registry lease", () =>
-          registry.acquire(state.id, owner, now, options.priorOwnerLiveness ?? "unknown"),
-        ),
-        (lease) =>
-          finalizer("release registry lease", () => registry.release(lease)).pipe(
-            Effect.ensuring(
-              Effect.sync(() => {
-                current = undefined;
-              }),
-            ),
+/** Acquire the runtime's fenced lease and registry in the caller's scope. */
+export function acquireRuntimeLease(
+  options: RuntimeLeaseOptions,
+): Effect.Effect<
+  RuntimeLeaseHandle,
+  RuntimeRegistryError | LeaseDecisionRequiredError | WorkstreamStoreError,
+  Scope.Scope | FileSystem.FileSystem | Path.Path
+> {
+  return Effect.gen(function* () {
+    const registry = yield* Effect.acquireRelease(
+      registryEffect("open workstream registry", () => options.registry ?? new WorkgraphRegistry()),
+      (value) =>
+        options.registry === undefined
+          ? finalizer("close workstream registry", () => value.close(), options.onFinalizerError)
+          : Effect.void,
+    );
+    const state = yield* options.store.effects.load();
+    yield* registryEffect("index workstream", () =>
+      registry.indexWorkstream({
+        ...state,
+        runId: state.id,
+        lifecycle: state.lifecycle.state,
+      }),
+    );
+    const now = yield* DateTime.nowAsDate;
+    const owner = options.owner ?? state.coordinator;
+    let current: Lease | undefined = yield* Effect.acquireRelease(
+      registryEffect("claim registry lease", () =>
+        registry.acquire(state.id, owner, now, options.priorOwnerLiveness ?? "unknown"),
+      ),
+      (lease) =>
+        finalizer(
+          "release registry lease",
+          () => registry.release(lease),
+          options.onFinalizerError,
+        ).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              current = undefined;
+            }),
           ),
-      );
-      const handle: RuntimeLeaseHandle = {
-        registry,
-        assert: () => {
+        ),
+    );
+    const handle: RuntimeLeaseHandle = {
+      assert: () => {
+        if (current === undefined)
+          throw new LeaseDecisionRequiredError(
+            `Workstream ${state.id} no longer holds a live lease.`,
+          );
+        registry.assertLease(current);
+      },
+      renew: Effect.suspend(() =>
+        registryEffect("renew registry lease", () => {
           if (current === undefined)
             throw new LeaseDecisionRequiredError(
               `Workstream ${state.id} no longer holds a live lease.`,
             );
-          registry.assertLease(current);
-        },
-        renew: Effect.suspend(() =>
-          registryEffect("renew registry lease", () => {
-            if (current === undefined)
-              throw new LeaseDecisionRequiredError(
-                `Workstream ${state.id} no longer holds a live lease.`,
-              );
-            current = registry.renew(current);
-          }),
-        ),
-      };
-      store.effects.bindMutationGuard(handle.assert);
-      if (
-        owner.sessionId !== state.coordinator.sessionId ||
-        owner.sessionFile !== state.coordinator.sessionFile
-      )
-        yield* store.effects.adopt(owner);
-      return handle;
-    }),
-  );
+          current = registry.renew(current);
+        }),
+      ),
+    };
+    options.store.effects.bindMutationGuard(handle.assert);
+    if (
+      owner.sessionId !== state.coordinator.sessionId ||
+      owner.sessionFile !== state.coordinator.sessionFile
+    )
+      yield* options.store.effects.adopt(owner);
+    return handle;
+  });
 }
+
+/** Immutable native Pi operations used by the cohesive runtime resource. */
+export const runtimePi = {
+  createSession: createWorkerSessionEffect,
+  readReport: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+    pi("read worker report", () => readWorkgraphReportResult(sessionFile, generation)),
+  readText: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+    pi("read worker text", () => readTerminalText(sessionFile, generation)),
+  observeFailure: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+    pi("observe worker failure", () => observeNativeFailure(sessionFile, generation)),
+  models: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+    pi("read effective models", () => effectiveModelObservations(sessionFile, generation)),
+  started: hasNativeAgentStarted,
+  settled: hasNativeAgentSettled,
+};
 
 function registryEffect<A>(operation: string, run: () => A) {
   return Effect.try({
@@ -279,55 +204,20 @@ function registryEffect<A>(operation: string, run: () => A) {
   });
 }
 
-function finalizer(operation: string, run: () => void): Effect.Effect<void> {
+function finalizer(
+  operation: string,
+  run: () => void,
+  onError: ((error: RuntimeRegistryError) => Effect.Effect<void, RuntimeHostError>) | undefined,
+): Effect.Effect<void> {
   return Effect.sync(run).pipe(
-    Effect.catchCause((cause) =>
-      Effect.die(new RuntimeRegistryError({ operation, cause: Cause.squash(cause) })),
-    ),
+    Effect.catchCause((cause) => {
+      const error = new RuntimeRegistryError({ operation, cause: Cause.squash(cause) });
+      const report = onError?.(error) ?? Effect.void;
+      return report.pipe(Effect.ignore, Effect.andThen(Effect.die(error)));
+    }),
   );
-}
-
-function hostService(options: RuntimeLayerOptions): RuntimeHost["Service"] {
-  const host = (
-    operation: string,
-    effect: Effect.Effect<void, RuntimeHostError>,
-  ): Effect.Effect<void, RuntimeHostError> =>
-    effect.pipe(
-      Effect.mapError((cause) =>
-        cause instanceof RuntimeHostError ? cause : new RuntimeHostError({ operation, cause }),
-      ),
-    );
-  return {
-    deliver: (id, state) => host("deliver result", options.onResult(id, state)),
-    state: (state) => host("publish state", options.onState(state)),
-    error: (error) => host("report error", options.onError(error)),
-  };
 }
 
 function pi<A>(operation: string, run: () => A) {
   return Effect.try({ try: run, catch: (cause) => new PiObservationError({ operation, cause }) });
-}
-function readWorkgraphReportResultEffect(
-  sessionFile: string,
-  generation: { runId: string; nodeId: string },
-) {
-  return pi("read worker report", () => readWorkgraphReportResult(sessionFile, generation));
-}
-function readTerminalTextEffect(
-  sessionFile: string,
-  generation: { runId: string; nodeId: string },
-) {
-  return pi("read worker text", () => readTerminalText(sessionFile, generation));
-}
-function observeNativeFailureEffect(
-  sessionFile: string,
-  generation: { runId: string; nodeId: string },
-) {
-  return pi("observe worker failure", () => observeNativeFailure(sessionFile, generation));
-}
-function effectiveModelObservationsEffect(
-  sessionFile: string,
-  generation: { runId: string; nodeId: string },
-) {
-  return pi("read effective models", () => effectiveModelObservations(sessionFile, generation));
 }

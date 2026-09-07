@@ -3,19 +3,18 @@ import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import {
   Cause,
-  type Clock,
+  Clock,
   Data,
-  Deferred,
   Effect,
   Exit,
   Fiber,
+  FiberSet,
   type FileSystem,
-  ManagedRuntime,
   Option,
   type Path,
-  Queue,
-  Ref,
   Schedule,
+  Scope,
+  Semaphore,
 } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import type { GitFailure, GitRepository, WorktreePlacement } from "./git.js";
@@ -30,6 +29,7 @@ import {
 } from "./herdr.js";
 import type { WorkerLaunchError } from "./herdr-launch.js";
 import {
+  loadModelPolicyEffect,
   type ModelPolicy,
   type ModelPolicyError,
   resolveSelection,
@@ -41,7 +41,7 @@ import type {
   PiSessionError,
 } from "./pi-process.js";
 import { LeaseDecisionRequiredError, type LeaseOwner, type WorkgraphRegistry } from "./registry.js";
-import type { ThinkingLevel } from "./types.js";
+import type { ThinkingLevel, WorkerIdentity } from "./types.js";
 import type {
   StoreEffect,
   WorkAssignment,
@@ -53,18 +53,13 @@ import type {
   WorkstreamStoreError,
 } from "./workstream.js";
 import {
-  makeRuntimeLayer,
+  acquireRuntimeLease,
   type PiObservationError,
-  RuntimeGit,
-  RuntimeHerdr,
-  RuntimeHost,
   type RuntimeHostError,
-  RuntimeLease,
-  RuntimePi,
-  RuntimePolicy,
+  type RuntimeLeaseHandle,
   RuntimeRegistryError,
-  RuntimeStore,
   type RuntimeWorkerPort,
+  runtimePi,
 } from "./workstream-runtime-services.js";
 import { WorkstreamStoreOperationError } from "./workstream-state.js";
 
@@ -122,62 +117,34 @@ export type RuntimeError =
   | RuntimeHostError
   | RuntimeRegistryError
   | LeaseDecisionRequiredError;
-export type RuntimeServices =
-  | RuntimeStore
-  | RuntimeGit
-  | RuntimeHerdr
-  | RuntimePolicy
-  | RuntimePi
-  | RuntimeHost
-  | RuntimeLease
-  | FileSystem.FileSystem
-  | Path.Path;
-export type RuntimeEffect<A, E = RuntimeError> = Effect.Effect<A, E, RuntimeServices>;
-type OperationRequest = {
-  state: "queued" | "running" | "cancelled" | "settled";
-  readonly cancel: Deferred.Deferred<void>;
-  readonly settled: Deferred.Deferred<void>;
-  run: RuntimeEffect<void, never>;
-  fail: RuntimeEffect<void, never>;
-};
-type RuntimeLifecycle = "open" | "stopping" | "stopped";
+export type RuntimeEffect<A, E = RuntimeError> = Effect.Effect<
+  A,
+  E,
+  FileSystem.FileSystem | Path.Path
+>;
 
 export interface WorkstreamRuntimeEffects {
-  readonly submit: <A, E>(effect: RuntimeEffect<A, E>) => Effect.Effect<A, E | RuntimeError>;
+  readonly submit: <A, E>(effect: RuntimeEffect<A, E>) => RuntimeEffect<A, E | RuntimeError>;
   readonly queue: (
     input: Parameters<WorkstreamStore["assign"]>[0],
     options?: QueueOptions,
-  ) => Effect.Effect<WorkstreamState, RuntimeError>;
-  readonly reconcile: Effect.Effect<WorkstreamState, RuntimeError>;
-  readonly releaseExperiment: (
-    attemptId: string,
-    reason: string,
-  ) => Effect.Effect<WorkstreamState, RuntimeError>;
-  readonly steer: (attemptId: string, instruction: string) => Effect.Effect<void, RuntimeError>;
-  readonly cancel: (attemptId: string) => Effect.Effect<void, RuntimeError>;
-  readonly stop: Effect.Effect<void, RuntimeRegistryError | RuntimeHostError>;
+  ) => RuntimeEffect<WorkstreamState>;
+  readonly reconcile: RuntimeEffect<WorkstreamState>;
+  readonly releaseExperiment: (attemptId: string, reason: string) => RuntimeEffect<WorkstreamState>;
+  readonly steer: (attemptId: string, instruction: string) => RuntimeEffect<void>;
+  readonly cancel: (attemptId: string) => RuntimeEffect<void>;
+  readonly close: Effect.Effect<void, RuntimeRegistryError>;
 }
 
-/** One scoped, serialized execution owner backed by the registry's fenced lease. */
+/** Ready scoped owner for serialized work and its fenced registry lease. */
 export class WorkstreamRuntime {
   private readonly deliveryOwner = randomUUID();
-  private readonly operations = Effect.runSync(Queue.unbounded<OperationRequest>());
-  private readonly ready = Deferred.makeUnsafe<void, RuntimeError>();
-  private readonly startRequested = Deferred.makeUnsafe<void>();
-  private readonly fatal = Deferred.makeUnsafe<never, RuntimeError>();
-  private readonly applicationExit = Deferred.makeUnsafe<Exit.Exit<void, RuntimeError>>();
-  private readonly lifecycle = Ref.makeUnsafe<RuntimeLifecycle>("open");
-  private readonly effectRuntime: ManagedRuntime.ManagedRuntime<RuntimeServices, RuntimeError>;
-  private readonly applicationFiber: Fiber.Fiber<void, RuntimeError>;
-  private readonly stopResult = Deferred.makeUnsafe<
-    void,
-    RuntimeRegistryError | RuntimeHostError
-  >();
-  private readonly clients = new Set<Fiber.Fiber<unknown, unknown>>();
-  private stopRequested = false;
+  private readonly onState: (state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
+  private closed = false;
+  private reconciliationError: string | undefined;
   readonly effects: WorkstreamRuntimeEffects;
 
-  constructor(
+  private constructor(
     readonly store: WorkstreamStore,
     readonly repository: GitRepository,
     readonly workers: RuntimeWorkerPort,
@@ -187,59 +154,148 @@ export class WorkstreamRuntime {
       state: WorkstreamState,
     ) => Effect.Effect<void, RuntimeHostError>,
     readonly onError: (error: Error) => Effect.Effect<void, RuntimeHostError>,
-    private readonly ownership: RuntimeOwnership = {},
+    private readonly lease: RuntimeLeaseHandle,
+    private readonly scope: Scope.Closeable,
+    private readonly semaphore: Semaphore.Semaphore,
+    private readonly fibers: FiberSet.FiberSet<unknown, RuntimeError>,
+    private readonly policy: Effect.Effect<
+      ModelPolicy,
+      ModelPolicyError | PlatformError,
+      FileSystem.FileSystem
+    >,
+    private readonly clock: Clock.Clock | undefined,
+    onState: ((state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>) | undefined,
   ) {
-    this.effectRuntime = ManagedRuntime.make(
-      makeRuntimeLayer({
-        store,
-        repository,
-        workers,
-        onResult,
-        onError,
-        onState: ownership.onState ?? (() => Effect.void),
-        ...ownership,
-      }),
-    );
+    this.onState = onState ?? (() => Effect.void);
     this.effects = {
       submit: <A, E>(effect: RuntimeEffect<A, E>) =>
-        this.provide(this.submit(effect)).pipe(
-          Effect.mapError((error) => this.submissionError(error)),
-        ),
-      queue: (input, options = {}) => this.provide(this.submit(this.queueEffect(input, options))),
-      reconcile: this.provide(this.submit(this.reconcileOperation())),
+        this.submit(effect).pipe(Effect.mapError((error) => this.submissionError(error))),
+      queue: (input, options = {}) => this.submit(this.queueEffect(input, options)),
+      reconcile: this.submit(this.reconcileOperation()),
       releaseExperiment: (attemptId, reason) =>
-        this.provide(this.submit(this.releaseExperimentEffect(attemptId, reason))),
-      steer: (attemptId, instruction) =>
-        this.provide(this.submit(this.steerEffect(attemptId, instruction))),
-      cancel: (attemptId) => this.provide(this.submit(this.cancelEffect(attemptId))),
-      stop: Effect.suspend(() => this.stopEffect()),
+        this.submit(this.releaseExperimentEffect(attemptId, reason)),
+      steer: (attemptId, instruction) => this.submit(this.steerEffect(attemptId, instruction)),
+      cancel: (attemptId) => this.submit(this.cancelEffect(attemptId)),
+      close: Effect.suspend(() => this.close(Exit.void)),
     };
-    this.applicationFiber = this.effectRuntime.runFork(this.application());
-    this.applicationFiber.addObserver((exit) => {
-      Deferred.doneUnsafe(
-        this.ready,
-        Exit.isFailure(exit) ? Effect.failCause(exit.cause) : Effect.void,
+  }
+
+  static acquire(
+    store: WorkstreamStore,
+    repository: GitRepository,
+    workers: RuntimeWorkerPort,
+    launch: WorkstreamLaunch,
+    onResult: (resultId: string, state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>,
+    onError: (error: Error) => Effect.Effect<void, RuntimeHostError>,
+    ownership: RuntimeOwnership = {},
+  ): RuntimeEffect<WorkstreamRuntime> {
+    return Effect.gen(function* () {
+      const scope = yield* Scope.make("sequential");
+      let runtime: WorkstreamRuntime | undefined;
+      yield* Scope.addFinalizerExit(scope, (exit) => {
+        const stopped = ownership.onStopped?.(failureFromExit(exit));
+        if (stopped === undefined) return Effect.void;
+        return stopped.pipe(
+          Effect.catch((error) =>
+            onError(error).pipe(Effect.ignore, Effect.andThen(Effect.die(error))),
+          ),
+        );
+      });
+      const acquisition = Effect.gen(function* () {
+        const lease = yield* acquireRuntimeLease({
+          store,
+          registry: ownership.registry,
+          owner: ownership.owner,
+          priorOwnerLiveness: ownership.priorOwnerLiveness,
+          onFinalizerError: (error) => onError(error),
+        });
+        const semaphore = yield* Semaphore.make(1);
+        const fibers = yield* FiberSet.make<unknown, RuntimeError>();
+        runtime = new WorkstreamRuntime(
+          store,
+          repository,
+          workers,
+          launch,
+          onResult,
+          onError,
+          lease,
+          scope,
+          semaphore,
+          fibers,
+          ownership.policy === undefined
+            ? loadModelPolicyEffect()
+            : Effect.succeed(ownership.policy),
+          ownership.clock,
+          ownership.onState,
+        );
+        const active = runtime;
+        yield* Scope.addFinalizer(
+          scope,
+          Effect.sync(() => {
+            active.closed = true;
+          }),
+        );
+        yield* FiberSet.run(fibers, active.clocked(active.heartbeatLoop()));
+        yield* FiberSet.run(fibers, active.clocked(active.reconciliationLoop()));
+        return active;
+      }).pipe(Scope.provide(scope));
+      const configured =
+        ownership.clock === undefined
+          ? acquisition
+          : Effect.provideService(acquisition, Clock.Clock, ownership.clock);
+      return yield* configured.pipe(
+        Effect.onError((cause) => Scope.close(scope, Exit.failCause(cause))),
       );
-      Deferred.doneUnsafe(this.applicationExit, Effect.succeed(exit));
-      Effect.runSync(Ref.set(this.lifecycle, "stopping"));
-      if (!this.stopRequested) Effect.runFork(this.shutdownEffect(false).pipe(Effect.ignore));
     });
   }
 
-  private application(): RuntimeEffect<void> {
-    return Effect.scoped(
-      Effect.gen(
+  private submit<T, E>(effect: RuntimeEffect<T, E>): RuntimeEffect<T, E | RuntimeError> {
+    return Effect.suspend(() => {
+      if (this.closed)
+        return Effect.fail(new RuntimeStoppedError({ message: "Workstream runtime is stopped." }));
+      const run = Effect.gen(
         function* (this: WorkstreamRuntime) {
-          yield* RuntimeLease;
-          yield* Deferred.succeed(this.ready, undefined);
-          yield* Effect.forkScoped(this.heartbeatLoop());
-          yield* Effect.forkScoped(
-            Deferred.await(this.startRequested).pipe(Effect.andThen(this.reconciliationLoop())),
+          const fiber = yield* FiberSet.run(
+            this.fibers,
+            Effect.exit(
+              this.semaphore.withPermit(
+                Effect.suspend<T, E | RuntimeError, FileSystem.FileSystem | Path.Path>(() =>
+                  this.closed
+                    ? Effect.fail(
+                        new RuntimeStoppedError({ message: "Workstream runtime is stopped." }),
+                      )
+                    : this.ownershipEffect().pipe(Effect.andThen(effect)),
+                ),
+              ),
+            ),
           );
-          yield* Effect.raceFirst(this.operationLoop(), Deferred.await(this.fatal));
+          const exit = yield* Fiber.join(fiber).pipe(
+            Effect.onInterrupt(() => Fiber.interrupt(fiber).pipe(Effect.asVoid)),
+          );
+          return yield* exit;
         }.bind(this),
+      );
+      return this.clocked(run);
+    });
+  }
+
+  private close(exit: Exit.Exit<unknown, RuntimeError>): Effect.Effect<void, RuntimeRegistryError> {
+    return Scope.close(this.scope, exit).pipe(
+      Effect.catchCause((cause) =>
+        Effect.fail(
+          new RuntimeRegistryError({
+            operation: "close workstream runtime",
+            cause: Cause.squash(cause),
+          }),
+        ),
       ),
-    ).pipe(Effect.ensuring(this.closeOperations()));
+    );
+  }
+
+  private clocked<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> {
+    return this.clock === undefined
+      ? effect
+      : Effect.provideService(effect, Clock.Clock, this.clock);
   }
 
   private runtimeSync<A>(operation: string, run: () => A): RuntimeEffect<A, RuntimeOperationError> {
@@ -252,7 +308,7 @@ export class WorkstreamRuntime {
   private storeEffect<A>(
     run: (store: WorkstreamStoreEffects) => StoreEffect<A>,
   ): RuntimeEffect<A, WorkstreamStoreError | LeaseDecisionRequiredError> {
-    return Effect.flatMap(RuntimeStore, ({ effects }) => run(effects)).pipe(
+    return run(this.store.effects).pipe(
       Effect.mapError((error) =>
         error instanceof WorkstreamStoreOperationError &&
         error.cause instanceof LeaseDecisionRequiredError
@@ -263,162 +319,58 @@ export class WorkstreamRuntime {
   }
 
   private gitEffect<A>(
-    run: (repository: RuntimeGit["Service"]["effects"]) => Effect.Effect<A, GitFailure>,
+    run: (repository: GitRepository["effects"]) => Effect.Effect<A, GitFailure>,
   ): RuntimeEffect<A, GitFailure> {
-    return Effect.flatMap(RuntimeGit, ({ effects }) => run(effects));
+    return run(this.repository.effects);
   }
 
   private herdrEffect<A, E>(
-    run: (workers: RuntimeHerdr["Service"]["effects"]) => RuntimeEffect<A, E>,
+    run: (workers: RuntimeWorkerPort["effects"]) => RuntimeEffect<A, E>,
   ): RuntimeEffect<A, E> {
-    return Effect.flatMap(RuntimeHerdr, ({ effects }) => run(effects));
+    return run(this.workers.effects);
   }
 
   private ownershipEffect(): RuntimeEffect<
     void,
     LeaseDecisionRequiredError | RuntimeRegistryError
   > {
-    return Effect.flatMap(RuntimeLease, (lease) =>
-      Effect.try({
-        try: lease.assert,
-        catch: (cause) =>
-          cause instanceof LeaseDecisionRequiredError
-            ? cause
-            : new RuntimeRegistryError({ operation: "assert registry lease", cause }),
-      }),
-    );
-  }
-
-  private operationLoop(): RuntimeEffect<void, never> {
-    return Effect.suspend(() =>
-      Queue.take(this.operations).pipe(
-        Effect.flatMap((request) => request.run.pipe(Effect.andThen(this.operationLoop()))),
-      ),
-    );
-  }
-
-  private closeOperations(): RuntimeEffect<void, never> {
-    const drain: RuntimeEffect<void, never> = Effect.suspend(() =>
-      Queue.poll(this.operations).pipe(
-        Effect.flatMap((request) =>
-          Option.isNone(request) ? Effect.void : request.value.fail.pipe(Effect.andThen(drain)),
-        ),
-      ),
-    );
-    return drain.pipe(Effect.andThen(Queue.shutdown(this.operations)), Effect.asVoid);
-  }
-
-  private submit<T, E>(effect: RuntimeEffect<T, E>): RuntimeEffect<T, E | RuntimeError> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        yield* Deferred.await(this.ready);
-        yield* this.acceptingEffect();
-        const reply = yield* Deferred.make<T, E | RuntimeError>();
-        const cancel = yield* Deferred.make<void>();
-        const settled = yield* Deferred.make<void>();
-        const stopped = new RuntimeStoppedError({ message: "Workstream runtime is stopped." });
-        const request: OperationRequest = {
-          state: "queued",
-          cancel,
-          settled,
-          run: Effect.void,
-          fail: Effect.void,
-        };
-        request.run = Effect.suspend(() => {
-          if (request.state === "cancelled" || request.state === "settled") return Effect.void;
-          request.state = "running";
-          return Effect.exit(
-            Effect.raceFirst(
-              this.ownershipEffect().pipe(Effect.andThen(effect)),
-              Deferred.await(cancel).pipe(Effect.andThen(Effect.interrupt)),
-            ),
-          ).pipe(
-            Effect.flatMap((exit) => Deferred.done(reply, exit)),
-            Effect.ensuring(
-              Effect.sync(() => {
-                request.state = "settled";
-              }).pipe(Effect.andThen(Deferred.succeed(settled, undefined)), Effect.asVoid),
-            ),
-            Effect.asVoid,
-          );
-        });
-        request.fail = Effect.suspend(() => {
-          if (request.state === "settled") return Effect.void;
-          request.state = "settled";
-          return Deferred.fail(reply, stopped).pipe(
-            Effect.andThen(Deferred.succeed(settled, undefined)),
-            Effect.asVoid,
-          );
-        });
-        const cancelRequest = Effect.suspend(() => {
-          if (request.state === "queued") {
-            request.state = "cancelled";
-            return Deferred.interrupt(reply).pipe(
-              Effect.andThen(Deferred.succeed(settled, undefined)),
-              Effect.asVoid,
-            );
-          }
-          if (request.state === "running")
-            return Deferred.succeed(cancel, undefined).pipe(
-              Effect.andThen(Deferred.await(settled)),
-              Effect.asVoid,
-            );
-          return Effect.void;
-        });
-        return yield* Queue.offer(this.operations, request).pipe(
-          Effect.flatMap((offered) => {
-            if (!offered) return Effect.fail(stopped);
-            return Effect.raceFirst(
-              Deferred.await(reply),
-              Deferred.await(this.applicationExit).pipe(
-                Effect.flatMap((exit) =>
-                  Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)
-                    ? Effect.failCause(exit.cause)
-                    : Effect.fail(stopped),
-                ),
-              ),
-            );
-          }),
-          Effect.onInterrupt(() => cancelRequest),
-        );
-      }.bind(this),
-    );
-  }
-
-  private acceptingEffect(): RuntimeEffect<void, RuntimeStoppedError> {
-    return Effect.flatMap(Ref.get(this.lifecycle), (state) =>
-      state === "open"
-        ? Effect.void
-        : Effect.fail(
-            new RuntimeStoppedError({
-              message: "Workstream runtime is stopped.",
-            }),
-          ),
-    );
+    return Effect.try({
+      try: this.lease.assert,
+      catch: (cause) =>
+        cause instanceof LeaseDecisionRequiredError
+          ? cause
+          : new RuntimeRegistryError({ operation: "assert registry lease", cause }),
+    });
   }
 
   private heartbeatLoop(): RuntimeEffect<void> {
-    const heartbeat = Effect.flatMap(RuntimeLease, (lease) => lease.renew);
-    return heartbeat.pipe(
+    return this.lease.renew.pipe(
       Effect.repeat(Schedule.spaced("5 seconds")),
       Effect.asVoid,
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),
         (cause) => {
           const failure = Cause.squash(cause);
-          const error = failure instanceof Error ? failure : new Error(String(failure));
           const fatal =
             failure instanceof LeaseDecisionRequiredError || failure instanceof RuntimeRegistryError
               ? failure
               : new RuntimeRegistryError({ operation: "renew registry lease", cause: failure });
-          return Effect.flatMap(RuntimeHost, (host) => host.error(error)).pipe(
-            Effect.ignore,
-            Effect.andThen(Deferred.fail(this.fatal, fatal)),
-            Effect.asVoid,
-          );
+          return this.terminate(fatal);
         },
       ),
     );
+  }
+
+  private terminate(fatal: RuntimeError): RuntimeEffect<void> {
+    return Effect.suspend(() => {
+      if (this.closed) return Effect.void;
+      this.closed = true;
+      return this.onError(fatal).pipe(
+        Effect.ignore,
+        Effect.andThen(this.close(Exit.fail(fatal))),
+        Effect.asVoid,
+      );
+    });
   }
 
   private reconciliationLoop(): RuntimeEffect<void> {
@@ -430,33 +382,20 @@ export class WorkstreamRuntime {
         (cause) => {
           const failure = Cause.squash(cause);
           const error = failure instanceof Error ? failure : new Error(String(failure));
+          if (
+            failure instanceof LeaseDecisionRequiredError ||
+            failure instanceof RuntimeRegistryError
+          )
+            return this.terminate(failure);
           const detail = error.message;
           if (detail === this.reconciliationError) return Effect.void;
           this.reconciliationError = detail;
-          return Effect.flatMap(RuntimeHost, (host) => host.error(error)).pipe(Effect.ignore);
+          return this.onError(error).pipe(Effect.ignore);
         },
       ),
       Effect.repeat(Schedule.forever),
       Effect.asVoid,
     );
-  }
-
-  private reconciliationError: string | undefined;
-
-  private provide<A, E>(effect: RuntimeEffect<A, E>): Effect.Effect<A, E | RuntimeError> {
-    return Effect.suspend(() => {
-      if (Ref.getUnsafe(this.lifecycle) !== "open")
-        return Effect.fail(new RuntimeStoppedError({ message: "Workstream runtime is stopped." }));
-      return Effect.callback<A, E | RuntimeError>((resume) => {
-        const fiber = this.effectRuntime.runFork(effect);
-        this.clients.add(fiber);
-        fiber.addObserver((exit) => {
-          this.clients.delete(fiber);
-          resume(Exit.isSuccess(exit) ? Effect.succeed(exit.value) : Effect.failCause(exit.cause));
-        });
-        return Fiber.interrupt(fiber).pipe(Effect.asVoid);
-      });
-    });
   }
 
   private submissionError<E>(error: E | RuntimeError): E | RuntimeError {
@@ -465,96 +404,13 @@ export class WorkstreamRuntime {
       : error;
   }
 
-  start(): void {
-    Deferred.doneUnsafe(this.startRequested, Effect.void);
-  }
-
-  private stopEffect(): Effect.Effect<void, RuntimeRegistryError | RuntimeHostError> {
-    return this.shutdownEffect(true);
-  }
-
-  private shutdownEffect(
-    interruptApplication: boolean,
-  ): Effect.Effect<void, RuntimeRegistryError | RuntimeHostError> {
-    if (this.stopRequested) return Deferred.await(this.stopResult);
-    this.stopRequested = true;
-    Effect.runSync(Ref.update(this.lifecycle, (state) => (state === "open" ? "stopping" : state)));
-    const close = Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        if (interruptApplication) {
-          yield* Fiber.interrupt(this.applicationFiber);
-          yield* Fiber.await(this.applicationFiber);
-        }
-        yield* Effect.forEach([...this.clients], (fiber) => Fiber.await(fiber), {
-          discard: true,
-        });
-        yield* this.effectRuntime.disposeEffect.pipe(
-          Effect.catchCause((cause) =>
-            Effect.fail(
-              new RuntimeRegistryError({
-                operation: "dispose runtime services",
-                cause: Cause.squash(cause),
-              }),
-            ),
-          ),
-        );
-      }.bind(this),
-    );
-    const shutdown = Effect.exit(close).pipe(
-      Effect.flatMap((closeExit) => {
-        const failure = Exit.isFailure(closeExit) ? Cause.squash(closeExit.cause) : undefined;
-        const error =
-          failure === undefined
-            ? undefined
-            : failure instanceof Error
-              ? failure
-              : new Error("Runtime shutdown failed with a non-Error cause.", { cause: failure });
-        const report =
-          error === undefined ? Effect.void : this.onError(error).pipe(Effect.ignoreCause);
-        const stopped = this.ownershipStopped(error);
-        return report.pipe(
-          Effect.andThen(stopped),
-          Effect.andThen(
-            Exit.isSuccess(closeExit) ? Effect.void : Effect.failCause(closeExit.cause),
-          ),
-        );
-      }),
-      Effect.ensuring(Ref.set(this.lifecycle, "stopped")),
-    );
-    return Effect.uninterruptible(
-      Effect.exit(shutdown).pipe(
-        Effect.tap((exit) => Deferred.done(this.stopResult, exit)),
-        Effect.flatMap((exit) =>
-          Exit.isSuccess(exit) ? Effect.void : Effect.failCause(exit.cause),
-        ),
-      ),
-    );
-  }
-
-  private ownershipStopped(error: Error | undefined): Effect.Effect<void, RuntimeHostError> {
-    const stopped = this.ownership.onStopped?.(error);
-    if (stopped === undefined) return Effect.void;
-    return stopped;
-  }
-
-  stop(): Promise<void> {
-    return Effect.runPromise(this.effects.stop);
-  }
-
-  queue(
-    input: Parameters<WorkstreamStore["assign"]>[0],
-    options: QueueOptions = {},
-  ): Promise<WorkstreamState> {
-    return Effect.runPromise(this.effects.queue(input, options));
-  }
-
   private queueEffect(
     input: Parameters<WorkstreamStore["assign"]>[0],
     options: QueueOptions,
   ): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const policy = yield* (yield* RuntimePolicy).policy;
+        const policy = yield* this.policy;
         const baseRevision = yield* this.resolveQueueBaseEffect(input, options);
         const attempts = yield* this.runtimeSync("prepare queued attempt", () =>
           input.capability === "implement"
@@ -613,7 +469,7 @@ export class WorkstreamRuntime {
             discard: true,
           });
         const reconciled = yield* this.storeEffect((store) => store.load());
-        yield* (yield* RuntimeHost).state(reconciled);
+        yield* this.onState(reconciled);
         return reconciled;
       }.bind(this),
     );
@@ -639,6 +495,8 @@ export class WorkstreamRuntime {
   }
 
   private preserveExistingBoundary(item: WorkAttempt): RuntimeEffect<boolean> {
+    if (item.state === "cancel_requested" && item.cleanup?.state === "completed")
+      return this.storeEffect((store) => store.finishCleanup(item.id)).pipe(Effect.as(true));
     if (item.experimentRelease?.state === "blocked")
       return this.runtimeSync("preserve blocked experiment release", () => {
         throw new Error(required(item.experimentRelease?.error, "experiment release blocker"));
@@ -670,7 +528,7 @@ export class WorkstreamRuntime {
         const attempt = findAttempt(latest, id);
         if (attempt.error === error.message) return;
         yield* this.storeEffect((store) => store.recordAttention(id, error.message));
-        yield* (yield* RuntimeHost).error(new Error(`Attempt ${id}: ${error.message}`));
+        yield* this.onError(new Error(`Attempt ${id}: ${error.message}`));
       }.bind(this),
     );
   }
@@ -685,9 +543,7 @@ export class WorkstreamRuntime {
         );
         const latest = yield* this.storeEffect((store) => store.load());
         const deliveryEffect = this.ownershipEffect().pipe(
-          Effect.andThen(
-            Effect.flatMap(RuntimeHost, (host) => host.deliver(delivery.resultId, latest)),
-          ),
+          Effect.andThen(this.onResult(delivery.resultId, latest)),
           Effect.andThen(this.storeEffect((store) => store.markDelivered(delivery.resultId))),
         );
         yield* deliveryEffect.pipe(
@@ -701,10 +557,6 @@ export class WorkstreamRuntime {
     );
   }
 
-  reconcile(): Promise<WorkstreamState> {
-    return Effect.runPromise(this.effects.reconcile);
-  }
-
   private advance(id: string): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
@@ -712,6 +564,11 @@ export class WorkstreamRuntime {
         const attempt = findAttempt(state, id);
         const assignment = findAssignment(state, attempt.assignmentId);
         if (attempt.cleanup?.state === "completed") return;
+        if (attempt.state === "cancel_requested") {
+          yield* this.beginCleanupIfNeeded(attempt);
+          yield* this.cleanup(id);
+          return;
+        }
         if (requiresLaunch(attempt)) {
           if (state.lifecycle.state === "active")
             yield* this.launchAttempt(state, attempt, assignment);
@@ -742,7 +599,7 @@ export class WorkstreamRuntime {
             : initial;
         const worker = required(attempt.worker, "worker identity");
         const observation = yield* this.herdrEffect((workers) => workers.observe(worker));
-        const pi = yield* RuntimePi;
+        const pi = runtimePi;
         const started = pi.started(worker.sessionFile, state.id, attempt.id);
         if (started && attempt.submission !== "started")
           yield* this.storeEffect((store) => store.markSubmission(attempt.id, "started"));
@@ -904,7 +761,7 @@ export class WorkstreamRuntime {
           workerCwd,
           baseRevision,
         );
-        const pi = yield* RuntimePi;
+        const pi = runtimePi;
         const sessionFile = yield* pi.createSession(sessionRequest);
         yield* this.storeEffect((store) => store.recordSessionFile(attempt.id, sessionFile));
         const models = required(attempt.models, "assignment models");
@@ -938,7 +795,7 @@ export class WorkstreamRuntime {
         const resultId = attempt.resultId ?? `result-${attempt.id}`;
         if (!state.results.some((item) => item.id === resultId))
           yield* this.retainNewResult(state, attempt, assignment, sessionFile, resultId);
-        const effectiveModels = yield* (yield* RuntimePi).models(sessionFile, generation);
+        const effectiveModels = yield* runtimePi.models(sessionFile, generation);
         yield* this.storeEffect((store) =>
           store.settleAttempt({ id: attempt.id, resultId, effectiveModels }),
         );
@@ -957,7 +814,7 @@ export class WorkstreamRuntime {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const generation = { runId: state.id, nodeId: attempt.id };
-        const pi = yield* RuntimePi;
+        const pi = runtimePi;
         const read = yield* pi.readReport(sessionFile, generation);
         const base = {
           id: resultId,
@@ -1231,10 +1088,6 @@ export class WorkstreamRuntime {
     ).pipe(Effect.asVoid);
   }
 
-  releaseExperiment(attemptId: string, reason: string): Promise<WorkstreamState> {
-    return Effect.runPromise(this.effects.releaseExperiment(attemptId, reason));
-  }
-
   private releaseExperimentEffect(
     attemptId: string,
     reason: string,
@@ -1294,10 +1147,6 @@ export class WorkstreamRuntime {
     );
   }
 
-  steer(attemptId: string, instruction: string): Promise<void> {
-    return Effect.runPromise(this.effects.steer(attemptId, instruction));
-  }
-
   private steerEffect(attemptId: string, instruction: string): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
@@ -1323,51 +1172,89 @@ export class WorkstreamRuntime {
     );
   }
 
-  cancel(attemptId: string): Promise<void> {
-    return Effect.runPromise(this.effects.cancel(attemptId));
-  }
-
   private cancelEffect(attemptId: string): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const state = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(state, attemptId);
-        if (attempt.state !== "queued")
-          yield* this.runtimeSync("validate cancellation request", () => {
-            if (attempt.state !== "running" && attempt.state !== "starting")
-              throw new Error("Attempt is not active.");
-          });
-        let worker = attempt.worker;
-        if (
-          attempt.state === "starting" &&
-          attempt.sessionFile !== undefined &&
-          attempt.launchPane === undefined &&
-          worker === undefined
-        ) {
-          const assignment = findAssignment(state, attempt.assignmentId);
-          const recovered = yield* this.herdrEffect((workers) =>
-            workers.recover(
-              workerRecoveryRequest(this.launch.workspaceId, state, attempt, assignment),
+        yield* this.validateCancellation(attempt);
+        const worker = yield* this.recoverCancellationWorker(state, attempt);
+        yield* this.storeEffect((store) => store.cancelAttempt(attemptId));
+        if (attempt.state === "starting" && hasProvenNoNativeLaunch(attempt))
+          return yield* this.finishUnlaunchedCancellation(attemptId);
+        yield* this.cancelOwnedWorker(attemptId, attempt.state, worker);
+      }.bind(this),
+    );
+  }
+
+  private validateCancellation(attempt: WorkAttempt): RuntimeEffect<void> {
+    return this.runtimeSync("validate cancellation request", () => {
+      if (!["queued", "running", "starting"].includes(attempt.state))
+        throw new Error("Attempt is not active.");
+    });
+  }
+
+  private recoverCancellationWorker(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+  ): RuntimeEffect<WorkerIdentity | undefined> {
+    if (
+      attempt.state !== "starting" ||
+      attempt.sessionFile === undefined ||
+      attempt.launchPane !== undefined ||
+      attempt.worker !== undefined
+    )
+      return Effect.succeed(attempt.worker);
+    const assignment = findAssignment(state, attempt.assignmentId);
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const recovered = yield* this.herdrEffect((workers) =>
+          workers.recover(
+            workerRecoveryRequest(this.launch.workspaceId, state, attempt, assignment),
+          ),
+        );
+        if (recovered === undefined) return undefined;
+        yield* this.storeEffect((store) => store.recordWorker(attempt.id, recovered.identity));
+        return recovered.identity;
+      }.bind(this),
+    );
+  }
+
+  private finishUnlaunchedCancellation(attemptId: string): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const cancelled = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
+        yield* this.beginCleanupIfNeeded(cancelled);
+        yield* this.storeEffect((store) => store.markWorkerClosed(attemptId));
+        yield* this.cleanup(attemptId);
+      }.bind(this),
+    );
+  }
+
+  private cancelOwnedWorker(
+    attemptId: string,
+    state: WorkAttempt["state"],
+    worker: WorkerIdentity | undefined,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        let interruptionError: HerdrProtocolError | undefined;
+        if (state !== "queued" && worker !== undefined)
+          yield* this.herdrEffect((workers) => workers.interrupt(worker)).pipe(
+            Effect.catch((error) =>
+              Effect.sync(() => {
+                interruptionError = error;
+              }),
             ),
           );
-          if (recovered !== undefined) {
-            yield* this.storeEffect((store) => store.recordWorker(attemptId, recovered.identity));
-            worker = recovered.identity;
-          }
-        }
-        yield* this.storeEffect((store) => store.cancelAttempt(attemptId));
-        if (attempt.state === "starting" && hasProvenNoNativeLaunch(attempt)) {
-          const cancelled = findAttempt(
-            yield* this.storeEffect((store) => store.load()),
-            attemptId,
-          );
-          yield* this.beginCleanupIfNeeded(cancelled);
-          yield* this.storeEffect((store) => store.markWorkerClosed(attemptId));
-          yield* this.cleanup(attemptId);
-          return;
-        }
-        if (attempt.state !== "queued" && worker !== undefined)
-          yield* this.herdrEffect((workers) => workers.interrupt(worker));
+        const cancelled = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
+        if (cancelled.placement === undefined) return;
+        yield* this.beginCleanupIfNeeded(cancelled);
+        yield* this.cleanup(attemptId);
+        if (interruptionError === undefined) return;
+        const latest = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
+        if (latest.cleanup?.state !== "completed")
+          yield* this.recordAttemptFailure(attemptId, interruptionError);
       }.bind(this),
     );
   }
@@ -1672,6 +1559,11 @@ function findAssignment(state: WorkstreamState, id: string): WorkAssignment {
 function required<T>(value: T | undefined, label: string): T {
   if (value === undefined) throw new Error(`Missing ${label}.`);
   return value;
+}
+function failureFromExit(exit: Exit.Exit<unknown, unknown>): Error | undefined {
+  if (Exit.isSuccess(exit)) return undefined;
+  const failure = Cause.squash(exit.cause);
+  return failure instanceof Error ? failure : new Error(String(failure));
 }
 function absentResultDetail(failure: NativeFailureCategory | undefined): string {
   switch (failure) {
