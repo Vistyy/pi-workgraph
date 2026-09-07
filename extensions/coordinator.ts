@@ -53,7 +53,8 @@ const WorkstreamPointer = Type.Object({ path: Type.String({ minLength: 1 }) });
 const InputReceipt = HumanInputReceiptSchema;
 const TargetRepository = Type.String({
   minLength: 1,
-  description: "Explicit repository path for the workstream; it may differ from coordinator cwd.",
+  description:
+    "Repository for the workstream, fixed at first delegation. Defaults to coordinator cwd on creation; later calls cannot switch repositories.",
 });
 type HostServices = FileSystem.FileSystem | Path.Path;
 type CoordinatorEffect<T, E = RuntimeError, R = HostServices> = Effect.Effect<T, E, R>;
@@ -63,7 +64,12 @@ const ModelOptions = {
   model: Type.Optional(Type.String()),
   modelReason: Type.Optional(Type.String()),
   thinking: Type.Optional(Thinking),
-  continuationOf: Type.Optional(Type.String()),
+  continuationOf: Type.Optional(
+    Type.String({
+      description:
+        "Exact prior attempt ID in this workstream whose retained session supplies continuation context. Requires a settled worker with completed cleanup and a retained session; with multiple attempts, only the first continues it.",
+    }),
+  ),
   baseRevision: Type.Optional(Type.String({ pattern: "^[0-9a-f]{40,64}$" })),
 };
 
@@ -396,7 +402,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     message: {
       customType: "pi-workgraph-policy",
       content:
-        "[WORKGRAPH]\nUse research, implementation and selective review as needed, not a pipeline. The coordinator interprets human authority and judges evidence. Mutation tools reference genuine retained human inputs; receiving a new receipt does not revise established semantic scope, which changes only through workgraph_intent. Worker reports and extension notifications do not grant authority. After queuing work, do immediately useful independent work if any; otherwise end the turn so retained-result notifications can resume coordination. Do not poll status or run waits for workers. Use workgraph_inspect only when handling uncertainty, blockers, repeated attempts, or truncated content. Finish the requested work through verification and correction within scope.",
+        "[WORKGRAPH]\nAfter queuing work, do immediately useful independent work if any; otherwise end the turn so retained-result notifications can resume coordination. Do not poll status or run waits for workers. Finish the requested work through verification and correction within scope.",
       display: false,
     },
   }));
@@ -605,7 +611,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_review",
     label: "Workgraph Review",
     description:
-      "Delegate an independent review of a retained proposal, artifact or exact revision for a specified concern.",
+      "Delegate read-only independent review of a retained result, artifact, exact revision, or comparison of retained results for a specified concern. Exact-revision evidence must come from that revision, not live working files.",
     promptSnippet: "Delegate selective review",
     parameters: Type.Object({
       id: Type.String(),
@@ -621,7 +627,10 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         }),
         Type.Object({
           kind: Type.Literal("revision"),
-          revision: Type.String(),
+          revision: Type.String({
+            description:
+              "Exact commit already recorded as a retained revision artifact in this workstream; an arbitrary Git commit is not a valid revision subject.",
+          }),
         }),
         Type.Object({
           kind: Type.Literal("comparison"),
@@ -705,7 +714,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_control",
     label: "Workgraph Control",
     description:
-      "Suspend or resume work, cancel or steer a worker, explicitly apply retained maintained output, or release retained output. Apply requires exact attempt, reported source commit, and current destination HEAD; release requires exact attempt and a destructive reason.",
+      "Suspend/resume work, cancel/steer a worker, apply retained maintained output, or release retained output. Settlement never applies output; cancel preserves experiment output. Apply requires exact attempt, reported source commit, and freshly observed destination HEAD under current intent. Release deletes verified owned retained output, requires exact attempt and a destructive reason, and remains available after completion. Inspect resulting effects before retrying uncertain application or release.",
     parameters: Type.Object({
       action: StringEnum([
         "suspend",

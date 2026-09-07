@@ -33,8 +33,9 @@ If the seam is unavailable or changes shape, Calm stays visible and emits a warn
 Activity labels distinguish coordinating, active worker counts, and genuine blocking extension UI prompts awaiting input; a pending notepad item alone does not imply that work is blocked.
 The display clears when no activity remains, and shutdown restores Pi's ordinary working indicator.
 The coordinator gate prevents the extension from loading in worker sessions.
-First delegation creates a workstream automatically; `workgraph_begin` is optional. Pass `targetRepository` to select an explicit repository when it differs from coordinator cwd; that repository is fixed for the workstream and no conversation fork is required.
+First delegation creates a workstream automatically. Pass `targetRepository` to select an explicit repository when it differs from coordinator cwd; that repository is fixed for the workstream and no conversation fork is required.
 Workers run in visible Herdr tabs with ordinary Pi package/configuration loading and fresh context.
+`continuationOf` selects a prior attempt's retained session, not the coordinator conversation; it requires a settled worker with completed cleanup and a session file. With multiple attempts, only the first uses that continuation.
 Worker tab labels show only bounded task text - at most 18 display characters, with readable word-boundary shortening when possible.
 Native agent names retain bounded sanitized assignment text, the capability role, and a short identity suffix so repeated attempts remain distinguishable.
 Use concise, semantic 1-2 word assignment IDs when practical; tab labels are display text only, while native names and stored resource IDs provide identity and recovery.
@@ -54,15 +55,15 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 | `workgraph_review` | Independently inspect a retained result, artifact, exact revision, or comparison of retained results for a specified concern. |
 | `workgraph_intent` | Explicitly record the coordinator's changed semantic scope against an actual retained human input receipt. |
 | `workgraph_inspect` | Unified bounded inspection of overview, retained context, semantic tasks, complete assignments, outcomes/evidence/reports, coordinator judgments, and exact recovery; large content has lossless continuation handles. |
-| `workgraph_control` | Suspend/resume work or cancel/steer a specific live attempt. |
+| `workgraph_control` | Suspend/resume work, cancel/steer a worker, explicitly apply maintained output, or release retained output. |
 | `workgraph_adopt` | Attach retained work without forking the conversation or implicitly resuming suspension. |
 | `workgraph_fork` | Explicitly fork the coordinator conversation into a new no-focus Herdr workspace; workers remain tabs in their owning workspace. |
 | `workgraph_complete` | Record a conclusion, evidence, and limitations after workers and owned resources settle. |
 | `workgraph_models` | Inspect or explicitly change model defaults. |
 | `workgraph_notepad` | Read, add, update, or remove current coordinator-only id/text pending items. |
 
-The coordinator interprets what a human request authorizes and chooses which independent contributions are meaningful.
-Research, experiments, implementation slices, comparison, review, and integration are optional capabilities rather than a prescribed route.
+For delegation choices, change-quality expectations, and evidence judgment, read the [coordination skill](skills/workgraph-coordination/SKILL.md).
+Tool descriptions and parameter schemas explain call-specific contracts; this README covers detailed operating and recovery behavior.
 Receiving a new human input records a lossless receipt but does not change an established semantic scope or make existing assignments stale.
 The first authorized maintained change or disposable experiment may establish intent version 1 from a genuine retained input when the workstream still has only intent version 0.
 After scope is established, delegation defaults to a real authority receipt from the current intent even when a newer input has been retained.
@@ -149,6 +150,7 @@ The active runtime uses workstream format version 5.
 Earlier active versions are preserved for offline inspection and are not migrated, rewritten, or silently adopted.
 Default shared research evidence describes live working files rather than an immutable committed snapshot.
 An explicit base revision is exact Git evidence; an exact-revision review must inspect that commit with Git rather than treating current working files as the revision.
+A review's `revision` subject must already appear as a retained revision artifact in the current workstream; existence in Git alone is insufficient. Result and artifact subjects likewise reference retained workstream evidence, and comparisons require distinct retained results.
 
 ## Runtime and persistence ownership
 
