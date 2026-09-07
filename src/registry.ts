@@ -23,7 +23,7 @@ function decodeStatePathRow(row: NativeSqliteRow): StatePathRow {
  * A discovery locator only. Lifecycle, project identity, aggregate state, and
  * fenced ownership belong to the private per-workstream SQLite database.
  *
- * Existing registries from the superseded schema are never rewritten. Their
+ * Historical rows from the superseded schema are left untouched. Their
  * runs table is a read-only historical fallback; current attachment always
  * writes the minimal locator table.
  */
@@ -67,9 +67,14 @@ export class WorkgraphRegistry {
     this.db
       .prepare(
         `INSERT INTO ${CURRENT_LOCATOR_TABLE}(run_id,state_path) VALUES(?,?)
-         ON CONFLICT(run_id) DO UPDATE SET state_path=excluded.state_path`,
+         ON CONFLICT(run_id) DO NOTHING`,
       )
       .run(reference.runId, reference.statePath);
+    if (
+      readStatePath(this.db, CURRENT_LOCATOR_TABLE, reference.runId)?.statePath !==
+      reference.statePath
+    )
+      throw new Error("Workstream registry identity collision.");
   }
 
   findRun(runId: string): { statePath: string } | undefined {
