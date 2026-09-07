@@ -1,13 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { Clock, Effect } from "effect";
+
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 
 export const HUMAN_INPUT_ENTRY = "pi-workgraph-human-input";
 const NOTE_STATE_ENTRY = "pi-workgraph-coordinator-note-state";
 const NOTE_CONTEXT_TYPE = "pi-workgraph-coordinator-notes";
+const CLEARED_NOTE_CONTEXT =
+  "[COORDINATOR RESPONSE NOTES]\nNo coordinator response notes currently await a later human response.";
 
 export const HumanInputReceiptSchema = Type.Object({
   id: Type.String(),
@@ -212,21 +214,14 @@ export function installCoordinatorNotes(
     });
   });
 
-  pi.on("context", (event) => {
-    const content = formatNoteContext(state);
-    if (content === undefined) return;
-    return {
-      messages: [
-        ...event.messages,
-        {
-          role: "custom" as const,
-          customType: NOTE_CONTEXT_TYPE,
-          content,
-          display: false,
-          timestamp: Effect.runSync(Clock.currentTimeMillis),
-        },
-      ],
-    };
+  pi.on("before_agent_start", (_event, ctx) => {
+    const message = noteReminder(state, ctx);
+    return message === undefined ? undefined : { message };
+  });
+
+  pi.on("session_compact", (_event, ctx) => {
+    const message = noteReminder(state, ctx);
+    if (message !== undefined) pi.sendMessage(message);
   });
 
   pi.registerTool({
@@ -511,6 +506,49 @@ function requiredText(value: string | undefined, message: string): string {
 
 function unique(values: string[]): string[] {
   return [...new Set(values)];
+}
+
+function noteReminder(
+  state: CoordinatorNoteState,
+  ctx: ExtensionContext,
+):
+  | {
+      customType: string;
+      content: string;
+      display: false;
+    }
+  | undefined {
+  const content = noteReminderContent(state, ctx);
+  if (
+    content === undefined ||
+    latestNoteContext(ctx.sessionManager.buildContextEntries()) === content
+  )
+    return undefined;
+  return { customType: NOTE_CONTEXT_TYPE, content, display: false };
+}
+
+function noteReminderContent(
+  state: CoordinatorNoteState,
+  ctx: ExtensionContext,
+): string | undefined {
+  const current = formatNoteContext(state);
+  if (current !== undefined) return current;
+  return ctx.sessionManager.getBranch().some(isNoteContextEntry) ? CLEARED_NOTE_CONTEXT : undefined;
+}
+
+function latestNoteContext(entries: SessionEntry[]): string | undefined {
+  const latest = entries.findLast(isNoteContextEntry);
+  return latest?.content;
+}
+
+function isNoteContextEntry(
+  entry: SessionEntry,
+): entry is Extract<SessionEntry, { type: "custom_message" }> & { content: string } {
+  return (
+    entry.type === "custom_message" &&
+    entry.customType === NOTE_CONTEXT_TYPE &&
+    typeof entry.content === "string"
+  );
 }
 
 function formatNoteContext(state: CoordinatorNoteState): string | undefined {

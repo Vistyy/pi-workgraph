@@ -75,21 +75,27 @@ function latestReceipt(f: Awaited<ReturnType<typeof fixture>>) {
   return Value.Decode(HumanInputReceiptSchema, entry.data);
 }
 
-async function contextText(f: Awaited<ReturnType<typeof fixture>>): Promise<string> {
-  const messages = await f.runner.emitContext([
-    { role: "user", content: "next", timestamp: Effect.runSync(Clock.currentTimeMillis) },
-  ]);
-  return messages
-    .filter((message) => message.role === "custom")
-    .map((message) =>
-      Array.isArray(message.content)
-        ? message.content
-            .filter((part): part is TextContent => part.type === "text")
-            .map((part) => part.text)
-            .join("\n")
-        : message.content,
-    )
-    .join("\n");
+async function reminderText(f: Awaited<ReturnType<typeof fixture>>): Promise<string | undefined> {
+  const result = await f.runner.emitBeforeAgentStart("next", undefined, "Fixture", {
+    cwd: f.session.getCwd(),
+  });
+  const message = result?.messages?.find(
+    (candidate) => candidate.customType === "pi-workgraph-coordinator-notes",
+  );
+  if (message === undefined) return undefined;
+  return Array.isArray(message.content)
+    ? message.content
+        .filter((part): part is TextContent => part.type === "text")
+        .map((part) => part.text)
+        .join("\n")
+    : message.content;
+}
+
+async function appendReminder(
+  f: Awaited<ReturnType<typeof fixture>>,
+  content: string,
+): Promise<void> {
+  f.session.appendCustomMessageEntry("pi-workgraph-coordinator-notes", content, false);
 }
 
 void test("coordinator notes persist visible-answer provenance, partial resolution, superseding, and reload", async () => {
@@ -103,15 +109,27 @@ void test("coordinator notes persist visible-answer provenance, partial resoluti
       ],
     });
     assert.match(JSON.stringify(drafted.content), /not evidence that an answer was shown/);
-    assert.match(await contextText(f), /Drafted but not yet grounded/);
+    assert.match((await reminderText(f)) ?? "", /Drafted but not yet grounded/);
+    const unchangedContext = [
+      {
+        role: "user" as const,
+        content: "next",
+        timestamp: Effect.runSync(Clock.currentTimeMillis),
+      },
+    ];
+    assert.deepEqual(await f.runner.emitContext(unchangedContext), unchangedContext);
+    const firstReminder = await reminderText(f);
+    assert.equal(firstReminder, await reminderText(f));
+    await appendReminder(f, firstReminder ?? "");
+    assert.equal(await reminderText(f), undefined);
 
     await present(f, "Which parser should I use?");
-    let text = await contextText(f);
+    let text = (await reminderText(f)) ?? "";
     assert.match(text, /decision: Need the human's choice of parser/);
     assert.equal(text.includes("Which parser should I use?"), false);
 
     await f.runner.emitInput("Thanks, continue the investigation", undefined, "interactive");
-    text = await contextText(f);
+    text = (await reminderText(f)) ?? "";
     assert.match(text, /decision:/, "unrelated human input does not auto-resolve a note");
 
     await f.call("workgraph_note", {
@@ -133,7 +151,7 @@ void test("coordinator notes persist visible-answer provenance, partial resoluti
         },
       ],
     });
-    text = await contextText(f);
+    text = (await reminderText(f)) ?? "";
     assert.doesNotMatch(text, /one: Need answer/);
     assert.match(text, /two: Need answer/);
 
@@ -148,16 +166,52 @@ void test("coordinator notes persist visible-answer provenance, partial resoluti
       ],
     });
     await present(f, "The latest status narrows the remaining request.");
-    text = await contextText(f);
+    text = (await reminderText(f)) ?? "";
     assert.doesNotMatch(text, /two: Need answer/);
     assert.match(text, /two-follow-up: Need the remaining/);
 
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
     await f.runner.emit({ type: "session_start", reason: "reload" });
-    text = await contextText(f);
+    text = (await reminderText(f)) ?? "";
     assert.doesNotMatch(text, /one: Need answer/);
     assert.doesNotMatch(text, /two: Need answer/);
     assert.match(text, /two-follow-up: Need the remaining/);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("coordinator reminders are redelivered only when compaction removes the persisted message", async () => {
+  const f = await fixture();
+  try {
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    await f.call("workgraph_note", {
+      changes: [
+        { operation: "record", id: "compact-me", summary: "Need a later answer after compaction." },
+      ],
+    });
+    const reminder = (await reminderText(f)) ?? "";
+    await appendReminder(f, reminder);
+    const keptEntryId = f.session.appendMessage({
+      role: "user",
+      content: "A later request",
+      timestamp: Effect.runSync(Clock.currentTimeMillis),
+    });
+    f.session.appendCompaction("Compacted", keptEntryId, 100);
+    const compaction = f.session.getLeafEntry();
+    assert.ok(compaction?.type === "compaction");
+
+    await f.runner.emit({
+      type: "session_compact",
+      compactionEntry: compaction,
+      fromExtension: false,
+      reason: "manual",
+      willRetry: false,
+    });
+
+    assert.equal(f.messages.length, 1);
+    assert.equal(f.messages[0]?.customType, "pi-workgraph-coordinator-notes");
+    assert.match(JSON.stringify(f.messages[0]?.content), /compact-me/);
   } finally {
     await f.dispose();
   }
@@ -185,7 +239,7 @@ void test("coordinator note resolution requires a later genuine receipt and visi
       }),
       /drafted but has no finalized visible assistant answer/,
     );
-    assert.match(await contextText(f), /unshown: Need a later/);
+    assert.match((await reminderText(f)) ?? "", /unshown: Need a later/);
   } finally {
     await f.dispose();
   }
