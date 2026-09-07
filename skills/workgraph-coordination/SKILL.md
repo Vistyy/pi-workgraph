@@ -10,9 +10,21 @@ Use a separate coordinator conversation for unrelated work.
 
 ## Assign useful work
 
-Give research a question and required observations, disposable experiments explicitly authorized effects and a stopping condition, and maintained changes concrete acceptance requirements.
-Make assignments bounded enough that their results can be judged independently.
-Choose separate assignments for different concerns or maintained slices; multiple attempts provide independent views of the same assignment, including across models.
+Use the existing assignment fields to supply enough context and direction that each result can be judged independently:
+
+- Research: put the precise question in `question` and the observations needed to answer it in `expectedEvidence`. Identify the relevant scope and request source references and unknowns, not an architectural decision.
+- Implementation: put the decided change, important relationships, constraints, and worker discretion in `objective`; put observable requirements and verification expectations in `acceptance`. Use diagrams, examples, interface outlines, or prose as the task requires. Resolve consequential gaps before requesting implementation; do not leave the worker to infer what “simpler” or “complete” means.
+- Review: identify the exact `subject` and specific `concern`, including the expected behavior to check. Request discrepancies and supporting evidence, not a blanket approval decision.
+- Disposable experiments: specify the question, permitted effects, and stopping condition; distinguish direct observations from conclusions about production behavior.
+
+Choose separate assignments for independent questions, concerns, or maintained slices; multiple attempts provide independent views of the same assignment, including across models. Do not replace several distinct questions with one broad domain assignment.
+
+Examples of assignment specificity, not additional requirements:
+
+- Instead of “investigate persistence simplification”: “Trace connection creation through attachment. Identify each creation site, the receiving caller, and closure on success or failure. Cite symbols and call sites; report missing ownership evidence. Do not choose a replacement architecture.”
+- Instead of “improve recovery documentation”: “Separate worker closure, output retention, and application in the recovery instructions. Preserve existing commands and authorization restrictions. Remove wording that implies closing a worker deletes its output. Check operational claims against the corresponding commands; return contradictions rather than inventing behavior.”
+- Instead of “review the persistence rewrite”: “At this exact revision, check creation-to-attachment connection ownership on success and failed attachment against the requirement that every acquired connection has a release owner. Report counterexamples or supporting evidence and identify unexamined paths.”
+
 Workers start fresh; request continuation only when a settled worker's retained trajectory is useful. `continuationOf` names that session trajectory only; it must not identify content lineage. Use the explicit maintained-implementation `candidateOf` path when a retained isolated candidate needs correction or integration.
 
 ## Own change quality

@@ -479,7 +479,8 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "workgraph_research",
     label: "Workgraph Research",
-    description: "Delegate bounded research or an explicitly authorized disposable experiment.",
+    description:
+      "Delegate a specific evidence question, not responsibility for choosing the design. Identify the relevant scope and required observations. Disposable experiments also require explicitly authorized effects and a stopping condition.",
     promptSnippet: "Delegate research or a bounded experiment",
     parameters: Type.Object({
       id: Type.String(),
@@ -564,7 +565,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_implement",
     label: "Workgraph Implement",
     description:
-      "Delegate a maintained change under the established human-backed intent. The default keeps current scope even when newer input is retained; changed scope must first be recorded with workgraph_intent.",
+      "Delegate implementation of a bounded, decided change under the established human-backed intent. Include context, intended relationships, constraints, and worker discretion sufficient to execute without inventing the design. Resolve consequential uncertainties before requesting implementation. The default keeps current scope even when newer input is retained; changed scope must first be recorded with workgraph_intent.",
     promptSnippet: "Delegate an authorized maintained change",
     parameters: Type.Object({
       id: Type.String(),
@@ -627,7 +628,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     name: "workgraph_review",
     label: "Workgraph Review",
     description:
-      "Delegate read-only independent review of a retained result, artifact, exact revision, or comparison of retained results for a specified concern. Exact-revision evidence must come from that revision, not live working files.",
+      "Delegate read-only independent review of a retained result, artifact, exact revision, or comparison of retained results for a specific concern. State the expected behavior or constraint to check; request discrepancies and supporting evidence, not an acceptance decision. Exact-revision evidence must come from that revision, not live working files.",
     promptSnippet: "Delegate selective review",
     parameters: Type.Object({
       id: Type.String(),
