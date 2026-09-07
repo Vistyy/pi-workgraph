@@ -273,7 +273,7 @@ void test("presentation adapter hides and restores existing tool and operational
   assert.deepEqual(message.render(80), ["message:pi-workgraph-attention:80"]);
 });
 
-void test("Calm marks successive assistant blocks on their existing first row", () => {
+void test("Calm inserts one dim ASCII separator between successive assistant blocks", () => {
   const state = {
     on: true,
     hiddenTools: new Set(["read"]),
@@ -305,13 +305,13 @@ void test("Calm marks successive assistant blocks on their existing first row", 
   chat.addChild(afterHiddenOperation);
   chat.addChild(fullWidthAssistant);
   const diagnostics: string[] = [];
-  const styledMarkers: string[] = [];
+  const styledSeparators: string[] = [];
   const detach = attachCalmPresentation(
     moduleForFakeRows(),
     state,
     (message) => diagnostics.push(message),
     (text) => {
-      styledMarkers.push(text);
+      styledSeparators.push(text);
       return `\u001b[2m${text}\u001b[22m`;
     },
   );
@@ -321,34 +321,37 @@ void test("Calm marks successive assistant blocks on their existing first row", 
       "",
       "  thinking",
       "  answer",
+      "---",
       "",
-      "·follow-up",
+      " follow-up",
       "  still attached",
       " user message",
       "",
       "  after user",
+      "---",
       "",
-      "· after hidden operation",
+      "  after hidden operation",
+      "---",
       fullWidthText,
     ]);
-    assert.equal(calmLines.length, 12);
+    assert.equal(calmLines.length, 15);
     assert.equal(calmLines[1], "  thinking");
-    assert.equal(calmLines[11], fullWidthText);
-    assert.equal(visibleWidth(calmLines[4] ?? ""), visibleWidth(" follow-up"));
-    assert.equal(calmLines[4], "\u001b]133;B\u0007\u001b[2m·\u001b[22mfollow-up");
-    assert.deepEqual(styledMarkers, ["·", "·"]);
+    assert.equal(calmLines[14], fullWidthText);
+    assert.equal(calmLines[3], "\u001b[2m---\u001b[22m");
+    assert.equal(visibleWidth(calmLines[3] ?? ""), 3);
+    assert.deepEqual(styledSeparators, ["---", "---", "---"]);
     assert.equal(chat.children.length, 11);
     assert.equal(chat.children, originalChildren);
     assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), calmLines.map(stripAnsiLikeTheme));
-    assert.deepEqual(styledMarkers, ["·", "·", "·", "·"]);
+    assert.deepEqual(styledSeparators, ["---", "---", "---", "---", "---", "---"]);
 
-    // The marker consumes the existing one-column output padding, so child and mouse rows do not
-    // move. The blank prefix in the second assistant remains attached to its thinking/content.
-    assert.deepEqual(chat.handleMouse({ y: 3, width }), { y: 0, width });
-    assert.deepEqual(chat.handleMouse({ y: 4, width }), { y: 1, width });
+    // The separator owns exactly one inert mouse row. Existing message rows, including their
+    // thinking padding, keep their original heights and local coordinates.
+    assert.equal(chat.handleMouse({ y: 3, width }), undefined);
+    assert.deepEqual(chat.handleMouse({ y: 4, width }), { y: 0, width });
     assert.deepEqual(
       chat.mouseLayout?.children.map(({ height }) => height),
-      [3, 0, 0, 0, 0, 3, 1, 2, 0, 2, 1],
+      [3, 0, 0, 0, 0, 1, 3, 1, 2, 0, 1, 2, 1, 1],
     );
 
     const visibleToolsChat = new FakeContainer();
@@ -362,11 +365,12 @@ void test("Calm marks successive assistant blocks on their existing first row", 
       "  answer",
       "tool:write:32",
       "tool:write:32",
+      "---",
       "",
-      "·follow-up",
+      " follow-up",
       "  still attached",
     ]);
-    assert.equal(styledMarkers.length, 5);
+    assert.equal(styledSeparators.length, 7);
 
     const thinkingOnlyChat = new FakeContainer();
     thinkingOnlyChat.addChild(new FakeAssistantRow("", "  thinking only"));
@@ -375,17 +379,46 @@ void test("Calm marks successive assistant blocks on their existing first row", 
     assert.deepEqual(thinkingOnlyChat.render(width).map(stripAnsiLikeTheme), [
       "",
       "  thinking only",
+      "---",
       "",
-      "· after thinking",
+      "  after thinking",
     ]);
-    assert.equal(styledMarkers.length, 6);
+    assert.equal(styledSeparators.length, 8);
 
     const emptyEdgesChat = new FakeContainer();
     emptyEdgesChat.addChild(new FakeAssistantRow());
     emptyEdgesChat.addChild(new FakeAssistantRow("only visible block"));
     emptyEdgesChat.addChild(new FakeAssistantRow());
     assert.deepEqual(emptyEdgesChat.render(width), ["only visible block"]);
-    assert.equal(styledMarkers.length, 6);
+    assert.equal(styledSeparators.length, 8);
+
+    // A streaming redraw replaces child output without accumulating separator rows.
+    second.lines.push("  streamed");
+    assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), [
+      "",
+      "  thinking",
+      "  answer",
+      "---",
+      "",
+      " follow-up",
+      "  still attached",
+      "  streamed",
+      " user message",
+      "",
+      "  after user",
+      "---",
+      "",
+      "  after hidden operation",
+      "---",
+      fullWidthText,
+    ]);
+    assert.equal(chat.render(width).filter((line) => stripAnsiLikeTheme(line) === "---").length, 3);
+
+    const narrowChat = new FakeContainer();
+    narrowChat.addChild(new FakeAssistantRow("a"));
+    narrowChat.addChild(new FakeAssistantRow("b"));
+    assert.deepEqual(narrowChat.render(2).map(stripAnsiLikeTheme), ["a", "--", "b"]);
+    assert.ok(narrowChat.render(2).every((line) => visibleWidth(line) <= 2));
 
     state.on = false;
     assert.deepEqual(chat.render(width).map(stripAnsiLikeTheme), [
@@ -398,6 +431,7 @@ void test("Calm marks successive assistant blocks on their existing first row", 
       "",
       " follow-up",
       "  still attached",
+      "  streamed",
       " user message",
       "",
       "  after user",
@@ -406,7 +440,7 @@ void test("Calm marks successive assistant blocks on their existing first row", 
       "  after hidden operation",
       fullWidthText,
     ]);
-    assert.deepEqual(styledMarkers, ["·", "·", "·", "·", "·", "·"]);
+    assert.deepEqual(styledSeparators.length, 16);
     state.on = true;
   } finally {
     detach();
@@ -421,6 +455,7 @@ void test("Calm marks successive assistant blocks on their existing first row", 
     "",
     "\u001b]133;B\u0007 follow-up",
     "  still attached",
+    "  streamed",
     " user message",
     "",
     "  after user",

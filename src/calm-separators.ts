@@ -4,7 +4,12 @@ import { type Component, stripTerminalSequences, visibleWidth } from "@earendil-
 // comes from the installed assistant class, not a potentially different extension dependency.
 // oxlint-disable anti-slop/no-runtime-typeof, anti-slop/no-reflect-get
 const OWNER = Symbol.for("@vistyy/pi-workgraph/calm-separators");
-const MESSAGE_MARKER = "·";
+const MESSAGE_SEPARATOR = "---";
+
+// A render-only, inert row keeps separator clicks out of adjacent message components.
+function separatorComponent(line: string): Component {
+  return { render: () => [line], invalidate: () => {} };
+}
 
 type MouseLayout = {
   readonly width: number;
@@ -51,46 +56,6 @@ function firstVisibleRow(lines: readonly string[]): number | undefined {
   return index === -1 ? undefined : index;
 }
 
-function csiSequenceLength(line: string, index: number): number | undefined {
-  const final = /[\u0040-\u007e]/u.exec(line.slice(index + 2));
-  return final === null ? undefined : final.index + 3;
-}
-
-function terminatedSequenceLength(line: string, index: number): number | undefined {
-  const bell = line.indexOf("\u0007", index + 2);
-  const stringTerminator = line.indexOf("\u001b\\", index + 2);
-  if (bell === -1) return stringTerminator === -1 ? undefined : stringTerminator + 2 - index;
-  if (stringTerminator === -1 || bell < stringTerminator) return bell + 1 - index;
-  return stringTerminator + 2 - index;
-}
-
-function terminalSequenceLength(line: string, index: number): number | undefined {
-  if (line[index] !== "\u001b") return undefined;
-  const kind = line[index + 1];
-  if (kind === "[") return csiSequenceLength(line, index);
-  if (kind === "]" || kind === "_") return terminatedSequenceLength(line, index);
-  return undefined;
-}
-
-function leadingPaddingIndex(line: string): number | undefined {
-  let index = 0;
-  while (index < line.length) {
-    const sequenceLength = terminalSequenceLength(line, index);
-    if (sequenceLength !== undefined) {
-      index += sequenceLength;
-      continue;
-    }
-    return line[index] === " " ? index : undefined;
-  }
-  return undefined;
-}
-
-function markFirstVisibleRow(line: string, style: (text: string) => string): string {
-  const paddingIndex = leadingPaddingIndex(line);
-  if (paddingIndex === undefined) return line;
-  return `${line.slice(0, paddingIndex)}${style(MESSAGE_MARKER)}${line.slice(paddingIndex + 1)}`;
-}
-
 type CalmRender = {
   readonly lines: string[];
   readonly children: { component: Component; height: number }[];
@@ -114,16 +79,16 @@ function renderCalmChildren(
       // A user's background already separates the next assistant block from the previous one.
       hasVisibleAssistant = false;
     }
-    let childLines = rendered;
     if (assistant && visibleRow !== undefined) {
-      if (hasVisibleAssistant) {
-        childLines = [...rendered];
-        childLines[visibleRow] = markFirstVisibleRow(childLines[visibleRow] ?? "", style);
+      if (hasVisibleAssistant && width > 0) {
+        const separator = style(MESSAGE_SEPARATOR.slice(0, Math.floor(width)));
+        lines.push(separator);
+        children.push({ component: separatorComponent(separator), height: 1 });
       }
       hasVisibleAssistant = true;
     }
     children.push({ component: child, height: rendered.length });
-    lines.push(...childLines);
+    lines.push(...rendered);
   }
   return { lines, children };
 }
@@ -162,7 +127,7 @@ export function attachCalmSeparators(
       style,
     );
     // When the host Container has a mouse layout, its dispatcher consumes this render-owned
-    // layout. Original child heights and local coordinates remain unchanged.
+    // layout. Inert separator entries preserve original child heights and local coordinates.
     if (hasMouseLayout) this.mouseLayout = { width, children: rendered.children };
     return rendered.lines;
   };
