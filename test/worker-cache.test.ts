@@ -51,67 +51,43 @@ const objective =
 const attempt = { runId: "fixture", nodeId: "attempt" };
 type SerializedRequest = Static<typeof serializedRequestSchema>;
 
-function sseResponse(chunks: readonly unknown[]): string {
-  return `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
-}
-
-function textResponse(index: number, text: string): string {
-  const id = `fixture-${index}`;
-  return sseResponse([
-    {
-      id,
-      object: "chat.completion.chunk",
-      created: 0,
-      model: "fixture-model",
-      choices: [{ index: 0, delta: { role: "assistant", content: text }, finish_reason: null }],
-    },
-    {
-      id,
-      object: "chat.completion.chunk",
-      created: 0,
-      model: "fixture-model",
-      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-    },
-  ]);
-}
-
-function planToolResponse(index: number, plan: typeof initialPlan): string {
-  const id = `fixture-${index}`;
-  const arguments_ = JSON.stringify({ action: "update", plan });
-  return sseResponse([
-    {
-      id,
-      object: "chat.completion.chunk",
-      created: 0,
-      model: "fixture-model",
-      choices: [
-        {
-          index: 0,
-          delta: {
-            role: "assistant",
-            tool_calls: [
-              {
-                index: 0,
-                id: "plan-call",
-                type: "function",
-                function: { name: "workgraph_plan", arguments: arguments_ },
-              },
-            ],
+function providerResponse(index: number, updatePlan: boolean): string {
+  const delta = updatePlan
+    ? {
+        role: "assistant",
+        tool_calls: [
+          {
+            index: 0,
+            id: "plan-call",
+            type: "function",
+            function: {
+              name: "workgraph_plan",
+              arguments: JSON.stringify({ action: "update", plan: revisedPlan }),
+            },
           },
-          finish_reason: null,
-        },
-      ],
-    },
+        ],
+      }
+    : { role: "assistant", content: "done" };
+  const chunks = [
+    { delta, finish_reason: null, usage: undefined },
     {
-      id,
+      delta: {},
+      finish_reason: updatePlan ? "tool_calls" : "stop",
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+  ].map(({ delta, finish_reason, usage }) => {
+    const chunk = {
+      id: `fixture-${index}`,
       object: "chat.completion.chunk",
       created: 0,
       model: "fixture-model",
-      choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-    },
-  ]);
+      choices: [{ index: 0, delta, finish_reason }],
+    };
+    if (usage === undefined) return chunk;
+    return { ...chunk, usage };
+  });
+  const events = chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`);
+  return `${events.join("")}data: [DONE]\n\n`;
 }
 
 async function requestBody(request: IncomingMessage): Promise<string> {
@@ -159,11 +135,7 @@ async function handleProviderRequest(
       "content-type": "text/event-stream",
       connection: "keep-alive",
     });
-    response.end(
-      requests.length === 2
-        ? planToolResponse(requests.length, revisedPlan)
-        : textResponse(requests.length, "done"),
-    );
+    response.end(providerResponse(requests.length, requests.length === 2));
   } catch {
     response.destroy();
   }
