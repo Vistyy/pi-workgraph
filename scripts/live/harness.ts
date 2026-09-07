@@ -28,7 +28,7 @@ const LiveEnvironmentConfig = Config.all({
   sourceAgent: Config.string("PI_CODING_AGENT_DIR").pipe(Config.option),
   herdrExtension: Config.string("PI_WORKGRAPH_HERDR_EXTENSION").pipe(Config.option),
   coordinatorModel: Config.string("PI_WORKGRAPH_COORDINATOR_MODEL").pipe(
-    Config.withDefault("openai-codex/gpt-6-astra"),
+    Config.withDefault("openai-codex/gpt-5.6-luna"),
   ),
   currentWorkspace: Config.string("HERDR_WORKSPACE_ID").pipe(Config.option),
 });
