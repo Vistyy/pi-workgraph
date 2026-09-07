@@ -78,8 +78,8 @@ const EXECUTOR_TARGET: ModelTarget = {
 export const DEFAULT_WORKER_POOL: ModelTarget[] = [
   RESEARCH_TARGET,
   EXECUTOR_TARGET,
-  { model: "deepseek/deepseek-v4-flash", thinking: "high" },
-  { model: "zai/glm-5.3-flash", thinking: "high" },
+  { model: "opencode-go/deepseek-v4-flash", thinking: "high" },
+  { model: "opencode-go/glm-5.3-flash", thinking: "high" },
   { model: "openai-codex/gpt-5.6-terra", thinking: "high" },
 ];
 

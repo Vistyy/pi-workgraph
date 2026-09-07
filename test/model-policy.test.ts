@@ -31,8 +31,8 @@ await test("policy defaults, read-only legacy mapping and explicit current-role 
       workerPool: [
         { model: "opencode-go/muse-spark-1.3-contributor", thinking: "high" },
         { model: "openai-codex/gpt-5.6-luna", thinking: "high" },
-        { model: "deepseek/deepseek-v4-flash", thinking: "high" },
-        { model: "zai/glm-5.3-flash", thinking: "high" },
+        { model: "opencode-go/deepseek-v4-flash", thinking: "high" },
+        { model: "opencode-go/glm-5.3-flash", thinking: "high" },
         { model: "openai-codex/gpt-5.6-terra", thinking: "high" },
       ],
     });
