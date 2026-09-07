@@ -30,10 +30,10 @@ The default hidden tool-name list covers Pi builtins, installed search tools, Wo
 Override it with `PI_WORKGRAPH_CALM_HIDDEN_TOOLS=tool_a,tool_b` before starting Pi.
 The internal adapter targets Pi's exported `ToolExecutionComponent` and `CustomMessageComponent` render seams, so it is compatibility-limited to Pi versions exposing those classes.
 If the seam is unavailable or changes shape, Calm stays visible and emits a warning rather than hiding content or changing execution.
-Activity labels distinguish coordinating, active worker counts, and genuine blocking extension UI prompts awaiting input; an unanswered response note alone does not imply that work is blocked.
+Activity labels distinguish coordinating, active worker counts, and genuine blocking extension UI prompts awaiting input; a pending notepad item alone does not imply that work is blocked.
 The display clears when no activity remains, and shutdown restores Pi's ordinary working indicator.
 The coordinator gate prevents the extension from loading in worker sessions.
-First delegation creates a workstream automatically; `workgraph_begin` is optional.
+First delegation creates a workstream automatically; `workgraph_begin` is optional. Pass `targetRepository` to select an explicit repository when it differs from coordinator cwd; that repository is fixed for the workstream and no conversation fork is required.
 Workers run in visible Herdr tabs with ordinary Pi package/configuration loading and fresh context.
 Worker tab labels show only bounded task text - at most 18 display characters, with readable word-boundary shortening when possible.
 Native agent names retain bounded sanitized assignment text, the capability role, and a short identity suffix so repeated attempts remain distinguishable.
@@ -41,8 +41,8 @@ Use concise, semantic 1-2 word assignment IDs when practical; tab labels are dis
 Forked coordinator workspaces use the target repository basename and a short identity suffix rather than exposing the full path or inventing a user purpose.
 Workspace, tab, pane, terminal, session, and stored resource IDs remain authoritative for ownership, observation, and cleanup; display labels are never cleanup targets.
 Retained states launched before task-first names remain recoverable through their stored exact resource identity, with the legacy name accepted only when that resource identity was not retained.
-Read-only research and review use the existing coordinator project directory, so they observe live tracked and untracked changes without a clean-tree prerequisite or copying.
-Implementation and disposable experiments use owned isolated Git worktrees; those worktrees are not operating-system sandboxes.
+Read-only research and review use the selected repository root, so they observe live tracked and untracked changes without a clean-tree prerequisite or copying. The coordinator cwd may differ.
+Implementation and disposable experiments use owned isolated Git worktrees created from the selected repository's exact base revision; those worktrees are not operating-system sandboxes.
 Read-only is an instruction and authority boundary, not a filesystem sandbox, and shared files may change while research runs.
 
 ## Conversation tools
@@ -59,7 +59,7 @@ Read-only is an instruction and authority boundary, not a filesystem sandbox, an
 | `workgraph_fork` | Explicitly fork the coordinator conversation into a new no-focus Herdr workspace; workers remain tabs in their owning workspace. |
 | `workgraph_complete` | Record a conclusion, evidence, and limitations after workers and owned resources settle. |
 | `workgraph_models` | Inspect or explicitly change model defaults. |
-| `workgraph_note` | Record, update, supersede, or resolve one batch of session-owned compact reminders for substantive human-facing answers, requested outcomes, or status awaiting a later human response. |
+| `workgraph_notepad` | Read, add, update, or remove current coordinator-only id/text pending items. |
 
 The coordinator interprets what a human request authorizes and chooses which independent contributions are meaningful.
 Research, experiments, implementation slices, comparison, review, and integration are optional capabilities rather than a prescribed route.
@@ -80,21 +80,17 @@ Use the returned `next` handle to retrieve every remaining character of typed, u
 The runtime verifies input provenance, intent versions, references, Git postconditions, and ownership; a receipt is not a semantic acceptance oracle.
 Completion derives mechanical unresolved accounting and accepts one explicit reason per unresolved semantic task only; it refuses live or blocked resources and never automatically accepts evidence.
 Extension notifications and worker reports do not grant authority.
-The coordinator also keeps session-owned response notes independently of Calm and WorkstreamStore state.
-The single `workgraph_note` tool records or updates a substantive answer, requested outcome, or status only when the coordinator judges that a later human response may matter; it is not a notebook, inbox, read detector, supervisor, delivery acknowledgment, disposition, or authority mutation.
-A finalized visible assistant answer is recorded as presentation provenance when practical, while a drafted note explicitly does not prove that its answer was shown.
-Only a later genuine interactive or RPC input receipt can ground resolution, and the model must cite the addressed note ids and explain its semantic interpretation.
-Unrelated or partial replies leave other notes pending, operational notifications never clear notes, and superseding status retains unresolved substance and provenance without arbitrary silent caps or loss.
-Reload, resume, branch navigation, and compaction preserve the session-owned unresolved state; completed workstreams do not clear it, and note state never blocks `workgraph_complete`.
-The hidden context contains compact reminder lines rather than repeated full answers.
-Whether a reply addresses a note remains semantic model judgment with explicit limits: visibility, delivery, idle state, and a tool call cannot establish that a human read or acknowledged an answer, and ambiguous courtesy does not require clarification merely for bookkeeping.
+The coordinator also keeps a session-owned pending-items notepad independently of Calm and WorkstreamStore state.
+The coordinator-only `workgraph_notepad` tool supports `read`, `add`, `update`, and `remove` for current id/text items. It is not a receipt, acknowledgment detector, delivery ledger, disposition, authority mutation, or auto-expiring notebook; mistaken items may be removed without presentation or receipt resolution.
+Reload, resume, branch navigation, and compaction restore the latest valid persisted notepad snapshot and inject only a compact hidden context when the branch lacks it. The stable `[WORKGRAPH PENDING ITEMS]` prefix is kept cache-friendly, and notepad state never blocks `workgraph_complete`.
+Legacy response-note snapshots migrate only pending substance; presentation, draft, resolution, and supersession history are not continued.
 An explicit semantic scope revision leaves historical evidence intact and tied to its original intent, while stale maintained output cannot compose into the current intent.
 An experiment retains its named artifacts before scratch files are discarded; its code is never automatically composed.
 
-Implementation uses Local Prewalk in the same worker session: a guide inspects the assignment and makes the first edit, then the executor continues.
+Implementation uses Local Prewalk in the same worker session: a guide inspects the runtime-generated repository, placement, and exact base instructions and makes the first edit, then the executor continues.
 A bounded TODO is useful telemetry, not an artificial prerequisite for accepting a valid implementation.
 Both selected models and actual message models are retained.
-A maintained result that changes code requires one clean direct commit on the assigned base before composition.
+A maintained result that changes code requires one clean direct commit on the assigned exact base before composition; the worker commit requirement is distinct from coordinator integration and any push authority.
 A maintained result may instead report `no_change` with a reason and the inspected base revision; the isolated worktree must be independently Git-validated clean and unchanged, and no composition is performed.
 Worker settlement, report validity, coordinator acknowledgment, and acceptance remain separate facts.
 

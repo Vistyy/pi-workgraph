@@ -94,6 +94,16 @@ async function fixture(
   };
 }
 
+void test("worker scope does not expose coordinator-only notepad tools", async () => {
+  const f = await fixture("research");
+  try {
+    assert.equal(f.runner.getToolDefinition("workgraph_notepad"), undefined);
+    assert.equal(f.runner.getToolDefinition("workgraph_note"), undefined);
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("registered worker observes a non-edit mutation, switches locally, reports a direct commit and native settlement", async () => {
   const f = await fixture("implementation");
   try {

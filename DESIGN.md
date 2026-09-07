@@ -17,18 +17,21 @@ The human request is the source of authority, and the coordinating agent decides
 Delegated research, experiments, implementation, review, and integration are capabilities, not mandatory phases or an approval pipeline.
 Mechanical receipts, validation, and settlement must not manufacture authority or replace human judgment.
 
-Coordinator response notes are session-owned semantic memory for substantive human-facing answers, requested outcomes, or status that may need a later human response.
-A note is distinct from a human input receipt, Workstream delivery acknowledgment, evidence disposition, and intent authority.
-A genuine later interactive or RPC receipt is required before a coordinator may resolve a note, but the model's resolution call remains an interpretation and does not grant workstream authority.
-Notes retain the cited receipt and visible-assistant provenance, never infer that a human read an answer, and never block workstream completion.
-Drafting a note does not prove that an answer was visible; presentation is associated with a finalized assistant entry when Pi exposes that boundary.
-Operational notifications, tool delivery, unrelated input, and session settlement do not resolve notes automatically.
-Partial replies resolve only the notes the coordinator explicitly judges addressed, while superseding status consolidates unresolved points without deleting their provenance.
-The note state is persisted in the Pi session branch and supplied as compact hidden context independently of Calm and WorkstreamStore state.
-Semantic address detection remains model judgment with ambiguity and terse-reply limitations, so the implementation must not claim actual read detection or demand acknowledgment ceremony.
+Coordinator pending items are session-owned compact id/text reminders for future coordination, persisted independently of WorkstreamStore and injected only as a cache-friendly hidden snapshot when needed.
+The coordinator-only notepad exposes read, add, update, and remove; removing a mistaken item is ordinary editing, with no receipt, presentation, acknowledgment, auto-expiry, or authority semantics.
+Pending items do not replace genuine human input receipts, Workstream delivery acknowledgment, evidence disposition, or intent authority, and never block workstream completion.
+Legacy response-note snapshots migrate only their currently pending substance into the notepad; presentation, draft, resolution, and supersession ledger metadata are not continued.
+Compaction, reload, resume, and branch restoration recover the latest valid notepad snapshot; malformed state is retained and warned about rather than guessed or cleared.
+The implementation must not parse task prose or replies to infer repository choice, acknowledgment, or item removal.
 
 Optimize for total tokens, calls, and correct decisions across the task rather than minimizing or maximizing tool use in isolation.
 A direct answer can be better than delegation, and one well-bounded delegation can be better than repeated coordinator work.
+
+### Select one repository, derive all mechanics
+
+A workstream has one explicit target repository. Its root and Git common directory are inspected once when the workstream is created, retained in state, and compared on subsequent explicit target requests.
+Coordinator cwd is only the default when no target is supplied; it is not an authority or placement identity. Adoption and runtime construction use the retained project root, so a coordinator may live in another directory.
+Base revisions, isolated worktrees, shared placements, exact-revision review instructions, worker working directories, commit requirements, and recovery checks are generated from that fixed repository and persisted attempt state rather than task-prose parsing.
 
 ### Present outcomes, retain substance
 

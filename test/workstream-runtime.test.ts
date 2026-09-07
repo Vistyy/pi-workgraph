@@ -368,6 +368,12 @@ await test("new runtime drives fresh research through native evidence, durable r
     assert.equal(request.assignmentId, "inspect");
     assert.equal(request.objective, "Inspect value.txt");
     assert.equal(request.role, "research");
+    assert.match(required(request.prompt, "generated worker prompt"), /Repository: .*repo/);
+    assert.match(
+      required(request.prompt, "generated worker prompt"),
+      /Assigned working directory: .*repo/,
+    );
+    assert.match(await readFile(request.sessionFile, "utf8"), /Repository: .*repo/);
     assert.match(await readFile(request.sessionFile, "utf8"), /Expected evidence: File evidence/);
     assert.equal(
       (await readFile(request.sessionFile, "utf8")).includes("UNRELATED_PARENT_SECRET"),

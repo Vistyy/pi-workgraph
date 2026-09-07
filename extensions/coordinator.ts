@@ -12,7 +12,10 @@ import {
   resultNotification,
 } from "../src/agent-facing.js";
 import { installCalmMode, isCoordinatorScope, updateCalmWorkers } from "../src/calm.js";
-import { installCoordinatorNotes } from "../src/coordinator-notes.js";
+import {
+  HumanInputReceiptSchema,
+  installCoordinatorSessionState,
+} from "../src/coordinator-notepad.js";
 import { GitRepository, inspectRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import {
@@ -46,12 +49,10 @@ const POINTER = "pi-workgraph-workstream";
 const INPUT = "pi-workgraph-human-input";
 
 const WorkstreamPointer = Type.Object({ path: Type.String({ minLength: 1 }) });
-const InputReceipt = Type.Object({
-  id: Type.String(),
-  sessionId: Type.String(),
-  sessionFile: Type.String(),
-  source: StringEnum(["interactive", "rpc"] as const),
-  text: Type.String(),
+const InputReceipt = HumanInputReceiptSchema;
+const TargetRepository = Type.String({
+  minLength: 1,
+  description: "Explicit repository path for the workstream; it may differ from coordinator cwd.",
 });
 type HostServices = FileSystem.FileSystem | Path.Path;
 type CoordinatorEffect<T, E = RuntimeError, R = HostServices> = Effect.Effect<T, E, R>;
@@ -180,36 +181,80 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         ),
       ),
     );
-  installCoordinatorNotes(pi, {
+  installCoordinatorSessionState(pi, {
     owner,
-    run: runCallback,
-    serialize: (operation) => hostSemaphore.withPermit(operation),
-    onHumanInput: (receipt) =>
-      Effect.gen(function* () {
-        pending.push(receipt);
-        const active = runtime;
-        if (active === undefined) return;
-        const state = yield* active.effects.submit(active.store.effects.load());
-        if (state.lifecycle.state === "active" || state.lifecycle.state === "suspended")
-          yield* active.effects.submit(
-            active.store.effects.recordInputEvent(receipt).pipe(Effect.asVoid),
-          );
-      }),
+    serialize: (run) =>
+      Effect.runPromise(
+        hostSemaphore.withPermit(
+          Effect.tryPromise({
+            try: run,
+            catch: (cause) =>
+              new RuntimeHostError({ operation: "update coordinator notepad", cause }),
+          }),
+        ),
+      ),
+    onHumanInput: (receipt) => {
+      pending.push(receipt);
+      const active = runtime;
+      if (active === undefined) return Promise.resolve();
+      return Effect.runPromise(active.effects.submit(active.store.effects.load())).then((state) => {
+        if (state.lifecycle.state !== "active" && state.lifecycle.state !== "suspended")
+          return undefined;
+        return Effect.runPromise(
+          active.effects.submit(active.store.effects.recordInputEvent(receipt).pipe(Effect.asVoid)),
+        ).then(() => undefined);
+      });
+    },
   });
+  const validateTargetEffect = (
+    state: WorkstreamState,
+    targetRepository?: string,
+  ): CoordinatorEffect<void> =>
+    targetRepository === undefined
+      ? Effect.void
+      : inspectRepository(targetRepository).pipe(
+          Effect.flatMap((requested) =>
+            requested.commonDir === state.gitCommonDir && requested.root === state.projectRoot
+              ? Effect.void
+              : Effect.fail(
+                  new RuntimeHostError({
+                    operation: "validate target repository",
+                    cause: new Error(
+                      `Target repository ${requested.root} does not match the fixed workstream repository ${state.projectRoot}.`,
+                    ),
+                  }),
+                ),
+          ),
+        );
+  const reuseOrStopEffect = (
+    targetRepository?: string,
+  ): CoordinatorEffect<WorkstreamRuntime | undefined> =>
+    Effect.gen(function* () {
+      if (runtime === undefined) return undefined;
+      const attached = runtime;
+      const state = yield* attached.effects.submit(attached.store.effects.load());
+      if (state.lifecycle.state === "suspended")
+        throw new Error("Workstream is suspended; resume explicitly before delegating.");
+      if (state.lifecycle.state !== "active") {
+        yield* Effect.tryPromise({
+          try: () => attached.stop(),
+          catch: (cause) => new RuntimeHostError({ operation: "stop terminal runtime", cause }),
+        });
+        if (runtime === attached) runtime = undefined;
+        return undefined;
+      }
+      yield* validateTargetEffect(state, targetRepository);
+      return attached;
+    });
   const ensureEffect = (
     ctx: ExtensionContext,
     purpose: string,
+    targetRepository?: string,
   ): CoordinatorEffect<WorkstreamRuntime> =>
     Effect.gen(function* () {
-      if (runtime !== undefined) {
-        const state = yield* runtime.effects.submit(runtime.store.effects.load());
-        if (state.lifecycle.state === "suspended")
-          throw new Error("Workstream is suspended; resume explicitly before delegating.");
-        if (state.lifecycle.state === "active") return runtime;
-        yield* runtime.effects.stop;
-        runtime = undefined;
-      }
-      const repository = yield* inspectRepository(ctx.cwd);
+      const existing = yield* reuseOrStopEffect(targetRepository);
+      if (existing !== undefined) return existing;
+      const repository = yield* inspectRepository(targetRepository ?? ctx.cwd);
       const created = yield* WorkstreamStoreEffects.create({
         id: `ws-${randomUUID()}`,
         purpose,
@@ -409,6 +454,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       id: Type.String(),
       question: Type.String(),
       expectedEvidence: Type.Array(Type.String(), { minItems: 1 }),
+      targetRepository: Type.Optional(TargetRepository),
       ...ModelOptions,
       experiment: Type.Optional(
         Type.Object({
@@ -432,7 +478,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
         Effect.gen(function* () {
-          const active = yield* ensureEffect(ctx, params.question);
+          const active = yield* ensureEffect(ctx, params.question, params.targetRepository);
           const authority =
             params.experiment === undefined
               ? undefined
@@ -498,6 +544,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     parameters: Type.Object({
       id: Type.String(),
       objective: Type.String(),
+      targetRepository: Type.Optional(TargetRepository),
       authorityReceiptId: Type.Optional(
         Type.String({
           description:
@@ -512,7 +559,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
         Effect.gen(function* () {
-          const active = yield* ensureEffect(ctx, params.objective);
+          const active = yield* ensureEffect(ctx, params.objective, params.targetRepository);
           const authorization = yield* authorizeEffect(
             active,
             params.objective,
@@ -555,6 +602,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       id: Type.String(),
       objective: Type.String(),
       concern: Type.String(),
+      targetRepository: Type.Optional(TargetRepository),
       subject: Type.Union([
         Type.Object({ kind: Type.Literal("result"), resultId: Type.String() }),
         Type.Object({
@@ -576,7 +624,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
         Effect.gen(function* () {
-          const active = yield* ensureEffect(ctx, params.objective);
+          const active = yield* ensureEffect(ctx, params.objective, params.targetRepository);
           const before = yield* active.effects.submit(active.store.effects.load());
           const intent = before.intents.at(-1);
           if (intent === undefined) throw new Error("Missing intent.");
@@ -696,7 +744,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
       return runCallback(
         Effect.gen(function* () {
           const state = yield* WorkstreamStoreEffects.inspect(params.statePath);
-          const repository = yield* inspectRepository(ctx.cwd);
+          const repository = yield* inspectRepository(state.projectRoot);
           if (repository.commonDir !== state.gitCommonDir)
             throw new Error("The retained workstream belongs to another repository.");
           const herdr = new HerdrCliRuntime();

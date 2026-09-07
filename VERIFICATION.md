@@ -25,6 +25,10 @@ Workstream persistence claims require real temporary state files and real isolat
 
 ## Persistence and external effects
 
+Target repository checks use an explicit repository path whose inspected root and Git common directory remain fixed for the workstream; coordinator cwd may differ. Deterministic coverage must verify cross-repository targeting and reject attempts to switch an active workstream's repository.
+Coordinator notepad checks must enter through the coordinator's registered tool path, verify read/add/update/remove without receipt or presentation resolution, verify the stable pending-item prefix and restoration after reload and compaction, verify legacy pending-substance migration, and verify that worker scope does not expose the tool.
+Interrupted cleanup checks must resume the normal cleanup path only after retained native identity/shutdown, evidence retention, ownership lease, exact worktree HEAD, and Git registration/branch guards are established; uncertain or mismatched resources remain retained with actionable reasons.
+
 A retained report, successful tool response, or worker statement alone does not establish Git composition, artifact retention, or resource cleanup.
 Those claims require the exact repository revision, retained bytes, or resource identity at the dependent boundary.
 Interrupted operations can leave effects despite an uncertain response; recovery must inspect those effects before retrying.

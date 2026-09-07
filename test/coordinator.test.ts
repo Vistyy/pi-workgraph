@@ -139,6 +139,44 @@ async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
   return created.state;
 }
 
+void test("explicit target repository is fixed independently of coordinator cwd", async () => {
+  const f = await fixture();
+  try {
+    const target = join(f.parent, "target-repository");
+    await mkdir(target);
+    await git(target, "init", "-b", "main");
+    await git(target, "config", "user.email", "fixture@example.test");
+    await git(target, "config", "user.name", "Target fixture");
+    await writeFile(join(target, "target.txt"), "target\\n");
+    await git(target, "add", ".");
+    await git(target, "commit", "-m", "Target base");
+
+    const queued = resultState(
+      (
+        await f.call("workgraph_research", {
+          id: "targeted",
+          question: "Inspect the explicit target repository",
+          expectedEvidence: ["target bytes"],
+          targetRepository: target,
+        })
+      ).details,
+    );
+    assert.equal(queued.projectRoot, target);
+    assert.equal(queued.attempts[0]?.placement, undefined);
+    await assert.rejects(
+      f.call("workgraph_research", {
+        id: "wrong-target",
+        question: "Try to switch repositories",
+        expectedEvidence: ["bytes"],
+        targetRepository: f.root,
+      }),
+      /does not match the fixed workstream repository/,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("registered delegation keeps established scope until explicit intent revision", async () => {
   const f = await fixture();
   try {

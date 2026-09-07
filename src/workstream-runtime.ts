@@ -2152,7 +2152,7 @@ function workerSessionRequest(
   const request: Parameters<typeof createWorkerSessionEffect>[0] = {
     targetCwd: workerCwd,
     sessionDir: join(dirname(state.statePath), "sessions"),
-    objective: objectiveFor(state, assignment, baseRevision),
+    objective: objectiveFor(state, assignment, workerCwd, baseRevision),
     mode: modeFor(assignment),
     runId: state.id,
     nodeId: attempt.id,
@@ -2179,6 +2179,7 @@ function workerLaunchRequest(
     ["PI_WORKGRAPH_MODE", modeFor(assignment)],
     ["PI_WORKGRAPH_RUN_ID", state.id],
     ["PI_WORKGRAPH_NODE_ID", attempt.id],
+    ["PI_WORKGRAPH_REPOSITORY", state.projectRoot],
   ]);
   if (baseRevision !== undefined) environment.set("PI_WORKGRAPH_BASE_COMMIT", baseRevision);
   const { PI_CODING_AGENT_DIR: codingAgentDir } = process.env;
@@ -2202,7 +2203,7 @@ function workerLaunchRequest(
     role: assignment.capability,
     cwd,
     sessionFile,
-    prompt: "Continue the assigned Workgraph objective now.",
+    prompt: workerPrompt(state, assignment, cwd, baseRevision),
     model: models.guide.model,
     thinking: models.guide.thinking,
     env,
@@ -2309,20 +2310,46 @@ function modeFor(assignment: WorkAssignment) {
       ? "review"
       : "research";
 }
+function workerPrompt(
+  state: WorkstreamState,
+  assignment: WorkAssignment,
+  workerCwd: string,
+  baseRevision?: string,
+): string {
+  const lines = [
+    `Workgraph assignment ${assignment.id}.`,
+    `Repository: ${state.projectRoot}`,
+    `Assigned working directory: ${workerCwd}`,
+  ];
+  if (baseRevision !== undefined) lines.push(`Exact base/review revision: ${baseRevision}`);
+  if (assignment.capability === "implement")
+    lines.push(
+      "For a changed result, use the assigned worktree, create exactly one direct commit on the exact base, and leave it clean; report that commit. For no change, report the unchanged exact base without a commit. Do not integrate into the coordinator repository or push; composition remains a coordinator decision.",
+    );
+  if (assignment.capability === "review")
+    lines.push(
+      "Review only the assigned subject; an exact revision must be inspected as that revision, not as live files.",
+    );
+  lines.push("Continue the assigned Workgraph objective now.");
+  return lines.join("\n");
+}
 function objectiveFor(
   state: WorkstreamState,
   assignment: WorkAssignment,
+  workerCwd: string,
   baseRevision?: string,
 ): string {
   const intent = state.intents.find((item) => item.version === assignment.intentVersion);
   const common = [
     `Assignment: ${assignment.objective}`,
     `Intent version: ${assignment.intentVersion}`,
+    `Repository: ${state.projectRoot}`,
+    `Assigned working directory: ${workerCwd}`,
     `Constraints: ${intent?.constraints.join("; ") ?? ""}`,
   ];
   if (baseRevision !== undefined)
     common.push(
-      `${assignment.capability === "implement" || assignment.artifactIntent === "disposable_experiment" ? "Isolated base revision" : "Requested Git revision evidence"}: ${baseRevision}`,
+      `${assignment.capability === "implement" || assignment.artifactIntent === "disposable_experiment" ? "Exact isolated base revision" : "Exact requested Git revision"}: ${baseRevision}`,
     );
   if (assignment.capability === "research")
     common.push(`Expected evidence: ${assignment.expectedEvidence.join("; ")}`);

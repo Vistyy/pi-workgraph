@@ -148,9 +148,9 @@ void test("calm policy defaults cover builtins, search tools, and Workgraph tool
   assert.ok(hidden.includes("bash"));
   assert.ok(hidden.includes("web_search"));
   assert.ok(hidden.includes("workgraph_report"));
-  assert.ok(hidden.includes("workgraph_note"));
+  assert.ok(hidden.includes("workgraph_notepad"));
   assert.deepEqual(parseCalmHiddenTools(" read,read, custom "), ["read", "custom"]);
-  assert.ok(!parseCalmHiddenTools(" read,read, custom ").includes("workgraph_note"));
+  assert.ok(!parseCalmHiddenTools(" read,read, custom ").includes("workgraph_notepad"));
   assert.deepEqual(parseCalmHiddenTools(" , "), []);
 });
 
@@ -272,8 +272,8 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
     sessionManager: pi.session,
   } as unknown as ExtensionContext;
   await pi.events.get("session_start")?.({}, context);
-  const tool = new FakeToolRow("workgraph_note");
-  assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
+  const tool = new FakeToolRow("workgraph_notepad");
+  assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
   calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
   assert.deepEqual(tool.render(80), []);
@@ -289,14 +289,14 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
   calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
-  assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
+  assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
   assert.equal(widget.render(80).length, 1);
   assert.equal(ui.statuses.at(-1)?.[1], undefined);
   assert.equal(ui.workingVisibility.at(-1), false);
   await pi.events.get("session_shutdown")?.({}, context);
   assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
   assert.equal(ui.workingVisibility.at(-1), true);
-  assert.deepEqual(tool.render(80), ["tool:workgraph_note:80"]);
+  assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
 });
 
 void test("missing internal seam leaves rows visible and reports a diagnostic", async () => {
