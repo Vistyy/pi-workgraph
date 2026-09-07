@@ -5,11 +5,7 @@ import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths identify real repository and session resources.
 import { join } from "node:path";
 import test from "node:test";
-import type {
-  ExtensionActions,
-  ExtensionRunner,
-  SessionManager,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionActions, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -232,14 +228,13 @@ const initialPlan = {
   ],
 };
 
-type ContextMessage = Parameters<ExtensionRunner["emitContext"]>[0][number];
-type CustomContextMessage = Extract<ContextMessage, { role: "custom" }>;
 const textContentSchema = Type.String();
 const textPartsSchema = Type.Array(
   Type.Object({ type: Type.Literal("text"), text: Type.String() }),
 );
 
-function messageText(message: Pick<CustomContextMessage, "content">): string {
+// Content is decoded before assertions so tests observe the same native message boundary as Pi.
+function messageText(message: { content: unknown }): string {
   if (Value.Check(textContentSchema, message.content))
     return Value.Decode(textContentSchema, message.content);
   if (!Value.Check(textPartsSchema, message.content)) return "";
@@ -248,102 +243,80 @@ function messageText(message: Pick<CustomContextMessage, "content">): string {
     .join("\\n");
 }
 
-void test("worker plan and exact objective survive reload/compaction without duplicate snapshots", async () => {
-  const f = await fixture("implementation");
+void test("worker guidance is persisted once per phase and restored once after compaction", async () => {
+  const deliveries: Array<{
+    customType: string;
+    content: unknown;
+    display: boolean;
+    details?: unknown;
+  }> = [];
+  let session: SessionManager | undefined;
+  const f = await fixture("implementation", false, {
+    sendMessage(message) {
+      deliveries.push(message);
+      session?.appendCustomMessageEntry(
+        message.customType,
+        message.content,
+        message.display,
+        message.details,
+      );
+    },
+  });
+  session = f.session;
   try {
     const objective =
       "[WORKGRAPH IMPLEMENTATION OBJECTIVE]\nAcceptance: preserve the exact acceptance text.\nConstraints: preserve the exact constraints text.";
-    f.session.appendCustomMessageEntry("pi-workgraph-objective", objective, true, {
+    session.appendCustomMessageEntry("pi-workgraph-objective", objective, true, {
       runId: "fixture",
       nodeId: "attempt",
       mode: "implementation",
     });
     const updated = await f.call("workgraph_plan", { action: "update", plan: initialPlan });
-    const updatedDetails = decodeTestValue(planToolDetailsSchema, updated.details);
-    assert.equal(updatedDetails.planStatus, "valid");
-    assert.equal(
-      await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
-        cwd: f.session.getCwd(),
-      }),
-      undefined,
-    );
-    const before = await f.runner.emitContext([]);
-    const guide = before.find(
-      (message): message is CustomContextMessage =>
-        message.role === "custom" && message.customType === "pi-workgraph-guide",
-    );
+    assert.equal(decodeTestValue(planToolDetailsSchema, updated.details).planStatus, "valid");
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+
+    const first = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+      cwd: session.getCwd(),
+    });
+    const guide = first?.messages?.find((message) => message.customType === "pi-workgraph-guide");
     assert.ok(guide !== undefined);
     assert.match(messageText(guide), /Approach: Inspect the worker extension/);
     assert.match(messageText(guide), /meaningful verification/);
     assert.match(messageText(guide), /navigation only/);
     assert.match(messageText(guide), /Acceptance: preserve the exact acceptance text/);
     assert.match(messageText(guide), /Constraints: preserve the exact constraints text/);
-
-    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    const restored = await f.call("workgraph_plan", { action: "get" });
-    const restoredDetails = decodeTestValue(planToolDetailsSchema, restored.details);
-    assert.equal(restoredDetails.planStatus, "valid");
-    assert.ok(restoredDetails.plan !== undefined);
-    assert.equal(restoredDetails.plan.steps.length, 2);
+    session.appendCustomMessageEntry(guide.customType, guide.content, guide.display, guide.details);
     assert.equal(
       await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
-        cwd: f.session.getCwd(),
+        cwd: session.getCwd(),
       }),
       undefined,
     );
-    const afterReload = await f.runner.emitContext([]);
-    const reloadMessage = afterReload.find(
-      (message): message is CustomContextMessage =>
-        message.role === "custom" && message.customType === "pi-workgraph-guide",
-    );
-    assert.ok(reloadMessage !== undefined);
-    assert.match(
-      messageText(reloadMessage),
-      /restored verbatim from the latest matching raw session entry/,
-    );
-    assert.match(messageText(reloadMessage), /Acceptance: preserve the exact acceptance text/);
 
-    const stale = [
-      {
-        role: "custom" as const,
-        customType: "pi-workgraph-guide",
-        content: "STALE SNAPSHOT",
-        display: false,
-        timestamp: fixtureTimestamp,
-      },
-      {
-        role: "custom" as const,
-        customType: "pi-workgraph-objective",
-        content: "STALE OBJECTIVE",
-        display: false,
-        timestamp: fixtureTimestamp,
-      },
-    ];
-    const context = await f.runner.emitContext(stale);
-    const snapshots = context.filter(
-      (message): message is CustomContextMessage =>
-        message.role === "custom" && message.customType === "pi-workgraph-guide",
-    );
-    assert.equal(snapshots.length, 1);
-    const snapshot = snapshots[0];
-    assert.ok(snapshot !== undefined);
-    assert.doesNotMatch(messageText(snapshot), /STALE SNAPSHOT|STALE OBJECTIVE/);
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    await f.runner.emit({ type: "session_start", reason: "reload" });
     assert.equal(
-      context.filter(
-        (message) => message.role === "custom" && message.customType === "pi-workgraph-objective",
-      ).length,
-      0,
+      await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+        cwd: session.getCwd(),
+      }),
+      undefined,
     );
-    assert.match(messageText(snapshot), /Current bounded plan/);
+    assert.equal(
+      session
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-guide",
+        ).length,
+      1,
+    );
 
-    const kept = f.session.appendMessage({
+    const kept = session.appendMessage({
       role: "user",
       content: "After compaction",
       timestamp: fixtureTimestamp,
     });
-    f.session.appendCompaction("Compacted", kept, 100);
-    const compaction = f.session.getLeafEntry();
+    session.appendCompaction("Compacted", kept, 100);
+    const compaction = session.getLeafEntry();
     assert.ok(compaction?.type === "compaction");
     await f.runner.emit({
       type: "session_compact",
@@ -352,16 +325,32 @@ void test("worker plan and exact objective survive reload/compaction without dup
       reason: "manual",
       willRetry: false,
     });
-    const afterCompaction = await f.runner.emitContext([]);
-    const compactedSnapshot = afterCompaction.at(-1);
-    assert.ok(compactedSnapshot?.role === "custom");
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0]?.customType, "pi-workgraph-guide");
+    assert.match(messageText(deliveries[0] ?? { content: undefined }), /Current bounded plan/);
     assert.match(
-      messageText(compactedSnapshot),
-      /restored verbatim from the latest matching raw session entry/,
+      messageText(deliveries[0] ?? { content: undefined }),
+      /Acceptance: preserve the exact acceptance text/,
     );
-    assert.match(messageText(compactedSnapshot), /Acceptance: preserve the exact acceptance text/);
-    assert.match(messageText(compactedSnapshot), /Current bounded plan/);
+    assert.equal(
+      await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+        cwd: session.getCwd(),
+      }),
+      undefined,
+    );
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    assert.equal(deliveries.length, 1);
+    assert.equal(
+      session
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-guide",
+        ).length,
+      2,
+    );
   } finally {
+    session = undefined;
     await f.dispose();
   }
 });
@@ -424,6 +413,8 @@ void test("current-attempt identity, malformed plan state, and bounded reminders
     },
   });
   try {
+    const reminders = () =>
+      deliveries.filter((delivery) => delivery.customType === "pi-workgraph-reconciliation");
     f.session.appendCustomEntry("pi-workgraph-worker-plan", {
       runId: "other-workstream",
       nodeId: "attempt",
@@ -449,18 +440,22 @@ void test("current-attempt identity, malformed plan state, and bounded reminders
     const malformedDetails = decodeTestValue(planToolDetailsSchema, malformed.details);
     assert.equal(malformedDetails.planStatus, "malformed");
     assert.equal(malformedDetails.plan, undefined);
-    assert.equal(
-      await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
-        cwd: f.session.getCwd(),
-      }),
-      undefined,
+    const recovery = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+      cwd: f.session.getCwd(),
+    });
+    const recoveryMessage = recovery?.messages?.find(
+      (message) => message.customType === "pi-workgraph-guide",
     );
-    const recoveryContext = await f.runner.emitContext([]);
-    const recoveryMessage = recoveryContext.at(-1);
-    assert.ok(recoveryMessage?.role === "custom");
+    assert.ok(recoveryMessage !== undefined);
     assert.match(messageText(recoveryMessage), /worker state/);
     assert.match(messageText(recoveryMessage), /malformed/);
     assert.match(messageText(recoveryMessage), /objective snapshot was malformed/);
+    f.session.appendCustomMessageEntry(
+      recoveryMessage.customType,
+      recoveryMessage.content,
+      recoveryMessage.display,
+      recoveryMessage.details,
+    );
 
     await f.call("workgraph_plan", { action: "update", plan: initialPlan });
     assistant(f.session);
@@ -473,10 +468,9 @@ void test("current-attempt identity, malformed plan state, and bounded reminders
       isError: false,
     });
     await f.runner.emit({ type: "agent_settled" });
-    assert.equal(deliveries.length, 1);
-    assert.equal(deliveries[0]?.customType, "pi-workgraph-reconciliation");
-    assert.match(String(deliveries[0]?.content), /RECONCILIATION REMINDER 1\/2/);
-    assert.deepEqual(deliveries[0]?.options, { deliverAs: "followUp", triggerTurn: true });
+    assert.equal(reminders().length, 1);
+    assert.match(String(reminders()[0]?.content), /RECONCILIATION REMINDER 1\/2/);
+    assert.deepEqual(reminders()[0]?.options, { deliverAs: "followUp", triggerTurn: true });
     assert.equal(
       f.session
         .getBranch()
@@ -489,9 +483,9 @@ void test("current-attempt identity, malformed plan state, and bounded reminders
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
     await f.runner.emit({ type: "session_start", reason: "reload" });
     await f.runner.emit({ type: "agent_settled" });
-    assert.equal(deliveries.length, 2);
-    assert.match(String(deliveries[1]?.content), /RECONCILIATION REMINDER 2\/2/);
-    assert.deepEqual(deliveries[1]?.options, { deliverAs: "followUp", triggerTurn: true });
+    assert.equal(reminders().length, 2);
+    assert.match(String(reminders()[1]?.content), /RECONCILIATION REMINDER 2\/2/);
+    assert.deepEqual(reminders()[1]?.options, { deliverAs: "followUp", triggerTurn: true });
     await f.runner.emit({ type: "agent_settled" });
     assert.equal(
       f.session
@@ -511,10 +505,20 @@ void test("current-attempt identity, malformed plan state, and bounded reminders
         (data): data is { reminderCount?: number } => typeof data === "object" && data !== null,
       );
     assert.equal(states.at(-1)?.reminderCount, 2);
-    const exhaustedContext = await f.runner.emitContext([]);
-    const exhaustedMessage = exhaustedContext.at(-1);
-    assert.ok(exhaustedMessage?.role === "custom");
-    assert.doesNotMatch(messageText(exhaustedMessage), /RECONCILIATION REMINDER/);
+    assert.deepEqual(await f.runner.emitContext([]), []);
+    const exhaustedRecovery = await f.runner.emitBeforeAgentStart(
+      "continue",
+      undefined,
+      "Fixture",
+      { cwd: f.session.getCwd() },
+    );
+    assert.ok(exhaustedRecovery !== undefined);
+    assert.ok(exhaustedRecovery.messages !== undefined);
+    assert.ok(
+      exhaustedRecovery.messages.every(
+        (message) => !/RECONCILIATION REMINDER/.test(messageText(message)),
+      ),
+    );
 
     const failed = await f.call("workgraph_report", {
       kind: "implementation",
@@ -525,7 +529,7 @@ void test("current-attempt identity, malformed plan state, and bounded reminders
     });
     assert.equal(failed.terminate, true);
     await f.runner.emit({ type: "agent_settled" });
-    assert.equal(deliveries.length, 2);
+    assert.equal(reminders().length, 2);
     const finalStates = f.session
       .getBranch()
       .filter(
@@ -542,10 +546,10 @@ void test("current-attempt identity, malformed plan state, and bounded reminders
 });
 
 void test("terminal failure stops pending reconciliation before the reminder budget is exhausted", async () => {
-  let deliveryCount = 0;
+  let reconciliationCount = 0;
   const f = await fixture("implementation", false, {
-    sendMessage() {
-      deliveryCount += 1;
+    sendMessage(message) {
+      if (message.customType === "pi-workgraph-reconciliation") reconciliationCount += 1;
     },
   });
   try {
@@ -560,7 +564,7 @@ void test("terminal failure stops pending reconciliation before the reminder bud
       isError: false,
     });
     await f.runner.emit({ type: "agent_settled" });
-    assert.equal(deliveryCount, 1);
+    assert.equal(reconciliationCount, 1);
     const failed = await f.call("workgraph_report", {
       kind: "implementation",
       status: "failed",
@@ -570,7 +574,7 @@ void test("terminal failure stops pending reconciliation before the reminder bud
     });
     assert.equal(failed.terminate, true);
     await f.runner.emit({ type: "agent_settled" });
-    assert.equal(deliveryCount, 1);
+    assert.equal(reconciliationCount, 1);
   } finally {
     await f.dispose();
   }

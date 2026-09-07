@@ -1,4 +1,4 @@
-import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Data, DateTime, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
@@ -311,6 +311,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       switchError = undefined;
       switchedAt = DateTime.formatIso(yield* DateTime.now);
       appendWorkerState(extension);
+      appendRecoverySnapshot(extension, ctx.sessionManager);
     });
   }
 
@@ -484,7 +485,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       base,
       "[WORKGRAPH CURRENT ATTEMPT RECOVERY]",
       `Attempt identity: ${runId}/${nodeId}. Continue the inherited bounded assignment; do not invent new scope or infer authority from this message.`,
-      "The objective below is restored verbatim from the latest matching raw session entry. Older objective and model snapshots are historical context and must not be replayed.",
+      "The objective below is restored verbatim from the latest matching raw session entry. Older objective and model snapshots are historical context and must not be replayed. Later workgraph_plan tool results supersede this snapshot's plan.",
       objectiveText(objective),
       planText(),
       planStateWarning ?? "",
@@ -543,31 +544,53 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       settledAt: DateTime.formatIso(DateTime.nowUnsafe()),
     });
   });
-  pi.on("context", (event, ctx) => {
-    if (mode !== "implementation") return;
-    const snapshotType = phase === "guide" ? "pi-workgraph-guide" : "pi-workgraph-executor";
+  function recoverySnapshot(
+    session: ExtensionContext["sessionManager"],
+  ):
+    | Pick<
+        Parameters<ExtensionAPI["sendMessage"]>[0],
+        "customType" | "content" | "display" | "details"
+      >
+    | undefined {
+    const customType = phase === "guide" ? "pi-workgraph-guide" : "pi-workgraph-executor";
+    if (
+      session
+        .buildContextEntries()
+        .some(
+          (entry) =>
+            entry.type === "custom_message" &&
+            entry.customType === customType &&
+            isCurrentAttemptData(entry.details),
+        )
+    )
+      return undefined;
     return {
-      messages: [
-        ...event.messages.filter(
-          (message) =>
-            message.role !== "custom" ||
-            (message.customType !== "pi-workgraph-guide" &&
-              message.customType !== "pi-workgraph-executor" &&
-              message.customType !== "pi-workgraph-objective"),
-        ),
-        {
-          role: "custom" as const,
-          customType: snapshotType,
-          content: currentInstructions(latestAttemptObjective(ctx.sessionManager.getBranch())),
-          display: false,
-          details: generation,
-          timestamp: DateTime.toEpochMillis(DateTime.nowUnsafe()),
-        },
-      ],
+      customType,
+      content: currentInstructions(latestAttemptObjective(session.getBranch())),
+      display: false,
+      details: generation,
     };
+  }
+
+  function appendRecoverySnapshot(
+    extension: ExtensionAPI,
+    session: ExtensionContext["sessionManager"],
+  ): void {
+    const snapshot = recoverySnapshot(session);
+    if (snapshot !== undefined) extension.sendMessage(snapshot);
+  }
+
+  // Persist guidance at real transcript boundaries, never move a synthetic tail
+  // behind new assistant/tool history on every provider request.
+  pi.on("session_compact", (_event, ctx) => {
+    if (mode !== "implementation") return;
+    appendRecoverySnapshot(pi, ctx.sessionManager);
   });
-  pi.on("before_agent_start", () => {
-    if (mode === "implementation") return;
+  pi.on("before_agent_start", (_event, ctx) => {
+    if (mode === "implementation") {
+      const message = recoverySnapshot(ctx.sessionManager);
+      return message === undefined ? undefined : { message };
+    }
     return {
       message: {
         customType: `pi-workgraph-${mode}`,
