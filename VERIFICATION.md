@@ -6,6 +6,7 @@ Deterministic adapters cannot establish ordinary Pi package loading, native Herd
 Changes to those boundaries need a normal visible Pi operation against the exact candidate in addition to focused contract checks.
 A missing integration, trust prompt, unavailable model, or absent native identity is an evidence limitation, not permission to bypass approval or claim settlement.
 Herdr's idle/done observation can lag Pi events; native attempt-generation markers establish settlement.
+Worker prewalk verification must distinguish the immutable current-attempt objective from the editable plan, named reconciliation delivery from its persisted reminder budget, and a terminal native settlement from a pending follow-up. Deterministic checks can establish shape, identity filtering, restoration, terminal/no-action behavior, and delivery options; any native lifecycle claim still needs a normal visible Pi observation recorded with its exact limitations in the work report.
 
 ## Static and deterministic checks
 
@@ -45,6 +46,7 @@ Lease and ownership checks use real isolated per-workstream SQLite storage. The 
 Git safety checks use disposable real repositories and preserve mismatched or unattributed resources.
 Shared read-only workers use the live project cwd, including dirty tracked and untracked files, and their settlement and recovery must not invoke Git cleanup or discard.
 Human authority tests enter through Pi's registered input/tool path, including rejection of extension-generated authority.
+Worker prewalk checks enter through the registered `workgraph_plan` tool: enforce the bounded shape, restore only the exact current attempt, ignore malformed/foreign snapshots safely, expose one current model-visible snapshot after reload and compaction, allow executor revision, and cap unfinished-plan reminders without blocking truthful failure, escalation, or no-change behavior. Plan statuses and reminder counts are navigation evidence only; Git/report boundaries remain the proof obligations.
 Historical work keeps its original intent scope; current maintained application requires current intent.
 
 ## Packed consumer bootstrap

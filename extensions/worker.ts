@@ -3,7 +3,7 @@ import { Config, ConfigProvider, Data, DateTime, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { ThinkingSchema } from "../src/model-policy.js";
-import { isWorkerReportInput, reportSchemaForMode } from "../src/report-schema.js";
+import { isWorkerReport, isWorkerReportInput, reportSchemaForMode } from "../src/report-schema.js";
 import type {
   ImplementationReport,
   WorkerMode,
@@ -26,11 +26,64 @@ const WorkerEnvironmentConfig = Config.all({
   experiment: Config.string("PI_WORKGRAPH_EXPERIMENT").pipe(Config.withDefault("")),
 });
 
+// One bounded, worker-owned plan survives the guide/executor handoff. Status is
+// navigation, never verification evidence or authority to expand the assignment.
+const PlanStepStatusSchema = Type.Union([
+  Type.Literal("pending"),
+  Type.Literal("in_progress"),
+  Type.Literal("done"),
+  Type.Literal("blocked"),
+  Type.Literal("superseded"),
+]);
+const WorkerPlanSchema = Type.Object({
+  approach: Type.String({ minLength: 3, maxLength: 2000 }),
+  rationale: Type.String({ minLength: 3, maxLength: 2000 }),
+  risks: Type.String({ maxLength: 2000 }),
+  steps: Type.Array(
+    Type.Object({
+      text: Type.String({ minLength: 3, maxLength: 1000 }),
+      status: PlanStepStatusSchema,
+      note: Type.Optional(Type.String({ maxLength: 1000 })),
+    }),
+    { minItems: 1, maxItems: 8 },
+  ),
+});
+const WorkerPlanActionSchema = Type.Union([Type.Literal("get"), Type.Literal("update")]);
+const WorkerPlanToolSchema = Type.Object({
+  action: WorkerPlanActionSchema,
+  plan: Type.Optional(WorkerPlanSchema),
+});
+const WorkerPlanEntrySchema = Type.Object({
+  runId: Type.String(),
+  nodeId: Type.String(),
+  plan: WorkerPlanSchema,
+});
+const AttemptIdentitySchema = Type.Object({
+  runId: Type.String(),
+  nodeId: Type.String(),
+});
+
+type WorkerPlan = Static<typeof WorkerPlanSchema>;
+type WorkerPlanToolInput = Static<typeof WorkerPlanToolSchema>;
+
+type PlanRestore =
+  | { readonly kind: "absent" }
+  | { readonly kind: "valid"; readonly plan: WorkerPlan }
+  | { readonly kind: "malformed" };
+type ObjectiveRestore =
+  | { readonly kind: "absent" }
+  | { readonly kind: "valid"; readonly content: string }
+  | { readonly kind: "malformed" };
+
+const MAX_PLAN_REMINDERS = 2;
+const RECONCILIATION_MESSAGE_TYPE = "pi-workgraph-reconciliation";
+const ObjectiveContentSchema = Type.String();
+const ReportToolDetailsSchema = Type.Object({ report: Type.Unknown() });
 const AttemptStateSchema = Type.Object({
   runId: Type.String(),
   nodeId: Type.String(),
   phase: Type.Optional(Type.Union([Type.Literal("guide"), Type.Literal("executor")])),
-  todos: Type.Optional(Type.Array(Type.String())),
+  reminderCount: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_PLAN_REMINDERS })),
   switchedAt: Type.Optional(Type.String()),
   switchError: Type.Optional(Type.String()),
 });
@@ -53,8 +106,9 @@ class WorkerGitError extends Data.TaggedError("WorkerGitError")<{
 type WorkerExpectedError = WorkerContractError | WorkerHostError | WorkerGitError;
 
 interface WorkerTerminalState {
-  readonly todos: readonly string[];
-  readonly todoRecorded?: boolean | undefined;
+  readonly plan?: WorkerPlan | undefined;
+  readonly planStatus: PlanRestore["kind"];
+  readonly reminderCount: number;
   readonly switchedAt?: string | undefined;
   readonly switchError?: string | undefined;
   readonly continued?: boolean | undefined;
@@ -66,7 +120,9 @@ interface WorkerTerminalState {
 interface WorkerReportExecutionState {
   readonly mode: WorkerMode;
   readonly phase: "guide" | "executor";
-  readonly todos: readonly string[];
+  readonly plan?: WorkerPlan | undefined;
+  readonly planStatus: PlanRestore["kind"];
+  readonly reminderCount: number;
   readonly switchedAt?: string | undefined;
   readonly switchError?: string | undefined;
   readonly continued: boolean;
@@ -83,7 +139,12 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   const continued = environment.implementationStart === "executor";
   const experiment = environment.experiment === "1";
   let phase: "guide" | "executor" = mode === "implementation" && !continued ? "guide" : "executor";
-  let todos: string[] = [];
+  let plan: WorkerPlan | undefined;
+  let planStatus: PlanRestore["kind"] = "absent";
+  let planStateWarning: string | undefined;
+  let stateWarning: string | undefined;
+  let reminderCount = 0;
+  let terminal = false;
   let switchError: string | undefined;
   let switchedAt: string | undefined;
 
@@ -126,42 +187,43 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     );
   }
 
-  pi.registerTool({
-    name: "workgraph_todo",
-    label: "Workgraph TODO",
-    description: "Record a bounded local implementation TODO before the first edit.",
-    parameters: Type.Object({
-      items: Type.Array(Type.String({ minLength: 3 }), {
-        minItems: 1,
-        maxItems: 8,
-      }),
-    }),
-    execute(_id, params) {
-      return Effect.runPromise(
-        Effect.gen(function* () {
-          if (mode !== "implementation" || phase !== "guide")
-            return yield* contractFailure(
-              "Local Prewalk TODOs belong before the first implementation edit.",
-            );
-          todos = params.items;
-          pi.appendEntry("pi-workgraph-worker-state", {
-            ...generation,
-            phase,
-            todos,
-          });
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Recorded ${todos.length} Local Prewalk items.`,
-              },
-            ],
-            details: { items: todos },
-          };
-        }),
-      );
-    },
-  });
+  if (mode === "implementation")
+    pi.registerTool({
+      name: "workgraph_plan",
+      label: "Workgraph Plan",
+      description:
+        "Inspect or replace one bounded current implementation plan. The plan guides work but is not proof of correctness or completion.",
+      promptSnippet: "Inspect or revise the bounded current implementation plan",
+      promptGuidelines: [
+        "Use workgraph_plan to keep one concise approach, rationale, risks, and concrete implementation/verification plan current; plan statuses are navigation only, not evidence.",
+      ],
+      parameters: WorkerPlanToolSchema,
+      execute(_id, params: WorkerPlanToolInput) {
+        return Effect.runPromise(
+          Effect.gen(function* () {
+            if (params.action === "get") {
+              return {
+                content: [{ type: "text" as const, text: planText() }],
+                details: { action: "get", plan, planStatus, attempt: generation },
+              };
+            }
+            if (params.plan === undefined)
+              return yield* contractFailure("Updating the current plan requires a plan value.");
+            plan = params.plan;
+            planStatus = "valid";
+            planStateWarning = undefined;
+            pi.appendEntry("pi-workgraph-worker-plan", {
+              ...generation,
+              plan,
+            });
+            return {
+              content: [{ type: "text" as const, text: `Updated ${planText()}` }],
+              details: { action: "update", plan, planStatus, attempt: generation },
+            };
+          }),
+        );
+      },
+    });
   pi.registerTool({
     name: "workgraph_report",
     label: "Workgraph Report",
@@ -173,15 +235,21 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     parameters: reportSchemaForMode(mode),
     execute(_id, params, _signal, _update, ctx) {
       return Effect.runPromise(
-        handleWorkerReport(pi, ctx.cwd, params, {
-          mode,
-          phase,
-          todos,
-          switchedAt,
-          switchError,
-          continued,
-          baseCommit,
-          hasExecutorMessage: () => hasExecutorMessage(ctx.sessionManager.getBranch()),
+        Effect.gen(function* () {
+          const result = yield* handleWorkerReport(pi, ctx.cwd, params, {
+            mode,
+            phase,
+            plan,
+            planStatus,
+            reminderCount,
+            switchedAt,
+            switchError,
+            continued,
+            baseCommit,
+            hasExecutorMessage: () => hasExecutorMessage(ctx.sessionManager.getBranch()),
+          });
+          if (result.terminate === true) terminal = true;
+          return result;
         }),
       );
     },
@@ -242,25 +310,20 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       phase = "executor";
       switchError = undefined;
       switchedAt = DateTime.formatIso(yield* DateTime.now);
-      extension.appendEntry("pi-workgraph-worker-state", {
-        ...generation,
-        phase,
-        todos,
-        executorModel,
-        executorThinking,
-        switchedAt,
-      });
+      appendWorkerState(extension);
     });
+  }
+
+  function appendWorkerState(extension: ExtensionAPI): void {
+    const state: AttemptState = { ...generation, phase, reminderCount };
+    if (switchedAt !== undefined) state.switchedAt = switchedAt;
+    if (switchError !== undefined) state.switchError = switchError;
+    extension.appendEntry("pi-workgraph-worker-state", state);
   }
 
   function recordSwitchFailure(extension: ExtensionAPI, error: WorkerExpectedError): void {
     switchError = error.message;
-    extension.appendEntry("pi-workgraph-worker-state", {
-      ...generation,
-      phase,
-      todos,
-      switchError,
-    });
+    appendWorkerState(extension);
   }
   pi.on("model_select", (event) => {
     pi.appendEntry("pi-workgraph-effective-model", {
@@ -277,20 +340,158 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         thinking: pi.getThinkingLevel(),
       });
   });
-  function latestAttemptState(entries: SessionEntry[]): AttemptState | undefined {
+  function latestAttemptState(
+    entries: SessionEntry[],
+  ):
+    | { readonly state: AttemptState; readonly malformed: false }
+    | { readonly state: undefined; readonly malformed: boolean } {
     for (const entry of [...entries].reverse()) {
       if (entry.type !== "custom" || entry.customType !== "pi-workgraph-worker-state") continue;
+      if (!isCurrentAttemptData(entry.data)) continue;
       const attempt = decodeAttemptState(entry.data);
-      if (attempt !== undefined && belongsToAttempt(attempt)) return attempt;
+      return attempt === undefined
+        ? { state: undefined, malformed: true }
+        : { state: attempt, malformed: false };
     }
-    return undefined;
+    return { state: undefined, malformed: false };
+  }
+
+  function latestAttemptPlan(entries: SessionEntry[]): PlanRestore {
+    for (const entry of [...entries].reverse()) {
+      if (entry.type !== "custom" || entry.customType !== "pi-workgraph-worker-plan") continue;
+      if (!isCurrentAttemptData(entry.data)) continue;
+      if (!Value.Check(WorkerPlanEntrySchema, entry.data)) return { kind: "malformed" };
+      const decoded = Value.Decode(WorkerPlanEntrySchema, entry.data);
+      return { kind: "valid", plan: decoded.plan };
+    }
+    return { kind: "absent" };
+  }
+
+  function latestAttemptObjective(entries: SessionEntry[]): ObjectiveRestore {
+    for (const entry of [...entries].reverse()) {
+      if (entry.type !== "custom_message" || entry.customType !== "pi-workgraph-objective")
+        continue;
+      if (!isCurrentAttemptData(entry.details)) continue;
+      if (!Value.Check(ObjectiveContentSchema, entry.content)) return { kind: "malformed" };
+      return { kind: "valid", content: Value.Decode(ObjectiveContentSchema, entry.content) };
+    }
+    return { kind: "absent" };
+  }
+
+  function hasTerminalReport(entries: SessionEntry[]): boolean {
+    const boundary = entries.findLastIndex(
+      (entry) =>
+        entry.type === "custom_message" &&
+        entry.customType === "pi-workgraph-objective" &&
+        isCurrentAttemptData(entry.details),
+    );
+    if (boundary < 0) return false;
+    return entries.slice(boundary + 1).some((entry) => {
+      if (entry.type !== "message" || entry.message.role !== "toolResult") return false;
+      if (entry.message.toolName !== "workgraph_report" || entry.message.isError) return false;
+      if (!Value.Check(ReportToolDetailsSchema, entry.message.details)) return false;
+      const details = Value.Decode(ReportToolDetailsSchema, entry.message.details);
+      return isWorkerReport(details.report);
+    });
   }
 
   function reattachAttemptState(attempt: AttemptState): void {
-    if (attempt.todos !== undefined) todos = attempt.todos;
+    if (attempt.reminderCount !== undefined) reminderCount = attempt.reminderCount;
     if (attempt.switchedAt !== undefined) switchedAt = attempt.switchedAt;
     if (attempt.phase === "executor") phase = "executor";
     if (attempt.switchError !== undefined) switchError = attempt.switchError;
+  }
+
+  // SAFETY: session custom data is untrusted external input and is decoded before use.
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Explicit Pi session identity decode boundary.
+  function isCurrentAttemptData(data: unknown): boolean {
+    if (!Value.Check(AttemptIdentitySchema, data)) return false;
+    const identity = Value.Decode(AttemptIdentitySchema, data);
+    return identity.runId === runId && identity.nodeId === nodeId;
+  }
+
+  function planText(): string {
+    if (plan === undefined) {
+      return planStatus === "malformed"
+        ? "Current bounded plan: unavailable because the latest current-attempt plan state was malformed. Recreate it with workgraph_plan update; do not treat the missing plan as evidence."
+        : "Current bounded plan: none recorded yet. Use workgraph_plan update only when a plan helps the assignment.";
+    }
+    const steps = plan.steps
+      .map(
+        (step, index) =>
+          `${index + 1}. ${step.status}: ${step.text}${step.note === undefined ? "" : ` — ${step.note}`}`,
+      )
+      .join("\n");
+    return [
+      "Current bounded plan (navigation only; statuses are not correctness evidence):",
+      `Approach: ${plan.approach}`,
+      `Rationale and constraints: ${plan.rationale}`,
+      `Risks and unknowns: ${plan.risks || "none recorded"}`,
+      "Steps:",
+      steps,
+    ].join("\n");
+  }
+
+  function hasActionablePlanSteps(): boolean {
+    return (
+      plan?.steps.some((step) => step.status === "pending" || step.status === "in_progress") ??
+      false
+    );
+  }
+
+  function reconciliationReminder(count: number): string {
+    return [
+      `[WORKGRAPH RECONCILIATION REMINDER ${count}/${MAX_PLAN_REMINDERS}]`,
+      "The executor settled without a terminal report while the current plan still has actionable steps.",
+      "Inspect the worktree and current-attempt snapshot, then continue useful work or report truthful failure or escalation. Do not treat plan status as evidence or a completion gate.",
+    ].join("\n");
+  }
+
+  function scheduleReconciliation(extension: ExtensionAPI): boolean {
+    if (
+      mode !== "implementation" ||
+      phase !== "executor" ||
+      terminal ||
+      !hasActionablePlanSteps() ||
+      reminderCount >= MAX_PLAN_REMINDERS
+    )
+      return false;
+    reminderCount += 1;
+    appendWorkerState(extension);
+    extension.sendMessage(
+      {
+        customType: RECONCILIATION_MESSAGE_TYPE,
+        content: reconciliationReminder(reminderCount),
+        display: false,
+        details: { ...generation, reminderCount },
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
+    return true;
+  }
+
+  function objectiveText(objective: ObjectiveRestore): string {
+    if (objective.kind === "valid")
+      return ["[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]", objective.content].join("\n");
+    if (objective.kind === "malformed")
+      return "[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]\nThe exact current-attempt objective snapshot was malformed and was ignored; do not guess its acceptance or constraints.";
+    return "[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]\nNo exact current-attempt objective snapshot was found; do not infer acceptance, constraints, or authority from the mutable plan.";
+  }
+
+  function currentInstructions(objective: ObjectiveRestore): string {
+    const base = phase === "guide" ? guideInstructions : executorInstructions();
+    return [
+      base,
+      "[WORKGRAPH CURRENT ATTEMPT RECOVERY]",
+      `Attempt identity: ${runId}/${nodeId}. Continue the inherited bounded assignment; do not invent new scope or infer authority from this message.`,
+      "The objective below is restored verbatim from the latest matching raw session entry. Older objective and model snapshots are historical context and must not be replayed.",
+      objectiveText(objective),
+      planText(),
+      planStateWarning ?? "",
+      stateWarning ?? "",
+    ]
+      .filter((line) => line.length > 0)
+      .join("\n");
   }
 
   pi.on("session_start", (_event, ctx) => {
@@ -303,8 +504,25 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     );
     if (allowedTools.length !== activeTools.length) pi.setActiveTools(allowedTools);
 
-    const attempt = latestAttemptState(ctx.sessionManager.getBranch());
-    if (attempt !== undefined) reattachAttemptState(attempt);
+    const branch = ctx.sessionManager.getBranch();
+    phase = mode === "implementation" && !continued ? "guide" : "executor";
+    reminderCount = 0;
+    switchError = undefined;
+    switchedAt = undefined;
+    terminal = hasTerminalReport(branch);
+    const attempt = latestAttemptState(branch);
+    stateWarning = attempt.malformed
+      ? "The latest current-attempt worker state was malformed and was ignored; continue conservatively and report the limitation."
+      : undefined;
+    if (attempt.state !== undefined) reattachAttemptState(attempt.state);
+
+    const restoredPlan = latestAttemptPlan(branch);
+    planStatus = restoredPlan.kind;
+    plan = restoredPlan.kind === "valid" ? restoredPlan.plan : undefined;
+    planStateWarning =
+      restoredPlan.kind === "malformed"
+        ? "The latest current-attempt plan state was malformed and was ignored; use workgraph_plan update to create a bounded replacement."
+        : undefined;
   });
   pi.on("agent_start", (_event, ctx) => {
     if (ctx.model)
@@ -319,22 +537,28 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     });
   });
   pi.on("agent_settled", () => {
+    if (scheduleReconciliation(pi)) return;
     pi.appendEntry("pi-workgraph-agent-settled", {
       ...generation,
       settledAt: DateTime.formatIso(DateTime.nowUnsafe()),
     });
   });
-  pi.on("context", (event) => {
-    if (mode !== "implementation" || phase !== "executor") return;
+  pi.on("context", (event, ctx) => {
+    if (mode !== "implementation") return;
+    const snapshotType = phase === "guide" ? "pi-workgraph-guide" : "pi-workgraph-executor";
     return {
       messages: [
         ...event.messages.filter(
-          (message) => !(message.role === "custom" && message.customType === "pi-workgraph-guide"),
+          (message) =>
+            message.role !== "custom" ||
+            (message.customType !== "pi-workgraph-guide" &&
+              message.customType !== "pi-workgraph-executor" &&
+              message.customType !== "pi-workgraph-objective"),
         ),
         {
           role: "custom" as const,
-          customType: "pi-workgraph-executor",
-          content: executorInstructions(),
+          customType: snapshotType,
+          content: currentInstructions(latestAttemptObjective(ctx.sessionManager.getBranch())),
           display: false,
           details: generation,
           timestamp: DateTime.toEpochMillis(DateTime.nowUnsafe()),
@@ -342,26 +566,22 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       ],
     };
   });
-  pi.on("before_agent_start", () => ({
-    message: {
-      customType:
-        mode === "implementation" && phase === "guide"
-          ? "pi-workgraph-guide"
-          : `pi-workgraph-${mode}`,
-      content:
-        mode === "implementation"
-          ? phase === "guide"
-            ? guideInstructions
-            : executorInstructions()
-          : mode === "review"
+  pi.on("before_agent_start", () => {
+    if (mode === "implementation") return;
+    return {
+      message: {
+        customType: `pi-workgraph-${mode}`,
+        content:
+          mode === "review"
             ? reviewInstructions
             : experiment
               ? experimentInstructions
               : researchInstructions,
-      display: false,
-      details: generation,
-    },
-  }));
+        display: false,
+        details: generation,
+      },
+    };
+  });
 }
 
 function handleWorkerReport(
@@ -379,7 +599,9 @@ function handleWorkerReport(
       // tracked and untracked local changes. Do not claim an immutable base unless the
       // report records exact Git evidence for the requested revision.
       return terminalReport(params, {
-        todos: execution.todos,
+        plan: execution.plan,
+        planStatus: execution.planStatus,
+        reminderCount: execution.reminderCount,
         switchedAt: execution.switchedAt,
         switchError: execution.switchError,
       });
@@ -406,8 +628,9 @@ function noChangeImplementationReport(
         `No-change implementation must report the unchanged base revision ${execution.baseCommit}.`,
       );
     return terminalReport(report, {
-      todos: execution.todos,
-      todoRecorded: execution.todos.length > 0,
+      plan: execution.plan,
+      planStatus: execution.planStatus,
+      reminderCount: execution.reminderCount,
       switchedAt: execution.switchedAt,
       continued: execution.continued,
       outcome: "no_change",
@@ -440,8 +663,9 @@ function changedImplementationReport(
     return terminalReport(
       { ...report, ...provenance },
       {
-        todos: execution.todos,
-        todoRecorded: execution.todos.length > 0,
+        plan: execution.plan,
+        planStatus: execution.planStatus,
+        reminderCount: execution.reminderCount,
         switchedAt: execution.switchedAt,
         continued: execution.continued,
         outcome: "changed",
@@ -516,9 +740,9 @@ const experimentInstructions =
 const reviewInstructions =
   "[WORKGRAPH REVIEW]\nReview only the identified subject and concern. For an exact revision subject, inspect that exact commit with Git (for example git show, git diff, and git ls-tree) and cite the revision in evidence; do not silently treat live working files as that commit. Do not claim tests against current working files validate another revision. Execute verification only when it genuinely targets the requested subject. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
 const guideInstructions =
-  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current isolated worktree. If the requirement already holds, verify it and report no_change with the inspected base revision and reason; no edit or executor turn is required. If a change is needed, record at most eight concrete local TODO items with workgraph_todo, then make the first useful implementation edit yourself. Recording TODOs does not switch models. The first successful edit or observed Git change triggers the executor switch; do not stop or wait for a handoff after recording TODOs. Changed work must complete through the executor. Missing TODO telemetry does not block an otherwise valid implementation. If required work crosses the authorized scope, report escalation without editing.";
+  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current isolated worktree. If the requirement already holds, verify it and report no_change with the inspected base revision and reason; no edit or executor turn is required. If a change is needed, use workgraph_plan once to record one concise bounded plan grounded in inspected code, with rationale and constraints, concrete risks or unknowns, and implementation and meaningful verification steps. Then make the first useful implementation edit yourself. Recording or revising the plan does not switch models. The first successful edit or observed Git change triggers the executor switch; do not stop or wait for a handoff after planning. Changed work must complete through the executor. Missing plan state does not block truthful implementation, failure, or escalation. If required work crosses the authorized scope, report escalation without editing.";
 function executorInstructions(): string {
-  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory in the isolated worktree. Complete the bounded assignment and run its verification. For changed code, create exactly one direct commit on the supplied base and leave the worktree clean. If verification establishes no change is needed and the worktree is clean at the supplied base, report no_change with that revision and reason instead. Return workgraph_report with evidence. Escalate required work beyond the authorized scope.";
+  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory in the isolated worktree and preserve the inherited assignment. Inspect the current bounded plan, revise it when the approach, risks, implementation steps, or verification steps change, and independently reconcile it against the worktree. Plan statuses are not correctness evidence and unfinished steps do not block a truthful failure or escalation. Complete the bounded assignment and run meaningful verification. For changed code, create exactly one direct commit on the supplied base and leave the worktree clean. If verification establishes no change is needed and the worktree is clean at the supplied base, report no_change with that revision and reason instead. Return workgraph_report with evidence and explicit limitations. Escalate required work beyond the authorized scope.";
 }
 function gitEffect(pi: ExtensionAPI, cwd: string, args: string[], allowEmpty = false) {
   return Effect.gen(function* () {
