@@ -9,6 +9,7 @@ import type {
   WorkResult,
   WorkstreamState,
 } from "../src/workstream.js";
+import { required } from "./decoders.js";
 
 const timestamp = "2026-01-01T00:00:00.000Z";
 
@@ -134,6 +135,39 @@ function researchReport(summary: string): WorkerReport {
   };
 }
 
+function settlementProjection(state: WorkstreamState, resultId: string) {
+  const view = inspectView(state, { section: "outcome", result: resultId });
+  if (!("settlement" in view)) throw new Error("Expected settlement projection");
+  return view.settlement;
+}
+
+function recoveryProjection(state: WorkstreamState, attemptId: string) {
+  const view = inspectView(state, { section: "recovery", attempt: attemptId });
+  if (!("guardedActions" in view) || !("recordedFacts" in view))
+    throw new Error("Expected recovery projection");
+  return view;
+}
+
+function recoveryActions(state: WorkstreamState, attemptId: string) {
+  return recoveryProjection(state, attemptId).guardedActions;
+}
+
+function assertOutputProjection(
+  state: WorkstreamState,
+  resultId: string,
+  attemptId: string,
+  disposition: string,
+  actions: string[],
+): void {
+  assert.equal(settlementProjection(state, resultId).retainedOutput.state, disposition);
+  const recovery = recoveryProjection(state, attemptId);
+  assert.equal(recovery.recordedFacts.retainedOutput.state, disposition);
+  assert.deepEqual(
+    new Set(recovery.guardedActions.map((action) => action.action)),
+    new Set(actions),
+  );
+}
+
 void test("candidate projection uses the canonical historical initial lineage", () => {
   const baseRevision = "a".repeat(40);
   const current = state(undefined, [
@@ -169,9 +203,55 @@ void test("overview task index recovers every arbitrary task id", () => {
   );
   assert.deepEqual(JSON.parse(recovered), ids);
   const overview = inspectView(current, { section: "overview", maxItems: 4 });
+  assert.equal(overview.workstream.currentIntent, 0);
+  assert.equal(overview.workstream.currentIntentStatement, "Test projections.");
+  assert.deepEqual(overview.workstream.currentIntentContext, { section: "context" });
   assert.equal(overview.tasks.totalItems, ids.length);
   assert.equal(overview.tasks.truncated, true);
   assert.ok(overview.tasks.next);
+  assert.ok("activeAttempts" in overview);
+  assert.equal("remainingWork" in overview, false);
+});
+
+void test("read-only task-scoped attempt ordinals resolve while projections expose exact IDs", () => {
+  const first = {
+    id: "attempt-a1",
+    assignmentId: "task",
+    state: "queued" as const,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const second = {
+    id: "attempt-a2",
+    assignmentId: "task",
+    state: "running" as const,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const other = {
+    id: "attempt-b1",
+    assignmentId: "other",
+    state: "queued" as const,
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const current = state([assignment("task"), assignment("other")], [first, second, other]);
+
+  const selected = inspectView(current, {
+    section: "recovery",
+    task: "task",
+    attempt: "attempt-2",
+  });
+  assert.deepEqual(selected.attempt, {
+    handle: "attempt-a2",
+    storageId: "attempt-a2",
+    state: "running",
+  });
+  const overview = inspectView(current, { section: "overview" });
+  assert.deepEqual(
+    overview.activeAttempts.items.map((item) => item.attempt),
+    ["attempt-a1", "attempt-a2", "attempt-b1"],
+  );
 });
 
 void test("retained authority, complete assignments, and completion roundtrip exactly", () => {
@@ -247,9 +327,10 @@ void test("retained authority, complete assignments, and completion roundtrip ex
     return records;
   });
   assert.deepEqual(JSON.parse(contextText), {
+    currentIntent: current.intents.at(-1),
     purpose: current.purpose,
     inputs: current.inputs,
-    intents: current.intents,
+    intents: current.intents.slice(0, -1),
   });
 
   for (const expected of current.assignments) {
@@ -275,6 +356,205 @@ void test("retained authority, complete assignments, and completion roundtrip ex
     lifecycle: current.lifecycle,
     completion: current.completion,
   });
+});
+
+void test("output projections follow cleanup ownership and retain uncertainty", () => {
+  const revision = "a".repeat(40);
+  const authority = { receiptId: "receipt", intentVersion: 0 };
+  const review: WorkAssignment = {
+    id: "exact-review",
+    capability: "review",
+    artifactIntent: "evidence_only",
+    objective: "Review the exact revision",
+    intentVersion: 0,
+    subject: { kind: "revision", revision },
+    concern: "Inspect the selected revision",
+    createdAt: timestamp,
+  };
+  const noChange: WorkAssignment = {
+    id: "no-change",
+    capability: "implement",
+    artifactIntent: "maintained_change",
+    objective: "Confirm existing behavior",
+    intentVersion: 0,
+    authority,
+    acceptance: ["Existing behavior remains correct"],
+    createdAt: timestamp,
+  };
+  const changed: WorkAssignment = {
+    id: "changed",
+    capability: "implement",
+    artifactIntent: "maintained_change",
+    objective: "Implement the change",
+    intentVersion: 0,
+    authority,
+    acceptance: ["The behavior changes"],
+    createdAt: timestamp,
+  };
+  const experiment: WorkAssignment = {
+    id: "experiment",
+    capability: "research",
+    artifactIntent: "disposable_experiment",
+    objective: "Try an isolated experiment",
+    intentVersion: 0,
+    authority,
+    permittedEffects: ["Write only in the isolated worktree"],
+    stopCondition: "The experiment is understood",
+    expectedEvidence: ["Experiment evidence"],
+    createdAt: timestamp,
+  };
+  const reviewResult = typedResult("review-result", review.id, {
+    kind: "review",
+    status: "completed",
+    summary: "Reviewed the exact revision.",
+    evidence: [],
+    findings: [],
+  });
+  const noChangeResult = typedResult("no-change-result", noChange.id, {
+    kind: "implementation",
+    status: "completed",
+    outcome: "no_change",
+    revision,
+    reason: "The requested behavior already holds.",
+    summary: "No change was needed.",
+    evidence: [],
+    findings: [],
+  });
+  const changedResult = typedResult("changed-result", changed.id, {
+    kind: "implementation",
+    status: "completed",
+    outcome: "changed",
+    commit: "b".repeat(40),
+    summary: "Changed the behavior.",
+    evidence: [],
+    findings: [],
+  });
+  const experimentResult = typedResult(
+    "experiment-result",
+    experiment.id,
+    researchReport("Experiment"),
+  );
+  const attempts: WorkAttempt[] = [
+    {
+      id: "review-attempt",
+      assignmentId: review.id,
+      state: "settled",
+      resultId: reviewResult.id,
+      placement: { kind: "isolated_worktree", path: "/tmp/review", branch: "review" },
+      cleanup: { state: "completed", workerClosed: true },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+    {
+      id: "no-change-attempt",
+      assignmentId: noChange.id,
+      state: "settled",
+      resultId: noChangeResult.id,
+      placement: { kind: "isolated_worktree", path: "/tmp/no-change", branch: "no-change" },
+      cleanup: { state: "completed", workerClosed: true },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+    {
+      id: "changed-attempt",
+      assignmentId: changed.id,
+      state: "settled",
+      resultId: changedResult.id,
+      placement: { kind: "isolated_worktree", path: "/tmp/changed", branch: "changed" },
+      cleanup: { state: "completed", workerClosed: true },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+    {
+      id: "experiment-attempt",
+      assignmentId: experiment.id,
+      state: "settled",
+      resultId: experimentResult.id,
+      placement: { kind: "isolated_worktree", path: "/tmp/experiment", branch: "experiment" },
+      cleanup: { state: "completed", workerClosed: true },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    },
+  ];
+  const current = state([review, noChange, changed, experiment], attempts, [
+    reviewResult,
+    noChangeResult,
+    changedResult,
+    experimentResult,
+  ]);
+
+  assertOutputProjection(current, reviewResult.id, "review-attempt", "not_applicable", []);
+  assertOutputProjection(current, noChangeResult.id, "no-change-attempt", "not_applicable", []);
+  assertOutputProjection(current, changedResult.id, "changed-attempt", "retained", [
+    "apply",
+    "release_output",
+  ]);
+  assertOutputProjection(current, experimentResult.id, "experiment-attempt", "retained", [
+    "release_output",
+  ]);
+
+  const retainedAttempt = required(
+    attempts.find((item) => item.id === "changed-attempt"),
+    "changed attempt",
+  );
+  const invalidResult = untypedResult(
+    "invalid-result",
+    changed.id,
+    "invalid",
+    "Malformed implementation report.",
+  );
+  const invalidState = state(
+    [changed],
+    [{ ...retainedAttempt, id: "invalid-attempt", resultId: invalidResult.id }],
+    [invalidResult],
+  );
+  assertOutputProjection(invalidState, invalidResult.id, "invalid-attempt", "retained", [
+    "release_output",
+  ]);
+
+  const failedResult = typedResult("failed-result", changed.id, {
+    kind: "implementation",
+    status: "failed",
+    summary: "The implementation failed.",
+    evidence: [],
+    findings: [],
+  });
+  const failedState = state(
+    [changed],
+    [{ ...retainedAttempt, id: "failed-attempt", resultId: failedResult.id }],
+    [failedResult],
+  );
+  assertOutputProjection(failedState, failedResult.id, "failed-attempt", "retained", [
+    "release_output",
+  ]);
+
+  const released = structuredClone(current);
+  const changedAttempt = required(
+    released.attempts.find((item) => item.id === "changed-attempt"),
+    "changed attempt",
+  );
+  changedAttempt.outputRelease = {
+    state: "completed",
+    expectedHead: revision,
+    reason: "Released after inspection.",
+  };
+  assertOutputProjection(released, changedResult.id, "changed-attempt", "released", []);
+
+  const uncertain = structuredClone(current);
+  const reviewAttempt = required(
+    uncertain.attempts.find((item) => item.id === "review-attempt"),
+    "review attempt",
+  );
+  reviewAttempt.cleanup = {
+    state: "blocked",
+    workerClosed: true,
+    error: "Worktree identity could not be verified.",
+  };
+  const uncertainSettlement = settlementProjection(uncertain, reviewResult.id);
+  assert.equal(uncertainSettlement.retainedOutput.state, "retained");
+  assert.equal(uncertainSettlement.retainedOutput.path, "/tmp/review");
+  assert.equal(uncertainSettlement.cleanup.state, "blocked");
+  assert.deepEqual(recoveryActions(uncertain, reviewAttempt.id), []);
 });
 
 void test("typed report kinds and untyped or malformed reports remain inspectable", () => {

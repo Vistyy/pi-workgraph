@@ -57,7 +57,6 @@ import {
   WorkstreamStateSchema,
 } from "./workstream-state.js";
 import {
-  accountingTaskId,
   deriveCompletionAccounting,
   hasActiveOrUncleanAttempt,
   recordInputTransition,
@@ -1013,8 +1012,6 @@ export class WorkstreamStoreEffects {
     conclusion: string;
     evidence: Static<typeof EvidenceSchema>[];
     limitations: string[];
-    /** One reason per unresolved semantic task; mechanical entries are derived below. */
-    reasons: Array<{ taskId: string; reason: string }>;
     now?: Date;
   }): StoreEffect<WorkstreamState> {
     return this.update((draft, now) => {
@@ -1031,40 +1028,13 @@ export class WorkstreamStoreEffects {
           "Complete only after workers and owned resources have settled and cleaned up.",
         );
       }
-      const expectedAccounting = deriveCompletionAccounting(draft);
-      const expectedTasks = [
-        ...new Set(
-          expectedAccounting
-            .map((entry) => accountingTaskId(draft, entry))
-            .filter((taskId): taskId is string => taskId !== undefined),
-        ),
-      ];
-      const reasonKeys = input.reasons.map((item) => item.taskId);
-      if (
-        reasonKeys.length !== new Set(reasonKeys).size ||
-        input.reasons.some(
-          (item) =>
-            !draft.assignments.some((assignment) => assignment.id === item.taskId) ||
-            !item.reason.trim(),
-        ) ||
-        expectedTasks.some((taskId) => !reasonKeys.includes(taskId)) ||
-        reasonKeys.some((taskId) => !expectedTasks.includes(taskId))
-      )
-        throw new Error(
-          `Completion requires exactly one reason per unresolved semantic task: ${expectedTasks.join(", ") || "none"}.`,
-        );
-      const reasonByTask = new Map(input.reasons.map((item) => [item.taskId, item.reason.trim()]));
-      // Every mechanical unresolved entry inherits the reason of its semantic task.
-      const resolvedAccounting = expectedAccounting.map((entry) => ({
-        ...entry,
-        reason: reasonByTask.get(accountingTaskId(draft, entry) ?? "") ?? entry.reason,
-      }));
+      const accounting = deriveCompletionAccounting(draft);
       const completedAt = (input.now ?? now).toISOString();
       draft.completion = {
         conclusion: input.conclusion.trim(),
         evidence: structuredClone(input.evidence),
         limitations: input.limitations.map((item) => item.trim()),
-        accounting: resolvedAccounting,
+        accounting,
         completedAt,
       };
       draft.lifecycle = {

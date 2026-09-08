@@ -20,11 +20,7 @@ import {
   type WorkstreamState,
   WorkstreamStateSchema,
 } from "./workstream-state.js";
-import {
-  accountingIdentity,
-  accountingTaskId,
-  deriveCompletionAccounting,
-} from "./workstream-transitions.js";
+import { accountingIdentity, deriveCompletionAccounting } from "./workstream-transitions.js";
 
 type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
@@ -534,18 +530,6 @@ function validateCompletion(
     throw new InvalidWorkstreamStateError(
       "Completion accounting does not exactly match derived unresolved records.",
     );
-
-  const reasonByTask = new Map<string, string>();
-  for (const item of state.completion.accounting) {
-    const taskId = accountingTaskId(state, item);
-    if (taskId === undefined) continue;
-    const previous = reasonByTask.get(taskId);
-    if (previous !== undefined && previous !== item.reason)
-      throw new InvalidWorkstreamStateError(
-        `Completion accounting has conflicting reasons for task ${taskId}.`,
-      );
-    reasonByTask.set(taskId, item.reason);
-  }
 }
 
 function validateCompletionReference(
@@ -602,7 +586,6 @@ export function validateSubject(state: WorkstreamState, subject: ResultSubject):
     validateArtifactSubject(state, subject.resultId, subject.artifactId);
     return;
   }
-  validateRevisionSubject(state, subject.revision);
 }
 
 function validateComparison(state: WorkstreamState, resultIds: string[]): void {
@@ -631,49 +614,6 @@ function validateArtifactSubject(
   const artifact = result?.artifacts.find((candidate) => candidate.id === artifactId);
   if (artifact?.retention !== "retained")
     throw new InvalidWorkstreamStateError("Review artifact is not retained.");
-}
-
-function validateRevisionSubject(state: WorkstreamState, revision: string): void {
-  const retainedArtifact = state.results.some((result) =>
-    result.artifacts.some(
-      (artifact) =>
-        artifact.kind === "revision" &&
-        artifact.reference === revision &&
-        artifact.retention === "retained",
-    ),
-  );
-  if (retainedArtifact || retainedCandidateRevision(state, revision)) return;
-  throw new InvalidWorkstreamStateError(`Review revision ${revision} is not retained.`);
-}
-
-function retainedCandidateRevision(state: WorkstreamState, revision: string): boolean {
-  return state.results.some((result) => {
-    if (
-      result.validity !== "typed" ||
-      result.report.kind !== "implementation" ||
-      result.report.status !== "completed" ||
-      result.report.outcome !== "changed" ||
-      result.report.commit !== revision
-    )
-      return false;
-    const attempt = state.attempts.find((candidate) => candidate.resultId === result.id);
-    const application = attempt?.application;
-    // An application checkpoint retains the exact source while the destination transition is in flight;
-    // an applied source remains retained in destination history even after its output worktree is released.
-    if (
-      application?.commit === revision &&
-      (application.state === "applied" || attempt?.outputRelease === undefined)
-    )
-      return true;
-    return (
-      attempt?.placement?.kind === "isolated_worktree" &&
-      attempt.cleanup?.state === "completed" &&
-      attempt.cleanup.workerClosed &&
-      attempt.outputRelease === undefined &&
-      application?.state !== "pending" &&
-      application?.state !== "applied"
-    );
-  });
 }
 
 export function validateId(value: string, label: string): void {

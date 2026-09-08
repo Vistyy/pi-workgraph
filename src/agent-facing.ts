@@ -93,10 +93,6 @@ function attemptOrdinal(state: WorkstreamState, attempt: WorkAttempt): number {
   );
 }
 
-function attemptHandle(state: WorkstreamState, attempt: WorkAttempt): string {
-  return `attempt-${attemptOrdinal(state, attempt)}`;
-}
-
 function resultOwnerAttempt(state: WorkstreamState, result: WorkResult): WorkAttempt | undefined {
   return state.attempts.find((attempt) => attempt.resultId === result.id);
 }
@@ -113,20 +109,16 @@ function outcomeHandle(state: WorkstreamState, result: WorkResult): string {
   return `outcome-${outcomeOrdinal(state, result)}`;
 }
 
-function attemptMatches(state: WorkstreamState, attempt: WorkAttempt, handle: string): boolean {
-  return attempt.id === handle || attemptHandle(state, attempt) === handle;
-}
-
-export function resolveAttemptHandle(
+function resolveAttemptHandle(
   state: WorkstreamState,
   handle: string,
   taskId?: string,
 ): WorkAttempt {
-  const matches = state.attempts.filter(
-    (attempt) =>
-      (taskId === undefined || attempt.assignmentId === taskId) &&
-      attemptMatches(state, attempt, handle),
-  );
+  // Ordinals are a read-only inspector convenience; controls use exact stored IDs.
+  const matches = state.attempts.filter((attempt) => {
+    if (taskId !== undefined && attempt.assignmentId !== taskId) return false;
+    return attempt.id === handle || `attempt-${attemptOrdinal(state, attempt)}` === handle;
+  });
   const match = matches.at(0);
   if (match === undefined)
     throw new Error(
@@ -192,13 +184,13 @@ function assertCompatibleSelection(
   if (attempt === undefined || outcome === undefined || retainedResultId === outcome.id) return;
   if (retainedResultId === undefined)
     throw new Error(
-      `Attempt ${attemptHandle(state, attempt)} has no retained outcome; it cannot select ${outcomeHandle(state, outcome)}.`,
+      `Attempt ${attempt.id} has no retained outcome; it cannot select ${outcomeHandle(state, outcome)}.`,
     );
   const retained = resultById(state, retainedResultId);
   const retainedIdentity =
     retained === undefined ? retainedResultId : outcomeHandle(state, retained);
   throw new Error(
-    `Attempt ${attemptHandle(state, attempt)} retained ${retainedIdentity}, not ${outcomeHandle(state, outcome)}.`,
+    `Attempt ${attempt.id} retained ${retainedIdentity}, not ${outcomeHandle(state, outcome)}.`,
   );
 }
 
@@ -257,14 +249,11 @@ function resolveSelection(state: WorkstreamState, request: InspectRequest): Sele
   };
 }
 
-function requireUnambiguousAttempt(
-  state: WorkstreamState,
-  selection: Selection,
-): WorkAttempt | undefined {
+function requireUnambiguousAttempt(selection: Selection): WorkAttempt | undefined {
   if (selection.attempt !== undefined) return selection.attempt;
   if (selection.taskAttempts.length <= 1) return selection.taskAttempts.at(0);
   throw new Error(
-    `Task ${compactText(selection.task?.id ?? "")} has repeated attempts; specify one of: ${selection.taskAttempts.map((item) => attemptHandle(state, item)).join(", ")}.`,
+    `Task ${compactText(selection.task?.id ?? "")} has repeated attempts; specify one of: ${selection.taskAttempts.map((item) => item.id).join(", ")}.`,
   );
 }
 
@@ -316,7 +305,6 @@ function reportPreview(result: WorkResult) {
       severity: item.severity,
       title: compactText(item.title, 120),
       detail: compactText(item.detail, 280),
-      envelopeImpact: item.envelopeImpact,
     })),
     counts: {
       uncertainty: report.uncertainty?.length ?? 0,
@@ -392,12 +380,44 @@ function applicationProjection(attempt: WorkAttempt | undefined, result: WorkRes
   return { state: "not_applicable" as const };
 }
 
-function retainedOutputProjection(attempt: WorkAttempt | undefined) {
+function successfulImplementationOutcome(
+  result: WorkResult | undefined,
+  outcome: "changed" | "no_change",
+): boolean {
+  return (
+    result?.validity === "typed" &&
+    result.report.kind === "implementation" &&
+    result.report.status === "completed" &&
+    result.report.outcome === outcome
+  );
+}
+
+function successfulNoChange(result: WorkResult | undefined): boolean {
+  return successfulImplementationOutcome(result, "no_change");
+}
+
+function outputDisposition(
+  task: WorkAssignment,
+  attempt: WorkAttempt | undefined,
+  result: WorkResult | undefined,
+) {
   const placement = attempt?.placement;
-  if (placement?.kind !== "isolated_worktree") return { state: "not_applicable" as const };
-  const release = attempt?.outputRelease;
+  if (attempt === undefined || placement?.kind !== "isolated_worktree")
+    return { state: "not_applicable" as const };
+  const release = attempt.outputRelease;
+  if (release?.state === "completed")
+    return { state: "released" as const, path: placement.path, releaseState: release.state };
+  const cleanupRemovesPlacement =
+    task.artifactIntent !== "disposable_experiment" &&
+    !(
+      task.capability === "implement" &&
+      attempt.application?.state !== "applied" &&
+      !successfulNoChange(result)
+    );
+  if (cleanupRemovesPlacement && attempt.cleanup?.state === "completed")
+    return { state: "not_applicable" as const };
   return {
-    state: release?.state === "completed" ? ("released" as const) : ("retained" as const),
+    state: "retained" as const,
     path: placement.path,
     releaseState: release?.state,
     blocker: release?.error === undefined ? undefined : compactText(release.error, 280),
@@ -416,6 +436,7 @@ function cleanupProjection(attempt: WorkAttempt | undefined) {
 
 function settlement(state: WorkstreamState, result: WorkResult) {
   const attempt = resultOwnerAttempt(state, result);
+  const task = taskById(state, result.assignmentId);
   const blockers =
     result.validity === "typed"
       ? result.report.findings
@@ -433,7 +454,7 @@ function settlement(state: WorkstreamState, result: WorkResult) {
     blockers,
     blockerCount,
     application: applicationProjection(attempt, result),
-    retainedOutput: retainedOutputProjection(attempt),
+    retainedOutput: outputDisposition(task, attempt, result),
     cleanup: cleanupProjection(attempt),
     delivery: deliveryPreview(state, result),
     recovery:
@@ -474,7 +495,7 @@ function attemptPreview(state: WorkstreamState, attempt: WorkAttempt) {
   const retainedResultId = attempt.resultId;
   const result = retainedResultId === undefined ? undefined : resultById(state, retainedResultId);
   return {
-    handle: attemptHandle(state, attempt),
+    handle: attempt.id,
     state: attempt.state,
     outcome: result === undefined ? undefined : outcomeHandle(state, result),
     blocker: attempt.error === undefined ? undefined : compactText(attempt.error, 280),
@@ -520,16 +541,20 @@ function taskView(state: WorkstreamState, assignment: WorkAssignment, request: I
 }
 
 function contextView(state: WorkstreamState, request: InspectRequest) {
+  const currentIntent = state.intents.at(-1);
   return {
     inputCount: state.inputs.length,
     intentCount: state.intents.length,
-    currentIntentVersion: state.intents.at(-1)?.version,
+    currentIntentVersion: currentIntent?.version,
+    currentIntentStatement:
+      currentIntent === undefined ? undefined : compactText(currentIntent.statement),
     records: boundedText(
       JSON.stringify(
         {
+          currentIntent,
           purpose: state.purpose,
           inputs: state.inputs,
-          intents: state.intents,
+          intents: currentIntent === undefined ? state.intents : state.intents.slice(0, -1),
         },
         null,
         2,
@@ -583,7 +608,7 @@ function attention(state: WorkstreamState) {
     return [
       {
         taskPreview: compactText(attempt.assignmentId, 120),
-        attempt: attemptHandle(state, attempt),
+        attempt: attempt.id,
         blocker: compactText(blocker, 280),
         recovery: { section: "recovery" as const, attempt: attempt.id },
       },
@@ -597,13 +622,17 @@ function overview(state: WorkstreamState, request: InspectRequest) {
   );
   const taskRetrieval = { section: "overview" as const };
   const attentionItems = attention(state);
+  const currentIntent = state.intents.at(-1);
   return {
     workstream: {
       id: state.id,
       lifecycle: state.lifecycle.state,
       purpose: compactText(state.purpose),
       statePathPreview: compactText(state.statePath, 240),
-      currentIntent: state.intents.at(-1)?.version,
+      currentIntent: currentIntent?.version,
+      currentIntentStatement:
+        currentIntent === undefined ? undefined : compactText(currentIntent.statement),
+      currentIntentContext: { section: "context" as const },
     },
     counts: {
       tasks: state.assignments.length,
@@ -626,10 +655,10 @@ function overview(state: WorkstreamState, request: InspectRequest) {
       totalItems: attentionItems.length,
       truncated: attentionItems.length > 5,
     },
-    remainingWork: {
+    activeAttempts: {
       items: active.slice(0, 10).map((attempt) => ({
         taskPreview: compactText(attempt.assignmentId, 120),
-        attempt: attemptHandle(state, attempt),
+        attempt: attempt.id,
         state: attempt.state,
         recovery: { section: "recovery" as const, attempt: attempt.id },
       })),
@@ -806,7 +835,7 @@ function recoveryView(
   return {
     taskPreview: compactText(task.id, 120),
     attempt: {
-      handle: attemptHandle(state, attempt),
+      handle: attempt.id,
       storageId: attempt.id,
       state: attempt.state,
     },
@@ -822,7 +851,11 @@ function recoveryView(
       nativeOrGitStateFromTerminalStateAlone: false,
       application: recordedApplication(attempt),
       candidate: candidateProjection(attempt),
-      retainedOutput: retainedOutputProjection(attempt),
+      retainedOutput: outputDisposition(
+        task,
+        attempt,
+        attempt.resultId === undefined ? undefined : resultById(state, attempt.resultId),
+      ),
       cleanup: recordedCleanup(attempt),
       delivery: recordedDelivery(state, attempt),
       models: projectedModels(attempt),
@@ -835,15 +868,15 @@ function recoveryView(
       { section: "recovery", attempt: attempt.id },
     ),
     uncertainty,
-    guardedActions: retainedOutputActions(task, attempt),
+    guardedActions: retainedOutputActions(state, task, attempt),
   };
 }
 
-function retainedOutputActions(task: WorkAssignment, attempt: WorkAttempt) {
+function retainedOutputActions(state: WorkstreamState, task: WorkAssignment, attempt: WorkAttempt) {
+  const result = attempt.resultId === undefined ? undefined : resultById(state, attempt.resultId);
   if (
-    attempt.placement?.kind !== "isolated_worktree" ||
-    attempt.cleanup?.state !== "completed" ||
-    attempt.outputRelease?.state === "completed"
+    outputDisposition(task, attempt, result).state !== "retained" ||
+    attempt.cleanup?.state !== "completed"
   )
     return [];
   const actions = [
@@ -857,7 +890,9 @@ function retainedOutputActions(task: WorkAssignment, attempt: WorkAttempt) {
   if (
     task.capability === "implement" &&
     attempt.state === "settled" &&
-    attempt.application === undefined
+    attempt.application === undefined &&
+    attempt.outputRelease === undefined &&
+    successfulImplementationOutcome(result, "changed")
   )
     return [
       {
@@ -865,7 +900,7 @@ function retainedOutputActions(task: WorkAssignment, attempt: WorkAttempt) {
         action: "apply" as const,
         attempt: attempt.id,
         requirement:
-          "Provide the exact reported sourceCommit and freshly observed current destinationHead.",
+          "The runtime derives the retained source and observes the current destination before application.",
       },
       ...actions,
     ];
@@ -993,12 +1028,7 @@ export function inspectView(state: WorkstreamState, request: InspectRequest): In
   if (request.section === "task") return taskView(state, selection.task, request);
   if (request.section === "assignment") return assignmentView(selection.task, request);
   if (request.section === "recovery")
-    return recoveryView(
-      state,
-      selection.task,
-      requireUnambiguousAttempt(state, selection),
-      request,
-    );
+    return recoveryView(state, selection.task, requireUnambiguousAttempt(selection), request);
   const outcome = requireUnambiguousOutcome(state, selection);
   if (outcome === undefined) return pendingView(state, selection);
   if (request.section === "outcome") return outcomeView(state, outcome, request);

@@ -17,6 +17,8 @@ import {
   Semaphore,
 } from "effect";
 import type { PlatformError } from "effect/PlatformError";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
 import {
   candidateApplicationIssue,
   candidateLineageForAttempt,
@@ -38,11 +40,15 @@ import {
 } from "./herdr.js";
 import type { WorkerLaunchError } from "./herdr-launch.js";
 import {
+  type ImplementationModelOverrides,
+  ImplementationModelOverridesSchema,
   loadModelPolicyEffect,
   type ModelPolicy,
   type ModelPolicyError,
   resolveSelection,
+  resolveTargetOverride,
   type SelectionRequest,
+  SelectionRequestSchema,
 } from "./model-policy.js";
 import type {
   createWorkerSessionEffect,
@@ -50,7 +56,7 @@ import type {
   PiSessionError,
 } from "./pi-process.js";
 import type { WorkgraphRegistry } from "./registry.js";
-import type { ThinkingLevel, WorkerIdentity } from "./types.js";
+import type { WorkerIdentity } from "./types.js";
 import type {
   CandidateLineage,
   StoreEffect,
@@ -78,11 +84,7 @@ export interface WorkstreamLaunch {
 }
 export interface QueueOptions {
   selection?: SelectionRequest;
-  /** Explicit target compatibility is retained only with a reason. */
-  model?: string;
-  modelReason?: string;
-  thinking?: ThinkingLevel;
-  executor?: { model: string; thinking: ThinkingLevel };
+  models?: ImplementationModelOverrides;
   continuationOf?: string;
   /** Content lineage; unlike continuationOf this never names a Pi session trajectory. */
   candidateOf?: string;
@@ -147,11 +149,7 @@ export interface WorkstreamRuntimeEffects {
     options?: QueueOptions,
   ) => RuntimeEffect<WorkstreamState>;
   readonly reconcile: RuntimeEffect<WorkstreamState>;
-  readonly apply: (
-    attemptId: string,
-    sourceCommit: string,
-    destinationHead: string,
-  ) => RuntimeEffect<WorkstreamState>;
+  readonly apply: (attemptId: string) => RuntimeEffect<WorkstreamState>;
   readonly releaseOutput: (attemptId: string, reason: string) => RuntimeEffect<WorkstreamState>;
   readonly steer: (attemptId: string, instruction: string) => RuntimeEffect<void>;
   readonly cancel: (attemptId: string) => RuntimeEffect<void>;
@@ -194,8 +192,7 @@ export class WorkstreamRuntime {
         this.submit(effect).pipe(Effect.mapError((error) => this.submissionError(error))),
       queue: (input, options = {}) => this.submit(this.queueEffect(input, options)),
       reconcile: this.submit(this.reconcileOperation()),
-      apply: (attemptId, sourceCommit, destinationHead) =>
-        this.submit(this.applyEffect(attemptId, sourceCommit, destinationHead)),
+      apply: (attemptId) => this.submit(this.applyEffect(attemptId)),
       releaseOutput: (attemptId, reason) =>
         this.submit(this.releaseOutputEffect(attemptId, reason)),
       steer: (attemptId, instruction) => this.submit(this.steerEffect(attemptId, instruction)),
@@ -342,18 +339,6 @@ export class WorkstreamRuntime {
     );
   }
 
-  private gitEffect<A>(
-    run: (repository: GitRepository["effects"]) => Effect.Effect<A, GitFailure>,
-  ): RuntimeEffect<A, GitFailure> {
-    return run(this.repository.effects);
-  }
-
-  private herdrEffect<A, E>(
-    run: (workers: RuntimeWorkerPort["effects"]) => RuntimeEffect<A, E>,
-  ): RuntimeEffect<A, E> {
-    return run(this.workers.effects);
-  }
-
   private ownershipEffect(): RuntimeEffect<
     void,
     LeaseDecisionRequiredError | RuntimeRegistryError
@@ -434,6 +419,9 @@ export class WorkstreamRuntime {
   ): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
+        yield* this.runtimeSync("validate model queue options", () =>
+          validateQueueModelOptions(input.capability, options),
+        );
         const policy = yield* this.policy;
         const base = yield* this.resolveQueueBaseEffect(input, options);
         const attempts = yield* this.runtimeSync("prepare queued attempt", () =>
@@ -494,9 +482,7 @@ export class WorkstreamRuntime {
         const parent = findAttemptHandle(state, required(options.candidateOf, "candidate parent"));
         const parentCandidate = yield* this.validateRetainedCandidate(state, parent);
         const requested = options.baseRevision ?? parentCandidate.commit;
-        const baseRevision = yield* this.gitEffect((repository) =>
-          repository.resolveRevision(requested),
-        );
+        const baseRevision = yield* this.repository.resolveRevision(requested);
         const correction = baseRevision === parentCandidate.commit;
         if (!correction) yield* this.validateIntegrationBaseEffect(baseRevision);
         return {
@@ -515,14 +501,14 @@ export class WorkstreamRuntime {
   private validateIntegrationBaseEffect(baseRevision: string): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const destination = yield* this.gitEffect((repository) => repository.head());
+        const destination = yield* this.repository.head();
         if (destination !== baseRevision)
           return yield* this.runtimeSync("validate integration base", () => {
             throw new Error(
               `Integration base ${baseRevision} is not the current destination HEAD ${destination}.`,
             );
           });
-        yield* this.gitEffect((repository) => repository.assertClean());
+        yield* this.repository.assertClean();
       }.bind(this),
     );
   }
@@ -541,12 +527,12 @@ export class WorkstreamRuntime {
         );
         const repositoryHead =
           options.baseRevision === undefined && subjectRevision === undefined && isolated
-            ? yield* this.gitEffect((repository) => repository.head())
+            ? yield* this.repository.head()
             : undefined;
         const requested = options.baseRevision ?? subjectRevision ?? repositoryHead;
         return requested === undefined
           ? undefined
-          : yield* this.gitEffect((repository) => repository.resolveRevision(requested));
+          : yield* this.repository.resolveRevision(requested);
       }.bind(this),
     );
   }
@@ -570,12 +556,10 @@ export class WorkstreamRuntime {
             );
           return retained;
         });
-        const validated = yield* this.gitEffect((repository) =>
-          repository.validateCandidate(
-            placementOf(parent),
-            source.candidate.rootCommit,
-            source.commit,
-          ),
+        const validated = yield* this.repository.validateCandidate(
+          placementOf(parent),
+          source.candidate.rootCommit,
+          source.commit,
         );
         if (validated.commit !== source.commit)
           return yield* this.runtimeSync("validate retained candidate source", () => {
@@ -737,7 +721,7 @@ export class WorkstreamRuntime {
             ? yield* this.recoverWorker(state, initial, assignment)
             : initial;
         const worker = required(attempt.worker, "worker identity");
-        const observation = yield* this.herdrEffect((workers) => workers.observe(worker));
+        const observation = yield* this.workers.observe(worker);
         const pi = runtimePi;
         const started = pi.started(worker.sessionFile, state.id, attempt.id);
         if (started && attempt.submission !== "started")
@@ -761,7 +745,7 @@ export class WorkstreamRuntime {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const request = workerRecoveryRequest(this.launch.workspaceId, state, attempt, assignment);
-        const recovered = yield* this.herdrEffect((workers) => workers.recover(request));
+        const recovered = yield* this.workers.recover(request);
         if (recovered === undefined)
           return yield* this.runtimeSync("validate recovered worker", () => {
             throw new Error(
@@ -789,11 +773,7 @@ export class WorkstreamRuntime {
       });
     const worker = required(attempt.worker, "worker identity");
     return this.storeEffect((store) => store.markSubmission(attempt.id, "uncertain")).pipe(
-      Effect.andThen(
-        this.herdrEffect((workers) =>
-          workers.steer(worker, "Continue the assigned Workgraph objective now."),
-        ),
-      ),
+      Effect.andThen(this.workers.steer(worker, "Continue the assigned Workgraph objective now.")),
       Effect.andThen(this.storeEffect((store) => store.markSubmission(attempt.id, "submitted"))),
       Effect.as(true),
     );
@@ -848,9 +828,7 @@ export class WorkstreamRuntime {
           id: attempt.id,
         };
         if (attempt.placement?.kind === "isolated_worktree")
-          input.expectedHead = yield* this.gitEffect((repository) =>
-            repository.head(attempt.placement?.path),
-          );
+          input.expectedHead = yield* this.repository.head(attempt.placement?.path);
         yield* this.storeEffect((store) => store.beginCleanup(input));
       }.bind(this),
     );
@@ -870,12 +848,10 @@ export class WorkstreamRuntime {
         );
         const baseRevision = attempt.baseRevision;
         const placement = isolated
-          ? yield* this.gitEffect((repository) =>
-              repository.createWorktree(
-                state.id,
-                attempt.id,
-                required(baseRevision, "base revision"),
-              ),
+          ? yield* this.repository.createWorktree(
+              state.id,
+              attempt.id,
+              required(baseRevision, "base revision"),
             )
           : undefined;
         const workerCwd = placement?.path ?? this.repository.root;
@@ -915,7 +891,7 @@ export class WorkstreamRuntime {
           baseRevision,
           this.store,
         );
-        yield* this.herdrEffect((workers) => workers.launch(request));
+        yield* this.workers.launch(request);
       }.bind(this),
     );
   }
@@ -1000,9 +976,7 @@ export class WorkstreamRuntime {
     report: WorkerReport,
   ): RuntimeEffect<void> {
     if (isNoChangeImplementation(assignment, report))
-      return this.gitEffect((repository) =>
-        repository.validateWorkerNoChange(placementOf(attempt), report.revision),
-      ).pipe(
+      return this.repository.validateWorkerNoChange(placementOf(attempt), report.revision).pipe(
         Effect.andThen(
           this.storeEffect((store) => store.retainResult({ ...base, validity: "typed", report })),
         ),
@@ -1048,41 +1022,43 @@ export class WorkstreamRuntime {
           id: attempt.id,
         };
         if (attempt.placement?.kind === "isolated_worktree")
-          cleanup.expectedHead = yield* this.gitEffect((repository) =>
-            repository.head(attempt.placement?.path),
-          );
+          cleanup.expectedHead = yield* this.repository.head(attempt.placement?.path);
         yield* this.storeEffect((store) => store.beginCleanup(cleanup));
         yield* this.storeEffect((store) => store.blockCleanup(attempt.id, error.message));
       }.bind(this),
     );
   }
 
-  private applyEffect(
-    attemptId: string,
-    sourceCommit: string,
-    destinationHead: string,
-  ): RuntimeEffect<WorkstreamState> {
+  private applyEffect(attemptId: string): RuntimeEffect<WorkstreamState> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const state = yield* this.storeEffect((store) => store.load());
         const attempt = findAttempt(state, attemptId);
         const assignment = findAssignment(state, attempt.assignmentId);
         const result = state.results.find((item) => item.id === attempt.resultId);
-        const reportedCommit = validApplicationCommit(result);
+        const sourceCommit = validApplicationCommit(result);
         const candidate = required(candidateLineageForAttempt(attempt), "candidate base revision");
         yield* this.runtimeSync("validate explicit application", () =>
           validateExplicitApplication(
             state,
             attempt,
             assignment,
-            reportedCommit,
             sourceCommit,
-            destinationHead,
             this.store.isAssignmentCurrent(state, assignment.id),
           ),
         );
-        const validated = yield* this.gitEffect((repository) =>
-          repository.validateCandidate(placementOf(attempt), candidate.rootCommit, sourceCommit),
+        const destinationHead = yield* this.repository.head();
+        yield* this.runtimeSync("validate application destination", () => {
+          if (destinationHead !== candidate.rootCommit)
+            throw new Error(
+              `Destination HEAD ${destinationHead} does not equal candidate root ${candidate.rootCommit}; integrate the retained candidate onto the moved destination first.`,
+            );
+        });
+        yield* this.repository.assertClean();
+        const validated = yield* this.repository.validateCandidate(
+          placementOf(attempt),
+          candidate.rootCommit,
+          sourceCommit,
         );
         const source: CandidateApplicationSource = {
           rootCommit: validated.rootCommit,
@@ -1116,13 +1092,6 @@ export class WorkstreamRuntime {
   ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const validated = yield* this.gitEffect((repository) =>
-          repository.validateCandidate(placementOf(attempt), source.rootCommit, source.commit),
-        );
-        yield* this.runtimeSync("validate candidate application history", () => {
-          if (!sameCommitChain(validated.commits, source.commits))
-            throw new Error("Candidate history changed between application checks.");
-        });
         yield* this.storeEffect((store) =>
           store.beginApplication({
             id: attempt.id,
@@ -1140,9 +1109,7 @@ export class WorkstreamRuntime {
             );
         });
         yield* this.ownershipEffect();
-        const revision = yield* this.gitEffect((repository) =>
-          repository.applyCandidate(source, expectedHead),
-        );
+        const revision = yield* this.repository.applyCandidate(source, expectedHead);
         yield* this.storeEffect((store) => store.finishApplication(attempt.id, revision));
         yield* this.recordApplicationArtifact(
           attempt,
@@ -1162,9 +1129,9 @@ export class WorkstreamRuntime {
     // A command or persistence error can occur after Git changed HEAD. Inspect before retry.
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const recovery = yield* this.gitEffect((repository) =>
-          repository.recoverCandidateApplication(expectedHead, source),
-        ).pipe(Effect.option);
+        const recovery = yield* this.repository
+          .recoverCandidateApplication(expectedHead, source)
+          .pipe(Effect.option);
         if (Option.isNone(recovery) || recovery.value === undefined) {
           yield* this.storeEffect((store) =>
             store.blockApplication(attempt.id, originalError.message),
@@ -1227,9 +1194,7 @@ export class WorkstreamRuntime {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         if (!cleanup.workerClosed) {
-          const result = yield* this.herdrEffect((workers) =>
-            workers.cleanup(required(attempt.worker, "worker identity")),
-          );
+          const result = yield* this.workers.cleanup(required(attempt.worker, "worker identity"));
           if (result.state === "pending") return;
           if (result.state !== "completed")
             return yield* this.runtimeSync("validate worker cleanup result", () => {
@@ -1264,12 +1229,12 @@ export class WorkstreamRuntime {
         !noChange)
     )
       return Effect.void;
-    return this.gitEffect((repository) =>
-      repository.cleanupWorktree(
+    return this.repository
+      .cleanupWorktree(
         placementOf(attempt),
         required(cleanup.expectedHead, "expected worktree HEAD"),
-      ),
-    ).pipe(Effect.asVoid);
+      )
+      .pipe(Effect.asVoid);
   }
 
   private releaseOutputEffect(attemptId: string, reason: string): RuntimeEffect<WorkstreamState> {
@@ -1300,7 +1265,7 @@ export class WorkstreamRuntime {
         if (attempt.outputRelease?.state === "completed") return state;
         const expectedHead =
           attempt.outputRelease?.expectedHead ??
-          (yield* this.gitEffect((repository) => repository.head(placementOf(attempt).path)));
+          (yield* this.repository.head(placementOf(attempt).path));
         yield* this.storeEffect((store) =>
           store.beginOutputRelease({ id: attemptId, expectedHead, reason }),
         );
@@ -1309,13 +1274,9 @@ export class WorkstreamRuntime {
         const release = Effect.gen(
           function* (this: WorkstreamRuntime) {
             yield* this.ownershipEffect();
-            yield* this.gitEffect((repository) =>
-              repository.discardExperiment(placementOf(attempt), expectedHead),
-            );
+            yield* this.repository.discardExperiment(placementOf(attempt), expectedHead);
             yield* this.ownershipEffect();
-            yield* this.gitEffect((repository) =>
-              repository.cleanupWorktree(placementOf(attempt), expectedHead),
-            );
+            yield* this.repository.cleanupWorktree(placementOf(attempt), expectedHead);
             yield* this.storeEffect((store) => store.finishOutputRelease(attemptId));
           }.bind(this),
         );
@@ -1348,7 +1309,7 @@ export class WorkstreamRuntime {
         yield* this.storeEffect((store) =>
           store.recordSteering(attemptId, instruction, "uncertain"),
         );
-        yield* this.herdrEffect((workers) => workers.steer(worker, instruction));
+        yield* this.workers.steer(worker, instruction);
         yield* this.storeEffect((store) =>
           store.recordSteering(attemptId, instruction, "submitted"),
         );
@@ -1392,10 +1353,8 @@ export class WorkstreamRuntime {
     const assignment = findAssignment(state, attempt.assignmentId);
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const recovered = yield* this.herdrEffect((workers) =>
-          workers.recover(
-            workerRecoveryRequest(this.launch.workspaceId, state, attempt, assignment),
-          ),
+        const recovered = yield* this.workers.recover(
+          workerRecoveryRequest(this.launch.workspaceId, state, attempt, assignment),
         );
         if (recovered === undefined) return undefined;
         yield* this.storeEffect((store) => store.recordWorker(attempt.id, recovered.identity));
@@ -1424,7 +1383,7 @@ export class WorkstreamRuntime {
       function* (this: WorkstreamRuntime) {
         let interruptionError: HerdrProtocolError | undefined;
         if (state !== "queued" && worker !== undefined)
-          yield* this.herdrEffect((workers) => workers.interrupt(worker)).pipe(
+          yield* this.workers.interrupt(worker).pipe(
             Effect.catch((error) =>
               Effect.sync(() => {
                 interruptionError = error;
@@ -1457,22 +1416,7 @@ function implementationAttempt(
   options: QueueOptions,
   base: QueueBase,
 ): EnqueuedAttempt {
-  const guide = policy.roles["implementation.guide"];
-  const hasGuideOverride = options.model !== undefined || options.thinking !== undefined;
-  const hasExecutorOverride = options.executor !== undefined;
-  const reason = options.modelReason?.trim() ?? "";
-  if (hasGuideOverride && reason === "")
-    throw new Error("An explicit worker model or thinking level requires a specific reason.");
-  if (hasExecutorOverride && reason === "")
-    throw new Error("An explicit executor target requires a specific reason.");
-  const models = implementationModels(
-    policy,
-    options,
-    guide,
-    hasGuideOverride,
-    hasExecutorOverride,
-    reason,
-  );
+  const models = implementationModels(policy, options);
   const attempt: EnqueuedAttempt = { id: `attempt-${randomUUID()}`, models };
   if (options.continuationOf !== undefined) attempt.continuationOf = options.continuationOf;
   if (base.revision !== undefined) attempt.baseRevision = base.revision;
@@ -1483,23 +1427,21 @@ function implementationAttempt(
 function implementationModels(
   policy: ModelPolicy,
   options: QueueOptions,
-  guide: ModelPolicy["roles"]["implementation.guide"],
-  hasGuideOverride: boolean,
-  hasExecutorOverride: boolean,
-  reason: string,
 ): NonNullable<WorkAttempt["models"]> {
-  const models: NonNullable<WorkAttempt["models"]> = {
-    guide: hasGuideOverride
-      ? {
-          model: options.model ?? guide.model,
-          thinking: options.thinking ?? guide.thinking,
-        }
-      : guide,
-    executor: options.executor ?? policy.roles["implementation.executor"],
-    source: hasGuideOverride || hasExecutorOverride ? "override" : "policy",
+  const overrides = options.models;
+  const guide =
+    overrides?.guide === undefined
+      ? policy.roles["implementation.guide"]
+      : resolveTargetOverride(overrides.guide, policy.roles["implementation.guide"]);
+  const executor =
+    overrides?.executor === undefined
+      ? policy.roles["implementation.executor"]
+      : resolveTargetOverride(overrides.executor, policy.roles["implementation.executor"]);
+  return {
+    guide,
+    executor,
+    source: overrides === undefined ? "policy" : "override",
   };
-  if (hasGuideOverride || hasExecutorOverride) models.overrideReason = reason;
-  return models;
 }
 
 function selectedAttempts(
@@ -1508,18 +1450,7 @@ function selectedAttempts(
   options: QueueOptions,
   baseRevision: string | undefined,
 ): EnqueuedAttempt[] {
-  const request = options.selection === undefined ? {} : { ...options.selection };
-  if (options.model !== undefined || options.thinking !== undefined) {
-    const role = capability === "review" ? "review" : "research";
-    request.override = {
-      target: {
-        model: options.model ?? policy.roles[role][0].model,
-        thinking: options.thinking ?? policy.roles[role][0].thinking,
-      },
-      reason: options.modelReason ?? "",
-    };
-  }
-  const selection = resolveSelection(capability, request, policy);
+  const selection = resolveSelection(capability, options.selection, policy);
   if (selection.unfulfilled.length > 0) throw new Error(selection.unfulfilled.join(" "));
   return selection.selected.map((target, index) => {
     const attempt: EnqueuedAttempt = {
@@ -1531,6 +1462,33 @@ function selectedAttempts(
     if (baseRevision !== undefined) attempt.baseRevision = baseRevision;
     return attempt;
   });
+}
+
+const QueueModelOptionsSchema = Type.Object(
+  {
+    selection: Type.Optional(SelectionRequestSchema),
+    models: Type.Optional(ImplementationModelOverridesSchema),
+    continuationOf: Type.Optional(Type.String()),
+    candidateOf: Type.Optional(Type.String()),
+    baseRevision: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+function validateQueueModelOptions(
+  capability: WorkAssignment["capability"],
+  options: QueueOptions,
+): void {
+  if (!Value.Check(QueueModelOptionsSchema, options))
+    throw new Error(
+      "Invalid model queue options: use selection for research/review or models for implementation.",
+    );
+  if (capability === "implement" && options.selection !== undefined)
+    throw new Error("Selection options are supported only for research and review assignments.");
+  if (capability !== "implement" && options.models !== undefined)
+    throw new Error(
+      "Implementation model options are supported only for implementation assignments.",
+    );
 }
 
 function blockedDetail(attempt: WorkAttempt): string | undefined {
@@ -1711,28 +1669,22 @@ function validateExplicitApplication(
   attempt: WorkAttempt,
   assignment: WorkAssignment,
   reportedCommit: string,
-  sourceCommit: string,
-  destinationHead: string,
   current: boolean,
 ): void {
   if (state.lifecycle.state !== "active")
     throw new Error("Maintained output can be applied only while coordination is active.");
   if (assignment.capability !== "implement" || attempt.state !== "settled")
     throw new Error("Attempt is not settled maintained implementation output.");
+  if (attempt.cleanup?.state !== "completed" || attempt.cleanup.workerClosed !== true)
+    throw new Error("Attempt worker and owned output have not settled for application.");
+  if (attempt.outputRelease !== undefined)
+    throw new Error("Retained output has already entered release; it cannot be applied.");
   if (!current)
     throw new Error("Intent changed; retained implementation is stale and cannot be applied.");
-  if (reportedCommit !== sourceCommit)
-    throw new Error("Source commit does not exactly match the worker report.");
-  if (!/^[0-9a-f]{40,64}$/.test(destinationHead))
-    throw new Error("Application requires the freshly observed exact destination HEAD.");
   if (attempt.application !== undefined)
     throw new Error("Application already has a recorded checkpoint; inspect it before recovery.");
-  const issue = candidateApplicationIssue(state, assignment, attempt, sourceCommit);
+  const issue = candidateApplicationIssue(state, assignment, attempt, reportedCommit);
   if (issue !== undefined) throw new Error(issue);
-}
-
-function sameCommitChain(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((commit, index) => commit === right[index]);
 }
 
 function validApplicationCommit(result: WorkResult | undefined): string {

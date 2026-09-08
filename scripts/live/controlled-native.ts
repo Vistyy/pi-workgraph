@@ -176,19 +176,35 @@ function coordinatorResponse(request: ControlledRequest, count: number): Control
   if (count === 1)
     return {
       tool: {
+        id: "intent-request",
+        name: "workgraph_intent",
+        arguments: {
+          statement: "Establish the read-only controlled-baseline scope.",
+          constraints: ["Do not modify the fixture repository."],
+        },
+      },
+    };
+  if (count === 2) {
+    const result = request.messages.find((message) =>
+      JSON.stringify(message).includes('"tool_call_id":"intent-request"'),
+    );
+    assert.ok(result);
+    assert.doesNotMatch(JSON.stringify(result), /isError.*true/);
+    assert.match(JSON.stringify(result), /Recorded intent revision/);
+    return {
+      tool: {
         id: "research-request",
         name: "workgraph_research",
         arguments: {
           id: "controlled-baseline",
           question: "Read the fixture without changing it.",
           expectedEvidence: ["The fixture remains unchanged."],
-          model: "controlled/research",
-          modelReason: "Local scripted provider for this bounded native check",
-          thinking: "off",
+          selection: { override: { model: "controlled/research", thinking: "off" } },
         },
       },
     };
-  if (count === 2) {
+  }
+  if (count === 3) {
     const result = request.messages.find((message) =>
       JSON.stringify(message).includes('"tool_call_id":"research-request"'),
     );
@@ -196,7 +212,7 @@ function coordinatorResponse(request: ControlledRequest, count: number): Control
     assert.doesNotMatch(JSON.stringify(result), /isError.*true/);
     return { text: "Initial coordinator turn settled independently." };
   }
-  if (count === 3) {
+  if (count === 4) {
     assert.match(JSON.stringify(request.messages), /\[WORKGRAPH OUTCOME\]/);
     return {
       tool: {
@@ -210,7 +226,7 @@ function coordinatorResponse(request: ControlledRequest, count: number): Control
       },
     };
   }
-  assert.equal(count, 4);
+  assert.equal(count, 5);
   const marker = request.messages.find((message) =>
     JSON.stringify(message).includes('"tool_call_id":"marker-call"'),
   );
@@ -479,7 +495,7 @@ async function run(signal: AbortSignal): Promise<void> {
     () =>
       startControlledProvider(
         Array.from(
-          { length: 5 },
+          { length: 6 },
           () => (request: ControlledRequest) => responseFor(request, counts, gate.promise),
         ),
       ),
@@ -601,7 +617,7 @@ async function run(signal: AbortSignal): Promise<void> {
         "agent",
         "prompt",
         paneId as string,
-        "Run exactly one read-only controlled-baseline research attempt, then stop. When its result arrives, record the continuation marker.",
+        "First establish the coordinator scope with workgraph_intent, then run exactly one read-only controlled-baseline research attempt, then stop. When its result arrives, record the continuation marker.",
       ),
     signal,
   );
@@ -615,14 +631,14 @@ async function run(signal: AbortSignal): Promise<void> {
   await gate.promise;
   await waitFor(
     "notification-requested",
-    async () => (counts.get("coordinator") ?? 0) >= 3,
+    async () => (counts.get("coordinator") ?? 0) >= 4,
     signal,
   );
   await waitFor(
     "continuation-settlement",
     async () =>
       settledEvents(await eventEntries(), sessionFile as string).length >= settlementBaseline + 2 &&
-      (counts.get("coordinator") ?? 0) === 4,
+      (counts.get("coordinator") ?? 0) === 5,
     signal,
   );
   evidence.settlementEvents = await eventEntries();
@@ -632,6 +648,9 @@ async function run(signal: AbortSignal): Promise<void> {
   assert.equal(await readFile(join(repo, "fixture.txt"), "utf8"), "unchanged\n");
   assertProviderHealthy();
   provider.assertComplete();
+  assert.equal(provider.requests.length, 6);
+  assert.equal(provider.requests.filter((request) => request.model === "coordinator").length, 5);
+  assert.equal(provider.requests.filter((request) => request.model === "research").length, 1);
   const providerRequests = provider.requests.map((request) => ({
     index: request.index,
     model: request.model,

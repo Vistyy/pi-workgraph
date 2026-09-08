@@ -103,50 +103,7 @@ export type GitFailure =
   | ProcessExecutionError;
 export type GitEffect<A> = Effect.Effect<A, GitFailure>;
 
-export interface GitRepositoryEffects {
-  readonly head: (cwd?: string) => GitEffect<string>;
-  readonly resolveRevision: (revision: string) => GitEffect<string>;
-  readonly status: (cwd?: string) => GitEffect<string>;
-  readonly retainCommit: (runId: string, attemptId: string, commit: string) => GitEffect<string>;
-  readonly assertClean: (cwd?: string) => GitEffect<void>;
-  readonly createWorktree: (
-    runId: string,
-    nodeId: string,
-    baseCommit: string,
-  ) => GitEffect<WorktreePlacement>;
-  readonly validateWorkerNoChange: (
-    placement: WorktreePlacement,
-    reportedRevision: string,
-  ) => GitEffect<{ revision: string; changedFiles: string[] }>;
-  readonly validateWorkerCommit: (
-    placement: WorktreePlacement,
-    reportedCommit?: string,
-  ) => GitEffect<ValidatedCommit>;
-  readonly validateCandidate: (
-    placement: WorktreePlacement,
-    rootCommit: string,
-    reportedCommit?: string,
-  ) => GitEffect<ValidatedCandidate>;
-  readonly recoverCandidateApplication: (
-    expectedHead: string,
-    source: CandidateApplicationSource,
-  ) => GitEffect<{ head: string } | undefined>;
-  readonly applyCandidate: (
-    source: CandidateApplicationSource,
-    expectedHead: string,
-  ) => GitEffect<string>;
-  readonly discardExperiment: (
-    placement: WorktreePlacement,
-    expectedHead: string,
-  ) => GitEffect<void>;
-  readonly cleanupWorktree: (
-    placement: WorktreePlacement,
-    expectedHead: string,
-  ) => GitEffect<WorktreeCleanupResult>;
-}
-
 export class GitRepository {
-  readonly effects: GitRepositoryEffects;
   private readonly git: GitClient;
 
   constructor(
@@ -155,81 +112,24 @@ export class GitRepository {
     processRunner: GitProcessRunner = liveGitProcessRunner,
   ) {
     this.git = makeGitClient(processRunner);
-    this.effects = {
-      head: (cwd) => this.headEffect(cwd ?? this.root),
-      resolveRevision: (revision) => this.resolveRevisionEffect(revision),
-      status: (cwd) => this.statusEffect(cwd ?? this.root),
-      retainCommit: (runId, attemptId, commit) => this.retainCommitEffect(runId, attemptId, commit),
-      assertClean: (cwd) => this.assertCleanEffect(cwd ?? this.root),
-      createWorktree: (runId, nodeId, baseCommit) =>
-        this.createWorktreeEffect(runId, nodeId, baseCommit),
-      validateWorkerNoChange: (placement, reportedRevision) =>
-        this.validateWorkerNoChangeEffect(placement, reportedRevision),
-      validateWorkerCommit: (placement, reportedCommit) =>
-        this.validateWorkerCommitEffect(placement, reportedCommit),
-      validateCandidate: (placement, rootCommit, reportedCommit) =>
-        this.validateCandidateEffect(placement, rootCommit, reportedCommit),
-      recoverCandidateApplication: (expectedHead, source) =>
-        this.recoverCandidateApplicationEffect(expectedHead, source),
-      applyCandidate: (source, expectedHead) => this.applyCandidateEffect(source, expectedHead),
-      discardExperiment: (placement, expectedHead) =>
-        this.discardExperimentEffect(placement, expectedHead),
-      cleanupWorktree: (placement, expectedHead) =>
-        this.cleanupWorktreeEffect(placement, expectedHead),
-    };
   }
 
-  private headEffect(cwd: string): GitEffect<string> {
-    return this.git.text(cwd, ["rev-parse", "HEAD"]);
-  }
+  readonly head = (cwd: string = this.root): GitEffect<string> =>
+    this.git.text(cwd, ["rev-parse", "HEAD"]);
 
-  private resolveRevisionEffect(revision: string): GitEffect<string> {
-    return resolveRevision(this.git, this.root, revision);
-  }
+  readonly resolveRevision = (revision: string): GitEffect<string> =>
+    resolveRevision(this.git, this.root, revision);
 
-  private statusEffect(cwd: string): GitEffect<string> {
-    return this.git.text(cwd, ["status", "--porcelain", "--untracked-files=all"], true);
-  }
+  readonly status = (cwd: string = this.root): GitEffect<string> =>
+    this.git.text(cwd, ["status", "--porcelain", "--untracked-files=all"], true);
 
-  private retainCommitEffect(runId: string, attemptId: string, commit: string): GitEffect<string> {
-    const root = this.root;
-    const git = this.git;
-    return Effect.gen(function* () {
-      const ref = yield* retainedRef(runId, attemptId);
-      const resolved = yield* resolveRevision(git, root, commit);
-      const existing = yield* inspectRef(
-        git,
-        root,
-        ref,
-        (result) => `Could not inspect retained ref ${ref}: ${diagnostic(result)}`,
-      );
-      if (existing.state === "present") {
-        const current = yield* git.text(root, ["rev-parse", ref]);
-        if (current !== resolved) {
-          return yield* fail(`Retained ref ${ref} points to a different commit.`);
-        }
-        return ref;
-      }
+  readonly assertClean = (cwd: string = this.root): GitEffect<void> => assertClean(this.git, cwd);
 
-      yield* Effect.uninterruptible(
-        Effect.gen(function* () {
-          const update = yield* git.process(root, ["update-ref", ref, resolved, ""]);
-          yield* verifyRetainedRef(git, root, ref, resolved, update);
-        }),
-      );
-      return ref;
-    });
-  }
-
-  private assertCleanEffect(cwd: string): GitEffect<void> {
-    return assertClean(this.git, cwd);
-  }
-
-  private createWorktreeEffect(
+  readonly createWorktree = (
     runId: string,
     nodeId: string,
     baseCommit: string,
-  ): GitEffect<WorktreePlacement> {
+  ): GitEffect<WorktreePlacement> => {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
@@ -250,12 +150,12 @@ export class GitRepository {
       yield* createUnregisteredWorktree(git, root, identity, nodeId);
       return identity.placement;
     });
-  }
+  };
 
-  private validateWorkerNoChangeEffect(
+  readonly validateWorkerNoChange = (
     placement: WorktreePlacement,
     reportedRevision: string,
-  ): GitEffect<{ revision: string; changedFiles: string[] }> {
+  ): GitEffect<{ revision: string; changedFiles: string[] }> => {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
@@ -282,12 +182,12 @@ export class GitRepository {
       yield* assertStableCleanHead(git, placement.path, revision, "No-change validation");
       return { revision, changedFiles: [] };
     });
-  }
+  };
 
-  private validateWorkerCommitEffect(
+  readonly validateWorkerCommit = (
     placement: WorktreePlacement,
     reportedCommit?: string,
-  ): GitEffect<ValidatedCommit> {
+  ): GitEffect<ValidatedCommit> => {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
@@ -336,27 +236,27 @@ export class GitRepository {
       yield* assertStableCleanHead(git, placement.path, commit, "Worker commit validation");
       return { commit, changedFiles };
     });
-  }
+  };
 
-  private validateCandidateEffect(
+  readonly validateCandidate = (
     placement: WorktreePlacement,
     rootCommit: string,
     reportedCommit?: string,
-  ): GitEffect<ValidatedCandidate> {
+  ): GitEffect<ValidatedCandidate> => {
     if (!/^[0-9a-f]{40,64}$/.test(rootCommit))
       return fail("Candidate root must be an exact commit id.");
-    return this.validateWorkerCommitEffect(placement, reportedCommit).pipe(
+    return this.validateWorkerCommit(placement, reportedCommit).pipe(
       Effect.flatMap((validated) =>
         candidateCommitChain(this.git, this.root, rootCommit, validated.commit).pipe(
           Effect.map((commits) => ({ ...validated, rootCommit, commits })),
         ),
       ),
     );
-  }
-  private recoverCandidateApplicationEffect(
+  };
+  readonly recoverCandidateApplication = (
     expectedHead: string,
     source: CandidateApplicationSource,
-  ): GitEffect<{ head: string } | undefined> {
+  ): GitEffect<{ head: string } | undefined> => {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
@@ -375,12 +275,12 @@ export class GitRepository {
       yield* assertStableCleanHead(git, root, head, "Candidate application recovery");
       return { head };
     });
-  }
+  };
 
-  private applyCandidateEffect(
+  readonly applyCandidate = (
     source: CandidateApplicationSource,
     expectedHead: string,
-  ): GitEffect<string> {
+  ): GitEffect<string> => {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
@@ -460,13 +360,13 @@ export class GitRepository {
         }),
       );
     });
-  }
+  };
 
   /** Discard only an explicitly disposable, stopped experiment at its recorded identity. */
-  private discardExperimentEffect(
+  readonly discardExperiment = (
     placement: WorktreePlacement,
     expectedHead: string,
-  ): GitEffect<void> {
+  ): GitEffect<void> => {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
@@ -504,12 +404,12 @@ export class GitRepository {
         }),
       );
     });
-  }
+  };
 
-  private cleanupWorktreeEffect(
+  readonly cleanupWorktree = (
     placement: WorktreePlacement,
     expectedHead: string,
-  ): GitEffect<WorktreeCleanupResult> {
+  ): GitEffect<WorktreeCleanupResult> => {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
@@ -532,7 +432,7 @@ export class GitRepository {
         detail: "Exact clean worktree and branch were removed, or were already absent.",
       };
     });
-  }
+  };
 }
 
 export function inspectRepository(cwd: string): GitEffect<RepositoryInfo> {
@@ -555,13 +455,6 @@ export function openRepository(cwd: string): GitEffect<GitRepository> {
   return Effect.map(inspectRepository(cwd), (info) => new GitRepository(info.root, info.commonDir));
 }
 
-function retainedRef(runId: string, attemptId: string): GitEffect<string> {
-  if (!validIdentity(runId) || !validIdentity(attemptId)) {
-    return fail("Invalid retained commit identity.");
-  }
-  return Effect.succeed(`refs/workgraph-retained/${runId}/${attemptId}`);
-}
-
 function inspectRef(
   git: GitClient,
   root: string,
@@ -579,34 +472,6 @@ function inspectRef(
     }
     if (result.exitCode === 1) return { state: "absent" as const };
     return yield* fail(inspectionFailure(result));
-  });
-}
-
-function verifyRetainedRef(
-  git: GitClient,
-  root: string,
-  ref: string,
-  resolved: string,
-  update: ProcessResult,
-): GitEffect<void> {
-  return Effect.gen(function* () {
-    if (!processSucceeded(update)) {
-      const raced = yield* inspectRef(
-        git,
-        root,
-        ref,
-        (inspection) =>
-          `Could not inspect retained ref after update (${diagnostic(update)}): ${diagnostic(inspection)}`,
-      );
-      if (raced.state === "absent" || raced.head !== resolved) {
-        return yield* fail(`Could not retain commit ${resolved}: ${diagnostic(update)}`);
-      }
-      return;
-    }
-    const current = yield* git.text(root, ["rev-parse", ref]);
-    if (current !== resolved) {
-      return yield* fail(`Retained ref ${ref} did not reach ${resolved}.`);
-    }
   });
 }
 

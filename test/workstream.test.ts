@@ -127,7 +127,6 @@ void test("historical research closes its original scope after intent changes, w
         conclusion: "Baseline research is resolved in its original scope",
         evidence: [{ label: "Baseline", observation: "Evidence predates the new intent" }],
         limitations: [],
-        reasons: [],
       }),
     );
     assert.deepEqual(state.completion?.accounting, []);
@@ -188,27 +187,12 @@ void test("accepting a failed report or unapplied stale implementation as eviden
           constraints: ["New constraint"],
         }),
       );
-      const completion = {
-        conclusion: "Known unresolved work",
-        evidence: [{ label: "Result", observation: "The assignment is not fulfilled" }],
-        limitations: [],
-        reasons: [],
-      };
-      await assert.rejects(
-        runStore(store.complete(completion)),
-        /Completion requires exactly one reason per unresolved semantic task/,
-      );
       const state = await runStore(
         store.complete({
-          ...completion,
+          conclusion: "Known unresolved work",
+          evidence: [{ label: "Result", observation: "The assignment is not fulfilled" }],
           limitations: [
             capability === "research" ? "The read failed" : "The stale change was never applied",
-          ],
-          reasons: [
-            {
-              taskId: "work",
-              reason: "The assignment and its result are unresolved.",
-            },
           ],
         }),
       );
@@ -922,12 +906,6 @@ void test("workstream keeps worker validity, limitations, and stale results dist
           },
         ],
         limitations: ["The revised constraint has no accepted result yet."],
-        reasons: [
-          {
-            taskId: "research",
-            reason: "The revised assignment and stale result are unresolved.",
-          },
-        ],
       }),
     );
     assert.equal(state.lifecycle.state, "completed");
@@ -993,17 +971,6 @@ void test("every independent attempt remains accounted for regardless of result 
       }
       const state = await runStore(store.load());
       assert.equal(queued.attempts.length, 2);
-      await assert.rejects(
-        runStore(
-          store.complete({
-            conclusion: "One contribution failed",
-            evidence: [{ label: "comparison", observation: "Both attempts retained" }],
-            limitations: ["The failed attempt remains unresolved."],
-            reasons: [],
-          }),
-        ),
-        /Completion requires exactly one reason per unresolved semantic task/,
-      );
       const failed = state.attempts.find((attempt) =>
         attempt.id.endsWith(order.indexOf("failed").toString()),
       );
@@ -1015,12 +982,6 @@ void test("every independent attempt remains accounted for regardless of result 
           conclusion: "One contribution failed",
           evidence: [{ label: "comparison", observation: "Both attempts retained" }],
           limitations: ["The failed attempt remains unresolved."],
-          reasons: [
-            {
-              taskId: "comparison",
-              reason: "One independent attempt and its result failed.",
-            },
-          ],
         }),
       );
       assert.deepEqual(
@@ -1187,17 +1148,18 @@ void test("invalid evidence remains unresolved", async () => {
       }),
     );
     await settleFixtureAttempt(invalidFixture.store, "research-attempt", "result");
-    await assert.rejects(
-      runStore(
-        invalidFixture.store.complete({
-          conclusion: "Invalid evidence remains unresolved.",
-          evidence: [{ label: "result", observation: "The retained result is invalid." }],
-          limitations: ["No valid report was retained."],
-          reasons: [],
-        }),
-      ),
-      /exactly one reason per unresolved semantic task/,
+    const completed = await runStore(
+      invalidFixture.store.complete({
+        conclusion: "Invalid evidence remains unresolved.",
+        evidence: [{ label: "result", observation: "The retained result is invalid." }],
+        limitations: ["No valid report was retained."],
+      }),
     );
+    assert.equal(
+      completed.completion?.accounting[0]?.reason,
+      "Assignment has an unresolved retained attempt or result.",
+    );
+    assert.equal(completed.completion?.accounting[2]?.reason, "Retained result is invalid.");
   } finally {
     await rm(invalidFixture.parent, { recursive: true, force: true });
   }

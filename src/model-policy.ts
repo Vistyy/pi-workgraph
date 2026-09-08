@@ -35,16 +35,27 @@ export const ModelTargetSchema = Type.Object(
   { additionalProperties: false },
 );
 export type ModelTarget = Static<typeof ModelTargetSchema>;
+const TargetOverrideSchema = Type.Object(
+  {
+    model: Type.Optional(Type.String({ pattern: "^[^/\\s]+/\\S+$" })),
+    thinking: Type.Optional(ThinkingSchema),
+  },
+  { additionalProperties: false, minProperties: 1 },
+);
+export type TargetOverride = Static<typeof TargetOverrideSchema>;
+export const ImplementationModelOverridesSchema = Type.Object(
+  {
+    guide: Type.Optional(TargetOverrideSchema),
+    executor: Type.Optional(TargetOverrideSchema),
+  },
+  { additionalProperties: false, minProperties: 1 },
+);
+export type ImplementationModelOverrides = Static<typeof ImplementationModelOverridesSchema>;
 export const SelectionRequestSchema = Type.Object(
   {
     count: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })),
     diversity: Type.Optional(StringEnum(["same-model", "distinct-models"] as const)),
-    override: Type.Optional(
-      Type.Object(
-        { target: ModelTargetSchema, reason: Type.String({ minLength: 1 }) },
-        { additionalProperties: false },
-      ),
-    ),
+    override: Type.Optional(TargetOverrideSchema),
   },
   { additionalProperties: false },
 );
@@ -261,10 +272,12 @@ export function resolveSelection(
   policy: ModelPolicy,
 ): SelectionReceipt {
   const normalized = request ?? {};
+  if (!Value.Check(SelectionRequestSchema, normalized))
+    throw new Error(`Invalid model selection request for ${role}.`);
   const count = normalized.count ?? 1;
   const diversity = normalized.diversity ?? "same-model";
   if (normalized.override !== undefined)
-    return overrideReceipt(role, normalized.override, count, diversity);
+    return overrideReceipt(role, normalized.override, policy.roles[role][0], count, diversity);
   const models = policy.roles[role];
   const selected =
     diversity === "same-model"
@@ -290,24 +303,43 @@ export function resolveSelection(
 function overrideReceipt(
   role: "research" | "review",
   override: NonNullable<SelectionRequest["override"]>,
+  policyDefault: ModelTarget,
   count: number,
   diversity: "same-model" | "distinct-models",
 ): SelectionReceipt {
-  const reason = override.reason.trim();
-  if (reason.length === 0) throw new Error("A model override requires a specific reason.");
+  const target = resolveTargetOverride(override, policyDefault);
+  const overridden = [
+    override.model === undefined ? undefined : "model",
+    override.thinking === undefined ? undefined : "thinking",
+  ]
+    .filter((component) => component !== undefined)
+    .join(" and ");
   const insufficientDiversity = diversity === "distinct-models" && count > 1;
   return {
     role,
     requested: count,
     diversity,
-    selected: insufficientDiversity
-      ? [override.target]
-      : Array.from({ length: count }, () => override.target),
+    selected: insufficientDiversity ? [target] : Array.from({ length: count }, () => target),
     unfulfilled: insufficientDiversity
       ? [`An explicit override supplies only one distinct model for ${count} requested attempts.`]
       : [],
     source: "override",
-    reason,
+    reason: `Explicit ${overridden} override; unspecified components use the ${role} policy default.`,
+  };
+}
+
+export function resolveTargetOverride(
+  override: TargetOverride,
+  policyDefault: ModelTarget,
+): ModelTarget {
+  if (
+    !Value.Check(TargetOverrideSchema, override) ||
+    (override.model === undefined && override.thinking === undefined)
+  )
+    throw new Error("Invalid model target override: provide model or thinking.");
+  return {
+    model: override.model ?? policyDefault.model,
+    thinking: override.thinking ?? policyDefault.thinking,
   };
 }
 

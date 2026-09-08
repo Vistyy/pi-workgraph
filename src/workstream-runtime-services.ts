@@ -1,6 +1,6 @@
 import type { FileSystem, Path, Scope } from "effect";
 import { Cause, Data, Effect } from "effect";
-import type { HerdrEffects } from "./herdr.js";
+import type { HerdrCliRuntime } from "./herdr.js";
 import {
   createWorkerSessionEffect,
   effectiveModelObservations,
@@ -19,20 +19,10 @@ import {
 } from "./workstream-persistence.js";
 import { legacyPathForWorkstream } from "./workstream-state.js";
 
-export type RuntimeWorkerPort = {
-  readonly available: boolean;
-  readonly effects: Pick<
-    HerdrEffects,
-    | "launch"
-    | "recover"
-    | "inspectLaunch"
-    | "inspect"
-    | "observe"
-    | "interrupt"
-    | "steer"
-    | "cleanup"
-  >;
-};
+export type RuntimeWorkerPort = Pick<
+  HerdrCliRuntime,
+  "launch" | "recover" | "inspectLaunch" | "inspect" | "observe" | "interrupt" | "steer" | "cleanup"
+>;
 
 export class RuntimeRegistryError extends Data.TaggedError("RuntimeRegistryError")<{
   readonly operation: string;

@@ -13,6 +13,7 @@ import { Effect } from "effect";
 import type { InspectSection } from "../src/agent-facing.js";
 import { runCli } from "../src/cli.js";
 import { inspectSections, parseCliRequest } from "../src/cli-parse.js";
+import type { CoordinatorLaunchRequest } from "../src/herdr.js";
 
 import { git, persistentSession } from "./helpers.js";
 
@@ -129,18 +130,16 @@ void test("CLI fork composes native Git and Pi effects with an injectable native
         assert.equal(command, "fake-herdr");
         return {
           available: true,
-          effects: {
-            launchCoordinator: (request) =>
-              Effect.succeed({
-                workspaceId: "workspace-1",
-                tabId: "tab-1",
-                paneId: "pane-1",
-                terminalId: "terminal-1",
-                agentName: "fixture-coordinator",
-                sessionFile: request.sessionFile,
-                cwd: request.cwd,
-              }),
-          },
+          launchCoordinator: (request: CoordinatorLaunchRequest) =>
+            Effect.succeed({
+              workspaceId: "workspace-1",
+              tabId: "tab-1",
+              paneId: "pane-1",
+              terminalId: "terminal-1",
+              agentName: "fixture-coordinator",
+              sessionFile: request.sessionFile,
+              cwd: request.cwd,
+            }),
         };
       },
     );

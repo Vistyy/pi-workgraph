@@ -14,6 +14,7 @@ import {
   HerdrProtocolError,
   herdrWorkerName,
   type WorkerLaunchEffectRequest,
+  WorkerLaunchError,
 } from "../src/herdr.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
@@ -21,7 +22,6 @@ import { WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity } from "../src/types.js";
 import { WorkstreamStoreEffects } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
-import type { RuntimeWorkerPort } from "../src/workstream-runtime-services.js";
 import { git, persistentSession, researchReport, usage } from "./helpers.js";
 
 const RAW_SECRET = "Bearer fixture-secret at https://provider.example/private";
@@ -31,59 +31,83 @@ type NativeFailureRequest = Pick<
   "sessionFile" | "runId" | "nodeId" | "assignmentId"
 >;
 
+function fixtureCheckpoint<E, R, A>(
+  phase: WorkerLaunchError<E>["phase"],
+  checkpoint: ((value: A) => Effect.Effect<void, E, R>) | undefined,
+  value: A,
+  locator: WorkerLaunchError<E>["locator"],
+): Effect.Effect<void, WorkerLaunchError<E>, R> {
+  if (checkpoint === undefined) return Effect.void;
+  return checkpoint(value).pipe(
+    Effect.mapError(
+      (cause) =>
+        new WorkerLaunchError({
+          phase,
+          locator,
+          resource: "terminalId" in locator ? locator : undefined,
+          cause,
+        }),
+    ),
+  );
+}
+
 class NativeFailureWorker {
   readonly available = true;
-  readonly effects: RuntimeWorkerPort["effects"] = {
-    launch: <E, R>(request: WorkerLaunchEffectRequest<E, R>) => {
-      const writeSession = (input: NativeFailureRequest) => this.writeSession(input);
-      const observe = (input: WorkerIdentity) => this.observation(input);
-      return Effect.gen(function* () {
-        const identity: WorkerIdentity = {
-          workspaceId: request.workspaceId,
-          tabId: `tab-${request.attemptId}`,
-          paneId: `pane-${request.attemptId}`,
-          terminalId: `terminal-${request.attemptId}`,
-          agentName: herdrWorkerName(request),
-          sessionFile: request.sessionFile,
-          cwd: request.cwd,
-        };
-        const resource = {
-          workspaceId: identity.workspaceId,
-          tabId: identity.tabId,
-          paneId: identity.paneId,
-          terminalId: identity.terminalId,
-          agentName: identity.agentName,
-          cwd: identity.cwd,
-        };
-        // Checkpoint failures are fixture setup failures; Herdr tests own launch-error behavior.
-        yield* request.onResource?.(resource) ?? Effect.void;
-        yield* request.onIdentity?.(identity) ?? Effect.void;
-        writeSession(request);
-        yield* request.onSubmitted?.() ?? Effect.void;
-        return observe(identity);
-      }).pipe(Effect.orDie);
-    },
-    recover: () => Effect.as(Effect.void, undefined),
-    inspectLaunch: () =>
-      Effect.fail(
-        new HerdrProtocolError({
-          operation: "inspect fixture launch",
-          reason: "process",
-          detail: "No launch inspection.",
-        }),
-      ),
-    inspect: (identity) => Effect.succeed(this.observation(identity)),
-    observe: (identity) => Effect.succeed(this.observation(identity)),
-    interrupt: (identity) => Effect.succeed(this.observation(identity)),
-    steer: () => Effect.void,
-    cleanup: (identity) =>
-      Effect.succeed({
-        state: "completed" as const,
-        identity,
-        observedAt: "2026-01-01T00:00:00.000Z",
-        detail: "Native fixture closed.",
-      }),
+  readonly launch = <E, R>(request: WorkerLaunchEffectRequest<E, R>) => {
+    const writeSession = (input: NativeFailureRequest) => this.writeSession(input);
+    const observe = (input: WorkerIdentity) => this.observation(input);
+    return Effect.gen(function* () {
+      const identity: WorkerIdentity = {
+        workspaceId: request.workspaceId,
+        tabId: `tab-${request.attemptId}`,
+        paneId: `pane-${request.attemptId}`,
+        terminalId: `terminal-${request.attemptId}`,
+        agentName: herdrWorkerName(request),
+        sessionFile: request.sessionFile,
+        cwd: request.cwd,
+      };
+      const resource = {
+        workspaceId: identity.workspaceId,
+        tabId: identity.tabId,
+        paneId: identity.paneId,
+        terminalId: identity.terminalId,
+        agentName: identity.agentName,
+        cwd: identity.cwd,
+      };
+      yield* fixtureCheckpoint("onResource", request.onResource, resource, resource);
+      yield* fixtureCheckpoint("onIdentity", request.onIdentity, identity, identity);
+      writeSession(request);
+      const onSubmitted = request.onSubmitted;
+      yield* fixtureCheckpoint(
+        "onSubmitted",
+        onSubmitted === undefined ? undefined : () => onSubmitted(),
+        undefined,
+        resource,
+      );
+      return observe(identity);
+    });
   };
+
+  readonly recover = () => Effect.as(Effect.void, undefined);
+  readonly inspectLaunch = () =>
+    Effect.fail(
+      new HerdrProtocolError({
+        operation: "inspect fixture launch",
+        reason: "process",
+        detail: "No launch inspection.",
+      }),
+    );
+  readonly inspect = (identity: WorkerIdentity) => Effect.succeed(this.observation(identity));
+  readonly observe = (identity: WorkerIdentity) => Effect.succeed(this.observation(identity));
+  readonly interrupt = (identity: WorkerIdentity) => Effect.succeed(this.observation(identity));
+  readonly steer = () => Effect.void;
+  readonly cleanup = (identity: WorkerIdentity) =>
+    Effect.succeed({
+      state: "completed" as const,
+      identity,
+      observedAt: "2026-01-01T00:00:00.000Z",
+      detail: "Native fixture closed.",
+    });
 
   private writeSession(request: NativeFailureRequest): void {
     const session = SessionManager.open(request.sessionFile);

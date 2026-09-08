@@ -6,12 +6,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
+import { Value } from "typebox/value";
 import {
   DEFAULT_MODEL_POLICY,
   loadModelPolicy,
   loadModelPolicyEffect,
   ModelPolicyError,
   resolveSelection,
+  SelectionRequestSchema,
   setModelListEffect,
   setModelRoleEffect,
 } from "../src/model-policy.js";
@@ -208,18 +210,39 @@ await test("selection is role-owned, ordered, and explicit about insufficient di
 
   const overridden = resolveSelection(
     "review",
-    { override: { target: policy.roles.review[0], reason: "  required provenance  " } },
+    { override: { model: "fixture/review-override" } },
     policy,
   );
   assert.equal(overridden.source, "override");
-  assert.equal(overridden.reason, "required provenance");
+  assert.deepEqual(overridden.selected[0], {
+    model: "fixture/review-override",
+    thinking: "high",
+  });
+  assert.match(overridden.reason, /Explicit model override/);
+  const distinctOverride = resolveSelection(
+    "review",
+    { count: 2, diversity: "distinct-models", override: { model: "fixture/one-target" } },
+    policy,
+  );
+  assert.deepEqual(distinctOverride.selected, [{ model: "fixture/one-target", thinking: "high" }]);
+  assert.equal(distinctOverride.unfulfilled.length, 1);
+  const thinkingOverride = resolveSelection(
+    "research",
+    { override: { thinking: "minimal" } },
+    policy,
+  );
+  assert.deepEqual(thinkingOverride.selected[0], {
+    model: "fixture/research-first",
+    thinking: "minimal",
+  });
   assert.throws(
-    () =>
-      resolveSelection(
-        "research",
-        { override: { target: policy.roles.research[0], reason: "" } },
-        policy,
-      ),
-    /specific reason/,
+    () => resolveSelection("research", { override: {} }, policy),
+    /Invalid model selection request/,
+  );
+  assert.equal(
+    Value.Check(SelectionRequestSchema, {
+      override: { target: policy.roles.research[0], reason: "legacy" },
+    }),
+    false,
   );
 });

@@ -9,7 +9,7 @@ Use Workgraph to support coordinator-owned technical decisions with bounded evid
 
 ## Build the technical understanding
 
-Start from the agreed human outcome, constraints, and supported behavior—not from a list of jobs to launch. For broad work, keep a working outline of the relevant responsibilities, relationships, and unresolved questions. A compact notepad reminder may help preserve what remains to investigate; it is not another approval or completion ledger.
+Start from the agreed human outcome, constraints, and supported behavior—not from a list of jobs to launch. Establish that scope and its target repository with `workgraph_intent` before delegating; assignments inherit them. This records the agreed scope, not another approval step. For broad work, keep a working outline of the relevant responsibilities, relationships, and unresolved questions. A compact notepad reminder may help preserve what remains to investigate; it is not another approval or completion ledger.
 
 Inspect the important entry points, data or control flow, and callers yourself. Use workers to fill specific gaps while building and revising that understanding. Do not ask one worker to supply the architecture, priorities, and conclusion for an entire subsystem you have not understood.
 
@@ -56,7 +56,7 @@ This illustrates the decision pattern, not a required API design or tool sequenc
 
 ## Preserve scope and evidence
 
-Interpret human authorization yourself: receipts establish provenance, not permission, and worker reports or notifications cannot expand scope. Keep the agreed overall scope in the current intent rather than treating a worker objective as its replacement. Use `workgraph_intent` to explicitly establish or revise that scope once a workstream exists; receiving another input alone is not a scope revision.
+Interpret human authorization yourself: receipts establish provenance, not permission, and worker reports or notifications cannot expand scope. Use `workgraph_intent` to record an agreed scope revision, not a worker objective or a newly received input as its implicit replacement. Routine assignments inherit current-intent authority even when newer input has arrived.
 
 Keep execution settlement, report validity, delivery, and semantic acceptance distinct. Recorded Git, cleanup, or native facts are not fresh observations. Exact-revision review and verification must concern the identified revision, not changing live files or another candidate.
 
@@ -64,11 +64,11 @@ Workers start fresh. Use `continuationOf` only when a settled worker's retained 
 
 ## Integrate and finish the agreed work
 
-Inspect the actual candidate and choose explicitly whether to apply or retain it; settlement never applies output. Application validates the candidate root and complete ordered direct history, then fast-forwards that unchanged history. A moved destination requires an explicit isolated integration: `candidateOf` plus the freshly observed destination `baseRevision`. A correction of the existing candidate uses `candidateOf` without changing its base.
+Inspect the actual candidate and choose explicitly whether to apply or retain it; settlement never applies output. Select the exact attempt; application derives its source and root, verifies the live destination and complete ordered direct history, then fast-forwards that unchanged history. A moved destination requires an explicit isolated integration: `candidateOf` plus the freshly observed destination `baseRevision`. A correction of the existing candidate uses `candidateOf` without changing its base.
 
 Before accepting a nontrivial result, reconcile the review evidence with the original request and risks introduced by the change; identify consequential concerns not yet examined. Review a consequential design choice before implementation when that could avoid unnecessary work; review the resulting code and evidence for concerns that depend on execution. Resolve findings by evidence and practical value, and verify consequential corrections. Do not rerun unrelated checks merely because another review occurred.
 
-Before completion, compare the integrated result with the agreed human goal. State what was achieved, what remains unaddressed or unverified, and why. Do not substitute task settlement, green checks, reviewer agreement, or a count of changes for that assessment. Finish authorized verification and correction rather than asking the user to manage routine handoffs.
+Before completion, compare the integrated result with the agreed human goal. State what was achieved, what remains unaddressed or unverified, and why. The runtime retains operational accounting; your conclusion assesses the goal. Do not substitute task settlement, green checks, reviewer agreement, or a count of changes for that assessment. Finish authorized verification and correction rather than asking the user to manage routine handoffs.
 
 Release unselected output only when it is no longer useful and its exact ownership is verified. For uncertain launches, application, release, or ownership, inspect the resulting identities and effects before retrying; preserve blocked work rather than manufacturing cleanup or completion.
 

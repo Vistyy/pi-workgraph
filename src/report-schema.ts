@@ -14,17 +14,6 @@ const FindingFields = {
   severity: StringEnum(["info", "warning", "error", "blocker"] as const),
   title: Type.String(),
   detail: Type.String(),
-  envelopeImpact: StringEnum([
-    "none",
-    "outcome",
-    "non_goal",
-    "owner",
-    "public_interface",
-    "dependency",
-    "security",
-    "scale",
-    "reuse",
-  ] as const),
 };
 
 // Retained reports were historically decoded with open nested evidence and finding objects.

@@ -9,6 +9,7 @@ import { Deferred, Effect } from "effect";
 import { TestClock } from "effect/testing";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import { inspectView } from "../src/agent-facing.js";
 import { openRepository } from "../src/git.js";
 import {
   type HerdrObservation,
@@ -16,6 +17,7 @@ import {
   herdrWorkerName,
   type WorkerLaunchEffectRequest,
   WorkerLaunchError,
+  type WorkerRecoveryRequest,
 } from "../src/herdr.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
@@ -29,7 +31,6 @@ import {
   type RuntimeOwnership,
   WorkstreamRuntime,
 } from "../src/workstream-runtime.js";
-import type { RuntimeWorkerPort } from "../src/workstream-runtime-services.js";
 import { RuntimeHostError } from "../src/workstream-runtime-services.js";
 import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
 import { required } from "./decoders.js";
@@ -133,143 +134,146 @@ class Worker {
   onWork: (request: FixtureLaunchRequest) => Promise<WorkerReport | undefined> = async () =>
     researchReport;
   onInspect: () => void = () => {};
-  readonly effects: RuntimeWorkerPort["effects"] = {
-    launch: <E, R>(request: WorkerLaunchEffectRequest<E, R>) =>
-      Effect.gen(
-        function* (this: Worker) {
-          const index = this.requests.length + 1;
-          this.requests.push(request);
-          const identity: WorkerIdentity = {
-            workspaceId: request.workspaceId,
-            tabId: `w1:t${index}`,
-            paneId: `w1:p${index}`,
-            terminalId: `term${index}`,
-            agentName: herdrWorkerName(request),
-            sessionFile: request.sessionFile,
-            cwd: request.cwd,
-          };
-          const resource = {
-            workspaceId: identity.workspaceId,
-            tabId: identity.tabId,
-            paneId: identity.paneId,
-            terminalId: identity.terminalId,
-            agentName: identity.agentName,
-            cwd: identity.cwd,
-          };
-          this.producers.set(request.sessionFile, () => this.produce(request));
-          if (this.failBeforePane)
-            return yield* new HerdrProtocolError({
-              operation: "launch fixture worker",
-              reason: "process",
-              detail: "fixture tab creation response interrupted",
-            });
-          const pane = { workspaceId: identity.workspaceId, paneId: identity.paneId };
-          yield* fixtureCheckpoint("onTab", request.onTab, pane, pane);
-          this.identities.set(identity.agentName, identity);
-          yield* fixtureCheckpoint("onResource", request.onResource, resource, resource);
-          if (this.failBeforeSubmission)
-            return yield* new HerdrProtocolError({
-              operation: "launch fixture worker",
-              reason: "process",
-              detail: "fixture readiness interruption",
-            });
-          yield* fixtureCheckpoint("onIdentity", request.onIdentity, identity, identity);
-          yield* this.deferWork ? Effect.void : this.produceEffect(request.sessionFile);
-          if (this.failAfterSubmission)
-            return yield* new HerdrProtocolError({
-              operation: "launch fixture worker",
-              reason: "process",
-              detail: "fixture uncertain prompt receipt",
-            });
-          const onSubmitted = request.onSubmitted;
-          yield* fixtureCheckpoint(
-            "onSubmitted",
-            onSubmitted === undefined ? undefined : () => onSubmitted(),
-            undefined,
-            resource,
-          );
-          return { identity, status: "working" as const, observedAt: FIXTURE_OBSERVED_AT };
-        }.bind(this),
-      ),
-    recover: (request) => {
-      const identity = [...this.identities.values()].find(
-        (item) => item.agentName === request.agentName,
-      );
-      return identity === undefined
-        ? Effect.as(Effect.void, undefined)
-        : this.effects.observe(identity);
-    },
-    inspectLaunch: () =>
-      Effect.fail(
-        new HerdrProtocolError({
-          operation: "inspect fixture launch",
-          reason: "process",
-          detail: "No launch inspection.",
-        }),
-      ),
-    inspect: (identity) =>
-      Effect.sync(() => {
-        this.onInspect();
-        return this.absent
-          ? {
-              identity,
-              status: "absent" as const,
-              observedAt: FIXTURE_OBSERVED_AT,
-              detail: "Exact fixture worker is absent.",
-            }
-          : this.observation(identity);
-      }),
-    observe: (identity) =>
-      this.absent
-        ? Effect.fail(
-            new HerdrProtocolError({
-              operation: "observe fixture worker",
-              reason: "process",
-              detail: "Exact fixture worker is absent.",
-            }),
-          )
-        : Effect.succeed(this.observation(identity)),
-    interrupt: (identity) =>
-      Effect.sync(() => {
-        this.interruptCount++;
-        return this.observation(identity);
-      }),
-    steer: (identity) => {
-      const produce = this.producers.get(identity.sessionFile);
-      if (produce === undefined)
-        return Effect.fail(
-          new HerdrProtocolError({
-            operation: "steer fixture worker",
+  readonly launch = <E, R>(request: WorkerLaunchEffectRequest<E, R>) =>
+    Effect.gen(
+      function* (this: Worker) {
+        const index = this.requests.length + 1;
+        this.requests.push(request);
+        const identity: WorkerIdentity = {
+          workspaceId: request.workspaceId,
+          tabId: `w1:t${index}`,
+          paneId: `w1:p${index}`,
+          terminalId: `term${index}`,
+          agentName: herdrWorkerName(request),
+          sessionFile: request.sessionFile,
+          cwd: request.cwd,
+        };
+        const resource = {
+          workspaceId: identity.workspaceId,
+          tabId: identity.tabId,
+          paneId: identity.paneId,
+          terminalId: identity.terminalId,
+          agentName: identity.agentName,
+          cwd: identity.cwd,
+        };
+        this.producers.set(request.sessionFile, () => this.produce(request));
+        if (this.failBeforePane)
+          return yield* new HerdrProtocolError({
+            operation: "launch fixture worker",
             reason: "process",
-            detail: "No fixture worker request exists for the identity.",
-          }),
+            detail: "fixture tab creation response interrupted",
+          });
+        const pane = { workspaceId: identity.workspaceId, paneId: identity.paneId };
+        yield* fixtureCheckpoint("onTab", request.onTab, pane, pane);
+        this.identities.set(identity.agentName, identity);
+        yield* fixtureCheckpoint("onResource", request.onResource, resource, resource);
+        if (this.failBeforeSubmission)
+          return yield* new HerdrProtocolError({
+            operation: "launch fixture worker",
+            reason: "process",
+            detail: "fixture readiness interruption",
+          });
+        yield* fixtureCheckpoint("onIdentity", request.onIdentity, identity, identity);
+        yield* this.deferWork ? Effect.void : this.produceEffect(request.sessionFile);
+        if (this.failAfterSubmission)
+          return yield* new HerdrProtocolError({
+            operation: "launch fixture worker",
+            reason: "process",
+            detail: "fixture uncertain prompt receipt",
+          });
+        const onSubmitted = request.onSubmitted;
+        yield* fixtureCheckpoint(
+          "onSubmitted",
+          onSubmitted === undefined ? undefined : () => onSubmitted(),
+          undefined,
+          resource,
         );
-      return this.produceEffect(identity.sessionFile);
-    },
-    cleanup: (identity) =>
-      Effect.sync(() => {
-        if (this.status === "working")
-          return {
-            state: "pending" as const,
+        return { identity, status: "working" as const, observedAt: FIXTURE_OBSERVED_AT };
+      }.bind(this),
+    );
+
+  readonly recover = (request: WorkerRecoveryRequest) => {
+    const identity = [...this.identities.values()].find(
+      (item) => item.agentName === request.agentName,
+    );
+    return identity === undefined ? Effect.as(Effect.void, undefined) : this.observe(identity);
+  };
+
+  readonly inspectLaunch = () =>
+    Effect.fail(
+      new HerdrProtocolError({
+        operation: "inspect fixture launch",
+        reason: "process",
+        detail: "No launch inspection.",
+      }),
+    );
+
+  readonly inspect = (identity: WorkerIdentity) =>
+    Effect.sync(() => {
+      this.onInspect();
+      return this.absent
+        ? {
             identity,
+            status: "absent" as const,
             observedAt: FIXTURE_OBSERVED_AT,
-            detail: "Fixture worker is still working.",
-          };
-        if (this.status === "blocked" || this.status === "unknown")
-          return {
-            state: "blocked" as const,
-            identity,
-            observedAt: FIXTURE_OBSERVED_AT,
-            detail: `Fixture worker is ${this.status}.`,
-          };
+            detail: "Exact fixture worker is absent.",
+          }
+        : this.observation(identity);
+    });
+
+  readonly observe = (identity: WorkerIdentity) =>
+    this.absent
+      ? Effect.fail(
+          new HerdrProtocolError({
+            operation: "observe fixture worker",
+            reason: "process",
+            detail: "Exact fixture worker is absent.",
+          }),
+        )
+      : Effect.succeed(this.observation(identity));
+
+  readonly interrupt = (identity: WorkerIdentity) =>
+    Effect.sync(() => {
+      this.interruptCount++;
+      return this.observation(identity);
+    });
+
+  readonly steer = (identity: WorkerIdentity) => {
+    const produce = this.producers.get(identity.sessionFile);
+    if (produce === undefined)
+      return Effect.fail(
+        new HerdrProtocolError({
+          operation: "steer fixture worker",
+          reason: "process",
+          detail: "No fixture worker request exists for the identity.",
+        }),
+      );
+    return this.produceEffect(identity.sessionFile);
+  };
+
+  readonly cleanup = (identity: WorkerIdentity) =>
+    Effect.sync(() => {
+      if (this.status === "working")
         return {
-          state: "completed" as const,
+          state: "pending" as const,
           identity,
           observedAt: FIXTURE_OBSERVED_AT,
-          detail: this.absent ? "Exact fixture worker is absent." : "Exact fixture worker closed.",
+          detail: "Fixture worker is still working.",
         };
-      }),
-  };
+      if (this.status === "blocked" || this.status === "unknown")
+        return {
+          state: "blocked" as const,
+          identity,
+          observedAt: FIXTURE_OBSERVED_AT,
+          detail: `Fixture worker is ${this.status}.`,
+        };
+      return {
+        state: "completed" as const,
+        identity,
+        observedAt: FIXTURE_OBSERVED_AT,
+        detail: this.absent ? "Exact fixture worker is absent." : "Exact fixture worker closed.",
+      };
+    });
 
   produceEffect(sessionFile: string): Effect.Effect<void, HerdrProtocolError> {
     const produce = this.producers.get(sessionFile);
@@ -469,7 +473,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
       { model: "fixture/research-second", thinking: "high" },
     ];
     const active = await f.runtime(undefined, { policy });
-    const initial = await runRuntime(f.repository.effects.head());
+    const initial = await runRuntime(f.repository.head());
     const queued = await runRuntime(
       active.effects.queue(research("shared-base"), {
         selection: { count: 2, diversity: "distinct-models" },
@@ -482,7 +486,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
     await writeFile(join(f.root, "moved.txt"), "moved\n");
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "move head");
-    const moved = await runRuntime(f.repository.effects.head());
+    const moved = await runRuntime(f.repository.head());
     assert.notEqual(moved, initial);
     const retainedBefore = (await runRuntime(f.store.load())).assignments.length;
     await assert.rejects(
@@ -505,6 +509,134 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
     const state = await runRuntime(f.store.load());
     assert.equal(state.assignments.length, retainedBefore);
     assert.equal(state.attempts.length, 2);
+
+    const directReview = await runRuntime(
+      active.effects.queue(
+        {
+          id: "direct-review",
+          capability: "review",
+          artifactIntent: "evidence_only",
+          objective: "Review the exact existing revision",
+          intentVersion: 0,
+          subject: { kind: "revision", revision: initial },
+          concern: "Inspect this commit directly",
+        },
+        {},
+      ),
+    );
+    const directAssignment = directReview.assignments.at(-1);
+    assert.equal(directAssignment?.id, "direct-review");
+    assert.equal(directReview.attempts.at(-1)?.baseRevision, initial);
+    await assert.rejects(
+      runRuntime(
+        active.effects.queue(
+          {
+            id: "missing-direct-review",
+            capability: "review",
+            artifactIntent: "evidence_only",
+            objective: "Review a missing revision",
+            intentVersion: 0,
+            subject: { kind: "revision", revision: "f".repeat(40) },
+            concern: "Must refuse before queueing",
+          },
+          {},
+        ),
+      ),
+      /git|revision|resolve/i,
+    );
+    const afterMissing = await runRuntime(f.store.load());
+    assert.equal(
+      afterMissing.assignments.some((item) => item.id === "missing-direct-review"),
+      false,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("direct exact revision review uses an owned exact-base checkout", async () => {
+  const f = await fixture();
+  try {
+    const base = await git(f.root, "rev-parse", "HEAD");
+    const oldBytes = await readFile(join(f.root, "value.txt"), "utf8");
+    await writeFile(join(f.root, "value.txt"), "advanced destination\n");
+    await git(f.root, "add", "value.txt");
+    await git(f.root, "commit", "-m", "Advance destination");
+    const destinationHead = await git(f.root, "rev-parse", "HEAD");
+    const destinationBytes = "uncommitted destination\n";
+    await writeFile(join(f.root, "value.txt"), destinationBytes);
+    f.workers.onWork = async (request) => {
+      assert.notEqual(request.cwd, f.root);
+      assert.equal(await git(request.cwd, "rev-parse", "HEAD"), base);
+      assert.equal(await readFile(join(request.cwd, "value.txt"), "utf8"), oldBytes);
+      assert.equal(await git(request.cwd, "status", "--porcelain"), "");
+      assert.equal(await git(f.root, "rev-parse", "HEAD"), destinationHead);
+      assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), destinationBytes);
+      return {
+        kind: "review",
+        status: "completed",
+        summary: "Reviewed the exact existing revision.",
+        evidence: [
+          {
+            label: "exact checkout",
+            observation: `The worker checkout was rooted at ${base} with the selected historical bytes.`,
+            class: "direct",
+          },
+        ],
+        findings: [],
+      };
+    };
+    const active = await f.runtime();
+    const queued = await runRuntime(
+      active.effects.queue(
+        {
+          id: "direct-exact-review",
+          capability: "review",
+          artifactIntent: "evidence_only",
+          objective: "Review the exact existing revision directly",
+          intentVersion: 0,
+          subject: { kind: "revision", revision: base },
+          concern: "Inspect only the exact commit",
+        },
+        {},
+      ),
+    );
+    assert.equal(queued.results.length, 0);
+    assert.equal(queued.attempts.at(-1)?.baseRevision, base);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    const state = await runRuntime(f.store.load());
+    assert.equal(state.results[0]?.validity, "typed");
+    assert.equal(
+      state.results[0]?.validity === "typed" ? state.results[0].report.kind : undefined,
+      "review",
+    );
+    assert.equal(state.attempts[0]?.baseRevision, base);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.placement?.kind, "isolated_worktree");
+    const outcome = inspectView(state, {
+      section: "outcome",
+      result: required(state.results[0], "exact-review result").id,
+    });
+    if (!("settlement" in outcome)) throw new Error("Expected exact-review outcome projection");
+    assert.equal(outcome.settlement.retainedOutput.state, "not_applicable");
+    const recovery = inspectView(state, {
+      section: "recovery",
+      attempt: required(state.attempts[0], "exact-review attempt").id,
+    });
+    if (!("guardedActions" in recovery) || !("recordedFacts" in recovery))
+      throw new Error("Expected exact-review recovery projection");
+    assert.equal(recovery.recordedFacts.retainedOutput.state, "not_applicable");
+    assert.deepEqual(recovery.guardedActions, []);
+    const exactPlacement = required(state.attempts[0], "exact-review attempt").placement;
+    if (exactPlacement?.kind !== "isolated_worktree")
+      throw new Error("Expected exact-review isolated placement");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(exactPlacement.path),
+      false,
+    );
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), destinationHead);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), destinationBytes);
   } finally {
     await f.dispose();
   }
@@ -599,7 +731,7 @@ await test("completed no-change implementations retain explicit attribution, ski
   try {
     const active = await f.runtime();
     const authority = await f.authority(active);
-    const base = await runRuntime(f.repository.effects.head());
+    const base = await runRuntime(f.repository.head());
     const before = await readFile(join(f.root, "value.txt"), "utf8");
     f.workers.onWork = async (request) => ({
       kind: "implementation",
@@ -637,8 +769,23 @@ await test("completed no-change implementations retain explicit attribution, ski
     assert.equal(result.report.revision, base);
     assert.equal(attempt.application, undefined);
     assert.equal(attempt.cleanup?.state, "completed");
-    assert.equal(await runRuntime(f.repository.effects.head()), base);
+    assert.equal(await runRuntime(f.repository.head()), base);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), before);
+    const outcome = inspectView(state, {
+      section: "outcome",
+      result: result.id,
+    });
+    if (!("settlement" in outcome)) throw new Error("Expected no-change outcome projection");
+    assert.equal(outcome.settlement.application.state, "not_applicable");
+    assert.equal(outcome.settlement.retainedOutput.state, "not_applicable");
+    const recovery = inspectView(state, {
+      section: "recovery",
+      attempt: attempt.id,
+    });
+    if (!("guardedActions" in recovery) || !("recordedFacts" in recovery))
+      throw new Error("Expected no-change recovery projection");
+    assert.equal(recovery.recordedFacts.retainedOutput.state, "not_applicable");
+    assert.deepEqual(recovery.guardedActions, []);
     const worktrees = await git(f.root, "worktree", "list", "--porcelain");
     assert.equal(worktrees.includes(attempt.placement?.path ?? ""), false);
   } finally {
@@ -651,7 +798,7 @@ await test("dirty isolated trees cannot settle a successful no-change implementa
   try {
     const active = await f.runtime();
     const authority = await f.authority(active);
-    const base = await runRuntime(f.repository.effects.head());
+    const base = await runRuntime(f.repository.head());
     f.workers.onWork = async (request) => {
       await writeFile(join(request.cwd, "unreported.txt"), "dirty\n");
       return {
@@ -681,7 +828,7 @@ await test("dirty isolated trees cannot settle a successful no-change implementa
     assert.equal(state.results[0]?.validity, "invalid");
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
-    assert.equal(await runRuntime(f.repository.effects.head()), base);
+    assert.equal(await runRuntime(f.repository.head()), base);
   } finally {
     await f.dispose();
   }
@@ -692,7 +839,7 @@ await test("advanced isolated trees cannot settle a successful no-change impleme
   try {
     const active = await f.runtime();
     const authority = await f.authority(active);
-    const base = await runRuntime(f.repository.effects.head());
+    const base = await runRuntime(f.repository.head());
     f.workers.onWork = async (request) => {
       await writeFile(join(request.cwd, "value.txt"), "advanced\n");
       await git(request.cwd, "add", "value.txt");
@@ -724,7 +871,64 @@ await test("advanced isolated trees cannot settle a successful no-change impleme
     assert.equal(state.results[0]?.validity, "invalid");
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
-    assert.equal(await runRuntime(f.repository.effects.head()), base);
+    assert.equal(await runRuntime(f.repository.head()), base);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("implementation role overrides resolve independently and invalid model inputs do not queue", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["implementation.guide"] = {
+      model: "fixture/guide-default",
+      thinking: "high",
+    };
+    policy.roles["implementation.executor"] = {
+      model: "fixture/executor-default",
+      thinking: "medium",
+    };
+    const active = await f.runtime(undefined, { policy });
+    const authority = await f.authority(active);
+    const assignment = {
+      id: "independent-role-overrides",
+      capability: "implement" as const,
+      artifactIntent: "maintained_change" as const,
+      objective: "Change value",
+      intentVersion: authority.intentVersion,
+      authority,
+      acceptance: ["value changes"],
+    };
+    await runRuntime(
+      active.effects.queue(assignment, {
+        models: {
+          guide: { thinking: "low" },
+          executor: { model: "fixture/executor-override" },
+        },
+      }),
+    );
+    let state = await runRuntime(f.store.load());
+    assert.deepEqual(state.attempts[0]?.models, {
+      guide: { model: "fixture/guide-default", thinking: "low" },
+      executor: { model: "fixture/executor-override", thinking: "medium" },
+      source: "override",
+    });
+    assert.equal(f.workers.requests.length, 0);
+
+    await assert.rejects(
+      runRuntime(
+        active.effects.queue(
+          { ...assignment, id: "empty-role-overrides" },
+          { models: { guide: {} } },
+        ),
+      ),
+      /Invalid model queue options/,
+    );
+    state = await runRuntime(f.store.load());
+    assert.equal(state.assignments.length, 1);
+    assert.equal(state.attempts.length, 1);
+    assert.equal(f.workers.requests.length, 0);
   } finally {
     await f.dispose();
   }
@@ -807,14 +1011,7 @@ await test("maintained changes keep semantic identity, use guide/executor policy
       implementationResult.report.outcome !== "changed"
     )
       assert.fail("Expected changed implementation report.");
-    const destinationHead = await git(f.root, "rev-parse", "HEAD");
-    state = await runRuntime(
-      active.effects.apply(
-        implementationAttempt.id,
-        required(implementationResult.report.commit, "reported implementation commit"),
-        destinationHead,
-      ),
-    );
+    state = await runRuntime(active.effects.apply(implementationAttempt.id));
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "maintained\n");
     const revision =
       state.attempts[0]?.application?.revision ??
@@ -956,7 +1153,7 @@ await test("retained candidate corrections apply their complete history and keep
         findings: [],
       };
     };
-    const base = await runRuntime(f.repository.effects.head());
+    const base = await runRuntime(f.repository.head());
     await runRuntime(
       active.effects.queue({
         id: "first",
@@ -1037,7 +1234,7 @@ await test("retained candidate corrections apply their complete history and keep
       parentCommit: firstCommit,
     });
     assert.equal(correctionAttempt.baseRevision, firstCommit);
-    assert.equal(await runRuntime(f.repository.effects.head()), base);
+    assert.equal(await runRuntime(f.repository.head()), base);
 
     await runRuntime(
       active.effects.queue({
@@ -1055,8 +1252,29 @@ await test("retained candidate corrections apply their complete history and keep
     assert.equal(state.attempts[2]?.cleanup?.state, "completed");
     assert.equal(state.results[2]?.validity, "typed");
 
-    state = await runRuntime(active.effects.apply(correctionAttempt.id, correctionCommit, base));
-    assert.equal(await runRuntime(f.repository.effects.head()), correctionCommit);
+    const beforeApplyBytes = await readFile(join(f.root, "value.txt"), "utf8");
+    const fixtureDirt = join(f.root, "apply-dirty.txt");
+    await writeFile(fixtureDirt, "fixture-owned dirt\n");
+    const dirtyHead = await runRuntime(f.repository.head());
+    await assert.rejects(
+      runRuntime(active.effects.apply(correctionAttempt.id)),
+      /Git working tree is not clean/,
+    );
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[1]?.application, undefined);
+    assert.equal(await runRuntime(f.repository.head()), dirtyHead);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), beforeApplyBytes);
+    assert.equal(await readFile(fixtureDirt, "utf8"), "fixture-owned dirt\n");
+    const correctionPath =
+      correctionAttempt.placement?.kind === "isolated_worktree"
+        ? correctionAttempt.placement.path
+        : assert.fail("Correction must retain its worktree before application.");
+    assert.match(await git(f.root, "worktree", "list", "--porcelain"), new RegExp(correctionPath));
+
+    await rm(fixtureDirt);
+    assert.equal(await runRuntime(f.repository.status()), "");
+    state = await runRuntime(active.effects.apply(correctionAttempt.id));
+    assert.equal(await runRuntime(f.repository.head()), correctionCommit);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "corrected\n");
     assert.equal(await git(f.root, "rev-list", "--count", `${base}..HEAD`), "2");
     assert.equal(await git(f.root, "rev-parse", `${correctionCommit}^`), firstCommit);
@@ -1072,7 +1290,6 @@ await test("retained candidate corrections apply their complete history and keep
             { label: "chain", observation: "The applied candidate retained both commits." },
           ],
           limitations: [],
-          reasons: [],
         }),
       ),
     );
@@ -1108,7 +1325,7 @@ await test("moved candidate application is blocked without mutation and supports
         findings: [],
       };
     };
-    const original = await runRuntime(f.repository.effects.head());
+    const original = await runRuntime(f.repository.head());
     await runRuntime(
       active.effects.queue({
         id: "candidate",
@@ -1139,14 +1356,14 @@ await test("moved candidate application is blocked without mutation and supports
     await writeFile(join(f.root, "value.txt"), "moved\n");
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Move destination");
-    const moved = await runRuntime(f.repository.effects.head());
+    const moved = await runRuntime(f.repository.head());
     await assert.rejects(
-      runRuntime(active.effects.apply(parent.id, parentCommit, moved)),
-      /Application did not establish/,
+      runRuntime(active.effects.apply(parent.id)),
+      /Destination HEAD .*candidate root/,
     );
     state = await runRuntime(f.store.load());
-    assert.equal(state.attempts[0]?.application?.state, "blocked");
-    assert.equal(await runRuntime(f.repository.effects.head()), moved);
+    assert.equal(state.attempts[0]?.application, undefined);
+    assert.equal(await runRuntime(f.repository.head()), moved);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "moved\n");
     assert.match(await git(f.root, "worktree", "list", "--porcelain"), new RegExp(parentPath));
 
@@ -1182,9 +1399,9 @@ await test("moved candidate application is blocked without mutation and supports
       parentCommit,
     });
     assert.equal(integration.baseRevision, moved);
-    assert.equal(await runRuntime(f.repository.effects.head()), moved);
-    state = await runRuntime(active.effects.apply(integration.id, integrationCommit, moved));
-    assert.equal(await runRuntime(f.repository.effects.head()), integrationCommit);
+    assert.equal(await runRuntime(f.repository.head()), moved);
+    state = await runRuntime(active.effects.apply(integration.id));
+    assert.equal(await runRuntime(f.repository.head()), integrationCommit);
     assert.equal(await git(f.root, "rev-list", "--count", `${moved}..HEAD`), "1");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "integrated\n");
     assert.equal(state.attempts[1]?.application?.rootCommit, moved);
@@ -1245,17 +1462,20 @@ await test("wrong-mode and stale maintained results remain retained without appl
     assert.equal(state.attempts[1]?.application, undefined);
     assert.equal(state.attempts[1]?.cleanup?.state, "completed");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
-    await assert.rejects(
-      submit(
-        active,
-        f.store.complete({
-          conclusion: "done",
-          evidence: [{ label: "limit", observation: "Not done" }],
-          limitations: ["stale"],
-          reasons: [],
-        }),
-      ),
-      /exactly one reason per unresolved semantic task/,
+    const completed = await submit(
+      active,
+      f.store.complete({
+        conclusion: "done",
+        evidence: [{ label: "limit", observation: "Not done" }],
+        limitations: ["stale"],
+      }),
+    );
+    assert.equal(completed.lifecycle.state, "completed");
+    assert.equal(
+      completed.completion?.accounting.some((item) =>
+        item.reason.includes("not applied or superseded"),
+      ) ?? false,
+      true,
     );
   } finally {
     await f.dispose();
@@ -1335,9 +1555,7 @@ await test("worker continuation uses an isolated new workspace and current gener
     await runRuntime(
       active.effects.queue(research("followup"), {
         continuationOf: previous.id,
-        model: "provider/other",
-        modelReason: "Test an explicitly selected continuation model.",
-        thinking: "low",
+        selection: { override: { model: "provider/other", thinking: "low" } },
       }),
     );
     await runRuntime(active.effects.reconcile);
@@ -1375,11 +1593,14 @@ await test("failed notification is not retried by polling and pending delivery r
       conclusion: "The bounded question is answered",
       evidence: [{ label: "Read", observation: "value.txt says initial" }],
       limitations: [],
-      reasons: [],
     };
-    await assert.rejects(
-      submit(active, f.store.complete(completion)),
-      /Completion requires exactly one reason per unresolved semantic task|Pending result delivery/,
+    const completed = await submit(active, f.store.complete(completion));
+    assert.equal(completed.lifecycle.state, "completed");
+    assert.equal(
+      completed.completion?.accounting.some((item) =>
+        item.reason.includes("delivery is pending"),
+      ) ?? false,
+      true,
     );
     await runRuntime(active.effects.reconcile);
     await runRuntime(active.effects.reconcile);
@@ -1387,10 +1608,6 @@ await test("failed notification is not retried by polling and pending delivery r
     const pending = await runRuntime(active.effects.reconcile);
     assert.equal(pending.deliveries[0]?.state, "pending");
     assert.equal(notifications, 1);
-    await assert.rejects(
-      submit(active, f.store.complete(completion)),
-      /exactly one reason per unresolved semantic task|Pending result delivery/,
-    );
   } finally {
     await f.dispose();
   }
@@ -1734,12 +1951,6 @@ await test("cancelling a disposable experiment retains output through reconcilia
         conclusion: "The cancelled experiment remains available for inspection.",
         evidence: [{ label: "retained output", observation: "The cancelled worktree is intact." }],
         limitations: [],
-        reasons: [
-          {
-            taskId: "cancel-experiment",
-            reason: "Cancellation stopped the probe before it produced a result.",
-          },
-        ],
       }),
     );
     assert.equal(state.lifecycle.state, "completed");

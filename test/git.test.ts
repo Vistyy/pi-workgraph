@@ -44,7 +44,8 @@ async function fixture() {
   await git(root, "commit", "-m", "Initial fixture");
   await git(root, "commit", "--allow-empty", "-m", "Assigned base");
   const repository = await Effect.runPromise(openRepository(root));
-  return { parent, root, repository, base: await runGit(repository.effects.head()) };
+  const { head } = repository;
+  return { parent, root, repository, base: await runGit(head()) };
 }
 
 function processResult(
@@ -112,7 +113,7 @@ void test("interrupting a long read-only Git effect waits for the Git child to c
     await git(f.root, "config", "core.fsmonitor", hook);
 
     const controller = new AbortController();
-    const running = Effect.runPromise(f.repository.effects.status(), {
+    const running = Effect.runPromise(f.repository.status(), {
       signal: controller.signal,
     });
     assert.match(await waitForFile(started), /^[0-9]+$/);
@@ -131,47 +132,41 @@ void test("Git placements preserve unknown data; cleanup requires exact clean id
     await mkdir(unknown, { recursive: true });
     await writeFile(join(unknown, "mine.txt"), "unattributed bytes");
     await assert.rejects(
-      () => runGit(f.repository.effects.createWorktree("run", "unknown", f.base)),
+      () => runGit(f.repository.createWorktree("run", "unknown", f.base)),
       /Unregistered worktree path/,
     );
     assert.equal(await readFile(join(unknown, "mine.txt"), "utf8"), "unattributed bytes");
     await assert.rejects(
-      () => runGit(f.repository.effects.createWorktree("../escape", "worker", f.base)),
+      () => runGit(f.repository.createWorktree("../escape", "worker", f.base)),
       /Invalid worktree identity/,
     );
 
-    const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
-    assert.deepEqual(
-      await runGit(f.repository.effects.createWorktree("run", "worker", f.base)),
-      placement,
-    );
+    const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
+    assert.deepEqual(await runGit(f.repository.createWorktree("run", "worker", f.base)), placement);
     await writeFile(join(placement.path, "data.txt"), "maintained\n");
     await assert.rejects(
-      () => runGit(f.repository.effects.createWorktree("run", "worker", f.base)),
+      () => runGit(f.repository.createWorktree("run", "worker", f.base)),
       /uncertain state/,
     );
     await assert.rejects(
-      () => runGit(f.repository.effects.cleanupWorktree(placement, f.base)),
+      () => runGit(f.repository.cleanupWorktree(placement, f.base)),
       /dirty worktree/,
     );
     await git(placement.path, "add", ".");
     await git(placement.path, "commit", "-m", "Maintained change");
-    const commit = await runGit(f.repository.effects.head(placement.path));
-    assert.deepEqual(await runGit(f.repository.effects.validateWorkerCommit(placement, commit)), {
+    const commit = await runGit(f.repository.head(placement.path));
+    assert.deepEqual(await runGit(f.repository.validateWorkerCommit(placement, commit)), {
       commit,
       changedFiles: ["data.txt"],
     });
-    await assert.rejects(
-      () => runGit(f.repository.effects.cleanupWorktree(placement, f.base)),
-      /HEAD is/,
-    );
+    await assert.rejects(() => runGit(f.repository.cleanupWorktree(placement, f.base)), /HEAD is/);
     assert.equal(await readFile(join(placement.path, "data.txt"), "utf8"), "maintained\n");
     assert.equal(
-      (await runGit(f.repository.effects.cleanupWorktree(placement, commit))).state,
+      (await runGit(f.repository.cleanupWorktree(placement, commit))).state,
       "completed",
     );
     assert.equal(
-      (await runGit(f.repository.effects.cleanupWorktree(placement, commit))).state,
+      (await runGit(f.repository.cleanupWorktree(placement, commit))).state,
       "completed",
     );
     assert.equal(await readFile(join(unknown, "mine.txt"), "utf8"), "unattributed bytes");
@@ -197,7 +192,7 @@ void test("timed-out and unavailable ref observations never remove a real worker
 
   for (const observationFailure of observationFailures) {
     const f = await fixture();
-    const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
+    const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
     const branchRef = `refs/heads/${placement.branch}`;
     const repository = new GitRepository(
       f.root,
@@ -210,7 +205,7 @@ void test("timed-out and unavailable ref observations never remove a real worker
     );
     try {
       const failure = await Effect.runPromise(
-        Effect.flip(repository.effects.cleanupWorktree(placement, f.base)),
+        Effect.flip(repository.cleanupWorktree(placement, f.base)),
       );
       if (failure instanceof ProcessExecutionError) {
         const cause =
@@ -232,7 +227,7 @@ void test("timed-out and unavailable ref observations never remove a real worker
 
 void test("cleanup independently rechecks the exact branch after worktree registration disappears", async () => {
   const f = await fixture();
-  const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
+  const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
   const branchRef = `refs/heads/${placement.branch}`;
   let refInspections = 0;
   const repository = new GitRepository(
@@ -248,7 +243,7 @@ void test("cleanup independently rechecks the exact branch after worktree regist
   );
   try {
     await assert.rejects(
-      () => runGit(repository.effects.cleanupWorktree(placement, f.base)),
+      () => runGit(repository.cleanupWorktree(placement, f.base)),
       /Cleanup branch postcondition failed/,
     );
     assert.equal(await git(f.root, "rev-parse", branchRef), f.base);
@@ -264,23 +259,17 @@ void test("cleanup independently rechecks the exact branch after worktree regist
 void test("candidate validation retains the complete direct history and refuses moved or dirty destinations", async () => {
   const f = await fixture();
   try {
-    const firstPlacement = await runGit(
-      f.repository.effects.createWorktree("run", "first", f.base),
-    );
+    const firstPlacement = await runGit(f.repository.createWorktree("run", "first", f.base));
     await writeFile(join(firstPlacement.path, "data.txt"), "first\n");
     await git(firstPlacement.path, "add", ".");
     await git(firstPlacement.path, "commit", "-m", "First candidate");
-    const first = await runGit(f.repository.effects.head(firstPlacement.path));
-    const secondPlacement = await runGit(
-      f.repository.effects.createWorktree("run", "second", first),
-    );
+    const first = await runGit(f.repository.head(firstPlacement.path));
+    const secondPlacement = await runGit(f.repository.createWorktree("run", "second", first));
     await writeFile(join(secondPlacement.path, "data.txt"), "second\n");
     await git(secondPlacement.path, "add", ".");
     await git(secondPlacement.path, "commit", "-m", "Second candidate");
-    const second = await runGit(f.repository.effects.head(secondPlacement.path));
-    const validated = await runGit(
-      f.repository.effects.validateCandidate(secondPlacement, f.base, second),
-    );
+    const second = await runGit(f.repository.head(secondPlacement.path));
+    const validated = await runGit(f.repository.validateCandidate(secondPlacement, f.base, second));
     assert.deepEqual(validated, {
       commit: second,
       changedFiles: ["data.txt"],
@@ -288,23 +277,20 @@ void test("candidate validation retains the complete direct history and refuses 
       commits: [first, second],
     });
     const source = { rootCommit: f.base, commit: second, commits: [first, second] };
-    assert.equal(
-      await runGit(f.repository.effects.recoverCandidateApplication(f.base, source)),
-      undefined,
-    );
+    assert.equal(await runGit(f.repository.recoverCandidateApplication(f.base, source)), undefined);
     await assert.rejects(
-      () => runGit(f.repository.effects.applyCandidate({ ...source, commits: [f.base] }, f.base)),
+      () => runGit(f.repository.applyCandidate({ ...source, commits: [f.base] }, f.base)),
       /Candidate source commit chain changed before application/,
     );
-    assert.equal(await runGit(f.repository.effects.head()), f.base);
+    assert.equal(await runGit(f.repository.head()), f.base);
     const mergeHead = join(f.repository.commonDir, "MERGE_HEAD");
     await writeFile(mergeHead, `${first}\n`);
     try {
       await assert.rejects(
-        () => runGit(f.repository.effects.applyCandidate(source, f.base)),
+        () => runGit(f.repository.applyCandidate(source, f.base)),
         /pre-existing merge state/,
       );
-      assert.equal(await runGit(f.repository.effects.head()), f.base);
+      assert.equal(await runGit(f.repository.head()), f.base);
     } finally {
       await rm(mergeHead, { force: true });
     }
@@ -318,35 +304,31 @@ void test("candidate validation retains the complete direct history and refuses 
       ),
     );
     await assert.rejects(
-      () => runGit(unchangedFailureRepository.effects.applyCandidate(source, f.base)),
+      () => runGit(unchangedFailureRepository.applyCandidate(source, f.base)),
       /Fast-forward application.*failed/,
     );
-    assert.equal(await runGit(f.repository.effects.head()), f.base);
-    assert.equal(await runGit(f.repository.effects.applyCandidate(source, f.base)), second);
-    assert.equal(await runGit(f.repository.effects.head()), second);
+    assert.equal(await runGit(f.repository.head()), f.base);
+    assert.equal(await runGit(f.repository.applyCandidate(source, f.base)), second);
+    assert.equal(await runGit(f.repository.head()), second);
     assert.equal(await git(f.root, "rev-list", "--count", `${f.base}..HEAD`), "2");
-    assert.deepEqual(
-      await runGit(f.repository.effects.recoverCandidateApplication(f.base, source)),
-      { head: second },
-    );
+    assert.deepEqual(await runGit(f.repository.recoverCandidateApplication(f.base, source)), {
+      head: second,
+    });
 
     await writeFile(join(f.root, "data.txt"), "moved\n");
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Move destination");
-    const moved = await runGit(f.repository.effects.head());
+    const moved = await runGit(f.repository.head());
     const movedBytes = await readFile(join(f.root, "data.txt"), "utf8");
     await assert.rejects(
-      () => runGit(f.repository.effects.applyCandidate(source, moved)),
+      () => runGit(f.repository.applyCandidate(source, moved)),
       /candidate root/,
     );
-    assert.equal(await runGit(f.repository.effects.head()), moved);
+    assert.equal(await runGit(f.repository.head()), moved);
     assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), movedBytes);
     await writeFile(join(f.root, "unrelated.txt"), "dirty\n");
-    await assert.rejects(
-      () => runGit(f.repository.effects.applyCandidate(source, moved)),
-      /not clean/,
-    );
-    assert.equal(await runGit(f.repository.effects.head()), moved);
+    await assert.rejects(() => runGit(f.repository.applyCandidate(source, moved)), /not clean/);
+    assert.equal(await runGit(f.repository.head()), moved);
     assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), movedBytes);
     assert.equal(await readFile(join(f.root, "unrelated.txt"), "utf8"), "dirty\n");
     assert.match(
@@ -360,12 +342,12 @@ void test("candidate validation retains the complete direct history and refuses 
 
 void test("unavailable post-failure HEAD leaves candidate application uncertain without recovery mutation", async () => {
   const f = await fixture();
-  const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
+  const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
   try {
     await writeFile(join(placement.path, "data.txt"), "candidate\n");
     await git(placement.path, "add", ".");
     await git(placement.path, "commit", "-m", "Candidate output");
-    const commit = await runGit(f.repository.effects.head(placement.path));
+    const commit = await runGit(f.repository.head(placement.path));
     const source = { rootCommit: f.base, commit, commits: [commit] };
     let headObservations = 0;
     let mergeAttempts = 0;
@@ -386,20 +368,15 @@ void test("unavailable post-failure HEAD leaves candidate application uncertain 
         return undefined;
       }),
     );
-    const failure = await Effect.runPromise(
-      Effect.flip(repository.effects.applyCandidate(source, f.base)),
-    );
+    const failure = await Effect.runPromise(Effect.flip(repository.applyCandidate(source, f.base)));
     assert.ok(failure instanceof GitStateUncertainError);
     assert.match(failure.message, /resulting HEAD is unavailable/);
     assert.match(failure.operationDiagnostic, /Fast-forward application/);
     assert.match(failure.followupDiagnostic, /destination HEAD unavailable/);
     assert.equal(mergeAttempts, 1);
-    assert.equal(await runGit(f.repository.effects.head()), f.base);
-    assert.equal(await runGit(f.repository.effects.status()), "");
-    assert.equal(
-      await runGit(repository.effects.recoverCandidateApplication(f.base, source)),
-      undefined,
-    );
+    assert.equal(await runGit(f.repository.head()), f.base);
+    assert.equal(await runGit(f.repository.status()), "");
+    assert.equal(await runGit(repository.recoverCandidateApplication(f.base, source)), undefined);
   } finally {
     await rm(f.parent, { recursive: true, force: true });
   }
@@ -407,12 +384,12 @@ void test("unavailable post-failure HEAD leaves candidate application uncertain 
 
 void test("uncertain candidate application is attributed only after exact postcondition recovery", async () => {
   const f = await fixture();
-  const placement = await runGit(f.repository.effects.createWorktree("run", "worker", f.base));
+  const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
   try {
     await writeFile(join(placement.path, "data.txt"), "candidate\n");
     await git(placement.path, "add", ".");
     await git(placement.path, "commit", "-m", "Candidate output");
-    const commit = await runGit(f.repository.effects.head(placement.path));
+    const commit = await runGit(f.repository.head(placement.path));
     const source = { rootCommit: f.base, commit, commits: [commit] };
     const repository = new GitRepository(
       f.root,
@@ -426,14 +403,12 @@ void test("uncertain candidate application is attributed only after exact postco
         });
       }),
     );
-    const failure = await Effect.runPromise(
-      Effect.flip(repository.effects.applyCandidate(source, f.base)),
-    );
+    const failure = await Effect.runPromise(Effect.flip(repository.applyCandidate(source, f.base)));
     assert.ok(failure instanceof GitStateUncertainError);
     assert.match(failure.message, /state changed/);
-    assert.equal(await runGit(f.repository.effects.head()), commit);
-    assert.equal(await runGit(f.repository.effects.status()), "");
-    assert.deepEqual(await runGit(repository.effects.recoverCandidateApplication(f.base, source)), {
+    assert.equal(await runGit(f.repository.head()), commit);
+    assert.equal(await runGit(f.repository.status()), "");
+    assert.deepEqual(await runGit(repository.recoverCandidateApplication(f.base, source)), {
       head: commit,
     });
   } finally {

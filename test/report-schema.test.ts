@@ -16,7 +16,6 @@ const reportContent = {
       severity: "info",
       title: "No concern",
       detail: "No actionable concern was found.",
-      envelopeImpact: "none",
     },
   ],
 } as const;
@@ -55,6 +54,14 @@ void test("live report schemas reject undeclared top-level and nested sensitive 
       false,
       `${mode} finding extra`,
     );
+    assert.equal(
+      Value.Check(schema, {
+        ...report,
+        findings: [{ ...report.findings[0], envelopeImpact: "none" }],
+      }),
+      false,
+      `${mode} superseded finding classification`,
+    );
   }
 });
 
@@ -66,7 +73,9 @@ void test("historical report decoding preserves fields accepted by the legacy sc
       ...reportContent,
       legacyTopLevel: { source: "retained research bytes" },
       evidence: [{ ...reportContent.evidence[0], legacyEvidence: "retained" }],
-      findings: [{ ...reportContent.findings[0], legacyFinding: "retained" }],
+      findings: [
+        { ...reportContent.findings[0], envelopeImpact: "none", legacyFinding: "retained" },
+      ],
     },
     {
       kind: "review",
@@ -74,14 +83,18 @@ void test("historical report decoding preserves fields accepted by the legacy sc
       ...reportContent,
       legacyTopLevel: { source: "retained review bytes" },
       evidence: [{ ...reportContent.evidence[0], legacyEvidence: "retained" }],
-      findings: [{ ...reportContent.findings[0], legacyFinding: "retained" }],
+      findings: [
+        { ...reportContent.findings[0], envelopeImpact: "none", legacyFinding: "retained" },
+      ],
     },
     {
       kind: "implementation",
       status: "failed",
       ...reportContent,
       evidence: [{ ...reportContent.evidence[0], legacyEvidence: "retained" }],
-      findings: [{ ...reportContent.findings[0], legacyFinding: "retained" }],
+      findings: [
+        { ...reportContent.findings[0], envelopeImpact: "none", legacyFinding: "retained" },
+      ],
     },
   ];
 

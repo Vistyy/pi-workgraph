@@ -162,47 +162,6 @@ export interface WorkerCleanupResult {
   detail: string;
 }
 
-export interface HerdrEffects {
-  readonly launchCoordinator: (
-    request: CoordinatorLaunchRequest,
-  ) => Effect.Effect<WorkerIdentity, CoordinatorLaunchError | HerdrProtocolError>;
-  readonly coordinatorLiveness: (
-    sessionFile: string,
-  ) => Effect.Effect<"alive" | "dead" | "unknown", HerdrProtocolError>;
-  readonly observeCurrentCoordinator: (
-    request: CoordinatorObservationRequest,
-  ) => Effect.Effect<CoordinatorRuntimeIdentity, HerdrProtocolError>;
-  readonly launch: <E, R>(
-    request: WorkerLaunchEffectRequest<E, R>,
-  ) => Effect.Effect<
-    HerdrObservation,
-    HerdrProtocolError | WorkerLaunchReadinessError | WorkerLaunchError<E>,
-    R
-  >;
-  readonly recover: (
-    request: WorkerRecoveryRequest,
-  ) => Effect.Effect<HerdrObservation | undefined, HerdrProtocolError | WorkerLaunchReadinessError>;
-  readonly inspectLaunch: (
-    request: WorkerLaunchInspectionRequest,
-  ) => Effect.Effect<WorkerLaunchInspection, HerdrProtocolError>;
-  readonly inspect: (
-    identity: WorkerIdentity,
-  ) => Effect.Effect<HerdrInspection, HerdrProtocolError>;
-  readonly observe: (
-    identity: WorkerIdentity,
-  ) => Effect.Effect<HerdrObservation, HerdrProtocolError>;
-  readonly interrupt: (
-    identity: WorkerIdentity,
-  ) => Effect.Effect<HerdrObservation, HerdrProtocolError>;
-  readonly steer: (
-    identity: WorkerIdentity,
-    instruction: string,
-  ) => Effect.Effect<void, HerdrProtocolError>;
-  readonly cleanup: (
-    identity: WorkerIdentity,
-  ) => Effect.Effect<WorkerCleanupResult, HerdrProtocolError>;
-}
-
 interface HerdrProcessEnvironment extends NodeJS.ProcessEnv {
   HERDR_ENV?: string;
   HERDR_WORKSPACE_ID?: string;
@@ -218,7 +177,6 @@ const hostEnvironment: HerdrProcessEnvironment = process.env;
 
 export class HerdrCliRuntime {
   readonly available: boolean;
-  readonly effects: HerdrEffects;
   private readonly coordinatorEnvironment: Record<string, string>;
   private readonly transport: HerdrCommandTransport;
   private readonly workerLauncher: HerdrWorkerLauncher;
@@ -236,26 +194,13 @@ export class HerdrCliRuntime {
       transport: this.transport,
       awaitNativeIdentity: (resource, sessionFile) =>
         this.awaitNativeIdentity(resource, sessionFile),
-      observe: (identity) => this.observeEffect(identity),
+      observe: (identity) => this.observe(identity),
     });
-    this.effects = {
-      launchCoordinator: (request) => this.launchCoordinatorEffect(request),
-      coordinatorLiveness: (sessionFile) => this.coordinatorLivenessEffect(sessionFile),
-      observeCurrentCoordinator: (request) => this.observeCurrentCoordinatorEffect(request),
-      launch: (request) => this.launchEffect(request),
-      recover: (request) => this.recoverEffect(request),
-      inspectLaunch: (request) => this.inspectLaunchEffect(request),
-      inspect: (identity) => this.inspectEffect(identity),
-      observe: (identity) => this.observeEffect(identity),
-      interrupt: (identity) => this.interruptEffect(identity),
-      steer: (identity, instruction) => this.steerEffect(identity, instruction),
-      cleanup: (identity) => this.cleanupEffect(identity),
-    };
   }
 
-  private launchCoordinatorEffect(
+  readonly launchCoordinator = (
     request: CoordinatorLaunchRequest,
-  ): Effect.Effect<WorkerIdentity, CoordinatorLaunchError | HerdrProtocolError> {
+  ): Effect.Effect<WorkerIdentity, CoordinatorLaunchError | HerdrProtocolError> => {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
         yield* this.requireAvailable("coordinator");
@@ -335,11 +280,11 @@ export class HerdrCliRuntime {
         );
       }.bind(this),
     );
-  }
+  };
 
-  private coordinatorLivenessEffect(
+  readonly coordinatorLiveness = (
     sessionFile: string,
-  ): Effect.Effect<"alive" | "dead" | "unknown", HerdrProtocolError> {
+  ): Effect.Effect<"alive" | "dead" | "unknown", HerdrProtocolError> => {
     if (!this.available) return Effect.succeed("unknown");
     return this.transport.call(["api", "snapshot"], decodeCoordinatorSnapshotResponse).pipe(
       Effect.map((sessionFiles) => {
@@ -351,11 +296,11 @@ export class HerdrCliRuntime {
         return unknown ? ("unknown" as const) : ("dead" as const);
       }),
     );
-  }
+  };
 
-  private observeCurrentCoordinatorEffect(
+  readonly observeCurrentCoordinator = (
     request: CoordinatorObservationRequest,
-  ): Effect.Effect<CoordinatorRuntimeIdentity, HerdrProtocolError> {
+  ): Effect.Effect<CoordinatorRuntimeIdentity, HerdrProtocolError> => {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
         yield* this.requireAvailable("coordinator");
@@ -373,23 +318,26 @@ export class HerdrCliRuntime {
         return current;
       }.bind(this),
     );
-  }
+  };
 
-  private launchEffect<E, R>(
+  readonly launch = <E, R>(
     request: WorkerLaunchEffectRequest<E, R>,
   ): Effect.Effect<
     HerdrObservation,
     HerdrProtocolError | WorkerLaunchReadinessError | WorkerLaunchError<E>,
     R
-  > {
+  > => {
     return this.requireAvailable("worker").pipe(
       Effect.andThen(this.workerLauncher.launch(request)),
     );
-  }
+  };
 
-  private recoverEffect(
+  readonly recover = (
     request: WorkerRecoveryRequest,
-  ): Effect.Effect<HerdrObservation | undefined, HerdrProtocolError | WorkerLaunchReadinessError> {
+  ): Effect.Effect<
+    HerdrObservation | undefined,
+    HerdrProtocolError | WorkerLaunchReadinessError
+  > => {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
         const agents = yield* this.transport.call(["api", "snapshot"], decodeSnapshotResponse);
@@ -438,11 +386,11 @@ export class HerdrCliRuntime {
         return { identity, status: current.status, observedAt: yield* observedAt };
       }.bind(this),
     );
-  }
+  };
 
-  private inspectLaunchEffect(
+  readonly inspectLaunch = (
     request: WorkerLaunchInspectionRequest,
-  ): Effect.Effect<WorkerLaunchInspection, HerdrProtocolError> {
+  ): Effect.Effect<WorkerLaunchInspection, HerdrProtocolError> => {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
         const paneResult = yield* this.spawnCommand(["pane", "get", request.paneId], 30_000);
@@ -460,7 +408,7 @@ export class HerdrCliRuntime {
         return yield* this.inspectLaunchAgent(request, pane, evidence);
       }.bind(this),
     );
-  }
+  };
 
   private inspectLaunchProcess(
     paneId: string,
@@ -590,9 +538,9 @@ export class HerdrCliRuntime {
     );
   }
 
-  private inspectEffect(
+  readonly inspect = (
     identity: WorkerIdentity,
-  ): Effect.Effect<HerdrInspection, HerdrProtocolError> {
+  ): Effect.Effect<HerdrInspection, HerdrProtocolError> => {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
         const result = yield* this.spawnCommand(["agent", "get", identity.paneId], 30_000);
@@ -619,12 +567,12 @@ export class HerdrCliRuntime {
         return { identity, status: current.status, observedAt: yield* observedAt };
       }.bind(this),
     );
-  }
+  };
 
-  private observeEffect(
+  readonly observe = (
     identity: WorkerIdentity,
-  ): Effect.Effect<HerdrObservation, HerdrProtocolError> {
-    return this.inspectEffect(identity).pipe(
+  ): Effect.Effect<HerdrObservation, HerdrProtocolError> => {
+    return this.inspect(identity).pipe(
       Effect.filterOrFail(
         (inspection): inspection is HerdrObservation => inspection.status !== "absent",
         (inspection) =>
@@ -635,27 +583,27 @@ export class HerdrCliRuntime {
           ),
       ),
     );
-  }
+  };
 
-  private interruptEffect(
+  readonly interrupt = (
     identity: WorkerIdentity,
-  ): Effect.Effect<HerdrObservation, HerdrProtocolError> {
+  ): Effect.Effect<HerdrObservation, HerdrProtocolError> => {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
-        yield* this.observeEffect(identity);
+        yield* this.observe(identity);
         yield* this.transport.call(
           ["agent", "send-keys", identity.agentName, "esc"],
           decodeSuccessResponse,
         );
-        return yield* this.observeEffect(identity);
+        return yield* this.observe(identity);
       }.bind(this),
     );
-  }
+  };
 
-  private steerEffect(
+  readonly steer = (
     identity: WorkerIdentity,
     instruction: string,
-  ): Effect.Effect<void, HerdrProtocolError> {
+  ): Effect.Effect<void, HerdrProtocolError> => {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
         const trimmed = instruction.trim();
@@ -665,7 +613,7 @@ export class HerdrCliRuntime {
             "identity",
             "Worker steering requires an instruction.",
           );
-        const current = yield* this.observeEffect(identity);
+        const current = yield* this.observe(identity);
         if (current.status === "blocked")
           return yield* protocolFailure(
             ["agent", "prompt"],
@@ -678,14 +626,14 @@ export class HerdrCliRuntime {
         );
       }.bind(this),
     );
-  }
+  };
 
-  private cleanupEffect(
+  readonly cleanup = (
     identity: WorkerIdentity,
-  ): Effect.Effect<WorkerCleanupResult, HerdrProtocolError> {
+  ): Effect.Effect<WorkerCleanupResult, HerdrProtocolError> => {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
-        const observation = yield* this.inspectEffect(identity);
+        const observation = yield* this.inspect(identity);
         if (observation.status === "absent")
           return {
             state: "completed" as const,
@@ -722,7 +670,7 @@ export class HerdrCliRuntime {
         };
       }.bind(this),
     );
-  }
+  };
 
   private tabAbsent(tabId: string): Effect.Effect<boolean, HerdrProtocolError> {
     return Effect.gen(

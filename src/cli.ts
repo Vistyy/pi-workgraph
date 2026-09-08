@@ -10,12 +10,7 @@ import { Value } from "typebox/value";
 import { type InspectView, inspectView } from "./agent-facing.js";
 import { CliInputError, type CliRequest, parseCliRequest, usage } from "./cli-parse.js";
 import { type GitFailure, inspectRepository } from "./git.js";
-import {
-  type CoordinatorLaunchError,
-  HerdrCliRuntime,
-  type HerdrEffects,
-  type HerdrProtocolError,
-} from "./herdr.js";
+import { type CoordinatorLaunchError, HerdrCliRuntime, type HerdrProtocolError } from "./herdr.js";
 import { liveLayer } from "./node-platform.js";
 import { forkConversationSessionEffect, type PiSessionError } from "./pi-process.js";
 import { defaultRegistryPath } from "./registry.js";
@@ -55,10 +50,7 @@ export type CliResult =
   | { command: "inspect"; statePath: string; view: InspectView }
   | { command: "fork"; sessionFile: string; identity: WorkerIdentity };
 
-export interface NativeHerdr {
-  readonly available: boolean;
-  readonly effects: Pick<HerdrEffects, "launchCoordinator">;
-}
+export type NativeHerdr = Pick<HerdrCliRuntime, "available" | "launchCoordinator">;
 
 export type NativeHerdrFactory = (command: string, env: NodeJS.ProcessEnv) => NativeHerdr;
 
@@ -156,7 +148,7 @@ function forkEffect(
     const forkRequest: ForkRequest = { parentSessionFile, targetCwd };
     if (request.entryId !== undefined) forkRequest.entryId = request.entryId;
     const sessionFile = yield* forkConversationSessionEffect(forkRequest);
-    const identity: WorkerIdentity = yield* herdr.effects.launchCoordinator({
+    const identity: WorkerIdentity = yield* herdr.launchCoordinator({
       cwd: targetCwd,
       sessionFile,
     });

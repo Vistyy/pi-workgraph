@@ -87,40 +87,57 @@ export function deriveCompletionAccounting(state: WorkstreamState): CompletionAc
       accounting.push({
         kind: "unresolved_assignment",
         assignmentId: assignment.id,
-        reason: "Unresolved assignment requires coordinator accounting.",
+        reason: assignmentAccountingReason(state, assignment),
       });
   for (const attempt of state.attempts)
     if (!attemptResolved(state, attempt))
       accounting.push({
         kind: "unresolved_attempt",
         attemptId: attempt.id,
-        reason: "Unresolved attempt requires coordinator accounting.",
+        reason: attemptAccountingReason(state, attempt),
       });
   for (const result of state.results)
     if (resultUnresolved(state, result.id))
       accounting.push({
         kind: "unresolved_result",
         resultId: result.id,
-        reason: "Unresolved result requires coordinator accounting.",
+        reason: resultAccountingReason(result),
       });
   for (const delivery of state.deliveries)
     if (delivery.state === "pending")
       accounting.push({
         kind: "undelivered_result",
         resultId: delivery.resultId,
-        reason: "Undelivered result requires coordinator accounting.",
+        reason: "Retained result delivery is pending.",
       });
   return accounting;
 }
 
-export function accountingTaskId(
-  state: WorkstreamState,
-  item: CompletionAccounting,
-): string | undefined {
-  if (item.kind === "unresolved_assignment") return item.assignmentId;
-  if (item.kind === "unresolved_attempt")
-    return state.attempts.find((attempt) => attempt.id === item.attemptId)?.assignmentId;
-  return state.results.find((result) => result.id === item.resultId)?.assignmentId;
+function assignmentAccountingReason(state: WorkstreamState, assignment: WorkAssignment): string {
+  const attempts = state.attempts.filter((attempt) => attempt.assignmentId === assignment.id);
+  if (attempts.length === 0) return "Assignment has no retained attempt result.";
+  return "Assignment has an unresolved retained attempt or result.";
+}
+
+function attemptAccountingReason(state: WorkstreamState, attempt: WorkAttempt): string {
+  const result = resultForAttempt(state, attempt);
+  if (result === undefined) return "Attempt has no retained result.";
+  if (result.validity !== "typed") return `Attempt result is ${result.validity}.`;
+  if (result.report.status !== "completed")
+    return `Attempt retained a ${result.report.status} ${result.report.kind} report.`;
+  if (
+    result.report.kind === "implementation" &&
+    result.report.outcome === "changed" &&
+    attempt.application?.state !== "applied" &&
+    !includedByAppliedCandidateDescendant(state, attempt)
+  )
+    return "Completed implementation output is not applied or superseded by an applied candidate.";
+  return "Attempt has no resolved completion outcome.";
+}
+
+function resultAccountingReason(result: WorkResult): string {
+  if (result.validity !== "typed") return `Retained result is ${result.validity}.`;
+  return `${result.report.kind} report status is ${result.report.status}.`;
 }
 
 export function accountingIdentity(item: CompletionAccounting): string {

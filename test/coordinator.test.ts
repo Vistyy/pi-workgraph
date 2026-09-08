@@ -61,6 +61,7 @@ const actionDetailsSchema = Type.Object({
     affected: Type.Object({
       task: Type.Object({ idPreview: Type.String() }),
       attempt: Type.Object({
+        handle: Type.String(),
         models: Type.Object({
           selected: Type.Object({ guide: Type.Object({ model: Type.String() }) }),
         }),
@@ -179,6 +180,53 @@ async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
   return created.state;
 }
 
+void test("registered control and completion inputs are closed and action-specific", async () => {
+  const f = await fixture();
+  try {
+    await emptyWorkstream(f);
+    await assert.rejects(
+      f.call("workgraph_control", {
+        action: "suspend",
+        reason: "Pause before inspection",
+        task: "obsolete-task",
+      }),
+      /Invalid fixture input to workgraph_control/,
+    );
+    await assert.rejects(
+      f.call("workgraph_control", {
+        action: "apply",
+        attempt: "missing-attempt",
+        sourceCommit: "a".repeat(40),
+        destinationHead: "b".repeat(40),
+      }),
+      /Invalid fixture input to workgraph_control/,
+    );
+    await assert.rejects(
+      f.call("workgraph_complete", {
+        conclusion: "No unresolved work",
+        evidence: [{ label: "state", observation: "No assignments were queued." }],
+        limitations: [],
+        unresolved: [],
+      }),
+      /Invalid fixture input to workgraph_complete/,
+    );
+    const state = resultState((await f.call("workgraph_inspect", { section: "overview" })).details);
+    assert.equal(state.lifecycle.state, "active");
+    assert.equal(state.attempts.length, 0);
+    const completed = resultState(
+      (
+        await f.call("workgraph_complete", {
+          conclusion: "No unresolved work",
+          evidence: [{ label: "state", observation: "No assignments were queued." }],
+        })
+      ).details,
+    );
+    assert.equal(completed.lifecycle.state, "completed");
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("explicit target repository is fixed independently of coordinator cwd", async () => {
   const f = await fixture();
   try {
@@ -191,23 +239,34 @@ void test("explicit target repository is fixed independently of coordinator cwd"
     await git(target, "add", ".");
     await git(target, "commit", "-m", "Target base");
 
+    await f.runner.emitInput("Inspect the explicit target repository", undefined, "interactive");
+    await f.call("workgraph_intent", {
+      statement: "Inspect the explicit target repository",
+      targetRepository: target,
+    });
+    await assert.rejects(
+      f.call("workgraph_research", {
+        id: "removed-target",
+        question: "Try to retarget delegation",
+        expectedEvidence: ["bytes"],
+        targetRepository: target,
+      }),
+      /Invalid fixture input to workgraph_research/,
+    );
     const queued = resultState(
       (
         await f.call("workgraph_research", {
           id: "targeted",
           question: "Inspect the explicit target repository",
           expectedEvidence: ["target bytes"],
-          targetRepository: target,
         })
       ).details,
     );
     assert.equal(queued.projectRoot, target);
     assert.equal(queued.attempts[0]?.placement, undefined);
     await assert.rejects(
-      f.call("workgraph_research", {
-        id: "wrong-target",
-        question: "Try to switch repositories",
-        expectedEvidence: ["bytes"],
+      f.call("workgraph_intent", {
+        statement: "Try to switch repositories",
         targetRepository: f.root,
       }),
       /does not match the fixed workstream repository/,
@@ -220,32 +279,49 @@ void test("explicit target repository is fixed independently of coordinator cwd"
 void test("registered delegation keeps established scope until explicit intent revision", async () => {
   const f = await fixture();
   try {
-    const initial = resultState(
-      (
-        await f.call("workgraph_research", {
-          id: "read-value",
-          question: "What is value.txt?",
-          expectedEvidence: ["Exact bytes"],
-        })
-      ).details,
-    );
-    assert.equal(initial.assignments[0]?.id, "read-value");
     const request = {
       id: "fix-value",
       objective: "Fix value",
       acceptance: ["Correct bytes"],
     };
+    await assert.rejects(
+      f.call("workgraph_intent", { statement: "No human receipt yet" }),
+      /actual retained human input/,
+    );
+    await assert.rejects(
+      f.call("workgraph_research", {
+        id: "without-scope",
+        question: "No scope yet",
+        expectedEvidence: ["No queued attempt"],
+      }),
+      /No attached workstream/,
+    );
     await f.runner.emitInput("Implement a change", undefined, "extension");
-    await assert.rejects(f.call("workgraph_implement", request), /actual retained human input/);
+    await assert.rejects(f.call("workgraph_implement", request), /No attached workstream/);
+
+    const initialScopeText = "What is value.txt?";
+    await f.runner.emitInput(initialScopeText, undefined, "interactive");
+    await f.call("workgraph_intent", { statement: initialScopeText });
+    const initial = resultState(
+      (
+        await f.call("workgraph_research", {
+          id: "read-value",
+          question: initialScopeText,
+          expectedEvidence: ["Exact bytes"],
+        })
+      ).details,
+    );
+    assert.equal(initial.assignments[0]?.id, "read-value");
 
     const firstHumanText = "Implement the maintained value change - private first context";
     await f.runner.emitInput(firstHumanText, undefined, "interactive");
+    await f.call("workgraph_intent", { statement: "Fix value" });
     const firstResponse = await f.call("workgraph_implement", request);
     const firstAuthorized = resultState(firstResponse.details);
-    const firstReceipt = required(firstAuthorized.inputs[0], "first retained human input").id;
-    assert.equal(firstAuthorized.intents.at(-1)?.version, 1);
+    const firstReceipt = required(firstAuthorized.inputs[1], "first retained human input").id;
+    assert.equal(firstAuthorized.intents.at(-1)?.version, 2);
     assert.deepEqual(firstAuthorized.intents.at(-1)?.authorityReceiptIds, [firstReceipt]);
-    assert.equal(firstAuthorized.assignments[1]?.intentVersion, 1);
+    assert.equal(firstAuthorized.assignments[1]?.intentVersion, 2);
     assert.equal(JSON.stringify(firstResponse).includes(firstHumanText), false);
 
     const secondHumanText =
@@ -257,13 +333,13 @@ void test("registered delegation keeps established scope until explicit intent r
       objective: "Apply the second maintained slice",
     });
     const secondAuthorized = resultState(secondResponse.details);
-    const secondReceipt = required(secondAuthorized.inputs[1], "second retained human input").id;
+    const secondReceipt = required(secondAuthorized.inputs[2], "second retained human input").id;
     assert.notEqual(secondReceipt, firstReceipt);
-    assert.equal(secondAuthorized.intents.at(-1)?.version, 1);
+    assert.equal(secondAuthorized.intents.at(-1)?.version, 2);
     assert.deepEqual(secondAuthorized.intents.at(-1)?.authorityReceiptIds, [firstReceipt]);
     assert.deepEqual(
       secondAuthorized.assignments.slice(1).map((item) => item.intentVersion),
-      [1, 1],
+      [2, 2],
     );
     const continuedAssignment = secondAuthorized.assignments[2];
     assert.equal(continuedAssignment?.artifactIntent, "maintained_change");
@@ -271,14 +347,14 @@ void test("registered delegation keeps established scope until explicit intent r
       throw new Error("Expected the continued maintained assignment.");
     assert.deepEqual(continuedAssignment.authority, {
       receiptId: firstReceipt,
-      intentVersion: 1,
+      intentVersion: 2,
     });
     const continuationAuthority = decodeTestValue(
       authorityActionDetailsSchema,
       secondResponse.details,
     ).view.action.authorityContext;
     assert.deepEqual(continuationAuthority.selectedScope, {
-      intentVersion: 1,
+      intentVersion: 2,
       authorityReceiptId: firstReceipt,
     });
     assert.deepEqual(continuationAuthority.latestObservedInput, {
@@ -293,12 +369,12 @@ void test("registered delegation keeps established scope until explicit intent r
         id: "new-receipt-without-scope-revision",
         authorityReceiptId: secondReceipt,
       }),
-      /not authority for current intent 1.*workgraph_intent/,
+      /Invalid fixture input to workgraph_implement/,
     );
     const afterRejectedReceipt = resultState(
       (await f.call("workgraph_inspect", { section: "overview" })).details,
     );
-    assert.equal(afterRejectedReceipt.intents.at(-1)?.version, 1);
+    assert.equal(afterRejectedReceipt.intents.at(-1)?.version, 2);
     assert.equal(
       afterRejectedReceipt.assignments.some(
         (item) => item.id === "new-receipt-without-scope-revision",
@@ -312,11 +388,10 @@ void test("registered delegation keeps established scope until explicit intent r
           ...request,
           id: "fix-value-original-scope",
           objective: "Apply the coordinator judgment under original scope",
-          authorityReceiptId: firstReceipt,
         })
       ).details,
     );
-    assert.equal(explicitCurrent.intents.at(-1)?.version, 1);
+    assert.equal(explicitCurrent.intents.at(-1)?.version, 2);
 
     const changedScopeText =
       "Change the semantic scope to include the corrected follow-up - private changed context";
@@ -325,10 +400,10 @@ void test("registered delegation keeps established scope until explicit intent r
       (await f.call("workgraph_inspect", { section: "overview" })).details,
     );
     const changedScopeReceipt = required(
-      beforeRevision.inputs[2],
+      beforeRevision.inputs[3],
       "changed-scope retained human input",
     ).id;
-    assert.equal(beforeRevision.intents.at(-1)?.version, 1);
+    assert.equal(beforeRevision.intents.at(-1)?.version, 2);
 
     const revised = resultState(
       (
@@ -339,7 +414,7 @@ void test("registered delegation keeps established scope until explicit intent r
         })
       ).details,
     );
-    assert.equal(revised.intents.at(-1)?.version, 2);
+    assert.equal(revised.intents.at(-1)?.version, 3);
     assert.deepEqual(revised.intents.at(-1)?.authorityReceiptIds, [changedScopeReceipt]);
 
     const changedScope = resultState(
@@ -355,12 +430,12 @@ void test("registered delegation keeps established scope until explicit intent r
     assert.equal(revisedAssignment?.artifactIntent, "maintained_change");
     if (revisedAssignment?.artifactIntent !== "maintained_change")
       throw new Error("Expected the revised-scope maintained assignment.");
-    assert.equal(revisedAssignment.intentVersion, 2);
+    assert.equal(revisedAssignment.intentVersion, 3);
     assert.deepEqual(revisedAssignment.authority, {
       receiptId: changedScopeReceipt,
-      intentVersion: 2,
+      intentVersion: 3,
     });
-    assert.equal(changedScope.assignments[1]?.intentVersion, 1);
+    assert.equal(changedScope.assignments[1]?.intentVersion, 2);
     assert.notEqual(
       changedScope.assignments[1]?.intentVersion,
       changedScope.intents.at(-1)?.version,
@@ -371,11 +446,16 @@ void test("registered delegation keeps established scope until explicit intent r
         id: "old-receipt-after-scope-revision",
         authorityReceiptId: firstReceipt,
       }),
-      /not authority for current intent 2.*workgraph_intent/,
+      /Invalid fixture input to workgraph_implement/,
     );
     assert.deepEqual(
       changedScope.intents.map((intent) => intent.statement),
-      ["What is value.txt?", "Fix value", "Apply the corrected follow-up scope"],
+      [
+        "What is value.txt?",
+        "What is value.txt?",
+        "Fix value",
+        "Apply the corrected follow-up scope",
+      ],
     );
 
     const retainedContext = decodeTestValue(
@@ -398,7 +478,7 @@ void test("registered delegation keeps established scope until explicit intent r
       (await f.call("workgraph_inspect", { section: "overview" })).details,
     );
     assert.equal(reloaded.lifecycle.state, "suspended");
-    assert.equal(reloaded.inputs.length, 3);
+    assert.equal(reloaded.inputs.length, 4);
     await assert.rejects(
       f.call("workgraph_research", {
         id: "while-paused",
@@ -412,9 +492,11 @@ void test("registered delegation keeps established scope until explicit intent r
   }
 });
 
-void test("concurrent first registered tools acquire one attached runtime", async () => {
+void test("concurrent registered tools share one explicitly scoped runtime", async () => {
   const f = await fixture();
   try {
+    await f.runner.emitInput("Inspect concurrent boundaries", undefined, "interactive");
+    await f.call("workgraph_intent", { statement: "Inspect concurrent boundaries" });
     const [first, second] = await Promise.all([
       f.call("workgraph_research", {
         id: "concurrent-first",
@@ -453,14 +535,18 @@ void test("registered AbortSignal interrupts native coordinator work", async () 
       `#!/bin/sh\necho $$ > ${JSON.stringify(pidPath)}\ntrap 'exit 130' TERM INT\nwhile :; do sleep 1; done\n`,
     );
     await chmod(executable, 0o755);
+    await f.runner.emitInput("Review the current commit", undefined, "interactive");
+    await f.call("workgraph_intent", { statement: "Review the current commit" });
+    const revision = await git(f.root, "rev-parse", "HEAD");
     previousEnvironment = configureFixtureEnvironment({ PATH: `${bin}:/usr/bin:/bin` });
     const controller = new AbortController();
     const running = f.call(
-      "workgraph_research",
+      "workgraph_review",
       {
         id: "cancel-native-inspection",
-        question: "Cancel the native repository inspection",
-        expectedEvidence: ["No detached process"],
+        objective: "Cancel the native repository inspection",
+        concern: "No detached process",
+        subject: { kind: "revision", revision },
       },
       controller.signal,
     );
@@ -557,6 +643,7 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
     const current = await createUnattachedWorkstream(f, "current-work");
     f.session.appendCustomEntry("pi-workgraph-workstream", { path: current.store.path });
     await f.runner.emit({ type: "session_start", reason: "reload" });
+    await f.call("workgraph_intent", { statement: "Inspect the current recovery workstream" });
     const currentState = resultState(
       (await f.call("workgraph_inspect", { section: "overview" }, operationSignal())).details,
     );
@@ -715,22 +802,49 @@ void test("mutation responses stay action-focused while retaining handles, model
     await runStore(seeded.store.releaseLease(lease));
     f.session.appendCustomEntry("pi-workgraph-workstream", { path: seeded.state.statePath });
     await f.runner.emit({ type: "session_start", reason: "new" });
+    await f.runner.emitInput("Inspect the focused fixture", undefined, "interactive");
+    await f.call("workgraph_intent", { statement: "Inspect the focused fixture" });
 
     const first = await f.call("workgraph_research", {
       id: "focused-research",
       question: "Inspect the focused fixture",
       expectedEvidence: ["bytes"],
-      model: "fixture/research",
-      modelReason: "The regression checks selected model provenance.",
-      thinking: "low",
+      selection: { override: { model: "fixture/research", thinking: "low" } },
     });
     const firstText = decodeTestValue(textContentSchema, first.content[0]).text;
     const firstView = decodeTestValue(actionDetailsSchema, first.details).view;
     assert.equal(firstView.action.name, "workgraph_research");
     assert.equal(firstView.affected.task.idPreview, "focused-research");
     assert.equal(firstView.affected.attempt.models.selected.guide.model, "fixture/research");
+    assert.match(firstView.affected.attempt.handle, /^attempt-/);
     assert.match(firstText, /focused-research/);
     assert.doesNotMatch(firstText, /"assignments":\s*\[/);
+
+    const second = await f.call("workgraph_research", {
+      id: "focused-second",
+      question: "Inspect the second focused fixture",
+      expectedEvidence: ["bytes"],
+    });
+    const secondView = decodeTestValue(actionDetailsSchema, second.details).view;
+    assert.equal(secondView.affected.task.idPreview, "focused-second");
+    assert.notEqual(secondView.affected.attempt.handle, firstView.affected.attempt.handle);
+    const cancelled = resultState(
+      (
+        await f.call("workgraph_control", {
+          action: "cancel",
+          attempt: firstView.affected.attempt.handle,
+        })
+      ).details,
+    );
+    assert.equal(
+      cancelled.attempts.find((attempt) => attempt.id === firstView.affected.attempt.handle)?.state,
+      "cancelled",
+    );
+    assert.equal(
+      cancelled.attempts.find((attempt) => attempt.id === secondView.affected.attempt.handle)
+        ?.state,
+      "queued",
+    );
 
     const later = await f.call("workgraph_inspect", {
       section: "overview",
@@ -739,8 +853,99 @@ void test("mutation responses stay action-focused while retaining handles, model
     assert.ok(laterText.length < 8_000);
     assert.match(laterText, /Unrelated history 0/);
     const laterView = decodeTestValue(overviewDetailsSchema, later.details).inspection;
-    assert.equal(laterView.tasks.totalItems, 13);
+    assert.equal(laterView.tasks.totalItems, 14);
     assert.deepEqual(laterView.attention.items, []);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("registered implementation models resolve partial guide and executor overrides", async () => {
+  const f = await fixture();
+  try {
+    await f.runner.emitInput("Implement the bounded fixture change", undefined, "interactive");
+    await f.call("workgraph_intent", { statement: "Implement the bounded fixture change" });
+    const state = resultState(
+      (
+        await f.call("workgraph_implement", {
+          id: "partial-role-overrides",
+          objective: "Change the fixture",
+          acceptance: ["The fixture changes"],
+          models: {
+            guide: { thinking: "low" },
+            executor: { model: "fixture/executor-override" },
+          },
+        })
+      ).details,
+    );
+    assert.deepEqual(state.attempts[0]?.models, {
+      guide: { model: "openai-codex/gpt-6-astra", thinking: "low" },
+      executor: { model: "fixture/executor-override", thinking: "xhigh" },
+      source: "override",
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("registered assignment model inputs reject empty, legacy, and cross-capability forms before queueing", async () => {
+  const f = await fixture();
+  try {
+    await assert.rejects(
+      f.call("workgraph_research", {
+        id: "empty-selection-override",
+        question: "Read",
+        expectedEvidence: ["bytes"],
+        selection: { override: {} },
+      }),
+      /Invalid fixture input to workgraph_research/,
+    );
+    await assert.rejects(
+      f.call("workgraph_research", {
+        id: "legacy-selection-override",
+        question: "Read",
+        expectedEvidence: ["bytes"],
+        selection: { override: { target: { model: "fixture/old", thinking: "low" } } },
+      }),
+      /Invalid fixture input to workgraph_research/,
+    );
+    await assert.rejects(
+      f.call("workgraph_research", {
+        id: "legacy-top-level-model",
+        question: "Read",
+        expectedEvidence: ["bytes"],
+        model: "fixture/old",
+      }),
+      /Invalid fixture input to workgraph_research/,
+    );
+    await assert.rejects(
+      f.call("workgraph_implement", {
+        id: "selection-on-implementation",
+        objective: "Change",
+        acceptance: ["changed"],
+        selection: { count: 1 },
+      }),
+      /Invalid fixture input to workgraph_implement/,
+    );
+    await assert.rejects(
+      f.call("workgraph_implement", {
+        id: "empty-role-overrides",
+        objective: "Change",
+        acceptance: ["changed"],
+        models: {},
+      }),
+      /Invalid fixture input to workgraph_implement/,
+    );
+    await assert.rejects(
+      f.call("workgraph_implement", {
+        id: "legacy-executor-alias",
+        objective: "Change",
+        acceptance: ["changed"],
+        executor: { model: "fixture/old", thinking: "low" },
+      }),
+      /Invalid fixture input to workgraph_implement/,
+    );
+    assert.deepEqual(f.selected, []);
   } finally {
     await f.dispose();
   }
@@ -857,7 +1062,6 @@ void test("registered status stays compact and focused result retrieval projects
             },
           ],
           limitations: [],
-          unresolved: [],
         })
       ).details,
     );
@@ -1113,6 +1317,10 @@ void test("registered model policy selection requires genuine input and persists
     const receipt = required(mutation.authority, "model authority").receiptId;
     assert.equal(mutation.authority?.source, "interactive");
     assert.match(JSON.stringify(mutation), new RegExp(receipt));
+    await f.call("workgraph_intent", {
+      statement: "Read",
+      authorityReceiptId: receipt,
+    });
 
     const selected = resultState(
       (
