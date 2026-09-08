@@ -78,6 +78,7 @@ import {
   runtimePi,
 } from "./workstream-runtime-services.js";
 import { WorkstreamStoreOperationError } from "./workstream-state.js";
+import { cleanupRetainsOutput } from "./workstream-transitions.js";
 
 export interface WorkstreamLaunch {
   workspaceId: string;
@@ -1216,17 +1217,9 @@ export class WorkstreamRuntime {
     assignment: WorkAssignment,
   ): RuntimeEffect<void> {
     const result = state.results.find((item) => item.id === attempt.resultId);
-    const noChange =
-      result?.validity === "typed" &&
-      result.report.kind === "implementation" &&
-      result.report.status === "completed" &&
-      result.report.outcome === "no_change";
     if (
       attempt.placement?.kind !== "isolated_worktree" ||
-      assignment.artifactIntent === "disposable_experiment" ||
-      (assignment.capability === "implement" &&
-        attempt.application?.state !== "applied" &&
-        !noChange)
+      cleanupRetainsOutput(assignment, attempt, result)
     )
       return Effect.void;
     return this.repository

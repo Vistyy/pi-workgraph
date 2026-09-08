@@ -79,6 +79,23 @@ export function startAttemptTransition(
   attempt.submission = "not_sent";
 }
 
+/** Whether normal cleanup retains an isolated checkout as coordinator-owned output. */
+export function cleanupRetainsOutput(
+  assignment: WorkAssignment,
+  attempt: WorkAttempt,
+  result: WorkResult | undefined,
+): boolean {
+  const noChange =
+    result?.validity === "typed" &&
+    result.report.kind === "implementation" &&
+    result.report.status === "completed" &&
+    result.report.outcome === "no_change";
+  return (
+    assignment.artifactIntent === "disposable_experiment" ||
+    (assignment.capability === "implement" && attempt.application?.state !== "applied" && !noChange)
+  );
+}
+
 /** Mechanical completion entries derived from retained domain facts. */
 export function deriveCompletionAccounting(state: WorkstreamState): CompletionAccounting[] {
   const accounting: CompletionAccounting[] = [];

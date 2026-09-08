@@ -1,5 +1,6 @@
 import { candidateLineageForAttempt } from "./candidate.js";
 import type { WorkAssignment, WorkAttempt, WorkResult, WorkstreamState } from "./workstream.js";
+import { cleanupRetainsOutput } from "./workstream-transitions.js";
 
 const DEFAULT_CHARS = 3_000;
 const MAX_CHARS = 8_000;
@@ -380,20 +381,13 @@ function applicationProjection(attempt: WorkAttempt | undefined, result: WorkRes
   return { state: "not_applicable" as const };
 }
 
-function successfulImplementationOutcome(
-  result: WorkResult | undefined,
-  outcome: "changed" | "no_change",
-): boolean {
+function successfulChangedImplementation(result: WorkResult | undefined): boolean {
   return (
     result?.validity === "typed" &&
     result.report.kind === "implementation" &&
     result.report.status === "completed" &&
-    result.report.outcome === outcome
+    result.report.outcome === "changed"
   );
-}
-
-function successfulNoChange(result: WorkResult | undefined): boolean {
-  return successfulImplementationOutcome(result, "no_change");
 }
 
 function outputDisposition(
@@ -407,14 +401,7 @@ function outputDisposition(
   const release = attempt.outputRelease;
   if (release?.state === "completed")
     return { state: "released" as const, path: placement.path, releaseState: release.state };
-  const cleanupRemovesPlacement =
-    task.artifactIntent !== "disposable_experiment" &&
-    !(
-      task.capability === "implement" &&
-      attempt.application?.state !== "applied" &&
-      !successfulNoChange(result)
-    );
-  if (cleanupRemovesPlacement && attempt.cleanup?.state === "completed")
+  if (!cleanupRetainsOutput(task, attempt, result) && attempt.cleanup?.state === "completed")
     return { state: "not_applicable" as const };
   return {
     state: "retained" as const,
@@ -892,7 +879,7 @@ function retainedOutputActions(state: WorkstreamState, task: WorkAssignment, att
     attempt.state === "settled" &&
     attempt.application === undefined &&
     attempt.outputRelease === undefined &&
-    successfulImplementationOutcome(result, "changed")
+    successfulChangedImplementation(result)
   )
     return [
       {
