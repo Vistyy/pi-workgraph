@@ -595,7 +595,9 @@ export class WorkstreamRuntime {
   private reconcileAttempt(item: WorkstreamState["attempts"][number]): RuntimeEffect<void> {
     const operation = Effect.gen(
       function* (this: WorkstreamRuntime) {
-        if (yield* this.preserveExistingBoundary(item)) return;
+        const currentState = yield* this.storeEffect((store) => store.load());
+        const current = findAttempt(currentState, item.id);
+        if (yield* this.preserveExistingBoundary(currentState, current)) return;
         yield* this.advance(item.id);
         const state = yield* this.storeEffect((store) => store.load());
         const advanced = findAttempt(state, item.id);
@@ -611,7 +613,10 @@ export class WorkstreamRuntime {
     return operation.pipe(Effect.catch((error) => this.recordAttemptFailure(item.id, error)));
   }
 
-  private preserveExistingBoundary(item: WorkAttempt): RuntimeEffect<boolean> {
+  private preserveExistingBoundary(
+    state: WorkstreamState,
+    item: WorkAttempt,
+  ): RuntimeEffect<boolean> {
     if (item.state === "cancel_requested" && item.cleanup?.state === "completed")
       return this.storeEffect((store) => store.finishCleanup(item.id)).pipe(Effect.as(true));
     if (item.outputRelease?.state === "pending" || item.outputRelease?.state === "blocked")
@@ -634,6 +639,7 @@ export class WorkstreamRuntime {
           ? Effect.void
           : this.storeEffect((store) => store.clearAttention(item.id))
       ).pipe(Effect.as(true));
+    if (canRetryCleanupBoundary(state, item)) return Effect.succeed(false);
     const interruption =
       item.cleanup?.state === "pending" || item.cleanup?.state === "blocked"
         ? (item.cleanup.error ??
@@ -1488,6 +1494,15 @@ function blockedDetail(attempt: WorkAttempt): string | undefined {
   if (attempt.application?.state === "blocked") return attempt.application.error;
   if (attempt.cleanup?.state === "blocked") return attempt.cleanup.error;
   return undefined;
+}
+function canRetryCleanupBoundary(state: WorkstreamState, attempt: WorkAttempt): boolean {
+  const cleanup = attempt.cleanup;
+  if (cleanup?.state !== "pending") return false;
+  if (!cleanup.workerClosed) return true;
+  if (attempt.placement?.kind !== "isolated_worktree") return true;
+  const assignment = findAssignment(state, attempt.assignmentId);
+  const result = state.results.find((candidate) => candidate.id === attempt.resultId);
+  return cleanupRetainsOutput(assignment, attempt, result);
 }
 function requiresLaunch(attempt: WorkAttempt): boolean {
   return attempt.state === "queued";

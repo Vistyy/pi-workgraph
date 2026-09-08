@@ -1990,6 +1990,214 @@ await test("reconcile settles cancellation only after proven external worker abs
   }
 });
 
+await test("working cancellation stays pending and quiet until the exact worker becomes idle", async () => {
+  const f = await fixture();
+  try {
+    f.workers.deferWork = true;
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    await runRuntime(
+      active.effects.queue({
+        id: "cancel-working-retained",
+        capability: "research",
+        artifactIntent: "disposable_experiment",
+        objective: "Cancel a working retained experiment",
+        intentVersion: authority.intentVersion,
+        authority,
+        permittedEffects: ["Write only inside the isolated worktree"],
+        stopCondition: "Cancellation requested",
+        expectedEvidence: ["No fabricated result"],
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    const attempt = required(
+      (await runRuntime(f.store.load())).attempts[0],
+      "working cancellation attempt",
+    );
+    const placement = required(attempt.placement, "working cancellation placement");
+    const worker = required(attempt.worker, "working cancellation worker");
+    f.workers.status = "working";
+    await runRuntime(active.effects.cancel(attempt.id));
+    let state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.state, "cancel_requested");
+    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, false);
+    assert.equal(state.attempts[0]?.error, undefined);
+    assert.equal(state.results.length, 0);
+    assert.deepEqual(f.workers.cleanupIdentities[0], worker);
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      true,
+    );
+
+    f.workers.status = "idle";
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.state, "cancelled");
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.results.length, 0);
+    assert.deepEqual(f.workers.cleanupIdentities[1], worker);
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      true,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("reconcile proves exact absence after closure before its worker checkpoint", async (t) => {
+  const f = await fixture();
+  try {
+    f.workers.deferWork = true;
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    await runRuntime(
+      active.effects.queue({
+        id: "cancel-checkpoint-interruption",
+        capability: "research",
+        artifactIntent: "disposable_experiment",
+        objective: "Recover cancellation after the native close checkpoint is interrupted",
+        intentVersion: authority.intentVersion,
+        authority,
+        permittedEffects: ["Write only inside the isolated worktree"],
+        stopCondition: "Cancellation requested",
+        expectedEvidence: ["Exact worker absence"],
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    const attempt = required(
+      (await runRuntime(f.store.load())).attempts[0],
+      "checkpoint interruption attempt",
+    );
+    const placement = required(attempt.placement, "checkpoint interruption placement");
+    const worker = required(attempt.worker, "checkpoint interruption worker");
+    f.workers.status = "idle";
+    t.mock.method(f.store, "markWorkerClosed", () => Effect.never);
+    await assert.rejects(
+      runRuntime(active.effects.cancel(attempt.id).pipe(Effect.timeout("100 millis"))),
+    );
+    t.mock.restoreAll();
+
+    let state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.state, "cancel_requested");
+    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, false);
+    assert.equal(state.results.length, 0);
+    f.workers.absent = true;
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.state, "cancelled");
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.results.length, 0);
+    assert.deepEqual(f.workers.cleanupIdentities, [worker, worker]);
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      true,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("checkpointed retained cleanup finishes bookkeeping without deleting its output", async (t) => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    await runRuntime(
+      active.effects.queue({
+        id: "recover-retained-cleanup",
+        capability: "research",
+        artifactIntent: "disposable_experiment",
+        objective: "Retain experiment output across cleanup recovery",
+        intentVersion: authority.intentVersion,
+        authority,
+        permittedEffects: ["Write only inside the isolated worktree"],
+        stopCondition: "The worker report is retained",
+        expectedEvidence: ["Retained output"],
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    const launched = required(
+      (await runRuntime(f.store.load())).attempts[0],
+      "retained cleanup attempt",
+    );
+    const placement = required(launched.placement, "retained cleanup placement");
+    t.mock.method(f.store, "finishCleanup", () => Effect.never);
+    await assert.rejects(runRuntime(active.effects.reconcile.pipe(Effect.timeout("100 millis"))));
+    t.mock.restoreAll();
+
+    let state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.attempts[0]?.error, undefined);
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      true,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("checkpointed non-retained isolated cleanup stays pending for diagnosis", async (t) => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    const base = await runRuntime(f.repository.head());
+    f.workers.onWork = async (request) => ({
+      kind: "implementation",
+      status: "completed",
+      outcome: "no_change",
+      summary: "No source change was needed.",
+      revision: workerEnvironment(request, "PI_WORKGRAPH_BASE_COMMIT"),
+      reason: "The requested behavior already holds.",
+      evidence: [],
+      findings: [],
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "preserve-destructive-cleanup-boundary",
+        capability: "implement",
+        artifactIntent: "maintained_change",
+        objective: "Confirm the existing implementation behavior",
+        intentVersion: authority.intentVersion,
+        authority,
+        acceptance: ["The existing behavior remains correct"],
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    const launched = required(
+      (await runRuntime(f.store.load())).attempts[0],
+      "non-retained cleanup attempt",
+    );
+    const placement = required(launched.placement, "non-retained cleanup placement");
+    t.mock.method(f.repository, "cleanupWorktree", () => Effect.never);
+    await assert.rejects(runRuntime(active.effects.reconcile.pipe(Effect.timeout("2 seconds"))));
+    t.mock.restoreAll();
+
+    let state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.match(state.attempts[0]?.error ?? "", /Cleanup was interrupted/);
+    assert.equal(state.attempts[0]?.resultId !== undefined, true);
+    assert.equal(base, await runRuntime(f.repository.head()));
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      true,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
 await test("unknown worker state remains blocked rather than becoming absent", async () => {
   const f = await fixture();
   try {

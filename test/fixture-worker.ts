@@ -85,6 +85,7 @@ export class Worker {
   private readonly producers = new Map<string, () => Promise<void>>();
   promptCount = 0;
   interruptCount = 0;
+  readonly cleanupIdentities: WorkerIdentity[] = [];
   deferWork = false;
   absent = false;
   status: HerdrObservation["status"] = "idle";
@@ -214,6 +215,7 @@ export class Worker {
 
   readonly cleanup = (identity: WorkerIdentity) =>
     Effect.sync(() => {
+      this.cleanupIdentities.push(identity);
       if (this.status === "working")
         return {
           state: "pending" as const,
