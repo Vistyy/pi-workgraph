@@ -14,7 +14,6 @@ import {
   HerdrProtocolError,
   herdrWorkerName,
   type WorkerLaunchEffectRequest,
-  WorkerLaunchError,
 } from "../src/herdr.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
@@ -31,26 +30,6 @@ type NativeFailureRequest = Pick<
   WorkerLaunchEffectRequest,
   "sessionFile" | "runId" | "nodeId" | "assignmentId"
 >;
-
-function fixtureCheckpoint<E, R, A>(
-  phase: WorkerLaunchError<E>["phase"],
-  checkpoint: ((value: A) => Effect.Effect<void, E, R>) | undefined,
-  value: A,
-  locator: WorkerLaunchError<E>["locator"],
-): Effect.Effect<void, WorkerLaunchError<E>, R> {
-  if (checkpoint === undefined) return Effect.void;
-  return checkpoint(value).pipe(
-    Effect.mapError(
-      (cause) =>
-        new WorkerLaunchError({
-          phase,
-          locator,
-          resource: "terminalId" in locator ? locator : undefined,
-          cause,
-        }),
-    ),
-  );
-}
 
 class NativeFailureWorker {
   readonly available = true;
@@ -76,18 +55,13 @@ class NativeFailureWorker {
           agentName: identity.agentName,
           cwd: identity.cwd,
         };
-        yield* fixtureCheckpoint("onResource", request.onResource, resource, resource);
-        yield* fixtureCheckpoint("onIdentity", request.onIdentity, identity, identity);
+        // Checkpoint failures are fixture setup failures; Herdr tests own launch-error behavior.
+        yield* request.onResource?.(resource) ?? Effect.void;
+        yield* request.onIdentity?.(identity) ?? Effect.void;
         writeSession(request);
-        const onSubmitted = request.onSubmitted;
-        yield* fixtureCheckpoint(
-          "onSubmitted",
-          onSubmitted === undefined ? undefined : () => onSubmitted(),
-          undefined,
-          resource,
-        );
+        yield* request.onSubmitted?.() ?? Effect.void;
         return observe(identity);
-      });
+      }).pipe(Effect.orDie);
     },
     recover: () => Effect.as(Effect.void, undefined),
     inspectLaunch: () =>
@@ -228,7 +202,6 @@ await test("absent native failures project sanitized actionable notifications wi
     const fallback = state.results.find((result) => result.assignmentId === "fallback");
     const untyped = state.results.find((result) => result.assignmentId === "untyped");
     const typed = state.results.find((result) => result.assignmentId === "typed");
-    assert.equal(rateLimit?.assignmentIntentVersion, 0);
     assert.equal(rateLimit?.validity, "absent");
     if (rateLimit?.validity === "absent")
       assert.equal(

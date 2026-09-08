@@ -593,7 +593,8 @@ void test("integration-root candidate accounting excludes its superseded source"
     const unresolvedAttempts = (state: WorkstreamState) =>
       deriveCompletionAccounting(state)
         .filter((item) => item.kind === "unresolved_attempt")
-        .map((item) => item.attemptId);
+        .map((item) => item.attemptId)
+        .sort();
     assert.deepEqual(unresolvedAttempts(integrated), [f.firstAttemptId]);
 
     const crossRoot = structuredClone(integrated);
@@ -602,7 +603,10 @@ void test("integration-root candidate accounting excludes its superseded source"
       "correction application",
     );
     crossRootApplication.rootCommit = f.base;
-    assert.deepEqual(unresolvedAttempts(crossRoot), [f.firstAttemptId, integrationAttempt.id]);
+    assert.deepEqual(
+      unresolvedAttempts(crossRoot),
+      [f.firstAttemptId, integrationAttempt.id].sort(),
+    );
 
     const partial = structuredClone(integrated);
     const partialApplication = requiredValue(
@@ -610,7 +614,7 @@ void test("integration-root candidate accounting excludes its superseded source"
       "correction application",
     );
     partialApplication.commits = [f.correctionCommit];
-    assert.deepEqual(unresolvedAttempts(partial), [f.firstAttemptId, integrationAttempt.id]);
+    assert.deepEqual(unresolvedAttempts(partial), [f.firstAttemptId, integrationAttempt.id].sort());
   } finally {
     await rm(f.parent, { recursive: true, force: true });
   }
@@ -1046,16 +1050,13 @@ void test("malformed state diagnostics identify a bounded field path without ech
     assert.ok(Value.Check(PersistedSqliteRowSchema, originalRow));
     const original = Value.Decode(PersistedSqliteRowSchema, originalRow);
     SqliteWorkstreamDatabase.use(store.path, (database) => {
-      database.db
-        .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
-        .run(
-          original.state_json
-            .replace(
-              '"purpose": "Determine the safe fixture change."',
-              '"purpose": "credential=redacted-secret"',
-            )
-            .replace('"revision": 0', '"revision": "invalid"'),
-        );
+      database.db.prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1").run(
+        JSON.stringify({
+          ...parsePersistedObject(original.state_json),
+          purpose: "credential=redacted-secret",
+          revision: "invalid",
+        }),
+      );
     });
     await assert.rejects(
       runStore(WorkstreamStoreEffects.inspect(store.path)),

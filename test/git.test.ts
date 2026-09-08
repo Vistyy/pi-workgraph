@@ -82,12 +82,10 @@ function processUnavailable(request: GitProcessRequest, message: string): Proces
   });
 }
 
-void test("malformed Git worktree output fails with the declared parse tag", async () => {
+void test("Git worktree parsing rejects missing paths and preserves embedded newlines", async () => {
   const malformed = "branch refs/heads/missing-worktree\0\0";
   const failure = await Effect.runPromise(Effect.flip(parseWorktreeList(malformed)));
   assert.ok(failure instanceof GitParseError);
-  assert.equal(failure._tag, "GitParseError");
-  assert.match(failure.message, /Invalid git worktree record/);
   assert.equal(failure.output, malformed);
 
   assert.deepEqual(

@@ -157,32 +157,30 @@ function fakeTheme(): FakeTheme {
 }
 
 function fakeUi() {
-  const statuses: Array<[string, string | undefined]> = [];
+  const statuses = new Map<string, string | undefined>();
   type WorkingIndicator = { readonly frames?: readonly string[]; readonly intervalMs?: number };
   type CalmWidget = { render(width: number): string[] };
   type Widget = (tui: { requestRender(): void }, theme: FakeTheme) => CalmWidget;
-  const indicators: Array<WorkingIndicator | undefined> = [];
-  const workingVisibility: boolean[] = [];
-  const widgets: Array<[string, Widget | undefined]> = [];
+  const widgets = new Map<string, Widget | undefined>();
   const notifications: string[] = [];
   const ui = {
     statuses,
-    indicators,
-    workingVisibility,
+    indicator: undefined as WorkingIndicator | undefined,
+    workingVisible: true,
     widgets,
     notifications,
     theme: fakeTheme(),
     setStatus(key: string, text: string | undefined) {
-      statuses.push([key, text]);
+      statuses.set(key, text);
     },
     setWorkingIndicator(options?: WorkingIndicator) {
-      indicators.push(options);
+      ui.indicator = options;
     },
     setWorkingVisible(visible: boolean) {
-      workingVisibility.push(visible);
+      ui.workingVisible = visible;
     },
     setWidget(key: string, content: Widget | undefined) {
-      widgets.push([key, content]);
+      widgets.set(key, content);
     },
     notify(message: string) {
       notifications.push(message);
@@ -397,41 +395,32 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
   assert.deepEqual(tool.render(80), []);
-  assert.match(ui.statuses.at(-1)?.[1] ?? "", /calm/);
-  assert.equal(ui.widgets.at(-1)?.[0], "calm");
-  const widgetFactory = ui.widgets.at(-1)?.[1];
+  assert.match(ui.statuses.get("calm") ?? "", /calm/);
+  const widgetFactory = ui.widgets.get("calm");
   assert.ok(widgetFactory);
   const widget = widgetFactory({ requestRender() {} }, ui.theme);
   assert.equal(widget.render(80).length, 1);
   assert.match(widget.render(80)[0] ?? "", /Workgraph/);
-  assert.ok(ui.workingVisibility.includes(false));
+  assert.equal(ui.workingVisible, false);
   calm.setActiveWorkers(0);
-  assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
+  assert.equal(ui.widgets.get("calm"), undefined);
   calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
   assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
-  assert.equal(widget.render(80).length, 1);
-  assert.equal(ui.statuses.at(-1)?.[1], undefined);
-  assert.equal(ui.workingVisibility.at(-1), false);
+  const compactFactory = ui.widgets.get("calm");
+  assert.ok(compactFactory);
+  assert.equal(compactFactory({ requestRender() {} }, ui.theme).render(80).length, 1);
+  assert.equal(ui.statuses.get("calm"), undefined);
+  assert.equal(ui.workingVisible, false);
   await pi.events.get("session_shutdown")?.({}, context);
-  assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
-  assert.equal(ui.workingVisibility.at(-1), true);
+  assert.equal(ui.widgets.get("calm"), undefined);
+  assert.equal(ui.workingVisible, true);
   assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
 });
 
 void test("missing internal seam leaves rows visible and reports a diagnostic", async () => {
   const tool = new FakeToolRow("read");
   const message = new FakeMessageRow("pi-workgraph-attention");
-  const originalToolRender = Object.getOwnPropertyDescriptor(FakeToolRow.prototype, "render")
-    ?.value as FakeToolRow["render"];
-  const originalToolMouse = Object.getOwnPropertyDescriptor(FakeToolRow.prototype, "handleMouse")
-    ?.value as FakeToolRow["handleMouse"];
-  const originalMessageRender = Object.getOwnPropertyDescriptor(FakeMessageRow.prototype, "render")
-    ?.value as FakeMessageRow["render"];
-  const originalMessageMouse = Object.getOwnPropertyDescriptor(
-    FakeMessageRow.prototype,
-    "handleMouse",
-  )?.value as FakeMessageRow["handleMouse"];
   const toolOutput = tool.render(80);
   const messageOutput = message.render(80);
   const toolClick = { kind: "tool-click" };
@@ -456,29 +445,13 @@ void test("missing internal seam leaves rows visible and reports a diagnostic", 
   try {
     await pi.events.get("session_start")?.({}, context);
     calm.setActiveWorkers(1);
-    const widgetFactory = ui.widgets.at(-1)?.[1];
+    const widgetFactory = ui.widgets.get("calm");
     assert.ok(widgetFactory);
     widgetFactory({ requestRender: () => renderRequests++ }, ui.theme);
     await delay(20);
     assert.ok(renderRequests > 0);
 
     await pi.commands.get("calm")?.("", context);
-    assert.equal(
-      Object.getOwnPropertyDescriptor(FakeToolRow.prototype, "render")?.value,
-      originalToolRender,
-    );
-    assert.equal(
-      Object.getOwnPropertyDescriptor(FakeToolRow.prototype, "handleMouse")?.value,
-      originalToolMouse,
-    );
-    assert.equal(
-      Object.getOwnPropertyDescriptor(FakeMessageRow.prototype, "render")?.value,
-      originalMessageRender,
-    );
-    assert.equal(
-      Object.getOwnPropertyDescriptor(FakeMessageRow.prototype, "handleMouse")?.value,
-      originalMessageMouse,
-    );
     assert.deepEqual(tool.render(80), toolOutput);
     assert.deepEqual(message.render(80), messageOutput);
     assert.equal(tool.handleMouse(toolClick), toolClick);
@@ -491,9 +464,9 @@ void test("missing internal seam leaves rows visible and reports a diagnostic", 
     const requestsAfterShutdown = renderRequests;
     await delay(20);
     assert.equal(renderRequests, requestsAfterShutdown);
-    assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
-    assert.equal(ui.indicators.at(-1), undefined);
-    assert.equal(ui.workingVisibility.at(-1), true);
+    assert.equal(ui.widgets.get("calm"), undefined);
+    assert.equal(ui.indicator, undefined);
+    assert.equal(ui.workingVisible, true);
   }
 });
 
@@ -568,11 +541,11 @@ void test("activity uses compact mode outside Calm and freezes for registered fi
   try {
     await pi.events.get("session_start")?.({}, context);
     await pi.events.get("agent_start")?.({}, context);
-    const factory = ui.widgets.at(-1)?.[1];
+    const factory = ui.widgets.get("calm");
     assert.ok(factory);
     const widget = factory({ requestRender() {} }, ui.theme);
     assert.equal(widget.render(80).length, 1);
-    assert.equal(ui.workingVisibility.at(-1), false);
+    assert.equal(ui.workingVisible, false);
     await pi.commands.get("calm")?.("", context);
     assert.equal(widget.render(80).length, 1);
     await pi.events.get("ui_prompt_start")?.({}, context);
@@ -583,7 +556,7 @@ void test("activity uses compact mode outside Calm and freezes for registered fi
     assert.match(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /2 workers active/);
     assert.doesNotMatch(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /coordinating/);
     calm.setActiveWorkers(0);
-    assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
+    assert.equal(ui.widgets.get("calm"), undefined);
   } finally {
     await pi.events.get("session_shutdown")?.({}, context);
   }

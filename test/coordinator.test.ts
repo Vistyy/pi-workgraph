@@ -593,6 +593,25 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
       PI_WORKGRAPH_HERDR_BIN: command,
     });
 
+    const adoptWithFreshSnapshot = async () => {
+      await writeFile(commandLog, "");
+      try {
+        return await f.call(
+          "workgraph_adopt",
+          { statePath: retainedStore.path },
+          operationSignal(),
+        );
+      } finally {
+        const commands = (await readFile(commandLog, "utf8"))
+          .trim()
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => decodeTestValue(Type.Array(Type.String()), JSON.parse(line)));
+        assert.ok(commands.length > 0, "each adoption must inspect the current native snapshot");
+        for (const args of commands) assert.deepEqual(args, ["api", "snapshot"]);
+      }
+    };
+
     // Native SQLite expiry is explicit fault injection. Snapshot contents model the
     // authoritative native observation boundary; this is not a real Herdr process death.
     SqliteWorkstreamDatabase.use(retainedStore.path, (database) => {
@@ -618,27 +637,18 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
         result: { snapshot: { agents: [{ agent_session: { value: otherOwner.sessionFile } }] } },
       }),
     );
-    await assert.rejects(
-      f.call("workgraph_adopt", { statePath: retainedStore.path }, operationSignal()),
-      /runtime owner/,
-    );
+    await assert.rejects(adoptWithFreshSnapshot(), /runtime owner/);
     await assertRefusalInvariants();
 
     await writeFile(
       snapshotPath,
       JSON.stringify({ result: { snapshot: { agents: [{ agent_session: {} }] } } }),
     );
-    await assert.rejects(
-      f.call("workgraph_adopt", { statePath: retainedStore.path }, operationSignal()),
-      /runtime owner/,
-    );
+    await assert.rejects(adoptWithFreshSnapshot(), /runtime owner/);
     await assertRefusalInvariants();
 
     await writeFile(snapshotPath, JSON.stringify({ result: { snapshot: { agents: [] } } }));
-    const adopted = resultState(
-      (await f.call("workgraph_adopt", { statePath: retainedStore.path }, operationSignal()))
-        .details,
-    );
+    const adopted = resultState((await adoptWithFreshSnapshot()).details);
     assert.equal(adopted.id, retainedBefore.id);
     assert.equal(adopted.lifecycle.state, "suspended");
     assert.deepEqual(adopted.inputs, retainedBefore.inputs);
@@ -666,15 +676,6 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
     competing = undefined;
     assert.deepEqual(leaseIdentity(leaseRow(retainedStore.path)), replacementLease);
 
-    const commands = (await readFile(commandLog, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => decodeTestValue(Type.Array(Type.String()), JSON.parse(line)));
-    assert.deepEqual(commands, [
-      ["api", "snapshot"],
-      ["api", "snapshot"],
-      ["api", "snapshot"],
-    ]);
     await f.runner.emit({ type: "session_shutdown", reason: "quit" });
     assert.equal(leaseRow(retainedStore.path), undefined);
     assert.equal(leaseRow(current.store.path), undefined);
@@ -821,20 +822,10 @@ void test("registered status stays compact and focused result retrieval projects
     assert.equal(evidenceContent.offset, 2);
     assert.equal(evidenceContent.truncated, true);
     assert.equal(required(evidenceContent.next, "next evidence page").offset > 2, true);
-    const findings = await f.call("workgraph_inspect", {
-      section: "evidence",
-      result: "large-result-1",
-      offset: 0,
-      maxChars: 100,
-    });
-    const findingsContent = decodeTestValue(contentDetailsSchema, findings.details).inspection
-      .content;
-    assert.equal(findingsContent.offset, 0);
-    assert.equal(findingsContent.truncated, true);
-
     let assignmentText = "";
     let assignmentOffset = 0;
-    for (;;) {
+    for (let pageCount = 0; ; pageCount++) {
+      assert.ok(pageCount < 100, "assignment pagination exceeded the fixture's page budget");
       const assignmentPage = await f.call("workgraph_inspect", {
         section: "assignment",
         task: "large-result",
@@ -844,6 +835,8 @@ void test("registered status stays compact and focused result retrieval projects
       const page = decodeTestValue(contentDetailsSchema, assignmentPage.details).inspection.content;
       assignmentText += page.text;
       if (page.next === undefined) break;
+      assert.equal(page.next.offset, assignmentOffset + page.text.length);
+      assert.ok(page.next.offset > assignmentOffset);
       assignmentOffset = page.next.offset;
     }
     assert.equal(

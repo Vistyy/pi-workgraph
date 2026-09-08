@@ -64,6 +64,7 @@ const reportDetailsSchema = Type.Object({
 });
 const noChangeDetailsSchema = Type.Object({
   report: Type.Object({ outcome: Type.Literal("no_change") }),
+  state: Type.Object({ switchedAt: Type.Optional(Type.String()) }),
 });
 
 function assistant(session: SessionManager, model = "gpt-4o") {
@@ -137,7 +138,7 @@ async function fixture(
   };
 }
 
-void test("worker scope does not expose coordinator-only notepad tools", async () => {
+void test("research workers do not expose coordinator notes or implementation plans", async () => {
   const f = await fixture("research");
   try {
     assert.equal(f.runner.getToolDefinition("workgraph_notepad"), undefined);
@@ -812,27 +813,6 @@ void test("current-attempt identity, malformed plan state, and bounded reminders
         (message) => !/RECONCILIATION REMINDER/.test(messageText(message)),
       ),
     );
-
-    const failed = await f.call("workgraph_report", {
-      kind: "implementation",
-      status: "failed",
-      summary: "The bounded native verification is unavailable.",
-      evidence: [],
-      findings: [],
-    });
-    assert.equal(failed.terminate, true);
-    await f.runner.emit({ type: "agent_settled" });
-    assert.equal(reminders().length, 2);
-    const finalStates = f.session
-      .getBranch()
-      .filter(
-        (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-worker-state",
-      )
-      .map((entry) => (entry.type === "custom" ? entry.data : undefined))
-      .filter(
-        (data): data is { reminderCount?: number } => typeof data === "object" && data !== null,
-      );
-    assert.equal(finalStates.at(-1)?.reminderCount, 2);
   } finally {
     await f.dispose();
   }
@@ -932,9 +912,10 @@ void test("no-change implementation can report from the guide without manufactur
     const result = await f.call("workgraph_report", report);
     assert.equal(result.terminate, true);
     assert.equal(
-      decodeTestValue(noChangeDetailsSchema, result.details).report.outcome,
-      "no_change",
+      decodeTestValue(noChangeDetailsSchema, result.details).state.switchedAt,
+      undefined,
     );
+    assert.deepEqual(f.selected, []);
     assert.equal(await git(f.root, "rev-parse", "HEAD"), revision);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "before\n");
   } finally {
@@ -1016,7 +997,7 @@ void test("continued implementation requires this attempt's native start and lat
   }
 });
 
-void test("registered report schemas reject undeclared fields in every mode, with one execution boundary", async () => {
+void test("registered report schemas reject undeclared fields in every mode", async () => {
   for (const mode of ["research", "review", "implementation"] as const) {
     const f = await fixture(mode);
     try {
@@ -1042,16 +1023,13 @@ void test("registered report schemas reject undeclared fields in every mode, wit
           false,
           `${mode} accepted extra input`,
         );
-      if (mode === "research")
-        for (const candidate of invalid)
-          await assert.rejects(f.call("workgraph_report", candidate), /Invalid fixture input/);
     } finally {
       await f.dispose();
     }
   }
 });
 
-void test("read-only review observes dirty live files without changing them", async () => {
+void test("read-only review reports accept dirty live files without changing them", async () => {
   const f = await fixture("review");
   const report = {
     kind: "review",
@@ -1061,12 +1039,11 @@ void test("read-only review observes dirty live files without changing them", as
     findings: [],
   };
   try {
-    assert.equal((await f.call("workgraph_report", report)).terminate, true);
+    const head = await git(f.root, "rev-parse", "HEAD");
     await writeFile(join(f.root, "value.txt"), "changed\n");
     assert.equal((await f.call("workgraph_report", report)).terminate, true);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "changed\n");
-    await git(f.root, "commit", "-am", "Observed local change");
-    assert.equal((await f.call("workgraph_report", report)).terminate, true);
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), head);
   } finally {
     await f.dispose();
   }

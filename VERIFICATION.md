@@ -25,6 +25,8 @@ Start from the supported entry point for the behavior: a coordinator tool, worke
 
 These are claim boundaries, not required layers for every change. Keep focused component tests when they protect a consequential failure that a flow check cannot adequately distinguish. Use temporary probes when permanent fixtures would cost more than their protection warrants.
 
+Prefer supported operations for ordinary scenario setup. Raw persisted-state edits are appropriate for corruption or historical-format cases, not a shortcut around the lifecycle being tested; keep that representation dependence local to the fault. Observe commits, bytes, resource presence, and delivered results rather than mirroring internal state transitions. Exact identity, no duplicate submission, and close-before-release are behavioral guarantees, not incidental implementation details.
+
 ## Bounded native checks
 
 Every native/model check needs a concrete outcome, operation-specific deadlines, and an overall stopping condition. `verify:native` bounds each phase and provider/Herdr operation at 30 seconds, the complete run at 180 seconds, and cleanup at the same bounded operation deadlines. Report the last completed boundary and the operation that stalled; do not hide all failures behind one long convergence timeout. The controlled native path submits exactly one initial prompt, releases the scripted research report only after independent coordinator settlement, and requires the production notification to cause the next provider request and notepad marker. Provider request identity and errors are retained in diagnostics; no success retry is automatic.
@@ -43,10 +45,12 @@ For a change, identify the affected guarantee and the evidence missing for it. R
 
 Retain prior evidence only for unchanged boundaries and identify the exact revision checked. If the combined behavior changed, verify the affected combination. Behavior-preserving refactors should ordinarily preserve behavior tests; widespread fixture churn is a reason to reconsider coupling, not to add more scaffolding.
 
+Review concerns follow the affected guarantees: authority or lifecycle work needs scrutiny of forbidden effects and recovery, simplification needs scrutiny of surviving responsibilities and caller obligations, and test changes need scrutiny of lost protection, oracle independence, and refactor coupling. Provider-prefix checks establish request stability, not actual billing savings; performance or token-cost claims need representative measurements. CLI help from the installed package establishes that entry point, not installed extension loading or coordinator continuation.
+
 ## Integration limitations
 
 - Herdr idle/done observation can lag Pi events. Use attempt-generation settlement evidence and exact identity when interpreting worker state.
-- Git worktrees isolate checkouts, not arbitrary filesystem, network, or credential access. Tests must not claim sandbox guarantees.
+- Git worktrees isolate checkouts, not arbitrary filesystem, network, or credential access. Tests must not claim sandbox guarantees. The process adapter owns direct children and their inherited streams, not detached descendants; observing direct-child closure does not establish whole-process-tree termination.
 - Native evidence depends on the tested Pi, Herdr, Git, OS, provider, and model configuration. Native assistant-message usage does not measure hidden provider requests or unavailable billing data.
 - The pinned Effect platform spawner's Windows behavior includes unconditional `taskkill /T /F`; any process-adapter replacement must establish ownership-safe termination rather than assuming library substitution preserves it.
 

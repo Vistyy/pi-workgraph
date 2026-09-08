@@ -12,6 +12,21 @@ import type {
 
 const timestamp = "2026-01-01T00:00:00.000Z";
 
+function collectPages(
+  read: (offset: number) => { text: string; truncated: boolean; next?: { offset: number } },
+): string {
+  let text = "";
+  for (let page = 0; page < 1_000; page++) {
+    const content = read(text.length);
+    text += content.text;
+    assert.equal(content.truncated, content.next !== undefined);
+    if (content.next === undefined) return text;
+    assert.ok(content.text.length > 0, "pagination must make progress");
+    assert.equal(content.next.offset, text.length);
+  }
+  assert.fail("pagination did not finish within the fixture's page budget");
+}
+
 function assignment(id: string): WorkAssignment {
   return {
     id,
@@ -149,16 +164,10 @@ void test("overview task index recovers every arbitrary task id", () => {
     "task 4 with spaces",
   ];
   const current = state(ids.map((id) => assignment(id)));
-  const recovered: string[] = [];
-  let offset = 0;
-  let truncated = true;
-  while (truncated) {
-    const view = inspectView(current, { section: "overview", offset, maxChars: 31 });
-    recovered.push(view.taskIndex.text);
-    truncated = view.taskIndex.truncated;
-    offset = view.taskIndex.next?.offset ?? offset;
-  }
-  assert.equal(recovered.join(""), JSON.stringify(ids));
+  const recovered = collectPages(
+    (offset) => inspectView(current, { section: "overview", offset, maxChars: 31 }).taskIndex,
+  );
+  assert.deepEqual(JSON.parse(recovered), ids);
   const overview = inspectView(current, { section: "overview", maxItems: 4 });
   assert.equal(overview.tasks.totalItems, ids.length);
   assert.equal(overview.tasks.truncated, true);
@@ -232,19 +241,11 @@ void test("retained authority, complete assignments, and completion roundtrip ex
     completedAt: timestamp,
   };
 
-  let contextText = "";
-  let contextOffset = 0;
-  for (;;) {
-    const view = inspectView(current, {
-      section: "context",
-      offset: contextOffset,
-      maxChars: 257,
-    });
-    contextText += view.records.text;
-    if (view.records.next === undefined) break;
-    assert.equal(view.records.next.section, "context");
-    contextOffset = view.records.next.offset;
-  }
+  const contextText = collectPages((offset) => {
+    const { records } = inspectView(current, { section: "context", offset, maxChars: 257 });
+    if (records.next !== undefined) assert.equal(records.next.section, "context");
+    return records;
+  });
   assert.deepEqual(JSON.parse(contextText), {
     purpose: current.purpose,
     inputs: current.inputs,
@@ -252,36 +253,24 @@ void test("retained authority, complete assignments, and completion roundtrip ex
   });
 
   for (const expected of current.assignments) {
-    let assignmentText = "";
-    let assignmentOffset = 0;
-    for (;;) {
-      const view = inspectView(current, {
+    const assignmentText = collectPages((offset) => {
+      const { content } = inspectView(current, {
         section: "assignment",
         task: expected.id,
-        offset: assignmentOffset,
+        offset,
         maxChars: 211,
       });
-      assignmentText += view.content.text;
-      if (view.content.next === undefined) break;
-      assert.equal(view.content.next.task, expected.id);
-      assignmentOffset = view.content.next.offset;
-    }
+      if (content.next !== undefined) assert.equal(content.next.task, expected.id);
+      return content;
+    });
     assert.deepEqual(JSON.parse(assignmentText), expected);
   }
 
-  let completionText = "";
-  let completionOffset = 0;
-  for (;;) {
-    const view = inspectView(current, {
-      section: "completion",
-      offset: completionOffset,
-      maxChars: 193,
-    });
-    completionText += view.records.text;
-    if (view.records.next === undefined) break;
-    assert.equal(view.records.next.section, "completion");
-    completionOffset = view.records.next.offset;
-  }
+  const completionText = collectPages((offset) => {
+    const { records } = inspectView(current, { section: "completion", offset, maxChars: 193 });
+    if (records.next !== undefined) assert.equal(records.next.section, "completion");
+    return records;
+  });
   assert.deepEqual(JSON.parse(completionText), {
     lifecycle: current.lifecycle,
     completion: current.completion,
@@ -316,20 +305,27 @@ void test("typed report kinds and untyped or malformed reports remain inspectabl
   const current = state(undefined, [], results);
   for (const result of results) {
     const outcome = inspectView(current, { section: "outcome", result: result.id });
-    assert.equal("result" in outcome, true);
-    if (!("result" in outcome)) continue;
-    assert.equal(
-      outcome.result,
-      result.id.startsWith("typed")
-        ? `outcome-${Number(result.id.slice(-1)) + 1}`
-        : `outcome-${results.indexOf(result) + 1}`,
-    );
-    const report = inspectView(current, { section: "report", result: result.id, maxChars: 20 });
-    assert.equal("content" in report, true);
-    if (!("content" in report)) continue;
-    assert.ok(report.content.text.length <= 20);
-    assert.equal(report.content.truncated, true);
-    assert.ok(report.content.next);
+    assert.ok("result" in outcome);
+    let target = outcome.result;
+    const recovered = collectPages((offset) => {
+      const page = inspectView(current, {
+        section: "report",
+        result: target,
+        offset,
+        maxChars: 20,
+      });
+      assert.ok("content" in page);
+      assert.ok(page.content.text.length <= 20);
+      if (offset === 0) assert.ok(page.content.next);
+      if (page.content.next !== undefined) {
+        assert.equal(page.content.next.section, "report");
+        assert.ok(page.content.next.result !== undefined && page.content.next.result.length > 0);
+        target = page.content.next.result;
+      }
+      return page.content;
+    });
+    if (result.validity === "typed") assert.deepEqual(JSON.parse(recovered), result.report);
+    else assert.equal(recovered, result.validity === "untyped" ? result.text : result.detail);
   }
 });
 
@@ -357,23 +353,20 @@ void test("large delivery errors and retained artifacts stay bounded with lossle
   assert.equal(notice.includes(current.deliveries[0]?.error ?? ""), false);
   assert.ok(notice.includes(artifacts[0]?.reference ?? ""));
 
-  let offset = 0;
-  let recovered = "";
-  for (;;) {
+  const recovered = collectPages((offset) => {
     const view = inspectView(current, {
       section: "outcome",
       result: result.id,
       offset,
       maxChars: 1_000,
     });
-    assert.equal("retainedArtifacts" in view, true);
-    if (!("retainedArtifacts" in view)) break;
-    recovered += view.retainedArtifacts.text;
+    assert.ok("retainedArtifacts" in view);
     const next = view.retainedArtifacts.next;
-    if (next === undefined) break;
-    assert.equal(next.section, "outcome");
-    assert.equal(next.result, result.id);
-    offset = next.offset;
-  }
+    if (next !== undefined) {
+      assert.equal(next.section, "outcome");
+      assert.equal(next.result, result.id);
+    }
+    return view.retainedArtifacts;
+  });
   assert.deepEqual(JSON.parse(recovered), artifacts);
 });

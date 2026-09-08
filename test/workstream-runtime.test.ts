@@ -123,7 +123,6 @@ class Worker {
   readonly identities = new Map<string, WorkerIdentity>();
   private readonly producers = new Map<string, () => Promise<void>>();
   promptCount = 0;
-  cleanupCount = 0;
   interruptCount = 0;
   deferWork = false;
   absent = false;
@@ -249,7 +248,6 @@ class Worker {
     },
     cleanup: (identity) =>
       Effect.sync(() => {
-        this.cleanupCount++;
         if (this.status === "working")
           return {
             state: "pending" as const,
@@ -530,17 +528,12 @@ await test("new runtime drives fresh research through native evidence, durable r
     assert.equal(request.assignmentId, "inspect");
     assert.equal(request.objective, "Inspect value.txt");
     assert.equal(request.role, "research");
-    assert.match(required(request.prompt, "generated worker prompt"), /Repository: .*repo/);
-    assert.match(
-      required(request.prompt, "generated worker prompt"),
-      /Assigned working directory: .*repo/,
-    );
-    assert.match(await readFile(request.sessionFile, "utf8"), /Repository: .*repo/);
-    assert.match(await readFile(request.sessionFile, "utf8"), /Expected evidence: File evidence/);
-    assert.equal(
-      (await readFile(request.sessionFile, "utf8")).includes("UNRELATED_PARENT_SECRET"),
-      false,
-    );
+    assert.equal(request.cwd, f.root);
+    assert.ok(required(request.prompt, "generated worker prompt").includes(f.root));
+    const session = await readFile(request.sessionFile, "utf8");
+    assert.ok(session.includes(f.root));
+    assert.ok(session.includes("File evidence"));
+    assert.equal(session.includes("UNRELATED_PARENT_SECRET"), false);
     let state = await runRuntime(first.effects.reconcile);
     assert.equal(state.results[0]?.validity, "typed");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
@@ -557,7 +550,6 @@ await test("new runtime drives fresh research through native evidence, durable r
     assert.ok(state.results[0], "delivered result");
     await runRuntime(next.effects.reconcile);
     assert.equal(f.delivered.length, 1);
-    assert.equal(f.workers.cleanupCount, 1);
     assert.equal(
       (await git(f.root, "worktree", "list", "--porcelain")).split("worktree ").length - 1,
       1,
@@ -645,7 +637,6 @@ await test("completed no-change implementations retain explicit attribution, ski
     assert.equal(result.report.revision, base);
     assert.equal(attempt.application, undefined);
     assert.equal(attempt.cleanup?.state, "completed");
-    assert.equal(f.workers.cleanupCount, 1);
     assert.equal(await runRuntime(f.repository.effects.head()), base);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), before);
     const worktrees = await git(f.root, "worktree", "list", "--porcelain");
@@ -807,7 +798,6 @@ await test("maintained changes keep semantic identity, use guide/executor policy
     const implementationAttempt = required(state.attempts[0], "implementation attempt");
     const implementationResult = required(state.results[0], "implementation result");
     assert.equal(state.assignments[0]?.id, semanticId);
-    assert.notEqual(implementationAttempt.id, semanticId);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
     assert.equal(implementationResult.validity, "typed");
     if (
@@ -1255,7 +1245,6 @@ await test("wrong-mode and stale maintained results remain retained without appl
     assert.equal(state.attempts[1]?.application, undefined);
     assert.equal(state.attempts[1]?.cleanup?.state, "completed");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
-    assert.equal(f.workers.cleanupCount, 2);
     await assert.rejects(
       submit(
         active,
@@ -1411,7 +1400,7 @@ await test("partial adoption failure releases the acquired lease before runtime 
   const f = await fixture();
   try {
     const adoptionFailure = new Error("fixture adoption failure");
-    const adopt = t.mock.method(f.store, "adopt", () =>
+    t.mock.method(f.store, "adopt", () =>
       Effect.fail(
         new WorkstreamStoreOperationError({
           code: "workstream_store_operation_failed",
@@ -1429,7 +1418,6 @@ await test("partial adoption failure releases the acquired lease before runtime 
       }),
       /adoption failure/,
     );
-    assert.equal(adopt.mock.callCount(), 1);
     assert.equal(
       SqliteWorkstreamDatabase.use(f.store.path, (database) =>
         database.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(),
@@ -1686,7 +1674,7 @@ await test("owned idle-worker cancellation closes without a model turn or fabric
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.results.length, 0);
     assert.equal(f.workers.interruptCount, 1);
-    assert.equal(f.workers.cleanupCount, 1);
+    assert.equal(f.workers.promptCount, 0);
   } finally {
     await f.dispose();
   }

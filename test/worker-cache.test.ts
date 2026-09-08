@@ -249,10 +249,14 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
 
     provider.assertComplete();
     assertPrefix(provider.requests);
-    assert.equal(
-      provider.requests.map((request) => request.model).join(","),
-      "guide,guide,guide,executor,executor",
-    );
+    for (const request of provider.requests) {
+      const messages = JSON.stringify(request.messages);
+      assert.equal(messages.split("[WORKGRAPH LOCAL PREWALK - GUIDE]").length - 1, 1);
+      assert.equal(
+        messages.split("[WORKGRAPH EXECUTOR]").length - 1,
+        request.model === "executor" ? 1 : 0,
+      );
+    }
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "after\n");
     assert.equal(await git(f.root, "status", "--porcelain"), "");
     assert.equal(await git(f.root, "rev-parse", "HEAD^"), f.base);

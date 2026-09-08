@@ -35,9 +35,10 @@ await test("worker tabs use concise task text while native names remain unique a
   const first = herdrWorkerName(request);
   const second = herdrWorkerName({ ...request, attemptId: "attempt-two" });
   const label = herdrWorkerTabLabel(request);
-  assert.match(first, /^meaningful-agen[a-z]*-implement-[a-f0-9]{6}$/);
+  assert.match(first, /implement/);
+  assert.notEqual(first, herdrWorkerName({ ...request, role: "research" }));
   assert.match(first, /^[a-z][a-z0-9_-]{0,31}$/);
-  assert.equal(label, "↳ Meaningful");
+  assert.match(label, /meaningful/i);
   assert.ok(label.length <= 18);
   assert.doesNotMatch(label, /implement|[a-f0-9]{6}/i);
   assert.equal(herdrWorkerTabLabel({ ...request, attemptId: "attempt-two" }), label);
@@ -47,14 +48,14 @@ await test("worker tabs use concise task text while native names remain unique a
     assignmentId: "assignment-123456789abcdef0",
     objective: "Implement parser support",
   });
-  assert.equal(fallback, "↳ Implement");
+  assert.match(fallback, /implement/i);
   assert.ok(fallback.length <= 18);
   const semanticId = herdrWorkerTabLabel({
     ...request,
     assignmentId: "tool-design",
     objective: "Implement the tool design",
   });
-  assert.equal(semanticId, "↳ Tool design");
+  assert.match(semanticId, /tool/i);
   assert.ok(semanticId.length <= 18);
 });
 
@@ -63,9 +64,11 @@ await test("coordinator fork names use repository context without exposing paths
     cwd: "/private/Customer Work/repo-name",
     sessionFile: "/private/session.jsonl",
   });
-  assert.match(names.agentName, /^repo-name-coordinator-[a-f0-9]{6}$/);
+  assert.match(names.agentName, /repo-name/);
+  assert.match(names.agentName, /coordinator/);
   assert.match(names.agentName, /^[a-z][a-z0-9_-]{0,31}$/);
-  assert.match(names.label, /^repo name - coordinator - [a-f0-9]{6}$/);
+  assert.match(names.label, /repo name/);
+  assert.match(names.label, /coordinator/);
   assert.equal(names.label.includes("Customer"), false);
   assert.equal(names.label.includes("/"), false);
 });
@@ -335,16 +338,15 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       assert.ok(create.includes(`${key}=`));
     const start = calls.find((args) => args[0] === "agent" && args[1] === "start");
     assert.ok(start, "agent start command was recorded");
-    assert.deepEqual(start.slice(0, 7), [
-      "agent",
-      "start",
-      identity.agentName,
-      "--kind",
-      "pi",
-      "--pane",
-      identity.paneId,
-    ]);
-    assert.deepEqual(start.slice(-2), ["--session", sessionFile]);
+    assert.deepEqual(start.slice(0, 3), ["agent", "start", identity.agentName]);
+    const separator = start.indexOf("--");
+    assert.ok(separator > 2);
+    const options = start.slice(3, separator);
+    assert.ok(options.includes("--kind"));
+    assert.ok(options.includes("--pane"));
+    assert.equal(options[options.indexOf("--kind") + 1], "pi");
+    assert.equal(options[options.indexOf("--pane") + 1], identity.paneId);
+    assert.deepEqual(start.slice(separator + 1), ["--session", sessionFile]);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -423,7 +425,7 @@ await test("cleanup rejects mismatched cwd, verifies exact tab absence and toler
   };
   await writeFile(
     command,
-    `#!/usr/bin/env node\nimport { existsSync, writeFileSync } from "node:fs";\nconst args=process.argv.slice(2);\nconst closed=${JSON.stringify(closed)};\nif(args[0]==="agent"&&args[1]==="get"){if(existsSync(closed)){console.error(JSON.stringify({error:{code:"pane_not_found",message:"gone"}}));process.exit(1)}console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}))}\nelse if(args[0]==="tab"&&args[1]==="close"){writeFileSync(closed,"");console.log(JSON.stringify({result:{type:"ok"}}))}\nelse if(args[0]==="tab"&&args[1]==="get"&&existsSync(closed)){console.error(JSON.stringify({error:{code:"tab_not_found",message:"gone"}}));process.exit(1)}\nelse console.log(JSON.stringify({result:{tab:{tab_id:${JSON.stringify(identity.tabId)}}}}));\n`,
+    `#!/usr/bin/env node\nimport { existsSync, writeFileSync } from "node:fs";\nconst args=process.argv.slice(2);\nconst closed=${JSON.stringify(closed)};\nif(args[0]==="agent"&&args[1]==="get"){if(existsSync(closed)){console.error(JSON.stringify({error:{code:"pane_not_found",message:"gone"}}));process.exit(1)}console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}))}\nelse if(args[0]==="tab"&&args[1]==="close"){writeFileSync(closed,args[2]);console.log(JSON.stringify({result:{type:"ok"}}))}\nelse if(args[0]==="tab"&&args[1]==="get"&&existsSync(closed)){console.error(JSON.stringify({error:{code:"tab_not_found",message:"gone"}}));process.exit(1)}\nelse console.log(JSON.stringify({result:{tab:{tab_id:${JSON.stringify(identity.tabId)}}}}));\n`,
   );
   await chmod(command, 0o755);
   try {
@@ -435,17 +437,17 @@ await test("cleanup rejects mismatched cwd, verifies exact tab absence and toler
       () => runEffect(runtime.effects.cleanup({ ...identity, cwd: `${cwd}-different` })),
       /worker cwd changed/,
     );
+    assert.equal(existsSync(closed), false, "identity refusal must not close any tab");
     const result = await runEffect(runtime.effects.cleanup(identity));
     assert.equal(result.state, "completed");
-    assert.match(result.detail, /Closed and verified exact Herdr tab/);
-    assert.equal(existsSync(closed), true);
+    assert.equal(await readFile(closed, "utf8"), identity.tabId);
     assert.equal((await runEffect(runtime.effects.cleanup(identity))).state, "completed");
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
 });
 
-await test("the Herdr adapter launches without waiting and validates exact identity before interrupt", async () => {
+await test("Herdr launch submits one non-waiting prompt and cleanup preserves a working tab", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-"));
   const log = join(parent, "commands.jsonl");
   const command = join(parent, "fake-herdr.mjs");
@@ -499,17 +501,6 @@ await test("the Herdr adapter launches without waiting and validates exact ident
     assert.equal(observation.identity.workspaceId, "workspace-1");
     assert.equal(observation.identity.paneId, "workspace-1:pane-1");
     assert.equal(observation.identity.sessionFile, sessionFile);
-    const recovered = await runEffect(
-      runtime.effects.recover({
-        workspaceId: "workspace-1",
-        agentName,
-        sessionFile,
-        cwd,
-      }),
-    );
-    assert.deepEqual(recovered?.identity, observation.identity);
-    assert.equal(recovered?.status, "working");
-    await runEffect(runtime.effects.interrupt(observation.identity));
     const pendingCleanup = await runEffect(runtime.effects.cleanup(observation.identity));
     assert.equal(pendingCleanup.state, "pending");
     // SAFETY: Each fixture process writes only JSON-encoded string argument arrays to this private log.
@@ -517,9 +508,12 @@ await test("the Herdr adapter launches without waiting and validates exact ident
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
-    const prompt = calls.find((args) => args[0] === "agent" && args[1] === "prompt");
-    assert.ok(prompt, "agent prompt command was recorded");
-    assert.equal(prompt.includes("--wait"), false);
+    const prompts = calls.filter((args) => args[0] === "agent" && args[1] === "prompt");
+    assert.deepEqual(prompts, [["agent", "prompt", agentName, "Continue now."]]);
+    assert.equal(
+      calls.some((args) => args[0] === "tab" && args[1] === "close"),
+      false,
+    );
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

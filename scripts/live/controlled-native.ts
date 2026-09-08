@@ -381,7 +381,7 @@ async function closeWorkspace(signal: AbortSignal): Promise<void> {
   );
   assert.ok(!remaining.some((item) => item.workspace_id === workspaceId));
   evidence.cleanup.push(
-    "Exact owned workspace, tab, pane, terminal, and session closure verified.",
+    "Exact owned workspace absence verified after checking its tab, pane, terminal, session, and idle agent identity.",
   );
 }
 

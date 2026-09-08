@@ -114,7 +114,7 @@ void test("notepad snapshot has a stable prefix, restores after reload, and is r
     });
     assert.equal(f.messages.length, 1);
     assert.equal(f.messages[0]?.customType, "pi-workgraph-coordinator-notepad");
-    assert.match(JSON.stringify(f.messages[0]?.content), /later/);
+    assert.equal(f.messages[0]?.content, first);
   } finally {
     await f.dispose();
   }
