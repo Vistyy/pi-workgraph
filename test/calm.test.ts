@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
 import {
   type ExtensionAPI,
@@ -34,11 +35,11 @@ class FakeToolRow {
     this.toolName = toolName;
   }
 
-  render(width: number): string[] {
+  render(this: FakeToolRow, width: number): string[] {
     return [`tool:${this.toolName}:${width}`];
   }
 
-  handleMouse(event: FakeMouseEvent): FakeMouseEvent {
+  handleMouse(this: void, event: FakeMouseEvent): FakeMouseEvent {
     return event;
   }
 }
@@ -136,11 +137,11 @@ class FakeMessageRow {
     this.message = { customType };
   }
 
-  render(width: number): string[] {
+  render(this: FakeMessageRow, width: number): string[] {
     return [`message:${this.message.customType}:${width}`];
   }
 
-  handleMouse(event: FakeMouseEvent): FakeMouseEvent {
+  handleMouse(this: void, event: FakeMouseEvent): FakeMouseEvent {
     return event;
   }
 }
@@ -419,6 +420,22 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
 });
 
 void test("missing internal seam leaves rows visible and reports a diagnostic", async () => {
+  const tool = new FakeToolRow("read");
+  const message = new FakeMessageRow("pi-workgraph-attention");
+  const originalToolRender = Object.getOwnPropertyDescriptor(FakeToolRow.prototype, "render")
+    ?.value as FakeToolRow["render"];
+  const originalToolMouse = Object.getOwnPropertyDescriptor(FakeToolRow.prototype, "handleMouse")
+    ?.value as FakeToolRow["handleMouse"];
+  const originalMessageRender = Object.getOwnPropertyDescriptor(FakeMessageRow.prototype, "render")
+    ?.value as FakeMessageRow["render"];
+  const originalMessageMouse = Object.getOwnPropertyDescriptor(
+    FakeMessageRow.prototype,
+    "handleMouse",
+  )?.value as FakeMessageRow["handleMouse"];
+  const toolOutput = tool.render(80);
+  const messageOutput = message.render(80);
+  const toolClick = { kind: "tool-click" };
+  const messageClick = { kind: "message-click" };
   const pi = fakePi();
   const ui = fakeUi();
   const calm = installCalmMode(pi as unknown as ExtensionAPI, {
@@ -426,6 +443,7 @@ void test("missing internal seam leaves rows visible and reports a diagnostic", 
       throw new Error("unsupported Pi seam");
     },
     preferences: { load: async () => false, save: async () => {} },
+    intervalMs: 5,
   });
   // SAFETY: The fixture supplies only the ExtensionContext fields consumed by Calm.
   const context = {
@@ -434,11 +452,49 @@ void test("missing internal seam leaves rows visible and reports a diagnostic", 
     isIdle: () => true,
     sessionManager: pi.session,
   } as unknown as ExtensionContext;
-  await pi.events.get("session_start")?.({}, context);
-  await Promise.resolve();
-  await pi.commands.get("calm")?.("", context);
-  assert.ok(ui.notifications.some((message) => message.includes("Rows remain visible")));
-  calm.setActiveWorkers(0);
+  let renderRequests = 0;
+  try {
+    await pi.events.get("session_start")?.({}, context);
+    calm.setActiveWorkers(1);
+    const widgetFactory = ui.widgets.at(-1)?.[1];
+    assert.ok(widgetFactory);
+    widgetFactory({ requestRender: () => renderRequests++ }, ui.theme);
+    await delay(20);
+    assert.ok(renderRequests > 0);
+
+    await pi.commands.get("calm")?.("", context);
+    assert.equal(
+      Object.getOwnPropertyDescriptor(FakeToolRow.prototype, "render")?.value,
+      originalToolRender,
+    );
+    assert.equal(
+      Object.getOwnPropertyDescriptor(FakeToolRow.prototype, "handleMouse")?.value,
+      originalToolMouse,
+    );
+    assert.equal(
+      Object.getOwnPropertyDescriptor(FakeMessageRow.prototype, "render")?.value,
+      originalMessageRender,
+    );
+    assert.equal(
+      Object.getOwnPropertyDescriptor(FakeMessageRow.prototype, "handleMouse")?.value,
+      originalMessageMouse,
+    );
+    assert.deepEqual(tool.render(80), toolOutput);
+    assert.deepEqual(message.render(80), messageOutput);
+    assert.equal(tool.handleMouse(toolClick), toolClick);
+    assert.equal(message.handleMouse(messageClick), messageClick);
+    assert.ok(
+      ui.notifications.some((notification) => notification.includes("Rows remain visible")),
+    );
+  } finally {
+    await pi.events.get("session_shutdown")?.({}, context);
+    const requestsAfterShutdown = renderRequests;
+    await delay(20);
+    assert.equal(renderRequests, requestsAfterShutdown);
+    assert.deepEqual(ui.widgets.at(-1), ["calm", undefined]);
+    assert.equal(ui.indicators.at(-1), undefined);
+    assert.equal(ui.workingVisibility.at(-1), true);
+  }
 });
 
 void test("saved default affects new sessions, while local choice survives reload and resume", async () => {
@@ -495,7 +551,7 @@ void test("saved default affects new sessions, while local choice survives reloa
   }
 });
 
-void test("activity uses compact mode outside Calm and freezes for a genuine UI prompt", async () => {
+void test("activity uses compact mode outside Calm and freezes for registered fixture prompt state", async () => {
   const pi = fakePi();
   const ui = fakeUi();
   const calm = installCalmMode(pi as unknown as ExtensionAPI, {
