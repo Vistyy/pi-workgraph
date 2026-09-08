@@ -1266,6 +1266,7 @@ export class WorkstreamRuntime {
         if (attempt.outputRelease?.state === "completed") return state;
         const expectedHead =
           attempt.outputRelease?.expectedHead ??
+          attempt.cleanup?.expectedHead ??
           (yield* this.repository.head(placementOf(attempt).path));
         yield* this.storeEffect((store) =>
           store.beginOutputRelease({ id: attemptId, expectedHead, reason }),

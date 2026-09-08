@@ -38,7 +38,7 @@ import {
   Worker,
   workerEnvironment,
 } from "./fixture-worker.js";
-import { extensionFixture } from "./helpers.js";
+import { extensionFixture, resultState } from "./helpers.js";
 
 const PersistedSqliteRowSchema = Type.Object({ state_json: Type.String() });
 const TaskInspectionDetailsSchema = Type.Object({
@@ -1965,6 +1965,100 @@ await test("registered cancellation retains an experiment through completion unt
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
   } finally {
     await f.dispose();
+  }
+});
+
+await test("retained-output release uses the cleanup fence after worktree absence and refuses a moved branch", async () => {
+  for (const movedBranch of [false, true]) {
+    const f = await registeredFixture();
+    try {
+      await f.input("Inspect a disposable output and decide when it can be released.", "rpc");
+      await f.call("workgraph_intent", {
+        statement: "Inspect and explicitly release the disposable output when finished.",
+      });
+      const queued = resultState(
+        (
+          await f.call("workgraph_research", {
+            id: movedBranch ? "absent-moved-branch" : "absent-exact-branch",
+            question: "Inspect the disposable output",
+            expectedEvidence: ["The output is retained"],
+            experiment: {
+              permittedEffects: ["Write only inside the isolated worktree"],
+              stopCondition: "The worker report is retained",
+            },
+          })
+        ).details,
+      );
+      const settled = await poll(async () => {
+        const state = await runRuntime(WorkstreamStoreEffects.inspect(queued.statePath));
+        const attempt = state.attempts[0];
+        return attempt?.cleanup?.state === "completed" && attempt.cleanup.workerClosed
+          ? state
+          : undefined;
+      }, "retained output cleanup");
+      const attempt = required(settled.attempts[0], "retained output attempt");
+      const placement =
+        attempt.placement?.kind === "isolated_worktree"
+          ? attempt.placement
+          : assert.fail("Retained output must use an isolated worktree.");
+      const cleanup = required(attempt.cleanup, "retained output cleanup checkpoint");
+      const expectedHead = required(cleanup.expectedHead, "retained output cleanup HEAD");
+      assert.equal(attempt.outputRelease, undefined);
+      assert.equal(await git(f.root, "rev-parse", placement.branch), expectedHead);
+
+      await git(f.root, "worktree", "remove", placement.path);
+      assert.doesNotMatch(
+        await git(f.root, "worktree", "list", "--porcelain"),
+        new RegExp(placement.path),
+      );
+      assert.equal(await git(f.root, "rev-parse", placement.branch), expectedHead);
+
+      let movedHead: string | undefined;
+      if (movedBranch) {
+        await writeFile(join(f.root, "moved.txt"), "moved branch\n");
+        await git(f.root, "add", "moved.txt");
+        await git(f.root, "commit", "-m", "Move retained branch fence");
+        movedHead = await git(f.root, "rev-parse", "HEAD");
+        await git(f.root, "branch", "-f", placement.branch, movedHead);
+        assert.notEqual(movedHead, expectedHead);
+      }
+
+      const completed = resultState(
+        (
+          await f.call("workgraph_complete", {
+            conclusion: "The disposable output was inspected.",
+            evidence: [{ label: "retained output", observation: "The output was retained." }],
+          })
+        ).details,
+      );
+      assert.equal(completed.lifecycle.state, "completed");
+
+      const release = {
+        action: "release_output" as const,
+        attempt: attempt.id,
+        reason: "The inspected disposable output is no longer needed.",
+      };
+      if (!movedBranch) {
+        const released = resultState((await f.call("workgraph_control", release)).details);
+        const releasedAttempt = required(released.attempts[0], "released output attempt");
+        assert.equal(releasedAttempt.outputRelease?.state, "completed");
+        assert.equal(releasedAttempt.outputRelease?.expectedHead, expectedHead);
+        assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
+      } else {
+        await assert.rejects(f.call("workgraph_control", release), /Refusing cleanup: branch/);
+        const blocked = await runRuntime(WorkstreamStoreEffects.inspect(queued.statePath));
+        const blockedAttempt = required(blocked.attempts[0], "blocked output attempt");
+        assert.equal(blockedAttempt.outputRelease?.state, "blocked");
+        assert.equal(blockedAttempt.outputRelease?.expectedHead, expectedHead);
+        assert.equal(await git(f.root, "rev-parse", placement.branch), movedHead);
+        assert.equal(
+          (await git(f.root, "branch", "--list", placement.branch)).includes(placement.branch),
+          true,
+        );
+      }
+    } finally {
+      await f.dispose();
+    }
   }
 });
 
