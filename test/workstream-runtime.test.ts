@@ -9,21 +9,13 @@ import { Deferred, Effect } from "effect";
 import { TestClock } from "effect/testing";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import workgraphCoordinator from "../extensions/coordinator.js";
 import { inspectView } from "../src/agent-facing.js";
 import { openRepository } from "../src/git.js";
-import {
-  type HerdrObservation,
-  HerdrProtocolError,
-  herdrWorkerName,
-  type WorkerLaunchEffectRequest,
-  WorkerLaunchError,
-  type WorkerRecoveryRequest,
-} from "../src/herdr.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import { processEffect } from "../src/process.js";
 import { WorkgraphRegistry } from "../src/registry.js";
-import type { WorkerIdentity, WorkerReport } from "../src/types.js";
 import { type WorkstreamState, WorkstreamStoreEffects } from "../src/workstream.js";
 import { type Lease, SqliteWorkstreamDatabase } from "../src/workstream-persistence.js";
 import {
@@ -33,11 +25,119 @@ import {
 } from "../src/workstream-runtime.js";
 import { RuntimeHostError } from "../src/workstream-runtime-services.js";
 import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
-import { required } from "./decoders.js";
+import {
+  configureFixtureEnvironment,
+  decodeTestValue,
+  required,
+  restoreFixtureEnvironment,
+} from "./decoders.js";
+import {
+  FIXTURE_TIMESTAMP,
+  researchReport,
+  usage,
+  Worker,
+  workerEnvironment,
+} from "./fixture-worker.js";
+import { extensionFixture, resultState } from "./helpers.js";
 
-const FIXTURE_TIMESTAMP = 1_700_000_000_000;
-const FIXTURE_OBSERVED_AT = "2023-11-14T22:13:20.000Z";
 const PersistedSqliteRowSchema = Type.Object({ state_json: Type.String() });
+const TaskInspectionDetailsSchema = Type.Object({
+  inspection: Type.Object({
+    idPreview: Type.String(),
+    capability: Type.String(),
+    objective: Type.String(),
+    intentVersion: Type.Number(),
+    attemptCount: Type.Number(),
+    latestAttempt: Type.Optional(
+      Type.Object({
+        handle: Type.String(),
+        state: Type.String(),
+        outcome: Type.Optional(Type.String()),
+      }),
+    ),
+  }),
+});
+const OutcomeInspectionDetailsSchema = Type.Object({
+  inspection: Type.Object({
+    result: Type.String(),
+    report: Type.Object({
+      validity: Type.String(),
+      kind: Type.String(),
+      status: Type.String(),
+      outcome: Type.String(),
+      reportedCommit: Type.String(),
+    }),
+    settlement: Type.Object({
+      application: Type.Object({
+        state: Type.String(),
+        revision: Type.Optional(Type.String()),
+      }),
+    }),
+  }),
+});
+const ReviewOutcomeInspectionDetailsSchema = Type.Object({
+  inspection: Type.Object({
+    result: Type.String(),
+    report: Type.Object({ validity: Type.String(), kind: Type.String(), status: Type.String() }),
+  }),
+});
+const RecoveryInspectionDetailsSchema = Type.Object({
+  inspection: Type.Object({
+    recordedFacts: Type.Object({
+      cleanup: Type.Object({ state: Type.String(), workerClosed: Type.Boolean() }),
+      retainedOutput: Type.Object({ state: Type.String(), path: Type.String() }),
+    }),
+  }),
+});
+const ControlActionDetailsSchema = Type.Object({
+  view: Type.Object({
+    action: Type.Object({ name: Type.String(), outcome: Type.String() }),
+  }),
+});
+const CompletionActionDetailsSchema = Type.Object({
+  view: Type.Object({
+    workstream: Type.Object({ lifecycle: Type.String() }),
+    action: Type.Object({ name: Type.String(), outcome: Type.String() }),
+  }),
+});
+const CompletionInspectionDetailsSchema = Type.Object({
+  inspection: Type.Object({ completionRecorded: Type.Boolean() }),
+});
+type OutcomeInspectionRequest = { section: "outcome"; result: string; task?: string };
+
+const ImplementationActionDetailsSchema = Type.Object({
+  view: Type.Object({
+    action: Type.Object({
+      name: Type.String(),
+      authorityContext: Type.Object({
+        selectedScope: Type.Object({
+          intentVersion: Type.Number(),
+          authorityReceiptId: Type.String(),
+        }),
+        latestObservedInput: Type.Optional(
+          Type.Object({ receiptId: Type.String(), source: Type.String() }),
+        ),
+      }),
+    }),
+    affected: Type.Object({
+      task: Type.Object({
+        idPreview: Type.String(),
+        capability: Type.String(),
+        intentVersion: Type.Number(),
+      }),
+      attempt: Type.Object({
+        handle: Type.String(),
+        state: Type.String(),
+        models: Type.Object({
+          selected: Type.Object({
+            guide: Type.Object({ model: Type.String() }),
+            executor: Type.Object({ model: Type.String() }),
+          }),
+        }),
+      }),
+    }),
+  }),
+});
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await Effect.runPromise(
@@ -50,292 +150,10 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout.trim();
 }
 
-type WorkerEnvironmentVariable =
-  | "PI_WORKGRAPH_BASE_COMMIT"
-  | "PI_WORKGRAPH_EXECUTOR_MODEL"
-  | "PI_WORKGRAPH_EXPERIMENT"
-  | "PI_WORKGRAPH_MODE";
-
-type FixtureLaunchRequest = Pick<
-  WorkerLaunchEffectRequest,
-  | "runId"
-  | "nodeId"
-  | "attemptId"
-  | "assignmentId"
-  | "objective"
-  | "role"
-  | "cwd"
-  | "sessionFile"
-  | "prompt"
-  | "model"
-  | "env"
->;
-
-function workerEnvironment(
-  request: FixtureLaunchRequest,
-  variable: WorkerEnvironmentVariable,
-): string {
-  return required(request.env[variable], `${variable} environment variable`);
-}
-
 function nativeLeaseTimestamp(): number {
   // oxlint-disable-next-line effecttsgo/global-date -- The injected test clock must align with WorkgraphRegistry's native Date lease checks.
   return Date.now();
 }
-const usage = {
-  input: 0,
-  output: 0,
-  cacheRead: 0,
-  cacheWrite: 0,
-  totalTokens: 0,
-  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
-const researchReport: WorkerReport = {
-  kind: "research",
-  status: "completed",
-  summary: "Read fixture",
-  evidence: [{ label: "file", observation: "value.txt says initial", class: "direct" }],
-  findings: [],
-};
-
-function fixtureCheckpoint<E, R, A>(
-  phase: WorkerLaunchError<E>["phase"],
-  checkpoint: ((value: A) => Effect.Effect<void, E, R>) | undefined,
-  value: A,
-  locator: WorkerLaunchError<E>["locator"],
-): Effect.Effect<void, WorkerLaunchError<E>, R> {
-  if (checkpoint === undefined) return Effect.void;
-  return checkpoint(value).pipe(
-    Effect.mapError(
-      (cause) =>
-        new WorkerLaunchError({
-          phase,
-          locator,
-          resource: "terminalId" in locator ? locator : undefined,
-          cause,
-        }),
-    ),
-  );
-}
-
-class Worker {
-  readonly available = true;
-  readonly requests: FixtureLaunchRequest[] = [];
-  readonly identities = new Map<string, WorkerIdentity>();
-  private readonly producers = new Map<string, () => Promise<void>>();
-  promptCount = 0;
-  interruptCount = 0;
-  deferWork = false;
-  absent = false;
-  status: HerdrObservation["status"] = "idle";
-  failBeforePane = false;
-  failBeforeSubmission = false;
-  failAfterSubmission = false;
-  onWork: (request: FixtureLaunchRequest) => Promise<WorkerReport | undefined> = async () =>
-    researchReport;
-  onInspect: () => void = () => {};
-  readonly launch = <E, R>(request: WorkerLaunchEffectRequest<E, R>) =>
-    Effect.gen(
-      function* (this: Worker) {
-        const index = this.requests.length + 1;
-        this.requests.push(request);
-        const identity: WorkerIdentity = {
-          workspaceId: request.workspaceId,
-          tabId: `w1:t${index}`,
-          paneId: `w1:p${index}`,
-          terminalId: `term${index}`,
-          agentName: herdrWorkerName(request),
-          sessionFile: request.sessionFile,
-          cwd: request.cwd,
-        };
-        const resource = {
-          workspaceId: identity.workspaceId,
-          tabId: identity.tabId,
-          paneId: identity.paneId,
-          terminalId: identity.terminalId,
-          agentName: identity.agentName,
-          cwd: identity.cwd,
-        };
-        this.producers.set(request.sessionFile, () => this.produce(request));
-        if (this.failBeforePane)
-          return yield* new HerdrProtocolError({
-            operation: "launch fixture worker",
-            reason: "process",
-            detail: "fixture tab creation response interrupted",
-          });
-        const pane = { workspaceId: identity.workspaceId, paneId: identity.paneId };
-        yield* fixtureCheckpoint("onTab", request.onTab, pane, pane);
-        this.identities.set(identity.agentName, identity);
-        yield* fixtureCheckpoint("onResource", request.onResource, resource, resource);
-        if (this.failBeforeSubmission)
-          return yield* new HerdrProtocolError({
-            operation: "launch fixture worker",
-            reason: "process",
-            detail: "fixture readiness interruption",
-          });
-        yield* fixtureCheckpoint("onIdentity", request.onIdentity, identity, identity);
-        yield* this.deferWork ? Effect.void : this.produceEffect(request.sessionFile);
-        if (this.failAfterSubmission)
-          return yield* new HerdrProtocolError({
-            operation: "launch fixture worker",
-            reason: "process",
-            detail: "fixture uncertain prompt receipt",
-          });
-        const onSubmitted = request.onSubmitted;
-        yield* fixtureCheckpoint(
-          "onSubmitted",
-          onSubmitted === undefined ? undefined : () => onSubmitted(),
-          undefined,
-          resource,
-        );
-        return { identity, status: "working" as const, observedAt: FIXTURE_OBSERVED_AT };
-      }.bind(this),
-    );
-
-  readonly recover = (request: WorkerRecoveryRequest) => {
-    const identity = [...this.identities.values()].find(
-      (item) => item.agentName === request.agentName,
-    );
-    return identity === undefined ? Effect.as(Effect.void, undefined) : this.observe(identity);
-  };
-
-  readonly inspectLaunch = () =>
-    Effect.fail(
-      new HerdrProtocolError({
-        operation: "inspect fixture launch",
-        reason: "process",
-        detail: "No launch inspection.",
-      }),
-    );
-
-  readonly inspect = (identity: WorkerIdentity) =>
-    Effect.sync(() => {
-      this.onInspect();
-      return this.absent
-        ? {
-            identity,
-            status: "absent" as const,
-            observedAt: FIXTURE_OBSERVED_AT,
-            detail: "Exact fixture worker is absent.",
-          }
-        : this.observation(identity);
-    });
-
-  readonly observe = (identity: WorkerIdentity) =>
-    this.absent
-      ? Effect.fail(
-          new HerdrProtocolError({
-            operation: "observe fixture worker",
-            reason: "process",
-            detail: "Exact fixture worker is absent.",
-          }),
-        )
-      : Effect.succeed(this.observation(identity));
-
-  readonly interrupt = (identity: WorkerIdentity) =>
-    Effect.sync(() => {
-      this.interruptCount++;
-      return this.observation(identity);
-    });
-
-  readonly steer = (identity: WorkerIdentity) => {
-    const produce = this.producers.get(identity.sessionFile);
-    if (produce === undefined)
-      return Effect.fail(
-        new HerdrProtocolError({
-          operation: "steer fixture worker",
-          reason: "process",
-          detail: "No fixture worker request exists for the identity.",
-        }),
-      );
-    return this.produceEffect(identity.sessionFile);
-  };
-
-  readonly cleanup = (identity: WorkerIdentity) =>
-    Effect.sync(() => {
-      if (this.status === "working")
-        return {
-          state: "pending" as const,
-          identity,
-          observedAt: FIXTURE_OBSERVED_AT,
-          detail: "Fixture worker is still working.",
-        };
-      if (this.status === "blocked" || this.status === "unknown")
-        return {
-          state: "blocked" as const,
-          identity,
-          observedAt: FIXTURE_OBSERVED_AT,
-          detail: `Fixture worker is ${this.status}.`,
-        };
-      return {
-        state: "completed" as const,
-        identity,
-        observedAt: FIXTURE_OBSERVED_AT,
-        detail: this.absent ? "Exact fixture worker is absent." : "Exact fixture worker closed.",
-      };
-    });
-
-  produceEffect(sessionFile: string): Effect.Effect<void, HerdrProtocolError> {
-    const produce = this.producers.get(sessionFile);
-    if (produce === undefined)
-      return Effect.fail(
-        new HerdrProtocolError({
-          operation: "produce fixture worker",
-          reason: "process",
-          detail: "No fixture worker request exists for the identity.",
-        }),
-      );
-    return Effect.tryPromise({
-      try: produce,
-      catch: (cause) =>
-        new HerdrProtocolError({
-          operation: "produce fixture worker",
-          reason: "process",
-          detail: cause instanceof Error ? cause.message : String(cause),
-          cause,
-        }),
-    });
-  }
-
-  private async produce<E, R>(request: WorkerLaunchEffectRequest<E, R>): Promise<void> {
-    this.promptCount++;
-    const session = SessionManager.open(request.sessionFile);
-    session.appendCustomEntry("pi-workgraph-agent-running", {
-      runId: request.runId,
-      nodeId: request.nodeId,
-    });
-    const report = await this.onWork(request);
-    session.appendMessage({
-      role: "assistant",
-      content: [{ type: "text", text: "Actual fixture worker evidence" }],
-      api: "test",
-      provider: "test",
-      model: "worker",
-      usage,
-      stopReason: "stop",
-      timestamp: FIXTURE_TIMESTAMP,
-    });
-    if (report !== undefined)
-      session.appendMessage({
-        role: "toolResult",
-        toolCallId: "report",
-        toolName: "workgraph_report",
-        content: [{ type: "text", text: "report" }],
-        details: { report },
-        isError: false,
-        timestamp: FIXTURE_TIMESTAMP,
-      });
-    session.appendCustomEntry("pi-workgraph-agent-settled", {
-      runId: request.runId,
-      nodeId: request.nodeId,
-    });
-  }
-
-  private observation(identity: WorkerIdentity): HerdrObservation {
-    return { identity, status: this.status, observedAt: FIXTURE_OBSERVED_AT };
-  }
-}
-
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workstream-runtime-"));
   const root = join(parent, "repo");
@@ -448,6 +266,98 @@ async function fixture() {
     dispose,
   };
 }
+
+async function registeredFixture() {
+  const parent = await mkdtemp(join(tmpdir(), "workstream-registered-"));
+  const root = join(parent, "repo");
+  await mkdir(root);
+  await git(root, "init", "-b", "main");
+  await git(root, "config", "user.email", "fixture@example.test");
+  await git(root, "config", "user.name", "Registered runtime test");
+  await writeFile(join(root, "value.txt"), "initial\n");
+  await git(root, "add", ".");
+  await git(root, "commit", "-m", "fixture");
+  const previous = configureFixtureEnvironment({
+    PI_CODING_AGENT_DIR: join(parent, "agent"),
+    PI_WORKGRAPH_MODE: null,
+    HERDR_ENV: null,
+    HERDR_WORKSPACE_ID: "w1",
+  });
+  const workers = new Worker();
+  let workerFactoryCalls = 0;
+  try {
+    const pi = await extensionFixture("coordinator", root, parent, {}, [
+      {
+        name: "fixture-coordinator",
+        factory: (extension) =>
+          workgraphCoordinator(extension, () => {
+            workerFactoryCalls++;
+            return workers;
+          }),
+      },
+    ]);
+    return {
+      ...pi,
+      root,
+      parent,
+      workers,
+      get workerFactoryCalls() {
+        return workerFactoryCalls;
+      },
+      async dispose() {
+        let closed = false;
+        try {
+          await pi.close();
+          closed = true;
+        } finally {
+          restoreFixtureEnvironment(previous);
+        }
+        if (closed) await rm(parent, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    restoreFixtureEnvironment(previous);
+    await rm(parent, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function poll<T>(read: () => Promise<T | undefined>, description: string): Promise<T> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const value = await read();
+    if (value !== undefined) return value;
+    await Effect.runPromise(Effect.sleep("25 millis"));
+  }
+  throw new Error(`Timed out waiting for ${description}.`);
+}
+
+async function taskInspection(f: Awaited<ReturnType<typeof registeredFixture>>, task: string) {
+  const result = await f.call("workgraph_inspect", { section: "task", task });
+  return decodeTestValue(TaskInspectionDetailsSchema, result.details).inspection;
+}
+
+async function outcomeInspection(
+  f: Awaited<ReturnType<typeof registeredFixture>>,
+  result: string,
+  task?: string,
+) {
+  const request: OutcomeInspectionRequest = {
+    section: "outcome",
+    result,
+  };
+  if (task !== undefined) request.task = task;
+  const output = await f.call("workgraph_inspect", request);
+  return decodeTestValue(OutcomeInspectionDetailsSchema, output.details).inspection;
+}
+
+function worktreeBranch(worktrees: string, path: string): string {
+  const record = worktrees
+    .split("\n\n")
+    .find((entry) => entry.split("\n").includes(`worktree ${path}`));
+  const branch = record?.split("\n").find((line) => line.startsWith("branch refs/heads/"));
+  return branch?.slice("branch refs/heads/".length) ?? assert.fail("Missing worker branch.");
+}
+
 function runRuntime<A, E>(effect: RuntimeEffect<A, E> | Effect.Effect<A, E>): Promise<A> {
   return Effect.runPromise(effect.pipe(Effect.provide(liveLayer)));
 }
@@ -934,11 +844,11 @@ await test("implementation role overrides resolve independently and invalid mode
   }
 });
 
-await test("maintained changes keep semantic identity, use guide/executor policy, and review the requested earlier revision", async () => {
-  const f = await fixture();
+await test("registered maintained changes preserve identity, apply explicitly, and review an exact earlier revision", async () => {
+  const f = await registeredFixture();
   try {
-    const active = await f.runtime();
-    const authority = await f.authority(active);
+    assert.equal(f.workerFactoryCalls, 0, "worker runtime creation must remain lazy");
+    const initialDestinationHead = await git(f.root, "rev-parse", "HEAD");
     const semanticId = "Fix Value With Spaces and a deliberately long task name";
     f.workers.onWork = async (request) => {
       if (workerEnvironment(request, "PI_WORKGRAPH_MODE") === "implementation") {
@@ -964,19 +874,11 @@ await test("maintained changes keep semantic identity, use guide/executor policy
           findings: [],
         };
       }
-      assert.equal(
-        await git(
-          request.cwd,
-          "show",
-          `${workerEnvironment(request, "PI_WORKGRAPH_BASE_COMMIT")}:value.txt`,
-        ),
-        "maintained",
-      );
+      assert.equal(workerEnvironment(request, "PI_WORKGRAPH_MODE"), "review");
+      const base = workerEnvironment(request, "PI_WORKGRAPH_BASE_COMMIT");
+      assert.equal(await git(request.cwd, "show", `${base}:value.txt`), "maintained");
       assert.notEqual(request.cwd, f.root);
-      assert.equal(
-        await git(request.cwd, "rev-parse", "HEAD"),
-        workerEnvironment(request, "PI_WORKGRAPH_BASE_COMMIT"),
-      );
+      assert.equal(await git(request.cwd, "rev-parse", "HEAD"), base);
       assert.equal(await readFile(join(request.cwd, "value.txt"), "utf8"), "maintained\n");
       return {
         kind: "review",
@@ -986,61 +888,121 @@ await test("maintained changes keep semantic identity, use guide/executor policy
         findings: [],
       };
     };
-    await runRuntime(
-      active.effects.queue({
-        id: semanticId,
-        capability: "implement",
-        artifactIntent: "maintained_change",
-        objective: "Change value",
-        intentVersion: 1,
-        authority,
-        acceptance: ["value is maintained"],
-      }),
+
+    const input = await f.input(
+      "Implement value.txt and preserve the current repository scope.",
+      "interactive",
     );
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
-    const implementationAttempt = required(state.attempts[0], "implementation attempt");
-    const implementationResult = required(state.results[0], "implementation result");
-    assert.equal(state.assignments[0]?.id, semanticId);
+    assert.equal(input.action, "continue");
+    const intent = await f.call("workgraph_intent", {
+      statement: "Implement the maintained value change in the current repository.",
+      constraints: ["Keep the destination unchanged until explicit apply."],
+    });
+    assert.equal(resultState(intent.details).intents.at(-1)?.version, 1);
+    const queued = await f.call("workgraph_implement", {
+      id: semanticId,
+      objective: "Change value",
+      acceptance: ["value is maintained"],
+    });
+    const queuedView = decodeTestValue(ImplementationActionDetailsSchema, queued.details).view;
+    assert.equal(queuedView.action.name, "workgraph_implement");
+    assert.equal(queuedView.action.authorityContext.selectedScope.intentVersion, 1);
+    assert.notEqual(queuedView.action.authorityContext.selectedScope.authorityReceiptId, "");
+    assert.equal(queuedView.affected.task.idPreview, semanticId);
+    assert.equal(queuedView.affected.task.capability, "implement");
+    assert.equal(queuedView.affected.task.intentVersion, 1);
+    assert.equal(
+      queuedView.affected.attempt.models.selected.guide.model,
+      "openai-codex/gpt-6-astra",
+    );
+    assert.equal(
+      queuedView.affected.attempt.models.selected.executor.model,
+      "openai-codex/gpt-5.6-luna",
+    );
+
+    const implementationTask = await poll(async () => {
+      const view = await taskInspection(f, semanticId);
+      return view.latestAttempt?.outcome === undefined ? undefined : view;
+    }, "registered implementation result");
+    const implementationAttempt = required(
+      implementationTask.latestAttempt,
+      "registered implementation attempt",
+    );
+    const implementationOutcome = await outcomeInspection(
+      f,
+      required(implementationAttempt.outcome, "registered implementation outcome"),
+    );
+    assert.equal(implementationTask.idPreview, semanticId);
+    assert.equal(implementationTask.intentVersion, 1);
+    assert.equal(implementationOutcome.report.validity, "typed");
+    assert.equal(implementationOutcome.report.kind, "implementation");
+    assert.equal(implementationOutcome.report.status, "completed");
+    assert.equal(implementationOutcome.report.outcome, "changed");
+    await poll(
+      async () => (f.messages.length === 0 ? undefined : f.messages.at(-1)),
+      "registered result notification",
+    );
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
-    assert.equal(implementationResult.validity, "typed");
-    if (
-      implementationResult.validity !== "typed" ||
-      implementationResult.report.kind !== "implementation" ||
-      implementationResult.report.status !== "completed" ||
-      implementationResult.report.outcome !== "changed"
-    )
-      assert.fail("Expected changed implementation report.");
-    state = await runRuntime(active.effects.apply(implementationAttempt.id));
+    const sourceCommit = implementationOutcome.report.reportedCommit;
+    const implementationPath = required(f.workers.requests[0], "implementation worker").cwd;
+    const implementationBranch = worktreeBranch(
+      await git(f.root, "worktree", "list", "--porcelain"),
+      implementationPath,
+    );
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), initialDestinationHead);
+    const destinationHead = await git(f.root, "rev-parse", "HEAD");
+
+    const applied = await f.call("workgraph_control", {
+      action: "apply",
+      attempt: implementationAttempt.handle,
+    });
+    const appliedView = decodeTestValue(ControlActionDetailsSchema, applied.details).view;
+    assert.equal(appliedView.action.name, "workgraph_control:apply");
+    assert.equal(appliedView.action.outcome, "recorded");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "maintained\n");
-    const revision =
-      state.attempts[0]?.application?.revision ??
-      assert.fail("Application revision must be present.");
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    const appliedOutcome = await outcomeInspection(f, implementationOutcome.result, semanticId);
+    assert.equal(appliedOutcome.settlement.application.state, "applied");
+    const revision = required(appliedOutcome.settlement.application.revision, "applied revision");
+    const actualHead = await git(f.root, "rev-parse", "HEAD");
+    assert.equal(actualHead, sourceCommit);
+    assert.equal(actualHead, revision);
+    assert.notEqual(actualHead, destinationHead);
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(implementationPath),
+      false,
+    );
+    assert.equal(await git(f.root, "branch", "--list", implementationBranch), "");
+
     await writeFile(join(f.root, "value.txt"), "later\n");
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "later unrelated change");
-    await runRuntime(
-      active.effects.queue({
-        id: "review",
-        capability: "review",
-        artifactIntent: "evidence_only",
-        objective: "Review maintained change",
-        intentVersion: 1,
-        subject: { kind: "revision", revision },
-        concern: "Exact content",
-      }),
-    );
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(active.effects.reconcile);
-    assert.equal(state.attempts[1]?.baseRevision, revision);
-    assert.equal(state.attempts[1]?.placement?.kind, "isolated_worktree");
-    assert.equal(state.results[1]?.validity, "typed");
+    await f.call("workgraph_review", {
+      id: "review",
+      objective: "Review maintained change",
+      concern: "Exact content",
+      subject: { kind: "revision", revision },
+    });
+    assert.equal(f.workerFactoryCalls, 1, "same-store review must reuse the existing worker port");
+    const reviewTask = await poll(async () => {
+      const view = await taskInspection(f, "review");
+      return view.latestAttempt?.outcome === undefined ? undefined : view;
+    }, "registered exact-revision review result");
+    const reviewAttempt = required(reviewTask.latestAttempt, "registered review attempt");
+    const reviewOutcome = await f.call("workgraph_inspect", {
+      section: "outcome",
+      task: "review",
+      result: required(reviewAttempt.outcome, "registered review outcome"),
+    });
+    const reviewView = decodeTestValue(ReviewOutcomeInspectionDetailsSchema, reviewOutcome.details);
+    assert.equal(reviewView.inspection.report.validity, "typed");
+    assert.equal(reviewView.inspection.report.kind, "review");
+    assert.equal(reviewView.inspection.report.status, "completed");
+    const reviewRequest = required(f.workers.requests[1], "review worker");
+    assert.equal(workerEnvironment(reviewRequest, "PI_WORKGRAPH_BASE_COMMIT"), revision);
+    assert.notEqual(reviewRequest.cwd, f.root);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "later\n");
     assert.equal(
-      (await git(f.root, "worktree", "list", "--porcelain")).includes(
-        state.attempts[1]?.placement?.path ?? "",
-      ),
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(reviewRequest.cwd),
       false,
     );
   } finally {
@@ -1897,82 +1859,114 @@ await test("owned idle-worker cancellation closes without a model turn or fabric
   }
 });
 
-await test("cancelling a disposable experiment retains output through reconciliation and completion until explicit release", async () => {
-  const f = await fixture();
+await test("registered cancellation retains an experiment through completion until exact release", async () => {
+  const f = await registeredFixture();
   try {
+    assert.equal(f.workerFactoryCalls, 0, "worker runtime creation must remain lazy");
     f.workers.deferWork = true;
-    const active = await f.runtime();
-    const authority = await f.authority(active);
-    await runRuntime(
-      active.effects.queue({
-        id: "cancel-experiment",
-        capability: "research",
-        artifactIntent: "disposable_experiment",
-        objective: "Cancel this isolated probe",
-        intentVersion: authority.intentVersion,
-        authority,
+    const destinationHead = await git(f.root, "rev-parse", "HEAD");
+    const input = await f.input(
+      "Run a disposable experiment, then cancel it without producing a model result.",
+      "rpc",
+    );
+    assert.equal(input.action, "continue");
+    const intent = await f.call("workgraph_intent", {
+      statement: "Run and inspect the disposable cancellation experiment.",
+      constraints: ["Retain the isolated output until explicit release."],
+    });
+    assert.equal(resultState(intent.details).intents.at(-1)?.version, 1);
+    const queued = await f.call("workgraph_research", {
+      id: "cancel-experiment",
+      question: "Cancel this isolated probe",
+      expectedEvidence: ["No model turn"],
+      experiment: {
         permittedEffects: ["Write only inside the isolated worktree"],
         stopCondition: "Cancellation requested",
-        expectedEvidence: ["No model turn"],
-      }),
+      },
+    });
+    const queuedView = decodeTestValue(ControlActionDetailsSchema, queued.details).view;
+    assert.equal(queuedView.action.name, "workgraph_research");
+    assert.equal(queuedView.action.outcome, "queued");
+
+    const queuedTask = await poll(async () => {
+      const view = await taskInspection(f, "cancel-experiment");
+      return f.workers.requests.length === 0 || view.latestAttempt === undefined ? undefined : view;
+    }, "registered experiment worker launch");
+    const experimentAttempt = required(queuedTask.latestAttempt, "registered experiment attempt");
+    const experimentWorker = required(f.workers.requests[0], "experiment worker");
+    const retainedFile = join(experimentWorker.cwd, "cancelled-output.txt");
+    const experimentBranch = worktreeBranch(
+      await git(f.root, "worktree", "list", "--porcelain"),
+      experimentWorker.cwd,
     );
-    await runRuntime(active.effects.reconcile);
-    const attempt = required((await runRuntime(f.store.load())).attempts[0], "experiment attempt");
-    const placement = required(attempt.placement, "experiment placement");
-    if (placement.kind !== "isolated_worktree")
-      throw new Error("Experiment placement must be isolated.");
-    const retainedFile = join(placement.path, "cancelled-output.txt");
     await writeFile(retainedFile, "retained after cancellation\n");
-    await runRuntime(active.effects.cancel(attempt.id));
-    let state = await runRuntime(f.store.load());
-    assert.equal(state.attempts[0]?.state, "cancelled");
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
-    assert.equal(state.attempts[0]?.outputRelease, undefined);
-    assert.equal(await readFile(retainedFile, "utf8"), "retained after cancellation\n");
-    assert.equal(
-      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
-      true,
-    );
-    assert.equal(
-      (await git(f.root, "branch", "--list", placement.branch)).includes(placement.branch),
-      true,
-    );
     assert.equal(f.workers.promptCount, 0);
 
-    state = await runRuntime(active.effects.reconcile);
-    assert.equal(state.attempts[0]?.state, "cancelled");
-    assert.equal(state.attempts[0]?.outputRelease, undefined);
-    assert.equal(await readFile(retainedFile, "utf8"), "retained after cancellation\n");
-
-    state = await submit(
-      active,
-      f.store.complete({
-        conclusion: "The cancelled experiment remains available for inspection.",
-        evidence: [{ label: "retained output", observation: "The cancelled worktree is intact." }],
-        limitations: [],
-      }),
-    );
-    assert.equal(state.lifecycle.state, "completed");
+    const cancelled = await f.call("workgraph_control", {
+      action: "cancel",
+      attempt: experimentAttempt.handle,
+    });
+    const cancelledView = decodeTestValue(ControlActionDetailsSchema, cancelled.details).view;
+    assert.equal(cancelledView.action.name, "workgraph_control:cancel");
+    const cancelledTask = await poll(async () => {
+      const view = await taskInspection(f, "cancel-experiment");
+      return view.latestAttempt?.state === "cancelled" ? view : undefined;
+    }, "registered cancellation settlement");
+    assert.equal(cancelledTask.latestAttempt?.outcome, undefined);
+    assert.equal(f.workers.promptCount, 0);
+    assert.equal(f.workers.interruptCount, 1);
+    const recovery = await f.call("workgraph_inspect", {
+      section: "recovery",
+      attempt: experimentAttempt.handle,
+    });
+    const recoveryView = decodeTestValue(RecoveryInspectionDetailsSchema, recovery.details);
+    assert.equal(recoveryView.inspection.recordedFacts.cleanup.state, "completed");
+    assert.equal(recoveryView.inspection.recordedFacts.cleanup.workerClosed, true);
+    assert.equal(recoveryView.inspection.recordedFacts.retainedOutput.state, "retained");
+    assert.equal(recoveryView.inspection.recordedFacts.retainedOutput.path, experimentWorker.cwd);
     assert.equal(await readFile(retainedFile, "utf8"), "retained after cancellation\n");
     assert.equal(
-      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(experimentWorker.cwd),
       true,
     );
+    assert.ok((await git(f.root, "branch", "--list", experimentBranch)).includes(experimentBranch));
 
-    state = await runRuntime(
-      active.effects.releaseOutput(
-        attempt.id,
-        "The cancelled experiment output is no longer needed.",
-      ),
+    const completed = await f.call("workgraph_complete", {
+      conclusion: "The cancelled experiment remains available for inspection.",
+      evidence: [{ label: "retained output", observation: "The cancelled worktree is intact." }],
+      limitations: [],
+    });
+    const completedView = decodeTestValue(CompletionActionDetailsSchema, completed.details).view;
+    assert.equal(completedView.workstream.lifecycle, "completed");
+    assert.equal(completedView.action.name, "workgraph_complete");
+    const completion = await f.call("workgraph_inspect", { section: "completion" });
+    assert.equal(
+      decodeTestValue(CompletionInspectionDetailsSchema, completion.details).inspection
+        .completionRecorded,
+      true,
     );
-    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
+    assert.equal(await readFile(retainedFile, "utf8"), "retained after cancellation\n");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(experimentWorker.cwd),
+      true,
+    );
+    assert.equal(f.workerFactoryCalls, 1, "completion must retain the attached runtime");
+
+    const released = await f.call("workgraph_control", {
+      action: "release_output",
+      reason: "The cancelled experiment output is no longer needed.",
+      attempt: experimentAttempt.handle,
+    });
+    const releasedView = decodeTestValue(ControlActionDetailsSchema, released.details).view;
+    assert.equal(releasedView.action.name, "workgraph_control:release_output");
     await assert.rejects(readFile(retainedFile, "utf8"));
     assert.equal(
-      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(experimentWorker.cwd),
       false,
     );
-    assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
+    assert.equal(await git(f.root, "branch", "--list", experimentBranch), "");
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), destinationHead);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
   } finally {
     await f.dispose();
   }

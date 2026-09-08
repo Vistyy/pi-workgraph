@@ -42,7 +42,7 @@ import {
   type RuntimeError,
   WorkstreamRuntime,
 } from "../src/workstream-runtime.js";
-import { RuntimeHostError } from "../src/workstream-runtime-services.js";
+import { RuntimeHostError, type RuntimeWorkerPort } from "../src/workstream-runtime-services.js";
 import { isLegacyWorkstreamPath } from "../src/workstream-state.js";
 
 const POINTER = "pi-workgraph-workstream";
@@ -121,7 +121,10 @@ const ImplementationModelOptions = {
   models: Type.Optional(ImplementationModels),
 };
 
-export default function workgraphCoordinator(pi: ExtensionAPI): void {
+export default function workgraphCoordinator(
+  pi: ExtensionAPI,
+  runtimeWorker: () => RuntimeWorkerPort = () => new HerdrCliRuntime(),
+): void {
   if (!isCoordinatorScope(process.env)) return;
   const calm = installCalmMode(pi);
   let runtime: WorkstreamRuntime | undefined;
@@ -179,7 +182,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
         next = yield* WorkstreamRuntime.acquire(
           target,
           new GitRepository(state.projectRoot, state.gitCommonDir),
-          new HerdrCliRuntime(),
+          runtimeWorker(),
           { workspaceId: workspaceId ?? "" },
           (resultId, latest) =>
             sdk("deliver workstream result", () => {

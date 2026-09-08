@@ -6,8 +6,9 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { ExtensionActions } from "@earendil-works/pi-coding-agent";
 import {
-  discoverAndLoadExtensions,
+  DefaultResourceLoader,
   ExtensionRunner,
+  type InlineExtension,
   ModelRegistry,
   ModelRuntime,
   SessionManager,
@@ -85,13 +86,23 @@ export async function extensionFixture(
   root: string,
   parent: string,
   actions: Partial<ExtensionActions> = {},
+  extensionFactories: InlineExtension[] = [],
 ) {
   const session = persistentSession(root, join(parent, "sessions"));
-  const loaded = await discoverAndLoadExtensions(
-    [resolve(`extensions/${name}.ts`)],
-    root,
-    join(parent, "agent"),
-  );
+  const resourceLoader = new DefaultResourceLoader({
+    cwd: root,
+    agentDir: join(parent, "agent"),
+    additionalExtensionPaths:
+      extensionFactories.length === 0 ? [resolve(`extensions/${name}.ts`)] : [],
+    extensionFactories,
+    noExtensions: extensionFactories.length > 0,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+  });
+  await resourceLoader.reload();
+  const loaded = resourceLoader.getExtensions();
   assert.deepEqual(loaded.errors, []);
   const models = await ModelRuntime.create({
     authPath: join(parent, "auth.json"),
@@ -165,6 +176,10 @@ export async function extensionFixture(
     notifications,
     selected,
     registry,
+    // oxlint-disable-next-line effecttsgo/async-function -- Genuine input is delivered through the asynchronous pinned Pi runner event boundary.
+    async input(text: string, source: "interactive" | "rpc" = "interactive") {
+      return runner.emitInput(text, undefined, source);
+    },
     // oxlint-disable-next-line anti-slop/no-unknown-parameters, effecttsgo/async-function -- Raw input intentionally enters through Pi's registered tool boundary and is decoded against that exact registration schema before execute performs authority validation.
     async call(toolName: string, params: unknown, signal?: AbortSignal) {
       const tool = runner.getToolDefinition(toolName);
