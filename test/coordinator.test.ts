@@ -6,12 +6,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
+import { TestClock } from "effect/testing";
 import { Type } from "typebox";
 import { openRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { liveLayer } from "../src/node-platform.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { type StoreEffect, WorkstreamStoreEffects } from "../src/workstream.js";
+import { SqliteWorkstreamDatabase } from "../src/workstream-persistence.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
 import { legacyPathForWorkstream } from "../src/workstream-state.js";
 import { parsePersistedObject } from "../src/workstream-validation.js";
@@ -480,64 +482,180 @@ void test("registered AbortSignal interrupts native coordinator work", async () 
   }
 });
 
-void test("failed registered adoption preserves the attached runtime lease; same-target attachment reuses it", async () => {
+void test("registered adoption uses authoritative snapshots and fences a stale expired owner", async () => {
   const f = await fixture();
   let competing: WorkstreamRuntime | undefined;
+  let previousEnvironment: NodeJS.ProcessEnv | undefined;
   const registry = new WorkgraphRegistry(join(f.parent, "agent", "workgraph", "registry.sqlite"));
+  const leaseRow = (path: string) =>
+    SqliteWorkstreamDatabase.use(path, (database) =>
+      database.db.prepare("SELECT * FROM lease WHERE singleton=1").get(),
+    );
+  const repositorySnapshot = async () => ({
+    head: await git(f.root, "rev-parse", "HEAD"),
+    bytes: await readFile(join(f.root, "value.txt"), "utf8"),
+    worktrees: await git(f.root, "worktree", "list", "--porcelain"),
+  });
   try {
-    const a = await emptyWorkstream(f);
+    // Establish retained authority and suspension through the registered coordinator lifecycle.
+    const retained = await emptyWorkstream(f);
+    await f.runner.emitInput("Retain this recovery receipt", undefined, "interactive");
+    await f.call("workgraph_control", {
+      action: "suspend",
+      reason: "Await authoritative recovery",
+    });
+    const retainedBefore = resultState(
+      (await f.call("workgraph_inspect", { section: "overview" })).details,
+    );
+    assert.equal(retainedBefore.lifecycle.state, "suspended");
+    assert.equal(retainedBefore.inputs.length, 1);
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+
     const repository = await Effect.runPromise(openRepository(f.root));
     const otherOwner = {
-      sessionId: "other",
-      sessionFile: join(f.parent, "other.jsonl"),
+      sessionId: "other-owner",
+      sessionFile: join(f.parent, "other-owner.jsonl"),
     };
-    const { store } = await runStore(
-      WorkstreamStoreEffects.create({
-        id: "other-work",
-        purpose: "Other work",
-        projectRoot: f.root,
-        gitCommonDir: repository.commonDir,
-        coordinator: otherOwner,
-      }),
-    );
+    const retainedStore = WorkstreamStoreEffects.open(retained.statePath, retained.coordinator);
+    const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+    // The frozen Effect clock prevents the task-owned runtime from renewing after fault injection.
     competing = await Effect.runPromise(
       WorkstreamRuntime.acquire(
-        store,
+        retainedStore,
         repository,
         new HerdrCliRuntime(),
         { workspaceId: "" },
         () => Effect.void,
         () => Effect.void,
-        { registry },
+        { registry, owner: otherOwner, clock },
       ).pipe(Effect.provide(liveLayer)),
     );
     await Effect.runPromise(competing.effects.submit(Effect.void).pipe(Effect.provide(liveLayer)));
-    await assert.rejects(f.call("workgraph_adopt", { statePath: store.path }), /runtime owner/);
-    assert.equal(
-      resultState((await f.call("workgraph_inspect", { section: "overview" })).details).id,
-      a.id,
+
+    const current = await createUnattachedWorkstream(f, "current-work");
+    f.session.appendCustomEntry("pi-workgraph-workstream", { path: current.store.path });
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    const currentState = resultState(
+      (await f.call("workgraph_inspect", { section: "overview" })).details,
     );
-    const competingLocator = WorkstreamStoreEffects.open(a.statePath, a.coordinator);
-    assert.throws(
-      () => Effect.runSync(competingLocator.acquireLease(a.coordinator)),
+    assert.equal(currentState.id, "current-work");
+    const currentLease = leaseRow(current.store.path);
+    const liveCompetingLease = leaseRow(retainedStore.path);
+
+    // A non-expired owner still refuses adoption without consulting unavailable Herdr.
+    await assert.rejects(
+      f.call("workgraph_adopt", { statePath: retainedStore.path }),
       /runtime owner/,
     );
-    const same = resultState((await f.call("workgraph_adopt", { statePath: a.statePath })).details);
-    assert.equal(same.id, a.id);
-    await f.call("workgraph_control", {
-      action: "suspend",
-      reason: "Existing runtime is still usable",
-    });
-    await Effect.runPromise(competing.effects.close);
-    const adopted = resultState(
-      (await f.call("workgraph_adopt", { statePath: store.path })).details,
+    assert.deepEqual(leaseRow(current.store.path), currentLease);
+    assert.deepEqual(leaseRow(retainedStore.path), liveCompetingLease);
+    const same = resultState(
+      (await f.call("workgraph_adopt", { statePath: current.store.path })).details,
     );
-    assert.equal(adopted.id, "other-work");
+    assert.equal(same.id, currentState.id);
+    assert.deepEqual(leaseRow(current.store.path), currentLease);
+
+    const snapshotPath = join(f.parent, "coordinator-snapshot.json");
+    const commandLog = join(f.parent, "coordinator-herdr-argv.jsonl");
+    const command = join(f.parent, "controlled-herdr.mjs");
+    await writeFile(
+      command,
+      `#!/usr/bin/env node\nimport { appendFileSync, readFileSync } from "node:fs";\nconst args = process.argv.slice(2);\nappendFileSync(${JSON.stringify(commandLog)}, JSON.stringify(args) + "\\n");\nif (args.length !== 2 || args[0] !== "api" || args[1] !== "snapshot") {\n  console.error("unexpected controlled Herdr command");\n  process.exit(64);\n}\nprocess.stdout.write(readFileSync(${JSON.stringify(snapshotPath)}, "utf8"));\n`,
+    );
+    await chmod(command, 0o755);
+    previousEnvironment = configureFixtureEnvironment({
+      HERDR_ENV: "1",
+      HERDR_WORKSPACE_ID: "controlled-workspace",
+      PI_WORKGRAPH_HERDR_BIN: command,
+    });
+
+    // Native SQLite expiry is explicit fault injection. Snapshot contents model the
+    // authoritative native observation boundary; this is not a real Herdr process death.
+    SqliteWorkstreamDatabase.use(retainedStore.path, (database) => {
+      database.db
+        .prepare("UPDATE lease SET expires_at=? WHERE singleton=1")
+        .run("2000-01-01T00:00:00.000Z");
+    });
+    const expiredCompetingLease = leaseRow(retainedStore.path);
+    const unchangedResources = await repositorySnapshot();
+    const assertRefusalInvariants = async () => {
+      const attached = resultState(
+        (await f.call("workgraph_inspect", { section: "overview" })).details,
+      );
+      assert.equal(attached.id, currentState.id);
+      assert.deepEqual(leaseRow(current.store.path), currentLease);
+      assert.deepEqual(leaseRow(retainedStore.path), expiredCompetingLease);
+      assert.deepEqual(await repositorySnapshot(), unchangedResources);
+    };
+
+    await writeFile(
+      snapshotPath,
+      JSON.stringify({
+        result: { snapshot: { agents: [{ agent_session: { value: otherOwner.sessionFile } }] } },
+      }),
+    );
+    await assert.rejects(
+      f.call("workgraph_adopt", { statePath: retainedStore.path }),
+      /runtime owner/,
+    );
+    await assertRefusalInvariants();
+
+    await writeFile(
+      snapshotPath,
+      JSON.stringify({ result: { snapshot: { agents: [{ agent_session: {} }] } } }),
+    );
+    await assert.rejects(
+      f.call("workgraph_adopt", { statePath: retainedStore.path }),
+      /runtime owner/,
+    );
+    await assertRefusalInvariants();
+
+    await writeFile(snapshotPath, JSON.stringify({ result: { snapshot: { agents: [] } } }));
+    const adopted = resultState(
+      (await f.call("workgraph_adopt", { statePath: retainedStore.path })).details,
+    );
+    assert.equal(adopted.id, retainedBefore.id);
+    assert.equal(adopted.lifecycle.state, "suspended");
+    assert.deepEqual(adopted.inputs, retainedBefore.inputs);
+    assert.equal(adopted.projectRoot, retainedBefore.projectRoot);
+    assert.equal(adopted.gitCommonDir, retainedBefore.gitCommonDir);
+    assert.deepEqual(adopted.results, []);
     assert.equal(adopted.coordinator.sessionId, f.session.getSessionId());
-    const releasedLocator = WorkstreamStoreEffects.open(a.statePath, a.coordinator);
-    const released = Effect.runSync(releasedLocator.acquireLease(a.coordinator));
-    Effect.runSync(releasedLocator.releaseLease(released));
+    assert.equal(adopted.coordinator.sessionFile, f.session.getSessionFile());
+    assert.deepEqual(await repositorySnapshot(), unchangedResources);
+    const replacementLease = leaseRow(retainedStore.path);
+    assert.notDeepEqual(replacementLease, expiredCompetingLease);
+    assert.equal(leaseRow(current.store.path), undefined);
+
+    await assert.rejects(
+      Effect.runPromise(
+        competing.effects
+          .submit(
+            retainedStore.setLifecycle({ state: "active", reason: "stale owner must not mutate" }),
+          )
+          .pipe(Effect.provide(liveLayer)),
+      ),
+      /live lease/,
+    );
+    await Effect.runPromise(competing.effects.close);
+    competing = undefined;
+    assert.deepEqual(leaseRow(retainedStore.path), replacementLease);
+
+    const commands = (await readFile(commandLog, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => decodeTestValue(Type.Array(Type.String()), JSON.parse(line)));
+    assert.deepEqual(commands, [
+      ["api", "snapshot"],
+      ["api", "snapshot"],
+      ["api", "snapshot"],
+    ]);
+    await f.runner.emit({ type: "session_shutdown", reason: "quit" });
+    assert.equal(leaseRow(retainedStore.path), undefined);
+    assert.equal(leaseRow(current.store.path), undefined);
+    assert.deepEqual(await repositorySnapshot(), unchangedResources);
   } finally {
+    if (previousEnvironment !== undefined) restoreFixtureEnvironment(previousEnvironment);
     if (competing !== undefined) await Effect.runPromise(competing.effects.close);
     registry.close();
     await f.dispose();
