@@ -36,7 +36,7 @@ const WorkerEnvironmentConfig = Config.all({
   targetThinking: Config.string("PI_WORKGRAPH_TARGET_THINKING").pipe(Config.withDefault("off")),
 });
 
-// One bounded, worker-owned plan survives the guide/executor handoff. Status is
+// One concise, worker-owned plan survives the guide/executor handoff. Status is
 // navigation, never verification evidence or authority to expand the assignment.
 const PlanStepStatusSchema = Type.Union([
   Type.Literal("pending"),
@@ -45,7 +45,7 @@ const PlanStepStatusSchema = Type.Union([
   Type.Literal("blocked"),
   Type.Literal("superseded"),
 ]);
-const PlanStepIdSchema = Type.String({ pattern: "^step-[1-8]$" });
+const PlanStepIdSchema = Type.String({ pattern: "^step-[1-9][0-9]*$", maxLength: 21 });
 const TargetedPlanStepStatusSchema = Type.Union([
   Type.Literal("pending"),
   Type.Literal("in_progress"),
@@ -66,14 +66,14 @@ const WorkerPlanSchema = Type.Object(
     approach: Type.String({ minLength: 3, maxLength: 2000 }),
     rationale: Type.String({ minLength: 3, maxLength: 2000 }),
     risks: Type.String({ maxLength: 2000 }),
-    steps: Type.Array(WorkerPlanStepSchema, { minItems: 1, maxItems: 8 }),
+    steps: Type.Array(WorkerPlanStepSchema, { minItems: 1 }),
   },
   { additionalProperties: false },
 );
 const GuidePlanStepSchema = Type.Object(
   {
     text: Type.String({ minLength: 3, maxLength: 1000 }),
-    status: PlanStepStatusSchema,
+    status: TargetedPlanStepStatusSchema,
     note: Type.Optional(Type.String({ maxLength: 1000 })),
   },
   { additionalProperties: false },
@@ -83,7 +83,24 @@ const GuidePlanInputSchema = Type.Object(
     approach: Type.String({ minLength: 3, maxLength: 2000 }),
     rationale: Type.String({ minLength: 3, maxLength: 2000 }),
     risks: Type.String({ maxLength: 2000 }),
-    steps: Type.Array(GuidePlanStepSchema, { minItems: 1, maxItems: 8 }),
+    steps: Type.Array(GuidePlanStepSchema, { minItems: 1 }),
+  },
+  { additionalProperties: false },
+);
+const LegacyGuidePlanStepSchema = Type.Object(
+  {
+    text: Type.String({ minLength: 3, maxLength: 1000 }),
+    status: PlanStepStatusSchema,
+    note: Type.Optional(Type.String({ maxLength: 1000 })),
+  },
+  { additionalProperties: false },
+);
+const LegacyGuidePlanInputSchema = Type.Object(
+  {
+    approach: Type.String({ minLength: 3, maxLength: 2000 }),
+    rationale: Type.String({ minLength: 3, maxLength: 2000 }),
+    risks: Type.String({ maxLength: 2000 }),
+    steps: Type.Array(LegacyGuidePlanStepSchema, { minItems: 1, maxItems: 8 }),
   },
   { additionalProperties: false },
 );
@@ -91,7 +108,7 @@ const LegacyPlanEntrySchema = Type.Object(
   {
     runId: Type.String(),
     nodeId: Type.String(),
-    plan: GuidePlanInputSchema,
+    plan: LegacyGuidePlanInputSchema,
   },
   { additionalProperties: false },
 );
@@ -118,6 +135,20 @@ const WorkerPlanUpdateStepSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+const WorkerPlanUpdateOverviewSchema = Type.Object(
+  {
+    action: Type.Literal("update_overview"),
+    patch: Type.Object(
+      {
+        approach: Type.Optional(Type.String({ minLength: 3, maxLength: 2000 })),
+        rationale: Type.Optional(Type.String({ minLength: 3, maxLength: 2000 })),
+        risks: Type.Optional(Type.String({ maxLength: 2000 })),
+      },
+      { additionalProperties: false },
+    ),
+  },
+  { additionalProperties: false },
+);
 const WorkerPlanAddStepSchema = Type.Object(
   {
     action: Type.Literal("add_step"),
@@ -138,6 +169,7 @@ const WorkerPlanToolSchema = Type.Union([
   WorkerPlanGetSchema,
   WorkerPlanUpdateSchema,
   WorkerPlanUpdateStepSchema,
+  WorkerPlanUpdateOverviewSchema,
   WorkerPlanAddStepSchema,
   WorkerPlanRemoveStepSchema,
 ]);
@@ -146,6 +178,7 @@ const WorkerPlanEntrySchema = Type.Object(
     runId: Type.String(),
     nodeId: Type.String(),
     plan: WorkerPlanSchema,
+    nextStepNumber: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
   },
   { additionalProperties: false },
 );
@@ -161,21 +194,40 @@ const EnrichmentEntrySchema = Type.Intersect([
 type WorkerPlan = Static<typeof WorkerPlanSchema>;
 type WorkerPlanToolInput = Static<typeof WorkerPlanToolSchema>;
 
-const MAX_RETAINED_STEPS = 8;
+// This is a resource ceiling, not a semantic step-count limit. It roughly preserves
+// the previous maximum serialized payload while allowing concise plans to evolve.
+const MAX_SERIALIZED_PLAN_CHARACTERS = 24_000;
 
-function nextStepId(steps: ReadonlyArray<{ readonly id: string }>): string | undefined {
-  const used = new Set(steps.map((step) => step.id));
-  for (let number = 1; number <= MAX_RETAINED_STEPS; number += 1) {
-    const id = `step-${number}`;
-    if (!used.has(id)) return id;
+function stepNumber(id: string): number | undefined {
+  const number = Number(id.slice("step-".length));
+  return Number.isSafeInteger(number) && number >= 1 ? number : undefined;
+}
+
+function nextNumberAfter(steps: ReadonlyArray<{ readonly id: string }>): number | undefined {
+  let maximum = 0;
+  for (const step of steps) {
+    const number = stepNumber(step.id);
+    if (number === undefined) return undefined;
+    maximum = Math.max(maximum, number);
   }
+  return maximum < Number.MAX_SAFE_INTEGER ? maximum + 1 : undefined;
+}
+
+function planValidationFailure(candidate: WorkerPlan): string | undefined {
+  if (!Value.Check(WorkerPlanSchema, candidate)) return "Invalid plan";
+  if (JSON.stringify(candidate).length > MAX_SERIALIZED_PLAN_CHARACTERS)
+    return `The current plan exceeds the ${MAX_SERIALIZED_PLAN_CHARACTERS}-character serialized safety limit`;
   return undefined;
 }
 
 type PlanRestore =
   | { readonly kind: "absent" }
-  | { readonly kind: "valid"; readonly plan: WorkerPlan }
-  | { readonly kind: "malformed" };
+  | {
+      readonly kind: "valid";
+      readonly plan: WorkerPlan;
+      readonly nextStepNumber: number;
+    }
+  | { readonly kind: "malformed"; readonly nextStepNumber: number };
 type ObjectiveRestore =
   | { readonly kind: "absent" }
   | { readonly kind: "valid"; readonly content: string }
@@ -212,18 +264,45 @@ class WorkerGitError extends Data.TaggedError("WorkerGitError")<{
 type WorkerExpectedError = WorkerContractError | WorkerHostError | WorkerGitError;
 
 type GuidePlanInput = Static<typeof GuidePlanInputSchema>;
+type LegacyGuidePlanInput = Static<typeof LegacyGuidePlanInputSchema>;
 type PlanStep = WorkerPlan["steps"][number];
 type StepPatch = Extract<WorkerPlanToolInput, { readonly action: "update_step" }>["patch"];
+type OverviewPatch = Extract<WorkerPlanToolInput, { readonly action: "update_overview" }>["patch"];
 
-function createGuidePlan(input: GuidePlanInput): WorkerPlan {
+function createGuidePlan(
+  input: GuidePlanInput | LegacyGuidePlanInput,
+  firstStepNumber: number,
+): WorkerPlan | undefined {
+  if (input.steps.length > Number.MAX_SAFE_INTEGER - firstStepNumber || firstStepNumber < 1)
+    return undefined;
   return {
     ...input,
-    steps: input.steps.map((step, index) => ({ ...step, id: `step-${index + 1}` })),
+    steps: input.steps.map((step, index) => ({
+      ...step,
+      id: `step-${firstStepNumber + index}`,
+    })),
   };
 }
 
 function patchedStep(step: PlanStep, patch: StepPatch): PlanStep {
   return { ...step, ...patch };
+}
+
+function applyOverviewPatch(current: WorkerPlan, patch: OverviewPatch) {
+  return Effect.gen(function* () {
+    if (Object.keys(patch).length === 0)
+      return yield* contractFailure(
+        "Updating the plan overview requires at least one of approach, rationale, or risks; no changes were made.",
+      );
+    const next: WorkerPlan = {
+      ...current,
+      ...patch,
+      steps: current.steps.map((step) => ({ ...step })),
+    };
+    const failure = planValidationFailure(next);
+    if (failure !== undefined) return yield* contractFailure(`${failure}; no changes were made.`);
+    return next;
+  });
 }
 
 function applyStepPatch(current: WorkerPlan, id: string, patch: StepPatch) {
@@ -243,18 +322,19 @@ function applyStepPatch(current: WorkerPlan, id: string, patch: StepPatch) {
         stepIndex === index ? patchedStep(step, patch) : { ...step },
       ),
     };
-    if (!Value.Check(WorkerPlanSchema, next))
-      return yield* contractFailure("Invalid step update; no changes were made.");
+    const failure = planValidationFailure(next);
+    if (failure !== undefined) return yield* contractFailure(`${failure}; no changes were made.`);
     return next;
   });
 }
 
-function applyStepAddition(current: WorkerPlan, text: string, afterId: string | undefined) {
+function applyStepAddition(
+  current: WorkerPlan,
+  text: string,
+  afterId: string | undefined,
+  nextStepNumber: number,
+) {
   return Effect.gen(function* () {
-    if (current.steps.length >= MAX_RETAINED_STEPS)
-      return yield* contractFailure(
-        "The bounded plan already retains 8 total steps including superseded steps; removal retains by supersession and the bound cannot be pruned. No changes were made.",
-      );
     let insertAt = current.steps.length;
     if (afterId !== undefined) {
       const anchor = current.steps.findIndex((step) => step.id === afterId);
@@ -264,17 +344,20 @@ function applyStepAddition(current: WorkerPlan, text: string, afterId: string | 
         );
       insertAt = anchor + 1;
     }
-    const id = nextStepId(current.steps);
-    if (id === undefined)
+    if (!Number.isSafeInteger(nextStepNumber) || nextStepNumber >= Number.MAX_SAFE_INTEGER)
       return yield* contractFailure(
-        "No stable step ID remains in the bounded plan; no changes were made.",
+        "No stable step ID remains in the current plan; no changes were made.",
       );
-    const retained = [...current.steps];
-    retained.splice(insertAt, 0, { id, text, status: "pending" });
+    const retained = current.steps.map((step) => ({ ...step }));
+    retained.splice(insertAt, 0, {
+      id: `step-${nextStepNumber}`,
+      text,
+      status: "pending",
+    });
     const next: WorkerPlan = { ...current, steps: retained };
-    if (!Value.Check(WorkerPlanSchema, next))
-      return yield* contractFailure("Invalid step addition; no changes were made.");
-    return next;
+    const failure = planValidationFailure(next);
+    if (failure !== undefined) return yield* contractFailure(`${failure}; no changes were made.`);
+    return { plan: next, nextStepNumber: nextStepNumber + 1 };
   });
 }
 
@@ -285,15 +368,19 @@ function applyStepRemoval(current: WorkerPlan, id: string, reason: string) {
       return yield* contractFailure(
         `Unknown step id: ${id}. No changes were made; use workgraph_plan get to inspect stable step IDs.`,
       );
+    if (current.steps.length === 1)
+      return yield* contractFailure(
+        "The current plan must retain at least one step; update or replace the last step instead. No changes were made.",
+      );
     const next: WorkerPlan = {
       ...current,
-      steps: current.steps.map((step, stepIndex) =>
-        stepIndex === index ? { ...step, status: "superseded", note: reason } : { ...step },
-      ),
+      steps: current.steps
+        .filter((_step, stepIndex) => stepIndex !== index)
+        .map((step) => ({ ...step })),
     };
-    if (!Value.Check(WorkerPlanSchema, next))
-      return yield* contractFailure("Invalid step removal; no changes were made.");
-    return next;
+    const failure = planValidationFailure(next);
+    if (failure !== undefined) return yield* contractFailure(`${failure}; no changes were made.`);
+    return { plan: next, removed: { id, reason } };
   });
 }
 
@@ -340,6 +427,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   const experiment = environment.experiment === "1";
   let phase: "guide" | "executor" = mode === "implementation" && !continued ? "guide" : "executor";
   let plan: WorkerPlan | undefined;
+  let nextStepNumber = 1;
   let planStatus: PlanRestore["kind"] = "absent";
   let planStateWarning: string | undefined;
   let stateWarning: string | undefined;
@@ -360,15 +448,31 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     return data.runId === runId && data.nodeId === nodeId;
   }
 
-  function persistPlan(next: WorkerPlan, action: string) {
+  function persistPlan(
+    next: WorkerPlan,
+    action: string,
+    allocatedThrough = nextStepNumber,
+    change?: { readonly removed: { readonly id: string; readonly reason: string } },
+  ) {
     const persisted = structuredClone(next);
-    pi.appendEntry("pi-workgraph-worker-plan", { ...generation, plan: persisted });
+    pi.appendEntry("pi-workgraph-worker-plan", {
+      ...generation,
+      plan: persisted,
+      nextStepNumber: allocatedThrough,
+    });
     plan = next;
+    nextStepNumber = allocatedThrough;
     planStatus = "valid";
     planStateWarning = undefined;
     return {
       content: [{ type: "text" as const, text: `Updated ${planText()}` }],
-      details: { action, plan: structuredClone(next), planStatus, attempt: generation },
+      details: {
+        action,
+        plan: structuredClone(next),
+        planStatus,
+        attempt: generation,
+        change: change === undefined ? undefined : structuredClone(change),
+      },
     };
   }
 
@@ -384,22 +488,28 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     return Effect.gen(function* () {
       if (phase !== "guide")
         return yield* contractFailure(
-          "Only the guide phase may replace the full plan with workgraph_plan update. Use targeted get, update_step, add_step, or remove_step to execute the inherited approach, record findings in step notes, and escalate consequential approach conflicts instead of inferring new scope. No changes were made.",
+          "Only the guide phase may replace the full plan with workgraph_plan update. Use targeted get, update_overview, update_step, add_step, or remove_step to keep local implementation knowledge current within the inherited assignment, and escalate consequential conflicts instead of inferring new scope. No changes were made.",
         );
       if (input === undefined)
         return yield* contractFailure(
           "Updating the current plan requires a plan value. No changes were made.",
         );
-      const created = createGuidePlan(input);
-      if (!Value.Check(WorkerPlanSchema, created))
-        return yield* contractFailure("Invalid full plan replacement; no changes were made.");
-      return persistPlan(created, "update");
+      const created = createGuidePlan(input, nextStepNumber);
+      if (created === undefined)
+        return yield* contractFailure(
+          "No stable step IDs remain for a full plan replacement. No changes were made.",
+        );
+      const failure = planValidationFailure(created);
+      if (failure !== undefined) return yield* contractFailure(`${failure}; no changes were made.`);
+      return persistPlan(created, "update", nextStepNumber + created.steps.length);
     });
   }
 
   type TargetedPlanInput = Extract<
     WorkerPlanToolInput,
-    { readonly action: "update_step" | "add_step" | "remove_step" }
+    {
+      readonly action: "update_step" | "update_overview" | "add_step" | "remove_step";
+    }
   >;
 
   function handleTargetedEdit(targeted: TargetedPlanInput) {
@@ -409,12 +519,21 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         const next = yield* applyStepPatch(plan, targeted.id, targeted.patch);
         return persistPlan(next, "update_step");
       }
+      if (targeted.action === "update_overview") {
+        const next = yield* applyOverviewPatch(plan, targeted.patch);
+        return persistPlan(next, "update_overview");
+      }
       if (targeted.action === "add_step") {
-        const next = yield* applyStepAddition(plan, targeted.text, targeted.after_id);
-        return persistPlan(next, "add_step");
+        const next = yield* applyStepAddition(
+          plan,
+          targeted.text,
+          targeted.after_id,
+          nextStepNumber,
+        );
+        return persistPlan(next.plan, "add_step", next.nextStepNumber);
       }
       const next = yield* applyStepRemoval(plan, targeted.id, targeted.reason);
-      return persistPlan(next, "remove_step");
+      return persistPlan(next.plan, "remove_step", nextStepNumber, { removed: next.removed });
     });
   }
 
@@ -450,10 +569,10 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       name: "workgraph_plan",
       label: "Workgraph Plan",
       description:
-        "Inspect one bounded current implementation plan or apply one atomic step edit. The plan guides work but is not proof of correctness or completion.",
-      promptSnippet: "Inspect or apply one atomic edit to the bounded current plan",
+        "Inspect one current implementation plan or apply one atomic targeted edit. The plan guides work but is not proof of correctness or completion.",
+      promptSnippet: "Inspect or apply one atomic targeted edit to the current plan",
       promptGuidelines: [
-        "Use workgraph_plan to inspect the current plan or apply one atomic step edit with stable step IDs; keep targeted steps and notes current while executing the inherited approach, plan statuses are navigation only, not evidence.",
+        "Use workgraph_plan to inspect the current plan or apply one atomic targeted edit with stable step IDs; keep local implementation knowledge, steps, and notes current within the inherited assignment, plan statuses are navigation only, not evidence.",
       ],
       parameters: WorkerPlanToolSchema,
       execute(_id, params: WorkerPlanToolInput) {
@@ -649,23 +768,51 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     if (Value.Check(WorkerPlanEntrySchema, data)) {
       const decoded = Value.Decode(WorkerPlanEntrySchema, data);
       const ids = decoded.plan.steps.map((step) => step.id);
-      if (new Set(ids).size !== ids.length) return { kind: "malformed" };
-      return { kind: "valid", plan: structuredClone(decoded.plan) };
+      const minimumNext = nextNumberAfter(decoded.plan.steps);
+      const restoredNext = decoded.nextStepNumber ?? minimumNext;
+      if (
+        new Set(ids).size !== ids.length ||
+        minimumNext === undefined ||
+        restoredNext === undefined ||
+        restoredNext < minimumNext ||
+        planValidationFailure(decoded.plan) !== undefined
+      )
+        return { kind: "malformed", nextStepNumber: 1 };
+      return {
+        kind: "valid",
+        plan: structuredClone(decoded.plan),
+        nextStepNumber: restoredNext,
+      };
     }
     if (Value.Check(LegacyPlanEntrySchema, data)) {
       const decoded = Value.Decode(LegacyPlanEntrySchema, data);
-      return { kind: "valid", plan: createGuidePlan(decoded.plan) };
+      const restored = createGuidePlan(decoded.plan, 1);
+      if (restored === undefined || planValidationFailure(restored) !== undefined)
+        return { kind: "malformed", nextStepNumber: 1 };
+      return {
+        kind: "valid",
+        plan: restored,
+        nextStepNumber: restored.steps.length + 1,
+      };
     }
-    return { kind: "malformed" };
+    return { kind: "malformed", nextStepNumber: 1 };
   }
 
   function latestAttemptPlan(entries: SessionEntry[]): PlanRestore {
-    for (const entry of [...entries].reverse()) {
+    let latest: PlanRestore = { kind: "absent" };
+    let allocationFloor = 1;
+    for (const entry of entries) {
       if (entry.type !== "custom" || entry.customType !== "pi-workgraph-worker-plan") continue;
       if (!isCurrentAttemptData(entry.data)) continue;
-      return restorePlanEntry(entry.data);
+      const restored = restorePlanEntry(entry.data);
+      if (restored.kind === "valid")
+        allocationFloor = Math.max(allocationFloor, restored.nextStepNumber);
+      latest =
+        restored.kind === "valid"
+          ? { ...restored, nextStepNumber: allocationFloor }
+          : { kind: "malformed", nextStepNumber: allocationFloor };
     }
-    return { kind: "absent" };
+    return latest;
   }
 
   function latestAttemptObjective(entries: SessionEntry[]): ObjectiveRestore {
@@ -734,11 +881,11 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     if (plan === undefined) {
       if (planStatus === "malformed")
         return phase === "guide"
-          ? "Current bounded plan: unavailable because the latest current-attempt plan state was malformed. Recreate it with workgraph_plan update; do not treat the missing plan as evidence."
-          : "Current bounded plan: unavailable because the latest current-attempt plan state was malformed. Do not infer or author replacement direction; continue only with truthful work, report, or escalation within the inherited assignment and explain that no scope was inferred.";
+          ? "Current plan: unavailable because the latest current-attempt plan state was malformed. Recreate it with workgraph_plan update; do not treat the missing plan as evidence."
+          : "Current plan: unavailable because the latest current-attempt plan state was malformed. Do not infer or author replacement direction; continue only with truthful work, report, or escalation within the inherited assignment and explain that no scope was inferred.";
       return phase === "guide"
-        ? "Current bounded plan: none recorded yet. Use workgraph_plan update only when a plan helps the assignment."
-        : "Current bounded plan: none recorded yet. Do not infer or author plan direction; continue only with truthful work, report, or escalation within the inherited assignment and explain that no scope was inferred.";
+        ? "Current plan: none recorded yet. Use workgraph_plan update only when a plan helps the assignment."
+        : "Current plan: none recorded yet. Do not infer or author plan direction; continue only with truthful work, report, or escalation within the inherited assignment and explain that no scope was inferred.";
     }
     const steps = plan.steps
       .map(
@@ -747,9 +894,9 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       )
       .join("\n");
     return [
-      "Current bounded plan (navigation only; statuses are not correctness evidence):",
+      "Current plan (navigation only; statuses are not correctness evidence):",
       `Approach: ${plan.approach}`,
-      `Rationale and constraints: ${plan.rationale}`,
+      `Rationale: ${plan.rationale}`,
       `Risks and unknowns: ${plan.risks || "none recorded"}`,
       "Steps:",
       steps,
@@ -862,6 +1009,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
 
   function restoreWorkerSession(branch: SessionEntry[]): void {
     phase = mode === "implementation" && !continued ? "guide" : "executor";
+    nextStepNumber = 1;
     reminderCount = 0;
     switchError = undefined;
     switchedAt = undefined;
@@ -875,6 +1023,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     const restoredPlan = latestAttemptPlan(branch);
     planStatus = restoredPlan.kind;
     plan = restoredPlan.kind === "valid" ? restoredPlan.plan : undefined;
+    if (restoredPlan.kind !== "absent") nextStepNumber = restoredPlan.nextStepNumber;
     planStateWarning =
       restoredPlan.kind === "malformed"
         ? "The latest current-attempt plan state was malformed and was ignored; continue conservatively and report the limitation."
@@ -1131,9 +1280,9 @@ const consultationInstructions =
 const reviewInstructions =
   "[WORKGRAPH REVIEW]\nReview only the identified subject and concern. Ordinary result, artifact, and comparison reviews may observe the live project cwd. An exact revision review runs in an owned worktree checked out at the requested SHA; inspect that exact commit with Git (for example git show, git diff, and git ls-tree) and cite that revision in evidence. Do not silently treat live working files as that commit or claim tests against another revision. Execute verification only when it genuinely targets the requested subject. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
 const guideInstructions =
-  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current isolated worktree. Treat its settled decisions as constraints; ground the local plan in code without replacing the intended solution. If implementation requires choosing an unsettled responsibility owner, retained or removed mechanism, interaction contract, consumer or integration change, end-to-end flow, or failure, ordering, precedence, concurrency, or lifetime behavior, escalate before editing. Return specific contradictions or consequential decisions outside the stated discretion to the coordinator rather than silently resolving them. If the requirement already holds, verify it and report no_change with the inspected base revision and reason; no edit or executor turn is required. If a change is needed, use workgraph_plan once with action update to record one concise bounded plan grounded in inspected code, with rationale and constraints, concrete risks or unknowns, and implementation and meaningful verification steps. The guide owns the approach, rationale, and initial risks; the update assigns stable step IDs. Then make the first useful implementation edit yourself. Recording or revising the plan does not switch models. The first successful edit or observed Git change triggers the executor switch; do not stop or wait for a handoff after planning. Changed work must complete through the executor. Missing plan state does not block truthful implementation, failure, or escalation. If required work crosses the authorized scope, report escalation without editing.";
+  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current isolated worktree. Treat its settled decisions as constraints; ground the local plan in code without replacing the intended solution. If implementation requires choosing an unsettled responsibility owner, retained or removed mechanism, interaction contract, consumer or integration change, end-to-end flow, or failure, ordering, precedence, concurrency, or lifetime behavior, escalate before editing. Return specific contradictions or consequential decisions outside the stated discretion to the coordinator rather than silently resolving them. If the requirement already holds, verify it and report no_change with the inspected base revision and reason; no edit or executor turn is required. If a change is needed, use workgraph_plan with action update to record one concise plan grounded in inspected code. Prefer 5-9 meaningful implementation or verification steps, use fewer for genuinely small work, and retain every explicitly required task. Record the local approach and rationale, concrete risks or unknowns, and meaningful verification. The update assigns stable step IDs. Then make the first useful implementation edit yourself. Recording or revising the plan does not switch models. The first successful edit or observed Git change triggers the executor switch; do not stop or wait for a handoff after planning. Changed work must complete through the executor. Missing plan state does not block truthful implementation, failure, or escalation. If required work crosses the authorized scope, report escalation without editing.";
 function executorInstructions(): string {
-  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory in the isolated worktree and preserve the inherited assignment. Adjust local execution steps within its stated discretion; return conflicts with settled decisions or missing consequential decisions to the coordinator rather than redesigning the solution. If later evidence exposes an unsettled responsibility owner, retained or removed mechanism, interaction contract, consumer or integration change, end-to-end flow, or failure, ordering, precedence, concurrency, or lifetime behavior, stop editing and escalate. Inspect the current bounded plan with stable step IDs and independently reconcile it against the worktree. Use workgraph_plan targeted actions only (get, update_step, add_step, remove_step) to execute the inherited approach: update step text, status, and notes as work proceeds and record new findings there; never replace the full plan or mutate the inherited approach, rationale, or initial risks. Escalate consequential approach conflicts to the coordinator instead of inferring new scope; no schema verifies semantic conformity. When the plan is absent or malformed, do not author replacement direction; continue only with truthful work, report, or escalation and explain that no scope was inferred. Plan statuses are not correctness evidence and unfinished steps do not block a truthful failure or escalation. Complete the bounded assignment and run meaningful verification. For changed code, create exactly one direct commit on the supplied base and leave the worktree clean. If verification establishes no change is needed and the worktree is clean at the supplied base, report no_change with that revision and reason instead. Return workgraph_report with evidence and explicit limitations. Escalate required work beyond the authorized scope.";
+  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory in the isolated worktree and preserve the inherited assignment. Adjust local implementation knowledge and execution steps within its stated discretion; return conflicts with settled decisions or missing consequential decisions to the coordinator rather than redesigning the solution. If later evidence exposes an unsettled responsibility owner, retained or removed mechanism, interaction contract, consumer or integration change, end-to-end flow, or failure, ordering, precedence, concurrency, or lifetime behavior, stop editing and escalate. Inspect the current plan with stable step IDs and independently reconcile it against the worktree. Use workgraph_plan targeted actions only (get, update_overview, update_step, add_step, remove_step): keep the local approach, rationale, risks, step text, statuses, and notes current as evidence changes, but never replace the full plan. Escalate consequential conflicts to the coordinator instead of inferring new scope; the immutable assignment remains authoritative and no schema verifies semantic conformity. When the plan is absent or malformed, do not author replacement direction; continue only with truthful work, report, or escalation and explain that no scope was inferred. Plan statuses are not correctness evidence and unfinished steps do not block a truthful failure or escalation. Complete the bounded assignment and run meaningful verification. For changed code, create exactly one direct commit on the supplied base and leave the worktree clean. If verification establishes no change is needed and the worktree is clean at the supplied base, report no_change with that revision and reason instead. Return workgraph_report with evidence and explicit limitations. Escalate required work beyond the authorized scope.";
 }
 function gitEffect(pi: ExtensionAPI, cwd: string, args: string[], allowEmpty = false) {
   return Effect.gen(function* () {

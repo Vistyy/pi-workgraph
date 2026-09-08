@@ -166,6 +166,70 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
       );
       return {
         tool: {
+          id: "overview-call",
+          name: "workgraph_plan",
+          arguments: {
+            action: "update_overview",
+            patch: {
+              approach: "Commit the observed authorized edit and report its direct evidence.",
+              rationale:
+                "The first edit confirmed the fixture path without changing assignment scope.",
+              risks: "Mutable implementation knowledge must append without rewriting the prefix.",
+            },
+          },
+        },
+      };
+    },
+    (request) => {
+      assert.equal(request.model, "executor");
+      const result = request.messages.find((message) =>
+        JSON.stringify(message).includes('"tool_call_id":"overview-call"'),
+      );
+      if (result === undefined)
+        throw new Error("Executor overview result did not reach the next request.");
+      assert.match(JSON.stringify(result), /without rewriting the prefix/);
+      return {
+        tool: {
+          id: "add-step-call",
+          name: "workgraph_plan",
+          arguments: {
+            action: "add_step",
+            text: "Confirm the committed fixture bytes.",
+          },
+        },
+      };
+    },
+    (request) => {
+      assert.equal(request.model, "executor");
+      const result = request.messages.find((message) =>
+        JSON.stringify(message).includes('"tool_call_id":"add-step-call"'),
+      );
+      if (result === undefined)
+        throw new Error("Added step result did not reach the next request.");
+      assert.match(JSON.stringify(result), /step-2 pending/);
+      return {
+        tool: {
+          id: "remove-step-call",
+          name: "workgraph_plan",
+          arguments: {
+            action: "remove_step",
+            id: "step-2",
+            reason:
+              "The existing verification evidence already covers this separate navigation row.",
+          },
+        },
+      };
+    },
+    (request) => {
+      assert.equal(request.model, "executor");
+      const result = request.messages.find((message) =>
+        JSON.stringify(message).includes('"tool_call_id":"remove-step-call"'),
+      );
+      if (result === undefined)
+        throw new Error("Removed step result did not reach the next request.");
+      assert.doesNotMatch(JSON.stringify(result), /step-2 pending/);
+      return {
+        tool: {
           id: "commit-call",
           name: "bash",
           arguments: { command: "git add value.txt && git commit -m 'Changed value'" },
@@ -257,6 +321,13 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
         request.model === "executor" ? 1 : 0,
       );
     }
+    assert.ok(
+      provider.requests.some((request) =>
+        request.messages.some((message) =>
+          JSON.stringify(message).includes("Mutable implementation knowledge must append"),
+        ),
+      ),
+    );
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "after\n");
     assert.equal(await git(f.root, "status", "--porcelain"), "");
     assert.equal(await git(f.root, "rev-parse", "HEAD^"), f.base);
