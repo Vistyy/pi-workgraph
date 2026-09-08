@@ -6,8 +6,13 @@ import {
   effectiveModelObservations,
   hasNativeAgentSettled,
   hasNativeAgentStarted,
+  nativeSubmissionEvidence,
   observeNativeFailure,
+  providerAvailabilityEvidence,
+  readEnrichmentPacketResult,
+  readModelPreflight,
   readTerminalText,
+  readWorkerText,
   readWorkgraphReportResult,
 } from "./pi-process.js";
 import { WorkgraphRegistry } from "./registry.js";
@@ -153,11 +158,27 @@ export const runtimePi = {
   readReport: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
     pi("read worker report", () => readWorkgraphReportResult(sessionFile, generation)),
   readText: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
-    pi("read worker text", () => readTerminalText(sessionFile, generation)),
+    pi("read worker text", () => readWorkerText(sessionFile, generation)),
+  advisorText: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+    pi("read advisor terminal text", () => readTerminalText(sessionFile, generation)),
   observeFailure: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
     pi("observe worker failure", () => observeNativeFailure(sessionFile, generation)),
   models: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
     pi("read effective models", () => effectiveModelObservations(sessionFile, generation)),
+  enrichment: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+    pi("read enrichment packet", () => readEnrichmentPacketResult(sessionFile, generation)),
+  submissionEvidence: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+    pi("read native submission evidence", () => nativeSubmissionEvidence(sessionFile, generation)),
+  providerAvailability: (
+    sessionFile: string,
+    generation: { runId: string; nodeId: string },
+    target: { model: string; thinking: string },
+  ) =>
+    pi("read provider availability evidence", () =>
+      providerAvailabilityEvidence(sessionFile, generation, target),
+    ),
+  preflight: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+    pi("read model preflight", () => readModelPreflight(sessionFile, generation)),
   started: hasNativeAgentStarted,
   settled: hasNativeAgentSettled,
 };

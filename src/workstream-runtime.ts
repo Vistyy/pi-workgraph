@@ -45,6 +45,8 @@ import {
   loadModelPolicyEffect,
   type ModelPolicy,
   type ModelPolicyError,
+  type ModelTarget,
+  ModelTargetSchema,
   resolveSelection,
   resolveTargetOverride,
   type SelectionRequest,
@@ -52,13 +54,17 @@ import {
 } from "./model-policy.js";
 import type {
   createWorkerSessionEffect,
+  ModelPreflight,
   NativeFailureCategory,
+  NativeSubmissionEvidence,
   PiSessionError,
+  ProviderAvailabilityEvidence,
 } from "./pi-process.js";
 import type { WorkgraphRegistry } from "./registry.js";
 import type { WorkerIdentity } from "./types.js";
 import type {
   CandidateLineage,
+  ConsultationPhase,
   StoreEffect,
   WorkAssignment,
   WorkAttempt,
@@ -425,11 +431,11 @@ export class WorkstreamRuntime {
         );
         const policy = yield* this.policy;
         const base = yield* this.resolveQueueBaseEffect(input, options);
-        const attempts = yield* this.runtimeSync("prepare queued attempt", () =>
-          input.capability === "implement"
-            ? implementationAttempt(policy, options, base)
-            : selectedAttempts(input.capability, policy, options, base.revision),
-        );
+        const attempts = yield* this.runtimeSync("prepare queued attempt", () => {
+          if (input.capability === "implement") return implementationAttempt(policy, options, base);
+          if (input.capability === "consultation") return consultationAttempt(policy, input, base);
+          return selectedAttempts(input.capability, policy, options, base.revision);
+        });
         return yield* this.storeEffect((store) => store.enqueue(input, attempts));
       }.bind(this),
     );
@@ -701,7 +707,7 @@ export class WorkstreamRuntime {
           yield* this.cleanup(id);
           return;
         }
-        if (requiresLaunch(attempt)) {
+        if (requiresLaunch(attempt) || isConsultationAdvisorReady(attempt, assignment)) {
           if (state.lifecycle.state === "active")
             yield* this.launchAttempt(state, attempt, assignment);
           return;
@@ -741,6 +747,10 @@ export class WorkstreamRuntime {
           return;
         }
         if (observation.status === "working" || observation.status === "blocked") return;
+        if (assignment.capability === "consultation") {
+          yield* this.reconcileConsultationSettlement(state, attempt, assignment);
+          return;
+        }
         yield* this.retain(state, attempt, assignment);
       }.bind(this),
     );
@@ -848,6 +858,8 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     assignment: WorkAssignment,
   ): RuntimeEffect<void> {
+    if (assignment.capability === "consultation" && attempt.consultation?.phase === "advisor")
+      return this.launchConsultationAdvisor(state, attempt, assignment);
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const isolated = requiresIsolatedPlacement(
@@ -901,6 +913,417 @@ export class WorkstreamRuntime {
           this.store,
         );
         yield* this.workers.launch(request);
+      }.bind(this),
+    );
+  }
+
+  private reconcileConsultationSettlement(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        if (attempt.consultation?.phase === "enricher")
+          yield* this.reconcileConsultationEnricher(state, attempt, assignment);
+        else yield* this.reconcileConsultationAdvisorSettlement(state, attempt, assignment);
+        const latest = yield* this.storeEffect((store) => store.load());
+        const advanced = findAttempt(latest, attempt.id);
+        if (advanced.resultId !== undefined)
+          yield* this.advanceRetainedResult(attempt.id, assignment);
+      }.bind(this),
+    );
+  }
+
+  private reconcileConsultationAdvisorSettlement(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const target = required(
+          attempt.consultation?.selectedAdvisor ?? attempt.models?.advisor,
+          "selected advisor",
+        );
+        const evidence = yield* consultationLaunchEvidence(
+          attempt,
+          { runId: state.id, nodeId: attempt.id },
+          target,
+        );
+        if (
+          assignment.advisorOverride !== undefined &&
+          consultationUnavailableBeforeSubmission(target, attempt, evidence)
+        ) {
+          yield* this.cancelUnavailableAdvisor(state, attempt, attempt.id);
+          const reason = required(
+            consultationFallbackReason(target, evidence),
+            "consultation unavailability reason",
+          );
+          yield* this.storeEffect((store) =>
+            store.recordAttention(attempt.id, `Exact advisor target unavailable: ${reason}`),
+          );
+        } else if (consultationFallbackAllowed(assignment, attempt, target, evidence))
+          yield* this.advanceConsultationAdvisorFallback(state, attempt, target, evidence);
+        else {
+          const terminalText = yield* runtimePi.advisorText(
+            required(attempt.sessionFile, "advisor session"),
+            { runId: state.id, nodeId: attempt.id },
+          );
+          if (
+            terminalText === undefined &&
+            consultationSubmissionUncertain(attempt, target, evidence)
+          ) {
+            const failure = yield* runtimePi.observeFailure(
+              required(attempt.sessionFile, "advisor session"),
+              { runId: state.id, nodeId: attempt.id },
+            );
+            const detail =
+              failure === undefined
+                ? "Advisor settled without terminal assistant text; submission may have occurred."
+                : `Advisor settled with ${failure}; submission may have occurred.`;
+            yield* this.storeEffect((store) =>
+              store.recordConsultationUncertainty(attempt.id, detail),
+            );
+          }
+          yield* this.retainConsultationAdvisor(state, attempt, assignment);
+        }
+      }.bind(this),
+    );
+  }
+
+  private reconcileConsultationEnricher(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const sessionFile = required(attempt.sessionFile, "enricher session");
+        const generation = { runId: state.id, nodeId: attempt.id };
+        const packetRead = yield* runtimePi.enrichment(sessionFile, generation);
+        if (packetRead.packet === undefined) {
+          yield* this.retainConsultationFailure(
+            state,
+            attempt,
+            assignment,
+            packetRead.error ?? "The enricher did not produce a strict bounded packet.",
+          );
+          return;
+        }
+        const packet = required(packetRead.packet, "enrichment packet");
+        const effective = yield* runtimePi.models(sessionFile, generation);
+        const phase = consultationPhaseRecord(
+          "enricher",
+          attempt,
+          attempt.models?.guide,
+          effective,
+        );
+        const packetId = `enrichment-${attempt.id}`;
+        yield* this.storeEffect((store) =>
+          store.recordConsultationEnrichment({
+            id: attempt.id,
+            packetId,
+            packet,
+            phase,
+          }),
+        );
+        const latest = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
+        const worker = required(latest.worker, "enricher worker identity");
+        const closed = yield* this.workers.cleanup(worker);
+        if (closed.state === "pending") return;
+        if (closed.state !== "completed")
+          return yield* this.runtimeSync("validate enricher cleanup", () => {
+            throw new Error(closed.detail || "Enricher cleanup was not proven complete.");
+          });
+        yield* this.storeEffect((store) => store.closeConsultationEnricher(attempt.id));
+      }.bind(this),
+    );
+  }
+
+  private retainConsultationFailure(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+    detail: string,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const sessionFile = required(attempt.sessionFile, "enricher session");
+        const generation = { runId: state.id, nodeId: attempt.id };
+        const report: WorkerReport = {
+          kind: "consultation",
+          status: "failed",
+          text: detail,
+          summary: "Consultation could not produce its required enrichment packet.",
+          evidence: [],
+          findings: [{ severity: "error", title: "Missing enrichment packet", detail }],
+        };
+        const resultId = attempt.resultId ?? `result-${attempt.id}`;
+        if (!state.results.some((item) => item.id === resultId))
+          yield* this.storeEffect((store) =>
+            store.retainResult({
+              id: resultId,
+              assignmentId: assignment.id,
+              assignmentIntentVersion: assignment.intentVersion,
+              validity: "typed",
+              report,
+            }),
+          );
+        const effectiveModels = yield* runtimePi.models(sessionFile, generation);
+        yield* this.storeEffect((store) =>
+          store.settleAttempt({ id: attempt.id, resultId, effectiveModels }),
+        );
+      }.bind(this),
+    );
+  }
+
+  private retainConsultationAdvisor(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const sessionFile = required(attempt.sessionFile, "advisor session");
+        const generation = { runId: state.id, nodeId: attempt.id };
+        const text = yield* runtimePi.advisorText(sessionFile, generation);
+        const effectiveModels = yield* runtimePi.models(sessionFile, generation);
+        const target = required(attempt.models?.advisor, "selected advisor");
+        const phase = consultationPhaseRecord("advisor", attempt, target, effectiveModels);
+        yield* this.storeEffect((store) =>
+          store.recordConsultationAdvisorPhase(attempt.id, phase, effectiveModels),
+        );
+        const resultId = attempt.resultId ?? `result-${attempt.id}`;
+        if (!state.results.some((item) => item.id === resultId)) {
+          const report: WorkerReport =
+            text !== undefined && text !== ""
+              ? {
+                  kind: "consultation",
+                  status: "completed",
+                  text,
+                  summary: "Advisor terminal text retained as consultation evidence.",
+                  evidence: [],
+                  findings: [],
+                }
+              : {
+                  kind: "consultation",
+                  status: "failed",
+                  text: "Advisor settled without terminal assistant text.",
+                  summary: "Consultation advisor produced no terminal assistant text.",
+                  evidence: [],
+                  findings: [
+                    {
+                      severity: "error",
+                      title: "Missing advisor text",
+                      detail:
+                        "The advisor session settled without a terminal assistant text response.",
+                    },
+                  ],
+                };
+          yield* this.storeEffect((store) =>
+            store.retainResult({
+              id: resultId,
+              assignmentId: assignment.id,
+              assignmentIntentVersion: assignment.intentVersion,
+              validity: "typed",
+              report,
+            }),
+          );
+        }
+        yield* this.storeEffect((store) =>
+          store.settleAttempt({ id: attempt.id, resultId, effectiveModels }),
+        );
+      }.bind(this),
+    );
+  }
+
+  private launchConsultationAdvisor(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const target = required(
+          attempt.consultation?.selectedAdvisor ?? attempt.models?.advisor,
+          "selected advisor",
+        );
+        yield* this.storeEffect((store) =>
+          store.recordConsultationAdvisorSelection(attempt.id, target),
+        );
+        const latest = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
+        const workerCwd = state.projectRoot;
+        const sessionRequest = workerSessionRequest(
+          state,
+          latest,
+          assignment,
+          workerCwd,
+          latest.baseRevision,
+        );
+        const sessionFile = yield* runtimePi.createSession(sessionRequest);
+        yield* this.storeEffect((store) => store.recordSessionFile(attempt.id, sessionFile));
+        yield* this.ownershipEffect();
+        const models = required(latest.models, "consultation models");
+        yield* this.workers
+          .launch(
+            workerLaunchRequest(
+              this.launch.workspaceId,
+              state,
+              findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id),
+              assignment,
+              workerCwd,
+              sessionFile,
+              { ...models, guide: target },
+              latest.baseRevision,
+              this.store,
+            ),
+          )
+          .pipe(
+            Effect.catch((error) =>
+              this.handleConsultationLaunchFailure(state, attempt.id, assignment, error),
+            ),
+          );
+      }.bind(this),
+    );
+  }
+
+  private handleConsultationLaunchFailure(
+    state: WorkstreamState,
+    attemptId: string,
+    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+    error: RuntimeError,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const latestState = yield* this.storeEffect((store) => store.load());
+        const attempt = findAttempt(latestState, attemptId);
+        const target = required(
+          attempt.consultation?.selectedAdvisor ?? attempt.models?.advisor,
+          "selected advisor",
+        );
+        const evidence = yield* consultationLaunchEvidence(
+          attempt,
+          { runId: state.id, nodeId: attemptId },
+          target,
+        );
+        yield* this.recordConsultationAdvisorPhaseIfNeeded(attemptId, attempt, target, evidence);
+        if (!consultationFallbackAllowed(assignment, attempt, target, evidence)) {
+          if (
+            assignment.advisorOverride !== undefined &&
+            consultationUnavailableBeforeSubmission(target, attempt, evidence)
+          ) {
+            yield* this.cancelUnavailableAdvisor(latestState, attempt, attemptId);
+            yield* this.storeEffect((store) => store.recordAttention(attemptId, error.message));
+            return;
+          }
+          return yield* this.blockConsultationAdvisor(
+            attemptId,
+            attempt,
+            target,
+            evidence,
+            error.message,
+          );
+        }
+        yield* this.advanceConsultationAdvisorFallback(latestState, attempt, target, evidence);
+      }.bind(this),
+    );
+  }
+
+  private recordConsultationAdvisorPhaseIfNeeded(
+    attemptId: string,
+    attempt: WorkAttempt,
+    target: ModelTarget,
+    evidence: { submission: NativeSubmissionEvidence },
+  ): RuntimeEffect<void> {
+    if (attempt.consultation?.advisor !== undefined || attempt.sessionFile === undefined)
+      return Effect.void;
+    const phase = consultationPhaseRecord("advisor", attempt, target, []);
+    if (evidence.submission === "submitted") phase.submission = "submitted";
+    return this.storeEffect((store) => store.recordConsultationAdvisorPhase(attemptId, phase));
+  }
+
+  private blockConsultationAdvisor(
+    attemptId: string,
+    attempt: WorkAttempt,
+    target: ModelTarget,
+    evidence: ConsultationLaunchEvidence,
+    detail: string,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        if (!consultationSubmissionUncertain(attempt, target, evidence)) {
+          yield* this.storeEffect((store) => store.recordAttention(attemptId, detail));
+          return;
+        }
+        if (attempt.submission === "not_sent") {
+          yield* this.storeEffect((store) => store.markSubmission(attemptId, "uncertain"));
+          if (evidence.submission === "submitted")
+            yield* this.storeEffect((store) => store.markSubmission(attemptId, "submitted"));
+          const marked = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
+          const phase = marked.consultation?.advisor;
+          if (phase !== undefined)
+            yield* this.storeEffect((store) =>
+              store.recordConsultationAdvisorPhase(attemptId, {
+                ...phase,
+                submission: marked.submission ?? "uncertain",
+              }),
+            );
+        }
+        yield* this.storeEffect((store) => store.recordConsultationUncertainty(attemptId, detail));
+        yield* this.storeEffect((store) => store.recordAttention(attemptId, detail));
+      }.bind(this),
+    );
+  }
+
+  private advanceConsultationAdvisorFallback(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    target: ModelTarget,
+    evidence: ConsultationLaunchEvidence,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const reason = consultationFallbackReason(target, evidence);
+        if (reason === undefined)
+          return yield* this.runtimeSync("validate consultation fallback", () => {
+            throw new Error("Consultation fallback lacks conclusive target-bound unavailability.");
+          });
+        yield* this.recordConsultationAdvisorPhaseIfNeeded(attempt.id, attempt, target, evidence);
+        yield* this.storeEffect((store) =>
+          store.recordConsultationFallback(attempt.id, target, reason),
+        );
+        yield* this.cancelUnavailableAdvisor(state, attempt, attempt.id);
+        const next = nextAdvisorCandidate(attempt, target);
+        if (next !== undefined)
+          yield* this.storeEffect((store) => store.retryConsultationAdvisor(attempt.id, next));
+        else
+          yield* this.storeEffect((store) =>
+            store.recordAttention(
+              attempt.id,
+              `No configured consultation advisor remained after ${target.model} was unavailable.`,
+            ),
+          );
+      }.bind(this),
+    );
+  }
+
+  private cancelUnavailableAdvisor(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    attemptId: string,
+  ): RuntimeEffect<void> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const recoveredWorker = yield* this.recoverCancellationWorker(state, attempt);
+        yield* this.storeEffect((store) => store.cancelAttempt(attemptId));
+        const cancelled = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
+        if (
+          cancelled.state === "cancel_requested" &&
+          hasProvenNoNativeLaunchAfterSession(cancelled)
+        )
+          yield* this.finishUnlaunchedCancellation(attemptId);
+        else yield* this.cancelOwnedWorker(attemptId, cancelled.state, recoveredWorker);
       }.bind(this),
     );
   }
@@ -1210,12 +1633,31 @@ export class WorkstreamRuntime {
               throw new Error(result.detail ?? "Worker cleanup is not proven complete.");
             });
           yield* this.storeEffect((store) => store.markWorkerClosed(attempt.id));
+          yield* this.closeConsultationPhaseIfNeeded(attempt, assignment);
         }
         yield* this.ownershipEffect();
         yield* this.cleanupPlacement(state, attempt, cleanup, assignment);
         yield* this.storeEffect((store) => store.finishCleanup(attempt.id));
       }.bind(this),
     );
+  }
+
+  private closeConsultationPhaseIfNeeded(
+    attempt: WorkAttempt,
+    assignment: WorkAssignment,
+  ): RuntimeEffect<void> {
+    if (assignment.capability !== "consultation") return Effect.void;
+    if (
+      attempt.consultation?.phase === "enricher" &&
+      (attempt.consultation.enricher !== undefined || attempt.sessionFile !== undefined)
+    )
+      return this.storeEffect((store) => store.markConsultationEnricherClosed(attempt.id));
+    if (
+      attempt.consultation?.phase === "advisor" &&
+      (attempt.consultation.advisor !== undefined || attempt.sessionFile !== undefined)
+    )
+      return this.storeEffect((store) => store.markConsultationAdvisorClosed(attempt.id));
+    return Effect.void;
   }
 
   private cleanupPlacement(
@@ -1345,14 +1787,14 @@ export class WorkstreamRuntime {
     state: WorkstreamState,
     attempt: WorkAttempt,
   ): RuntimeEffect<WorkerIdentity | undefined> {
+    const assignment = findAssignment(state, attempt.assignmentId);
     if (
       attempt.state !== "starting" ||
       attempt.sessionFile === undefined ||
-      attempt.launchPane !== undefined ||
-      attempt.worker !== undefined
+      attempt.worker !== undefined ||
+      (attempt.launchPane !== undefined && assignment?.capability !== "consultation")
     )
       return Effect.succeed(attempt.worker);
-    const assignment = findAssignment(state, attempt.assignmentId);
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const recovered = yield* this.workers.recover(
@@ -1407,11 +1849,38 @@ export class WorkstreamRuntime {
 type EnqueuedAttempt = {
   id: string;
   models: NonNullable<WorkAttempt["models"]>;
+  consultation?: NonNullable<WorkAttempt["consultation"]>;
   continuationOf?: string;
   candidate?: CandidateLineage;
   baseRevision?: string;
 };
 type WorkerReport = Extract<WorkResult, { validity: "typed" }>["report"];
+
+function consultationPhaseRecord(
+  phase: "enricher" | "advisor",
+  attempt: WorkAttempt,
+  target: ModelTarget | undefined,
+  effective: ReadonlyArray<{ model: string; thinking?: string }>,
+): ConsultationPhase {
+  const exactTarget = required(target, `${phase} model target`);
+  const record: ConsultationPhase = {
+    phase,
+    sessionFile: required(attempt.sessionFile, `${phase} session`),
+    target: { model: exactTarget.model, thinking: exactTarget.thinking },
+    submission: required(attempt.submission, `${phase} submission`),
+  };
+  if (attempt.launchPane !== undefined) record.launchPane = structuredClone(attempt.launchPane);
+  if (attempt.resource !== undefined) record.resource = structuredClone(attempt.resource);
+  if (attempt.worker !== undefined) record.worker = structuredClone(attempt.worker);
+  const models = effective.map((model) => {
+    const candidate = { model: model.model, thinking: model.thinking ?? "off" };
+    if (!Value.Check(ModelTargetSchema, candidate))
+      throw new Error(`Invalid effective ${phase} model evidence.`);
+    return Value.Decode(ModelTargetSchema, candidate);
+  });
+  if (models.length > 0) record.effectiveModels = models;
+  return record;
+}
 
 function implementationAttempt(
   policy: ModelPolicy,
@@ -1423,6 +1892,43 @@ function implementationAttempt(
   if (options.continuationOf !== undefined) attempt.continuationOf = options.continuationOf;
   if (base.revision !== undefined) attempt.baseRevision = base.revision;
   if (base.candidate !== undefined) attempt.candidate = base.candidate;
+  return attempt;
+}
+
+function consultationAttempt(
+  policy: ModelPolicy,
+  input: Omit<Extract<WorkAssignment, { capability: "consultation" }>, "createdAt">,
+  base: QueueBase,
+): EnqueuedAttempt {
+  const advisorCandidates: ModelTarget[] = input.advisorOverride
+    ? [{ ...input.advisorOverride }]
+    : policy.roles["consultation.advisor"].map((choice) => ({
+        model: choice.model,
+        thinking: choice.thinking,
+      }));
+  const enricher = { ...policy.roles["consultation.enricher"] };
+  const advisor = advisorCandidates[0];
+  if (advisor === undefined) throw new Error("Consultation advisor policy must be nonempty.");
+  if (
+    new Set(advisorCandidates.map((candidate) => `${candidate.model}\0${candidate.thinking}`))
+      .size !== advisorCandidates.length
+  )
+    throw new Error("Consultation advisor policy cannot contain duplicate exact model targets.");
+  const attempt: EnqueuedAttempt = {
+    id: `attempt-${randomUUID()}`,
+    models: {
+      guide: enricher,
+      advisor: { ...advisor },
+      source: input.advisorOverride === undefined ? "policy" : "override",
+    },
+    consultation: {
+      phase: "enricher",
+      advisorCandidates,
+      advisorHistory: [],
+      fallbackHistory: [],
+    },
+  };
+  if (base.revision !== undefined) attempt.baseRevision = base.revision;
   return attempt;
 }
 
@@ -1510,6 +2016,13 @@ function canRetryCleanupBoundary(state: WorkstreamState, attempt: WorkAttempt): 
 function requiresLaunch(attempt: WorkAttempt): boolean {
   return attempt.state === "queued";
 }
+function isConsultationAdvisorReady(attempt: WorkAttempt, assignment: WorkAssignment): boolean {
+  return (
+    assignment.capability === "consultation" &&
+    attempt.consultation?.phase === "advisor" &&
+    attempt.sessionFile === undefined
+  );
+}
 
 function exactReviewRevision(
   input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
@@ -1557,6 +2070,128 @@ function hasProvenNoNativeLaunch(attempt: WorkAttempt): boolean {
     attempt.worker === undefined
   );
 }
+function hasProvenNoNativeLaunchAfterSession(attempt: WorkAttempt): boolean {
+  return (
+    attempt.sessionFile !== undefined &&
+    attempt.launchPane === undefined &&
+    attempt.resource === undefined &&
+    attempt.worker === undefined
+  );
+}
+function sameTarget(left: ModelTarget, right: ModelTarget): boolean {
+  return left.model === right.model && left.thinking === right.thinking;
+}
+type ConsultationLaunchEvidence = {
+  submission: NativeSubmissionEvidence;
+  preflight: ModelPreflight | undefined;
+  availability: ProviderAvailabilityEvidence;
+};
+
+function consultationLaunchEvidence(
+  attempt: WorkAttempt,
+  generation: { runId: string; nodeId: string },
+  target: ModelTarget,
+): RuntimeEffect<ConsultationLaunchEvidence> {
+  return Effect.gen(function* () {
+    const submission =
+      attempt.sessionFile === undefined
+        ? ("absent" as const)
+        : yield* runtimePi.submissionEvidence(attempt.sessionFile, generation);
+    const preflight =
+      attempt.sessionFile === undefined
+        ? undefined
+        : yield* runtimePi.preflight(attempt.sessionFile, generation);
+    const availability =
+      attempt.sessionFile === undefined
+        ? ("absent" as const)
+        : yield* runtimePi.providerAvailability(attempt.sessionFile, generation, target);
+    return { submission, preflight, availability };
+  });
+}
+function matchingUnavailablePreflight(
+  target: ModelTarget,
+  preflight: ModelPreflight | undefined,
+): ModelPreflight | undefined {
+  if (
+    preflight === undefined ||
+    preflight.model !== target.model ||
+    preflight.thinking !== target.thinking ||
+    !["missing_model", "missing_credentials", "unsupported_thinking"].includes(preflight.state)
+  )
+    return undefined;
+  return preflight;
+}
+function matchingUnavailableProvider(
+  target: ModelTarget,
+  availability: ProviderAvailabilityEvidence,
+): Extract<ProviderAvailabilityEvidence, { state: "unavailable" }> | undefined {
+  if (
+    availability === "absent" ||
+    availability === "contradictory" ||
+    availability.model !== target.model ||
+    availability.thinking !== target.thinking
+  )
+    return undefined;
+  return availability;
+}
+function consultationSubmissionUncertain(
+  attempt: WorkAttempt,
+  target: ModelTarget,
+  evidence: ConsultationLaunchEvidence,
+): boolean {
+  if (evidence.submission === "submitted" || evidence.submission === "contradictory") return true;
+  if (matchingUnavailablePreflight(target, evidence.preflight) !== undefined)
+    return (attempt.submission ?? "not_sent") !== "not_sent";
+  if (matchingUnavailableProvider(target, evidence.availability) !== undefined) return false;
+  return !(
+    (attempt.submission ?? "not_sent") === "not_sent" &&
+    attempt.worker === undefined &&
+    attempt.launchPane === undefined &&
+    attempt.resource === undefined
+  );
+}
+function consultationFallbackReason(
+  target: ModelTarget,
+  evidence: ConsultationLaunchEvidence,
+): string | undefined {
+  const preflight = matchingUnavailablePreflight(target, evidence.preflight);
+  if (preflight !== undefined) return preflight.detail;
+  return matchingUnavailableProvider(target, evidence.availability)?.reason;
+}
+function consultationUnavailableBeforeSubmission(
+  target: ModelTarget,
+  attempt: WorkAttempt,
+  evidence: ConsultationLaunchEvidence,
+): boolean {
+  if (
+    consultationFallbackReason(target, evidence) === undefined ||
+    evidence.submission === "submitted" ||
+    evidence.submission === "contradictory"
+  )
+    return false;
+  if (matchingUnavailablePreflight(target, evidence.preflight) !== undefined)
+    return (attempt.submission ?? "not_sent") === "not_sent";
+  return matchingUnavailableProvider(target, evidence.availability) !== undefined;
+}
+function consultationFallbackAllowed(
+  assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+  attempt: WorkAttempt,
+  target: ModelTarget,
+  evidence: ConsultationLaunchEvidence,
+): boolean {
+  if (assignment.advisorOverride !== undefined) return false;
+  const preflight = matchingUnavailablePreflight(target, evidence.preflight);
+  const provider = matchingUnavailableProvider(target, evidence.availability);
+  if (preflight === undefined && provider === undefined) return false;
+  if (evidence.submission === "submitted" || evidence.submission === "contradictory") return false;
+  if (preflight !== undefined) return (attempt.submission ?? "not_sent") === "not_sent";
+  return provider !== undefined;
+}
+function nextAdvisorCandidate(attempt: WorkAttempt, target: ModelTarget): ModelTarget | undefined {
+  const candidates = attempt.consultation?.advisorCandidates ?? [];
+  const currentIndex = candidates.findIndex((candidate) => sameTarget(candidate, target));
+  return currentIndex < 0 ? undefined : candidates[currentIndex + 1];
+}
 function hasRetainedSession(attempt: WorkAttempt): boolean {
   return (
     (attempt.state === "starting" ||
@@ -1579,7 +2214,7 @@ function workerRecoveryRequest(
       attemptId: attempt.id,
       assignmentId: assignment.id,
       objective: assignment.objective,
-      role: assignment.capability,
+      role: workerRoleFor(assignment, phaseFor(attempt)),
     }),
     cwd: attempt.placement?.path ?? state.projectRoot,
     sessionFile: required(attempt.sessionFile, "session file"),
@@ -1598,7 +2233,7 @@ function workerSessionRequest(
     targetCwd: workerCwd,
     sessionDir: join(dirname(state.statePath), "sessions"),
     objective: objectiveFor(state, attempt, assignment, workerCwd, baseRevision),
-    mode: modeFor(assignment),
+    mode: modeFor(assignment, phaseFor(attempt)),
     runId: state.id,
     nodeId: attempt.id,
   };
@@ -1619,9 +2254,12 @@ function workerLaunchRequest(
   models: NonNullable<WorkAttempt["models"]>,
   baseRevision: string | undefined,
   store: WorkstreamStoreEffects,
-): WorkerLaunchEffectRequest<WorkstreamStoreError, FileSystem.FileSystem | Path.Path> {
+): WorkerLaunchEffectRequest<
+  RuntimeError | WorkstreamStoreError,
+  FileSystem.FileSystem | Path.Path
+> {
   const environment = new Map<string, string>([
-    ["PI_WORKGRAPH_MODE", modeFor(assignment)],
+    ["PI_WORKGRAPH_MODE", modeFor(assignment, phaseFor(attempt))],
     ["PI_WORKGRAPH_RUN_ID", state.id],
     ["PI_WORKGRAPH_NODE_ID", attempt.id],
     ["PI_WORKGRAPH_REPOSITORY", state.projectRoot],
@@ -1632,34 +2270,81 @@ function workerLaunchRequest(
     environment.set("PI_CODING_AGENT_DIR", codingAgentDir);
   if (assignment.artifactIntent === "disposable_experiment")
     environment.set("PI_WORKGRAPH_EXPERIMENT", "1");
+  const phase = phaseFor(attempt);
+  const phaseTarget = phase === "advisor" && models.advisor ? models.advisor : models.guide;
+  environment.set("PI_WORKGRAPH_TARGET_MODEL", phaseTarget.model);
+  environment.set("PI_WORKGRAPH_TARGET_THINKING", phaseTarget.thinking);
   if (models.executor !== undefined) {
     environment.set("PI_WORKGRAPH_IMPLEMENTATION_START", "guide");
     environment.set("PI_WORKGRAPH_EXECUTOR_MODEL", models.executor.model);
     environment.set("PI_WORKGRAPH_EXECUTOR_THINKING", models.executor.thinking);
   }
   const env = Object.fromEntries(environment);
-  return {
+  const preflight:
+    | (() => Effect.Effect<
+        void,
+        RuntimeError | WorkstreamStoreError,
+        FileSystem.FileSystem | Path.Path
+      >)
+    | undefined =
+    assignment.capability === "consultation" && phase === "advisor"
+      ? () =>
+          Effect.gen(function* () {
+            const evidence = yield* runtimePi.preflight(sessionFile, {
+              runId: state.id,
+              nodeId: attempt.id,
+            });
+            if (
+              evidence?.state !== "ready" ||
+              evidence.model !== phaseTarget.model ||
+              evidence.thinking !== phaseTarget.thinking
+            )
+              return yield* new RuntimeOperationError({
+                operation: "consultation model preflight",
+                cause: new Error(
+                  evidence?.detail ??
+                    "No generation-scoped model preflight evidence was recorded before advisor submission.",
+                ),
+              });
+            yield* store.markSubmission(attempt.id, "uncertain");
+          })
+      : undefined;
+  const launch: WorkerLaunchEffectRequest<
+    RuntimeError | WorkstreamStoreError,
+    FileSystem.FileSystem | Path.Path
+  > = {
     workspaceId,
     runId: state.id,
     nodeId: attempt.id,
     attemptId: attempt.id,
     assignmentId: assignment.id,
     objective: assignment.objective,
-    role: assignment.capability,
+    role: workerRoleFor(assignment, phaseFor(attempt)),
     cwd,
     sessionFile,
     prompt: workerPrompt(state, attempt, assignment, cwd, baseRevision),
-    model: models.guide.model,
-    thinking: models.guide.thinking,
+    model:
+      phaseFor(attempt) === "advisor" && models.advisor ? models.advisor.model : models.guide.model,
+    thinking:
+      phaseFor(attempt) === "advisor" && models.advisor
+        ? models.advisor.thinking
+        : models.guide.thinking,
     env,
     onTab: (pane) => store.recordLaunchPane(attempt.id, pane).pipe(Effect.asVoid),
     onResource: (resource) => store.recordResource(attempt.id, resource).pipe(Effect.asVoid),
-    onIdentity: (worker) =>
-      store
-        .recordWorker(attempt.id, worker)
-        .pipe(Effect.andThen(store.markSubmission(attempt.id, "uncertain")), Effect.asVoid),
+    onIdentity: (worker) => {
+      const recorded = store.recordWorker(attempt.id, worker);
+      if (assignment.capability === "consultation" && phase === "advisor")
+        return recorded.pipe(Effect.asVoid);
+      return recorded.pipe(
+        Effect.andThen(store.markSubmission(attempt.id, "uncertain")),
+        Effect.asVoid,
+      );
+    },
     onSubmitted: () => store.markSubmission(attempt.id, "submitted").pipe(Effect.asVoid),
   };
+  if (preflight !== undefined) launch.onPreflight = preflight;
+  return launch;
 }
 function isNoChangeImplementation(
   assignment: WorkAssignment,
@@ -1757,12 +2442,28 @@ function absentResultDetail(failure: NativeFailureCategory | undefined): string 
   }
 }
 
-function modeFor(assignment: WorkAssignment) {
-  return assignment.capability === "implement"
-    ? "implementation"
-    : assignment.capability === "review"
-      ? "review"
-      : "research";
+function phaseFor(attempt: WorkAttempt): "enricher" | "advisor" | undefined {
+  return attempt.consultation?.phase;
+}
+
+function workerRoleFor(
+  assignment: WorkAssignment,
+  phase: "enricher" | "advisor" | undefined,
+): "implement" | "research" | "review" | "consultation" | "consultation_enricher" {
+  if (assignment.capability !== "consultation")
+    return assignment.capability === "implement" ? "implement" : assignment.capability;
+  return phase === "enricher" ? "consultation_enricher" : "consultation";
+}
+
+function modeFor(
+  assignment: WorkAssignment,
+  phase?: "enricher" | "advisor",
+): "implementation" | "review" | "research" | "consultation" | "consultation_enricher" {
+  if (assignment.capability === "implement") return "implementation";
+  if (assignment.capability === "review") return "review";
+  if (assignment.capability === "consultation")
+    return phase === "enricher" ? "consultation_enricher" : "consultation";
+  return "research";
 }
 function appendCandidatePrompt(
   lines: string[],
@@ -1814,6 +2515,29 @@ function workerPrompt(
   lines.push("Continue the assigned Workgraph objective now.");
   return lines.join("\n");
 }
+function appendConsultationObjective(
+  lines: string[],
+  assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+  attempt: WorkAttempt,
+): void {
+  lines.push(`Question: ${assignment.question}`);
+  if (assignment.context !== undefined)
+    lines.push(`Coordinator-known context: ${assignment.context}`);
+  if (assignment.enrichmentFocus !== undefined)
+    lines.push(`Enrichment focus: ${assignment.enrichmentFocus}`);
+  if (phaseFor(attempt) === "advisor") {
+    lines.push(
+      "This is a fresh advisor session. The enricher transcript is not available and must not be inferred.",
+      `Frozen enrichment packet: ${JSON.stringify(attempt.consultation?.packet)}`,
+      "Provide advice as evidence only; do not claim coordinator acceptance or authority.",
+    );
+    return;
+  }
+  lines.push(
+    "Enrichment is mandatory. Use read-only tools, collect source observations and counterevidence, record local state identity and explicit gaps, and finish with workgraph_enrichment. Do not decide or summarize the answer.",
+  );
+}
+
 function objectiveFor(
   state: WorkstreamState,
   attempt: WorkAttempt,
@@ -1836,6 +2560,8 @@ function objectiveFor(
   appendCandidatePrompt(common, state, attempt);
   if (assignment.capability === "research")
     common.push(`Expected evidence: ${assignment.expectedEvidence.join("; ")}`);
+  if (assignment.capability === "consultation")
+    appendConsultationObjective(common, assignment, attempt);
   if (assignment.artifactIntent === "disposable_experiment")
     common.push(
       `Permitted effects: ${assignment.permittedEffects.join("; ")}`,

@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { applicationRecordIssue, candidateLineageIssue } from "./candidate.js";
+import { ModelTargetSchema } from "./model-policy.js";
 import {
   type AuthorityReference,
   type CompletionAccounting,
@@ -234,6 +235,7 @@ function validateAssignments(state: WorkstreamState): Set<string> {
         );
     }
     if (assignment.capability === "review") validateSubject(state, assignment.subject);
+    if (assignment.capability === "consultation") validateConsultationAssignment(assignment);
   }
   return assignmentIds;
 }
@@ -285,10 +287,62 @@ function validateAttempts(
     }
     validateCandidateRecord(state, attempt);
     validateApplicationRecord(attempt);
+    validateConsultationRecord(state, attempt);
     if (attempt.models?.selection && attempt.models.selection.selected.length === 0)
       throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} has an empty model selection.`);
     validateOutputRelease(state, attempt);
   }
+}
+
+function validateConsultationAssignment(
+  assignment: Extract<WorkAssignment, { capability: "consultation" }>,
+): void {
+  if (assignment.question.trim() !== assignment.objective.trim())
+    throw new InvalidWorkstreamStateError(
+      `Consultation assignment ${assignment.id} question does not match its objective.`,
+    );
+  if (
+    assignment.advisorOverride !== undefined &&
+    !Value.Check(ModelTargetSchema, assignment.advisorOverride)
+  )
+    throw new InvalidWorkstreamStateError(
+      `Consultation assignment ${assignment.id} has an invalid exact advisor override.`,
+    );
+}
+
+function validateConsultationRecord(state: WorkstreamState, attempt: WorkAttempt): void {
+  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
+  if (assignment?.capability !== "consultation") {
+    if (attempt.consultation !== undefined)
+      throw new InvalidWorkstreamStateError(
+        `Attempt ${attempt.id} has consultation state for a non-consultation assignment.`,
+      );
+    return;
+  }
+  const consultation = attempt.consultation;
+  if (consultation === undefined)
+    throw new InvalidWorkstreamStateError(
+      `Consultation attempt ${attempt.id} has no phase envelope.`,
+    );
+  if (consultation.advisorCandidates.length === 0)
+    throw new InvalidWorkstreamStateError(
+      `Consultation attempt ${attempt.id} has no advisor candidates.`,
+    );
+  if (consultation.phase === "advisor" && consultation.packet === undefined)
+    throw new InvalidWorkstreamStateError(
+      `Consultation advisor ${attempt.id} has no frozen packet.`,
+    );
+  if (consultation.packet !== undefined && consultation.packetId === undefined)
+    throw new InvalidWorkstreamStateError(
+      `Consultation attempt ${attempt.id} has an unnamed frozen packet.`,
+    );
+  if (
+    consultation.selectedAdvisor !== undefined &&
+    !Value.Check(ModelTargetSchema, consultation.selectedAdvisor)
+  )
+    throw new InvalidWorkstreamStateError(
+      `Consultation attempt ${attempt.id} has an invalid selected advisor.`,
+    );
 }
 
 function validateCandidateRecord(state: WorkstreamState, attempt: WorkAttempt): void {

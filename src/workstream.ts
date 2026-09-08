@@ -12,7 +12,8 @@ import {
   candidateParent,
   retainedCandidate,
 } from "./candidate.js";
-import { EvidenceSchema } from "./report-schema.js";
+import { ModelTargetSchema } from "./model-policy.js";
+import { EnrichmentPacketSchema, EvidenceSchema } from "./report-schema.js";
 import {
   assertLegacySourceFile,
   claimWorkstreamDirectory,
@@ -35,6 +36,9 @@ import {
   type CandidateLineage,
   CommitSchema,
   type CompletionAccounting,
+  type ConsultationEnvelope,
+  type ConsultationPhase,
+  type EnrichmentPacket,
   type HumanInputReceipt,
   type HumanInputSource,
   type Intent,
@@ -83,6 +87,9 @@ export type {
   AuthorityReference,
   CandidateLineage,
   CompletionAccounting,
+  ConsultationEnvelope,
+  ConsultationPhase,
+  EnrichmentPacket,
   HumanInputReceipt,
   HumanInputSource,
   Intent,
@@ -108,6 +115,7 @@ type ResultInput = OmitEach<WorkResult, "observedAt" | "artifacts"> & {
 type QueuedAttempt = {
   id: string;
   models: NonNullable<WorkAttempt["models"]>;
+  consultation?: NonNullable<WorkAttempt["consultation"]>;
   continuationOf?: string;
   candidate?: CandidateLineage;
   baseRevision?: string;
@@ -498,6 +506,225 @@ export class WorkstreamStoreEffects {
           baseRevision: input.baseRevision,
         }),
       input.now,
+    );
+  }
+
+  recordConsultationEnrichment(input: {
+    id: string;
+    packetId: string;
+    packet: EnrichmentPacket;
+    phase: ConsultationPhase;
+    now?: Date;
+  }): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      input.id,
+      (attempt) => {
+        const consultation = consultationFor(attempt, input.id, "enricher");
+        if (!Value.Check(EnrichmentPacketSchema, input.packet))
+          throw new Error("Consultation enrichment packet is outside its strict bounded contract.");
+        if (input.phase.phase !== "enricher") throw new Error("Invalid consultation phase record.");
+        if (consultation.packet !== undefined) {
+          if (
+            consultation.packetId === input.packetId &&
+            sameValue(consultation.packet, input.packet)
+          )
+            return;
+          throw new Error(`Attempt ${input.id} has contradictory enrichment evidence.`);
+        }
+        attempt.consultation = {
+          ...consultation,
+          packetId: input.packetId,
+          packet: structuredClone(input.packet),
+          enricher: structuredClone(input.phase),
+        };
+      },
+      input.now,
+    );
+  }
+
+  closeConsultationEnricher(id: string, now?: Date): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const consultation = consultationFor(attempt, id, "enricher");
+        if (!consultation.packet)
+          throw new Error(`Attempt ${id} has no durably retained enrichment packet.`);
+        const enricher = consultation.enricher;
+        if (!enricher) throw new Error(`Attempt ${id} has no enricher phase evidence.`);
+        attempt.consultation = {
+          ...consultation,
+          phase: "advisor",
+          enricher: {
+            ...enricher,
+            cleanup: {
+              ...(enricher.cleanup ?? { state: "pending" as const, workerClosed: false }),
+              state: "completed",
+              workerClosed: true,
+            },
+          },
+        };
+        attempt.state = "starting";
+        delete attempt.sessionFile;
+        delete attempt.launchPane;
+        delete attempt.resource;
+        delete attempt.worker;
+        delete attempt.steering;
+        delete attempt.effectiveModels;
+        attempt.submission = "not_sent";
+      },
+      now,
+    );
+  }
+
+  recordConsultationAdvisorSelection(
+    id: string,
+    target: NonNullable<WorkAttempt["models"]>["guide"],
+    now?: Date,
+  ): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const current = consultationFor(attempt, id, "advisor");
+        attempt.consultation = { ...current, selectedAdvisor: { ...target } };
+        if (attempt.models) attempt.models = { ...attempt.models, advisor: { ...target } };
+      },
+      now,
+    );
+  }
+
+  retryConsultationAdvisor(
+    id: string,
+    target: NonNullable<WorkAttempt["models"]>["guide"],
+    now?: Date,
+  ): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const consultation = consultationFor(attempt, id, "advisor");
+        if (attempt.state !== "cancelled" || attempt.cleanup?.state !== "completed")
+          throw new Error(`Attempt ${id} is not ready for advisor retry.`);
+        attempt.state = "starting";
+        const models = attempt.models;
+        if (!models) throw new Error(`Attempt ${id} has no consultation models.`);
+        attempt.models = { ...models, advisor: { ...target } };
+        const next = { ...consultation, selectedAdvisor: { ...target } };
+        attempt.consultation = next;
+        delete attempt.sessionFile;
+        delete attempt.launchPane;
+        delete attempt.resource;
+        delete attempt.worker;
+        attempt.submission = "not_sent";
+        delete attempt.steering;
+        delete attempt.cleanup;
+        delete attempt.resultId;
+        delete attempt.effectiveModels;
+      },
+      now,
+    );
+  }
+
+  recordConsultationFallback(
+    id: string,
+    target: NonNullable<WorkAttempt["models"]>["guide"],
+    reason: string,
+    now?: Date,
+  ): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const current = attempt.consultation;
+        if (!current) throw new Error(`Attempt ${id} has no consultation envelope.`);
+        requireText(reason, "Consultation fallback reason");
+        const fallback = { target: { ...target }, reason: reason.trim() };
+        if (current.fallbackHistory.some((item) => sameValue(item, fallback))) return;
+        attempt.consultation = {
+          ...current,
+          fallbackHistory: [...current.fallbackHistory, fallback],
+        };
+      },
+      now,
+    );
+  }
+
+  recordConsultationUncertainty(
+    id: string,
+    detail: string,
+    now?: Date,
+  ): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const current = attempt.consultation;
+        if (!current) throw new Error(`Attempt ${id} has no consultation envelope.`);
+        requireText(detail, "Consultation uncertainty");
+        attempt.consultation = { ...current, uncertainty: detail.trim() };
+      },
+      now,
+    );
+  }
+
+  recordConsultationAdvisorPhase(
+    id: string,
+    phase: ConsultationPhase,
+    effectiveModels?: NonNullable<WorkAttempt["effectiveModels"]>,
+    now?: Date,
+  ): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const current = consultationFor(attempt, id, "advisor");
+        if (phase.phase !== "advisor")
+          throw new Error("Invalid consultation advisor phase record.");
+        const advisor =
+          effectiveModels === undefined
+            ? structuredClone(phase)
+            : {
+                ...phase,
+                effectiveModels: effectiveModels.map((model) => {
+                  const exact = {
+                    model: model.model,
+                    thinking: model.thinking ?? "off",
+                  };
+                  if (!Value.Check(ModelTargetSchema, exact))
+                    throw new Error("Consultation advisor effective model evidence is invalid.");
+                  return Value.Decode(ModelTargetSchema, exact);
+                }),
+              };
+        attempt.consultation = { ...current, advisor };
+      },
+      now,
+    );
+  }
+
+  markConsultationEnricherClosed(id: string, now?: Date): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const current = consultationFor(attempt, id, "enricher");
+        attempt.consultation = {
+          ...current,
+          enricher: closedConsultationPhase(attempt, current, "enricher", id),
+        };
+      },
+      now,
+    );
+  }
+
+  markConsultationAdvisorClosed(id: string, now?: Date): StoreEffect<WorkstreamState> {
+    return this.changeAttempt(
+      id,
+      (attempt) => {
+        const current = attempt.consultation;
+        if (!current) throw new Error(`Attempt ${id} has no consultation envelope.`);
+        if (current.phase !== "advisor")
+          throw new Error(`Attempt ${id} is not in its advisor phase.`);
+        const advisor = closedConsultationPhase(attempt, current, "advisor", id);
+        const advisorHistory = current.advisorHistory.some((phase) => sameValue(phase, advisor))
+          ? current.advisorHistory
+          : [...current.advisorHistory, structuredClone(advisor)];
+        attempt.consultation = { ...current, advisor, advisorHistory };
+      },
+      now,
     );
   }
 
@@ -1299,6 +1526,62 @@ function requireAssignment(state: WorkstreamState, id: string): WorkAssignment {
   const assignment = state.assignments.find((candidate) => candidate.id === id);
   if (!assignment) throw new Error(`Unknown assignment ${id}.`);
   return assignment;
+}
+
+function consultationFor(
+  attempt: WorkAttempt,
+  id: string,
+  phase: ConsultationEnvelope["phase"],
+): ConsultationEnvelope {
+  const consultation = attempt.consultation;
+  if (!consultation || consultation.phase !== phase)
+    throw new Error(`Attempt ${id} is not in its ${phase} phase.`);
+  return consultation;
+}
+
+function closedConsultationPhase(
+  attempt: WorkAttempt,
+  consultation: ConsultationEnvelope,
+  phaseName: "enricher" | "advisor",
+  id: string,
+): ConsultationPhase {
+  const existing = consultation[phaseName];
+  const phase =
+    existing ??
+    (attempt.sessionFile === undefined
+      ? undefined
+      : consultationPhaseFromAttempt(attempt, consultation, phaseName));
+  if (phase === undefined) throw new Error(`Attempt ${id} has no ${phaseName} phase evidence.`);
+  return {
+    ...phase,
+    cleanup: {
+      ...(attempt.cleanup ?? { state: "pending" as const, workerClosed: false }),
+      state: "completed",
+      workerClosed: true,
+    },
+  };
+}
+
+function consultationPhaseFromAttempt(
+  attempt: WorkAttempt,
+  consultation: ConsultationEnvelope,
+  phaseName: "enricher" | "advisor",
+): ConsultationPhase | undefined {
+  const target =
+    phaseName === "enricher"
+      ? attempt.models?.guide
+      : (consultation.selectedAdvisor ?? attempt.models?.advisor);
+  if (attempt.sessionFile === undefined || target === undefined) return undefined;
+  const phase: ConsultationPhase = {
+    phase: phaseName,
+    sessionFile: attempt.sessionFile,
+    target: { ...target },
+    submission: attempt.submission ?? "not_sent",
+  };
+  if (attempt.launchPane !== undefined) phase.launchPane = structuredClone(attempt.launchPane);
+  if (attempt.resource !== undefined) phase.resource = structuredClone(attempt.resource);
+  if (attempt.worker !== undefined) phase.worker = structuredClone(attempt.worker);
+  return phase;
 }
 
 function requireAuthority(state: WorkstreamState, authority: AuthorityReference): void {

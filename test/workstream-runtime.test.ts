@@ -10,12 +10,18 @@ import { TestClock } from "effect/testing";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import workgraphCoordinator from "../extensions/coordinator.js";
-import { inspectView } from "../src/agent-facing.js";
+import { inspectView, resultNotification } from "../src/agent-facing.js";
 import { openRepository } from "../src/git.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
+import {
+  nativeSubmissionEvidence,
+  observeNativeFailure,
+  providerAvailabilityEvidence,
+} from "../src/pi-process.js";
 import { processEffect } from "../src/process.js";
 import { WorkgraphRegistry } from "../src/registry.js";
+import type { WorkerIdentity } from "../src/types.js";
 import { type WorkstreamState, WorkstreamStoreEffects } from "../src/workstream.js";
 import { type Lease, SqliteWorkstreamDatabase } from "../src/workstream-persistence.js";
 import {
@@ -386,6 +392,682 @@ const research = (id: string, intentVersion = 0) => ({
   objective: "Inspect value.txt",
   intentVersion,
   expectedEvidence: ["File evidence"],
+});
+
+await test("consultation freezes bounded enrichment before a fresh advisor session", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = {
+      model: "fixture/enricher",
+      thinking: "high",
+    };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/advisor", thinking: "high", useWhen: "Architecture decisions." },
+    ];
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentTranscript = "ENRICHER_ONLY_TRANSCRIPT";
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [
+        { label: "fixture", observation: "value.txt starts at initial", class: "direct" },
+      ],
+      counterevidence: [],
+      gaps: ["No production workload was available in the fixture."],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    f.workers.onWork = async (request) => {
+      assert.equal(
+        workerEnvironment(request, "PI_WORKGRAPH_MODE"),
+        request === f.workers.requests[0] ? "consultation_enricher" : "consultation",
+      );
+      return undefined;
+    };
+    await runRuntime(
+      active.effects.queue({
+        id: "fixture-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Should the fixture retain its current file strategy?",
+        question: "Should the fixture retain its current file strategy?",
+        context: "The coordinator is considering a small safe change.",
+        enrichmentFocus: "Inspect repository state and relevant source boundaries.",
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.consultation?.phase, "advisor");
+    assert.equal(state.attempts[0]?.consultation?.packet?.localState.revision, initial);
+    assert.equal(f.workers.requests.length, 1);
+    const enricherSession = SessionManager.open(
+      required(f.workers.requests[0], "enricher").sessionFile,
+    );
+    assert.match(JSON.stringify(enricherSession.getBranch()), /ENRICHER_ONLY_TRANSCRIPT/);
+
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(f.workers.requests.length, 2);
+    const advisorRequest = required(f.workers.requests[1], "advisor");
+    const advisorSession = SessionManager.open(advisorRequest.sessionFile);
+    const advisorBranch = JSON.stringify(advisorSession.getBranch());
+    assert.equal(advisorRequest.sessionFile === f.workers.requests[0]?.sessionFile, false);
+    assert.match(advisorBranch, /Frozen enrichment packet/);
+    assert.equal(advisorBranch.includes("ENRICHER_ONLY_TRANSCRIPT"), false);
+    assert.equal(state.results[0]?.validity, "typed");
+    assert.equal(state.results[0]?.report.kind, "consultation");
+    assert.equal(state.results[0]?.report.status, "completed");
+    assert.equal(state.attempts[0]?.consultation?.advisor?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.consultation?.enricher?.cleanup?.state, "completed");
+    const outcome = inspectView(state, {
+      section: "outcome",
+      result: required(state.results[0], "consultation result").id,
+    });
+    if (!("settlement" in outcome)) throw new Error("Expected consultation settlement projection.");
+    assert.equal("consultation" in outcome.settlement, true);
+    assert.equal(f.workers.cleanupIdentities.length, 2);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("consultation enricher recovery rebuilds its phase-specific worker identity", async (t) => {
+  const f = await fixture();
+  try {
+    f.workers.deferWork = true;
+    const persistWorker = f.store.recordWorker.bind(f.store);
+    let recordWorkerCalls = 0;
+    t.mock.method(f.store, "recordWorker", (id: string, worker: WorkerIdentity, now?: Date) => {
+      recordWorkerCalls++;
+      return recordWorkerCalls === 1 ? f.store.load() : persistWorker(id, worker, now);
+    });
+    const active = await f.runtime();
+    await runRuntime(
+      active.effects.queue({
+        id: "recover-consultation-enricher",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.worker, undefined);
+    assert.equal(f.workers.requests[0]?.role, "consultation_enricher");
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(f.store.load());
+    assert.equal(recordWorkerCalls, 2);
+    assert.deepEqual(state.attempts[0]?.worker, [...f.workers.identities.values()][0]);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("consultation falls through only before advisor submission and retains a visible warning", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/advisor-first", thinking: "high" },
+      { model: "fixture/advisor-second", thinking: "high" },
+    ];
+    f.workers.failBeforeSubmissionForModels.add("fixture/advisor-first");
+    f.workers.unavailableBeforeSubmissionForModels.add("fixture/advisor-first");
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+      counterevidence: [],
+      gaps: ["No external workload was available."],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "fallback-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.consultation?.phase, "advisor");
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(f.store.load());
+    assert.deepEqual(state.attempts[0]?.consultation?.selectedAdvisor, {
+      model: "fixture/advisor-second",
+      thinking: "high",
+    });
+    assert.equal(state.attempts[0]?.consultation?.fallbackHistory.length, 1);
+    assert.equal(state.attempts[0]?.consultation?.advisorCandidates.length, 2);
+
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(f.workers.requests.length, 3);
+    assert.equal(f.workers.requests[1]?.model, "fixture/advisor-first");
+    assert.equal(f.workers.requests[2]?.model, "fixture/advisor-second");
+    const result = required(state.results[0], "fallback result");
+    assert.equal(result.validity, "typed");
+    if (result.validity !== "typed") throw new Error("Expected typed consultation result.");
+    assert.equal(result.report.kind, "consultation");
+    assert.equal(state.attempts[0]?.consultation?.advisorHistory.length, 2);
+    assert.match(resultNotification(state, result.id), /WARNING/);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("consultation exact advisor overrides do not fall through", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/advisor-first", thinking: "high" },
+      { model: "fixture/advisor-second", thinking: "high" },
+    ];
+    f.workers.preflightStateForModels.set("fixture/advisor-first", "unsupported_thinking");
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+      counterevidence: [],
+      gaps: [],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "override-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        advisorOverride: { model: "fixture/advisor-first", thinking: "high" },
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(f.store.load());
+    assert.equal(f.workers.requests.length, 2);
+    assert.equal(state.attempts[0]?.consultation?.fallbackHistory.length, 0);
+    assert.deepEqual(state.attempts[0]?.consultation?.selectedAdvisor, {
+      model: "fixture/advisor-first",
+      thinking: "high",
+    });
+    assert.equal(state.attempts[0]?.state, "cancelled");
+    assert.equal(state.attempts[0]?.submission, "not_sent");
+    assert.equal(state.attempts[0]?.consultation?.uncertainty, undefined);
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(f.workers.requests.length, 2);
+    assert.equal(state.results.length, 0);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("settled provider unavailability cancels an exact advisor override after local submission", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/advisor-first", thinking: "high" },
+      { model: "fixture/advisor-second", thinking: "high" },
+    ];
+    f.workers.settledUnavailableForModels.add("fixture/advisor-first");
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+      counterevidence: [],
+      gaps: [],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "settled-provider-override-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        advisorOverride: { model: "fixture/advisor-first", thinking: "high" },
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    const state = await runRuntime(active.effects.reconcile);
+    assert.equal(f.workers.requests.length, 2);
+    assert.equal(state.attempts[0]?.state, "cancelled");
+    assert.equal(state.attempts[0]?.submission, "submitted");
+    assert.equal(state.attempts[0]?.consultation?.fallbackHistory.length, 0);
+    assert.equal(state.attempts[0]?.consultation?.uncertainty, undefined);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("consultation does not fall through on a bare unsent marker or generic launch failure", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/advisor-generic-failure", thinking: "high" },
+      { model: "fixture/advisor-second", thinking: "high" },
+    ];
+    f.workers.failBeforeSubmissionForModels.add("fixture/advisor-generic-failure");
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+      counterevidence: [],
+      gaps: [],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "generic-failure-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    const state = await runRuntime(f.store.load());
+    assert.deepEqual(state.attempts[0]?.consultation?.selectedAdvisor, {
+      model: "fixture/advisor-generic-failure",
+      thinking: "high",
+    });
+    assert.equal(state.attempts[0]?.consultation?.fallbackHistory.length, 0);
+    assert.equal(state.attempts[0]?.submission, "uncertain");
+    assert.match(state.attempts[0]?.consultation?.uncertainty ?? "", /readiness interruption/);
+    assert.equal(f.workers.requests.length, 2);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("consultation falls through on matching unsupported thinking before prompt", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/advisor-unsupported", thinking: "high" },
+      { model: "fixture/advisor-second", thinking: "high" },
+    ];
+    f.workers.preflightStateForModels.set("fixture/advisor-unsupported", "unsupported_thinking");
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+      counterevidence: [],
+      gaps: [],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "unsupported-thinking-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    const state = await runRuntime(f.store.load());
+    assert.deepEqual(state.attempts[0]?.consultation?.selectedAdvisor, {
+      model: "fixture/advisor-second",
+      thinking: "high",
+    });
+    assert.equal(state.attempts[0]?.submission, "not_sent");
+    assert.equal(state.attempts[0]?.consultation?.uncertainty, undefined);
+    assert.match(
+      state.attempts[0]?.consultation?.fallbackHistory[0]?.reason ?? "",
+      /unsupported_thinking/,
+    );
+    assert.deepEqual(f.workers.checkpointEvents.slice(-4), [
+      "onTab",
+      "onResource",
+      "onIdentity",
+      "onPreflight",
+    ]);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("settled provider unavailability closes the advisor phase before policy fallback", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/advisor-settled-unavailable", thinking: "high" },
+      { model: "fixture/advisor-second", thinking: "high" },
+    ];
+    f.workers.settledUnavailableForModels.add("fixture/advisor-settled-unavailable");
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+      counterevidence: [],
+      gaps: [],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "settled-unavailable-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(f.store.load());
+    assert.deepEqual(state.attempts[0]?.consultation?.selectedAdvisor, {
+      model: "fixture/advisor-second",
+      thinking: "high",
+    });
+    assert.equal(state.attempts[0]?.consultation?.advisorHistory.length, 1);
+    assert.match(state.attempts[0]?.consultation?.fallbackHistory[0]?.reason ?? "", /cannot use/);
+    assert.equal(state.attempts[0]?.consultation?.advisor?.cleanup?.state, "completed");
+    assert.deepEqual(f.workers.checkpointEvents.slice(-10), [
+      "onTab",
+      "onResource",
+      "onIdentity",
+      "onPreflight",
+      "onSubmitted",
+      "onTab",
+      "onResource",
+      "onIdentity",
+      "onPreflight",
+      "onSubmitted",
+    ]);
+    const settledAttempt = required(state.attempts[0], "settled consultation attempt");
+    const settledAdvisor = required(
+      settledAttempt.consultation?.advisorHistory[0],
+      "settled advisor history",
+    );
+    const settledGeneration = { runId: state.id, nodeId: settledAttempt.id };
+    assert.equal(settledAdvisor.submission, "submitted");
+    assert.equal(nativeSubmissionEvidence(settledAdvisor.sessionFile, settledGeneration), "absent");
+    assert.equal(
+      observeNativeFailure(settledAdvisor.sessionFile, settledGeneration),
+      "native-error",
+    );
+    assert.deepEqual(
+      providerAvailabilityEvidence(settledAdvisor.sessionFile, settledGeneration, {
+        model: "fixture/advisor-settled-unavailable",
+        thinking: "high",
+      }),
+      {
+        state: "unavailable",
+        model: "fixture/advisor-settled-unavailable",
+        thinking: "high",
+        reason: "Fixture provider cannot use fixture/advisor-settled-unavailable.",
+      },
+    );
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(f.workers.requests.length, 3);
+    const result = state.results[0];
+    assert.equal(result?.validity, "typed");
+    if (result?.validity === "typed") assert.equal(result.report.kind, "consultation");
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("settled provider conflicts conservatively block policy fallback", async () => {
+  for (const conflict of [
+    "successful-response",
+    "submitted-marker",
+    "contradictory-marker",
+  ] as const) {
+    const f = await fixture();
+    try {
+      const model = `fixture/advisor-${conflict}`;
+      const policy = structuredClone(DEFAULT_MODEL_POLICY);
+      policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+      policy.roles["consultation.advisor"] = [
+        { model, thinking: "high" },
+        { model: "fixture/advisor-second", thinking: "high" },
+      ];
+      f.workers.settledUnavailableForModels.add(model);
+      if (conflict === "successful-response")
+        f.workers.settledUnavailableSuccessfulModels.add(model);
+      if (conflict === "submitted-marker")
+        f.workers.settledUnavailableSubmittedMarkerModels.add(model);
+      if (conflict === "contradictory-marker")
+        f.workers.settledUnavailableContradictoryMarkerModels.add(model);
+      const active = await f.runtime(undefined, { policy });
+      const initial = await runRuntime(f.repository.head());
+      f.workers.enrichmentPacket = () => ({
+        sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+        counterevidence: [],
+        gaps: [],
+        localState: { repository: f.root, revision: initial, workingTree: "clean" },
+      });
+      await runRuntime(
+        active.effects.queue({
+          id: `settled-conflict-${conflict}`,
+          capability: "consultation",
+          artifactIntent: "evidence_only",
+          objective: "Which fixture strategy should be retained?",
+          question: "Which fixture strategy should be retained?",
+          intentVersion: 0,
+        }),
+      );
+      await runRuntime(active.effects.reconcile);
+      await runRuntime(active.effects.reconcile);
+      await runRuntime(active.effects.reconcile);
+      await runRuntime(active.effects.reconcile);
+      const state = await runRuntime(f.store.load());
+      assert.equal(f.workers.requests.length, 2);
+      assert.equal(state.attempts[0]?.consultation?.fallbackHistory.length, 0);
+      assert.deepEqual(state.attempts[0]?.consultation?.selectedAdvisor, {
+        model,
+        thinking: "high",
+      });
+      if (conflict === "successful-response")
+        assert.equal(state.attempts[0]?.consultation?.uncertainty, undefined);
+      else
+        assert.match(
+          state.attempts[0]?.consultation?.uncertainty ?? "",
+          /submission may have occurred/,
+        );
+    } finally {
+      await f.dispose();
+    }
+  }
+});
+
+await test("duplicate exact consultation advisor targets are rejected before launch", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/duplicate", thinking: "high" },
+      { model: "fixture/duplicate", thinking: "high" },
+    ];
+    const active = await f.runtime(undefined, { policy });
+    await assert.rejects(
+      runRuntime(
+        active.effects.queue({
+          id: "duplicate-consultation",
+          capability: "consultation",
+          artifactIntent: "evidence_only",
+          objective: "Which fixture strategy should be retained?",
+          question: "Which fixture strategy should be retained?",
+          intentVersion: 0,
+        }),
+      ),
+      /duplicate exact model targets/,
+    );
+    assert.equal(f.workers.requests.length, 0);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("consultation does not retry after advisor submission becomes uncertain", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/advisor-first", thinking: "high" },
+      { model: "fixture/advisor-second", thinking: "high" },
+    ];
+    f.workers.failAfterSubmissionForModels.add("fixture/advisor-first");
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+      counterevidence: [],
+      gaps: [],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "uncertain-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(f.store.load());
+    assert.equal(f.workers.requests.length, 2);
+    assert.equal(state.attempts[0]?.consultation?.advisor?.submission, "submitted");
+    assert.match(state.attempts[0]?.consultation?.uncertainty ?? "", /uncertain prompt receipt/);
+
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(f.workers.requests.length, 2);
+    assert.equal(state.results[0]?.validity, "typed");
+    assert.equal(state.attempts[0]?.consultation?.advisor?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.consultation?.fallbackHistory.length, 0);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("settled advisor errors retain uncertainty without policy fallback", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/advisor-error", thinking: "high" },
+      { model: "fixture/advisor-second", thinking: "high" },
+    ];
+    f.workers.settledFailureForModels.set("fixture/advisor-error", "error");
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+      counterevidence: [],
+      gaps: [],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "settled-error-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(f.store.load());
+    assert.equal(f.workers.requests.length, 2);
+    assert.equal(state.attempts[0]?.consultation?.advisorHistory.length, 1);
+    assert.equal(state.attempts[0]?.consultation?.fallbackHistory.length, 0);
+    assert.match(state.attempts[0]?.consultation?.uncertainty ?? "", /native-error/);
+    assert.equal(state.results[0]?.validity, "typed");
+    if (state.results[0]?.validity === "typed")
+      assert.equal(state.results[0].report.status, "failed");
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(f.workers.requests.length, 2);
+    assert.equal(state.attempts[0]?.consultation?.selectedAdvisor?.model, "fixture/advisor-error");
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("consultation cancellation closes the active phase without launching a later phase", async () => {
+  const f = await fixture();
+  try {
+    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
+    policy.roles["consultation.advisor"] = [{ model: "fixture/advisor", thinking: "high" }];
+    const active = await f.runtime(undefined, { policy });
+    const initial = await runRuntime(f.repository.head());
+    f.workers.enrichmentPacket = () => ({
+      sourceObservations: [{ label: "fixture", observation: "source", class: "direct" }],
+      counterevidence: [],
+      gaps: [],
+      localState: { repository: f.root, revision: initial, workingTree: "clean" },
+    });
+    await runRuntime(
+      active.effects.queue({
+        id: "cancel-consultation",
+        capability: "consultation",
+        artifactIntent: "evidence_only",
+        objective: "Which fixture strategy should be retained?",
+        question: "Which fixture strategy should be retained?",
+        intentVersion: 0,
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.effects.reconcile);
+    f.workers.deferWork = true;
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(f.store.load());
+    const attempt = required(state.attempts[0], "active advisor attempt");
+    assert.equal(attempt.consultation?.phase, "advisor");
+    await runRuntime(active.effects.cancel(attempt.id));
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.state, "cancelled");
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.consultation?.advisor?.cleanup?.state, "completed");
+    assert.equal(state.results.length, 0);
+    assert.equal(f.workers.requests.length, 2);
+  } finally {
+    await f.dispose();
+  }
 });
 
 await test("multi-attempt queueing resolves one shared validated base and exact-review conflicts have no effects", async () => {

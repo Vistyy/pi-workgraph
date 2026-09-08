@@ -15,6 +15,19 @@ Inspect the important entry points, data or control flow, and callers yourself. 
 
 Choose investigations that could change a decision. For example, ask which guarantee a wrapper adds, where a state value is produced and consumed, or what can change between two checks. “This subsystem needs safety checks” does not answer whether its current layers or duplicated checks are needed.
 
+### Route consultation separately
+
+Use consultation when the coordinator needs decision-oriented advice assembled from a precise question, rather than source observations for a research assignment, a subject-specific challenge for review, or an implementation change. Consultation is an optional capability, not a mandatory phase of every workstream or a replacement for those responsibilities. Route it through the dedicated consultation assignment/tool instead of disguising it as research or review.
+
+A consultation delegation should supply:
+
+- one precise decision question, including the decision or trade-off the advice should inform;
+- coordinator-known context and constraints that materially affect that question;
+- an optional focused enrichment request, without exhaustively preparing the evidence packet in the coordinator. Mandatory enrichment gathers source observations, counterevidence, local-state identity, and explicit gaps before the advisor runs;
+- the configured ordered advisor choices. Use their policy annotations such as `useWhen` to choose an appropriate candidate, while keeping the selected execution target exact. A complete per-assignment override is an explicit choice, not a request to silently fall through.
+
+Treat consultation advice as non-authoritative input: it does not change intent, grant authority, accept work, or replace coordinator judgment. The coordinator must reconcile it with the original outcome and independent evidence. A policy advisor may advance only when no remote submission is possible/proven and the exact selected generation/target is conclusively unavailable: matching local `missing_model`, `missing_credentials`, or `unsupported_thinking` preflight, or a trusted provider marker bound to model/thinking that explicitly says `unavailable` and `not_submitted` and retains a reason. Bare not-submitted observations, missing resources/workers, generic Herdr/process/readiness errors, absent/malformed/contradictory evidence, and mismatched targets are not proof; preserve `not_sent` for conclusive pre-prompt rejection, and close a settled unavailable phase before advancing. The final outcome must show the skipped target and retained reason. Once submission may have occurred, the result is uncertain: do not issue a second advisor submission or fall back merely because the first attempt errored, timed out, or was interrupted. An exact per-assignment override never falls through. The advisor has no `workgraph_report` tool; retain only its latest successful terminal assistant message and all text blocks.
+
 Keep the overall goal distinct from each contribution. Completed investigations do not clear unexamined areas, and an empty active-attempt list does not establish that the human goal is met. Bring actual capability or policy trade-offs to the user with a recommendation and consequences, not an unfiltered collection of worker opinions.
 
 ## Shape bounded assignments

@@ -14,6 +14,8 @@ export const MODEL_ROLES = [
   "implementation.guide",
   "implementation.executor",
   "review",
+  "consultation.enricher",
+  "consultation.advisor",
 ] as const;
 const MODEL_LIST_ROLES = ["research", "review"] as const;
 export type ModelRole = (typeof MODEL_ROLES)[number];
@@ -35,6 +37,20 @@ export const ModelTargetSchema = Type.Object(
   { additionalProperties: false },
 );
 export type ModelTarget = Static<typeof ModelTargetSchema>;
+export const ModelChoiceSchema = Type.Object(
+  {
+    model: Type.String({ pattern: "^[^/\\s]+/\\S+$" }),
+    thinking: ThinkingSchema,
+    useWhen: Type.Optional(Type.String({ minLength: 1, maxLength: 2000 })),
+  },
+  { additionalProperties: false },
+);
+export type ModelChoice = Static<typeof ModelChoiceSchema>;
+
+/** Policy guidance is presentation-only, never an executable target. */
+function exactTarget(target: ModelTarget): ModelTarget {
+  return { model: target.model, thinking: target.thinking };
+}
 const TargetOverrideSchema = Type.Object(
   {
     model: Type.Optional(Type.String({ pattern: "^[^/\\s]+/\\S+$" })),
@@ -61,13 +77,14 @@ export const SelectionRequestSchema = Type.Object(
 );
 export type SelectionRequest = Static<typeof SelectionRequestSchema>;
 
-export type ListModelRole = "research" | "review";
+export type ListModelRole = "research" | "review" | "consultation.advisor";
 export type ImplementationModelRole = "implementation.guide" | "implementation.executor";
-export type ModelTargetList = [ModelTarget, ...ModelTarget[]];
+export type ModelTargetList = [ModelChoice, ...ModelChoice[]];
 
 export interface ModelPolicy {
-  version: 4;
-  roles: Record<ImplementationModelRole, ModelTarget> & Record<ListModelRole, ModelTargetList>;
+  version: 5;
+  roles: Record<ImplementationModelRole | "consultation.enricher", ModelTarget> &
+    Record<ListModelRole, ModelTargetList>;
 }
 
 export type ModelPolicyOperation = "parse" | "decode" | "temporary-path";
@@ -99,8 +116,10 @@ const DEFAULT_EXECUTOR_TARGET: ModelTarget = {
 };
 
 export const DEFAULT_MODEL_POLICY: ModelPolicy = {
-  version: 4,
+  version: 5,
   roles: {
+    "consultation.enricher": { model: "openai-codex/gpt-5.6-luna", thinking: "high" },
+    "consultation.advisor": [{ model: "openai-codex/gpt-6-astra", thinking: "high" }],
     research: DEFAULT_RESEARCH_MODELS,
     "implementation.guide": DEFAULT_GUIDE_TARGET,
     "implementation.executor": DEFAULT_EXECUTOR_TARGET,
@@ -114,6 +133,8 @@ const PolicyRolesInputSchema = Type.Object(
     "implementation.guide": Type.Optional(Type.Unknown()),
     "implementation.executor": Type.Optional(Type.Unknown()),
     review: Type.Optional(Type.Unknown()),
+    "consultation.enricher": Type.Optional(Type.Unknown()),
+    "consultation.advisor": Type.Optional(Type.Unknown()),
     "discovery.evidence": Type.Optional(Type.Unknown()),
     "verification.product": Type.Optional(Type.Unknown()),
   },
@@ -121,14 +142,20 @@ const PolicyRolesInputSchema = Type.Object(
 );
 const ModelPolicyInputSchema = Type.Object(
   {
-    version: Type.Union([Type.Literal(1), Type.Literal(2), Type.Literal(3), Type.Literal(4)]),
+    version: Type.Union([
+      Type.Literal(1),
+      Type.Literal(2),
+      Type.Literal(3),
+      Type.Literal(4),
+      Type.Literal(5),
+    ]),
     roles: PolicyRolesInputSchema,
     // Version 3 used one shared pool. It is accepted only to read and migrate that legacy shape.
     workerPool: Type.Optional(Type.Unknown()),
   },
   { additionalProperties: true },
 );
-const ModelTargetListSchema = Type.Array(ModelTargetSchema, { minItems: 1 });
+const ModelTargetListSchema = Type.Array(ModelChoiceSchema, { minItems: 1 });
 type ModelPolicyInput = Static<typeof ModelPolicyInputSchema>;
 
 export function modelPolicyPath(agentDir = getAgentDir()): string {
@@ -154,6 +181,8 @@ function configuredRole(policy: ModelPolicyInput, role: ModelRole): unknown {
       return policy.roles["discovery.evidence"];
     case "implementation.guide":
     case "implementation.executor":
+    case "consultation.enricher":
+    case "consultation.advisor":
       return policy.roles[role];
     case "review":
       return policy.roles["verification.product"];
@@ -164,7 +193,7 @@ function applyConfiguredRole(policy: ModelPolicyInput, result: ModelPolicy, role
   const configured = configuredRole(policy, role);
   if (configured === undefined) return;
   if (isListModelRole(role)) {
-    if (policy.version === 4) {
+    if (policy.version >= 4) {
       result.roles[role] = decodeModelList(configured, role);
       return;
     }
@@ -182,7 +211,10 @@ function decodeModelList(value: unknown, role: ModelRole): ModelTargetList {
   if (!Value.Check(ModelTargetListSchema, value))
     throw new Error(`Invalid model list for ${role}.`);
   // SAFETY: The preceding Value.Check establishes a nonempty array of ModelTarget values.
-  return Value.Decode(ModelTargetListSchema, value) as ModelTargetList;
+  const decoded = Value.Decode(ModelTargetListSchema, value) as ModelTargetList;
+  if (role === "consultation.advisor" && hasDuplicateExecutableTargets(decoded))
+    throw new Error("Consultation advisor policy cannot contain duplicate exact model targets.");
+  return decoded;
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Legacy role values are checked as targets before they enter the typed policy.
@@ -251,8 +283,10 @@ function decodeModelPolicyEffect(
       const policy = decodeModelPolicyInput(parsed);
       const result = structuredClone(DEFAULT_MODEL_POLICY);
       applyConfiguredRoles(policy, result);
-      if (policy.version === 4 && policy.workerPool !== undefined)
-        throw new Error("The shared worker pool is unsupported in model policy version 4.");
+      if (policy.version >= 4 && policy.workerPool !== undefined)
+        throw new Error(
+          "The shared worker pool is unsupported in model policy version 4 or later.",
+        );
       migrateLegacyWorkerPool(policy, result);
       return result;
     },
@@ -287,7 +321,7 @@ export function resolveSelection(
     role,
     requested: count,
     diversity,
-    selected,
+    selected: selected.map(exactTarget),
     unfulfilled:
       selected.length < count
         ? [`Requested ${count} distinct models but policy provides ${selected.length}.`]
@@ -367,13 +401,23 @@ function targetKey(target: ModelTarget): string {
   return `${target.model}\0${target.thinking}`;
 }
 
+function hasDuplicateExecutableTargets(targets: ReadonlyArray<ModelTarget>): boolean {
+  const seen = new Set<string>();
+  for (const target of targets) {
+    const key = targetKey(target);
+    if (seen.has(key)) return true;
+    seen.add(key);
+  }
+  return false;
+}
+
 function isListModelRole(role: ModelRole): role is ListModelRole {
-  return role === "research" || role === "review";
+  return role === "research" || role === "review" || role === "consultation.advisor";
 }
 
 export function setModelListEffect(
   role: ListModelRole,
-  list: ModelTarget[],
+  list: ModelChoice[],
   path = modelPolicyPath(),
 ): Effect.Effect<ModelPolicy, ModelPolicyError | PlatformError, FileSystem.FileSystem | Path.Path> {
   return Effect.gen(function* () {

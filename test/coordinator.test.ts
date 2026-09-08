@@ -276,6 +276,44 @@ void test("explicit target repository is fixed independently of coordinator cwd"
   }
 });
 
+void test("registered consultation keeps a precise question, context, and exact advisor override", async () => {
+  const f = await fixture();
+  try {
+    const question = "Should the fixture keep its current file strategy?";
+    await f.runner.emitInput(question, undefined, "interactive");
+    await f.call("workgraph_intent", { statement: question });
+    const response = await f.call("workgraph_consult", {
+      id: "fixture-consult",
+      question,
+      context: "The coordinator needs a bounded architecture trade-off.",
+      enrichmentFocus: "Inspect current repository state and relevant callers.",
+      advisor: { model: "fixture/advisor", thinking: "off" },
+    });
+    const state = resultState(response.details);
+    const assignment = required(state.assignments[0], "consultation assignment");
+    assert.equal(assignment.capability, "consultation");
+    if (assignment.capability !== "consultation")
+      throw new Error("Expected consultation assignment");
+    assert.equal(assignment.question, question);
+    assert.equal(assignment.context, "The coordinator needs a bounded architecture trade-off.");
+    assert.equal(
+      assignment.enrichmentFocus,
+      "Inspect current repository state and relevant callers.",
+    );
+    assert.deepEqual(assignment.advisorOverride, { model: "fixture/advisor", thinking: "off" });
+    await assert.rejects(
+      f.call("workgraph_consult", {
+        id: "partial-advisor",
+        question,
+        advisor: { model: "fixture/advisor" },
+      }),
+      /Invalid fixture input to workgraph_consult/,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("registered delegation keeps established scope until explicit intent revision", async () => {
   const f = await fixture();
   try {

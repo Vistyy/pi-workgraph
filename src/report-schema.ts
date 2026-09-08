@@ -1,7 +1,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import type { WorkerMode, WorkerReport, WorkerReportInput } from "./types.js";
+import type { WorkerReport, WorkerReportInput, WorkerSessionMode } from "./types.js";
 
 const EvidenceFields = {
   label: Type.String(),
@@ -89,10 +89,47 @@ function implementationReportSchema(content: ReportContentFields) {
 // These schemas decode retained reports and preserve fields accepted by the old contracts.
 const ResearchReportSchema = readOnlyReportSchema("research", LegacyReportContentFields, true);
 const ReviewReportSchema = readOnlyReportSchema("review", LegacyReportContentFields, true);
+const ConsultationReportSchemaInternal = Type.Object(
+  {
+    kind: Type.Literal("consultation"),
+    status: StringEnum(["completed", "escalated", "failed"] as const),
+    text: Type.String({ minLength: 1, maxLength: 100_000 }),
+    ...LegacyReportContentFields,
+  },
+  { additionalProperties: true },
+);
+const EnrichmentEvidenceSchema = Type.Object(
+  {
+    label: Type.String({ minLength: 1, maxLength: 500 }),
+    observation: Type.String({ minLength: 1, maxLength: 10_000 }),
+    class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
+    command: Type.Optional(Type.String({ maxLength: 4_000 })),
+    artifact: Type.Optional(Type.String({ maxLength: 2_000 })),
+  },
+  { additionalProperties: false },
+);
+export const EnrichmentPacketSchema = Type.Object(
+  {
+    sourceObservations: Type.Array(EnrichmentEvidenceSchema, { minItems: 1, maxItems: 20 }),
+    counterevidence: Type.Array(EnrichmentEvidenceSchema, { maxItems: 20 }),
+    gaps: Type.Array(Type.String({ minLength: 1, maxLength: 2000 }), { maxItems: 20 }),
+    localState: Type.Object(
+      {
+        repository: Type.String({ minLength: 1, maxLength: 1000 }),
+        revision: Type.String({ minLength: 1, maxLength: 128 }),
+        workingTree: Type.String({ minLength: 1, maxLength: 4000 }),
+      },
+      { additionalProperties: false },
+    ),
+  },
+  { additionalProperties: false },
+);
+export const ConsultationReportSchema = ConsultationReportSchemaInternal;
 export const ImplementationReportSchema = implementationReportSchema(LegacyReportContentFields);
 export const WorkerReportSchema = Type.Union([
   ResearchReportSchema,
   ReviewReportSchema,
+  ConsultationReportSchemaInternal,
   ImplementationReportSchema,
 ]);
 
@@ -103,14 +140,24 @@ const ResearchReportInputSchema = readOnlyReportSchema(
   false,
 );
 const ReviewReportInputSchema = readOnlyReportSchema("review", StrictReportContentFields, false);
+const ConsultationReportInputSchema = Type.Object(
+  {
+    kind: Type.Literal("consultation"),
+    status: StringEnum(["completed", "escalated", "failed"] as const),
+    text: Type.String({ minLength: 1, maxLength: 100_000 }),
+    ...StrictReportContentFields,
+  },
+  { additionalProperties: false },
+);
 const ImplementationReportInputSchema = implementationReportSchema(StrictReportContentFields);
 export const WorkerReportInputSchema = Type.Union([
   ResearchReportInputSchema,
   ReviewReportInputSchema,
+  ConsultationReportInputSchema,
   ImplementationReportInputSchema,
 ]);
 
-export function reportSchemaForMode(mode: WorkerMode) {
+export function reportSchemaForMode(mode: WorkerSessionMode) {
   switch (mode) {
     case "research":
       return ResearchReportInputSchema;
@@ -118,6 +165,10 @@ export function reportSchemaForMode(mode: WorkerMode) {
       return ReviewReportInputSchema;
     case "implementation":
       return ImplementationReportInputSchema;
+    case "consultation":
+      return ConsultationReportInputSchema;
+    case "consultation_enricher":
+      return EnrichmentPacketSchema;
   }
 }
 

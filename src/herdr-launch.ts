@@ -43,6 +43,8 @@ export interface WorkerLaunchEffectRequest<E = never, R = never> extends WorkerL
   onTab?: (tab: WorkerPaneLocator) => Effect.Effect<void, E, R>;
   onResource?: (resource: WorkerResourceIdentity) => Effect.Effect<void, E, R>;
   onIdentity?: (identity: WorkerIdentity) => Effect.Effect<void, E, R>;
+  /** Generation-scoped preflight runs after local worker identity and before remote inference. */
+  onPreflight?: () => Effect.Effect<void, E, R>;
   onSubmitted?: () => Effect.Effect<void, E, R>;
 }
 
@@ -56,7 +58,7 @@ export class WorkerLaunchReadinessError extends Data.TaggedError("WorkerLaunchRe
 }
 
 export class WorkerLaunchError<Cause = unknown> extends Data.TaggedError("WorkerLaunchError")<{
-  readonly phase: "onTab" | "onResource" | "onIdentity" | "onSubmitted";
+  readonly phase: "onTab" | "onResource" | "onIdentity" | "onPreflight" | "onSubmitted";
   readonly locator: WorkerLaunchLocator;
   readonly resource: WorkerResourceIdentity | undefined;
   readonly cause: Cause;
@@ -181,6 +183,13 @@ export class HerdrWorkerLauncher {
           () => resource,
         );
         if (request.prompt !== undefined) {
+          const onPreflight = request.onPreflight;
+          yield* checkpointAfterRemote(
+            Effect.void,
+            "onPreflight",
+            onPreflight === undefined ? undefined : () => onPreflight(),
+            () => resource,
+          );
           const onSubmitted = request.onSubmitted;
           yield* checkpointAfterRemote(
             this.host.transport.call(

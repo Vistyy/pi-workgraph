@@ -291,7 +291,7 @@ function reportPreview(result: WorkResult) {
       detail: compactText(result.validity === "untyped" ? result.text : result.detail),
     };
   const report = result.report;
-  return {
+  const preview = {
     ...reportStatus(result),
     summary: compactText(report.summary, 320),
     uncertainty: report.uncertainty?.slice(0, 3).map((item) => compactText(item)),
@@ -313,6 +313,8 @@ function reportPreview(result: WorkResult) {
       findings: report.findings.length,
     },
   };
+  if (report.kind === "consultation") return { ...preview, text: compactText(report.text, 640) };
+  return preview;
 }
 
 function deliveryPreview(state: WorkstreamState, result: WorkResult) {
@@ -436,7 +438,7 @@ function settlement(state: WorkstreamState, result: WorkResult) {
     (result.validity === "typed"
       ? result.report.findings.filter((finding) => finding.severity === "blocker").length
       : 0) + (attempt?.error === undefined ? 0 : 1);
-  return {
+  const projection = {
     workerReport: reportStatus(result),
     blockers,
     blockerCount,
@@ -452,6 +454,8 @@ function settlement(state: WorkstreamState, result: WorkResult) {
             attempt: attempt.id,
           },
   };
+  if (attempt?.consultation === undefined) return projection;
+  return { ...projection, consultation: consultationProjection(attempt.consultation) };
 }
 
 function itemPage<T, U>(
@@ -694,6 +698,37 @@ function boundedText(
   return projection;
 }
 
+function consultationProjection(consultation: NonNullable<WorkAttempt["consultation"]>) {
+  return {
+    phase: consultation.phase,
+    packetId: consultation.packetId,
+    frozenPacket: consultation.packet,
+    selectedAdvisor: consultation.selectedAdvisor,
+    advisorCandidates: consultation.advisorCandidates,
+    advisorHistory: consultation.advisorHistory,
+    fallbackHistory: consultation.fallbackHistory,
+    enricher:
+      consultation.enricher === undefined ? undefined : phaseProjection(consultation.enricher),
+    advisor: consultation.advisor === undefined ? undefined : phaseProjection(consultation.advisor),
+    uncertainty: consultation.uncertainty,
+  };
+}
+
+function phaseProjection(phase: NonNullable<WorkAttempt["consultation"]>["enricher"]) {
+  if (phase === undefined) return undefined;
+  return {
+    phase: phase.phase,
+    sessionFile: phase.sessionFile,
+    target: phase.target,
+    launchPane: phase.launchPane,
+    resource: phase.resource,
+    worker: phase.worker,
+    submission: phase.submission,
+    effectiveModels: phase.effectiveModels,
+    cleanup: phase.cleanup,
+  };
+}
+
 function projectedModels(attempt: WorkAttempt) {
   const models = attempt.models;
   const selected =
@@ -711,6 +746,13 @@ function projectedModels(attempt: WorkAttempt) {
               : {
                   model: compactText(models.executor.model, 160),
                   thinking: models.executor.thinking,
+                },
+          advisor:
+            models.advisor === undefined
+              ? undefined
+              : {
+                  model: compactText(models.advisor.model, 160),
+                  thinking: models.advisor.thinking,
                 },
           overrideReason:
             models.overrideReason === undefined
@@ -803,6 +845,8 @@ function recoveryView(
     attentionHistory: attempt.attentionHistory,
     models: attempt.models,
     effectiveModels: attempt.effectiveModels,
+    consultation:
+      attempt.consultation === undefined ? undefined : consultationProjection(attempt.consultation),
     delivery: state.deliveries.find((item) => item.resultId === attempt.resultId),
   };
   const blocker =
@@ -1088,6 +1132,11 @@ export function resultNotification(state: WorkstreamState, resultId: string): st
     `[WORKGRAPH OUTCOME] Task ${compactText(result.assignmentId, 120)} produced ${outcomeHandle(state, result)}.`,
     "Decide from this bounded outcome; inspect only when uncertainty or truncated detail matters.",
     JSON.stringify(view, null, 2),
+    ...((resultOwnerAttempt(state, result)?.consultation?.fallbackHistory.length ?? 0) > 0
+      ? [
+          "WARNING: one or more configured consultation advisors were conclusively unavailable before submission; inspect fallbackHistory before relying on this evidence.",
+        ]
+      : []),
     "A repeated notification is transport recurrence, not new work or semantic acceptance.",
   ].join("\n");
 }

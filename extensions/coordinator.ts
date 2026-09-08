@@ -24,6 +24,7 @@ import {
   MODEL_ROLES,
   type ModelPolicy,
   modelPolicyPath,
+  ModelChoiceSchema as PolicyChoice,
   SelectionRequestSchema as Selection,
   setModelListEffect,
   setModelRoleEffect,
@@ -471,7 +472,7 @@ export default function workgraphCoordinator(
     name: "workgraph_models",
     label: "Workgraph Models",
     description:
-      "Get model defaults and their configuration path, or persist an implementation default or ordered research/review list backed by a retained interactive or RPC input receipt. Assignment selection or per-role models overrides use policy defaults without changing policy or the coordinator model.",
+      "Get model defaults and their configuration path, or persist an implementation default, singleton consultation enricher, or ordered research/review/consultation advisor list backed by a retained interactive or RPC input receipt. Assignment selection or per-role models overrides use policy defaults without changing policy or the coordinator model.",
     promptSnippet: "Inspect or configure Workgraph model defaults",
     parameters: Type.Object({
       action: StringEnum(["get", "set", "set_list", "rates"] as const),
@@ -483,7 +484,7 @@ export default function workgraphCoordinator(
       ),
       role: Type.Optional(StringEnum(MODEL_ROLES)),
       target: Type.Optional(Target),
-      list: Type.Optional(Type.Array(Target, { minItems: 1 })),
+      list: Type.Optional(Type.Array(PolicyChoice, { minItems: 1 })),
       models: Type.Optional(Type.Array(Type.String())),
     }),
     execute(_id, params, signal, _update, ctx) {
@@ -573,6 +574,50 @@ export default function workgraphCoordinator(
             `Queued ${params.id}; submission and execution are observed asynchronously.`,
             yield* remember(state, ctx),
             projection,
+          );
+        }),
+        signal,
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_consult",
+    label: "Workgraph Consult",
+    description:
+      "Queue one evidence-only consultation under the established current intent. A fresh read-only enricher produces a strict frozen packet before a fresh advisor phase. The advisor returns evidence, not authority or acceptance.",
+    promptSnippet: "Consult an ordered evidence advisor",
+    parameters: Type.Object(
+      {
+        id: Type.String({ minLength: 1 }),
+        question: Type.String({ minLength: 1, maxLength: 20_000 }),
+        context: Type.Optional(Type.String({ maxLength: 20_000 })),
+        enrichmentFocus: Type.Optional(Type.String({ maxLength: 4_000 })),
+        advisor: Type.Optional(Target),
+      },
+      { additionalProperties: false },
+    ),
+    execute(_id, params, signal, _update, ctx) {
+      return runCallback(
+        Effect.gen(function* () {
+          const { active, state: before } = yield* activeEstablishedScopeEffect();
+          const intent = requiredValue(before.intents.at(-1), "established workstream intent");
+          const assignment: Parameters<WorkstreamStoreEffects["enqueue"]>[0] = {
+            id: params.id,
+            capability: "consultation",
+            artifactIntent: "evidence_only",
+            objective: params.question,
+            question: params.question,
+            intentVersion: intent.version,
+          };
+          if (params.context !== undefined) assignment.context = params.context;
+          if (params.enrichmentFocus !== undefined)
+            assignment.enrichmentFocus = params.enrichmentFocus;
+          if (params.advisor !== undefined) assignment.advisorOverride = params.advisor;
+          const state = yield* active.effects.queue(assignment);
+          return mutationResult(
+            `Queued consultation ${params.id}; enrichment and advice are observed asynchronously.`,
+            yield* remember(state, ctx),
+            { action: "workgraph_consult", assignmentId: params.id, outcome: "queued" },
           );
         }),
         signal,
@@ -1053,12 +1098,14 @@ function researchAssignment(
 }
 
 function isModelListRole(role: (typeof MODEL_ROLES)[number] | undefined): role is ListModelRole {
-  return role === "research" || role === "review";
+  return role === "research" || role === "review" || role === "consultation.advisor";
 }
 
 function requiredModelListRole(role: (typeof MODEL_ROLES)[number] | undefined): ListModelRole {
   if (!isModelListRole(role))
-    throw new Error("Model list operations require research or review role.");
+    throw new Error(
+      "Model list operations require research, review, or consultation.advisor role.",
+    );
   return role;
 }
 
@@ -1066,19 +1113,21 @@ function validateModelRequest(
   action: "get" | "set" | "set_list" | "rates",
   role: (typeof MODEL_ROLES)[number] | undefined,
   target: Static<typeof Target> | undefined,
-  list: Static<typeof Target>[] | undefined,
+  list: Static<typeof PolicyChoice>[] | undefined,
 ): void {
   if (action === "set" && (role === undefined || target === undefined))
     throw new Error("Setting a model default requires role and target.");
   if (action === "set_list" && (!isModelListRole(role) || list === undefined))
-    throw new Error("Setting a model list requires research/review role and a nonempty list.");
+    throw new Error(
+      "Setting a model list requires research, review, or consultation.advisor role and a nonempty list.",
+    );
 }
 
 function resolveModelPolicyEffect(
   action: "get" | "set" | "set_list" | "rates",
   role: (typeof MODEL_ROLES)[number] | undefined,
   target: Static<typeof Target> | undefined,
-  list: Static<typeof Target>[] | undefined,
+  list: Static<typeof PolicyChoice>[] | undefined,
 ) {
   if (action === "set")
     return setModelRoleEffect(
@@ -1096,6 +1145,8 @@ function policyModelIds(policy: ModelPolicy): string[] {
     ...policy.roles.review,
     policy.roles["implementation.guide"],
     policy.roles["implementation.executor"],
+    policy.roles["consultation.enricher"],
+    ...policy.roles["consultation.advisor"],
   ].reduce<string[]>((models, target) => {
     if (!models.includes(target.model)) models.push(target.model);
     return models;

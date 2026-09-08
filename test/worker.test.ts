@@ -95,7 +95,7 @@ function assistant(session: SessionManager, model = "gpt-4o") {
 }
 
 async function fixture(
-  mode: "implementation" | "research" | "review",
+  mode: "implementation" | "research" | "review" | "consultation" | "consultation_enricher",
   continued = false,
   actions: Partial<ExtensionActions> = {},
   experiment = false,
@@ -137,6 +137,47 @@ async function fixture(
     },
   };
 }
+
+void test("consultation workers expose separate bounded enricher and advisor contracts", async () => {
+  const enricher = await fixture("consultation_enricher");
+  try {
+    await enricher.runner.emit({ type: "session_start", reason: "startup" });
+    assert.equal(enricher.runner.getToolDefinition("workgraph_report"), undefined);
+    assert.ok(enricher.runner.getToolDefinition("workgraph_enrichment"));
+    const packet = {
+      sourceObservations: [{ label: "file", observation: "value.txt exists", class: "direct" }],
+      counterevidence: [],
+      gaps: ["No external workload was available."],
+      localState: { repository: enricher.root, revision: "fixture-revision", workingTree: "clean" },
+    };
+    const result = await enricher.call("workgraph_enrichment", packet);
+    assert.equal(result.terminate, true);
+    assert.match(JSON.stringify(enricher.session.getBranch()), /fixture-revision/);
+    await assert.rejects(enricher.call("workgraph_enrichment", packet), /already terminal/);
+  } finally {
+    await enricher.dispose();
+  }
+
+  const advisor = await fixture("consultation");
+  try {
+    await advisor.runner.emit({ type: "session_start", reason: "startup" });
+    assert.equal(advisor.runner.getToolDefinition("workgraph_enrichment"), undefined);
+    assert.equal(advisor.runner.getToolDefinition("workgraph_report"), undefined);
+    await assert.rejects(
+      advisor.call("workgraph_report", {
+        kind: "consultation",
+        status: "completed",
+        text: "The current strategy is adequate for this bounded question.",
+        summary: "Advisor response",
+        evidence: [],
+        findings: [],
+      }),
+      /Unknown tool|not registered|workgraph_report/i,
+    );
+  } finally {
+    await advisor.dispose();
+  }
+});
 
 void test("research workers do not expose coordinator notes or implementation plans", async () => {
   const f = await fixture("research");

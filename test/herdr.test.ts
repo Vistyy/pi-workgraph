@@ -1086,7 +1086,7 @@ else console.log(JSON.stringify({result:{accepted:true}}));
     HERDR_ENV: "1",
     HERDR_WORKSPACE_ID: "workspace-1",
   });
-  const phases = ["onTab", "onResource", "onIdentity", "onSubmitted"] as const;
+  const phases = ["onTab", "onResource", "onIdentity", "onPreflight", "onSubmitted"] as const;
   try {
     for (const phase of phases) {
       await writeFile(log, "");
@@ -1119,6 +1119,7 @@ else console.log(JSON.stringify({result:{accepted:true}}));
           onTab: () => checkpoint("onTab"),
           onResource: () => checkpoint("onResource"),
           onIdentity: () => checkpoint("onIdentity"),
+          onPreflight: () => checkpoint("onPreflight"),
           onSubmitted: () => checkpoint("onSubmitted"),
         }),
         { signal: controller.signal },
@@ -1148,7 +1149,7 @@ else console.log(JSON.stringify({result:{accepted:true}}));
           calls.some((args) => args[0] === "agent" && args[1] === "get"),
           false,
         );
-      if (phase === "onIdentity")
+      if (phase === "onIdentity" || phase === "onPreflight")
         assert.equal(
           calls.some((args) => args[0] === "agent" && args[1] === "prompt"),
           false,
