@@ -414,7 +414,7 @@ async function run(signal: AbortSignal): Promise<void> {
   await Promise.all([
     mkdir(repo),
     mkdir(join(agentDir, "extensions"), { recursive: true }),
-    mkdir(join(agentDir, "workgraph")),
+    mkdir(join(agentDir, "workgraph"), { recursive: true }),
     mkdir(home),
   ]);
   await writeFile(join(parent, "OWNER"), parent);
