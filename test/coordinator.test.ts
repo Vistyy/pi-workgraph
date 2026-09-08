@@ -494,8 +494,9 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
     SqliteWorkstreamDatabase.use(path, (database) =>
       database.db.prepare("SELECT * FROM lease WHERE singleton=1").get(),
     );
-  const leaseIdentity = (row: unknown) =>
-    decodeTestValue(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- SQLite rows enter as unknown and are validated against the exact identity schema below.
+  const leaseIdentity = (row: unknown) => {
+    const { token, owner_session_id, owner_session_file, acquired_at } = decodeTestValue(
       Type.Object({
         token: Type.String(),
         owner_session_id: Type.String(),
@@ -504,6 +505,8 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
       }),
       row,
     );
+    return { token, owner_session_id, owner_session_file, acquired_at };
+  };
   const repositorySnapshot = async () => ({
     head: await git(f.root, "rev-parse", "HEAD"),
     bytes: await readFile(join(f.root, "value.txt"), "utf8"),
