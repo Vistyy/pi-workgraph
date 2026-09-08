@@ -685,7 +685,7 @@ export default function workgraphCoordinator(
     name: "workgraph_implement",
     label: "Workgraph Implement",
     description:
-      "Delegate implementation of a bounded, decided change under the established human-backed intent. Include context, intended relationships, constraints, and worker discretion sufficient to execute without inventing the design. Resolve consequential uncertainties before requesting implementation. The default keeps current scope even when newer input is retained; changed scope must first be recorded with workgraph_intent.",
+      "Delegate implementation only after the boundary-level design has been settled and, for nontrivial work, externalized in the coordinator conversation and carried into the objective; a local change beneath stable contracts needs only its direct contract and flow. Use the vocabulary of the work. The guide may choose mechanics beneath that design, but must not invent responsibility ownership, retained or removed mechanisms, interaction contracts, consumer and integration changes, end-to-end flow, or failure, ordering, precedence, concurrency, and lifetime behavior. The default keeps current scope even when newer input is retained; changed scope must first be recorded with workgraph_intent.",
     promptSnippet: "Delegate an authorized maintained change",
     parameters: Type.Object(
       {
