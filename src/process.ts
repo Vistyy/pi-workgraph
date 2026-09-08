@@ -80,6 +80,8 @@ export function processEffect(
   return Effect.scoped(
     Effect.gen(function* () {
       const completion = yield* Deferred.make<ProcessClose>();
+      // Let runPromise schedule an already-aborted external signal before native acquisition.
+      yield* Effect.yieldNow;
       const owned = yield* Effect.acquireRelease(
         Effect.try({
           try: () => acquireProcess(command, args, options, outputLimit, completion),
