@@ -94,7 +94,7 @@ export class SqliteWorkstreamDatabase {
     options: { readOnly?: boolean } = {},
   ): A {
     using db = new DatabaseSync(path, { readOnly: options.readOnly ?? false });
-    configureDatabase(db, options.readOnly ?? false);
+    db.exec("PRAGMA busy_timeout = 5000;");
     return run(new SqliteWorkstreamDatabase(path, db));
   }
 
@@ -106,6 +106,9 @@ export class SqliteWorkstreamDatabase {
       closeSync(descriptor);
     }
     SqliteWorkstreamDatabase.use(path, (database) => {
+      database.db.exec(
+        "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON;",
+      );
       chmodPrivateDatabase(path);
       database.db.exec(`
         CREATE TABLE IF NOT EXISTS workstream_state (
@@ -338,14 +341,6 @@ export class SqliteWorkstreamDatabase {
       throw cause;
     }
   }
-}
-
-function configureDatabase(db: DatabaseSync, readOnly: boolean): void {
-  db.exec(
-    readOnly
-      ? "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"
-      : "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
-  );
 }
 
 function chmodPrivateDatabase(path: string): void {
