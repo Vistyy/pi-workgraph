@@ -27,6 +27,13 @@ const HERDR_AGENT_NAME_LIMIT = 32;
 const IDENTITY_SUFFIX_LENGTH = 6;
 const WORKER_TAB_LABEL_LIMIT = 18;
 const WORKER_TAB_PREFIX = "↳ ";
+const WORKER_TAB_ROLE_MARKERS: Record<WorkerRole, string> = {
+  implement: "I",
+  research: "R",
+  review: "V",
+  consultation: "C",
+  consultation_enricher: "E",
+};
 const TAB_SUBJECT_LIMIT = 24;
 const GENERIC_ASSIGNMENT_IDS = new Set([
   "assignment",
@@ -53,11 +60,10 @@ export function herdrWorkerName(request: WorkerNamingContext): string {
 }
 
 export function herdrWorkerTabLabel(request: WorkerNamingContext): string {
-  const subject = boundAtWord(
-    workerSubject(request),
-    WORKER_TAB_LABEL_LIMIT - WORKER_TAB_PREFIX.length,
-  );
-  return `${WORKER_TAB_PREFIX}${subject}`;
+  const role = request.role ?? "research";
+  const prefix = `${WORKER_TAB_PREFIX}[${WORKER_TAB_ROLE_MARKERS[role]}] `;
+  const subject = boundAtWord(workerSubject(request), WORKER_TAB_LABEL_LIMIT - prefix.length);
+  return `${prefix}${subject}`;
 }
 
 export function herdrCoordinatorNames(request: CoordinatorNamingContext) {

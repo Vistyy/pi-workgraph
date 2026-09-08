@@ -18,6 +18,7 @@ import {
   herdrWorkerTabLabel,
   WorkerLaunchError,
   WorkerLaunchPlacementError,
+  type WorkerRole,
 } from "../src/herdr.js";
 import type { WorkerIdentity, WorkerResourceIdentity } from "../src/types.js";
 
@@ -38,10 +39,33 @@ await test("worker tabs use concise task text while native names remain unique a
   assert.match(first, /implement/);
   assert.notEqual(first, herdrWorkerName({ ...request, role: "research" }));
   assert.match(first, /^[a-z][a-z0-9_-]{0,31}$/);
+  assert.match(label, /^↳ \[I\] /);
   assert.match(label, /meaningful/i);
   assert.ok(label.length <= 18);
   assert.doesNotMatch(label, /implement|[a-f0-9]{6}/i);
   assert.equal(herdrWorkerTabLabel({ ...request, attemptId: "attempt-two" }), label);
+  const roleMarkers = [
+    ["implement", "I"],
+    ["research", "R"],
+    ["review", "V"],
+    ["consultation", "C"],
+    ["consultation_enricher", "E"],
+  ] as const satisfies ReadonlyArray<readonly [WorkerRole, string]>;
+  for (const [role, marker] of roleMarkers) {
+    const roleLabel = herdrWorkerTabLabel({ ...request, role });
+    assert.ok(roleLabel.startsWith(`↳ [${marker}] `));
+    assert.ok(roleLabel.length <= 18);
+  }
+  assert.match(
+    herdrWorkerTabLabel({
+      runId: request.runId,
+      nodeId: request.nodeId,
+      attemptId: request.attemptId,
+      assignmentId: request.assignmentId,
+      objective: request.objective,
+    }),
+    /^↳ \[R\] /,
+  );
   assert.notEqual(first, second);
   const fallback = herdrWorkerTabLabel({
     ...request,
