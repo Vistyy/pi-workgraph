@@ -41,8 +41,12 @@ For interrupted work or missing evidence, see [Recovery and inspection](OPERATIO
 ## Contributing
 
 ```bash
-pnpm check       # Quality checks and deterministic tests
+pnpm check       # Quality checks and deterministic tests; no model or Herdr calls
 pnpm typecheck   # Independent compiler check
+pnpm verify:package  # Pack/install the exact tarball in a disposable consumer (needs network)
+pnpm verify:native   # Opt-in controlled Herdr/provider continuation check (requires HERDR_ENV=1)
 ```
+
+`verify:native` is not part of the routine gate and must be run only with an operator-owned Herdr pane. It uses a loopback scripted provider, performs one bounded coordinator notification continuation, and retains uncertain native resources for reconciliation. Optional real-model observations remain task-specific rather than a maintained mechanical smoke gate.
 
 [Contributor instructions](AGENTS.md) · [Design](DESIGN.md) · [Verification](VERIFICATION.md)

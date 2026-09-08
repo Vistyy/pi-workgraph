@@ -27,7 +27,7 @@ These are claim boundaries, not required layers for every change. Keep focused c
 
 ## Bounded native checks
 
-Every native/model check needs a concrete outcome, operation-specific deadlines, and an overall stopping condition. Report the last completed boundary and the operation that stalled; do not hide all failures behind one long convergence timeout.
+Every native/model check needs a concrete outcome, operation-specific deadlines, and an overall stopping condition. `verify:native` bounds each phase and provider/Herdr operation at 30 seconds, the complete run at 180 seconds, and cleanup at the same bounded operation deadlines. Report the last completed boundary and the operation that stalled; do not hide all failures behind one long convergence timeout. The controlled native path submits exactly one initial prompt, releases the scripted research report only after independent coordinator settlement, and requires the production notification to cause the next provider request and notepad marker. Provider request identity and errors are retained in diagnostics; no success retry is automatic.
 
 Checkpoint owned workspace, pane, terminal, session, worktree, and branch identities as they become available. On success or failure, establish native closure before deleting verified disposable resources or copied credentials. Preserve useful private diagnostics and any resources whose ownership or liveness remains uncertain. Never change user-global model configuration, credentials, or trust settings to make a check pass.
 
@@ -37,7 +37,7 @@ An autonomous coordinator scenario is not the routine integration gate. Use it w
 
 ## Selecting checks
 
-The maintained static/deterministic command is `pnpm check`; `pnpm typecheck` is the independent compiler diagnostic. [package.json](package.json) owns executable commands and pinned tooling. Existing smoke scripts are available mechanisms, not obligations to run all of them.
+The maintained static/deterministic command is `pnpm check`; `pnpm typecheck` is the independent compiler diagnostic. [package.json](package.json) owns executable commands and pinned tooling. The real-Pi loopback integration tests run within `pnpm check` without model or Herdr calls. `pnpm verify:package` is a separate explicit package-boundary check: it packs this exact revision, installs the tarball into a disposable consumer, and invokes help outside the checkout; its install requires registry/network access when dependencies are not cached. `pnpm verify:native` is opt-in only and requires `HERDR_ENV=1` plus an operator-owned Herdr pane; it uses the finite loopback provider and must not be added to the routine test glob.
 
 For a change, identify the affected guarantee and the evidence missing for it. Run applicable checks, resolve concrete failures, and stop when that evidence is sufficient. Do not repeat expensive checks solely because another review or tool call occurred. A pure state-predicate refactor ordinarily needs deterministic workflow/regression evidence, not another autonomous coordinator run. A native notification change needs a real continuation observation, not only a test asserting `triggerTurn: true`.
 

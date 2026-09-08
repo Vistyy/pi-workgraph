@@ -35,9 +35,8 @@
     "quality": "pnpm run quality:prepare && biome check --error-on-warnings . && oxlint --config oxlint.config.ts .",
     "check:exports": "knip --no-progress --include exports,nsExports",
     "check": "pnpm run quality && pnpm run check:exports && pnpm run test",
-    "smoke:herdr": "node --import tsx scripts/live/native-smoke.ts",
-    "smoke:coordinator": "node --import tsx scripts/live/capability-smoke.ts",
-    "smoke:natural": "node --import tsx scripts/live/natural-smoke.ts"
+    "verify:native": "node --import tsx scripts/live/controlled-native.ts",
+    "verify:package": "node --import tsx scripts/live/package-check.ts"
   },
   "pi": {
     "extensions": [
