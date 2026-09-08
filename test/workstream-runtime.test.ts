@@ -2136,25 +2136,54 @@ await test("checkpointed retained cleanup closes an absent worker without deleti
       "retained cleanup attempt",
     );
     const placement = required(launched.placement, "retained cleanup placement");
-    t.mock.method(f.store, "markWorkerClosed", () => Effect.never);
+    const worker = required(launched.worker, "retained cleanup worker");
+    const retainedFile = join(placement.path, "retained.txt");
+    await writeFile(retainedFile, "retained across cleanup recovery\n");
+    const markWorkerClosed = t.mock.method(f.store, "markWorkerClosed", () => Effect.never);
     await assert.rejects(runRuntime(active.effects.reconcile.pipe(Effect.timeout("100 millis"))));
-    t.mock.restoreAll();
+    markWorkerClosed.mock.restore();
 
     let state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.cleanup?.state, "pending");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, false);
     assert.equal(state.attempts[0]?.error, undefined);
-    assert.equal(state.results.length, 1);
+    const retainedResult = required(state.results[0], "retained cleanup result");
+    assert.equal(await readFile(retainedFile, "utf8"), "retained across cleanup recovery\n");
+    assert.equal(await readFile(join(placement.path, "value.txt"), "utf8"), "initial\n");
+
     f.workers.absent = true;
-    state = await runRuntime(active.effects.reconcile);
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    const observe = t.mock.method(f.workers, "observe", () =>
+      assert.fail("settled cleanup must not use general worker observation"),
+    );
+    const finishCleanup = t.mock.method(f.store, "finishCleanup", () => Effect.never);
+    await assert.rejects(runRuntime(active.effects.reconcile.pipe(Effect.timeout("100 millis"))));
+    observe.mock.restore();
+    finishCleanup.mock.restore();
+
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.equal(state.attempts[0]?.error, undefined);
-    assert.equal(state.results.length, 1);
+    assert.deepEqual(state.results, [retainedResult]);
+    assert.deepEqual(f.workers.cleanupIdentities, [worker, worker]);
     assert.equal(
       (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
       true,
     );
+    assert.equal(await readFile(retainedFile, "utf8"), "retained across cleanup recovery\n");
+    assert.equal(await readFile(join(placement.path, "value.txt"), "utf8"), "initial\n");
+
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.attempts[0]?.error, undefined);
+    assert.deepEqual(state.results, [retainedResult]);
+    assert.deepEqual(f.workers.cleanupIdentities, [worker, worker]);
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      true,
+    );
+    assert.equal(await readFile(retainedFile, "utf8"), "retained across cleanup recovery\n");
     assert.equal(await readFile(join(placement.path, "value.txt"), "utf8"), "initial\n");
   } finally {
     await f.dispose();
