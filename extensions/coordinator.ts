@@ -280,10 +280,7 @@ export default function workgraphCoordinator(pi: ExtensionAPI): void {
           gitCommonDir: repository.commonDir,
           coordinator: owner(ctx),
         });
-        const active = yield* attachOwned(
-          ctx,
-          WorkstreamStoreEffects.open(created.store.path, owner(ctx)),
-        );
+        const active = yield* attachOwned(ctx, created.store);
         yield* importInputsEffect(active);
         yield* sdk("retain workstream pointer", () =>
           pi.appendEntry(POINTER, { path: created.store.path }),

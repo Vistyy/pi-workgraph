@@ -518,14 +518,10 @@ void test("failed registered adoption preserves the attached runtime lease; same
       a.id,
     );
     const competingLocator = WorkstreamStoreEffects.open(a.statePath, a.coordinator);
-    try {
-      assert.throws(
-        () => Effect.runSync(competingLocator.acquireLease(a.coordinator)),
-        /runtime owner/,
-      );
-    } finally {
-      competingLocator.close();
-    }
+    assert.throws(
+      () => Effect.runSync(competingLocator.acquireLease(a.coordinator)),
+      /runtime owner/,
+    );
     const same = resultState((await f.call("workgraph_adopt", { statePath: a.statePath })).details);
     assert.equal(same.id, a.id);
     await f.call("workgraph_control", {
@@ -539,12 +535,8 @@ void test("failed registered adoption preserves the attached runtime lease; same
     assert.equal(adopted.id, "other-work");
     assert.equal(adopted.coordinator.sessionId, f.session.getSessionId());
     const releasedLocator = WorkstreamStoreEffects.open(a.statePath, a.coordinator);
-    try {
-      const released = Effect.runSync(releasedLocator.acquireLease(a.coordinator));
-      Effect.runSync(releasedLocator.releaseLease(released));
-    } finally {
-      releasedLocator.close();
-    }
+    const released = Effect.runSync(releasedLocator.acquireLease(a.coordinator));
+    Effect.runSync(releasedLocator.releaseLease(released));
   } finally {
     if (competing !== undefined) await Effect.runPromise(competing.effects.close);
     registry.close();
@@ -576,7 +568,6 @@ void test("mutation responses stay action-focused while retaining handles, model
       );
     }
     await runStore(seeded.store.releaseLease(lease));
-    seeded.store.close();
     f.session.appendCustomEntry("pi-workgraph-workstream", { path: seeded.state.statePath });
     await f.runner.emit({ type: "session_start", reason: "new" });
 
@@ -656,7 +647,6 @@ void test("registered status stays compact and focused result retrieval projects
     );
     await settleFixtureAttempt(store, "large-result-attempt", "large-result-1");
     await runStore(store.releaseLease(lease));
-    store.close();
     f.session.appendCustomEntry("pi-workgraph-workstream", { path: created.state.statePath });
     await f.runner.emit({ type: "session_start", reason: "new" });
     const status = await f.call("workgraph_inspect", { section: "overview" });

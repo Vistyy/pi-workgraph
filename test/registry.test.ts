@@ -145,7 +145,6 @@ await test("legacy registry rows follow only the validated JSON-to-SQLite migrat
       null,
       2,
     )}\n`;
-    created.store.close();
     await rm(created.state.statePath, { force: true });
     await writeFile(legacyPath, source, { mode: 0o600 });
 
@@ -207,7 +206,6 @@ await test("legacy registry rows follow only the validated JSON-to-SQLite migrat
       /identity collision/,
     );
   } finally {
-    opened?.close();
     registry?.close();
     await rm(parent, { recursive: true, force: true });
   }
@@ -232,9 +230,9 @@ await test("SQLite lease fencing rejects lock-wait and long-callback commits", a
   const lease = await run(created.store.acquireLease(owner));
   let blocker: DatabaseSync | undefined;
   try {
-    created.store.db
-      .prepare("UPDATE lease SET expires_at=? WHERE singleton=1")
-      .run(nativeExpiry(120));
+    SqliteWorkstreamDatabase.use(created.store.path, (database) => {
+      database.db.prepare("UPDATE lease SET expires_at=? WHERE singleton=1").run(nativeExpiry(120));
+    });
     blocker = new DatabaseSync(created.store.path);
     blocker.exec("PRAGMA busy_timeout = 5000; BEGIN IMMEDIATE;");
     const persistenceUrl = JSON.stringify(
@@ -242,12 +240,13 @@ await test("SQLite lease fencing rejects lock-wait and long-callback commits", a
     );
     const child = startBoundaryProcess(
       `import { LeaseDecisionRequiredError, SqliteWorkstreamDatabase } from ${persistenceUrl};
-const database = SqliteWorkstreamDatabase.open(process.env.WG_DB_PATH);
 const lease = JSON.parse(process.env.WG_LEASE);
 process.stdout.write("ready\\n");
 try {
-  database.update(lease, (draft) => {
-    draft.purpose = draft.purpose + " child";
+  SqliteWorkstreamDatabase.use(process.env.WG_DB_PATH, (database) => {
+    database.update(lease, (draft) => {
+      draft.purpose = draft.purpose + " child";
+    });
   });
   process.stdout.write("committed\\n");
 } catch (error) {
@@ -256,8 +255,6 @@ try {
     console.error(error);
     process.exitCode = 1;
   }
-} finally {
-  database.close();
 }`,
       { WG_DB_PATH: created.store.path, WG_LEASE: JSON.stringify(lease) },
     );
@@ -273,31 +270,32 @@ try {
     assert.equal(
       Value.Decode(
         RevisionRowSchema,
-        created.store.db.prepare("SELECT revision FROM workstream_state").get(),
+        SqliteWorkstreamDatabase.use(created.store.path, (database) =>
+          database.db.prepare("SELECT revision FROM workstream_state").get(),
+        ),
       ).revision,
       0,
     );
 
-    created.store.db
-      .prepare("UPDATE lease SET expires_at=? WHERE singleton=1")
-      .run(nativeExpiry(120));
-    const direct = SqliteWorkstreamDatabase.open(created.store.path);
-    try {
+    SqliteWorkstreamDatabase.use(created.store.path, (database) => {
+      database.db.prepare("UPDATE lease SET expires_at=? WHERE singleton=1").run(nativeExpiry(120));
+    });
+    SqliteWorkstreamDatabase.use(created.store.path, (database) => {
       assert.throws(
         () =>
-          direct.update(lease, (draft) => {
+          database.update(lease, (draft) => {
             sleepSync(300);
             draft.purpose = `${draft.purpose} delayed`;
           }),
         /fenced lease|live lease/,
       );
-    } finally {
-      direct.close();
-    }
+    });
     assert.equal(
       Value.Decode(
         RevisionRowSchema,
-        created.store.db.prepare("SELECT revision FROM workstream_state").get(),
+        SqliteWorkstreamDatabase.use(created.store.path, (database) =>
+          database.db.prepare("SELECT revision FROM workstream_state").get(),
+        ),
       ).revision,
       0,
     );
@@ -311,7 +309,6 @@ try {
       }
       blocker.close();
     }
-    created.store.close();
     await rm(parent, { recursive: true, force: true });
   }
 });
@@ -340,7 +337,6 @@ await test("concurrent legacy imports retain the sole exclusive SQLite winner", 
     purpose: "concurrent legacy import ".repeat(250_000),
   };
   const source = `${JSON.stringify(legacy, null, 2)}\n`;
-  created.store.close();
   await rm(created.state.statePath, { force: true });
   await writeFile(sourcePath, source, { mode: 0o600 });
   const releasePath = join(parent, "release-import");
@@ -430,14 +426,14 @@ await test("private workstream SQLite fences leases and commits aggregate mutati
       }),
     );
     assert.equal(updated.state.revision, 1);
-    const revisionRow = second.db.prepare("SELECT revision FROM workstream_state").get();
+    const revisionRow = SqliteWorkstreamDatabase.use(second.path, (database) =>
+      database.db.prepare("SELECT revision FROM workstream_state").get(),
+    );
     assert.ok(Value.Check(RevisionRowSchema, revisionRow));
     assert.equal(Value.Decode(RevisionRowSchema, revisionRow).revision, 1);
     assert.throws(() => second.assertLease({ ...lease, token: "stale" }, at(3)), /live lease/);
     await run(first.store.releaseLease(lease));
-    second.close();
   } finally {
-    first.store.close();
     await rm(parent, { recursive: true, force: true });
   }
 });

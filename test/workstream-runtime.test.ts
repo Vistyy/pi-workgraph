@@ -23,7 +23,7 @@ import { processEffect } from "../src/process.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity, WorkerReport } from "../src/types.js";
 import { type WorkstreamState, WorkstreamStoreEffects } from "../src/workstream.js";
-import type { Lease } from "../src/workstream-persistence.js";
+import { type Lease, SqliteWorkstreamDatabase } from "../src/workstream-persistence.js";
 import {
   type RuntimeEffect,
   type RuntimeOwnership,
@@ -996,9 +996,9 @@ await test("retained candidate corrections apply their complete history and keep
         : assert.fail("First candidate must retain an isolated worktree.");
 
     // SAFETY: This fixture updates only the known SQLite aggregate row to remove optional candidate metadata.
-    const persistedRow = f.store.db
-      .prepare("SELECT state_json FROM workstream_state WHERE singleton=1")
-      .get();
+    const persistedRow = SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+      database.db.prepare("SELECT state_json FROM workstream_state WHERE singleton=1").get(),
+    );
     assert.ok(Value.Check(PersistedSqliteRowSchema, persistedRow));
     // SAFETY: The validated SQLite aggregate row contains the JSON object whose attempts array is inspected only to remove optional metadata.
     const persisted = JSON.parse(
@@ -1009,9 +1009,11 @@ await test("retained candidate corrections apply their complete history and keep
     const persistedParent = persisted.attempts.find((attempt) => attempt.id === firstAttempt.id);
     assert.ok(persistedParent !== undefined);
     delete persistedParent.candidate;
-    f.store.db
-      .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
-      .run(JSON.stringify(persisted));
+    SqliteWorkstreamDatabase.use(f.store.path, (database) => {
+      database.db
+        .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
+        .run(JSON.stringify(persisted));
+    });
 
     await runRuntime(
       active.effects.queue(
@@ -1305,9 +1307,11 @@ await test("exclusive lease fences same-session duplicates and dead-owner adopti
     const receipts = (await runRuntime(f.store.load())).inputs;
     await assert.rejects(f.runtime(), /already has a runtime owner/);
     await submit(first, f.store.setLifecycle({ state: "suspended", reason: "Keep stopped" }));
-    f.store.db
-      .prepare("UPDATE lease SET expires_at=? WHERE singleton=1")
-      .run("2000-01-01T00:00:00.000Z");
+    SqliteWorkstreamDatabase.use(f.store.path, (database) => {
+      database.db
+        .prepare("UPDATE lease SET expires_at=? WHERE singleton=1")
+        .run("2000-01-01T00:00:00.000Z");
+    });
     const nextOwner = {
       sessionId: "new-owner",
       sessionFile: join(f.parent, "new-session.jsonl"),
@@ -1426,7 +1430,12 @@ await test("partial adoption failure releases the acquired lease before runtime 
       /adoption failure/,
     );
     assert.equal(adopt.mock.callCount(), 1);
-    assert.equal(f.store.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(), undefined);
+    assert.equal(
+      SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+        database.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(),
+      ),
+      undefined,
+    );
   } finally {
     await f.dispose();
   }
@@ -1458,11 +1467,18 @@ await test("fatal heartbeat loss releases ownership and permits a clean reattach
   try {
     const active = await f.runtime(undefined, { clock });
     await submit(active, Effect.void);
-    f.store.db.prepare("DELETE FROM lease WHERE singleton=1").run();
+    SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+      database.db.prepare("DELETE FROM lease WHERE singleton=1").run(),
+    );
     await Effect.runPromise(clock.adjust("5 seconds"));
     assert.equal(f.errors.length, 1);
     assert.match(f.errors[0] ?? "", /lease|owner/i);
-    assert.equal(f.store.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(), undefined);
+    assert.equal(
+      SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+        database.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(),
+      ),
+      undefined,
+    );
     const reattached = await f.runtime();
     await submit(reattached, Effect.void);
     await runRuntime(active.effects.close);
@@ -1534,7 +1550,12 @@ await test("close interrupts a suspended store operation and fails queued replie
     await runRuntime(active.effects.close);
     await assert.rejects(running, /stopped|interrupt/i);
     await assert.rejects(queued, /stopped|interrupt/i);
-    assert.equal(f.store.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(), undefined);
+    assert.equal(
+      SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+        database.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(),
+      ),
+      undefined,
+    );
   } finally {
     await f.dispose();
   }
@@ -1554,7 +1575,12 @@ await test("close surfaces private lease release failures after attempting the e
   try {
     await assert.rejects(runRuntime(active.effects.close), /private lease release failure/);
     assert.match(f.errors[0] ?? "", /private lease release failure/);
-    assert.equal(f.store.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(), undefined);
+    assert.equal(
+      SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+        database.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(),
+      ),
+      undefined,
+    );
   } finally {
     f.registry.close();
     await rm(f.parent, { recursive: true, force: true });

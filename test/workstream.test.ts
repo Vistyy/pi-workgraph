@@ -27,6 +27,7 @@ import {
   type WorkstreamState,
   WorkstreamStoreEffects,
 } from "../src/workstream.js";
+import { SqliteWorkstreamDatabase } from "../src/workstream-persistence.js";
 import { legacyPathForWorkstream, WorkstreamStoreOperationError } from "../src/workstream-state.js";
 import { deriveCompletionAccounting } from "../src/workstream-transitions.js";
 import { parsePersistedObject } from "../src/workstream-validation.js";
@@ -1039,21 +1040,23 @@ void test("every independent attempt remains accounted for regardless of result 
 void test("malformed state diagnostics identify a bounded field path without echoing payloads", async () => {
   const { parent, store } = await fixture();
   try {
-    const originalRow = store.db
-      .prepare("SELECT state_json FROM workstream_state WHERE singleton=1")
-      .get();
+    const originalRow = SqliteWorkstreamDatabase.use(store.path, (database) =>
+      database.db.prepare("SELECT state_json FROM workstream_state WHERE singleton=1").get(),
+    );
     assert.ok(Value.Check(PersistedSqliteRowSchema, originalRow));
     const original = Value.Decode(PersistedSqliteRowSchema, originalRow);
-    store.db
-      .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
-      .run(
-        original.state_json
-          .replace(
-            '"purpose": "Determine the safe fixture change."',
-            '"purpose": "credential=redacted-secret"',
-          )
-          .replace('"revision": 0', '"revision": "invalid"'),
-      );
+    SqliteWorkstreamDatabase.use(store.path, (database) => {
+      database.db
+        .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
+        .run(
+          original.state_json
+            .replace(
+              '"purpose": "Determine the safe fixture change."',
+              '"purpose": "credential=redacted-secret"',
+            )
+            .replace('"revision": 0', '"revision": "invalid"'),
+        );
+    });
     await assert.rejects(
       runStore(WorkstreamStoreEffects.inspect(store.path)),
       (error: Error) =>
@@ -1206,7 +1209,6 @@ void test("legacy current JSON imports only after dead-owner proof and preserves
     const legacyPath = legacyPathForWorkstream(state.gitCommonDir, state.id);
     const raw = await runStore(WorkstreamStoreEffects.readRaw(state.statePath));
     const legacy = { ...parsePersistedObject(raw), statePath: legacyPath };
-    store.close();
     await rm(state.statePath, { force: true });
     await writeFile(legacyPath, `${JSON.stringify(legacy, null, 2)}\n`);
     const before = await readFile(legacyPath);

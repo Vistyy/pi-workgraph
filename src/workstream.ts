@@ -55,7 +55,6 @@ import {
   type WorkstreamReattachmentInspection,
   type WorkstreamState,
   WorkstreamStateSchema,
-  WorkstreamStoreOperationError,
 } from "./workstream-state.js";
 import {
   accountingTaskId,
@@ -116,22 +115,13 @@ type QueuedAttempt = {
 };
 
 export class WorkstreamStoreEffects {
-  private readonly database: SqliteWorkstreamDatabase;
   private readonly leases = new Map<string, Lease>();
   private lease: Lease | undefined;
 
   private constructor(
     readonly path: string,
     private owner: SessionIdentity,
-    database: SqliteWorkstreamDatabase,
-  ) {
-    this.database = database;
-  }
-
-  /** The SQLite handle is exposed for focused boundary checks, not as a second store API. */
-  get db(): SqliteWorkstreamDatabase["db"] {
-    return this.database.db;
-  }
+  ) {}
 
   adopt(owner: SessionIdentity): StoreEffect<WorkstreamState> {
     return this.prepared(
@@ -148,9 +138,11 @@ export class WorkstreamStoreEffects {
             throw new LeaseDecisionRequiredError(
               "Workstream adoption owner does not hold its lease.",
             );
-          const state = this.database.update(lease, (draft) => {
-            draft.coordinator = { ...owner };
-          });
+          const state = this.withDatabase((database) =>
+            database.update(lease, (draft) => {
+              draft.coordinator = { ...owner };
+            }),
+          );
           this.owner = { ...owner };
           return state;
         }),
@@ -215,33 +207,13 @@ export class WorkstreamStoreEffects {
       Effect.flatMap(({ path, state }) =>
         claimWorkstreamDirectory(path).pipe(
           Effect.flatMap(() =>
-            domainEffect(() => SqliteWorkstreamDatabase.create(path)).pipe(
-              Effect.flatMap((database) =>
-                domainEffect(() => database.initialize(state)).pipe(
-                  Effect.catch((error) =>
-                    Effect.sync(() => database.close()).pipe(
-                      Effect.matchEffect({
-                        onFailure: (closeError) =>
-                          Effect.fail(
-                            new WorkstreamStoreOperationError({
-                              code: "workstream_store_operation_failed",
-                              message:
-                                "Workstream initialization failed and its SQLite handle could not be closed; the private artifact was retained for inspection.",
-                              cause: new AggregateError([error, closeError]),
-                            }),
-                          ),
-                        onSuccess: () => Effect.fail(error),
-                      }),
-                    ),
-                  ),
-                  Effect.map(
-                    () =>
-                      ({
-                        store: new WorkstreamStoreEffects(path, input.coordinator, database),
-                        state: structuredClone(state),
-                      }) as const,
-                  ),
-                ),
+            domainEffect(() => SqliteWorkstreamDatabase.create(path, state)).pipe(
+              Effect.map(
+                () =>
+                  ({
+                    store: new WorkstreamStoreEffects(path, input.coordinator),
+                    state: structuredClone(state),
+                  }) as const,
               ),
             ),
           ),
@@ -257,11 +229,7 @@ export class WorkstreamStoreEffects {
       throw new Error(
         `Legacy JSON workstream state is read-only; explicitly migrate it after proving the prior owner is dead: ${resolvedPath}.`,
       );
-    return new WorkstreamStoreEffects(
-      resolvedPath,
-      owner,
-      SqliteWorkstreamDatabase.open(resolvedPath),
-    );
+    return new WorkstreamStoreEffects(resolvedPath, owner);
   }
 
   static inspect(path: string): StoreEffect<WorkstreamState> {
@@ -322,24 +290,19 @@ export class WorkstreamStoreEffects {
       yield* domainEffect(() => assertLegacySourceFile(resolvedPath));
       yield* claimWorkstreamDirectory(targetPath, true);
       const imported = { ...structuredClone(legacy), statePath: targetPath };
-      return yield* Effect.acquireUseRelease(
-        domainEffect(() => SqliteWorkstreamDatabase.create(targetPath)),
-        (database) =>
-          domainEffect(() => {
-            database.initialize(imported);
-            if (readFileSync(resolvedPath, "utf8") !== source)
-              throw new Error(
-                `Legacy workstream source changed during bounded import; source was left untouched and the canonical artifact was retained at ${targetPath}.`,
-              );
-            return { path: targetPath, state: imported };
-          }),
-        (database) => Effect.sync(() => database.close()),
-      );
+      return yield* domainEffect(() => {
+        SqliteWorkstreamDatabase.create(targetPath, imported);
+        if (readFileSync(resolvedPath, "utf8") !== source)
+          throw new Error(
+            `Legacy workstream source changed during bounded import; source was left untouched and the canonical artifact was retained at ${targetPath}.`,
+          );
+        return { path: targetPath, state: imported };
+      });
     });
   }
 
   load(): StoreEffect<WorkstreamState> {
-    return domainEffect(() => this.database.state()).pipe(
+    return domainEffect(() => this.withDatabase((database) => database.state())).pipe(
       Effect.tap((state) => domainEffect(() => this.assertOwner(state))),
     );
   }
@@ -350,7 +313,7 @@ export class WorkstreamStoreEffects {
   ): StoreEffect<Lease, never> {
     return domainEffect(() => {
       validateSession(owner);
-      const lease = this.database.claimLease(owner, liveness);
+      const lease = this.withDatabase((database) => database.claimLease(owner, liveness));
       this.leases.set(lease.token, lease);
       this.lease = lease;
       return lease;
@@ -358,13 +321,13 @@ export class WorkstreamStoreEffects {
   }
 
   assertLease(lease: Lease, now?: Date): void {
-    this.database.assertLease(lease, now);
+    this.withDatabase((database) => database.assertLease(lease, now));
   }
 
   renewLease(lease: Lease): StoreEffect<Lease, never> {
     return domainEffect(() => {
       this.assertLocalLease(lease);
-      const renewed = this.database.renewLease(lease);
+      const renewed = this.withDatabase((database) => database.renewLease(lease));
       this.leases.set(renewed.token, renewed);
       if (this.lease?.token === lease.token) this.lease = renewed;
       return renewed;
@@ -374,14 +337,10 @@ export class WorkstreamStoreEffects {
   releaseLease(lease: Lease): StoreEffect<void, never> {
     return domainEffect(() => {
       this.assertLocalLease(lease);
-      this.database.releaseLease(lease);
+      this.withDatabase((database) => database.releaseLease(lease));
       this.leases.delete(lease.token);
       if (this.lease?.token === lease.token) this.lease = undefined;
     });
-  }
-
-  close(): void {
-    this.database.close();
   }
 
   recordInputEvent(input: {
@@ -1136,12 +1095,18 @@ export class WorkstreamStoreEffects {
       const lease = this.lease;
       if (lease === undefined)
         throw new LeaseDecisionRequiredError("Workstream mutation requires its fenced lease.");
-      return this.database.update(lease, mutator, {
-        expectedOwner: this.owner,
-        suppliedNow,
-        allowedLifecycleStates,
-      });
+      return this.withDatabase((database) =>
+        database.update(lease, mutator, {
+          expectedOwner: this.owner,
+          suppliedNow,
+          allowedLifecycleStates,
+        }),
+      );
     });
+  }
+
+  private withDatabase<A>(run: (database: SqliteWorkstreamDatabase) => A): A {
+    return SqliteWorkstreamDatabase.use(this.path, run);
   }
 
   private assertOwner(state: WorkstreamState): void {
@@ -1199,11 +1164,7 @@ function sqliteEffect<A>(
   path: string,
   run: (database: SqliteWorkstreamDatabase) => A,
 ): StoreEffect<A, never> {
-  return Effect.acquireUseRelease(
-    domainEffect(() => SqliteWorkstreamDatabase.openReadOnly(path)),
-    (database) => domainEffect(() => run(database)),
-    (database) => Effect.sync(() => database.close()),
-  );
+  return domainEffect(() => SqliteWorkstreamDatabase.use(path, run, { readOnly: true }));
 }
 
 function inspectHistoricalReattachment(

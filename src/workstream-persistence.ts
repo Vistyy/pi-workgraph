@@ -83,28 +83,31 @@ type NativeSqliteRow = Exclude<ReturnType<ReturnType<DatabaseSync["prepare"]>["g
 
 /** The canonical private owner of one workstream's aggregate and fenced lease. */
 export class SqliteWorkstreamDatabase {
-  readonly db: DatabaseSync;
-
   private constructor(
     readonly path: string,
-    db: DatabaseSync,
-  ) {
-    this.db = db;
+    readonly db: DatabaseSync,
+  ) {}
+
+  static use<A>(
+    path: string,
+    run: (database: SqliteWorkstreamDatabase) => A,
+    options: { readOnly?: boolean } = {},
+  ): A {
+    using db = new DatabaseSync(path, { readOnly: options.readOnly ?? false });
+    configureDatabase(db, options.readOnly ?? false);
+    return run(new SqliteWorkstreamDatabase(path, db));
   }
 
-  static create(path: string): SqliteWorkstreamDatabase {
+  static create(path: string, state: WorkstreamState): void {
     const descriptor = openSync(path, "wx", FILE_MODE);
     try {
       chmodSync(path, FILE_MODE);
     } finally {
       closeSync(descriptor);
     }
-    let db: DatabaseSync | undefined;
-    try {
-      db = new DatabaseSync(path);
-      configureDatabase(db);
+    SqliteWorkstreamDatabase.use(path, (database) => {
       chmodPrivateDatabase(path);
-      db.exec(`
+      database.db.exec(`
         CREATE TABLE IF NOT EXISTS workstream_state (
           singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
           state_json TEXT NOT NULL,
@@ -121,36 +124,8 @@ export class SqliteWorkstreamDatabase {
         );
       `);
       chmodPrivateDatabase(path);
-      return new SqliteWorkstreamDatabase(path, db);
-    } catch (cause) {
-      if (db !== undefined) {
-        try {
-          db.close();
-        } catch (closeCause) {
-          throw new AggregateError(
-            [cause, closeCause],
-            "SQLite initialization failed and its handle could not be closed; the private artifact was retained.",
-          );
-        }
-      }
-      throw cause;
-    }
-  }
-
-  static open(path: string): SqliteWorkstreamDatabase {
-    const db = new DatabaseSync(path);
-    db.exec("PRAGMA busy_timeout = 5000;");
-    return new SqliteWorkstreamDatabase(path, db);
-  }
-
-  static openReadOnly(path: string): SqliteWorkstreamDatabase {
-    const db = new DatabaseSync(path, { readOnly: true });
-    db.exec("PRAGMA busy_timeout = 5000;");
-    return new SqliteWorkstreamDatabase(path, db);
-  }
-
-  close(): void {
-    this.db.close();
+      database.initialize(state);
+    });
   }
 
   rawState(): string {
@@ -365,9 +340,11 @@ export class SqliteWorkstreamDatabase {
   }
 }
 
-function configureDatabase(db: DatabaseSync): void {
+function configureDatabase(db: DatabaseSync, readOnly: boolean): void {
   db.exec(
-    "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
+    readOnly
+      ? "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;"
+      : "PRAGMA journal_mode = DELETE; PRAGMA synchronous = FULL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
   );
 }
 
