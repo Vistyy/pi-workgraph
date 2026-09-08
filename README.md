@@ -31,7 +31,7 @@ Tool descriptions explain arguments and restrictions. For delegation and quality
 
 ## Everyday controls
 
-**Less visual noise:** `/calm` hides operational rows while keeping answers and a compact activity indicator visible. `/calm default on` saves the preference for new sessions. This changes presentation, not execution or model context.
+**Less visual noise:** `/calm` hides thinking/reasoning and operational rows while keeping assistant answers and an ephemeral current-activity whisper plus the compact Workgraph indicator visible. The whisper reports typed coordinator activity, temporarily hides its detail while a blocking UI prompt is open, and resumes the same activity afterward; it never enters execution or model context. `/calm default on` saves the preference for new sessions.
 
 **Models:** ask the coordinator to inspect or change defaults with `workgraph_models`. Research/review use `selection` for replication, diversity, and overrides; implementation uses `models.guide` and `models.executor` overrides. Omitted model/thinking components use role defaults. Per-assignment choices do not change saved policy.
 

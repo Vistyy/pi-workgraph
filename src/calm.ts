@@ -16,12 +16,18 @@ import { Value } from "typebox/value";
 import {
   type CalmActivityState,
   calmActivityLines,
+  createCalmActivityTracker,
   isCalmActivityActive,
 } from "./calm-activity.js";
 import { type CalmPreferences, calmPreferences } from "./calm-preferences.js";
 import { attachCalmSeparators } from "./calm-separators.js";
+import { type AssistantPresentationConstructor, attachCalmThinking } from "./calm-thinking.js";
 
-export { calmActivityLines, isCalmActivityActive } from "./calm-activity.js";
+export {
+  calmActivityLines,
+  createCalmActivityTracker,
+  isCalmActivityActive,
+} from "./calm-activity.js";
 
 // SAFETY: This module is the narrowly guarded internal Pi rendering compatibility boundary.
 // Its unknown/reflection checks parse runtime exports and instances so a changed seam falls back visibly.
@@ -76,7 +82,7 @@ type PresentationInstance = {
   handleMouse: MouseHandler | undefined;
 };
 type PresentationPrototype = PresentationInstance & {
-  readonly [PATCH_OWNER]?: Render;
+  readonly [PATCH_OWNER]?: unknown;
 };
 type PresentationConstructor = {
   prototype: PresentationPrototype;
@@ -84,7 +90,7 @@ type PresentationConstructor = {
 export interface CalmPresentationModule {
   readonly ToolExecutionComponent: PresentationConstructor;
   readonly CustomMessageComponent: PresentationConstructor;
-  readonly AssistantMessageComponent: PresentationConstructor;
+  readonly AssistantMessageComponent: AssistantPresentationConstructor;
   readonly UserMessageComponent: PresentationConstructor;
 }
 
@@ -124,44 +130,50 @@ export function attachCalmPresentation(
   diagnostic: Diagnostic,
   separatorStyle: (text: string) => string = (text) => text,
 ): Detach {
-  const detachTool = patchPrototype(
-    module.ToolExecutionComponent.prototype,
-    "tool rows",
-    (component) => readStringProperty(component, "toolName"),
-    (name) => state.hiddenTools.has(name),
-    state,
-    diagnostic,
-  );
+  const detaches: Detach[] = [];
   try {
-    const detachMessage = patchPrototype(
-      module.CustomMessageComponent.prototype,
-      "custom messages",
-      (component) => readStringProperty(readProperty(component, "message"), "customType"),
-      (name) => state.hiddenMessageTypes.has(name),
-      state,
-      diagnostic,
+    detaches.push(
+      patchPrototype(
+        module.ToolExecutionComponent.prototype,
+        "tool rows",
+        (component) => readStringProperty(component, "toolName"),
+        (name) => state.hiddenTools.has(name),
+        state,
+        diagnostic,
+      ),
     );
-    try {
-      const detachSeparators = attachCalmSeparators(
+    detaches.push(
+      patchPrototype(
+        module.CustomMessageComponent.prototype,
+        "custom messages",
+        (component) => readStringProperty(readProperty(component, "message"), "customType"),
+        (name) => state.hiddenMessageTypes.has(name),
+        state,
+        diagnostic,
+      ),
+    );
+    detaches.push(
+      attachCalmThinking(module.AssistantMessageComponent.prototype, () => state.on, diagnostic),
+    );
+    detaches.push(
+      attachCalmSeparators(
         module.AssistantMessageComponent.prototype,
         module.UserMessageComponent.prototype,
         () => state.on,
         separatorStyle,
         diagnostic,
-      );
-      return () => {
-        detachSeparators();
-        detachMessage();
-        detachTool();
-      };
-    } catch (error) {
-      detachMessage();
-      throw error;
-    }
+      ),
+    );
   } catch (error) {
-    detachTool();
+    for (const detach of detaches.reverse()) detach();
     throw error;
   }
+  let attached = true;
+  return () => {
+    if (!attached) return;
+    attached = false;
+    for (const detach of detaches.reverse()) detach();
+  };
 }
 
 export function installCalmMode(
@@ -196,8 +208,15 @@ export function installCalmMode(
   let widgetVisible = false;
   let requestWidgetRender: (() => void) | undefined;
   const diagnosed = new Set<string>();
+  let activityTracker: ReturnType<typeof createCalmActivityTracker>;
 
-  const activity = (): CalmActivityState => ({ coordinatorActive, activeWorkers, waitingForInput });
+  const activity = (): CalmActivityState => ({
+    calmOn: state.on,
+    coordinatorActive,
+    activeWorkers,
+    waitingForInput,
+    ...activityTracker.snapshot(),
+  });
   const stopTimer = (): void => {
     if (timer !== undefined) clearInterval(timer);
     timer = undefined;
@@ -222,7 +241,7 @@ export function installCalmMode(
     }
     widgetVisible = true;
     ui.setWidget("calm", (tui, theme) => {
-      const request = (): void => tui.requestRender();
+      const request: () => void = () => tui.requestRender();
       requestWidgetRender = request;
       return {
         render: (width) => calmActivityLines(activity(), frame, width, theme),
@@ -250,6 +269,10 @@ export function installCalmMode(
       requestWidgetRender?.();
     }, intervalMs);
   };
+  activityTracker = createCalmActivityTracker(() => {
+    syncWidget();
+    syncTimer();
+  });
   const syncChrome = (): void => {
     if (ui === undefined) return;
     // Both views own the single activity surface; never stack Pi's spinner above it.
@@ -274,6 +297,7 @@ export function installCalmMode(
   const shutdown = (): void => {
     generation += 1;
     state.on = false;
+    activityTracker.clear();
     stopTimer();
     detachPresentation();
     if (ui !== undefined) {
@@ -348,12 +372,25 @@ export function installCalmMode(
   });
   pi.on("agent_start", () => {
     coordinatorActive = true;
+    activityTracker.startAgent();
     renderStatus();
     syncWidget();
     syncTimer();
   });
+  pi.on("message_update", (event) => {
+    if (event.message.role === "assistant")
+      activityTracker.messageUpdate(event.assistantMessageEvent.type);
+  });
+  pi.on("tool_execution_start", (event) => {
+    // Pi exposes tool args without a runtime-safe static shape; the activity tracker guards them.
+    activityTracker.toolStart(event.toolCallId, event.toolName, event.args);
+  });
+  pi.on("tool_execution_end", (event) => {
+    activityTracker.toolEnd(event.toolCallId);
+  });
   pi.on("agent_settled", () => {
     coordinatorActive = false;
+    activityTracker.clear();
     frame = 0;
     renderStatus();
     syncWidget();
@@ -517,7 +554,7 @@ function decodePresentationModule(value: unknown): CalmPresentationModule | unde
   if (
     !isPresentationConstructor(tool) ||
     !isPresentationConstructor(custom) ||
-    !isPresentationConstructor(assistant) ||
+    !isAssistantPresentationConstructor(assistant) ||
     !isPresentationConstructor(user)
   )
     return undefined;
@@ -533,6 +570,14 @@ function isPresentationConstructor(value: unknown): value is PresentationConstru
   if (typeof value !== "function") return false;
   const prototype = readProperty(value, "prototype");
   return readProperty(prototype, "render") instanceof Function;
+}
+
+function isAssistantPresentationConstructor(
+  value: unknown,
+): value is AssistantPresentationConstructor {
+  if (!isPresentationConstructor(value)) return false;
+  const prototype = readProperty(value, "prototype");
+  return readProperty(prototype, "updateContent") instanceof Function;
 }
 
 function readProperty(value: unknown, key: PropertyKey): unknown {

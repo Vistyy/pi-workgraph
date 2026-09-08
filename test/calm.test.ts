@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
+  AssistantMessageComponent,
   type ExtensionAPI,
   type ExtensionContext,
+  initTheme,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -15,12 +18,14 @@ import {
   activeWorkerCount,
   attachCalmPresentation,
   calmActivityLines,
+  createCalmActivityTracker,
   DEFAULT_CALM_HIDDEN_TOOLS,
   installCalmMode,
   isCalmActivityActive,
   isCoordinatorScope,
   parseCalmHiddenTools,
 } from "../src/calm.js";
+import { attachCalmThinking } from "../src/calm-thinking.js";
 
 type FakeMouseEvent = {
   readonly y?: number;
@@ -96,12 +101,53 @@ class FakeContainer {
   }
 }
 
+type FakeAssistantPart =
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "thinking"; readonly thinking: string }
+  | { readonly type: "toolCall"; readonly name: string };
+type FakeAssistantMessage = {
+  readonly role: "assistant";
+  readonly content: readonly FakeAssistantPart[];
+  readonly stopReason?: string;
+};
+
 class FakeAssistantRow extends FakeContainer {
-  readonly lines: string[];
+  lines: string[];
+  lastMessage?: FakeAssistantMessage;
+  isStreaming = false;
 
   constructor(...lines: string[]) {
     super();
     this.lines = lines;
+  }
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Model Pi's runtime message seam in the fixture.
+  updateContent(message: unknown, isStreaming = false): void {
+    // SAFETY: The fixture only calls this Pi-compatible seam with assistant messages.
+    const assistantMessage = message as FakeAssistantMessage;
+    this.lastMessage = assistantMessage;
+    this.isStreaming = isStreaming;
+    this.lines = assistantMessage.content.map((part) => {
+      if (part.type === "text") return part.text;
+      if (part.type === "thinking") return `thinking:${part.thinking}`;
+      return `tool:${part.name}`;
+    });
+  }
+
+  invalidate(): void {
+    if (this.lastMessage !== undefined) this.updateContent(this.lastMessage, this.isStreaming);
+  }
+
+  setHideThinkingBlock(): void {
+    if (this.lastMessage !== undefined) this.updateContent(this.lastMessage);
+  }
+
+  setHiddenThinkingLabel(): void {
+    if (this.lastMessage !== undefined) this.updateContent(this.lastMessage);
+  }
+
+  setOutputPad(): void {
+    if (this.lastMessage !== undefined) this.updateContent(this.lastMessage);
   }
 
   override render(_width: number): string[] {
@@ -148,11 +194,13 @@ class FakeMessageRow {
 
 type FakeTheme = {
   fg(color: string, text: string): string;
+  italic(text: string): string;
 };
 
 function fakeTheme(): FakeTheme {
   return {
     fg: (color, text) => `\u001b[38;5;${color === "accent" ? 183 : 146}m${text}\u001b[39m`,
+    italic: (text) => `\u001b[3m${text}\u001b[23m`,
   };
 }
 
@@ -190,7 +238,9 @@ function fakeUi() {
 }
 
 function fakePi() {
-  type FakeEvent = Record<string, never>;
+  // SAFETY: The fake dispatch table intentionally accepts each typed Pi event fixture.
+  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type
+  type FakeEvent = { readonly [key: string]: string | object | boolean | undefined };
   type FakeContext = ExtensionContext;
   type FakeHandlerResult = void | Promise<void>;
   const events = new Map<string, (event: FakeEvent, context: FakeContext) => FakeHandlerResult>();
@@ -270,6 +320,242 @@ void test("presentation adapter hides and restores existing tool and operational
   }
   assert.deepEqual(tool.render(80), ["tool:read:80"]);
   assert.deepEqual(message.render(80), ["message:pi-workgraph-attention:80"]);
+});
+
+void test("Calm filters assistant thinking structurally and restores the original message on toggles", () => {
+  const message: FakeAssistantMessage = {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "private reasoning" },
+      { type: "text", text: "answer" },
+      { type: "toolCall", name: "read" },
+    ],
+  };
+  const row = new FakeAssistantRow();
+  row.updateContent(message, true);
+  const originalContent = [...message.content];
+  const state = {
+    on: true,
+    hiddenTools: new Set<string>(),
+    hiddenMessageTypes: new Set<string>(),
+  };
+  const diagnostics: string[] = [];
+  let streamed: FakeAssistantMessage | undefined;
+  const detach = attachCalmPresentation(moduleForFakeRows(), state, (diagnostic) =>
+    diagnostics.push(diagnostic),
+  );
+  try {
+    assert.deepEqual(row.render(80), ["answer", "tool:read"]);
+    assert.deepEqual(message.content, originalContent);
+
+    row.invalidate();
+    row.setHideThinkingBlock();
+    row.setHiddenThinkingLabel();
+    row.setOutputPad();
+    assert.deepEqual(row.render(80), ["answer", "tool:read"]);
+    assert.deepEqual(row.lastMessage?.content, [
+      { type: "text", text: "answer" },
+      { type: "toolCall", name: "read" },
+    ]);
+    assert.deepEqual(message.content, originalContent);
+
+    for (let toggle = 0; toggle < 3; toggle += 1) {
+      state.on = false;
+      assert.deepEqual(row.render(80), ["thinking:private reasoning", "answer", "tool:read"]);
+      state.on = true;
+      assert.deepEqual(row.render(80), ["answer", "tool:read"]);
+      row.invalidate();
+      row.setHideThinkingBlock();
+    }
+
+    streamed = {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "updated reasoning" },
+        { type: "text", text: "updated answer" },
+      ],
+    };
+    row.updateContent(streamed, true);
+    row.setHiddenThinkingLabel();
+    row.setOutputPad();
+    row.invalidate();
+    assert.deepEqual(row.render(80), ["updated answer"]);
+    state.on = false;
+    assert.deepEqual(row.render(80), ["thinking:updated reasoning", "updated answer"]);
+    assert.deepEqual(streamed.content, [
+      { type: "thinking", thinking: "updated reasoning" },
+      { type: "text", text: "updated answer" },
+    ]);
+    assert.deepEqual(diagnostics, []);
+  } finally {
+    detach();
+  }
+  assert.deepEqual(row.render(80), ["thinking:updated reasoning", "updated answer"]);
+  assert.equal(row.lastMessage, streamed);
+  assert.deepEqual(row.lastMessage?.content, streamed?.content);
+});
+
+void test("the installed Pi assistant component remains compatible with Calm thinking filtering", () => {
+  initTheme("dark", false);
+  const source: AssistantMessage = {
+    role: "assistant",
+    content: [
+      { type: "thinking", thinking: "private reasoning" },
+      { type: "text", text: "visible answer" },
+      { type: "toolCall", id: "tool-1", name: "read", arguments: {} },
+    ],
+    api: "openai-completions",
+    provider: "fixture",
+    model: "fixture-model",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "toolUse",
+    timestamp: 0,
+  };
+  const originalContent = [...source.content];
+  const state = { on: true };
+  const diagnostics: string[] = [];
+  const detach = attachCalmThinking(
+    AssistantMessageComponent.prototype,
+    () => state.on,
+    (diagnostic) => diagnostics.push(diagnostic),
+  );
+  const row = new AssistantMessageComponent();
+  const visible = (): string => row.render(80).map(stripVTControlCharacters).join("\\n");
+  try {
+    row.updateContent(source, true);
+    assert.doesNotMatch(visible(), /private reasoning/);
+    assert.match(visible(), /visible answer/);
+    assert.deepEqual(source.content, originalContent);
+
+    row.invalidate();
+    row.setHideThinkingBlock(true);
+    row.setHiddenThinkingLabel("hidden");
+    row.setOutputPad(0);
+    assert.doesNotMatch(visible(), /private reasoning|hidden/);
+    assert.match(visible(), /visible answer/);
+    assert.deepEqual(source.content, originalContent);
+
+    for (let toggle = 0; toggle < 2; toggle += 1) {
+      state.on = false;
+      row.setHideThinkingBlock(false);
+      assert.match(visible(), /private reasoning/);
+      state.on = true;
+      assert.doesNotMatch(visible(), /private reasoning/);
+      row.invalidate();
+      row.setHideThinkingBlock(false);
+      row.setHiddenThinkingLabel("still hidden");
+      row.setOutputPad(1);
+      assert.doesNotMatch(visible(), /private reasoning|still hidden/);
+    }
+
+    const updated: AssistantMessage = {
+      ...source,
+      content: [
+        { type: "thinking", thinking: "updated private reasoning" },
+        { type: "text", text: "updated visible answer" },
+      ],
+    };
+    row.updateContent(updated, false);
+    row.invalidate();
+    assert.doesNotMatch(visible(), /updated private reasoning/);
+    assert.match(visible(), /updated visible answer/);
+    assert.deepEqual(updated.content, [
+      { type: "thinking", thinking: "updated private reasoning" },
+      { type: "text", text: "updated visible answer" },
+    ]);
+  } finally {
+    detach();
+  }
+  assert.match(visible(), /updated visible answer/);
+  assert.match(visible(), /updated private reasoning/);
+  assert.deepEqual(source.content, originalContent);
+  assert.deepEqual(diagnostics, []);
+});
+
+void test("thinking-only assistant rows do not create separators", () => {
+  const hiddenThinking = new FakeAssistantRow();
+  hiddenThinking.updateContent({
+    role: "assistant",
+    content: [{ type: "thinking", thinking: "only reasoning" }],
+  });
+  const visibleA = new FakeAssistantRow("answer A");
+  const visibleB = new FakeAssistantRow("answer B");
+  const chat = new FakeContainer();
+  chat.addChild(visibleA);
+  chat.addChild(hiddenThinking);
+  chat.addChild(new FakeToolRow("read"));
+  chat.addChild(visibleB);
+  const state = {
+    on: true,
+    hiddenTools: new Set(["read"]),
+    hiddenMessageTypes: new Set<string>(),
+  };
+  const detach = attachCalmPresentation(moduleForFakeRows(), state, () => {});
+  try {
+    assert.deepEqual(chat.render(40), ["answer A", "---", "answer B"]);
+    assert.equal(chat.handleMouse({ y: 1, width: 40 }), undefined);
+    assert.deepEqual(chat.handleMouse({ y: 2, width: 40 }), { y: 0, width: 40 });
+    state.on = false;
+    assert.deepEqual(chat.render(40), [
+      "answer A",
+      "thinking:only reasoning",
+      "tool:read:40",
+      "answer B",
+    ]);
+  } finally {
+    detach();
+  }
+});
+
+void test("assistant seam failures restore earlier patches and diagnose changed cleanup seams", () => {
+  const tool = new FakeToolRow("read");
+  const message = new FakeMessageRow("pi-workgraph-attention");
+  const state = {
+    on: true,
+    hiddenTools: new Set(["read"]),
+    hiddenMessageTypes: new Set(["pi-workgraph-attention"]),
+  };
+  const diagnostics: string[] = [];
+  class MissingAssistant extends FakeContainer {
+    override render(width: number): string[] {
+      return [`missing:${width}`];
+    }
+  }
+  const broken = {
+    ...moduleForFakeRows(),
+    AssistantMessageComponent: MissingAssistant,
+  } as unknown as Parameters<typeof attachCalmPresentation>[0];
+  assert.throws(
+    () => attachCalmPresentation(broken, state, (diagnostic) => diagnostics.push(diagnostic)),
+    /assistant message presentation seam/,
+  );
+  assert.deepEqual(tool.render(80), ["tool:read:80"]);
+  assert.deepEqual(message.render(80), ["message:pi-workgraph-attention:80"]);
+
+  // oxlint-disable-next-line typescript/unbound-method -- Capture the native seam for cleanup verification.
+  const nativeUpdate = FakeAssistantRow.prototype.updateContent;
+  const detach = attachCalmPresentation(moduleForFakeRows(), state, (diagnostic) =>
+    diagnostics.push(diagnostic),
+  );
+  // oxlint-disable-next-line typescript/unbound-method -- Call through the temporarily replaced seam.
+  const adaptedUpdate = FakeAssistantRow.prototype.updateContent;
+  FakeAssistantRow.prototype.updateContent = function (
+    message: FakeAssistantMessage,
+    isStreaming?: boolean,
+  ): void {
+    adaptedUpdate.call(this, message, isStreaming);
+  };
+  detach();
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.includes("update seam changed")));
+  // oxlint-disable-next-line typescript/unbound-method -- Verify cleanup restores the native seam.
+  assert.equal(FakeAssistantRow.prototype.updateContent, nativeUpdate);
 });
 
 void test("Calm separates visible assistant blocks with inert, width-safe rows", () => {
@@ -371,6 +657,173 @@ void test("minimal activity pulses without layout changes and keeps truthful wid
   assert.deepEqual(
     calmActivityLines({ coordinatorActive: false, activeWorkers: 0 }, 1, 80, theme),
     [],
+  );
+});
+
+void test("activity tracker derives static phases, allowlisted hints, and ID-scoped concurrency", () => {
+  let changes = 0;
+  const tracker = createCalmActivityTracker(() => {
+    changes += 1;
+  });
+  tracker.startAgent();
+  tracker.messageUpdate("thinking_delta");
+  assert.deepEqual(tracker.snapshot(), { phase: "thinking", activeTools: [] });
+  tracker.messageUpdate("text_delta");
+  assert.deepEqual(tracker.snapshot(), { phase: "responding", activeTools: [] });
+  tracker.toolStart("a", "read", { path: "/private/calm.ts", command: "do not show" });
+  assert.deepEqual(tracker.snapshot().activeTools, [
+    { toolCallId: "a", toolName: "read", pathHint: "calm.ts" },
+  ]);
+  tracker.toolStart("b", "bash", { command: "secret --query never-render" });
+  tracker.toolStart("a", "write", { path: "/tmp/output.txt", arbitrary: "hidden" });
+  assert.deepEqual(tracker.snapshot().activeTools, [
+    { toolCallId: "a", toolName: "write", pathHint: "output.txt" },
+    { toolCallId: "b", toolName: "bash" },
+  ]);
+  tracker.toolEnd("b");
+  assert.deepEqual(tracker.snapshot().activeTools, [
+    { toolCallId: "a", toolName: "write", pathHint: "output.txt" },
+  ]);
+  tracker.toolEnd("a");
+  assert.deepEqual(tracker.snapshot(), { phase: "thinking", activeTools: [] });
+  tracker.clear();
+  assert.deepEqual(tracker.snapshot(), { phase: undefined, activeTools: [] });
+  assert.ok(changes >= 7);
+
+  for (const args of [
+    { path: "unsafe\u0001.ts" },
+    { path: "unsafe\u0085.ts" },
+    { path: "unsafe\u001b[31m.ts" },
+    { path: "unsafe\u202e.ts" },
+    { path: "unsafe name.ts" },
+    { path: "unsafe-\u{1f4a5}.ts" },
+    { path: 42 },
+    { command: "secret", query: "private" },
+    null,
+    "not-an-object",
+  ] as unknown[]) {
+    tracker.toolStart("unsafe", "read", args);
+    const unsafeActivity = (tracker.snapshot().activeTools ?? []).at(-1);
+    assert.ok(unsafeActivity);
+    assert.deepEqual(unsafeActivity, {
+      toolCallId: "unsafe",
+      toolName: "read",
+    });
+    const unsafeLines = calmActivityLines(
+      {
+        calmOn: true,
+        coordinatorActive: true,
+        activeWorkers: 0,
+        activeTools: tracker.snapshot().activeTools,
+      },
+      0,
+      80,
+      fakeTheme(),
+    );
+    assert.equal(stripAnsiLikeTheme(unsafeLines[0] ?? ""), "read");
+    tracker.toolEnd("unsafe");
+  }
+  const getterArgs = {};
+  Object.defineProperty(getterArgs, "path", {
+    get: () => {
+      throw new Error("path getter must not run");
+    },
+  });
+  tracker.toolStart("getter", "read", getterArgs);
+  const getterActivity = (tracker.snapshot().activeTools ?? []).at(-1);
+  assert.ok(getterActivity);
+  assert.deepEqual(getterActivity, {
+    toolCallId: "getter",
+    toolName: "read",
+  });
+  const getterLines = calmActivityLines(
+    {
+      calmOn: true,
+      coordinatorActive: true,
+      activeWorkers: 0,
+      activeTools: tracker.snapshot().activeTools,
+    },
+    0,
+    80,
+    fakeTheme(),
+  );
+  assert.equal(stripAnsiLikeTheme(getterLines[0] ?? ""), "read");
+  tracker.toolEnd("getter");
+
+  const theme = fakeTheme();
+  const thinking = calmActivityLines(
+    { calmOn: true, coordinatorActive: true, activeWorkers: 0, phase: "thinking" },
+    0,
+    80,
+    theme,
+  );
+  assert.deepEqual(thinking.map(stripAnsiLikeTheme), ["thinking", "• Workgraph · coordinating"]);
+  const thinkingAtNextFrame = calmActivityLines(
+    { calmOn: true, coordinatorActive: true, activeWorkers: 0, phase: "thinking" },
+    1,
+    80,
+    theme,
+  );
+  assert.equal(thinkingAtNextFrame[0], thinking[0]);
+  assert.deepEqual(thinkingAtNextFrame.map(stripAnsiLikeTheme), thinking.map(stripAnsiLikeTheme));
+  const responding = calmActivityLines(
+    { calmOn: true, coordinatorActive: true, activeWorkers: 0, phase: "responding" },
+    0,
+    80,
+    theme,
+  );
+  assert.equal(stripAnsiLikeTheme(responding[0] ?? ""), "responding");
+  assert.ok(!stripAnsiLikeTheme(responding[0] ?? "").includes("•"));
+  assert.ok(visibleWidth(responding[0] ?? "") <= 80 && visibleWidth(responding[1] ?? "") <= 80);
+  const unsafe = calmActivityLines(
+    {
+      calmOn: true,
+      coordinatorActive: true,
+      activeWorkers: 0,
+      activeTools: [
+        { toolCallId: "a", toolName: "bash" },
+        { toolCallId: "b", toolName: "web_search" },
+      ],
+    },
+    0,
+    80,
+    theme,
+  );
+  assert.equal(stripAnsiLikeTheme(unsafe[0] ?? ""), "bash · web_search");
+  assert.doesNotMatch(stripAnsiLikeTheme(unsafe[0] ?? ""), /secret|query|never-render/);
+  const parallel = calmActivityLines(
+    {
+      calmOn: true,
+      coordinatorActive: true,
+      activeWorkers: 0,
+      activeTools: [
+        { toolCallId: "1", toolName: "read" },
+        { toolCallId: "2", toolName: "edit" },
+        { toolCallId: "3", toolName: "write" },
+        { toolCallId: "4", toolName: "bash" },
+        { toolCallId: "5", toolName: "web_search" },
+      ],
+    },
+    0,
+    12,
+    theme,
+  );
+  assert.equal(parallel.length, 2);
+  assert.ok(parallel.every((line) => visibleWidth(line) <= 12));
+  assert.doesNotMatch(stripAnsiLikeTheme(parallel[0] ?? ""), /never/);
+  assert.equal(
+    calmActivityLines(
+      {
+        calmOn: false,
+        coordinatorActive: true,
+        activeWorkers: 0,
+        phase: "thinking",
+      },
+      0,
+      80,
+      theme,
+    ).length,
+    1,
   );
 });
 
@@ -547,10 +1000,59 @@ void test("activity uses compact mode outside Calm and freezes for registered fi
     assert.equal(widget.render(80).length, 1);
     assert.equal(ui.workingVisible, false);
     await pi.commands.get("calm")?.("", context);
-    assert.equal(widget.render(80).length, 1);
+    assert.equal(widget.render(80).length, 2);
+    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "thinking");
+    await pi.events.get("message_update")?.(
+      {
+        message: { role: "assistant" },
+        assistantMessageEvent: { type: "text_delta" },
+      },
+      context,
+    );
+    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "responding");
+    await pi.events.get("tool_execution_start")?.(
+      {
+        toolCallId: "read-1",
+        toolName: "read",
+        args: { path: "/workspace/calm.ts", command: "never show" },
+      },
+      context,
+    );
+    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "read · calm.ts");
+    await pi.events.get("tool_execution_start")?.(
+      {
+        toolCallId: "bash-1",
+        toolName: "bash",
+        args: { command: "secret query never show" },
+      },
+      context,
+    );
+    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "read · bash");
+    await pi.events.get("tool_execution_end")?.(
+      {
+        toolCallId: "read-1",
+        toolName: "read",
+        result: [{ type: "text", text: "never show" }],
+        isError: false,
+      },
+      context,
+    );
+    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "bash");
     await pi.events.get("ui_prompt_start")?.({}, context);
+    assert.equal(widget.render(80).length, 1);
     assert.match(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /awaiting input/);
     await pi.events.get("ui_prompt_end")?.({}, context);
+    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "bash");
+    await pi.events.get("tool_execution_end")?.(
+      {
+        toolCallId: "bash-1",
+        toolName: "bash",
+        result: [{ type: "text", text: "never show" }],
+        isError: false,
+      },
+      context,
+    );
+    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "thinking");
     calm.setActiveWorkers(2);
     await pi.events.get("agent_settled")?.({}, context);
     assert.match(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /2 workers active/);
