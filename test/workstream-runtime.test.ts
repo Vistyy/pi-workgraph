@@ -2030,13 +2030,25 @@ await test("working cancellation stays pending and quiet until the exact worker 
       true,
     );
 
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.state, "cancel_requested");
+    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, false);
+    assert.equal(state.attempts[0]?.error, undefined);
+    assert.equal(state.results.length, 0);
+    assert.deepEqual(f.workers.cleanupIdentities[1], worker);
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      true,
+    );
+
     f.workers.status = "idle";
     state = await runRuntime(active.effects.reconcile);
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.equal(state.results.length, 0);
-    assert.deepEqual(f.workers.cleanupIdentities[1], worker);
+    assert.deepEqual(f.workers.cleanupIdentities[2], worker);
     assert.equal(
       (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
       true,
@@ -2100,7 +2112,7 @@ await test("reconcile proves exact absence after closure before its worker check
   }
 });
 
-await test("checkpointed retained cleanup finishes bookkeeping without deleting its output", async (t) => {
+await test("checkpointed retained cleanup closes an absent worker without deleting its output", async (t) => {
   const f = await fixture();
   try {
     const active = await f.runtime();
@@ -2124,20 +2136,26 @@ await test("checkpointed retained cleanup finishes bookkeeping without deleting 
       "retained cleanup attempt",
     );
     const placement = required(launched.placement, "retained cleanup placement");
-    t.mock.method(f.store, "finishCleanup", () => Effect.never);
+    t.mock.method(f.store, "markWorkerClosed", () => Effect.never);
     await assert.rejects(runRuntime(active.effects.reconcile.pipe(Effect.timeout("100 millis"))));
     t.mock.restoreAll();
 
     let state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.cleanup?.state, "pending");
-    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, false);
     assert.equal(state.attempts[0]?.error, undefined);
+    assert.equal(state.results.length, 1);
+    f.workers.absent = true;
     state = await runRuntime(active.effects.reconcile);
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(state.attempts[0]?.error, undefined);
+    assert.equal(state.results.length, 1);
     assert.equal(
       (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
       true,
     );
+    assert.equal(await readFile(join(placement.path, "value.txt"), "utf8"), "initial\n");
   } finally {
     await f.dispose();
   }

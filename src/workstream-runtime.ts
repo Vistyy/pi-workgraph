@@ -598,7 +598,9 @@ export class WorkstreamRuntime {
         const currentState = yield* this.storeEffect((store) => store.load());
         const current = findAttempt(currentState, item.id);
         if (yield* this.preserveExistingBoundary(currentState, current)) return;
-        yield* this.advance(item.id);
+        yield* canRetryCleanupBoundary(currentState, current)
+          ? this.cleanup(item.id)
+          : this.advance(item.id);
         const state = yield* this.storeEffect((store) => store.load());
         const advanced = findAttempt(state, item.id);
         const blocked = blockedDetail(advanced);
