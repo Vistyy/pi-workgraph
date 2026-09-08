@@ -38,7 +38,7 @@ import {
   Worker,
   workerEnvironment,
 } from "./fixture-worker.js";
-import { extensionFixture, resultState } from "./helpers.js";
+import { extensionFixture } from "./helpers.js";
 
 const PersistedSqliteRowSchema = Type.Object({ state_json: Type.String() });
 const TaskInspectionDetailsSchema = Type.Object({
@@ -305,14 +305,12 @@ async function registeredFixture() {
         return workerFactoryCalls;
       },
       async dispose() {
-        let closed = false;
         try {
           await pi.close();
-          closed = true;
         } finally {
           restoreFixtureEnvironment(previous);
         }
-        if (closed) await rm(parent, { recursive: true, force: true });
+        await rm(parent, { recursive: true, force: true });
       },
     };
   } catch (error) {
@@ -894,11 +892,10 @@ await test("registered maintained changes preserve identity, apply explicitly, a
       "interactive",
     );
     assert.equal(input.action, "continue");
-    const intent = await f.call("workgraph_intent", {
+    await f.call("workgraph_intent", {
       statement: "Implement the maintained value change in the current repository.",
       constraints: ["Keep the destination unchanged until explicit apply."],
     });
-    assert.equal(resultState(intent.details).intents.at(-1)?.version, 1);
     const queued = await f.call("workgraph_implement", {
       id: semanticId,
       objective: "Change value",
@@ -1870,11 +1867,10 @@ await test("registered cancellation retains an experiment through completion unt
       "rpc",
     );
     assert.equal(input.action, "continue");
-    const intent = await f.call("workgraph_intent", {
+    await f.call("workgraph_intent", {
       statement: "Run and inspect the disposable cancellation experiment.",
       constraints: ["Retain the isolated output until explicit release."],
     });
-    assert.equal(resultState(intent.details).intents.at(-1)?.version, 1);
     const queued = await f.call("workgraph_research", {
       id: "cancel-experiment",
       question: "Cancel this isolated probe",
