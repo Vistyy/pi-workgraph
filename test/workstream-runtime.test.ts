@@ -1534,20 +1534,89 @@ await test("Effect submissions cancel queued work immediately and await running 
   }
 });
 
-await test("close interrupts a suspended store operation and fails queued replies before releasing the lease", async (t) => {
+await test("close interrupts a suspended store operation and fails queued replies before releasing the lease", {
+  timeout: 30_000,
+}, async () => {
   const f = await fixture();
+  const entered = Deferred.makeUnsafe<void>();
+  const finalizerEntered = Deferred.makeUnsafe<void>();
+  const releaseFinalizer = Deferred.makeUnsafe<void>();
+  let queuedMutationRan = false;
+  let closeSettled = false;
+  let active: WorkstreamRuntime | undefined;
+  let running: Promise<unknown> | undefined;
+  let queued: Promise<unknown> | undefined;
+  let close: Promise<void> | undefined;
   try {
-    const active = await f.runtime();
+    active = await f.runtime();
     await submit(active, Effect.void);
-    const entered = Deferred.makeUnsafe<void>();
-    t.mock.method(f.store, "load", () =>
-      Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+    running = runRuntime(
+      active.effects.submit(
+        f.store
+          .load()
+          .pipe(
+            Effect.andThen(Deferred.succeed(entered, undefined)),
+            Effect.andThen(Effect.never),
+            Effect.ensuring(
+              Effect.uninterruptible(
+                Deferred.succeed(finalizerEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFinalizer)),
+                ),
+              ),
+            ),
+          ),
+      ),
     );
-    const running = runRuntime(active.effects.reconcile);
-    await Effect.runPromise(Deferred.await(entered));
-    const queued = runRuntime(active.effects.queue(research("queued-behind-suspended-store")));
-    await Effect.runPromise(Effect.sleep("1 millis"));
-    await runRuntime(active.effects.close);
+    void running.catch(() => undefined);
+    await Effect.runPromise(Deferred.await(entered).pipe(Effect.timeout("5 seconds")));
+
+    queued = runRuntime(
+      active.effects.submit(
+        Effect.sync(() => {
+          queuedMutationRan = true;
+        }),
+      ),
+    );
+    void queued.catch(() => undefined);
+    const leaseBeforeClose = SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+      database.db
+        .prepare(
+          `SELECT token, owner_session_id, owner_session_file, acquired_at, heartbeat_at, expires_at
+             FROM lease WHERE singleton=1`,
+        )
+        .get(),
+    );
+    assert.notEqual(leaseBeforeClose, undefined);
+
+    close = runRuntime(active.effects.close);
+    void close.then(
+      () => {
+        closeSettled = true;
+      },
+      () => {
+        closeSettled = true;
+      },
+    );
+    await Effect.runPromise(Deferred.await(finalizerEntered).pipe(Effect.timeout("5 seconds")));
+
+    assert.deepEqual(
+      SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+        database.db
+          .prepare(
+            `SELECT token, owner_session_id, owner_session_file, acquired_at, heartbeat_at, expires_at
+               FROM lease WHERE singleton=1`,
+          )
+          .get(),
+      ),
+      leaseBeforeClose,
+    );
+    assert.equal(closeSettled, false);
+    assert.equal(queuedMutationRan, false);
+
+    await Effect.runPromise(Deferred.succeed(releaseFinalizer, undefined));
+    const closePromise = close;
+    assert.notEqual(closePromise, undefined);
+    await runRuntime(Effect.tryPromise(() => closePromise).pipe(Effect.timeout("5 seconds")));
     await assert.rejects(running, /stopped|interrupt/i);
     await assert.rejects(queued, /stopped|interrupt/i);
     assert.equal(
@@ -1557,6 +1626,21 @@ await test("close interrupts a suspended store operation and fails queued replie
       undefined,
     );
   } finally {
+    await Effect.runPromise(Deferred.succeed(releaseFinalizer, undefined));
+    if (close === undefined && active !== undefined) close = runRuntime(active.effects.close);
+    if (close !== undefined)
+      await runRuntime(
+        Effect.tryPromise(() => Promise.allSettled([close])).pipe(Effect.timeout("5 seconds")),
+      );
+    if (running !== undefined || queued !== undefined)
+      await runRuntime(
+        Effect.tryPromise(() =>
+          Promise.allSettled([
+            ...(running === undefined ? [] : [running]),
+            ...(queued === undefined ? [] : [queued]),
+          ]),
+        ).pipe(Effect.timeout("5 seconds")),
+      );
     await f.dispose();
   }
 });
