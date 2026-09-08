@@ -482,14 +482,27 @@ void test("registered AbortSignal interrupts native coordinator work", async () 
   }
 });
 
-void test("registered adoption uses authoritative snapshots and fences a stale expired owner", async () => {
+void test("registered adoption uses authoritative snapshots and fences a stale expired owner", {
+  timeout: 30_000,
+}, async (t) => {
   const f = await fixture();
   let competing: WorkstreamRuntime | undefined;
   let previousEnvironment: NodeJS.ProcessEnv | undefined;
   const registry = new WorkgraphRegistry(join(f.parent, "agent", "workgraph", "registry.sqlite"));
+  const operationSignal = () => AbortSignal.any([t.signal, AbortSignal.timeout(5_000)]);
   const leaseRow = (path: string) =>
     SqliteWorkstreamDatabase.use(path, (database) =>
       database.db.prepare("SELECT * FROM lease WHERE singleton=1").get(),
+    );
+  const leaseIdentity = (row: unknown) =>
+    decodeTestValue(
+      Type.Object({
+        token: Type.String(),
+        owner_session_id: Type.String(),
+        owner_session_file: Type.String(),
+        acquired_at: Type.String(),
+      }),
+      row,
     );
   const repositorySnapshot = async () => ({
     head: await git(f.root, "rev-parse", "HEAD"),
@@ -499,13 +512,19 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
   try {
     // Establish retained authority and suspension through the registered coordinator lifecycle.
     const retained = await emptyWorkstream(f);
+    // Pi's shared input and shutdown fixture APIs have no signal parameter; the test timeout
+    // remains their last stopping guard. Registered tool calls receive a shorter real signal.
     await f.runner.emitInput("Retain this recovery receipt", undefined, "interactive");
-    await f.call("workgraph_control", {
-      action: "suspend",
-      reason: "Await authoritative recovery",
-    });
+    await f.call(
+      "workgraph_control",
+      {
+        action: "suspend",
+        reason: "Await authoritative recovery",
+      },
+      operationSignal(),
+    );
     const retainedBefore = resultState(
-      (await f.call("workgraph_inspect", { section: "overview" })).details,
+      (await f.call("workgraph_inspect", { section: "overview" }, operationSignal())).details,
     );
     assert.equal(retainedBefore.lifecycle.state, "suspended");
     assert.equal(retainedBefore.inputs.length, 1);
@@ -536,24 +555,26 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
     f.session.appendCustomEntry("pi-workgraph-workstream", { path: current.store.path });
     await f.runner.emit({ type: "session_start", reason: "reload" });
     const currentState = resultState(
-      (await f.call("workgraph_inspect", { section: "overview" })).details,
+      (await f.call("workgraph_inspect", { section: "overview" }, operationSignal())).details,
     );
     assert.equal(currentState.id, "current-work");
-    const currentLease = leaseRow(current.store.path);
-    const liveCompetingLease = leaseRow(retainedStore.path);
+    const currentLease = leaseIdentity(leaseRow(current.store.path));
+    const liveCompetingLease = leaseIdentity(leaseRow(retainedStore.path));
 
-    // A non-expired owner still refuses adoption without consulting unavailable Herdr.
+    // A non-expired owner still refuses adoption. Liveness is consulted, but the unavailable
+    // host yields unknown without invoking a Herdr subprocess.
     await assert.rejects(
-      f.call("workgraph_adopt", { statePath: retainedStore.path }),
+      f.call("workgraph_adopt", { statePath: retainedStore.path }, operationSignal()),
       /runtime owner/,
     );
-    assert.deepEqual(leaseRow(current.store.path), currentLease);
-    assert.deepEqual(leaseRow(retainedStore.path), liveCompetingLease);
+    assert.deepEqual(leaseIdentity(leaseRow(current.store.path)), currentLease);
+    assert.deepEqual(leaseIdentity(leaseRow(retainedStore.path)), liveCompetingLease);
     const same = resultState(
-      (await f.call("workgraph_adopt", { statePath: current.store.path })).details,
+      (await f.call("workgraph_adopt", { statePath: current.store.path }, operationSignal()))
+        .details,
     );
     assert.equal(same.id, currentState.id);
-    assert.deepEqual(leaseRow(current.store.path), currentLease);
+    assert.deepEqual(leaseIdentity(leaseRow(current.store.path)), currentLease);
 
     const snapshotPath = join(f.parent, "coordinator-snapshot.json");
     const commandLog = join(f.parent, "coordinator-herdr-argv.jsonl");
@@ -580,10 +601,10 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
     const unchangedResources = await repositorySnapshot();
     const assertRefusalInvariants = async () => {
       const attached = resultState(
-        (await f.call("workgraph_inspect", { section: "overview" })).details,
+        (await f.call("workgraph_inspect", { section: "overview" }, operationSignal())).details,
       );
       assert.equal(attached.id, currentState.id);
-      assert.deepEqual(leaseRow(current.store.path), currentLease);
+      assert.deepEqual(leaseIdentity(leaseRow(current.store.path)), currentLease);
       assert.deepEqual(leaseRow(retainedStore.path), expiredCompetingLease);
       assert.deepEqual(await repositorySnapshot(), unchangedResources);
     };
@@ -595,7 +616,7 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
       }),
     );
     await assert.rejects(
-      f.call("workgraph_adopt", { statePath: retainedStore.path }),
+      f.call("workgraph_adopt", { statePath: retainedStore.path }, operationSignal()),
       /runtime owner/,
     );
     await assertRefusalInvariants();
@@ -605,14 +626,15 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
       JSON.stringify({ result: { snapshot: { agents: [{ agent_session: {} }] } } }),
     );
     await assert.rejects(
-      f.call("workgraph_adopt", { statePath: retainedStore.path }),
+      f.call("workgraph_adopt", { statePath: retainedStore.path }, operationSignal()),
       /runtime owner/,
     );
     await assertRefusalInvariants();
 
     await writeFile(snapshotPath, JSON.stringify({ result: { snapshot: { agents: [] } } }));
     const adopted = resultState(
-      (await f.call("workgraph_adopt", { statePath: retainedStore.path })).details,
+      (await f.call("workgraph_adopt", { statePath: retainedStore.path }, operationSignal()))
+        .details,
     );
     assert.equal(adopted.id, retainedBefore.id);
     assert.equal(adopted.lifecycle.state, "suspended");
@@ -623,8 +645,8 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
     assert.equal(adopted.coordinator.sessionId, f.session.getSessionId());
     assert.equal(adopted.coordinator.sessionFile, f.session.getSessionFile());
     assert.deepEqual(await repositorySnapshot(), unchangedResources);
-    const replacementLease = leaseRow(retainedStore.path);
-    assert.notDeepEqual(replacementLease, expiredCompetingLease);
+    const replacementLease = leaseIdentity(leaseRow(retainedStore.path));
+    assert.notDeepEqual(replacementLease, leaseIdentity(expiredCompetingLease));
     assert.equal(leaseRow(current.store.path), undefined);
 
     await assert.rejects(
@@ -639,7 +661,7 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
     );
     await Effect.runPromise(competing.effects.close);
     competing = undefined;
-    assert.deepEqual(leaseRow(retainedStore.path), replacementLease);
+    assert.deepEqual(leaseIdentity(leaseRow(retainedStore.path)), replacementLease);
 
     const commands = (await readFile(commandLog, "utf8"))
       .trim()
@@ -658,6 +680,7 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
     if (previousEnvironment !== undefined) restoreFixtureEnvironment(previousEnvironment);
     if (competing !== undefined) await Effect.runPromise(competing.effects.close);
     registry.close();
+    // dispose awaits the registered shutdown before deleting the fixture directory.
     await f.dispose();
   }
 });
