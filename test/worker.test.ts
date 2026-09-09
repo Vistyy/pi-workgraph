@@ -1293,8 +1293,8 @@ void test("worker tool availability follows assignment permissions across reload
   }
 });
 
-void test("worker denylist restores only Workgraph-owned eligible tools after reload", async () => {
-  let activeTools = ["read", "bash"];
+void test("worker reload applies newly disabled tools without reactivating removed names", async () => {
+  let activeTools = ["read", "bash", "extension_denied"];
   const companion: InlineExtension = {
     name: "denied-extension-tool",
     factory(pi) {
@@ -1307,18 +1307,6 @@ void test("worker denylist restores only Workgraph-owned eligible tools after re
           return { content: [{ type: "text", text: "unexpected" }], details: {} };
         },
       });
-      pi.registerTool({
-        name: "unrelated_inactive",
-        label: "Unrelated inactive",
-        description: "Fixture inactive extension tool",
-        parameters: Type.Object({}),
-        async execute() {
-          return { content: [{ type: "text", text: "unexpected" }], details: {} };
-        },
-      });
-      pi.on("session_start", () =>
-        pi.setActiveTools([...new Set([...pi.getActiveTools(), "extension_denied"])]),
-      );
     },
   };
   const f = await fixture(
@@ -1338,24 +1326,27 @@ void test("worker denylist restores only Workgraph-owned eligible tools after re
     const settings = join(f.root, "..", "agent", "settings.json");
     await writeFile(
       settings,
-      JSON.stringify({
-        "pi-workgraph": { worker: { disabledTools: ["read", "extension_denied"] } },
-      }),
+      JSON.stringify({ "pi-workgraph": { worker: { disabledTools: ["extension_denied"] } } }),
     );
     await f.runner.emit({ type: "session_start", reason: "startup" });
-    await f.runner.emitBeforeAgentStart("fixture", undefined, "Fixture", { cwd: f.root });
+    assert.deepEqual(activeTools, ["read", "bash"]);
+
+    await writeFile(
+      settings,
+      JSON.stringify({ "pi-workgraph": { worker: { disabledTools: ["read"] } } }),
+    );
+    await f.runner.emit({ type: "session_start", reason: "reload" });
     assert.deepEqual(activeTools, ["bash"]);
 
     await writeFile(settings, JSON.stringify({ "pi-workgraph": { worker: {} } }));
     await f.runner.emit({ type: "session_start", reason: "reload" });
-    assert.deepEqual(activeTools, ["bash", "read", "extension_denied"]);
-    assert.ok(!activeTools.includes("unrelated_inactive"));
+    assert.deepEqual(activeTools, ["bash"]);
   } finally {
     await f.dispose();
   }
 });
 
-void test("invalid worker settings restore only owned tools while read-only assignment restrictions remain", async () => {
+void test("invalid worker settings warn without weakening read-only assignment restrictions", async () => {
   let activeTools = ["read", "bash", "edit", "write"];
   const f = await fixture("review", false, {
     getActiveTools: () => [...activeTools],
@@ -1365,20 +1356,12 @@ void test("invalid worker settings restore only owned tools while read-only assi
   });
   try {
     await mkdir(join(f.root, "..", "agent"), { recursive: true });
-    const settings = join(f.root, "..", "agent", "settings.json");
     await writeFile(
-      settings,
-      JSON.stringify({ "pi-workgraph": { worker: { disabledTools: ["read"] } } }),
-    );
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    assert.deepEqual(activeTools, ["bash"]);
-
-    await writeFile(
-      settings,
+      join(f.root, "..", "agent", "settings.json"),
       JSON.stringify({ "pi-workgraph": { worker: { disabledTools: [" "] } } }),
     );
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    assert.deepEqual(activeTools, ["bash", "read"]);
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    assert.deepEqual(activeTools, ["read", "bash"]);
     assert.deepEqual(f.notifications, [
       {
         message: "Could not load worker tool settings; configured tools remain available.",
@@ -1390,8 +1373,8 @@ void test("invalid worker settings restore only owned tools while read-only assi
   }
 });
 
-void test("worker blocks a denylisted call if a stale tool exposure races filtering", async () => {
-  const f = await fixture("implementation");
+void test("worker blocks configured and assignment-disabled calls if stale tool exposure races filtering", async () => {
+  const f = await fixture("review");
   try {
     await mkdir(join(f.root, "..", "agent"), { recursive: true });
     await writeFile(
@@ -1407,6 +1390,15 @@ void test("worker blocks a denylisted call if a stale tool exposure races filter
         input: { path: "value.txt" },
       }),
       { block: true, reason: "Tool read is unavailable to this Workgraph worker." },
+    );
+    assert.deepEqual(
+      await f.runner.emitToolCall({
+        type: "tool_call",
+        toolName: "write",
+        toolCallId: "stale-write",
+        input: { path: "value.txt", content: "after\n" },
+      }),
+      { block: true, reason: "Tool write is unavailable to this Workgraph worker." },
     );
   } finally {
     await f.dispose();

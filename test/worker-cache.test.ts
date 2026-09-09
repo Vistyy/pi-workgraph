@@ -423,6 +423,8 @@ void test("real Pi worker excludes configured built-in and extension tools befor
     (request) => {
       const schemas = JSON.stringify(request.tools);
       assert.doesNotMatch(schemas, /"read"/);
+      assert.doesNotMatch(schemas, /"edit"/);
+      assert.doesNotMatch(schemas, /"write"/);
       assert.doesNotMatch(schemas, /"session_denied"/);
       assert.doesNotMatch(schemas, /"dynamic_denied"/);
       assert.match(schemas, /"activate_dynamic"/);
@@ -431,6 +433,8 @@ void test("real Pi worker excludes configured built-in and extension tools befor
     (request) => {
       const schemas = JSON.stringify(request.tools);
       assert.doesNotMatch(schemas, /"read"/);
+      assert.doesNotMatch(schemas, /"edit"/);
+      assert.doesNotMatch(schemas, /"write"/);
       assert.doesNotMatch(schemas, /"session_denied"/);
       assert.doesNotMatch(schemas, /"dynamic_denied"/);
       return {
@@ -493,6 +497,8 @@ void test("real Pi worker excludes configured built-in and extension tools befor
       tools: [
         "read",
         "bash",
+        "edit",
+        "write",
         "activate_dynamic",
         "session_denied",
         "dynamic_denied",
@@ -507,16 +513,6 @@ void test("real Pi worker excludes configured built-in and extension tools befor
     await promptWithDeadline(agent, "Exercise the worker denylist.");
     provider.assertComplete();
     assert.equal(provider.requests.length, 2);
-    assert.ok(
-      session
-        .getBranch()
-        .some(
-          (entry) =>
-            entry.type === "custom" &&
-            entry.customType === "pi-workgraph-worker-tools" &&
-            JSON.stringify(entry.data).includes("dynamic_denied"),
-        ),
-    );
   } finally {
     await agent?.abort();
     agent?.dispose();

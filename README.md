@@ -60,7 +60,7 @@ To remove tools from every Workgraph worker's **model tool availability** (witho
 }
 ```
 
-Worker entries must be non-whitespace tool names. The list is deduplicated and reapplied on worker startup and `/reload`; it covers built-in and extension-provided tools, independently of Calm's coordinator-only visual hiding.
+Worker entries must be non-whitespace tool names. The list is deduplicated and covers built-in and extension-provided tools, independently of Calm's coordinator-only visual hiding. Adding a disabled name takes effect when a worker reloads; removing one takes effect for new workers and does not reactivate it in an existing worker.
 
 **Models:** ask the coordinator to inspect or change defaults with `workgraph_models`. Research/review use `selection` for replication, diversity, and overrides; consultation uses the ordered advisor policy and may receive one complete exact advisor override; implementation uses `models.guide` and `models.executor` overrides. Omitted model/thinking components use role defaults. Per-assignment choices do not change saved policy.
 
