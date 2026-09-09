@@ -233,10 +233,13 @@ function streamChatGPTWeb(model: Model<Api>, context: Context, options?: SimpleS
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: This stream boundary owns preflight, bridge uncertainty, and one terminal report.
   void (async () => {
     try {
+      // biome-ignore lint/complexity/useLiteralKeys: Environment names are explicit protocol keys.
       const mode = process.env["PI_WORKGRAPH_MODE"];
       if (mode !== "research")
         throw new Error("chatgpt-web/pro is available only to Workgraph research.");
+      // biome-ignore lint/complexity/useLiteralKeys: Environment names are explicit protocol keys.
       const runId = process.env["PI_WORKGRAPH_RUN_ID"]?.trim() ?? "";
+      // biome-ignore lint/complexity/useLiteralKeys: Environment names are explicit protocol keys.
       const nodeId = process.env["PI_WORKGRAPH_NODE_ID"]?.trim() ?? "";
       if (runId.length === 0 || nodeId.length === 0)
         throw new Error("Workgraph advisor identity is absent.");

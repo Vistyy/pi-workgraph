@@ -199,7 +199,7 @@ function coordinatorResponse(request: ControlledRequest, count: number): Control
           id: "controlled-baseline",
           question: "Read the fixture without changing it.",
           expectedEvidence: ["The fixture remains unchanged."],
-          selection: { override: { model: "controlled/research", thinking: "off" } },
+          selection: { model: "controlled/research" },
         },
       },
     };
@@ -517,12 +517,14 @@ async function run(signal: AbortSignal): Promise<void> {
   await writeFile(
     join(agentDir, "workgraph", "models.json"),
     JSON.stringify({
-      version: 4,
+      version: 6,
       roles: {
         research: [{ model: "controlled/research", thinking: "off" }],
         review: [{ model: "controlled/research", thinking: "off" }],
         "implementation.guide": { model: "controlled/research", thinking: "off" },
         "implementation.executor": { model: "controlled/research", thinking: "off" },
+        "consultation.enricher": { model: "controlled/research", thinking: "off" },
+        "consultation.advisor": [{ model: "controlled/research", thinking: "off" }],
       },
     }),
   );

@@ -42,13 +42,11 @@ import {
 } from "./herdr.js";
 import type { WorkerLaunchError } from "./herdr-launch.js";
 import {
-  type ImplementationModelOverrides,
-  ImplementationModelOverridesSchema,
+  configuredTarget,
   loadModelPolicyEffect,
   type ModelPolicy,
   type ModelPolicyError,
   resolveSelection,
-  resolveTargetOverride,
   type SelectionRequest,
   SelectionRequestSchema,
 } from "./model-policy.js";
@@ -88,7 +86,6 @@ export interface WorkstreamLaunch {
 }
 export interface QueueOptions {
   selection?: SelectionRequest;
-  models?: ImplementationModelOverrides;
   continuationOf?: string;
   /** Content lineage; unlike continuationOf this never names a Pi session trajectory. */
   candidateOf?: string;
@@ -103,7 +100,8 @@ export interface RuntimeOwnership {
   registry?: WorkgraphRegistry;
   owner?: LeaseOwner;
   priorOwnerLiveness?: "alive" | "dead" | "unknown";
-  policy?: ModelPolicy;
+  /** Test/runtime isolation seam; production omission loads the normal Pi agent policy path. */
+  policyPath?: string;
   /** Test-only clock injection; production uses Effect's live Clock service. */
   clock?: Clock.Clock;
   /** Presentation/status observer for the latest reconciled state. */
@@ -247,9 +245,7 @@ export class WorkstreamRuntime {
           scope,
           semaphore,
           fibers,
-          ownership.policy === undefined
-            ? loadModelPolicyEffect()
-            : Effect.succeed(ownership.policy),
+          loadModelPolicyEffect(ownership.policyPath),
           ownership.clock,
           ownership.onState,
         );
@@ -1555,7 +1551,7 @@ function implementationAttempt(
   options: QueueOptions,
   base: QueueBase,
 ): EnqueuedAttempt {
-  const models = implementationModels(policy, options);
+  const models = implementationModels(policy);
   const attempt: EnqueuedAttempt = { id: `attempt-${randomUUID()}`, models };
   if (options.continuationOf !== undefined) attempt.continuationOf = options.continuationOf;
   if (base.revision !== undefined) attempt.baseRevision = base.revision;
@@ -1569,15 +1565,12 @@ function consultationAttempt(
   base: QueueBase,
 ): EnqueuedAttempt {
   const enricher = { ...policy.roles["consultation.enricher"] };
-  const advisor =
-    input.advisorOverride === undefined
-      ? { ...policy.roles["consultation.advisor"] }
-      : { ...input.advisorOverride };
+  const advisor = configuredTarget(policy, "consultation.advisor", input.advisorModel);
   const attempt: EnqueuedAttempt = {
     id: `attempt-${randomUUID()}`,
     models: {
       guide: enricher,
-      source: input.advisorOverride === undefined ? "policy" : "override",
+      source: "policy",
     },
     consultation: {
       phase: "enricher",
@@ -1588,23 +1581,11 @@ function consultationAttempt(
   return attempt;
 }
 
-function implementationModels(
-  policy: ModelPolicy,
-  options: QueueOptions,
-): NonNullable<WorkAttempt["models"]> {
-  const overrides = options.models;
-  const guide =
-    overrides?.guide === undefined
-      ? policy.roles["implementation.guide"]
-      : resolveTargetOverride(overrides.guide, policy.roles["implementation.guide"]);
-  const executor =
-    overrides?.executor === undefined
-      ? policy.roles["implementation.executor"]
-      : resolveTargetOverride(overrides.executor, policy.roles["implementation.executor"]);
+function implementationModels(policy: ModelPolicy): NonNullable<WorkAttempt["models"]> {
   return {
-    guide,
-    executor,
-    source: overrides === undefined ? "policy" : "override",
+    guide: { ...policy.roles["implementation.guide"] },
+    executor: { ...policy.roles["implementation.executor"] },
+    source: "policy",
   };
 }
 
@@ -1615,11 +1596,14 @@ function selectedAttempts(
   baseRevision: string | undefined,
 ): EnqueuedAttempt[] {
   const selection = resolveSelection(capability, options.selection, policy);
-  if (selection.unfulfilled.length > 0) throw new Error(selection.unfulfilled.join(" "));
   return selection.selected.map((target, index) => {
     const attempt: EnqueuedAttempt = {
       id: `attempt-${randomUUID()}`,
-      models: { guide: target, source: selection.source, selection },
+      models: {
+        guide: target,
+        source: selection.source === "policy" ? "policy" : "requested-model",
+        selection,
+      },
     };
     if (index === 0 && options.continuationOf !== undefined)
       attempt.continuationOf = options.continuationOf;
@@ -1631,7 +1615,6 @@ function selectedAttempts(
 const QueueModelOptionsSchema = Type.Object(
   {
     selection: Type.Optional(SelectionRequestSchema),
-    models: Type.Optional(ImplementationModelOverridesSchema),
     continuationOf: Type.Optional(Type.String()),
     candidateOf: Type.Optional(Type.String()),
     baseRevision: Type.Optional(Type.String()),
@@ -1644,15 +1627,9 @@ function validateQueueModelOptions(
   options: QueueOptions,
 ): void {
   if (!Value.Check(QueueModelOptionsSchema, options))
-    throw new Error(
-      "Invalid model queue options: use selection for research/review or models for implementation.",
-    );
+    throw new Error("Invalid model queue options: use selection only for research or review.");
   if (capability === "implement" && options.selection !== undefined)
     throw new Error("Selection options are supported only for research and review assignments.");
-  if (capability !== "implement" && options.models !== undefined)
-    throw new Error(
-      "Implementation model options are supported only for implementation assignments.",
-    );
 }
 
 function hasCompletedReleaseCleanupBoundary(state: WorkstreamState, attempt: WorkAttempt): boolean {

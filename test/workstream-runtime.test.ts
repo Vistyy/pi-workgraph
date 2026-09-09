@@ -12,7 +12,6 @@ import { Value } from "typebox/value";
 import workgraphCoordinator from "../extensions/coordinator.js";
 import { inspectView } from "../src/agent-facing.js";
 import { openRepository, type WorktreePlacement } from "../src/git.js";
-import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import { processEffect } from "../src/process.js";
 import { WorkgraphRegistry } from "../src/registry.js";
@@ -25,6 +24,7 @@ import {
 } from "../src/workstream-runtime.js";
 import { RuntimeHostError } from "../src/workstream-runtime-services.js";
 import { WorkstreamStoreOperationError } from "../src/workstream-state.js";
+import { decodeState, type JsonValue, parsePersistedObject } from "../src/workstream-validation.js";
 import {
   configureFixtureEnvironment,
   decodeTestValue,
@@ -38,7 +38,7 @@ import {
   Worker,
   workerEnvironment,
 } from "./fixture-worker.js";
-import { extensionFixture } from "./helpers.js";
+import { extensionFixture, fixturePolicy } from "./helpers.js";
 
 const PersistedSqliteRowSchema = Type.Object({ state_json: Type.String() });
 const TaskInspectionDetailsSchema = Type.Object({
@@ -174,6 +174,9 @@ function nativeLeaseTimestamp(): number {
 }
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workstream-runtime-"));
+  const policyPath = join(parent, "agent", "workgraph", "models.json");
+  await mkdir(join(parent, "agent", "workgraph"), { recursive: true });
+  await writeFile(policyPath, `${JSON.stringify(fixturePolicy)}\n`, { mode: 0o600 });
   const root = join(parent, "repo");
   await mkdir(root);
   await git(root, "init", "-b", "main");
@@ -235,7 +238,7 @@ async function fixture() {
           Effect.sync(() => {
             errors.push(error.message);
           }),
-        { registry, policy: DEFAULT_MODEL_POLICY, ...options },
+        { registry, policyPath, ...options },
       ).pipe(Effect.provide(liveLayer)),
     );
     runtimes.push(value);
@@ -277,6 +280,10 @@ async function fixture() {
     registry,
     repository,
     workers,
+    policyPath,
+    async writePolicy(policy: typeof fixturePolicy) {
+      await writeFile(policyPath, `${JSON.stringify(policy)}\n`, { mode: 0o600 });
+    },
     delivered,
     errors,
     runtime,
@@ -402,10 +409,14 @@ const consultation = (id: string) => ({
 await test("consultation uses two ordinary research sessions and delivers one bounded final result", async () => {
   const f = await fixture();
   try {
-    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    const policy = structuredClone(fixturePolicy);
     policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
-    policy.roles["consultation.advisor"] = { model: "fixture/policy-advisor", thinking: "low" };
-    const active = await f.runtime(undefined, { policy });
+    policy.roles["consultation.advisor"] = [
+      { model: "fixture/policy-advisor", thinking: "low" },
+      { model: "fixture/policy-advisor-2", thinking: "medium" },
+    ];
+    await f.writePolicy(policy);
+    const active = await f.runtime();
     const reports = [
       {
         kind: "research" as const,
@@ -445,7 +456,7 @@ await test("consultation uses two ordinary research sessions and delivers one bo
         objective: "Which file strategy should be retained?",
         question: "Which file strategy should be retained?",
         context: "The coordinator needs a bounded architecture recommendation.",
-        advisorOverride: { model: "fixture/override-advisor", thinking: "max" },
+        advisorModel: "fixture/policy-advisor-2",
         intentVersion: 0,
       }),
     );
@@ -462,10 +473,10 @@ await test("consultation uses two ordinary research sessions and delivers one bo
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.consultation?.phase, "advisor");
     assert.deepEqual(state.attempts[0]?.consultation?.advisorTarget, {
-      model: "fixture/override-advisor",
-      thinking: "max",
+      model: "fixture/policy-advisor-2",
+      thinking: "medium",
     });
-    assert.equal(state.attempts[0]?.models?.guide.model, "fixture/override-advisor");
+    assert.equal(state.attempts[0]?.models?.guide.model, "fixture/policy-advisor-2");
     assert.equal(state.attempts[0]?.sessionFile, undefined);
     await runRuntime(active.effects.reconcile);
     await runRuntime(active.effects.reconcile);
@@ -476,11 +487,12 @@ await test("consultation uses two ordinary research sessions and delivers one bo
       f.workers.requests.map((request) => [
         request.role,
         request.model,
+        request.thinking,
         workerEnvironment(request, "PI_WORKGRAPH_MODE"),
       ]),
       [
-        ["research", "fixture/enricher", "research"],
-        ["research", "fixture/override-advisor", "research"],
+        ["research", "fixture/enricher", "high", "research"],
+        ["research", "fixture/policy-advisor-2", "medium", "research"],
       ],
     );
     const advisorFile = required(f.workers.requests[1], "advisor request").sessionFile;
@@ -504,6 +516,147 @@ await test("consultation uses two ordinary research sessions and delivers one bo
     }
     assert.equal(f.delivered.length, 1);
     assert.equal(f.delivered[0], state.results[0]?.id);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("consultation defaults to the first configured advisor and rejects unknown IDs atomically", async () => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const defaultState = await runRuntime(
+      active.effects.queue(consultation("default-consultation")),
+    );
+    for (let index = 0; index < 5; index++) await runRuntime(active.effects.reconcile);
+    assert.deepEqual(defaultState.attempts[0]?.consultation?.advisorTarget, {
+      model: "fixture/advisor",
+      thinking: "low",
+    });
+    const before = await runRuntime(f.store.load());
+    await assert.rejects(
+      runRuntime(
+        active.effects.queue({
+          ...consultation("unknown-consultation"),
+          advisorModel: "fixture/missing",
+        }),
+      ),
+      /not configured/,
+    );
+    const after = await runRuntime(f.store.load());
+    assert.equal(after.assignments.length, before.assignments.length);
+    assert.equal(after.attempts.length, before.attempts.length);
+    assert.equal(f.workers.requests.length, 2);
+    assert.deepEqual(
+      [f.workers.requests[1]?.model, f.workers.requests[1]?.thinking],
+      ["fixture/advisor", "low"],
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("predecessor-v7 model metadata normalizes on SQLite read and persists only after mutation", async () => {
+  type MutableJson = {
+    [key: string]: JsonValue | undefined;
+    assignments?: JsonValue;
+    attempts?: JsonValue;
+    advisorOverride?: JsonValue;
+    models?: JsonValue;
+    source?: JsonValue;
+    overrideReason?: JsonValue;
+    selection?: JsonValue;
+  };
+  const JsonObjectSchema = Type.Object({}, { additionalProperties: true });
+  const mutable = (value: JsonValue | undefined, label: string): MutableJson => {
+    const checked = required(value, label);
+    if (!Value.Check(JsonObjectSchema, checked)) throw new Error(`${label} must be an object`);
+    // SAFETY: This fixture mutates an owned JSON copy solely to represent predecessor persistence.
+    return checked as MutableJson;
+  };
+  const array = (value: JsonValue | undefined, label: string): JsonValue[] => {
+    const checked = required(value, label);
+    if (!Array.isArray(checked)) throw new Error(`${label} must be an array`);
+    return checked;
+  };
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    await runRuntime(active.effects.queue(consultation("legacy-consultation")));
+    const currentRaw = parsePersistedObject(
+      await runRuntime(WorkstreamStoreEffects.readRaw(f.store.path)),
+    );
+    assert.equal(decodeState(currentRaw), currentRaw);
+    const raw = mutable(
+      structuredClone(
+        SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+          parsePersistedObject(database.rawState()),
+        ),
+      ),
+      "raw state",
+    );
+    const assignment = mutable(
+      array(raw.assignments, "legacy assignments")[0],
+      "legacy assignment",
+    );
+    const attempt = mutable(array(raw.attempts, "legacy attempts")[0], "legacy attempt");
+    assignment.advisorOverride = { model: "fixture/advisor-2", thinking: "medium" };
+    const models = mutable(attempt.models, "legacy models");
+    models.source = "override";
+    models.overrideReason = "historical explicit selection";
+    models.selection = {
+      role: "research",
+      requested: 1,
+      diversity: "same-model",
+      selected: [{ model: "fixture/research", thinking: "high" }],
+      unfulfilled: [],
+      source: "override",
+      reason: "historical explicit selection",
+    };
+    assert.notEqual(decodeState(raw), raw);
+    SqliteWorkstreamDatabase.use(f.store.path, (database) => {
+      database.db
+        .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
+        .run(JSON.stringify(raw));
+    });
+    const restored = await runRuntime(f.store.load());
+    assert.equal(restored.assignments[0]?.capability, "consultation");
+    if (restored.assignments[0]?.capability !== "consultation")
+      throw new Error("Expected consultation");
+    assert.equal(restored.assignments[0].advisorModel, "fixture/advisor-2");
+    assert.equal(restored.attempts[0]?.consultation?.advisorTarget.model, "fixture/advisor");
+    assert.equal(restored.attempts[0]?.models?.source, "requested-model");
+    assert.deepEqual(restored.attempts[0]?.models?.selection, {
+      role: "research",
+      count: 1,
+      distinctModels: false,
+      selected: [{ model: "fixture/research", thinking: "high" }],
+      source: "requested-model",
+    });
+    const unchangedRaw = mutable(
+      parsePersistedObject(await runRuntime(WorkstreamStoreEffects.readRaw(f.store.path))),
+      "unchanged raw state",
+    );
+    const unchangedAssignment = mutable(
+      array(unchangedRaw.assignments, "unchanged assignments")[0],
+      "unchanged assignment",
+    );
+    assert.equal("advisorOverride" in unchangedAssignment, true);
+    await runRuntime(active.effects.queue(research("after-legacy")));
+    const persisted = mutable(
+      parsePersistedObject(await runRuntime(WorkstreamStoreEffects.readRaw(f.store.path))),
+      "persisted raw state",
+    );
+    const persistedAssignment = mutable(
+      array(persisted.assignments, "persisted assignments")[0],
+      "persisted assignment",
+    );
+    const persistedAttempt = mutable(
+      array(persisted.attempts, "persisted attempts")[0],
+      "persisted attempt",
+    );
+    assert.equal("advisorOverride" in persistedAssignment, false);
+    assert.equal("overrideReason" in mutable(persistedAttempt.models, "persisted models"), false);
   } finally {
     await f.dispose();
   }
@@ -608,19 +761,117 @@ await test("uncertain consultation launch is retained without an automatic resen
   }
 });
 
+await test("runtime queue persists repeated and distinct policy selections for research and review", async () => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const defaultResearch = await runRuntime(
+      active.effects.queue(research("runtime-default-research"), {
+        selection: { count: 2 },
+      }),
+    );
+    assert.deepEqual(
+      defaultResearch.attempts.map((attempt) => ({
+        model: attempt.models?.guide.model,
+        thinking: attempt.models?.guide.thinking,
+        source: attempt.models?.source,
+      })),
+      [
+        { model: "fixture/research", thinking: "high", source: "policy" },
+        { model: "fixture/research", thinking: "high", source: "policy" },
+      ],
+    );
+
+    const explicitResearch = await runRuntime(
+      active.effects.queue(research("runtime-explicit-research"), {
+        selection: { count: 2, model: "fixture/research-2" },
+      }),
+    );
+    assert.deepEqual(
+      explicitResearch.attempts.slice(-2).map((attempt) => ({
+        model: attempt.models?.guide.model,
+        thinking: attempt.models?.guide.thinking,
+        source: attempt.models?.source,
+      })),
+      [
+        { model: "fixture/research-2", thinking: "medium", source: "requested-model" },
+        { model: "fixture/research-2", thinking: "medium", source: "requested-model" },
+      ],
+    );
+
+    const distinctResearch = await runRuntime(
+      active.effects.queue(research("runtime-distinct-research"), {
+        selection: { count: 2, distinctModels: true },
+      }),
+    );
+    assert.deepEqual(
+      distinctResearch.attempts.slice(-2).map((attempt) => ({
+        model: attempt.models?.guide.model,
+        thinking: attempt.models?.guide.thinking,
+        source: attempt.models?.source,
+      })),
+      [
+        { model: "fixture/research", thinking: "high", source: "policy" },
+        { model: "fixture/research-2", thinking: "medium", source: "policy" },
+      ],
+    );
+
+    const distinctReview = await runRuntime(
+      active.effects.queue(
+        {
+          id: "runtime-distinct-review",
+          capability: "review",
+          artifactIntent: "evidence_only",
+          objective: "Review the fixture",
+          intentVersion: 0,
+          subject: { kind: "revision", revision: await runRuntime(f.repository.head()) },
+          concern: "Check the fixture evidence.",
+        },
+        { selection: { count: 2, distinctModels: true } },
+      ),
+    );
+    assert.deepEqual(
+      distinctReview.attempts.slice(-2).map((attempt) => ({
+        model: attempt.models?.guide.model,
+        thinking: attempt.models?.guide.thinking,
+        source: attempt.models?.source,
+      })),
+      [
+        { model: "fixture/review", thinking: "high", source: "policy" },
+        { model: "fixture/review-2", thinking: "low", source: "policy" },
+      ],
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
 await test("multi-attempt queueing resolves one shared validated base and exact-review conflicts have no effects", async () => {
   const f = await fixture();
   try {
-    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    const policy = structuredClone(fixturePolicy);
     policy.roles.research = [
       { model: "fixture/research-first", thinking: "high" },
       { model: "fixture/research-second", thinking: "high" },
     ];
-    const active = await f.runtime(undefined, { policy });
+    await f.writePolicy(policy);
+    const active = await f.runtime();
     const initial = await runRuntime(f.repository.head());
+    const beforeCapacityFailure = await runRuntime(f.store.load());
+    await assert.rejects(
+      runRuntime(
+        active.effects.queue(research("capacity-failure"), {
+          selection: { count: 3, distinctModels: true },
+        }),
+      ),
+      /only 2/,
+    );
+    const afterCapacityFailure = await runRuntime(f.store.load());
+    assert.equal(afterCapacityFailure.assignments.length, beforeCapacityFailure.assignments.length);
+    assert.equal(afterCapacityFailure.attempts.length, beforeCapacityFailure.attempts.length);
     const queued = await runRuntime(
       active.effects.queue(research("shared-base"), {
-        selection: { count: 2, diversity: "distinct-models" },
+        selection: { count: 2, distinctModels: true },
       }),
     );
     assert.deepEqual(
@@ -1231,10 +1482,10 @@ await test("advanced isolated trees cannot settle a successful no-change impleme
   }
 });
 
-await test("implementation role overrides resolve independently and invalid model inputs do not queue", async () => {
+await test("implementation roles always resolve from policy and do not accept queue inputs", async () => {
   const f = await fixture();
   try {
-    const policy = structuredClone(DEFAULT_MODEL_POLICY);
+    const policy = structuredClone(fixturePolicy);
     policy.roles["implementation.guide"] = {
       model: "fixture/guide-default",
       thinking: "high",
@@ -1243,7 +1494,8 @@ await test("implementation role overrides resolve independently and invalid mode
       model: "fixture/executor-default",
       thinking: "medium",
     };
-    const active = await f.runtime(undefined, { policy });
+    await f.writePolicy(policy);
+    const active = await f.runtime();
     const authority = await f.authority(active);
     const assignment = {
       id: "independent-role-overrides",
@@ -1254,30 +1506,23 @@ await test("implementation role overrides resolve independently and invalid mode
       authority,
       acceptance: ["value changes"],
     };
-    await runRuntime(
-      active.effects.queue(assignment, {
-        models: {
-          guide: { thinking: "low" },
-          executor: { model: "fixture/executor-override" },
-        },
-      }),
-    );
+    await runRuntime(active.effects.queue(assignment));
     let state = await runRuntime(f.store.load());
     assert.deepEqual(state.attempts[0]?.models, {
-      guide: { model: "fixture/guide-default", thinking: "low" },
-      executor: { model: "fixture/executor-override", thinking: "medium" },
-      source: "override",
+      guide: { model: "fixture/guide-default", thinking: "high" },
+      executor: { model: "fixture/executor-default", thinking: "medium" },
+      source: "policy",
     });
     assert.equal(f.workers.requests.length, 0);
 
     await assert.rejects(
       runRuntime(
         active.effects.queue(
-          { ...assignment, id: "empty-role-overrides" },
-          { models: { guide: {} } },
+          { ...assignment, id: "invalid-implementation-options" },
+          { selection: { count: 1 } },
         ),
       ),
-      /Invalid model queue options/,
+      /Selection options are supported only/,
     );
     state = await runRuntime(f.store.load());
     assert.equal(state.assignments.length, 1);
@@ -1296,11 +1541,8 @@ await test("registered maintained changes preserve identity, apply explicitly, a
     const semanticId = "Fix Value With Spaces and a deliberately long task name";
     f.workers.onWork = async (request) => {
       if (workerEnvironment(request, "PI_WORKGRAPH_MODE") === "implementation") {
-        assert.equal(request.model, "openai-codex/gpt-6-astra");
-        assert.equal(
-          workerEnvironment(request, "PI_WORKGRAPH_EXECUTOR_MODEL"),
-          "openai-codex/gpt-5.6-luna",
-        );
+        assert.equal(request.model, "fixture/guide");
+        assert.equal(workerEnvironment(request, "PI_WORKGRAPH_EXECUTOR_MODEL"), "fixture/executor");
         assert.equal(
           workerEnvironment(request, "PI_WORKGRAPH_BASE_COMMIT"),
           await git(request.cwd, "rev-parse", "HEAD"),
@@ -1354,14 +1596,8 @@ await test("registered maintained changes preserve identity, apply explicitly, a
     assert.equal(queuedView.affected.task.idPreview, semanticId);
     assert.equal(queuedView.affected.task.capability, "implement");
     assert.equal(queuedView.affected.task.intentVersion, 1);
-    assert.equal(
-      queuedView.affected.attempt.models.selected.guide.model,
-      "openai-codex/gpt-6-astra",
-    );
-    assert.equal(
-      queuedView.affected.attempt.models.selected.executor.model,
-      "openai-codex/gpt-5.6-luna",
-    );
+    assert.equal(queuedView.affected.attempt.models.selected.guide.model, "fixture/guide");
+    assert.equal(queuedView.affected.attempt.models.selected.executor.model, "fixture/executor");
 
     const implementationTask = await poll(async () => {
       const view = await taskInspection(f, semanticId);
@@ -2199,7 +2435,7 @@ await test("worker continuation uses an isolated new workspace and current gener
     await runRuntime(
       active.effects.queue(research("followup"), {
         continuationOf: previous.id,
-        selection: { override: { model: "provider/other", thinking: "low" } },
+        selection: { model: "fixture/research-2" },
       }),
     );
     await runRuntime(active.effects.reconcile);
@@ -2208,8 +2444,8 @@ await test("worker continuation uses an isolated new workspace and current gener
     assert.equal(state.attempts[1]?.placement?.kind, "shared_project");
     assert.equal(state.attempts[1]?.placement?.path, f.root);
     assert.notEqual(state.attempts[1]?.sessionFile, previous.sessionFile);
-    assert.equal(state.attempts[1]?.models?.guide.model, "provider/other");
-    assert.equal(state.attempts[1]?.models?.source, "override");
+    assert.equal(state.attempts[1]?.models?.guide.model, "fixture/research-2");
+    assert.equal(state.attempts[1]?.models?.source, "requested-model");
   } finally {
     await f.dispose();
   }

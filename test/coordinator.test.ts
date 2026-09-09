@@ -112,14 +112,6 @@ const contextDetailsSchema = Type.Object({
     records: Type.Object({ text: Type.String() }),
   }),
 });
-const modelPolicyDetailsSchema = Type.Object({
-  authority: Type.Optional(
-    Type.Object({
-      receiptId: Type.String(),
-      source: Type.String(),
-    }),
-  ),
-});
 const persistedHeaderSchema = Type.Object({
   format: Type.String(),
   version: Type.Number(),
@@ -276,7 +268,7 @@ void test("explicit target repository is fixed independently of coordinator cwd"
   }
 });
 
-void test("registered consultation keeps a precise question, context, and exact advisor override", async () => {
+void test("registered consultation keeps a precise question, context, and exact advisor model", async () => {
   const f = await fixture();
   try {
     const question = "Should the fixture keep its current file strategy?";
@@ -293,7 +285,7 @@ void test("registered consultation keeps a precise question, context, and exact 
       question,
       context: "The coordinator needs a bounded architecture trade-off.",
       enrichmentFocus: "Inspect current repository state and relevant callers.",
-      advisor: { model: "fixture/advisor", thinking: "off" },
+      advisor: "fixture/advisor",
     });
     const state = resultState(response.details);
     const assignment = required(state.assignments[0], "consultation assignment");
@@ -306,7 +298,7 @@ void test("registered consultation keeps a precise question, context, and exact 
       assignment.enrichmentFocus,
       "Inspect current repository state and relevant callers.",
     );
-    assert.deepEqual(assignment.advisorOverride, { model: "fixture/advisor", thinking: "off" });
+    assert.equal(assignment.advisorModel, "fixture/advisor");
     await assert.rejects(
       f.call("workgraph_consult", {
         id: "partial-advisor",
@@ -853,7 +845,7 @@ void test("mutation responses stay action-focused while retaining handles, model
       id: "focused-research",
       question: "Inspect the focused fixture",
       expectedEvidence: ["bytes"],
-      selection: { override: { model: "fixture/research", thinking: "low" } },
+      selection: { model: "fixture/research" },
     });
     const firstText = decodeTestValue(textContentSchema, first.content[0]).text;
     const firstView = decodeTestValue(actionDetailsSchema, first.details).view;
@@ -904,29 +896,30 @@ void test("mutation responses stay action-focused while retaining handles, model
   }
 });
 
-void test("registered implementation models resolve partial guide and executor overrides", async () => {
+void test("registered implementation rejects model override inputs and uses policy targets", async () => {
   const f = await fixture();
   try {
     await f.runner.emitInput("Implement the bounded fixture change", undefined, "interactive");
     await f.call("workgraph_intent", { statement: "Implement the bounded fixture change" });
+    await assert.rejects(
+      f.call("workgraph_implement", {
+        id: "implementation-override",
+        objective: "Change the fixture",
+        acceptance: ["The fixture changes"],
+        models: { guide: { model: "fixture/other", thinking: "low" } },
+      }),
+      /Invalid fixture input to workgraph_implement/,
+    );
     const state = resultState(
       (
         await f.call("workgraph_implement", {
-          id: "partial-role-overrides",
+          id: "policy-implementation",
           objective: "Change the fixture",
           acceptance: ["The fixture changes"],
-          models: {
-            guide: { thinking: "low" },
-            executor: { model: "fixture/executor-override" },
-          },
         })
       ).details,
     );
-    assert.deepEqual(state.attempts[0]?.models, {
-      guide: { model: "openai-codex/gpt-6-astra", thinking: "low" },
-      executor: { model: "fixture/executor-override", thinking: "xhigh" },
-      source: "override",
-    });
+    assert.equal(state.attempts[0]?.models?.source, "policy");
   } finally {
     await f.dispose();
   }
@@ -1328,74 +1321,23 @@ void test("registered session_start safely inspects retained and pointed workstr
   }
 });
 
-void test("registered model policy selection requires genuine input and persists one mutation", async () => {
+void test("registered model lookup is read-only and closed to configured list roles", async () => {
   const f = await fixture();
   try {
-    await f.runner.emitInput("Extension model request", undefined, "extension");
+    const result = await f.call("workgraph_models", { role: "research" });
+    // SAFETY: The registered tool's exact schema returns details with a targets field; this assertion narrows only that field.
+    assert.deepEqual((result.details as { targets: unknown }).targets, [
+      { model: "fixture/research", thinking: "high" },
+      { model: "fixture/research-2", thinking: "medium" },
+    ]);
     await assert.rejects(
-      f.call("workgraph_models", {
-        action: "set",
-        role: "research",
-        target: { model: "fixture/rejected", thinking: "low" },
-      }),
-      /actual retained human input/,
+      f.call("workgraph_models", { action: "get", role: "research" }),
+      /Invalid fixture input to workgraph_models/,
     );
-    assert.equal(
-      JSON.stringify(await f.call("workgraph_models", { action: "get" })).includes(
-        "fixture/rejected",
-      ),
-      false,
-    );
-
-    await f.runner.emitInput("Persist the first research model", undefined, "interactive");
-    const mutation = decodeTestValue(
-      modelPolicyDetailsSchema,
-      (
-        await f.call("workgraph_models", {
-          action: "set_list",
-          role: "research",
-          list: [{ model: "fixture/default", thinking: "low" }],
-        })
-      ).details,
-    );
-    const receipt = required(mutation.authority, "model authority").receiptId;
-    assert.equal(mutation.authority?.source, "interactive");
-    assert.match(JSON.stringify(mutation), new RegExp(receipt));
-    await f.call("workgraph_intent", {
-      statement: "Read",
-      authorityReceiptId: receipt,
-    });
-
-    const selected = resultState(
-      (
-        await f.call("workgraph_research", {
-          id: "first",
-          question: "Read",
-          expectedEvidence: ["bytes"],
-        })
-      ).details,
-    );
-    assert.deepEqual(selected.attempts[0]?.models?.guide, {
-      model: "fixture/default",
-      thinking: "low",
-    });
-
     await assert.rejects(
-      f.call("workgraph_models", {
-        action: "set_list",
-        authorityReceiptId: "extension-invented-receipt",
-        role: "research",
-        list: [{ model: "fixture/rejected-list", thinking: "low" }],
-      }),
-      /Unknown retained human input receipt/,
+      f.call("workgraph_models", { role: "implementation.guide" }),
+      /Invalid fixture input to workgraph_models/,
     );
-    assert.equal(
-      JSON.stringify(await f.call("workgraph_models", { action: "get" })).includes(
-        "fixture/rejected-list",
-      ),
-      false,
-    );
-    assert.deepEqual(f.selected, []);
   } finally {
     await f.dispose();
   }

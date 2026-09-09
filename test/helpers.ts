@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { readFileSync } from "node:fs";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Test setup writes an isolated user policy fixture before loading the real extension boundary.
+import { mkdir, writeFile } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -16,6 +18,7 @@ import {
 import { Clock, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import type { ModelPolicy } from "../src/model-policy.js";
 import { processEffect } from "../src/process.js";
 import type { WorkerReport } from "../src/types.js";
 import { WorkstreamStateSchema } from "../src/workstream.js";
@@ -27,6 +30,27 @@ const ResultDetailsSchema = Type.Object({
   statePath: Type.Optional(Type.String()),
 });
 const PersistedSqliteRowSchema = Type.Object({ state_json: Type.String() });
+
+export const fixturePolicy: ModelPolicy = {
+  version: 6,
+  roles: {
+    research: [
+      { model: "fixture/research", thinking: "high" },
+      { model: "fixture/research-2", thinking: "medium" },
+    ],
+    review: [
+      { model: "fixture/review", thinking: "high" },
+      { model: "fixture/review-2", thinking: "low" },
+    ],
+    "implementation.guide": { model: "fixture/guide", thinking: "high" },
+    "implementation.executor": { model: "fixture/executor", thinking: "xhigh" },
+    "consultation.enricher": { model: "fixture/enricher", thinking: "high" },
+    "consultation.advisor": [
+      { model: "fixture/advisor", thinking: "low" },
+      { model: "fixture/advisor-2", thinking: "medium" },
+    ],
+  },
+};
 
 export const usage = {
   input: 0,
@@ -89,6 +113,12 @@ export async function extensionFixture(
   extensionFactories: InlineExtension[] = [],
 ) {
   const session = persistentSession(root, join(parent, "sessions"));
+  await mkdir(join(parent, "agent", "workgraph"), { recursive: true });
+  await writeFile(
+    join(parent, "agent", "workgraph", "models.json"),
+    `${JSON.stringify(fixturePolicy)}\n`,
+    { mode: 0o600 },
+  );
   const resourceLoader = new DefaultResourceLoader({
     cwd: root,
     agentDir: join(parent, "agent"),

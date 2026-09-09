@@ -1,269 +1,144 @@
 import assert from "node:assert/strict";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This test verifies the native atomic policy-file boundary.
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- This test owns an isolated policy-file boundary.
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Native temporary paths are part of the policy-file test boundary.
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Temporary paths identify this test's isolated policy files.
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
 import {
-  DEFAULT_MODEL_POLICY,
   loadModelPolicy,
   loadModelPolicyEffect,
+  type ModelPolicy,
   ModelPolicyError,
   resolveSelection,
   SelectionRequestSchema,
-  setModelListEffect,
-  setModelRoleEffect,
 } from "../src/model-policy.js";
-import { liveLayer, runNodePlatformPromise } from "../src/node-platform.js";
+import { liveLayer } from "../src/node-platform.js";
 
-await test("policy defaults, legacy reads, and independent role-list writes use isolated paths", async () => {
+const valid: ModelPolicy = {
+  version: 6,
+  roles: {
+    research: [
+      { model: "fixture/research-first", thinking: "high" },
+      { model: "fixture/research-second", thinking: "low" },
+    ],
+    review: [{ model: "fixture/review", thinking: "medium" }],
+    "implementation.guide": { model: "fixture/guide", thinking: "low" },
+    "implementation.executor": { model: "fixture/executor", thinking: "xhigh" },
+    "consultation.enricher": { model: "fixture/enricher", thinking: "high" },
+    "consultation.advisor": [{ model: "fixture/advisor", thinking: "off" }],
+  },
+};
+
+await test("loads only a complete strict schema-v6 user policy", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-models-"));
   const path = join(parent, "models.json");
   try {
-    assert.deepEqual(DEFAULT_MODEL_POLICY, {
-      version: 5,
-      roles: {
-        "consultation.enricher": { model: "openai-codex/gpt-5.6-luna", thinking: "high" },
-        "consultation.advisor": { model: "chatgpt-web/pro", thinking: "off" },
-        research: [{ model: "openai-codex/gpt-5.6-luna", thinking: "high" }],
-        "implementation.guide": { model: "openai-codex/gpt-6-astra", thinking: "low" },
-        "implementation.executor": { model: "openai-codex/gpt-5.6-luna", thinking: "xhigh" },
-        review: [
-          { model: "openai-codex/gpt-5.6-terra", thinking: "high" },
-          { model: "opencode-go/deepseek-v4-flash", thinking: "high" },
-          { model: "opencode-go/glm-5.3-flash", thinking: "high" },
-        ],
+    await writeFile(path, `${JSON.stringify(valid)}\n`);
+    assert.deepEqual(await loadModelPolicy(path), valid);
+    for (const invalid of [
+      undefined,
+      { ...valid, version: 5 },
+      { ...valid, roles: { ...valid.roles, research: [] } },
+      { ...valid, roles: { ...valid.roles, "extra.role": valid.roles.research } },
+      {
+        ...valid,
+        roles: {
+          ...valid.roles,
+          research: [
+            valid.roles.research[0],
+            { model: valid.roles.research[0].model, thinking: "minimal" },
+          ],
+        },
       },
-    });
-    assert.deepEqual(await loadModelPolicy(path), DEFAULT_MODEL_POLICY);
-
-    const legacyV1 = JSON.stringify({
-      version: 1,
-      roles: {
-        "discovery.evidence": [{ model: "fixture/research", thinking: "low" }],
-        "implementation.guide": [{ model: "fixture/guide", thinking: "high" }],
-        "implementation.executor": [{ model: "fixture/executor", thinking: "medium" }],
-        "verification.product": [{ model: "fixture/reviewer", thinking: "off" }],
+      {
+        ...valid,
+        roles: {
+          ...valid.roles,
+          "implementation.guide": { model: "not-a-target", thinking: "high" },
+        },
       },
-    });
-    await writeFile(path, legacyV1);
-    const mappedV1 = await loadModelPolicy(path);
-    assert.deepEqual(mappedV1.roles.research, [{ model: "fixture/research", thinking: "low" }]);
-    assert.deepEqual(mappedV1.roles.review, [{ model: "fixture/reviewer", thinking: "off" }]);
-    assert.equal(mappedV1.roles["implementation.guide"].model, "fixture/guide");
-    assert.equal(mappedV1.roles["implementation.executor"].model, "fixture/executor");
-    assert.equal(await readFile(path, "utf8"), legacyV1);
-
-    const legacyV3 = JSON.stringify({
-      version: 3,
-      roles: {
-        research: { model: "fixture/research-default", thinking: "low" },
-        "implementation.guide": { model: "fixture/guide", thinking: "high" },
-        "implementation.executor": { model: "fixture/executor", thinking: "medium" },
-        review: { model: "fixture/review-default", thinking: "off" },
-      },
-      workerPool: [
-        { model: "fixture/shared-first", thinking: "high" },
-        { model: "fixture/shared-second", thinking: "medium" },
-        { model: "fixture/research-default", thinking: "low" },
-      ],
-    });
-    await writeFile(path, legacyV3);
-    const mappedV3 = await loadModelPolicy(path);
-    assert.deepEqual(mappedV3.roles.research, [
-      { model: "fixture/research-default", thinking: "low" },
-      { model: "fixture/shared-first", thinking: "high" },
-      { model: "fixture/shared-second", thinking: "medium" },
-    ]);
-    assert.deepEqual(mappedV3.roles.review, [
-      { model: "fixture/review-default", thinking: "off" },
-      { model: "fixture/shared-first", thinking: "high" },
-      { model: "fixture/shared-second", thinking: "medium" },
-      { model: "fixture/research-default", thinking: "low" },
-    ]);
-    assert.equal(await readFile(path, "utf8"), legacyV3);
-
-    await runNodePlatformPromise(
-      setModelListEffect(
-        "review",
-        [
-          { model: "fixture/review-first", thinking: "high" },
-          { model: "fixture/review-second", thinking: "low" },
-        ],
-        path,
-      ),
-    );
-    await runNodePlatformPromise(
-      setModelRoleEffect(
-        "implementation.guide",
-        { model: "fixture/guide-independent", thinking: "low" },
-        path,
-      ),
-    );
-    assert.equal((await stat(path)).mode & 0o777, 0o600);
-    const written = await loadModelPolicy(path);
-    assert.deepEqual(written.roles.review, [
-      { model: "fixture/review-first", thinking: "high" },
-      { model: "fixture/review-second", thinking: "low" },
-    ]);
-    assert.equal(written.roles.research[0].model, "fixture/research-default");
-    assert.equal(written.roles["implementation.guide"].model, "fixture/guide-independent");
-    assert.equal(written.version, 5);
-
-    await runNodePlatformPromise(
-      setModelRoleEffect(
-        "consultation.advisor",
-        { model: "fixture/advisor", thinking: "high" },
-        path,
-      ),
-    );
-    await runNodePlatformPromise(
-      setModelListEffect("research", [{ model: "fixture/research", thinking: "high" }], path),
-    );
-    const annotated = await loadModelPolicy(path);
-    assert.deepEqual(annotated.roles["consultation.advisor"], {
-      model: "fixture/advisor",
-      thinking: "high",
-    });
-    assert.deepEqual(annotated.roles.research, [{ model: "fixture/research", thinking: "high" }]);
-    assert.deepEqual(resolveSelection("research", { count: 1 }, annotated).selected, [
-      { model: "fixture/research", thinking: "high" },
-    ]);
-    await assert.rejects(
-      runNodePlatformPromise(setModelListEffect("research", [], path)),
-      /Invalid model list/,
-    );
-    await writeFile(path, '{"version":5,"roles":{"research":[]}}');
-    await assert.rejects(loadModelPolicy(path), /Invalid model list for research/);
-    await writeFile(
-      path,
-      '{"version":5,"roles":{"research":{"model":"fixture/not-a-list","thinking":"high"}}}',
-    );
-    await assert.rejects(loadModelPolicy(path), /Invalid model list for research/);
-    await writeFile(path, '{"version":3,"roles":{},"workerPool":[]}');
-    await assert.rejects(loadModelPolicy(path), /Invalid Workgraph worker pool/);
-    await writeFile(path, '{"version":999,"roles":{}}');
-    await assert.rejects(loadModelPolicy(path), /Unsupported/);
-    await writeFile(path, '{"credential":"super-secret"');
-    await assert.rejects(loadModelPolicy(path), /^Error: Invalid Workgraph model policy JSON\.$/);
-    await writeFile(path, '{"version":2,"roles":{"review":{"model":"p/m","thinking":"invalid"}}}');
-    await assert.rejects(loadModelPolicy(path), /Invalid model target/);
+    ]) {
+      if (invalid === undefined) {
+        await rm(path);
+        await assert.rejects(loadModelPolicy(path), /required/);
+        await writeFile(path, JSON.stringify(valid));
+      } else {
+        await writeFile(path, JSON.stringify(invalid));
+        await assert.rejects(loadModelPolicy(path), /Invalid Workgraph model policy/);
+      }
+    }
+    const { review: _review, ...rolesWithoutReview } = valid.roles;
+    await writeFile(path, JSON.stringify({ ...valid, roles: rolesWithoutReview }));
+    await assert.rejects(loadModelPolicy(path), /Invalid Workgraph model policy/);
+    await writeFile(path, "{broken");
+    await assert.rejects(loadModelPolicy(path), /Invalid JSON/);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
 });
 
-await test("policy Effect classifies malformed data separately from provider failures", async () => {
+await test("policy Effect classifies missing and malformed files", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-policy-errors-"));
-  const malformed = join(parent, "malformed.json");
   try {
-    await writeFile(malformed, '{"credential":"not-retained"');
-    const parseFailure = await Effect.runPromise(
-      Effect.flip(Effect.provide(loadModelPolicyEffect(malformed), liveLayer)),
+    const missing = await Effect.runPromise(
+      Effect.flip(Effect.provide(loadModelPolicyEffect(join(parent, "missing.json")), liveLayer)),
     );
-    assert.ok(parseFailure instanceof ModelPolicyError);
-    assert.equal(parseFailure.operation, "parse");
-    assert.equal(parseFailure.message.includes("not-retained"), false);
-
-    const providerFailure = await Effect.runPromise(
-      Effect.flip(Effect.provide(loadModelPolicyEffect(parent), liveLayer)),
-    );
-    assert.equal(providerFailure._tag, "PlatformError");
+    assert.ok(missing instanceof ModelPolicyError);
+    assert.equal(missing.operation, "read");
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
 });
 
-await test("selection is role-owned, ordered, and explicit about insufficient diversity", () => {
-  const policy = structuredClone(DEFAULT_MODEL_POLICY);
-  const repeatedResearch = resolveSelection("research", { count: 3 }, policy);
+await test("selection repeats independently or takes distinct policy-order targets", () => {
+  const policy = valid;
   assert.deepEqual(
-    repeatedResearch.selected.map((target) => target.model),
-    ["openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-luna"],
-  );
-  const distinctResearch = resolveSelection(
-    "research",
-    { count: 2, diversity: "distinct-models" },
-    policy,
+    resolveSelection("research", { count: 3 }, policy).selected.map((target) => target.model),
+    ["fixture/research-first", "fixture/research-first", "fixture/research-first"],
   );
   assert.deepEqual(
-    distinctResearch.selected.map((target) => target.model),
-    ["openai-codex/gpt-5.6-luna"],
-  );
-  assert.equal(distinctResearch.unfulfilled.length, 1);
-
-  const distinctReview = resolveSelection(
-    "review",
-    { count: 3, diversity: "distinct-models" },
-    policy,
-  );
-  assert.deepEqual(
-    distinctReview.selected.map((target) => target.model),
-    ["openai-codex/gpt-5.6-terra", "opencode-go/deepseek-v4-flash", "opencode-go/glm-5.3-flash"],
-  );
-  assert.equal(distinctReview.source, "policy");
-  assert.match(distinctReview.reason, /policy order/);
-  const unavailableReview = resolveSelection(
-    "review",
-    { count: 4, diversity: "distinct-models" },
-    policy,
-  );
-  assert.equal(unavailableReview.selected.length, 3);
-  assert.equal(unavailableReview.unfulfilled.length, 1);
-
-  policy.roles.research = [
-    { model: "fixture/research-first", thinking: "low" },
-    { model: "fixture/research-second", thinking: "high" },
-  ];
-  policy.roles.review = [{ model: "fixture/review-only", thinking: "high" }];
-  const isolated = resolveSelection("research", { count: 3, diversity: "distinct-models" }, policy);
-  assert.deepEqual(
-    isolated.selected.map((target) => target.model),
+    resolveSelection("research", { count: 2, distinctModels: true }, policy).selected.map(
+      (target) => target.model,
+    ),
     ["fixture/research-first", "fixture/research-second"],
   );
-  assert.equal(
-    isolated.selected.some((target) => target.model === "fixture/review-only"),
-    false,
+  assert.deepEqual(
+    resolveSelection(
+      "research",
+      { count: 2, model: "fixture/research-second" },
+      policy,
+    ).selected.map((target) => target.model),
+    ["fixture/research-second", "fixture/research-second"],
   );
-
-  const overridden = resolveSelection(
-    "review",
-    { override: { model: "fixture/review-override" } },
-    policy,
+  assert.deepEqual(
+    resolveSelection("review", { count: 2 }, policy).selected.map((target) => target.model),
+    ["fixture/review", "fixture/review"],
   );
-  assert.equal(overridden.source, "override");
-  assert.deepEqual(overridden.selected[0], {
-    model: "fixture/review-override",
-    thinking: "high",
-  });
-  assert.match(overridden.reason, /Explicit model override/);
-  const distinctOverride = resolveSelection(
-    "review",
-    { count: 2, diversity: "distinct-models", override: { model: "fixture/one-target" } },
-    policy,
+  assert.deepEqual(
+    resolveSelection("review", { count: 2, model: "fixture/review" }, policy).selected.map(
+      (target) => target.model,
+    ),
+    ["fixture/review", "fixture/review"],
   );
-  assert.deepEqual(distinctOverride.selected, [{ model: "fixture/one-target", thinking: "high" }]);
-  assert.equal(distinctOverride.unfulfilled.length, 1);
-  const thinkingOverride = resolveSelection(
-    "research",
-    { override: { thinking: "minimal" } },
-    policy,
-  );
-  assert.deepEqual(thinkingOverride.selected[0], {
-    model: "fixture/research-first",
-    thinking: "minimal",
-  });
   assert.throws(
-    () => resolveSelection("research", { override: {} }, policy),
-    /Invalid model selection request/,
+    () => resolveSelection("review", { count: 2, distinctModels: true }, policy),
+    /only 1/,
   );
-  assert.equal(
-    Value.Check(SelectionRequestSchema, {
-      override: { target: policy.roles.research[0], reason: "legacy" },
-    }),
-    false,
+  assert.throws(
+    () =>
+      resolveSelection(
+        "research",
+        { distinctModels: true, model: "fixture/research-first" },
+        policy,
+      ),
+    /incompatible/,
   );
+  assert.throws(
+    () => resolveSelection("research", { model: "fixture/unknown" }, policy),
+    /not configured/,
+  );
+  assert.equal(Value.Check(SelectionRequestSchema, { diversity: "distinct-models" }), false);
 });

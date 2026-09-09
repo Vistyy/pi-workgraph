@@ -14,6 +14,7 @@ import {
   RetainedTerminalEnvelopeSchema,
   type SessionIdentity,
   UnsupportedWorkstreamStateError,
+  WORKSTREAM_FORMAT,
   type WorkAssignment,
   type WorkAttempt,
   type WorkResult,
@@ -30,6 +31,41 @@ import {
 type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
 const JsonStringSchema = Type.String();
+const PredecessorSelectionReceiptSchema = Type.Object(
+  {
+    role: Type.Union([Type.Literal("research"), Type.Literal("review")]),
+    requested: Type.Integer({ minimum: 1 }),
+    diversity: Type.Union([Type.Literal("same-model"), Type.Literal("distinct-models")]),
+    selected: Type.Array(ModelTargetSchema),
+    unfulfilled: Type.Array(Type.String({ minLength: 1 })),
+    source: Type.Union([Type.Literal("policy"), Type.Literal("override")]),
+    reason: Type.String({ minLength: 1 }),
+  },
+  { additionalProperties: false },
+);
+type JsonObjectFields = {
+  readonly [key: string]: JsonValue | undefined;
+  readonly assignments?: JsonValue;
+  readonly attempts?: JsonValue;
+  readonly capability?: JsonValue;
+  readonly advisorOverride?: JsonValue;
+  readonly models?: JsonValue;
+  readonly source?: JsonValue;
+  readonly overrideReason?: JsonValue;
+  readonly selection?: JsonValue;
+};
+type MutableJsonObject = {
+  [key: string]: JsonValue | undefined;
+  assignments?: JsonValue;
+  attempts?: JsonValue;
+  capability?: JsonValue;
+  advisorOverride?: JsonValue;
+  advisorModel?: JsonValue;
+  models?: JsonValue;
+  source?: JsonValue;
+  overrideReason?: JsonValue;
+  selection?: JsonValue;
+};
 
 export type JsonObject = {
   readonly format?: JsonValue;
@@ -146,19 +182,21 @@ export function validateStoredPath(state: WorkstreamState, path: string): void {
 }
 
 export function decodeState(value: JsonObject): WorkstreamState {
-  if (!Value.Check(WorkstreamStateSchema, value))
-    throw new InvalidWorkstreamStateError(schemaDiagnostic(value));
+  const normalized = normalizePredecessorVersionSeven(value);
+  if (!Value.Check(WorkstreamStateSchema, normalized))
+    throw new InvalidWorkstreamStateError(schemaDiagnostic(normalized));
   // SAFETY: Value.Check established the complete WorkstreamStateSchema contract immediately above.
-  const state = value as WorkstreamState;
+  const state = normalized as WorkstreamState;
   validateState(state);
   return state;
 }
 
 export function decodeLegacyState(value: JsonObject, resolvedPath: string): WorkstreamState {
-  if (!Value.Check(WorkstreamStateSchema, value))
-    throw new InvalidWorkstreamStateError(schemaDiagnostic(value));
+  const normalized = normalizePredecessorVersionSeven(value);
+  if (!Value.Check(WorkstreamStateSchema, normalized))
+    throw new InvalidWorkstreamStateError(schemaDiagnostic(normalized));
   // SAFETY: Value.Check established the complete WorkstreamStateSchema contract immediately above.
-  const state = value as WorkstreamState;
+  const state = normalized as WorkstreamState;
   if (
     state.statePath !== resolvedPath ||
     state.statePath !== legacyPathForWorkstream(state.gitCommonDir, state.id)
@@ -168,6 +206,99 @@ export function decodeLegacyState(value: JsonObject, resolvedPath: string): Work
     );
   validateState({ ...state, statePath: pathForWorkstream(state.gitCommonDir, state.id) });
   return state;
+}
+
+function normalizePredecessorVersionSeven(value: JsonObject): JsonObject {
+  if (value.format !== WORKSTREAM_FORMAT || value.version !== 7 || !hasPredecessorMarkers(value))
+    return value;
+  // SAFETY: structuredClone creates an owned copy that this read-boundary normalizer mutates only before schema validation.
+  const normalized = mutableJsonObject(structuredClone(value));
+  normalizePredecessorAssignments(normalized.assignments);
+  normalizePredecessorAttempts(normalized.attempts);
+  return normalized;
+}
+
+function hasPredecessorMarkers(value: JsonObject): boolean {
+  const fields = jsonObjectFields(value);
+  return (
+    hasPredecessorAssignmentMarkers(fields.assignments) ||
+    hasPredecessorAttemptMarkers(fields.attempts)
+  );
+}
+
+function hasPredecessorAssignmentMarkers(value: JsonValue | undefined): boolean {
+  if (!Array.isArray(value)) return false;
+  for (const rawAssignment of value) {
+    if (!isJsonObject(rawAssignment)) continue;
+    const assignment = jsonObjectFields(rawAssignment);
+    if (assignment.capability !== "consultation") continue;
+    if (Value.Check(ModelTargetSchema, assignment.advisorOverride)) return true;
+  }
+  return false;
+}
+
+function hasPredecessorAttemptMarkers(value: JsonValue | undefined): boolean {
+  if (!Array.isArray(value)) return false;
+  for (const rawAttempt of value) {
+    if (!isJsonObject(rawAttempt)) continue;
+    const attempt = jsonObjectFields(rawAttempt);
+    const models = attempt.models;
+    if (!isJsonObject(models)) continue;
+    const modelFields = jsonObjectFields(models);
+    if (modelFields.source === "override" || modelFields.overrideReason !== undefined) return true;
+    if (Value.Check(PredecessorSelectionReceiptSchema, modelFields.selection)) return true;
+  }
+  return false;
+}
+
+function jsonObjectFields(value: JsonObject): JsonObjectFields {
+  // SAFETY: JsonObjectFields only names optional fields already permitted by the recursive JSON object contract.
+  return value as JsonObjectFields;
+}
+
+function normalizePredecessorAssignments(value: JsonValue | undefined): void {
+  if (!Array.isArray(value)) return;
+  for (const rawAssignment of value) {
+    if (!isJsonObject(rawAssignment)) continue;
+    const assignment = mutableJsonObject(rawAssignment);
+    if (assignment.capability !== "consultation") continue;
+    const selector = assignment.advisorOverride;
+    if (!Value.Check(ModelTargetSchema, selector)) continue;
+    const target = Value.Decode(ModelTargetSchema, selector);
+    assignment.advisorModel = target.model;
+    delete assignment.advisorOverride;
+  }
+}
+
+function normalizePredecessorAttempts(value: JsonValue | undefined): void {
+  if (!Array.isArray(value)) return;
+  for (const rawAttempt of value) {
+    if (!isJsonObject(rawAttempt)) continue;
+    const attempt = mutableJsonObject(rawAttempt);
+    const rawModels = attempt.models;
+    if (!isJsonObject(rawModels)) continue;
+    normalizePredecessorModels(mutableJsonObject(rawModels));
+  }
+}
+
+function mutableJsonObject(value: JsonObject): MutableJsonObject {
+  // SAFETY: The caller owns a structured-cloned JSON object and mutates it only at this compatibility boundary.
+  return value as MutableJsonObject;
+}
+
+function normalizePredecessorModels(models: MutableJsonObject): void {
+  if (models.source === "override") models.source = "requested-model";
+  delete models.overrideReason;
+  const selection = models.selection;
+  if (!Value.Check(PredecessorSelectionReceiptSchema, selection)) return;
+  const predecessor = Value.Decode(PredecessorSelectionReceiptSchema, selection);
+  models.selection = {
+    role: predecessor.role,
+    count: predecessor.requested,
+    distinctModels: predecessor.diversity === "distinct-models",
+    selected: predecessor.selected,
+    source: predecessor.source === "override" ? "requested-model" : "policy",
+  };
 }
 
 export function validateState(state: WorkstreamState): void {
@@ -306,12 +437,9 @@ function validateConsultationAssignment(
     throw new InvalidWorkstreamStateError(
       `Consultation assignment ${assignment.id} question does not match its objective.`,
     );
-  if (
-    assignment.advisorOverride !== undefined &&
-    !Value.Check(ModelTargetSchema, assignment.advisorOverride)
-  )
+  if (assignment.advisorModel !== undefined && !/^[^/\s]+\/\S+$/.test(assignment.advisorModel))
     throw new InvalidWorkstreamStateError(
-      `Consultation assignment ${assignment.id} has an invalid exact advisor override.`,
+      `Consultation assignment ${assignment.id} has an invalid advisor model ID.`,
     );
 }
 

@@ -27,11 +27,7 @@
     "src",
     "scripts/codex-web-gpt-headless",
     "skills",
-    "README.md",
-    "AGENTS.md",
-    "OPERATIONS.md",
-    "DESIGN.md",
-    "VERIFICATION.md"
+    "README.md"
   ],
   "scripts": {
     "test": "node --import tsx --test test/*.test.ts",

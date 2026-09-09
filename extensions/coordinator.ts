@@ -18,17 +18,10 @@ import {
 import { GitRepository, inspectRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import {
-  ImplementationModelOverridesSchema as ImplementationModels,
-  type ListModelRole,
   loadModelPolicyEffect,
-  MODEL_ROLES,
-  type ModelPolicy,
+  MODEL_LIST_ROLES,
   modelPolicyPath,
-  ModelChoiceSchema as PolicyChoice,
   SelectionRequestSchema as Selection,
-  setModelListEffect,
-  setModelRoleEffect,
-  ModelTargetSchema as Target,
 } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import { forkConversationSessionEffect } from "../src/pi-process.js";
@@ -117,10 +110,6 @@ const QueueOptionFields = {
 const ModelOptions = {
   ...QueueOptionFields,
   selection: Type.Optional(Selection),
-};
-const ImplementationModelOptions = {
-  ...QueueOptionFields,
-  models: Type.Optional(ImplementationModels),
 };
 
 export default function workgraphCoordinator(
@@ -473,54 +462,21 @@ export default function workgraphCoordinator(
     name: "workgraph_models",
     label: "Workgraph Models",
     description:
-      "Get model defaults and their configuration path, or persist an implementation or consultation target, or a research/review selection list backed by a retained interactive or RPC input receipt. Consultation has one exact enricher and advisor target; assignment selection or per-role model overrides use policy defaults without changing policy or the coordinator model.",
-    promptSnippet: "Inspect or configure Workgraph model defaults",
-    parameters: Type.Object({
-      action: StringEnum(["get", "set", "set_list", "rates"] as const),
-      authorityReceiptId: Type.Optional(
-        Type.String({
-          description:
-            "Retained interactive/RPC input receipt authorizing set or set_list. Omit to use the latest retained genuine input.",
-        }),
-      ),
-      role: Type.Optional(StringEnum(MODEL_ROLES)),
-      target: Type.Optional(Target),
-      list: Type.Optional(Type.Array(PolicyChoice, { minItems: 1 })),
-      models: Type.Optional(Type.Array(Type.String())),
-    }),
-    execute(_id, params, signal, _update, ctx) {
+      "Read the configured ordered targets for research, review, or consultation.advisor.",
+    promptSnippet: "Inspect configured Workgraph model targets",
+    parameters: Type.Object(
+      { role: StringEnum(MODEL_LIST_ROLES) },
+      { additionalProperties: false },
+    ),
+    execute(_id, params, signal) {
       return runCallback(
         Effect.gen(function* () {
-          validateModelRequest(params.action, params.role, params.target, params.list);
-          if (params.action === "rates") {
-            const policy = yield* loadModelPolicyEffect();
-            const models = params.models ?? policyModelIds(policy);
-            const rates = modelRates(models, ctx);
-            return {
-              content: [{ type: "text", text: formatRates(rates) }],
-              details: { rates },
-            };
-          }
-          const authority = isPersistentModelMutation(params.action)
-            ? selectSessionAuthority(pending, params.authorityReceiptId)
-            : undefined;
-          const policy = yield* resolveModelPolicyEffect(
-            params.action,
-            params.role,
-            params.target,
-            params.list,
-          );
+          const policy = yield* loadModelPolicyEffect();
+          const targets = policy.roles[params.role];
           return {
-            content: [
-              {
-                type: "text",
-                text:
-                  authority === undefined
-                    ? formatPolicy(policy)
-                    : `${formatPolicy(policy)}\nAuthority receipt: ${authority.receiptId} (${authority.source}).`,
-              },
-            ],
-            details: { path: modelPolicyPath(), policy, rates: [], authority },
+            // oxlint-disable-next-line effecttsgo/prefer-schema-over-json -- Configured targets are already validated domain values and this is the read-only tool response.
+            content: [{ type: "text", text: JSON.stringify(targets, null, 2) }],
+            details: { path: modelPolicyPath(), role: params.role, targets },
           };
         }),
         signal,
@@ -593,7 +549,7 @@ export default function workgraphCoordinator(
         question: Type.String({ minLength: 1, maxLength: 20_000 }),
         context: Type.Optional(Type.String({ maxLength: 20_000 })),
         enrichmentFocus: Type.Optional(Type.String({ maxLength: 4_000 })),
-        advisor: Type.Optional(Target),
+        advisor: Type.Optional(Type.String({ pattern: "^[^/\\s]+/\\S+$" })),
       },
       { additionalProperties: false },
     ),
@@ -613,7 +569,7 @@ export default function workgraphCoordinator(
           if (params.context !== undefined) assignment.context = params.context;
           if (params.enrichmentFocus !== undefined)
             assignment.enrichmentFocus = params.enrichmentFocus;
-          if (params.advisor !== undefined) assignment.advisorOverride = params.advisor;
+          if (params.advisor !== undefined) assignment.advisorModel = params.advisor;
           const state = yield* active.effects.queue(assignment);
           return mutationResult(
             `Queued consultation ${params.id}; enrichment and advice are observed asynchronously.`,
@@ -693,7 +649,7 @@ export default function workgraphCoordinator(
         id: Type.String(),
         objective: Type.String(),
         acceptance: Type.Array(Type.String(), { minItems: 1 }),
-        ...ImplementationModelOptions,
+        ...QueueOptionFields,
       },
       { additionalProperties: false },
     ),
@@ -711,7 +667,7 @@ export default function workgraphCoordinator(
               authority: authorization.authority,
               acceptance: params.acceptance,
             },
-            implementationQueueOptions(params),
+            queueOptions(params),
           );
           return mutationResult(
             `Queued maintained change ${params.id}.`,
@@ -1071,10 +1027,6 @@ function selectSessionAuthority(
   };
 }
 
-function isPersistentModelMutation(action: "get" | "set" | "set_list" | "rates"): boolean {
-  return action === "set" || action === "set_list";
-}
-
 function researchAssignment(
   params: ResearchParams,
   intentVersion: number,
@@ -1098,90 +1050,9 @@ function researchAssignment(
   };
 }
 
-function isModelListRole(role: (typeof MODEL_ROLES)[number] | undefined): role is ListModelRole {
-  return role === "research" || role === "review";
-}
-
-function requiredModelListRole(role: (typeof MODEL_ROLES)[number] | undefined): ListModelRole {
-  if (!isModelListRole(role))
-    throw new Error("Model list operations require research or review role.");
-  return role;
-}
-
-function validateModelRequest(
-  action: "get" | "set" | "set_list" | "rates",
-  role: (typeof MODEL_ROLES)[number] | undefined,
-  target: Static<typeof Target> | undefined,
-  list: Static<typeof PolicyChoice>[] | undefined,
-): void {
-  if (action === "set" && (role === undefined || target === undefined))
-    throw new Error("Setting a model default requires role and target.");
-  if (action === "set_list" && (!isModelListRole(role) || list === undefined))
-    throw new Error("Setting a model list requires research or review role and a nonempty list.");
-}
-
-function resolveModelPolicyEffect(
-  action: "get" | "set" | "set_list" | "rates",
-  role: (typeof MODEL_ROLES)[number] | undefined,
-  target: Static<typeof Target> | undefined,
-  list: Static<typeof PolicyChoice>[] | undefined,
-) {
-  if (action === "set")
-    return setModelRoleEffect(
-      requiredValue(role, "model role"),
-      requiredValue(target, "model target"),
-    );
-  if (action === "set_list")
-    return setModelListEffect(requiredModelListRole(role), requiredValue(list, "model list"));
-  return loadModelPolicyEffect();
-}
-
-function policyModelIds(policy: ModelPolicy): string[] {
-  return [
-    ...policy.roles.research,
-    ...policy.roles.review,
-    policy.roles["implementation.guide"],
-    policy.roles["implementation.executor"],
-    policy.roles["consultation.enricher"],
-    policy.roles["consultation.advisor"],
-  ].reduce<string[]>((models, target) => {
-    if (!models.includes(target.model)) models.push(target.model);
-    return models;
-  }, []);
-}
-
-function formatRates(rates: ReturnType<typeof modelRates>): string {
-  return JSON.stringify({ rates }, null, 2);
-}
-function formatPolicy(policy: ModelPolicy): string {
-  return JSON.stringify({ path: modelPolicyPath(), policy }, null, 2);
-}
 function formatInspection(view: InspectView): string {
   return JSON.stringify(view, null, 2);
 }
-
-function modelRates(models: string[], ctx: ExtensionContext) {
-  return models.map((modelId) => {
-    const slash = modelId.indexOf("/");
-    const model =
-      slash > 0
-        ? ctx.modelRegistry.find(modelId.slice(0, slash), modelId.slice(slash + 1))
-        : undefined;
-    return model === undefined
-      ? {
-          model: modelId,
-          source: "Pi registry configured estimate unavailable",
-          verified: false,
-        }
-      : {
-          model: modelId,
-          source: "Pi registry configured estimate",
-          verified: false,
-          ratesPerMillionTokens: { ...model.cost },
-        };
-  });
-}
-
 function isAttemptControl(params: ControlParams): params is AttemptControlParams {
   return (
     params.action === "cancel" ||
@@ -1300,15 +1171,5 @@ function queueOptions(params: {
     options.candidateOf = params.candidateOf;
   if (params.baseRevision !== undefined && params.baseRevision !== "")
     options.baseRevision = params.baseRevision;
-  return options;
-}
-
-function implementationQueueOptions(
-  params: Parameters<typeof queueOptions>[0] & {
-    models?: QueueOptions["models"];
-  },
-): QueueOptions {
-  const options = queueOptions(params);
-  if (params.models !== undefined) options.models = params.models;
   return options;
 }

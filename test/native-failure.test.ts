@@ -16,13 +16,12 @@ import {
   type WorkerLaunchEffectRequest,
   WorkerLaunchError,
 } from "../src/herdr.js";
-import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import type { WorkerIdentity } from "../src/types.js";
 import { WorkstreamStoreEffects } from "../src/workstream.js";
 import { WorkstreamRuntime } from "../src/workstream-runtime.js";
-import { git, persistentSession, researchReport, usage } from "./helpers.js";
+import { fixturePolicy, git, persistentSession, researchReport, usage } from "./helpers.js";
 
 const RAW_SECRET = "Bearer fixture-secret at https://provider.example/private";
 
@@ -166,6 +165,9 @@ await test("absent native failures project sanitized actionable notifications wi
   let registry: WorkgraphRegistry | undefined;
   try {
     const root = join(parent, "repo");
+    const policyPath = join(parent, "agent", "workgraph", "models.json");
+    await mkdir(join(parent, "agent", "workgraph"), { recursive: true });
+    await writeFile(policyPath, `${JSON.stringify(fixturePolicy)}\n`, { mode: 0o600 });
     await mkdir(root);
     await git(root, "init", "-b", "main");
     await git(root, "config", "user.email", "fixture@example.test");
@@ -199,7 +201,7 @@ await test("absent native failures project sanitized actionable notifications wi
             notifications.push(resultNotification(state, resultId));
           }),
         (error) => Effect.sync(() => assert.fail(error.message)),
-        { registry, policy: DEFAULT_MODEL_POLICY },
+        { registry, policyPath },
       ).pipe(Effect.provide(liveLayer)),
     );
     for (const id of ["rate-limit", "abort", "generic", "fallback", "untyped", "typed"])

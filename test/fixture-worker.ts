@@ -48,6 +48,7 @@ export type FixtureLaunchRequest = Pick<
   | "sessionFile"
   | "prompt"
   | "model"
+  | "thinking"
   | "env"
 >;
 

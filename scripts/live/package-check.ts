@@ -41,6 +41,15 @@ async function runPackage(): Promise<void> {
   const entries = await command(parent, "tar", ["-tzf", tarballPath]);
   assert.match(entries, /package\/scripts\/codex-web-gpt-headless\/consult\.py\n/);
   assert.doesNotMatch(entries, /package\/scripts\/live\//);
+  for (const repositoryOnly of [
+    "AGENTS.md",
+    "DESIGN.md",
+    "VERIFICATION.md",
+    "OPERATIONS.md",
+    "test/",
+  ]) {
+    assert.doesNotMatch(entries, new RegExp(`package\\/${repositoryOnly.replace("/", "\\/")}`));
+  }
   await mkdir(consumer);
   await command(parent, "pnpm", [
     "add",

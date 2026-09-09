@@ -753,10 +753,6 @@ function projectedModels(attempt: WorkAttempt) {
                   model: compactText(models.executor.model, 160),
                   thinking: models.executor.thinking,
                 },
-          overrideReason:
-            models.overrideReason === undefined
-              ? undefined
-              : compactText(models.overrideReason, 240),
         };
   return {
     selected,

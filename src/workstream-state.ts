@@ -164,7 +164,7 @@ const ConsultationAssignmentSchema = Type.Object(
     question: Type.String({ minLength: 1, maxLength: 20_000 }),
     context: Type.Optional(Type.String({ maxLength: 20_000 })),
     enrichmentFocus: Type.Optional(Type.String({ maxLength: 4_000 })),
-    advisorOverride: Type.Optional(ModelTargetSchema),
+    advisorModel: Type.Optional(Type.String({ pattern: "^[^/\\s]+/\\S+$" })),
   },
   { additionalProperties: false },
 );
@@ -229,12 +229,10 @@ export const ResultSchema = Type.Union([
 const SelectionReceiptSchema = Type.Object(
   {
     role: StringEnum(["research", "review"] as const),
-    requested: Type.Integer({ minimum: 1 }),
-    diversity: StringEnum(["same-model", "distinct-models"] as const),
+    count: Type.Integer({ minimum: 1 }),
+    distinctModels: Type.Boolean(),
     selected: Type.Array(ModelTargetSchema),
-    unfulfilled: Type.Array(NonEmptyStringSchema),
-    source: StringEnum(["policy", "override"] as const),
-    reason: NonEmptyStringSchema,
+    source: StringEnum(["policy", "requested-model"] as const),
   },
   { additionalProperties: false },
 );
@@ -242,8 +240,7 @@ const ModelsSchema = Type.Object(
   {
     guide: ModelTargetSchema,
     executor: Type.Optional(ModelTargetSchema),
-    source: StringEnum(["policy", "override"] as const),
-    overrideReason: Type.Optional(NonEmptyStringSchema),
+    source: StringEnum(["policy", "requested-model"] as const),
     selection: Type.Optional(SelectionReceiptSchema),
   },
   { additionalProperties: false },

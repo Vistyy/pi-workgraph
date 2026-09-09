@@ -153,6 +153,7 @@ await test("production text blocks succeed and completed artifacts replay", asyn
     const call = first.content[0];
     assert.ok(call?.type === "toolCall");
     assert.equal(call.name, "workgraph_report");
+    // biome-ignore lint/complexity/useLiteralKeys: The provider tool payload is an open protocol object.
     assert.equal(call.arguments["summary"], "WEB ANSWER\n");
     assert.equal(await readFile(join(root, "received-prompt.txt"), "utf8"), objective);
     assert.equal(await readFile(join(root, "invocations"), "utf8"), "1");
