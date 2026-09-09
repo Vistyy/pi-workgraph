@@ -115,7 +115,7 @@ export const DEFAULT_MODEL_POLICY: ModelPolicy = {
   version: 5,
   roles: {
     "consultation.enricher": { model: "openai-codex/gpt-5.6-luna", thinking: "high" },
-    "consultation.advisor": { model: "openai-codex/gpt-6-astra", thinking: "high" },
+    "consultation.advisor": { model: "chatgpt-web/pro", thinking: "off" },
     research: DEFAULT_RESEARCH_MODELS,
     "implementation.guide": DEFAULT_GUIDE_TARGET,
     "implementation.executor": DEFAULT_EXECUTOR_TARGET,

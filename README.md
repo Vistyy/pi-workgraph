@@ -17,6 +17,8 @@ pi -e /absolute/path/to/pi-workgraph
 
 Describe the outcome you want and any constraints. You don't need to prescribe tools or worker counts.
 
+Optional ChatGPT Web Pro consultation is provided by the bundled `scripts/codex-web-gpt-headless/` source and its separate Pi provider extension. The scripts install only the pinned launcher into the private external root `~/.local/share/codex-web-gpt-headless`; they do not copy credentials, browser profiles, logs, or runtime state. The provider invokes the bundled `consult.py` through `python3`, accepts only `PI_WORKGRAPH_CHATGPT_WEB_CLIENT` for tests or alternate installations, and retains stable advisor artifacts under that private root. A coherent completed artifact replays locally; every other existing state or uncertain invocation blocks and must be inspected rather than resubmitted. Routine checks use a fake client and do not make live ChatGPT or browser requests. Setup, login, lifecycle, pinning, and security details live in the [bundled bridge README](scripts/codex-web-gpt-headless/README.md).
+
 The coordinator first uses `workgraph_intent` to establish the agreed goal and create its workstream. The repository defaults to the coordinator's cwd; `targetRepository` on that intent can select another repository, fixed for the workstream. Assignments inherit the scope and repository rather than defining them.
 
 ## How work is handled

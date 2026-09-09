@@ -2056,7 +2056,7 @@ function appendConsultationObjective(
     lines.push(
       "This is a fresh advisor session. The enricher transcript is not available and must not be inferred.",
       `Frozen enricher research evidence: ${JSON.stringify(attempt.consultation?.frozenEvidence)}`,
-      "Use ordinary read-only research tools and finish with workgraph_report. Provide advice as evidence only; do not claim coordinator acceptance or authority.",
+      "Provide advice as evidence only; do not claim coordinator acceptance or authority.",
     );
     return;
   }

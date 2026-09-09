@@ -2,6 +2,8 @@
 
 Use this reference when operating Workgraph encounters missing evidence, interrupted operations, or ownership uncertainty. Tool descriptions own call arguments and restrictions.
 
+ChatGPT Web Pro consultation is packaged in `scripts/codex-web-gpt-headless/`; its setup, pinned launcher, human login boundary, and stop/status ownership checks are documented in the [bundled bridge README](scripts/codex-web-gpt-headless/README.md). If a supervisor still references an older source path, stop it through that old path and restart it through the bundled path after integration before removing the old source; this implementation does not touch an existing supervisor or external source directory.
+
 ## Inspect evidence
 
 Ordinary notifications contain actionable summaries. When missing detail could change a decision, use `workgraph_inspect` and follow its `next` handle for truncated content.

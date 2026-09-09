@@ -9,7 +9,11 @@
   },
   "license": "MIT",
   "bin": {
-    "pi-workgraph": "./bin/pi-workgraph.mjs"
+    "pi-workgraph": "./bin/pi-workgraph.mjs",
+    "pi-workgraph-chatgpt-web-install": "./bin/codex-web-gpt-lifecycle.sh",
+    "pi-workgraph-chatgpt-web-start": "./bin/codex-web-gpt-lifecycle.sh",
+    "pi-workgraph-chatgpt-web-status": "./bin/codex-web-gpt-lifecycle.sh",
+    "pi-workgraph-chatgpt-web-stop": "./bin/codex-web-gpt-lifecycle.sh"
   },
   "keywords": [
     "pi-package",
@@ -21,6 +25,7 @@
     "bin",
     "extensions",
     "src",
+    "scripts/codex-web-gpt-headless",
     "skills",
     "README.md",
     "AGENTS.md",
@@ -41,7 +46,8 @@
   "pi": {
     "extensions": [
       "./extensions/coordinator.ts",
-      "./extensions/worker.ts"
+      "./extensions/worker.ts",
+      "./extensions/chatgpt-web-provider.ts"
     ],
     "skills": [
       "./skills"

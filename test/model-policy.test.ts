@@ -27,7 +27,7 @@ await test("policy defaults, legacy reads, and independent role-list writes use 
       version: 5,
       roles: {
         "consultation.enricher": { model: "openai-codex/gpt-5.6-luna", thinking: "high" },
-        "consultation.advisor": { model: "openai-codex/gpt-6-astra", thinking: "high" },
+        "consultation.advisor": { model: "chatgpt-web/pro", thinking: "off" },
         research: [{ model: "openai-codex/gpt-5.6-luna", thinking: "high" }],
         "implementation.guide": { model: "openai-codex/gpt-6-astra", thinking: "low" },
         "implementation.executor": { model: "openai-codex/gpt-5.6-luna", thinking: "xhigh" },
