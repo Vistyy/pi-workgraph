@@ -18,12 +18,12 @@ import {
   activeWorkerCount,
   attachCalmPresentation,
   calmActivityLines,
+  calmHiddenTools,
   createCalmActivityTracker,
   DEFAULT_CALM_HIDDEN_TOOLS,
   installCalmMode,
   isCalmActivityActive,
   isCoordinatorScope,
-  parseCalmHiddenTools,
 } from "../src/calm.js";
 import { attachCalmThinking } from "../src/calm-thinking.js";
 
@@ -278,19 +278,25 @@ function stripAnsiLikeTheme(value: string): string {
   return stripVTControlCharacters(value);
 }
 
-void test("calm policy defaults cover builtins, search tools, and Workgraph tools", () => {
+void test("calm defaults own Pi and Workgraph tools while user additions are merged", () => {
   assert.equal(isCoordinatorScope({}), true);
   assert.equal(isCoordinatorScope({ PI_WORKGRAPH_MODE: "" }), true);
   assert.equal(isCoordinatorScope({ PI_WORKGRAPH_MODE: "implementation" }), false);
-  const hidden = parseCalmHiddenTools(undefined);
-  assert.deepEqual(hidden, [...DEFAULT_CALM_HIDDEN_TOOLS]);
-  assert.ok(hidden.includes("bash"));
-  assert.ok(hidden.includes("web_search"));
-  assert.ok(hidden.includes("workgraph_report"));
-  assert.ok(hidden.includes("workgraph_notepad"));
-  assert.deepEqual(parseCalmHiddenTools(" read,read, custom "), ["read", "custom"]);
-  assert.ok(!parseCalmHiddenTools(" read,read, custom ").includes("workgraph_notepad"));
-  assert.deepEqual(parseCalmHiddenTools(" , "), []);
+  const hidden = new Set<string>(calmHiddenTools());
+  assert.deepEqual([...hidden], [...DEFAULT_CALM_HIDDEN_TOOLS]);
+  assert.ok(hidden.has("bash"));
+  assert.ok(hidden.has("workgraph_consult"));
+  assert.ok(hidden.has("workgraph_enrichment"));
+  assert.ok(hidden.has("workgraph_report"));
+  assert.ok(hidden.has("workgraph_notepad"));
+  assert.ok(!hidden.has("web_search"));
+  assert.ok(!hidden.has("rename_resource"));
+  assert.ok(!hidden.has("herdr_rename"));
+  assert.deepEqual(calmHiddenTools(["web_search", "rename_resource", "bash"]), [
+    ...DEFAULT_CALM_HIDDEN_TOOLS,
+    "web_search",
+    "rename_resource",
+  ]);
 });
 
 void test("presentation adapter hides and restores existing tool and operational-message rows", () => {
@@ -831,6 +837,7 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   const pi = fakePi();
   const ui = fakeUi();
   const calm = installCalmMode(pi as unknown as ExtensionAPI, {
+    loadAdditionalHiddenTools: async () => ["web_search"],
     loadPresentation: async () => moduleForFakeRows(),
     intervalMs: 10_000,
     preferences: { load: async () => false, save: async () => {} },
@@ -844,10 +851,13 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   } as unknown as ExtensionContext;
   await pi.events.get("session_start")?.({}, context);
   const tool = new FakeToolRow("workgraph_notepad");
+  const addedTool = new FakeToolRow("web_search");
   assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
+  assert.deepEqual(addedTool.render(80), ["tool:web_search:80"]);
   calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
   assert.deepEqual(tool.render(80), []);
+  assert.deepEqual(addedTool.render(80), []);
   assert.match(ui.statuses.get("calm") ?? "", /calm/);
   const widgetFactory = ui.widgets.get("calm");
   assert.ok(widgetFactory);
@@ -860,6 +870,7 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   calm.setActiveWorkers(1);
   await pi.commands.get("calm")?.("", context);
   assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
+  assert.deepEqual(addedTool.render(80), ["tool:web_search:80"]);
   const compactFactory = ui.widgets.get("calm");
   assert.ok(compactFactory);
   assert.equal(compactFactory({ requestRender() {} }, ui.theme).render(80).length, 1);
@@ -869,6 +880,34 @@ void test("coordinator calm command defaults to hiding workgraph notes and resto
   assert.equal(ui.widgets.get("calm"), undefined);
   assert.equal(ui.workingVisible, true);
   assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
+});
+
+void test("invalid Calm tool additions warn and retain package defaults", async () => {
+  const pi = fakePi();
+  const ui = fakeUi();
+  installCalmMode(pi as unknown as ExtensionAPI, {
+    loadAdditionalHiddenTools: async () => {
+      throw new Error("invalid global additions");
+    },
+    loadPresentation: async () => moduleForFakeRows(),
+    preferences: { load: async () => true, save: async () => {} },
+  });
+  const context = {
+    mode: "tui",
+    ui,
+    isIdle: () => true,
+    sessionManager: pi.session,
+  } as unknown as ExtensionContext;
+  try {
+    await pi.events.get("session_start")?.({}, context);
+    assert.deepEqual(new FakeToolRow("read").render(80), []);
+    assert.deepEqual(new FakeToolRow("web_search").render(80), ["tool:web_search:80"]);
+    assert.ok(
+      ui.notifications.some((notification) => notification.includes("Using built-in defaults")),
+    );
+  } finally {
+    await pi.events.get("session_shutdown")?.({}, context);
+  }
 });
 
 void test("missing internal seam leaves rows visible and reports a diagnostic", async () => {

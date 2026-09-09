@@ -42,13 +42,10 @@ export const DEFAULT_CALM_HIDDEN_TOOLS = [
   "powershell",
   "read",
   "write",
-  "fetch_content",
-  "get_search_content",
-  "source_check",
-  "web_search",
   "workgraph_notepad",
   "workgraph_models",
   "workgraph_research",
+  "workgraph_consult",
   "workgraph_intent",
   "workgraph_implement",
   "workgraph_review",
@@ -58,8 +55,8 @@ export const DEFAULT_CALM_HIDDEN_TOOLS = [
   "workgraph_fork",
   "workgraph_complete",
   "workgraph_plan",
+  "workgraph_enrichment",
   "workgraph_report",
-  "herdr_rename",
 ] as const;
 
 const CALM_OPERATIONAL_MESSAGE_TYPES = [
@@ -112,16 +109,8 @@ export function isCoordinatorScope(env: { readonly PI_WORKGRAPH_MODE?: string })
   return env.PI_WORKGRAPH_MODE === undefined || env.PI_WORKGRAPH_MODE === "";
 }
 
-export function parseCalmHiddenTools(raw: string | undefined): string[] {
-  if (raw === undefined || raw.trim() === "") return [...DEFAULT_CALM_HIDDEN_TOOLS];
-  return [
-    ...new Set(
-      raw
-        .split(",")
-        .map((name) => name.trim())
-        .filter(Boolean),
-    ),
-  ];
+export function calmHiddenTools(additional: readonly string[] = []): string[] {
+  return [...new Set([...DEFAULT_CALM_HIDDEN_TOOLS, ...additional])];
 }
 
 export function attachCalmPresentation(
@@ -180,17 +169,16 @@ export function installCalmMode(
   pi: ExtensionAPI,
   options: {
     readonly hiddenTools?: readonly string[];
+    readonly loadAdditionalHiddenTools?: () => Promise<readonly string[]>;
     readonly loadPresentation?: PresentationLoader;
     readonly intervalMs?: number;
     readonly preferences?: CalmPreferences;
   } = {},
 ): CalmMode {
+  const hiddenTools = new Set(options.hiddenTools ?? calmHiddenTools());
   const state: CalmPresentationState = {
     on: false,
-    hiddenTools: new Set(
-      options.hiddenTools ??
-        parseCalmHiddenTools(readEnvironmentVariable("PI_WORKGRAPH_CALM_HIDDEN_TOOLS")),
-    ),
+    hiddenTools,
     hiddenMessageTypes: new Set(CALM_OPERATIONAL_MESSAGE_TYPES),
   };
   const preferences = options.preferences ?? calmPreferences();
@@ -341,9 +329,27 @@ export function installCalmMode(
             return false;
           })
         : Promise.resolve(sessionChoice);
-    return initial
-      .then((on) => {
+    const configuredHiddenTools =
+      options.hiddenTools !== undefined
+        ? Promise.resolve(options.hiddenTools)
+        : options.loadAdditionalHiddenTools === undefined
+          ? Promise.resolve([])
+          : options.loadAdditionalHiddenTools().catch((error: unknown) => {
+              if (currentGeneration === generation)
+                ctx.ui.notify(
+                  `Could not load Calm tool settings: ${errorMessage(error)} Using built-in defaults.`,
+                  "warning",
+                );
+              return [];
+            });
+    return Promise.all([initial, configuredHiddenTools])
+      .then(([on, configured]) => {
         if (currentGeneration !== generation) return;
+        hiddenTools.clear();
+        for (const name of options.hiddenTools === undefined
+          ? calmHiddenTools(configured)
+          : configured)
+          hiddenTools.add(name);
         if (sessionChoice === undefined) pi.appendEntry(CALM_SESSION_ENTRY, { sessionId, on });
         state.on = on;
         return loadPresentation();
@@ -589,11 +595,6 @@ function readProperty(value: unknown, key: PropertyKey): unknown {
 function readStringProperty(value: unknown, key: PropertyKey): string | undefined {
   const property = readProperty(value, key);
   return typeof property === "string" ? property : undefined;
-}
-
-function readEnvironmentVariable(name: string): string | undefined {
-  const value = Reflect.get(process.env, name);
-  return typeof value === "string" ? value : undefined;
 }
 
 function errorMessage(error: unknown): string {

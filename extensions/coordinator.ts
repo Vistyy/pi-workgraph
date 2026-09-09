@@ -11,6 +11,7 @@ import {
   resultNotification,
 } from "../src/agent-facing.js";
 import { installCalmMode, isCoordinatorScope, updateCalmWorkers } from "../src/calm.js";
+import { loadCalmAdditionalHiddenTools } from "../src/calm-settings.js";
 import {
   HumanInputReceiptSchema,
   installCoordinatorSessionState,
@@ -127,7 +128,7 @@ export default function workgraphCoordinator(
   runtimeWorker: () => RuntimeWorkerPort = () => new HerdrCliRuntime(),
 ): void {
   if (!isCoordinatorScope(process.env)) return;
-  const calm = installCalmMode(pi);
+  const calm = installCalmMode(pi, { loadAdditionalHiddenTools: loadCalmAdditionalHiddenTools });
   let runtime: WorkstreamRuntime | undefined;
   let pending: Static<typeof InputReceipt>[] = [];
   const hostSemaphore = Semaphore.makeUnsafe(1);
