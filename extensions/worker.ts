@@ -18,6 +18,7 @@ import type {
   WorkerReportInput,
   WorkerSessionMode,
 } from "../src/types.js";
+import { loadWorkerDisabledTools } from "../src/workgraph-settings.js";
 
 const WorkerEnvironmentConfig = Config.all({
   mode: Config.string("PI_WORKGRAPH_MODE").pipe(Config.withDefault("")),
@@ -245,6 +246,14 @@ const AttemptStateSchema = Type.Object({
   switchedAt: Type.Optional(Type.String()),
   switchError: Type.Optional(Type.String()),
 });
+const WorkerToolStateSchema = Type.Object(
+  {
+    runId: Type.String(),
+    nodeId: Type.String(),
+    removed: Type.Array(Type.String({ minLength: 1, pattern: "^\\S+$" }), { maxItems: 256 }),
+  },
+  { additionalProperties: false },
+);
 
 type AttemptState = Static<typeof AttemptStateSchema>;
 
@@ -435,6 +444,8 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   let terminal = false;
   let switchError: string | undefined;
   let switchedAt: string | undefined;
+  let disabledTools = new Set<string>();
+  let workgraphRemovedTools = new Set<string>();
 
   // SAFETY: session custom data is untrusted external input and is decoded before use.
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Explicit Pi session decode boundary.
@@ -996,15 +1007,72 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     });
   }
 
-  function configureReadOnlyTools(): void {
+  function assignmentDisables(name: string): boolean {
     // Keep editing tools for implementation and authorized research experiments.
-    // This filters tool availability; bash remains available and is not sandboxed.
+    // This filters model tool availability; bash remains available and is not sandboxed.
     const readOnly = mode !== "implementation" && !(mode === "research" && experiment);
-    const activeTools = pi.getActiveTools();
-    const allowedTools = activeTools.filter(
-      (name) => name !== "herdr_rename" && !(readOnly && (name === "edit" || name === "write")),
-    );
-    if (allowedTools.length !== activeTools.length) pi.setActiveTools(allowedTools);
+    return readOnly && (name === "edit" || name === "write");
+  }
+
+  function isDisabled(name: string): boolean {
+    return disabledTools.has(name) || assignmentDisables(name);
+  }
+
+  function persistWorkerToolState(): void {
+    pi.appendEntry("pi-workgraph-worker-tools", {
+      ...generation,
+      removed: [...workgraphRemovedTools],
+    });
+  }
+
+  function restoreWorkerToolState(branch: SessionEntry[]): void {
+    workgraphRemovedTools = new Set();
+    for (const entry of [...branch].reverse()) {
+      if (entry.type !== "custom" || entry.customType !== "pi-workgraph-worker-tools") continue;
+      if (!isCurrentAttemptData(entry.data)) continue;
+      if (!Value.Check(WorkerToolStateSchema, entry.data)) return;
+      workgraphRemovedTools = new Set(Value.Decode(WorkerToolStateSchema, entry.data).removed);
+      return;
+    }
+  }
+
+  function restoreEligibleWorkerTools(
+    active: readonly string[],
+    registered: ReadonlySet<string>,
+  ): string[] {
+    const next = [...active];
+    for (const name of workgraphRemovedTools) {
+      if (isDisabled(name) || !registered.has(name) || next.includes(name)) continue;
+      next.push(name);
+    }
+    return next;
+  }
+
+  function removedWorkerTools(active: readonly string[]): Set<string> {
+    const retained = new Set(workgraphRemovedTools);
+    for (const name of active) {
+      if (isDisabled(name)) retained.add(name);
+      else retained.delete(name);
+    }
+    return retained;
+  }
+
+  function sameToolNames(left: readonly string[], right: readonly string[]): boolean {
+    return left.length === right.length && left.every((name, index) => name === right[index]);
+  }
+
+  function reconcileWorkerTools(): void {
+    const registered = new Set(pi.getAllTools().map((tool) => tool.name));
+    const active = pi.getActiveTools();
+    // Only entries we recorded as removed may be restored. Existing inactive tools
+    // retain their owner's state across reloads and dynamic tool registration.
+    const restored = restoreEligibleWorkerTools(active, registered);
+    const retained = removedWorkerTools(restored);
+    const allowed = restored.filter((name) => !isDisabled(name));
+    const ownershipChanged = !sameToolNames([...retained], [...workgraphRemovedTools]);
+    workgraphRemovedTools = retained;
+    if (!sameToolNames(allowed, active)) pi.setActiveTools(allowed);
+    if (ownershipChanged) persistWorkerToolState();
   }
 
   function restoreWorkerSession(branch: SessionEntry[]): void {
@@ -1030,11 +1098,34 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         : undefined;
   }
 
-  pi.on("session_start", (_event, ctx) => {
-    configureReadOnlyTools();
-    appendModelPreflight(ctx);
-    restoreWorkerSession(ctx.sessionManager.getBranch());
+  pi.on("session_start", (_event, ctx) =>
+    loadWorkerDisabledTools()
+      .catch(() => {
+        ctx.ui.notify(
+          "Could not load worker tool settings; configured tools remain available.",
+          "warning",
+        );
+        return [];
+      })
+      .then((configuredTools) => {
+        disabledTools = new Set(configuredTools);
+        restoreWorkerToolState(ctx.sessionManager.getBranch());
+        reconcileWorkerTools();
+        appendModelPreflight(ctx);
+        restoreWorkerSession(ctx.sessionManager.getBranch());
+      }),
+  );
+  pi.on("tool_call", (event) => {
+    if (!isDisabled(event.toolName)) return;
+    return {
+      block: true,
+      reason: `Tool ${event.toolName} is unavailable to this Workgraph worker.`,
+    };
   });
+  // A tool may register or activate another tool while executing. turn_end is
+  // the last extension boundary before AgentSession snapshots tools for the
+  // next provider request; tool_call above remains the race backstop.
+  pi.on("turn_end", () => reconcileWorkerTools());
   pi.on("agent_start", (_event, ctx) => {
     if (ctx.model)
       pi.appendEntry("pi-workgraph-effective-model", {
@@ -1097,6 +1188,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     appendRecoverySnapshot(pi, ctx.sessionManager);
   });
   pi.on("before_agent_start", (_event, ctx) => {
+    reconcileWorkerTools();
     if (mode === "implementation") {
       const message = recoverySnapshot(ctx.sessionManager);
       return message === undefined ? undefined : { message };

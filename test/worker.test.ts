@@ -5,9 +5,14 @@ import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths identify real repository and session resources.
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionActions, SessionManager } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionActions,
+  InlineExtension,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import workgraphWorker from "../extensions/worker.js";
 import {
   configureFixtureEnvironment,
   decodeTestValue,
@@ -105,6 +110,7 @@ async function fixture(
   continued = false,
   actions: Partial<ExtensionActions> = {},
   experiment = false,
+  extensionFactories: InlineExtension[] = [],
 ) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
   const root = join(parent, "repo");
@@ -116,6 +122,7 @@ async function fixture(
   await git(root, "add", ".");
   await git(root, "commit", "-m", "Fixture");
   const previous = configureFixtureEnvironment({
+    PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_MODE: mode,
     PI_WORKGRAPH_RUN_ID: "fixture",
     PI_WORKGRAPH_NODE_ID: "attempt",
@@ -126,13 +133,19 @@ async function fixture(
     PI_WORKGRAPH_EXPERIMENT: experiment ? "1" : null,
   });
   let activeTools = ["read", "bash", "edit", "write"];
-  const pi = await extensionFixture("worker", root, parent, {
-    getActiveTools: () => [...activeTools],
-    setActiveTools: (toolNames) => {
-      activeTools = [...toolNames];
+  const pi = await extensionFixture(
+    "worker",
+    root,
+    parent,
+    {
+      getActiveTools: () => [...activeTools],
+      setActiveTools: (toolNames) => {
+        activeTools = [...toolNames];
+      },
+      ...actions,
     },
-    ...actions,
-  });
+    extensionFactories.length === 0 ? [] : [workgraphWorker, ...extensionFactories],
+  );
   return {
     ...pi,
     root,
@@ -1265,8 +1278,8 @@ void test("worker tool availability follows assignment permissions across reload
       experiment,
     );
     const expected = canEdit
-      ? ["read", "bash", "edit", "write", "custom_lookup"]
-      : ["read", "bash", "custom_lookup"];
+      ? ["read", "bash", "edit", "write", "herdr_rename", "custom_lookup"]
+      : ["read", "bash", "herdr_rename", "custom_lookup"];
     try {
       await f.runner.emit({ type: "session_start", reason: "startup" });
       assert.deepEqual(activeTools, expected);
@@ -1277,6 +1290,126 @@ void test("worker tool availability follows assignment permissions across reload
     } finally {
       await f.dispose();
     }
+  }
+});
+
+void test("worker denylist restores only Workgraph-owned eligible tools after reload", async () => {
+  let activeTools = ["read", "bash"];
+  const companion: InlineExtension = {
+    name: "denied-extension-tool",
+    factory(pi) {
+      pi.registerTool({
+        name: "extension_denied",
+        label: "Extension denied",
+        description: "Fixture extension tool",
+        parameters: Type.Object({}),
+        async execute() {
+          return { content: [{ type: "text", text: "unexpected" }], details: {} };
+        },
+      });
+      pi.registerTool({
+        name: "unrelated_inactive",
+        label: "Unrelated inactive",
+        description: "Fixture inactive extension tool",
+        parameters: Type.Object({}),
+        async execute() {
+          return { content: [{ type: "text", text: "unexpected" }], details: {} };
+        },
+      });
+      pi.on("session_start", () =>
+        pi.setActiveTools([...new Set([...pi.getActiveTools(), "extension_denied"])]),
+      );
+    },
+  };
+  const f = await fixture(
+    "implementation",
+    false,
+    {
+      getActiveTools: () => [...activeTools],
+      setActiveTools: (toolNames) => {
+        activeTools = [...toolNames];
+      },
+    },
+    false,
+    [companion],
+  );
+  try {
+    await mkdir(join(f.root, "..", "agent"), { recursive: true });
+    const settings = join(f.root, "..", "agent", "settings.json");
+    await writeFile(
+      settings,
+      JSON.stringify({
+        "pi-workgraph": { worker: { disabledTools: ["read", "extension_denied"] } },
+      }),
+    );
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    await f.runner.emitBeforeAgentStart("fixture", undefined, "Fixture", { cwd: f.root });
+    assert.deepEqual(activeTools, ["bash"]);
+
+    await writeFile(settings, JSON.stringify({ "pi-workgraph": { worker: {} } }));
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    assert.deepEqual(activeTools, ["bash", "read", "extension_denied"]);
+    assert.ok(!activeTools.includes("unrelated_inactive"));
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("invalid worker settings restore only owned tools while read-only assignment restrictions remain", async () => {
+  let activeTools = ["read", "bash", "edit", "write"];
+  const f = await fixture("review", false, {
+    getActiveTools: () => [...activeTools],
+    setActiveTools: (toolNames) => {
+      activeTools = [...toolNames];
+    },
+  });
+  try {
+    await mkdir(join(f.root, "..", "agent"), { recursive: true });
+    const settings = join(f.root, "..", "agent", "settings.json");
+    await writeFile(
+      settings,
+      JSON.stringify({ "pi-workgraph": { worker: { disabledTools: ["read"] } } }),
+    );
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    assert.deepEqual(activeTools, ["bash"]);
+
+    await writeFile(
+      settings,
+      JSON.stringify({ "pi-workgraph": { worker: { disabledTools: [" "] } } }),
+    );
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    assert.deepEqual(activeTools, ["bash", "read"]);
+    assert.deepEqual(f.notifications, [
+      {
+        message: "Could not load worker tool settings; configured tools remain available.",
+        type: "warning",
+      },
+    ]);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("worker blocks a denylisted call if a stale tool exposure races filtering", async () => {
+  const f = await fixture("implementation");
+  try {
+    await mkdir(join(f.root, "..", "agent"), { recursive: true });
+    await writeFile(
+      join(f.root, "..", "agent", "settings.json"),
+      JSON.stringify({ "pi-workgraph": { worker: { disabledTools: ["read"] } } }),
+    );
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    assert.deepEqual(
+      await f.runner.emitToolCall({
+        type: "tool_call",
+        toolName: "read",
+        toolCallId: "stale-read",
+        input: { path: "value.txt" },
+      }),
+      { block: true, reason: "Tool read is unavailable to this Workgraph worker." },
+    );
+  } finally {
+    await f.dispose();
   }
 });
 

@@ -9,10 +9,12 @@ import { clearTimeout, setTimeout as setTimer } from "node:timers";
 import {
   createAgentSession,
   DefaultResourceLoader,
+  type InlineExtension,
   ModelRuntime,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import {
   type ControlledRequest,
   startControlledProvider,
@@ -356,6 +358,170 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
     await agent?.abort();
     agent?.dispose();
     await provider.close();
+    restoreFixtureEnvironment(f.previous);
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("real Pi worker excludes configured built-in and extension tools before initial and dynamic follow-up requests", async () => {
+  const f = await fixture();
+  const previous = configureFixtureEnvironment({
+    PI_CODING_AGENT_DIR: join(f.parent, "agent"),
+    PI_WORKGRAPH_BASE_COMMIT: f.base,
+    PI_WORKGRAPH_EXECUTOR_MODEL: "fixture/executor",
+    PI_WORKGRAPH_EXECUTOR_THINKING: "off",
+    PI_WORKGRAPH_IMPLEMENTATION_START: null,
+    PI_WORKGRAPH_MODE: "research",
+    PI_WORKGRAPH_NODE_ID: "attempt",
+    PI_WORKGRAPH_RUN_ID: "fixture",
+  });
+  await mkdir(join(f.parent, "agent"), { recursive: true });
+  await writeFile(
+    join(f.parent, "agent", "settings.json"),
+    JSON.stringify({
+      "pi-workgraph": {
+        worker: { disabledTools: ["read", "session_denied", "dynamic_denied"] },
+      },
+    }),
+  );
+  const companion: InlineExtension = {
+    name: "worker-denylist-companion",
+    factory(pi) {
+      pi.registerTool({
+        name: "activate_dynamic",
+        label: "Activate dynamic",
+        description: "Register a denied tool during execution.",
+        parameters: Type.Object({}),
+        async execute() {
+          pi.registerTool({
+            name: "dynamic_denied",
+            label: "Dynamic denied",
+            description: "Must not reach another provider request.",
+            parameters: Type.Object({}),
+            async execute() {
+              return { content: [{ type: "text", text: "forbidden" }], details: {} };
+            },
+          });
+          pi.setActiveTools([...new Set([...pi.getActiveTools(), "dynamic_denied"])]);
+          return { content: [{ type: "text", text: "Dynamic tool registered." }], details: {} };
+        },
+      });
+      pi.on("session_start", () => {
+        pi.registerTool({
+          name: "session_denied",
+          label: "Session denied",
+          description: "Registered after the worker session_start handler.",
+          parameters: Type.Object({}),
+          async execute() {
+            return { content: [{ type: "text", text: "forbidden" }], details: {} };
+          },
+        });
+      });
+    },
+  };
+  const provider = await startControlledProvider([
+    (request) => {
+      const schemas = JSON.stringify(request.tools);
+      assert.doesNotMatch(schemas, /"read"/);
+      assert.doesNotMatch(schemas, /"session_denied"/);
+      assert.doesNotMatch(schemas, /"dynamic_denied"/);
+      assert.match(schemas, /"activate_dynamic"/);
+      return { tool: { id: "activate", name: "activate_dynamic", arguments: {} } };
+    },
+    (request) => {
+      const schemas = JSON.stringify(request.tools);
+      assert.doesNotMatch(schemas, /"read"/);
+      assert.doesNotMatch(schemas, /"session_denied"/);
+      assert.doesNotMatch(schemas, /"dynamic_denied"/);
+      return {
+        tool: {
+          id: "report",
+          name: "workgraph_report",
+          arguments: {
+            kind: "research",
+            status: "completed",
+            summary: "Configured worker tools stayed unavailable.",
+            evidence: [],
+            findings: [],
+          },
+        },
+      };
+    },
+  ]);
+  let agent: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
+  try {
+    const runtime = await ModelRuntime.create({
+      authPath: join(f.parent, "auth.json"),
+      modelsPath: null,
+      modelsStorePath: join(f.parent, "models.json"),
+      refreshOnCreate: false,
+      allowModelNetwork: false,
+    });
+    runtime.registerProvider("fixture", {
+      name: "Loopback fixture",
+      api: "openai-completions",
+      apiKey: "fixture-only",
+      baseUrl: provider.baseUrl,
+      models: [modelConfig("worker")],
+    });
+    const settings = SettingsManager.inMemory({
+      compaction: { enabled: false },
+      retry: { enabled: false },
+    });
+    const session = SessionManager.create(f.root, join(f.parent, "worker-denylist-sessions"));
+    const loader = new DefaultResourceLoader({
+      cwd: f.root,
+      agentDir: join(f.parent, "agent"),
+      settingsManager: settings,
+      additionalExtensionPaths: [resolve("extensions/worker.ts")],
+      extensionFactories: [companion],
+      noContextFiles: true,
+      noPromptTemplates: true,
+      noSkills: true,
+      noThemes: true,
+      systemPrompt: "Controlled worker denylist integration.",
+    });
+    await loader.reload();
+    const model = runtime.getModel("fixture", "worker");
+    assert.ok(model);
+    const created = await createAgentSession({
+      cwd: f.root,
+      agentDir: join(f.parent, "agent"),
+      modelRuntime: runtime,
+      model,
+      thinkingLevel: "off",
+      tools: [
+        "read",
+        "bash",
+        "activate_dynamic",
+        "session_denied",
+        "dynamic_denied",
+        "workgraph_report",
+      ],
+      resourceLoader: loader,
+      sessionManager: session,
+      settingsManager: settings,
+    });
+    agent = created.session;
+    await agent.bindExtensions({});
+    await promptWithDeadline(agent, "Exercise the worker denylist.");
+    provider.assertComplete();
+    assert.equal(provider.requests.length, 2);
+    assert.ok(
+      session
+        .getBranch()
+        .some(
+          (entry) =>
+            entry.type === "custom" &&
+            entry.customType === "pi-workgraph-worker-tools" &&
+            JSON.stringify(entry.data).includes("dynamic_denied"),
+        ),
+    );
+  } finally {
+    await agent?.abort();
+    agent?.dispose();
+    await provider.close();
+    restoreFixtureEnvironment(previous);
     restoreFixtureEnvironment(f.previous);
     await rm(f.parent, { recursive: true, force: true });
   }

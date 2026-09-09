@@ -34,7 +34,7 @@ Tool descriptions explain arguments and restrictions. For delegation and quality
 
 **Less visual noise:** `/calm` hides thinking/reasoning and operational rows while keeping assistant answers and an ephemeral current-activity whisper plus the compact Workgraph indicator visible. The whisper reports typed coordinator activity, temporarily hides its detail while a blocking UI prompt is open, and resumes the same activity afterward; it never enters execution or model context. `/calm default on` saves the preference for new sessions.
 
-Workgraph hides Pi's built-in tools and its own tools by default. Add tools owned by other installed extensions through the Workgraph namespace in global Pi settings (`~/.pi/agent/settings.json`):
+Calm hides Pi's built-in tools and Workgraph's own operational rows only in coordinator presentation. Add tools owned by other installed extensions to Calm's visual hiding through the Workgraph namespace in global Pi settings (`~/.pi/agent/settings.json`):
 
 ```json
 {
@@ -46,7 +46,21 @@ Workgraph hides Pi's built-in tools and its own tools by default. Add tools owne
 }
 ```
 
-The additions are merged with Workgraph's defaults and loaded when a session starts, including after `/reload`.
+Those additions are merged with Calm's presentation defaults and loaded when a coordinator session starts, including after `/reload`.
+
+To remove tools from every Workgraph worker's **model tool availability** (without preventing extensions, hooks, commands, skills, or context from loading), configure the global worker denylist in that same file:
+
+```json
+{
+  "pi-workgraph": {
+    "worker": {
+      "disabledTools": ["rename_resource"]
+    }
+  }
+}
+```
+
+Worker entries must be non-whitespace tool names. The list is deduplicated and reapplied on worker startup and `/reload`; it covers built-in and extension-provided tools, independently of Calm's coordinator-only visual hiding.
 
 **Models:** ask the coordinator to inspect or change defaults with `workgraph_models`. Research/review use `selection` for replication, diversity, and overrides; consultation uses the ordered advisor policy and may receive one complete exact advisor override; implementation uses `models.guide` and `models.executor` overrides. Omitted model/thinking components use role defaults. Per-assignment choices do not change saved policy.
 

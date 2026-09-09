@@ -142,6 +142,30 @@ export async function extensionFixture(
         messages.push(message);
       },
       getThinkingLevel: () => level,
+      getAllTools: () => [
+        ...["read", "bash", "edit", "write"].map((name) => ({
+          name,
+          description: "Fixture built-in tool",
+          parameters: Type.Object({}),
+          sourceInfo: {
+            path: `<builtin:${name}>`,
+            source: "builtin",
+            scope: "temporary" as const,
+            origin: "top-level" as const,
+          },
+        })),
+        ...runner.getAllRegisteredTools().map(({ definition, sourceInfo }) => {
+          const info: ReturnType<ExtensionActions["getAllTools"]>[number] = {
+            name: definition.name,
+            description: definition.description,
+            parameters: definition.parameters,
+            sourceInfo,
+          };
+          if (definition.promptGuidelines !== undefined)
+            info.promptGuidelines = definition.promptGuidelines;
+          return info;
+        }),
+      ],
       setThinkingLevel: (next) => {
         level = next;
       },

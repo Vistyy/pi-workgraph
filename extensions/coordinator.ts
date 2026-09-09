@@ -11,7 +11,6 @@ import {
   resultNotification,
 } from "../src/agent-facing.js";
 import { installCalmMode, isCoordinatorScope, updateCalmWorkers } from "../src/calm.js";
-import { loadCalmAdditionalHiddenTools } from "../src/calm-settings.js";
 import {
   HumanInputReceiptSchema,
   installCoordinatorSessionState,
@@ -34,6 +33,7 @@ import {
 import { liveLayer } from "../src/node-platform.js";
 import { forkConversationSessionEffect } from "../src/pi-process.js";
 import { EvidenceSchema } from "../src/report-schema.js";
+import { loadCalmAdditionalHiddenTools } from "../src/workgraph-settings.js";
 import {
   type SessionIdentity,
   type WorkstreamState,
