@@ -59,9 +59,9 @@ import {
   WorkstreamStateSchema,
 } from "./workstream-state.js";
 import {
-  cleanupHasReleasableOutput,
   deriveCompletionAccounting,
   hasActiveOrUncleanAttempt,
+  outputDisposition,
   recordInputTransition,
   startAttemptTransition,
 } from "./workstream-transitions.js";
@@ -841,18 +841,16 @@ export class WorkstreamStoreEffects {
       (attempt, draft) => {
         requireText(input.reason, "Retained-output release reason");
         const assignment = requireAssignment(draft, attempt.assignmentId);
+        if (attempt.outputRelease?.state === "completed") return;
         const result =
           attempt.resultId === undefined
             ? undefined
             : draft.results.find((candidate) => candidate.id === attempt.resultId);
-        if (
-          !["settled", "failed", "cancelled"].includes(attempt.state) ||
-          !cleanupHasReleasableOutput(assignment, attempt, result)
-        )
+        const disposition = outputDisposition(assignment, attempt, result);
+        if (disposition.release !== "ready")
           throw new Error(
             "Retained-output release requires a closed owned isolated attempt with releasable output.",
           );
-        if (attempt.outputRelease?.state === "completed") return;
         if (
           attempt.outputRelease !== undefined &&
           attempt.outputRelease.expectedHead !== input.expectedHead

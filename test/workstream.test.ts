@@ -413,6 +413,45 @@ function appliedCandidateState(
   return result;
 }
 
+void test("completion remains blocked by pending or blocked application after output release", async () => {
+  for (const applicationState of ["pending", "blocked"] as const) {
+    const f = await candidateAccountingFixture();
+    try {
+      await runStore(
+        f.store.beginApplication({
+          id: f.correctionAttemptId,
+          commit: f.correctionCommit,
+          expectedHead: f.firstCommit,
+        }),
+      );
+      if (applicationState === "blocked")
+        await runStore(f.store.blockApplication(f.correctionAttemptId, "Application is blocked."));
+      await runStore(
+        f.store.beginOutputRelease({
+          id: f.correctionAttemptId,
+          expectedHead: f.correctionCommit,
+          reason: "Release the completed output.",
+        }),
+      );
+      await runStore(f.store.finishOutputRelease(f.correctionAttemptId));
+      const released = await runStore(f.store.load());
+      assert.equal(released.attempts[1]?.outputRelease?.state, "completed");
+      await assert.rejects(
+        runStore(
+          f.store.complete({
+            conclusion: "The candidate output is accounted for.",
+            evidence: [{ label: "Application", observation: "Application remains unresolved." }],
+            limitations: [],
+          }),
+        ),
+        /workers and owned resources have settled and cleaned up/,
+      );
+    } finally {
+      await rm(f.parent, { recursive: true, force: true });
+    }
+  }
+});
+
 void test("completion accounting resolves only exact applied candidate ancestors", async () => {
   const f = await candidateAccountingFixture();
   try {
@@ -1127,6 +1166,13 @@ void test("current-format retained physical experiment artifacts remain decodabl
       }),
     );
     await runStore(store.finishOutputRelease("historical-experiment-attempt"));
+    await runStore(
+      store.beginOutputRelease({
+        id: "historical-experiment-attempt",
+        expectedHead: "c".repeat(40),
+        reason: "Repeat the completed release safely.",
+      }),
+    );
     const completed = await runStore(
       store.complete({
         conclusion: "Historical experiment evidence is complete after exact output release.",
@@ -1220,17 +1266,42 @@ void test("branch-only retained output does not block semantic completion", asyn
       store.beginCleanup({ id: "branch-only-experiment-attempt", expectedHead: outputHead }),
     );
     await runStore(store.markWorkerClosed("branch-only-experiment-attempt"));
-    await runStore(
-      store.addResultArtifacts("branch-only-experiment-result", [
-        {
-          id: "retained-output-branch",
-          kind: "reference",
-          reference: branch,
-          retention: "retained",
-          summary: "The exact useful experiment branch is retained.",
-        },
-      ]),
+    const pending = await runStore(store.load());
+    await assert.rejects(
+      runStore(
+        store.beginOutputRelease({
+          id: "branch-only-experiment-attempt",
+          expectedHead: outputHead,
+          reason: "Do not release while cleanup is pending.",
+        }),
+      ),
+      /closed owned isolated attempt with releasable output/,
     );
+    const validRaw = await runStore(WorkstreamStoreEffects.readRaw(store.path));
+    const invalidPendingRelease = structuredClone(pending);
+    const invalidAttempt = requiredValue(
+      invalidPendingRelease.attempts[0],
+      "invalid pending release attempt",
+    );
+    invalidAttempt.outputRelease = {
+      state: "pending",
+      expectedHead: outputHead,
+      reason: "Invalid persisted pending release.",
+    };
+    SqliteWorkstreamDatabase.use(store.path, (database) => {
+      database.db
+        .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
+        .run(JSON.stringify(invalidPendingRelease));
+    });
+    await assert.rejects(
+      runStore(WorkstreamStoreEffects.inspect(store.path)),
+      /outside closed owned isolated output/,
+    );
+    SqliteWorkstreamDatabase.use(store.path, (database) => {
+      database.db
+        .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
+        .run(validRaw);
+    });
     await runStore(store.finishCleanup("branch-only-experiment-attempt"));
     const completed = await runStore(
       store.complete({

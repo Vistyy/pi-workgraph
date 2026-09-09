@@ -23,10 +23,8 @@ import {
 } from "./workstream-state.js";
 import {
   accountingIdentity,
-  cleanupCanRemoveOutput,
-  cleanupHasReleasableOutput,
-  cleanupRetainsOutput,
   deriveCompletionAccounting,
+  outputDisposition,
 } from "./workstream-transitions.js";
 
 type JsonPrimitive = string | number | boolean | null;
@@ -496,10 +494,13 @@ function validateCleanupDisposition(state: WorkstreamState, attempt: WorkAttempt
     attempt.resultId === undefined
       ? undefined
       : state.results.find((item) => item.id === attempt.resultId);
+  const disposition = outputDisposition(assignment, attempt, result);
+  if (disposition.kind === "preserve_checkout" && disposition.source !== "historical")
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} completed isolated cleanup without a successful clean output disposition.`,
+    );
   if (
-    assignment === undefined ||
-    (!cleanupRetainsOutput(assignment, attempt, result) &&
-      !cleanupCanRemoveOutput(assignment, attempt, result))
+    !["remove_checkout_and_branch", "retain_branch", "preserve_checkout"].includes(disposition.kind)
   )
     throw new InvalidWorkstreamStateError(
       `Attempt ${attempt.id} completed isolated cleanup without a successful clean output disposition.`,
@@ -515,31 +516,15 @@ function validateOutputRelease(state: WorkstreamState, attempt: WorkAttempt): vo
       ? undefined
       : state.results.find((candidate) => candidate.id === attempt.resultId);
   if (release.state === "completed") {
-    if (release.error !== undefined)
-      throw new InvalidWorkstreamStateError(
-        `Attempt ${attempt.id} completed retained-output release has an error.`,
-      );
-    const cleanup = attempt.cleanup;
-    if (
-      assignment === undefined ||
-      !["settled", "failed", "cancelled"].includes(attempt.state) ||
-      attempt.placement?.kind !== "isolated_worktree" ||
-      cleanup === undefined ||
-      !["blocked", "completed"].includes(cleanup.state) ||
-      cleanup.workerClosed !== true ||
-      cleanup.expectedHead === undefined ||
-      cleanup.expectedHead !== release.expectedHead
-    )
+    const disposition = outputDisposition(assignment, attempt, result);
+    if (disposition.release !== "completed")
       throw new InvalidWorkstreamStateError(
         `Attempt ${attempt.id} completed retained-output release is not an exact closed isolated checkpoint.`,
       );
     return;
   }
-  if (
-    assignment === undefined ||
-    !["settled", "failed", "cancelled"].includes(attempt.state) ||
-    !cleanupHasReleasableOutput(assignment, attempt, result)
-  )
+  const disposition = outputDisposition(assignment, attempt, result);
+  if (disposition.release !== "ready")
     throw new InvalidWorkstreamStateError(
       `Attempt ${attempt.id} retained-output release is outside closed owned isolated output.`,
     );
@@ -570,30 +555,12 @@ function validateExperimentWorktree(
     throw new InvalidWorkstreamStateError(
       `Experiment ${assignment.id} has no exact isolated output placement.`,
     );
-  const artifact = result.artifacts.length === 1 ? result.artifacts[0] : undefined;
-  const legacyWorktreeArtifact =
-    artifact?.id === "retained-output-worktree" &&
-    artifact.kind === "path" &&
-    artifact.reference === attempt.placement.path &&
-    artifact.retention === "retained";
-  if (legacyWorktreeArtifact) return;
-
-  const branchArtifact =
-    artifact?.id === "retained-output-branch" &&
-    artifact.kind === "reference" &&
-    artifact.reference === attempt.placement.branch &&
-    artifact.retention === "retained";
+  const disposition = outputDisposition(assignment, attempt, result);
+  if (disposition.kind === "preserve_checkout" && disposition.source === "historical") return;
   if (attempt.cleanup?.state !== "completed") return;
-  if (cleanupRetainsOutput(assignment, attempt, result)) {
-    if (!branchArtifact)
-      throw new InvalidWorkstreamStateError(
-        `Experiment ${assignment.id} must retain its exact advanced output branch.`,
-      );
-    return;
-  }
-  if (branchArtifact)
+  if (disposition.kind === "preserve_checkout")
     throw new InvalidWorkstreamStateError(
-      `Experiment ${assignment.id} at its base must not retain an output branch.`,
+      `Experiment ${assignment.id} has an unproven isolated output disposition.`,
     );
 }
 

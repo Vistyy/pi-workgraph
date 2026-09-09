@@ -904,10 +904,7 @@ await test("disposable experiments remove zero-commit output and retain advanced
       ),
       "2",
     );
-    assert.deepEqual(
-      state.results[1]?.artifacts.map((artifact) => artifact.reference),
-      [placement.branch],
-    );
+    assert.deepEqual(state.results[1]?.artifacts, []);
     assert.equal(await git(f.root, "rev-parse", "HEAD"), destinationHead);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), destinationBytes);
     await runRuntime(
@@ -917,6 +914,59 @@ await test("disposable experiments remove zero-commit output and retain advanced
     assert.equal(state.attempts[1]?.cleanup?.state, "completed");
     assert.equal(state.attempts[1]?.outputRelease?.state, "completed");
     assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("blocked dirty successful exact review output releases, finishes cleanup, and retries idempotently", async () => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const revision = await runRuntime(f.repository.head());
+    f.workers.onWork = async (request) => {
+      await writeFile(join(request.cwd, "unreported.txt"), "dirty\n");
+      return {
+        kind: "review",
+        status: "completed",
+        summary: "Reviewed the exact fixture revision.",
+        evidence: [{ label: "fixture", observation: "The revision was inspected." }],
+        findings: [],
+      };
+    };
+    await runRuntime(
+      active.effects.queue({
+        id: "dirty-review",
+        capability: "review",
+        artifactIntent: "evidence_only",
+        objective: "Review the fixture revision",
+        intentVersion: 0,
+        subject: { kind: "revision", revision },
+        concern: "The review output must remain inspectable.",
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(active.effects.reconcile);
+    const attempt = required(state.attempts[0], "dirty review attempt");
+    const placement = required(attempt.placement, "dirty review placement");
+    if (placement.kind !== "isolated_worktree")
+      throw new Error("Dirty review output did not use an isolated placement.");
+    assert.equal(state.results[0]?.validity, "typed");
+    assert.equal(attempt.cleanup?.state, "blocked");
+    assert.equal(attempt.cleanup?.workerClosed, true);
+    await runRuntime(active.effects.releaseOutput(attempt.id, "Release dirty read-only output."));
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      false,
+    );
+    assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
+    await runRuntime(active.effects.releaseOutput(attempt.id, "Retry dirty read-only release."));
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
   } finally {
     await f.dispose();
   }

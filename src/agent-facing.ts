@@ -1,6 +1,6 @@
 import { candidateLineageForAttempt } from "./candidate.js";
 import type { WorkAssignment, WorkAttempt, WorkResult, WorkstreamState } from "./workstream.js";
-import { cleanupHasReleasableOutput } from "./workstream-transitions.js";
+import { outputDisposition } from "./workstream-transitions.js";
 
 const DEFAULT_CHARS = 3_000;
 const MAX_CHARS = 8_000;
@@ -402,35 +402,43 @@ function successfulChangedImplementation(result: WorkResult | undefined): boolea
   );
 }
 
-function outputDisposition(
+function retainedOutputProjection(
   task: WorkAssignment,
   attempt: WorkAttempt | undefined,
   result: WorkResult | undefined,
 ) {
-  const placement = attempt?.placement;
-  if (attempt === undefined || placement?.kind !== "isolated_worktree")
+  if (attempt === undefined) return { state: "not_applicable" as const };
+  const disposition = outputDisposition(task, attempt, result);
+  if (
+    disposition.kind === "not_applicable" ||
+    (disposition.kind === "remove_checkout_and_branch" && disposition.checkout === "removed")
+  )
     return { state: "not_applicable" as const };
+  const placement = attempt.placement;
+  if (placement?.kind !== "isolated_worktree") return { state: "not_applicable" as const };
   const release = attempt.outputRelease;
-  if (release?.state === "completed")
+  if (disposition.kind === "released")
     return {
       state: "released" as const,
       branch: placement.branch,
       checkout: "removed" as const,
-      releaseState: release.state,
+      releaseState: release?.state,
     };
-  if (attempt.cleanup?.state === "completed" && !cleanupHasReleasableOutput(task, attempt, result))
-    return { state: "not_applicable" as const };
-  const legacyPhysicalOutput =
-    result?.artifacts.some((artifact) => artifact.id === "retained-output-worktree") === true;
-  const compacted = attempt.cleanup?.state === "completed" && !legacyPhysicalOutput;
   const output: RetainedOutputProjection = {
     state: "retained",
     branch: placement.branch,
-    checkout: compacted ? "removed" : "preserved_or_uncertain",
+    checkout:
+      disposition.kind === "preserve_checkout" ? "preserved_or_uncertain" : disposition.checkout,
     releaseState: release?.state,
-    blocker: release?.error === undefined ? undefined : compactText(release.error, 280),
+    blocker:
+      release?.error === undefined
+        ? disposition.kind === "preserve_checkout"
+          ? compactText(disposition.reason, 280)
+          : undefined
+        : compactText(release.error, 280),
   };
-  if (!compacted) output.path = placement.path;
+  if (disposition.kind === "preserve_checkout" || disposition.checkout === "preserved_or_uncertain")
+    output.path = placement.path;
   return output;
 }
 
@@ -464,7 +472,7 @@ function settlement(state: WorkstreamState, result: WorkResult) {
     blockers,
     blockerCount,
     application: applicationProjection(attempt, result),
-    retainedOutput: outputDisposition(task, attempt, result),
+    retainedOutput: retainedOutputProjection(task, attempt, result),
     cleanup: cleanupProjection(attempt),
     delivery: deliveryPreview(state, result),
     recovery:
@@ -874,7 +882,7 @@ function recoveryView(
       nativeOrGitStateFromTerminalStateAlone: false,
       application: recordedApplication(attempt),
       candidate: candidateProjection(attempt),
-      retainedOutput: outputDisposition(
+      retainedOutput: retainedOutputProjection(
         task,
         attempt,
         attempt.resultId === undefined ? undefined : resultById(state, attempt.resultId),
@@ -897,12 +905,8 @@ function recoveryView(
 
 function retainedOutputActions(state: WorkstreamState, task: WorkAssignment, attempt: WorkAttempt) {
   const result = attempt.resultId === undefined ? undefined : resultById(state, attempt.resultId);
-  if (
-    outputDisposition(task, attempt, result).state !== "retained" ||
-    !["blocked", "completed"].includes(attempt.cleanup?.state ?? "") ||
-    attempt.cleanup?.workerClosed !== true
-  )
-    return [];
+  const disposition = outputDisposition(task, attempt, result);
+  if (disposition.release !== "ready") return [];
   const actions = [
     {
       tool: "workgraph_control" as const,

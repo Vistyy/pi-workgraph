@@ -81,12 +81,7 @@ import {
   runtimePi,
 } from "./workstream-runtime-services.js";
 import { WorkstreamStoreOperationError } from "./workstream-state.js";
-import {
-  cleanupCanRemoveOutput,
-  cleanupHasReleasableOutput,
-  cleanupMustPreserveOutput,
-  cleanupRetainsOutput,
-} from "./workstream-transitions.js";
+import { outputDisposition } from "./workstream-transitions.js";
 
 export interface WorkstreamLaunch {
   workspaceId: string;
@@ -642,7 +637,7 @@ export class WorkstreamRuntime {
     state: WorkstreamState,
     item: WorkAttempt,
   ): RuntimeEffect<boolean> {
-    if (hasCompletedReleaseCleanupBoundary(item))
+    if (hasCompletedReleaseCleanupBoundary(state, item))
       return this.storeEffect((store) => store.finishCleanup(item.id)).pipe(Effect.as(true));
     if (item.state === "cancel_requested" && item.cleanup?.state === "completed")
       return this.storeEffect((store) => store.finishCleanup(item.id)).pipe(Effect.as(true));
@@ -1085,28 +1080,8 @@ export class WorkstreamRuntime {
         Effect.catch((error) => this.retainFailedNoChange(attempt, base, error)),
         Effect.asVoid,
       );
-    const placement = attempt.placement;
-    const retainsOutput =
-      placement?.kind === "isolated_worktree" &&
-      attempt.state !== "cancelled" &&
-      report.status === "completed" &&
-      assignment.capability === "implement" &&
-      report.kind === "implementation" &&
-      report.outcome === "changed";
-    const artifacts =
-      retainsOutput && placement !== undefined
-        ? [
-            {
-              id: "retained-output-branch",
-              kind: "reference" as const,
-              reference: placement.branch,
-              retention: "retained" as const,
-              summary: "Owned output branch retained after its isolated checkout was compacted.",
-            },
-          ]
-        : [];
     return this.storeEffect((store) =>
-      store.retainResult({ ...base, validity: "typed", report, artifacts }),
+      store.retainResult({ ...base, validity: "typed", report, artifacts: [] }),
     ).pipe(Effect.asVoid);
   }
 
@@ -1348,46 +1323,11 @@ export class WorkstreamRuntime {
         }
         yield* this.ownershipEffect();
         yield* this.cleanupPlacement(state, attempt, cleanup, assignment);
-        yield* this.recordExperimentOutputBranch(attempt.id, assignment);
         yield* this.storeEffect((store) => store.finishCleanup(attempt.id));
       }.bind(this),
     );
   }
 
-  private recordExperimentOutputBranch(
-    attemptId: string,
-    assignment: WorkAssignment,
-  ): RuntimeEffect<void> {
-    if (assignment.artifactIntent !== "disposable_experiment") return Effect.void;
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const state = yield* this.storeEffect((store) => store.load());
-        const attempt = findAttempt(state, attemptId);
-        const result =
-          attempt.resultId === undefined
-            ? undefined
-            : state.results.find((item) => item.id === attempt.resultId);
-        if (!cleanupRetainsOutput(assignment, attempt, result)) return;
-        const placement = attempt.placement;
-        if (placement?.kind !== "isolated_worktree")
-          return yield* this.runtimeSync("validate experiment output placement", () => {
-            throw new Error("Experiment output has no isolated branch identity.");
-          });
-        yield* this.storeEffect((store) =>
-          store.addResultArtifacts(required(attempt.resultId, "experiment result"), [
-            {
-              id: "retained-output-branch",
-              kind: "reference",
-              reference: placement.branch,
-              retention: "retained",
-              summary:
-                "Owned experiment branch retained after its isolated checkout was compacted.",
-            },
-          ]),
-        );
-      }.bind(this),
-    );
-  }
   private cleanupPlacement(
     state: WorkstreamState,
     attempt: WorkAttempt,
@@ -1398,32 +1338,26 @@ export class WorkstreamRuntime {
     const result = state.results.find((item) => item.id === attempt.resultId);
     const placement = placementOf(attempt);
     const expectedHead = required(cleanup.expectedHead, "expected worktree HEAD");
-    if (cleanupMustPreserveOutput(assignment, attempt, result))
+    const disposition = outputDisposition(assignment, attempt, result);
+    if (disposition.kind === "preserve_checkout")
       return this.runtimeSync("preserve isolated output", () => {
-        throw new Error(
-          "Isolated output is failed, cancelled, malformed, dirty, or uncertain; inspect it and explicitly release the exact attempt.",
-        );
+        throw new Error(disposition.reason);
       });
-    if (cleanupRetainsOutput(assignment, attempt, result)) {
+    if (disposition.kind === "retain_branch") {
       if (assignment.artifactIntent === "disposable_experiment")
         return this.repository.cleanupWorktree(placement, expectedHead, true).pipe(Effect.asVoid);
       return this.repository
         .validateCandidate(
           placement,
           required(candidateLineageForAttempt(attempt)?.rootCommit, "candidate root"),
-          result?.validity === "typed" &&
-            result.report.kind === "implementation" &&
-            result.report.status === "completed" &&
-            result.report.outcome === "changed"
-            ? required(result.report.commit, "reported candidate commit")
-            : undefined,
+          required(disposition.commit, "reported candidate commit"),
         )
         .pipe(
           Effect.andThen(this.repository.cleanupWorktree(placement, expectedHead, true)),
           Effect.asVoid,
         );
     }
-    if (cleanupCanRemoveOutput(assignment, attempt, result))
+    if (disposition.kind === "remove_checkout_and_branch")
       return this.repository
         .validateWorkerNoChange(placement, expectedHead)
         .pipe(
@@ -1431,7 +1365,7 @@ export class WorkstreamRuntime {
           Effect.asVoid,
         );
     return this.runtimeSync("preserve isolated output", () => {
-      throw new Error("Isolated output disposition is unproven; inspect it before cleanup.");
+      throw new Error("Isolated output disposition is not applicable to cleanup.");
     });
   }
 
@@ -1444,24 +1378,25 @@ export class WorkstreamRuntime {
           });
         let state = yield* this.storeEffect((store) => store.load());
         let attempt = findAttempt(state, attemptId);
+        const assignment = findAssignment(state, attempt.assignmentId);
+        const result =
+          attempt.resultId === undefined
+            ? undefined
+            : state.results.find((candidate) => candidate.id === attempt.resultId);
+        const disposition = outputDisposition(assignment, attempt, result);
         if (attempt.outputRelease?.state === "completed") {
-          if (attempt.cleanup?.state === "blocked" && attempt.cleanup.workerClosed)
+          if (disposition.release !== "completed")
+            return yield* this.runtimeSync("validate retained-output release", () => {
+              throw new Error(
+                "Completed retained-output release is not an exact closed checkpoint.",
+              );
+            });
+          if (attempt.cleanup?.state === "blocked")
             yield* this.storeEffect((store) => store.finishCleanup(attemptId));
           return yield* this.storeEffect((store) => store.load());
         }
-        const assignment = findAssignment(state, attempt.assignmentId);
         yield* this.runtimeSync("validate retained-output release", () => {
-          if (
-            !["settled", "failed", "cancelled"].includes(attempt.state) ||
-            attempt.placement?.kind !== "isolated_worktree" ||
-            !cleanupHasReleasableOutput(
-              assignment,
-              attempt,
-              attempt.resultId === undefined
-                ? undefined
-                : state.results.find((result) => result.id === attempt.resultId),
-            )
-          )
+          if (disposition.release !== "ready")
             throw new Error("Only closed output from an owned isolated attempt can be released.");
         });
         const expectedHead =
@@ -1720,11 +1655,12 @@ function validateQueueModelOptions(
     );
 }
 
-function hasCompletedReleaseCleanupBoundary(attempt: WorkAttempt): boolean {
+function hasCompletedReleaseCleanupBoundary(state: WorkstreamState, attempt: WorkAttempt): boolean {
+  const assignment = findAssignment(state, attempt.assignmentId);
+  const result = state.results.find((candidate) => candidate.id === attempt.resultId);
   return (
-    attempt.outputRelease?.state === "completed" &&
-    attempt.cleanup?.state === "blocked" &&
-    attempt.cleanup.workerClosed
+    outputDisposition(assignment, attempt, result).release === "completed" &&
+    attempt.cleanup?.state === "blocked"
   );
 }
 
@@ -1740,10 +1676,8 @@ function canRetryCleanupBoundary(state: WorkstreamState, attempt: WorkAttempt): 
   if (attempt.placement?.kind !== "isolated_worktree") return true;
   const assignment = findAssignment(state, attempt.assignmentId);
   const result = state.results.find((candidate) => candidate.id === attempt.resultId);
-  return (
-    cleanupRetainsOutput(assignment, attempt, result) ||
-    cleanupCanRemoveOutput(assignment, attempt, result)
-  );
+  const disposition = outputDisposition(assignment, attempt, result);
+  return ["retain_branch", "remove_checkout_and_branch"].includes(disposition.kind);
 }
 function requiresLaunch(attempt: WorkAttempt): boolean {
   return attempt.state === "queued";

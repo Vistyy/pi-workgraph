@@ -200,48 +200,21 @@ export class GitRepository {
     return Effect.gen(function* () {
       yield* validatePlacementIdentity(git, root, placement, "Worker commit validation");
       yield* assertClean(git, placement.path);
-      const commit = yield* git.text(placement.path, ["rev-parse", "HEAD"]);
-      if (reportedCommit !== undefined && reportedCommit !== commit) {
-        return yield* fail(
-          `Worker reported commit ${reportedCommit}, but worktree HEAD is ${commit}.`,
-        );
-      }
-      if (commit === placement.baseCommit) {
-        return yield* fail("Worker completed without creating a commit.");
-      }
-      const commitCount = Number(
-        yield* git.text(placement.path, [
-          "rev-list",
-          "--count",
-          `${placement.baseCommit}..${commit}`,
-        ]),
-      );
-      if (commitCount !== 1) {
-        return yield* fail(`Worker must produce exactly one commit, but produced ${commitCount}.`);
-      }
-      const parents = yield* git.text(placement.path, ["rev-list", "--parents", "-n", "1", commit]);
-      if (parents !== `${commit} ${placement.baseCommit}`) {
-        return yield* fail(
-          `Worker commit ${commit} is not directly based on ${placement.baseCommit}.`,
-        );
-      }
-      const changedText = yield* git.text(
+      const validated = yield* validateDirectCommit(
+        git,
         placement.path,
-        ["diff", "--name-only", "--no-renames", placement.baseCommit, commit],
-        true,
+        placement.baseCommit,
+        reportedCommit,
+        "worktree",
+        ["rev-parse", "HEAD"],
       );
-      const changedFiles =
-        changedText.length > 0
-          ? changedText
-              .split("\n")
-              .filter((path) => path.length > 0)
-              .sort()
-          : [];
-      if (changedFiles.length === 0) {
-        return yield* fail("Worker commit does not change any files.");
-      }
-      yield* assertStableCleanHead(git, placement.path, commit, "Worker commit validation");
-      return { commit, changedFiles };
+      yield* assertStableCleanHead(
+        git,
+        placement.path,
+        validated.commit,
+        "Worker commit validation",
+      );
+      return validated;
     });
   };
 
@@ -956,6 +929,65 @@ function discardOwnedWorktree(
   });
 }
 
+function validateDirectCommit(
+  git: GitClient,
+  cwd: string,
+  baseCommit: string,
+  reportedCommit: string | undefined,
+  source: "worktree" | "branch",
+  commitArgs: readonly string[],
+  branchName?: string,
+): GitEffect<ValidatedCommit> {
+  const labels =
+    source === "branch"
+      ? {
+          head: "retained branch HEAD",
+          base: "Worker branch does not contain a changed commit.",
+          count: (value: number) =>
+            `Worker branch must contain exactly one commit, but contains ${value}.`,
+          parent: (_commit: string) =>
+            `Worker branch ${branchName} is not directly based on ${baseCommit}.`,
+          changed: "Worker branch does not change any files.",
+        }
+      : {
+          head: "worktree HEAD",
+          base: "Worker completed without creating a commit.",
+          count: (value: number) =>
+            `Worker must produce exactly one commit, but produced ${value}.`,
+          parent: (commit: string) =>
+            `Worker commit ${commit} is not directly based on ${baseCommit}.`,
+          changed: "Worker commit does not change any files.",
+        };
+  return Effect.gen(function* () {
+    const commit = yield* git.text(cwd, commitArgs);
+    if (reportedCommit !== undefined && reportedCommit !== commit)
+      return yield* fail(
+        `Worker reported commit ${reportedCommit}, but ${labels.head} is ${commit}.`,
+      );
+    if (commit === baseCommit) return yield* fail(labels.base);
+    const commitCount = Number(
+      yield* git.text(cwd, ["rev-list", "--count", `${baseCommit}..${commit}`]),
+    );
+    if (commitCount !== 1) return yield* fail(labels.count(commitCount));
+    const parents = yield* git.text(cwd, ["rev-list", "--parents", "-n", "1", commit]);
+    if (parents !== `${commit} ${baseCommit}`) return yield* fail(labels.parent(commit));
+    const changedText = yield* git.text(
+      cwd,
+      ["diff", "--name-only", "--no-renames", baseCommit, commit],
+      true,
+    );
+    const changedFiles =
+      changedText.length === 0
+        ? []
+        : changedText
+            .split("\n")
+            .filter((path) => path.length > 0)
+            .sort();
+    if (changedFiles.length === 0) return yield* fail(labels.changed);
+    return { commit, changedFiles };
+  });
+}
+
 function validateRetainedBranch(
   git: GitClient,
   root: string,
@@ -973,40 +1005,17 @@ function validateRetainedBranch(
     );
     if (branch.state === "absent")
       return yield* fail(`Retained worker branch ${placement.branch} is absent.`);
-    const commit = yield* git.text(root, ["rev-parse", branchRef]);
-    if (reportedCommit !== undefined && reportedCommit !== commit)
-      return yield* fail(
-        `Worker reported commit ${reportedCommit}, but retained branch HEAD is ${commit}.`,
-      );
-    if (commit === placement.baseCommit)
-      return yield* fail("Worker branch does not contain a changed commit.");
-    const commitCount = Number(
-      yield* git.text(root, ["rev-list", "--count", `${placement.baseCommit}..${commit}`]),
-    );
-    if (commitCount !== 1)
-      return yield* fail(
-        `Worker branch must contain exactly one commit, but contains ${commitCount}.`,
-      );
-    const parents = yield* git.text(root, ["rev-list", "--parents", "-n", "1", commit]);
-    if (parents !== `${commit} ${placement.baseCommit}`)
-      return yield* fail(
-        `Worker branch ${placement.branch} is not directly based on ${placement.baseCommit}.`,
-      );
-    const changedText = yield* git.text(
+    const validated = yield* validateDirectCommit(
+      git,
       root,
-      ["diff", "--name-only", "--no-renames", placement.baseCommit, commit],
-      true,
+      placement.baseCommit,
+      reportedCommit,
+      "branch",
+      ["rev-parse", branchRef],
+      placement.branch,
     );
-    const changedFiles =
-      changedText.length === 0
-        ? []
-        : changedText
-            .split("\n")
-            .filter((path) => path.length > 0)
-            .sort();
-    if (changedFiles.length === 0) return yield* fail("Worker branch does not change any files.");
-    yield* assertRetainedBranch(git, root, placement, branchRef, commit);
-    return { commit, changedFiles };
+    yield* assertRetainedBranch(git, root, placement, branchRef, validated.commit);
+    return validated;
   });
 }
 
