@@ -395,7 +395,7 @@ export function installCalmMode(
   });
   pi.on("agent_settled", () => {
     coordinatorActive = false;
-    activityTracker.clear();
+    activityTracker.settle(activeWorkers > 0);
     frame = 0;
     renderStatus();
     syncWidget();
@@ -408,6 +408,7 @@ export function installCalmMode(
   });
   pi.on("ui_prompt_end", () => {
     waitingForInput = false;
+    if (!coordinatorActive && activeWorkers === 0) activityTracker.clear();
     syncWidget();
     syncTimer();
   });
@@ -465,6 +466,7 @@ export function installCalmMode(
   return {
     setActiveWorkers(count: number): void {
       activeWorkers = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+      if (activeWorkers === 0 && !coordinatorActive && !waitingForInput) activityTracker.clear();
       renderStatus();
       syncWidget();
       syncTimer();

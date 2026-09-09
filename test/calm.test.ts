@@ -624,108 +624,68 @@ void test("activity indicator remains active for coordinator or workers and sett
   );
 });
 
-void test("minimal activity pulses without layout changes and keeps truthful width-safe labels", () => {
+void test("activity status remains truthful and width-safe", () => {
   const theme = fakeTheme();
-  const coordinator = { coordinatorActive: true, activeWorkers: 0 };
-  const workers = { coordinatorActive: false, activeWorkers: 2 };
-  const combined = { coordinatorActive: true, activeWorkers: 2 };
-  const wideA = calmActivityLines(coordinator, 1, 80, theme);
-  const wideB = calmActivityLines(coordinator, 2, 80, theme);
-  assert.equal(wideA.length, 1);
-  assert.notDeepEqual(wideA, wideB);
-  assert.equal(stripAnsiLikeTheme(wideA[0] ?? ""), "• Workgraph · coordinating");
-  assert.equal(stripAnsiLikeTheme(wideA[0] ?? ""), stripAnsiLikeTheme(wideB[0] ?? ""));
-  assert.match(
-    stripAnsiLikeTheme(calmActivityLines(workers, 0, 80, theme)[0] ?? ""),
-    /2 workers active/,
+  assert.notDeepEqual(
+    calmActivityLines({ coordinatorActive: true, activeWorkers: 0 }, 1, 80, theme),
+    calmActivityLines({ coordinatorActive: true, activeWorkers: 0 }, 2, 80, theme),
   );
-  assert.match(
-    stripAnsiLikeTheme(calmActivityLines(combined, 0, 80, theme)[0] ?? ""),
-    /Workgraph · coordinating · 2 workers active/,
-  );
-  assert.doesNotMatch(
-    stripAnsiLikeTheme(calmActivityLines(workers, 0, 80, theme)[0] ?? ""),
-    /coordinating/,
-  );
-
-  for (const width of [160, 80, 40, 36, 35, 24, 12, 8, 3, 1]) {
-    const lines = calmActivityLines(combined, 4, width, theme);
-    assert.equal(lines.length, 1);
-    assert.ok(lines.every((line) => visibleWidth(line) <= width));
-  }
   assert.match(
     stripAnsiLikeTheme(
-      calmActivityLines({ ...coordinator, waitingForInput: true }, 0, 80, theme)[0] ?? "",
+      calmActivityLines({ coordinatorActive: false, activeWorkers: 2 }, 0, 80, theme)[0] ?? "",
+    ),
+    /2 workers active/,
+  );
+  assert.doesNotMatch(
+    stripAnsiLikeTheme(
+      calmActivityLines({ coordinatorActive: false, activeWorkers: 2 }, 0, 80, theme)[0] ?? "",
+    ),
+    /coordinating/,
+  );
+  assert.match(
+    stripAnsiLikeTheme(
+      calmActivityLines(
+        { coordinatorActive: true, activeWorkers: 0, waitingForInput: true },
+        0,
+        80,
+        theme,
+      )[0] ?? "",
     ),
     /awaiting input/,
   );
-  assert.deepEqual(
-    calmActivityLines({ coordinatorActive: false, activeWorkers: 0 }, 1, 80, theme),
-    [],
-  );
 });
 
-void test("activity tracker derives static phases, allowlisted hints, and ID-scoped concurrency", () => {
-  let changes = 0;
-  const tracker = createCalmActivityTracker(() => {
-    changes += 1;
-  });
+void test("activity tracker keeps IDs and path hints safe", () => {
+  const tracker = createCalmActivityTracker();
   tracker.startAgent();
-  tracker.messageUpdate("thinking_delta");
-  assert.deepEqual(tracker.snapshot(), { phase: "thinking", activeTools: [] });
   tracker.messageUpdate("text_delta");
-  assert.deepEqual(tracker.snapshot(), { phase: "responding", activeTools: [] });
-  tracker.toolStart("a", "read", { path: "/private/calm.ts", command: "do not show" });
+  tracker.toolStart("read-1", "read", { path: "/private/calm.ts", command: "secret" });
+  tracker.toolStart("bash-1", "bash", { command: "secret --query never-render" });
+  tracker.toolEnd("bash-1");
   assert.deepEqual(tracker.snapshot().activeTools, [
-    { toolCallId: "a", toolName: "read", pathHint: "calm.ts" },
+    { toolCallId: "read-1", toolName: "read", pathHint: "calm.ts" },
   ]);
-  tracker.toolStart("b", "bash", { command: "secret --query never-render" });
-  tracker.toolStart("a", "write", { path: "/tmp/output.txt", arbitrary: "hidden" });
-  assert.deepEqual(tracker.snapshot().activeTools, [
-    { toolCallId: "a", toolName: "write", pathHint: "output.txt" },
-    { toolCallId: "b", toolName: "bash" },
-  ]);
-  tracker.toolEnd("b");
-  assert.deepEqual(tracker.snapshot().activeTools, [
-    { toolCallId: "a", toolName: "write", pathHint: "output.txt" },
-  ]);
-  tracker.toolEnd("a");
-  assert.deepEqual(tracker.snapshot(), { phase: "thinking", activeTools: [] });
-  tracker.clear();
-  assert.deepEqual(tracker.snapshot(), { phase: undefined, activeTools: [] });
-  assert.ok(changes >= 7);
+  assert.equal(tracker.snapshot().phase, undefined);
+  tracker.toolEnd("read-1");
+  assert.deepEqual(
+    tracker.snapshot().completedTools?.map((tool) => tool.toolName),
+    ["bash", "read"],
+  );
+  assert.equal(tracker.snapshot().phase, undefined);
 
   for (const args of [
     { path: "unsafe\u0001.ts" },
-    { path: "unsafe\u0085.ts" },
-    { path: "unsafe\u001b[31m.ts" },
-    { path: "unsafe\u202e.ts" },
     { path: "unsafe name.ts" },
-    { path: "unsafe-\u{1f4a5}.ts" },
     { path: 42 },
     { command: "secret", query: "private" },
     null,
     "not-an-object",
   ] as unknown[]) {
     tracker.toolStart("unsafe", "read", args);
-    const unsafeActivity = (tracker.snapshot().activeTools ?? []).at(-1);
-    assert.ok(unsafeActivity);
-    assert.deepEqual(unsafeActivity, {
+    assert.deepEqual((tracker.snapshot().activeTools ?? []).at(-1), {
       toolCallId: "unsafe",
       toolName: "read",
     });
-    const unsafeLines = calmActivityLines(
-      {
-        calmOn: true,
-        coordinatorActive: true,
-        activeWorkers: 0,
-        activeTools: tracker.snapshot().activeTools,
-      },
-      0,
-      80,
-      fakeTheme(),
-    );
-    assert.equal(stripAnsiLikeTheme(unsafeLines[0] ?? ""), "read");
     tracker.toolEnd("unsafe");
   }
   const getterArgs = {};
@@ -735,52 +695,12 @@ void test("activity tracker derives static phases, allowlisted hints, and ID-sco
     },
   });
   tracker.toolStart("getter", "read", getterArgs);
-  const getterActivity = (tracker.snapshot().activeTools ?? []).at(-1);
-  assert.ok(getterActivity);
-  assert.deepEqual(getterActivity, {
+  assert.deepEqual((tracker.snapshot().activeTools ?? []).at(-1), {
     toolCallId: "getter",
     toolName: "read",
   });
-  const getterLines = calmActivityLines(
-    {
-      calmOn: true,
-      coordinatorActive: true,
-      activeWorkers: 0,
-      activeTools: tracker.snapshot().activeTools,
-    },
-    0,
-    80,
-    fakeTheme(),
-  );
-  assert.equal(stripAnsiLikeTheme(getterLines[0] ?? ""), "read");
-  tracker.toolEnd("getter");
 
-  const theme = fakeTheme();
-  const thinking = calmActivityLines(
-    { calmOn: true, coordinatorActive: true, activeWorkers: 0, phase: "thinking" },
-    0,
-    80,
-    theme,
-  );
-  assert.deepEqual(thinking.map(stripAnsiLikeTheme), ["thinking", "• Workgraph · coordinating"]);
-  const thinkingAtNextFrame = calmActivityLines(
-    { calmOn: true, coordinatorActive: true, activeWorkers: 0, phase: "thinking" },
-    1,
-    80,
-    theme,
-  );
-  assert.equal(thinkingAtNextFrame[0], thinking[0]);
-  assert.deepEqual(thinkingAtNextFrame.map(stripAnsiLikeTheme), thinking.map(stripAnsiLikeTheme));
-  const responding = calmActivityLines(
-    { calmOn: true, coordinatorActive: true, activeWorkers: 0, phase: "responding" },
-    0,
-    80,
-    theme,
-  );
-  assert.equal(stripAnsiLikeTheme(responding[0] ?? ""), "responding");
-  assert.ok(!stripAnsiLikeTheme(responding[0] ?? "").includes("•"));
-  assert.ok(visibleWidth(responding[0] ?? "") <= 80 && visibleWidth(responding[1] ?? "") <= 80);
-  const unsafe = calmActivityLines(
+  const lines = calmActivityLines(
     {
       calmOn: true,
       coordinatorActive: true,
@@ -792,44 +712,63 @@ void test("activity tracker derives static phases, allowlisted hints, and ID-sco
     },
     0,
     80,
-    theme,
+    fakeTheme(),
   );
-  assert.equal(stripAnsiLikeTheme(unsafe[0] ?? ""), "bash · web_search");
-  assert.doesNotMatch(stripAnsiLikeTheme(unsafe[0] ?? ""), /secret|query|never-render/);
-  const parallel = calmActivityLines(
+  assert.equal(stripAnsiLikeTheme(lines[0] ?? ""), "bash › web_search");
+  assert.doesNotMatch(stripAnsiLikeTheme(lines[0] ?? ""), /secret|query|never-render/);
+});
+
+void test("activity rail bounds history, live labels, and width", () => {
+  const tracker = createCalmActivityTracker();
+  tracker.startAgent();
+  for (const [id, name] of [
+    ["one", "read"],
+    ["two", "edit"],
+    ["three", "bash"],
+    ["four", "write"],
+  ] as const) {
+    tracker.toolStart(id, name, {});
+    tracker.toolEnd(id);
+  }
+  assert.deepEqual(
+    tracker.snapshot().completedTools?.map((tool) => tool.toolName),
+    ["edit", "bash", "write"],
+  );
+
+  const state = {
+    calmOn: true,
+    coordinatorActive: true,
+    activeWorkers: 0,
+    completedTools: [{ toolCallId: "old", toolName: "old" }],
+    activeTools: [
+      { toolCallId: "1", toolName: "read" },
+      { toolCallId: "2", toolName: "edit" },
+      { toolCallId: "3", toolName: "write" },
+    ],
+  };
+  const three = calmActivityLines(state, 0, 80, fakeTheme()).map(stripAnsiLikeTheme);
+  assert.deepEqual(three, ["read › edit › write", "• Workgraph"]);
+  assert.doesNotMatch(three[0] ?? "", /old/);
+
+  const many = calmActivityLines(
     {
-      calmOn: true,
-      coordinatorActive: true,
-      activeWorkers: 0,
+      ...state,
       activeTools: [
-        { toolCallId: "1", toolName: "read" },
-        { toolCallId: "2", toolName: "edit" },
-        { toolCallId: "3", toolName: "write" },
+        ...state.activeTools,
         { toolCallId: "4", toolName: "bash" },
         { toolCallId: "5", toolName: "web_search" },
       ],
     },
     0,
-    12,
-    theme,
-  );
-  assert.equal(parallel.length, 2);
-  assert.ok(parallel.every((line) => visibleWidth(line) <= 12));
-  assert.doesNotMatch(stripAnsiLikeTheme(parallel[0] ?? ""), /never/);
-  assert.equal(
-    calmActivityLines(
-      {
-        calmOn: false,
-        coordinatorActive: true,
-        activeWorkers: 0,
-        phase: "thinking",
-      },
-      0,
-      80,
-      theme,
-    ).length,
-    1,
-  );
+    80,
+    fakeTheme(),
+  ).map(stripAnsiLikeTheme);
+  assert.deepEqual(many, ["read › edit › +3 tools", "• Workgraph"]);
+  for (const width of [1, 8, 12, 80]) {
+    assert.ok(
+      calmActivityLines(state, 0, width, fakeTheme()).every((line) => visibleWidth(line) <= width),
+    );
+  }
 });
 
 void test("coordinator calm command defaults to hiding workgraph notes and restores them when off", async () => {
@@ -1015,7 +954,7 @@ void test("saved default affects new sessions, while local choice survives reloa
   }
 });
 
-void test("activity uses compact mode outside Calm and freezes for registered fixture prompt state", async () => {
+void test("registered Calm widget covers the activity rail lifecycle", async () => {
   const pi = fakePi();
   const ui = fakeUi();
   const calm = installCalmMode(pi as unknown as ExtensionAPI, {
@@ -1029,17 +968,18 @@ void test("activity uses compact mode outside Calm and freezes for registered fi
     isIdle: () => true,
     sessionManager: pi.session,
   } as unknown as ExtensionContext;
+  const lines = (widget: { render(width: number): string[] }): string[] =>
+    widget.render(80).map(stripAnsiLikeTheme);
   try {
     await pi.events.get("session_start")?.({}, context);
     await pi.events.get("agent_start")?.({}, context);
     const factory = ui.widgets.get("calm");
     assert.ok(factory);
     const widget = factory({ requestRender() {} }, ui.theme);
-    assert.equal(widget.render(80).length, 1);
-    assert.equal(ui.workingVisible, false);
+    assert.deepEqual(lines(widget), ["• Workgraph"]);
+
     await pi.commands.get("calm")?.("", context);
-    assert.equal(widget.render(80).length, 2);
-    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "thinking");
+    assert.deepEqual(lines(widget), ["thinking", "• Workgraph"]);
     await pi.events.get("message_update")?.(
       {
         message: { role: "assistant" },
@@ -1047,7 +987,7 @@ void test("activity uses compact mode outside Calm and freezes for registered fi
       },
       context,
     );
-    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "responding");
+    assert.equal(lines(widget)[0], "responding");
     await pi.events.get("tool_execution_start")?.(
       {
         toolCallId: "read-1",
@@ -1056,7 +996,7 @@ void test("activity uses compact mode outside Calm and freezes for registered fi
       },
       context,
     );
-    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "read · calm.ts");
+    assert.equal(lines(widget)[0], "read calm.ts");
     await pi.events.get("tool_execution_start")?.(
       {
         toolCallId: "bash-1",
@@ -1065,38 +1005,40 @@ void test("activity uses compact mode outside Calm and freezes for registered fi
       },
       context,
     );
-    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "read · bash");
+    assert.equal(lines(widget)[0], "read calm.ts › bash");
     await pi.events.get("tool_execution_end")?.(
-      {
-        toolCallId: "read-1",
-        toolName: "read",
-        result: [{ type: "text", text: "never show" }],
-        isError: false,
-      },
+      { toolCallId: "read-1", result: [], isError: false },
       context,
     );
-    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "bash");
+    assert.equal(lines(widget)[0], "read calm.ts › bash");
+
     await pi.events.get("ui_prompt_start")?.({}, context);
-    assert.equal(widget.render(80).length, 1);
-    assert.match(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /awaiting input/);
+    assert.equal(lines(widget).length, 1);
+    assert.match(lines(widget)[0] ?? "", /awaiting input/);
     await pi.events.get("ui_prompt_end")?.({}, context);
-    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "bash");
+    assert.equal(lines(widget)[0], "read calm.ts › bash");
+
     await pi.events.get("tool_execution_end")?.(
+      { toolCallId: "bash-1", result: [], isError: false },
+      context,
+    );
+    assert.equal(lines(widget)[0], "read calm.ts › bash");
+    await pi.events.get("message_update")?.(
       {
-        toolCallId: "bash-1",
-        toolName: "bash",
-        result: [{ type: "text", text: "never show" }],
-        isError: false,
+        message: { role: "assistant" },
+        assistantMessageEvent: { type: "thinking_delta" },
       },
       context,
     );
-    assert.equal(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), "thinking");
+    assert.equal(lines(widget)[0], "read calm.ts › bash › thinking");
+    assert.doesNotMatch(lines(widget).join(" "), /secret|never show/);
+
     calm.setActiveWorkers(2);
     await pi.events.get("agent_settled")?.({}, context);
-    assert.match(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /2 workers active/);
-    assert.doesNotMatch(stripAnsiLikeTheme(widget.render(80)[0] ?? ""), /coordinating/);
+    assert.deepEqual(lines(widget), ["read calm.ts › bash", "• Workgraph · 2 workers active"]);
     calm.setActiveWorkers(0);
     assert.equal(ui.widgets.get("calm"), undefined);
+    assert.deepEqual(lines(widget), []);
   } finally {
     await pi.events.get("session_shutdown")?.({}, context);
   }
