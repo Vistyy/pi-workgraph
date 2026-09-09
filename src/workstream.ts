@@ -61,6 +61,7 @@ import {
   WorkstreamStateSchema,
 } from "./workstream-state.js";
 import {
+  cleanupHasReleasableOutput,
   deriveCompletionAccounting,
   hasActiveOrUncleanAttempt,
   recordInputTransition,
@@ -980,26 +981,14 @@ export class WorkstreamStoreEffects {
           throw new Error(`Cleanup for ${id} is not pending.`);
         if (attempt.cleanup.workerClosed === true) return;
         attempt.cleanup = { ...attempt.cleanup, workerClosed: true };
+        if (attempt.state === "cancel_requested") attempt.state = "cancelled";
       },
       now,
     );
   }
 
   finishCleanup(id: string, now?: Date): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      id,
-      (attempt) => {
-        if (attempt.cleanup?.state === "completed") {
-          if (attempt.state === "cancel_requested") attempt.state = "cancelled";
-          return;
-        }
-        if (attempt.cleanup?.state !== "pending" || !attempt.cleanup.workerClosed)
-          throw new Error(`Cleanup for ${id} requires a closed worker.`);
-        attempt.cleanup = { ...attempt.cleanup, state: "completed" };
-        if (attempt.state === "cancel_requested") attempt.state = "cancelled";
-      },
-      now,
-    );
+    return this.changeAttempt(id, (attempt) => finishCleanupTransition(attempt, id), now);
   }
 
   blockCleanup(id: string, error: string, now?: Date): StoreEffect<WorkstreamState> {
@@ -1035,18 +1024,16 @@ export class WorkstreamStoreEffects {
       (attempt, draft) => {
         requireText(input.reason, "Retained-output release reason");
         const assignment = requireAssignment(draft, attempt.assignmentId);
-        const releasableAssignment =
-          assignment.artifactIntent === "disposable_experiment" ||
-          assignment.capability === "implement";
+        const result =
+          attempt.resultId === undefined
+            ? undefined
+            : draft.results.find((candidate) => candidate.id === attempt.resultId);
         if (
-          !releasableAssignment ||
           !["settled", "failed", "cancelled"].includes(attempt.state) ||
-          attempt.placement?.kind !== "isolated_worktree" ||
-          attempt.cleanup?.state !== "completed" ||
-          !attempt.cleanup.workerClosed
+          !cleanupHasReleasableOutput(assignment, attempt, result)
         )
           throw new Error(
-            "Retained-output release requires closed owned experiment or unapplied implementation output.",
+            "Retained-output release requires a closed owned isolated attempt with releasable output.",
           );
         if (attempt.outputRelease?.state === "completed") return;
         if (
@@ -1389,6 +1376,28 @@ function describeJsonValue(value: JsonValue | undefined): string {
   return Array.isArray(value) ? "[array]" : "[object]";
 }
 
+function finishCleanupTransition(attempt: WorkAttempt, id: string): void {
+  if (attempt.cleanup?.state === "completed") {
+    if (attempt.state === "cancel_requested") attempt.state = "cancelled";
+    return;
+  }
+  if (
+    attempt.cleanup?.state === "blocked" &&
+    attempt.outputRelease?.state === "completed" &&
+    attempt.cleanup.workerClosed
+  ) {
+    attempt.cleanup = { ...attempt.cleanup, state: "completed" };
+    delete attempt.cleanup.error;
+    if (attempt.state === "cancel_requested") attempt.state = "cancelled";
+    return;
+  }
+  if (attempt.cleanup?.state !== "pending" || !attempt.cleanup.workerClosed)
+    throw new Error(`Cleanup for ${id} requires a closed worker.`);
+  attempt.cleanup = { ...attempt.cleanup, state: "completed" };
+  delete attempt.cleanup.error;
+  if (attempt.state === "cancel_requested") attempt.state = "cancelled";
+}
+
 function beginCleanupTransition(
   attempt: WorkAttempt,
   input: { expectedHead?: string; id: string },
@@ -1400,8 +1409,6 @@ function beginCleanupTransition(
   }
   const placement = attempt.placement;
   if (!placement) throw new Error("Cleanup requires an attempt placement.");
-  if (placement.kind === "isolated_worktree" && input.expectedHead === undefined)
-    throw new Error("Isolated worktree cleanup requires its exact HEAD.");
   const cleanup: NonNullable<WorkAttempt["cleanup"]> = {
     state: "pending",
     workerClosed: false,

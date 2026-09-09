@@ -1031,6 +1031,221 @@ void test("malformed state diagnostics identify a bounded field path without ech
   }
 });
 
+void test("current-format retained physical experiment artifacts remain decodable as historical evidence", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const { authority } = await recordedAuthority(store);
+    const base = "a".repeat(40);
+    await runStore(
+      store.enqueue(
+        {
+          id: "historical-experiment",
+          capability: "research",
+          artifactIntent: "disposable_experiment",
+          objective: "Retain the predecessor experiment record",
+          intentVersion: authority.intentVersion,
+          authority,
+          permittedEffects: ["Write only inside the isolated worktree"],
+          stopCondition: "The predecessor state is decoded",
+          expectedEvidence: ["The historical artifact remains readable"],
+        },
+        {
+          id: "historical-experiment-attempt",
+          baseRevision: base,
+          models: {
+            guide: { model: "fixture/research", thinking: "low" },
+            source: "policy",
+          },
+        },
+      ),
+    );
+    await runStore(
+      store.startAttempt({
+        id: "historical-experiment-attempt",
+        placement: {
+          kind: "isolated_worktree",
+          path: "/tmp/workgraph-historical-experiment",
+          branch: "pi-workgraph/historical-experiment-attempt",
+        },
+        baseRevision: base,
+      }),
+    );
+    await runStore(
+      store.recordSessionFile(
+        "historical-experiment-attempt",
+        "/tmp/historical-experiment-session.jsonl",
+      ),
+    );
+    await runStore(
+      store.retainResult({
+        id: "historical-experiment-result",
+        assignmentId: "historical-experiment",
+        assignmentIntentVersion: authority.intentVersion,
+        validity: "typed",
+        report: researchReport("Historical experiment"),
+        artifacts: [
+          {
+            id: "retained-output-worktree",
+            kind: "path",
+            reference: "/tmp/workgraph-historical-experiment",
+            retention: "retained",
+            summary: "Historical predecessor retained its physical output worktree.",
+          },
+        ],
+      }),
+    );
+    await runStore(
+      store.settleAttempt({
+        id: "historical-experiment-attempt",
+        resultId: "historical-experiment-result",
+        effectiveModels: [{ model: "fixture/research", thinking: "low" }],
+      }),
+    );
+    await runStore(store.beginCleanup({ id: "historical-experiment-attempt", expectedHead: base }));
+    await runStore(store.markWorkerClosed("historical-experiment-attempt"));
+    await runStore(store.finishCleanup("historical-experiment-attempt"));
+    const raw = await runStore(WorkstreamStoreEffects.readRaw(store.path));
+    const decoded = parsePersistedObject(raw);
+    assert.equal(decoded.version, 7);
+    const restored = await runStore(store.load());
+    assert.equal(restored.results[0]?.artifacts[0]?.id, "retained-output-worktree");
+    await assert.rejects(
+      runStore(
+        store.complete({
+          conclusion: "Historical experiment evidence is complete.",
+          evidence: [{ label: "Result", observation: "The historical result is retained." }],
+          limitations: [],
+        }),
+      ),
+      /owned resources have settled and cleaned up/,
+    );
+    await runStore(
+      store.beginOutputRelease({
+        id: "historical-experiment-attempt",
+        expectedHead: base,
+        reason: "Release the exact historical physical output.",
+      }),
+    );
+    await runStore(store.finishOutputRelease("historical-experiment-attempt"));
+    const completed = await runStore(
+      store.complete({
+        conclusion: "Historical experiment evidence is complete after exact output release.",
+        evidence: [{ label: "Result", observation: "The historical result is retained." }],
+        limitations: [],
+      }),
+    );
+    assert.equal(completed.lifecycle.state, "completed");
+    const malformed = structuredClone(await runStore(store.load()));
+    const attempt = requiredValue(malformed.attempts[0], "release identity attempt");
+    const release = requiredValue(attempt.outputRelease, "release identity checkpoint");
+    release.expectedHead = "c".repeat(40);
+    SqliteWorkstreamDatabase.use(store.path, (database) => {
+      database.db
+        .prepare("UPDATE workstream_state SET state_json=? WHERE singleton=1")
+        .run(JSON.stringify(malformed));
+    });
+    await assert.rejects(
+      runStore(WorkstreamStoreEffects.inspect(store.path)),
+      /exact closed isolated checkpoint/,
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("branch-only retained output does not block semantic completion", async () => {
+  const { parent, store } = await fixture();
+  try {
+    const { authority } = await recordedAuthority(store);
+    const base = "a".repeat(40);
+    const outputHead = "b".repeat(40);
+    const branch = "pi-workgraph/branch-only-experiment";
+    await runStore(
+      store.enqueue(
+        {
+          id: "branch-only-experiment",
+          capability: "research",
+          artifactIntent: "disposable_experiment",
+          objective: "Retain the useful experiment branch",
+          intentVersion: authority.intentVersion,
+          authority,
+          permittedEffects: ["Write only inside the isolated worktree"],
+          stopCondition: "The branch is retained",
+          expectedEvidence: ["The branch identity"],
+        },
+        {
+          id: "branch-only-experiment-attempt",
+          baseRevision: base,
+          models: {
+            guide: { model: "fixture/research", thinking: "low" },
+            source: "policy",
+          },
+        },
+      ),
+    );
+    await runStore(
+      store.startAttempt({
+        id: "branch-only-experiment-attempt",
+        placement: {
+          kind: "isolated_worktree",
+          path: "/tmp/workgraph-branch-only-experiment",
+          branch,
+        },
+        baseRevision: base,
+      }),
+    );
+    await runStore(
+      store.recordSessionFile(
+        "branch-only-experiment-attempt",
+        "/tmp/branch-only-experiment-session.jsonl",
+      ),
+    );
+    await runStore(
+      store.retainResult({
+        id: "branch-only-experiment-result",
+        assignmentId: "branch-only-experiment",
+        assignmentIntentVersion: authority.intentVersion,
+        validity: "typed",
+        report: researchReport("The experiment advanced the branch."),
+      }),
+    );
+    await runStore(
+      store.settleAttempt({
+        id: "branch-only-experiment-attempt",
+        resultId: "branch-only-experiment-result",
+        effectiveModels: [{ model: "fixture/research", thinking: "low" }],
+      }),
+    );
+    await runStore(
+      store.beginCleanup({ id: "branch-only-experiment-attempt", expectedHead: outputHead }),
+    );
+    await runStore(store.markWorkerClosed("branch-only-experiment-attempt"));
+    await runStore(
+      store.addResultArtifacts("branch-only-experiment-result", [
+        {
+          id: "retained-output-branch",
+          kind: "reference",
+          reference: branch,
+          retention: "retained",
+          summary: "The exact useful experiment branch is retained.",
+        },
+      ]),
+    );
+    await runStore(store.finishCleanup("branch-only-experiment-attempt"));
+    const completed = await runStore(
+      store.complete({
+        conclusion: "The useful branch is retained without a physical checkout.",
+        evidence: [{ label: "Branch", observation: "The exact output branch remains available." }],
+        limitations: [],
+      }),
+    );
+    assert.equal(completed.lifecycle.state, "completed");
+    assert.deepEqual(completed.completion?.accounting, []);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 void test("workstream serializes receipt writes and rejects corrupt or foreign history without rewriting it", async () => {
   const { parent, store } = await fixture();
   try {

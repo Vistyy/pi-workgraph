@@ -21,7 +21,13 @@ import {
   type WorkstreamState,
   WorkstreamStateSchema,
 } from "./workstream-state.js";
-import { accountingIdentity, deriveCompletionAccounting } from "./workstream-transitions.js";
+import {
+  accountingIdentity,
+  cleanupCanRemoveOutput,
+  cleanupHasReleasableOutput,
+  cleanupRetainsOutput,
+  deriveCompletionAccounting,
+} from "./workstream-transitions.js";
 
 type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | JsonObject;
@@ -274,6 +280,7 @@ function validateAttempts(
   for (const attempt of state.attempts) {
     validateAttemptPlacement(state, attempt);
     validateAttemptFields(attempt);
+    validateCleanupDisposition(state, attempt);
     if (!assignmentIds.has(attempt.assignmentId))
       throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} references unknown assignment.`);
     if (attempt.resultId !== undefined && !resultIds.has(attempt.resultId))
@@ -491,22 +498,61 @@ function isActiveAttemptState(state: WorkAttempt["state"]): boolean {
   return state === "starting" || state === "running" || state === "cancel_requested";
 }
 
+function validateCleanupDisposition(state: WorkstreamState, attempt: WorkAttempt): void {
+  if (attempt.cleanup?.state !== "completed" || attempt.placement?.kind !== "isolated_worktree")
+    return;
+  if (attempt.outputRelease?.state === "completed") return;
+  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
+  const result =
+    attempt.resultId === undefined
+      ? undefined
+      : state.results.find((item) => item.id === attempt.resultId);
+  if (
+    assignment === undefined ||
+    (!cleanupRetainsOutput(assignment, attempt, result) &&
+      !cleanupCanRemoveOutput(assignment, attempt, result))
+  )
+    throw new InvalidWorkstreamStateError(
+      `Attempt ${attempt.id} completed isolated cleanup without a successful clean output disposition.`,
+    );
+}
+
 function validateOutputRelease(state: WorkstreamState, attempt: WorkAttempt): void {
   const release = attempt.outputRelease;
   if (release === undefined) return;
   const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
-  const releasableAssignment =
-    assignment?.artifactIntent === "disposable_experiment" ||
-    assignment?.capability === "implement";
+  const result =
+    attempt.resultId === undefined
+      ? undefined
+      : state.results.find((candidate) => candidate.id === attempt.resultId);
+  if (release.state === "completed") {
+    if (release.error !== undefined)
+      throw new InvalidWorkstreamStateError(
+        `Attempt ${attempt.id} completed retained-output release has an error.`,
+      );
+    const cleanup = attempt.cleanup;
+    if (
+      assignment === undefined ||
+      !["settled", "failed", "cancelled"].includes(attempt.state) ||
+      attempt.placement?.kind !== "isolated_worktree" ||
+      cleanup === undefined ||
+      !["blocked", "completed"].includes(cleanup.state) ||
+      cleanup.workerClosed !== true ||
+      cleanup.expectedHead === undefined ||
+      cleanup.expectedHead !== release.expectedHead
+    )
+      throw new InvalidWorkstreamStateError(
+        `Attempt ${attempt.id} completed retained-output release is not an exact closed isolated checkpoint.`,
+      );
+    return;
+  }
   if (
-    !releasableAssignment ||
+    assignment === undefined ||
     !["settled", "failed", "cancelled"].includes(attempt.state) ||
-    attempt.placement?.kind !== "isolated_worktree" ||
-    attempt.cleanup?.state !== "completed" ||
-    !attempt.cleanup.workerClosed
+    !cleanupHasReleasableOutput(assignment, attempt, result)
   )
     throw new InvalidWorkstreamStateError(
-      `Attempt ${attempt.id} retained-output release is outside closed owned output.`,
+      `Attempt ${attempt.id} retained-output release is outside closed owned isolated output.`,
     );
   if ((release.state === "blocked") !== (release.error !== undefined))
     throw new InvalidWorkstreamStateError(
@@ -525,21 +571,40 @@ function validateExperimentWorktree(
     result.report.status !== "completed"
   )
     return;
-  const artifact = result.artifacts.length === 1 ? result.artifacts[0] : undefined;
   const attempt = state.attempts.find(
     (item) =>
       item.assignmentId === assignment.id &&
-      item.placement?.kind === "isolated_worktree" &&
-      resolve(item.placement.path) === resolve(artifact?.reference ?? ""),
+      (item.resultId === result.id ||
+        (item.resultId === undefined && ["starting", "running"].includes(item.state))),
   );
-  if (
-    artifact?.id !== "retained-output-worktree" ||
-    artifact.kind !== "path" ||
-    artifact.retention !== "retained" ||
-    attempt === undefined
-  )
+  if (attempt?.placement?.kind !== "isolated_worktree")
     throw new InvalidWorkstreamStateError(
-      `Experiment ${assignment.id} must retain its exact isolated worktree.`,
+      `Experiment ${assignment.id} has no exact isolated output placement.`,
+    );
+  const artifact = result.artifacts.length === 1 ? result.artifacts[0] : undefined;
+  const legacyWorktreeArtifact =
+    artifact?.id === "retained-output-worktree" &&
+    artifact.kind === "path" &&
+    artifact.reference === attempt.placement.path &&
+    artifact.retention === "retained";
+  if (legacyWorktreeArtifact) return;
+
+  const branchArtifact =
+    artifact?.id === "retained-output-branch" &&
+    artifact.kind === "reference" &&
+    artifact.reference === attempt.placement.branch &&
+    artifact.retention === "retained";
+  if (attempt.cleanup?.state !== "completed") return;
+  if (cleanupRetainsOutput(assignment, attempt, result)) {
+    if (!branchArtifact)
+      throw new InvalidWorkstreamStateError(
+        `Experiment ${assignment.id} must retain its exact advanced output branch.`,
+      );
+    return;
+  }
+  if (branchArtifact)
+    throw new InvalidWorkstreamStateError(
+      `Experiment ${assignment.id} at its base must not retain an output branch.`,
     );
 }
 

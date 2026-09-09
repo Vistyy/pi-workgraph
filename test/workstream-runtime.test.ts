@@ -11,7 +11,7 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import workgraphCoordinator from "../extensions/coordinator.js";
 import { inspectView, resultNotification } from "../src/agent-facing.js";
-import { openRepository } from "../src/git.js";
+import { openRepository, type WorktreePlacement } from "../src/git.js";
 import { DEFAULT_MODEL_POLICY } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import {
@@ -91,7 +91,7 @@ const RecoveryInspectionDetailsSchema = Type.Object({
   inspection: Type.Object({
     recordedFacts: Type.Object({
       cleanup: Type.Object({ state: Type.String(), workerClosed: Type.Boolean() }),
-      retainedOutput: Type.Object({ state: Type.String(), path: Type.String() }),
+      retainedOutput: Type.Object({ state: Type.String(), path: Type.Optional(Type.String()) }),
     }),
   }),
 });
@@ -104,7 +104,9 @@ const RetainedOutputRecoveryInspectionDetailsSchema = Type.Object({
       }),
       retainedOutput: Type.Object({
         state: Type.String(),
-        path: Type.String(),
+        path: Type.Optional(Type.String()),
+        checkout: Type.Optional(Type.String()),
+        branch: Type.Optional(Type.String()),
         releaseState: Type.Optional(Type.String()),
         blocker: Type.Optional(Type.String()),
       }),
@@ -121,9 +123,6 @@ const CompletionActionDetailsSchema = Type.Object({
     workstream: Type.Object({ lifecycle: Type.String() }),
     action: Type.Object({ name: Type.String(), outcome: Type.String() }),
   }),
-});
-const CompletionInspectionDetailsSchema = Type.Object({
-  inspection: Type.Object({ completionRecorded: Type.Boolean() }),
 });
 type OutcomeInspectionRequest = { section: "outcome"; result: string; task?: string };
 
@@ -1297,6 +1296,159 @@ await test("new runtime drives fresh research through native evidence, durable r
   }
 });
 
+await test("disposable experiments remove zero-commit output and retain advanced ordinary history", async () => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    const destinationHead = await runRuntime(f.repository.head());
+    const destinationBytes = await readFile(join(f.root, "value.txt"), "utf8");
+    f.workers.onWork = async (request) => {
+      if (request.assignmentId === "zero-experiment") return researchReport;
+      await writeFile(join(request.cwd, "experiment.txt"), "first\n");
+      await git(request.cwd, "add", ".");
+      await git(request.cwd, "commit", "-m", "Experiment first commit");
+      await writeFile(join(request.cwd, "experiment.txt"), "second\n");
+      await git(request.cwd, "add", ".");
+      await git(request.cwd, "commit", "-m", "Experiment second commit");
+      return researchReport;
+    };
+    const experiment = (id: string) => ({
+      id,
+      capability: "research" as const,
+      artifactIntent: "disposable_experiment" as const,
+      objective: `Run ${id}`,
+      intentVersion: authority.intentVersion,
+      authority,
+      permittedEffects: ["Write only inside the isolated worktree"],
+      stopCondition: "The experiment report is retained",
+      expectedEvidence: ["The experiment output"],
+    });
+
+    await runRuntime(active.effects.queue(experiment("zero-experiment")));
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(active.effects.reconcile);
+    const zero = required(state.attempts[0], "zero-commit experiment");
+    assert.equal(zero.cleanup?.state, "completed");
+    assert.deepEqual(state.results[0]?.artifacts, []);
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), destinationHead);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), destinationBytes);
+    const zeroPlacement = required(zero.placement, "zero experiment placement");
+    if (zeroPlacement.kind !== "isolated_worktree")
+      throw new Error("Zero experiment did not use an isolated placement.");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(zeroPlacement.path),
+      false,
+    );
+    assert.equal(await git(f.root, "branch", "--list", zeroPlacement.branch), "");
+
+    await runRuntime(active.effects.queue(experiment("advanced-experiment")));
+    await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.effects.reconcile);
+    const advanced = required(state.attempts[1], "advanced experiment");
+    const placement = required(advanced.placement, "advanced experiment placement");
+    if (placement.kind !== "isolated_worktree")
+      throw new Error("Advanced experiment did not use an isolated placement.");
+    assert.equal(advanced.cleanup?.state, "completed");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
+      false,
+    );
+    const advancedHead = await git(f.root, "rev-parse", placement.branch);
+    assert.notEqual(advancedHead, required(advanced.baseRevision, "advanced experiment base"));
+    assert.equal(
+      await git(
+        f.root,
+        "rev-list",
+        "--count",
+        `${required(advanced.baseRevision, "advanced experiment base")}..${placement.branch}`,
+      ),
+      "2",
+    );
+    assert.deepEqual(
+      state.results[1]?.artifacts.map((artifact) => artifact.reference),
+      [placement.branch],
+    );
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), destinationHead);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), destinationBytes);
+    await runRuntime(
+      active.effects.releaseOutput(advanced.id, "Release the inspected experiment branch."),
+    );
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[1]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[1]?.outputRelease?.state, "completed");
+    assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("blocked exact-revision release recovers its cleanup checkpoint without a second Git release", async (t) => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    const destinationHead = await runRuntime(f.repository.head());
+    f.workers.onWork = async () => researchReport;
+    await runRuntime(
+      active.effects.queue({
+        id: "malformed-review",
+        capability: "review",
+        artifactIntent: "evidence_only",
+        objective: "Review the exact fixture revision",
+        intentVersion: authority.intentVersion,
+        subject: { kind: "revision", revision: destinationHead },
+        concern: "The review report must be well-formed.",
+      }),
+    );
+    await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(active.effects.reconcile);
+    const attempt = required(state.attempts[0], "malformed review attempt");
+    const placement = required(attempt.placement, "malformed review placement");
+    if (placement.kind !== "isolated_worktree")
+      throw new Error("Malformed review did not use an isolated placement.");
+    assert.equal(state.results[0]?.validity, "invalid");
+    assert.equal(attempt.cleanup?.state, "blocked");
+    assert.equal(attempt.cleanup?.workerClosed, true);
+    let releaseCalls = 0;
+    const releaseOutput = f.repository.releaseOutput.bind(f.repository);
+    t.mock.method(
+      f.repository,
+      "releaseOutput",
+      (placement: WorktreePlacement, expectedHead: string) => {
+        releaseCalls++;
+        return releaseOutput(placement, expectedHead);
+      },
+    );
+    const interruptedFinish = t.mock.method(f.store, "finishCleanup", () =>
+      // oxlint-disable-next-line effecttsgo/global-error-in-effect-failure -- This test deliberately interrupts the post-release cleanup checkpoint.
+      Effect.fail(new Error("simulated cleanup checkpoint interruption")),
+    );
+    await assert.rejects(
+      runRuntime(active.effects.releaseOutput(attempt.id, "Release malformed review output.")),
+      /simulated cleanup checkpoint interruption/,
+    );
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
+    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
+    assert.equal(releaseCalls, 1);
+
+    interruptedFinish.mock.restore();
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
+    await runRuntime(active.effects.releaseOutput(attempt.id, "Retry the completed release."));
+    assert.equal(releaseCalls, 1);
+    const worktrees = await git(f.root, "worktree", "list", "--porcelain");
+    assert.match(worktrees, new RegExp(`worktree ${f.root}`));
+    assert.doesNotMatch(worktrees, new RegExp(placement.path));
+    assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), destinationHead);
+  } finally {
+    await f.dispose();
+  }
+});
+
 await test("shared research sees dirty tracked and untracked files and leaves them untouched after closure and retry", async () => {
   const f = await fixture();
   try {
@@ -1430,10 +1582,17 @@ await test("dirty isolated trees cannot settle a successful no-change implementa
       }),
     );
     await runRuntime(active.effects.reconcile);
-    const state = await runRuntime(active.effects.reconcile);
+    let state = await runRuntime(active.effects.reconcile);
     assert.equal(state.results[0]?.validity, "invalid");
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
+    assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    assert.equal(await runRuntime(f.repository.head()), base);
+    const attempt = required(state.attempts[0], "dirty no-change attempt");
+    await runRuntime(active.effects.releaseOutput(attempt.id, "Release dirty no-change output."));
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
     assert.equal(await runRuntime(f.repository.head()), base);
   } finally {
     await f.dispose();
@@ -1640,10 +1799,17 @@ await test("registered maintained changes preserve identity, apply explicitly, a
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
     const sourceCommit = implementationOutcome.report.reportedCommit;
     const implementationPath = required(f.workers.requests[0], "implementation worker").cwd;
-    const implementationBranch = worktreeBranch(
-      await git(f.root, "worktree", "list", "--porcelain"),
-      implementationPath,
+    const implementationBranch =
+      (await git(f.root, "branch", "--list", "pi-workgraph/*"))
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.length > 0) ??
+      assert.fail("Expected a retained implementation branch.");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(implementationPath),
+      false,
     );
+    assert.equal(await git(f.root, "rev-parse", implementationBranch), sourceCommit);
     assert.equal(await git(f.root, "rev-parse", "HEAD"), initialDestinationHead);
     const destinationHead = await git(f.root, "rev-parse", "HEAD");
 
@@ -1834,10 +2000,16 @@ await test("retained candidate corrections apply their complete history and keep
         ? required(firstResult.report.commit, "first candidate commit")
         : assert.fail("First candidate must be a changed implementation.");
     assert.deepEqual(firstAttempt.candidate, { kind: "initial", rootCommit: base });
-    const parentPath =
+    const parentBranch =
       firstAttempt.placement?.kind === "isolated_worktree"
-        ? firstAttempt.placement.path
-        : assert.fail("First candidate must retain an isolated worktree.");
+        ? firstAttempt.placement.branch
+        : assert.fail("First candidate must retain an isolated placement.");
+    assert.equal(
+      (await git(f.root, "worktree", "list", "--porcelain")).includes(
+        firstAttempt.placement?.kind === "isolated_worktree" ? firstAttempt.placement.path : "",
+      ),
+      false,
+    );
 
     // SAFETY: This fixture updates only the known SQLite aggregate row to remove optional candidate metadata.
     const persistedRow = SqliteWorkstreamDatabase.use(f.store.path, (database) =>
@@ -1922,11 +2094,15 @@ await test("retained candidate corrections apply their complete history and keep
     assert.equal(await runRuntime(f.repository.head()), dirtyHead);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), beforeApplyBytes);
     assert.equal(await readFile(fixtureDirt, "utf8"), "fixture-owned dirt\n");
-    const correctionPath =
+    const correctionBranch =
       correctionAttempt.placement?.kind === "isolated_worktree"
-        ? correctionAttempt.placement.path
-        : assert.fail("Correction must retain its worktree before application.");
-    assert.match(await git(f.root, "worktree", "list", "--porcelain"), new RegExp(correctionPath));
+        ? correctionAttempt.placement.branch
+        : assert.fail("Correction must retain its exact output branch.");
+    assert.doesNotMatch(
+      await git(f.root, "worktree", "list", "--porcelain"),
+      /\.pi-workgraph-worktrees/,
+    );
+    assert.equal(await git(f.root, "rev-parse", correctionBranch), correctionCommit);
 
     await rm(fixtureDirt);
     assert.equal(await runRuntime(f.repository.status()), "");
@@ -1952,10 +2128,11 @@ await test("retained candidate corrections apply their complete history and keep
     );
     assert.equal(completed.lifecycle.state, "completed");
     assert.deepEqual(completed.completion?.accounting, []);
-    assert.match(await git(f.root, "worktree", "list", "--porcelain"), new RegExp(parentPath));
+    assert.equal(await git(f.root, "rev-parse", parentBranch), firstCommit);
+    assert.equal(await git(f.root, "branch", "--list", correctionBranch), "");
     assert.doesNotMatch(
       await git(f.root, "worktree", "list", "--porcelain"),
-      new RegExp(state.attempts[1]?.placement?.path ?? "\\bdoes-not-exist\\b"),
+      /\.pi-workgraph-worktrees/,
     );
   } finally {
     await f.dispose();
@@ -2005,10 +2182,10 @@ await test("moved candidate application is blocked without mutation and supports
       result.report.outcome === "changed"
         ? required(result.report.commit, "retained candidate commit")
         : assert.fail("Expected changed candidate.");
-    const parentPath =
+    const parentBranch =
       parent.placement?.kind === "isolated_worktree"
-        ? parent.placement.path
-        : assert.fail("Candidate must retain its worktree.");
+        ? parent.placement.branch
+        : assert.fail("Candidate must retain its exact output branch.");
 
     await writeFile(join(f.root, "value.txt"), "moved\n");
     await git(f.root, "add", ".");
@@ -2022,7 +2199,7 @@ await test("moved candidate application is blocked without mutation and supports
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(await runRuntime(f.repository.head()), moved);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "moved\n");
-    assert.match(await git(f.root, "worktree", "list", "--porcelain"), new RegExp(parentPath));
+    assert.equal(await git(f.root, "rev-parse", parentBranch), parentCommit);
 
     await runRuntime(
       active.effects.queue(
@@ -2063,7 +2240,7 @@ await test("moved candidate application is blocked without mutation and supports
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "integrated\n");
     assert.equal(state.attempts[1]?.application?.rootCommit, moved);
     assert.deepEqual(state.attempts[1]?.application?.commits, [integrationCommit]);
-    assert.match(await git(f.root, "worktree", "list", "--porcelain"), new RegExp(parentPath));
+    assert.equal(await git(f.root, "rev-parse", parentBranch), parentCommit);
     assert.notEqual(original, moved);
   } finally {
     await f.dispose();
@@ -2088,8 +2265,14 @@ await test("wrong-mode and stale maintained results remain retained without appl
     await runRuntime(active.effects.reconcile);
     let state = await runRuntime(active.effects.reconcile);
     assert.equal(state.results[0]?.validity, "invalid");
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
+    await runRuntime(
+      active.effects.releaseOutput(
+        required(state.attempts[0], "invalid output attempt").id,
+        "Release malformed output after inspection.",
+      ),
+    );
     f.workers.onWork = async (request) => {
       await writeFile(join(request.cwd, "value.txt"), "stale\n");
       await git(request.cwd, "add", ".");
@@ -2614,7 +2797,7 @@ await test("registered cancellation retains an experiment through completion unt
       attempt: experimentAttempt.handle,
     });
     const recoveryView = decodeTestValue(RecoveryInspectionDetailsSchema, recovery.details);
-    assert.equal(recoveryView.inspection.recordedFacts.cleanup.state, "completed");
+    assert.equal(recoveryView.inspection.recordedFacts.cleanup.state, "blocked");
     assert.equal(recoveryView.inspection.recordedFacts.cleanup.workerClosed, true);
     assert.equal(recoveryView.inspection.recordedFacts.retainedOutput.state, "retained");
     assert.equal(recoveryView.inspection.recordedFacts.retainedOutput.path, experimentWorker.cwd);
@@ -2625,19 +2808,13 @@ await test("registered cancellation retains an experiment through completion unt
     );
     assert.ok((await git(f.root, "branch", "--list", experimentBranch)).includes(experimentBranch));
 
-    const completed = await f.call("workgraph_complete", {
-      conclusion: "The cancelled experiment remains available for inspection.",
-      evidence: [{ label: "retained output", observation: "The cancelled worktree is intact." }],
-      limitations: [],
-    });
-    const completedView = decodeTestValue(CompletionActionDetailsSchema, completed.details).view;
-    assert.equal(completedView.workstream.lifecycle, "completed");
-    assert.equal(completedView.action.name, "workgraph_complete");
-    const completion = await f.call("workgraph_inspect", { section: "completion" });
-    assert.equal(
-      decodeTestValue(CompletionInspectionDetailsSchema, completion.details).inspection
-        .completionRecorded,
-      true,
+    await assert.rejects(
+      f.call("workgraph_complete", {
+        conclusion: "The cancelled experiment remains available for inspection.",
+        evidence: [{ label: "retained output", observation: "The cancelled worktree is intact." }],
+        limitations: [],
+      }),
+      /settled and cleaned up/,
     );
     assert.equal(await readFile(retainedFile, "utf8"), "retained after cancellation\n");
     assert.equal(
@@ -2670,6 +2847,12 @@ await test("retained-output release uses the cleanup fence after worktree absenc
   for (const movedBranch of [false, true]) {
     const f = await registeredFixture();
     try {
+      f.workers.onWork = async (request) => {
+        await writeFile(join(request.cwd, "experiment.txt"), "experiment\n");
+        await git(request.cwd, "add", ".");
+        await git(request.cwd, "commit", "-m", "Successful experiment");
+        return researchReport;
+      };
       await f.input("Inspect a disposable output and decide when it can be released.", "rpc");
       await f.call("workgraph_intent", {
         statement: "Inspect and explicitly release the disposable output when finished.",
@@ -2708,14 +2891,18 @@ await test("retained-output release uses the cleanup fence after worktree absenc
       }, "retained output cleanup");
       const { attempt, worker, recoveryView } = settled;
       const placementPath = worker.cwd;
-      const worktrees = await git(f.root, "worktree", "list", "--porcelain");
-      const placementBranch = worktreeBranch(worktrees, placementPath);
+      const placementBranch =
+        (await git(f.root, "branch", "--list", "pi-workgraph/*"))
+          .split("\n")
+          .map((line) => line.trim())
+          .find((line) => line.length > 0) ?? assert.fail("Expected a retained experiment branch.");
       const expectedHead = await git(f.root, "rev-parse", placementBranch);
       assert.equal(recoveryView.recordedFacts.retainedOutput.state, "retained");
-      assert.equal(recoveryView.recordedFacts.retainedOutput.path, placementPath);
+      assert.equal(recoveryView.recordedFacts.retainedOutput.checkout, "removed");
+      assert.equal(recoveryView.recordedFacts.retainedOutput.path, undefined);
+      assert.equal(recoveryView.recordedFacts.retainedOutput.branch, placementBranch);
       assert.equal(recoveryView.recordedFacts.retainedOutput.releaseState, undefined);
 
-      await git(f.root, "worktree", "remove", placementPath);
       assert.equal(
         (await git(f.root, "worktree", "list", "--porcelain")).includes(placementPath),
         false,
@@ -2861,7 +3048,7 @@ await test("working cancellation stays pending and quiet until the exact worker 
     f.workers.status = "idle";
     state = await runRuntime(active.effects.reconcile);
     assert.equal(state.attempts[0]?.state, "cancelled");
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.equal(state.results.length, 0);
     assert.deepEqual(f.workers.cleanupIdentities[2], worker);
@@ -2915,7 +3102,7 @@ await test("reconcile proves exact absence after closure before its worker check
     f.workers.absent = true;
     state = await runRuntime(active.effects.reconcile);
     assert.equal(state.attempts[0]?.state, "cancelled");
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.equal(state.results.length, 0);
     assert.deepEqual(f.workers.cleanupIdentities, [worker, worker]);
@@ -2968,18 +3155,10 @@ await test("checkpointed retained cleanup closes an absent worker without deleti
     assert.equal(await readFile(join(placement.path, "value.txt"), "utf8"), "initial\n");
 
     f.workers.absent = true;
-    const observe = t.mock.method(f.workers, "observe", () =>
-      assert.fail("settled cleanup must not use general worker observation"),
-    );
-    const finishCleanup = t.mock.method(f.store, "finishCleanup", () => Effect.never);
-    await assert.rejects(runRuntime(active.effects.reconcile.pipe(Effect.timeout("100 millis"))));
-    observe.mock.restore();
-    finishCleanup.mock.restore();
-
-    state = await runRuntime(f.store.load());
-    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
+    state = await runRuntime(active.effects.reconcile);
+    assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
-    assert.equal(state.attempts[0]?.error, undefined);
+    assert.match(state.attempts[0]?.cleanup?.error ?? "", /not clean|dirty worktree/);
     assert.deepEqual(state.results, [retainedResult]);
     assert.deepEqual(f.workers.cleanupIdentities, [worker, worker]);
     assert.equal(
@@ -2990,11 +3169,10 @@ await test("checkpointed retained cleanup closes an absent worker without deleti
     assert.equal(await readFile(join(placement.path, "value.txt"), "utf8"), "initial\n");
 
     state = await runRuntime(active.effects.reconcile);
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
-    assert.equal(state.attempts[0]?.error, undefined);
+    assert.match(state.attempts[0]?.error ?? "", /not clean|dirty worktree/);
     assert.deepEqual(state.results, [retainedResult]);
-    assert.deepEqual(f.workers.cleanupIdentities, [worker, worker]);
     assert.equal(
       (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
       true,
@@ -3047,14 +3225,14 @@ await test("checkpointed non-retained isolated cleanup stays pending for diagnos
     assert.equal(state.attempts[0]?.cleanup?.state, "pending");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     state = await runRuntime(active.effects.reconcile);
-    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
-    assert.match(state.attempts[0]?.error ?? "", /Cleanup was interrupted/);
+    assert.equal(state.attempts[0]?.error, undefined);
     assert.equal(state.attempts[0]?.resultId !== undefined, true);
     assert.equal(base, await runRuntime(f.repository.head()));
-    assert.equal(
-      (await git(f.root, "worktree", "list", "--porcelain")).includes(placement.path),
-      true,
+    assert.doesNotMatch(
+      await git(f.root, "worktree", "list", "--porcelain"),
+      new RegExp(placement.path),
     );
   } finally {
     await f.dispose();
@@ -3121,7 +3299,7 @@ await test("pre-session cancellation cleans only the known placement and never l
     await runRuntime(active.effects.cancel(attempt.id));
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.state, "cancelled");
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+    assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.outputRelease, undefined);
     assert.equal(f.workers.requests.length, 0);
     assert.ok(attempt.placement);

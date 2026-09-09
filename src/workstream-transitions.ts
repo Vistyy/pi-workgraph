@@ -79,20 +79,104 @@ export function startAttemptTransition(
   attempt.submission = "not_sent";
 }
 
-/** Whether normal cleanup retains an isolated checkout as coordinator-owned output. */
+/** The only successful isolated outputs whose exact branch remains useful after compaction. */
 export function cleanupRetainsOutput(
   assignment: WorkAssignment,
   attempt: WorkAttempt,
   result: WorkResult | undefined,
 ): boolean {
-  const noChange =
-    result?.validity === "typed" &&
-    result.report.kind === "implementation" &&
-    result.report.status === "completed" &&
-    result.report.outcome === "no_change";
+  if (attempt.state === "cancelled") return false;
+  if (result?.validity !== "typed" || result.report.status !== "completed") return false;
   return (
-    assignment.artifactIntent === "disposable_experiment" ||
-    (assignment.capability === "implement" && attempt.application?.state !== "applied" && !noChange)
+    (assignment.artifactIntent === "disposable_experiment" &&
+      (attempt.baseRevision === undefined ||
+        (attempt.cleanup?.expectedHead !== undefined &&
+          attempt.cleanup.expectedHead !== attempt.baseRevision))) ||
+    (assignment.capability === "implement" &&
+      result.report.kind === "implementation" &&
+      result.report.outcome === "changed" &&
+      attempt.application?.state !== "applied")
+  );
+}
+
+/** The historical artifact that proves a checkout may still physically exist. */
+function hasLegacyRetainedOutputWorktree(
+  attempt: WorkAttempt,
+  result: WorkResult | undefined,
+): boolean {
+  const placement = attempt.placement;
+  return (
+    placement?.kind === "isolated_worktree" &&
+    result?.artifacts.some(
+      (artifact) =>
+        artifact.id === "retained-output-worktree" &&
+        artifact.kind === "path" &&
+        artifact.reference === placement.path &&
+        artifact.retention === "retained",
+    ) === true
+  );
+}
+
+function hasRetainedOutputBranch(attempt: WorkAttempt, result: WorkResult | undefined): boolean {
+  const placement = attempt.placement;
+  return (
+    placement?.kind === "isolated_worktree" &&
+    result?.artifacts.some(
+      (artifact) =>
+        artifact.id === "retained-output-branch" &&
+        artifact.kind === "reference" &&
+        artifact.reference === placement.branch &&
+        artifact.retention === "retained",
+    ) === true
+  );
+}
+
+/** Whether exact closed output still owns resources that explicit release may destroy. */
+export function cleanupHasReleasableOutput(
+  assignment: WorkAssignment,
+  attempt: WorkAttempt,
+  result: WorkResult | undefined,
+): boolean {
+  if (attempt.placement?.kind !== "isolated_worktree" || attempt.cleanup?.workerClosed !== true)
+    return false;
+  if (attempt.cleanup.state === "blocked") return true;
+  if (attempt.cleanup.state !== "completed") return false;
+  return (
+    cleanupRetainsOutput(assignment, attempt, result) ||
+    hasLegacyRetainedOutputWorktree(attempt, result) ||
+    hasRetainedOutputBranch(attempt, result)
+  );
+}
+
+/** Successful clean isolated output with no useful branch may be removed automatically. */
+export function cleanupCanRemoveOutput(
+  assignment: WorkAssignment,
+  attempt: WorkAttempt,
+  result: WorkResult | undefined,
+): boolean {
+  if (attempt.state === "cancelled") return false;
+  return (
+    result?.validity === "typed" &&
+    result.report.status === "completed" &&
+    !cleanupRetainsOutput(assignment, attempt, result)
+  );
+}
+
+/** Failed, cancelled, malformed, or uncertain output must remain for explicit release. */
+export function cleanupMustPreserveOutput(
+  assignment: WorkAssignment,
+  attempt: WorkAttempt,
+  result: WorkResult | undefined,
+): boolean {
+  if (attempt.state === "cancelled") return true;
+  if (
+    assignment.artifactIntent !== "disposable_experiment" &&
+    attempt.placement?.kind !== "isolated_worktree"
+  )
+    return false;
+  return (
+    !cleanupRetainsOutput(assignment, attempt, result) &&
+    !cleanupCanRemoveOutput(assignment, attempt, result)
   );
 }
 
@@ -163,13 +247,18 @@ export function accountingIdentity(item: CompletionAccounting): string {
   return `${item.kind}:${item.resultId}`;
 }
 
-export function hasActiveOrUncleanAttempt(_state: WorkstreamState, attempt: WorkAttempt): boolean {
+export function hasActiveOrUncleanAttempt(state: WorkstreamState, attempt: WorkAttempt): boolean {
   if (["queued", "starting", "running", "cancel_requested"].includes(attempt.state)) return true;
   if (attempt.placement === undefined) return false;
   if (attempt.cleanup?.state !== "completed" || attempt.cleanup.workerClosed !== true) return true;
   if (attempt.application?.state === "pending" || attempt.application?.state === "blocked")
     return true;
-  return attempt.outputRelease?.state === "pending" || attempt.outputRelease?.state === "blocked";
+  if (attempt.outputRelease?.state === "pending" || attempt.outputRelease?.state === "blocked")
+    return true;
+  return (
+    attempt.outputRelease?.state !== "completed" &&
+    hasLegacyRetainedOutputWorktree(attempt, resultForAttempt(state, attempt))
+  );
 }
 
 function assignmentResolved(state: WorkstreamState, assignment: WorkAssignment): boolean {

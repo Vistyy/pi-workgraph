@@ -492,6 +492,23 @@ void test("output projections follow cleanup ownership and retain uncertainty", 
   assertOutputProjection(current, experimentResult.id, "experiment-attempt", "retained", [
     "release_output",
   ]);
+  const legacy = structuredClone(current);
+  const legacyResult = required(
+    legacy.results.find((result) => result.id === experimentResult.id),
+    "legacy experiment result",
+  );
+  legacyResult.artifacts = [
+    {
+      id: "retained-output-worktree",
+      kind: "path",
+      reference: "/tmp/experiment",
+      retention: "retained",
+      summary: "Historical physical output.",
+    },
+  ];
+  const legacySettlement = settlementProjection(legacy, experimentResult.id);
+  assert.equal(legacySettlement.retainedOutput.checkout, "preserved_or_uncertain");
+  assert.equal(legacySettlement.retainedOutput.path, "/tmp/experiment");
 
   const retainedAttempt = required(
     attempts.find((item) => item.id === "changed-attempt"),
@@ -505,7 +522,14 @@ void test("output projections follow cleanup ownership and retain uncertainty", 
   );
   const invalidState = state(
     [changed],
-    [{ ...retainedAttempt, id: "invalid-attempt", resultId: invalidResult.id }],
+    [
+      {
+        ...retainedAttempt,
+        id: "invalid-attempt",
+        resultId: invalidResult.id,
+        cleanup: { state: "blocked" as const, workerClosed: true, error: "Malformed output." },
+      },
+    ],
     [invalidResult],
   );
   assertOutputProjection(invalidState, invalidResult.id, "invalid-attempt", "retained", [
@@ -521,7 +545,14 @@ void test("output projections follow cleanup ownership and retain uncertainty", 
   });
   const failedState = state(
     [changed],
-    [{ ...retainedAttempt, id: "failed-attempt", resultId: failedResult.id }],
+    [
+      {
+        ...retainedAttempt,
+        id: "failed-attempt",
+        resultId: failedResult.id,
+        cleanup: { state: "blocked" as const, workerClosed: true, error: "Failed output." },
+      },
+    ],
     [failedResult],
   );
   assertOutputProjection(failedState, failedResult.id, "failed-attempt", "retained", [
@@ -554,7 +585,10 @@ void test("output projections follow cleanup ownership and retain uncertainty", 
   assert.equal(uncertainSettlement.retainedOutput.state, "retained");
   assert.equal(uncertainSettlement.retainedOutput.path, "/tmp/review");
   assert.equal(uncertainSettlement.cleanup.state, "blocked");
-  assert.deepEqual(recoveryActions(uncertain, reviewAttempt.id), []);
+  assert.deepEqual(
+    recoveryActions(uncertain, reviewAttempt.id).map((action) => action.action),
+    ["release_output"],
+  );
 });
 
 void test("typed report kinds and untyped or malformed reports remain inspectable", () => {

@@ -1,6 +1,6 @@
 import { candidateLineageForAttempt } from "./candidate.js";
 import type { WorkAssignment, WorkAttempt, WorkResult, WorkstreamState } from "./workstream.js";
-import { cleanupRetainsOutput } from "./workstream-transitions.js";
+import { cleanupHasReleasableOutput } from "./workstream-transitions.js";
 
 const DEFAULT_CHARS = 3_000;
 const MAX_CHARS = 8_000;
@@ -82,6 +82,15 @@ interface Selection {
   taskAttempts: WorkAttempt[];
   taskOutcomes: WorkResult[];
 }
+
+type RetainedOutputProjection = {
+  state: "retained";
+  branch: string;
+  checkout: "removed" | "preserved_or_uncertain";
+  path?: string;
+  releaseState: "pending" | "blocked" | "completed" | undefined;
+  blocker: string | undefined;
+};
 
 function compactText(value: string, max = PREVIEW_CHARS): string {
   const text = value.replace(/\s+/g, " ").trim();
@@ -402,15 +411,26 @@ function outputDisposition(
     return { state: "not_applicable" as const };
   const release = attempt.outputRelease;
   if (release?.state === "completed")
-    return { state: "released" as const, path: placement.path, releaseState: release.state };
-  if (!cleanupRetainsOutput(task, attempt, result) && attempt.cleanup?.state === "completed")
+    return {
+      state: "released" as const,
+      branch: placement.branch,
+      checkout: "removed" as const,
+      releaseState: release.state,
+    };
+  if (attempt.cleanup?.state === "completed" && !cleanupHasReleasableOutput(task, attempt, result))
     return { state: "not_applicable" as const };
-  return {
-    state: "retained" as const,
-    path: placement.path,
+  const legacyPhysicalOutput =
+    result?.artifacts.some((artifact) => artifact.id === "retained-output-worktree") === true;
+  const compacted = attempt.cleanup?.state === "completed" && !legacyPhysicalOutput;
+  const output: RetainedOutputProjection = {
+    state: "retained",
+    branch: placement.branch,
+    checkout: compacted ? "removed" : "preserved_or_uncertain",
     releaseState: release?.state,
     blocker: release?.error === undefined ? undefined : compactText(release.error, 280),
   };
+  if (!compacted) output.path = placement.path;
+  return output;
 }
 
 function cleanupProjection(attempt: WorkAttempt | undefined) {
@@ -907,7 +927,8 @@ function retainedOutputActions(state: WorkstreamState, task: WorkAssignment, att
   const result = attempt.resultId === undefined ? undefined : resultById(state, attempt.resultId);
   if (
     outputDisposition(task, attempt, result).state !== "retained" ||
-    attempt.cleanup?.state !== "completed"
+    !["blocked", "completed"].includes(attempt.cleanup?.state ?? "") ||
+    attempt.cleanup?.workerClosed !== true
   )
     return [];
   const actions = [
@@ -920,6 +941,7 @@ function retainedOutputActions(state: WorkstreamState, task: WorkAssignment, att
   ];
   if (
     task.capability === "implement" &&
+    attempt.cleanup?.state === "completed" &&
     attempt.state === "settled" &&
     attempt.application === undefined &&
     attempt.outputRelease === undefined &&

@@ -159,7 +159,10 @@ void test("Git placements preserve unknown data; cleanup requires exact clean id
       commit,
       changedFiles: ["data.txt"],
     });
-    await assert.rejects(() => runGit(f.repository.cleanupWorktree(placement, f.base)), /HEAD is/);
+    await assert.rejects(
+      () => runGit(f.repository.cleanupWorktree(placement, f.base)),
+      /branch .* expected|HEAD is/,
+    );
     assert.equal(await readFile(join(placement.path, "data.txt"), "utf8"), "maintained\n");
     assert.equal(
       (await runGit(f.repository.cleanupWorktree(placement, commit))).state,
@@ -170,6 +173,76 @@ void test("Git placements preserve unknown data; cleanup requires exact clean id
       "completed",
     );
     assert.equal(await readFile(join(unknown, "mine.txt"), "utf8"), "unattributed bytes");
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("successful compaction retains an exact branch and supports branch-only validation and release", async () => {
+  const f = await fixture();
+  try {
+    const placement = await runGit(f.repository.createWorktree("run", "candidate", f.base));
+    await writeFile(join(placement.path, "data.txt"), "candidate\n");
+    await git(placement.path, "add", ".");
+    await git(placement.path, "commit", "-m", "Candidate");
+    const commit = await runGit(f.repository.head(placement.path));
+    assert.equal(
+      (await runGit(f.repository.cleanupWorktree(placement, commit, true))).state,
+      "completed",
+    );
+    assert.equal(
+      (await git(f.root, "branch", "--list", placement.branch)).trim(),
+      placement.branch,
+    );
+    await assert.rejects(readFile(placement.path, "utf8"));
+    const validated = await runGit(f.repository.validateCandidate(placement, f.base, commit));
+    assert.deepEqual(validated, {
+      commit,
+      changedFiles: ["data.txt"],
+      rootCommit: f.base,
+      commits: [commit],
+    });
+    assert.equal(
+      (await runGit(f.repository.cleanupWorktree(placement, commit, true))).state,
+      "completed",
+    );
+    assert.equal((await runGit(f.repository.releaseOutput(placement, commit))).state, "completed");
+    assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("branch-only candidate validation fences the final retained ref observation", async () => {
+  const f = await fixture();
+  try {
+    const placement = await runGit(f.repository.createWorktree("run", "fenced", f.base));
+    await writeFile(join(placement.path, "candidate.txt"), "candidate\n");
+    await git(placement.path, "add", ".");
+    await git(placement.path, "commit", "-m", "Candidate");
+    const commit = await runGit(f.repository.head(placement.path));
+    await runGit(f.repository.cleanupWorktree(placement, commit, true));
+    const moved = "f".repeat(40);
+    const branchRef = `refs/heads/${placement.branch}`;
+    let observations = 0;
+    const repository = new GitRepository(
+      f.root,
+      f.repository.commonDir,
+      interceptProcess((request) => {
+        if (request.args.join("\\0") !== `rev-parse\\0--verify\\0--quiet\\0${branchRef}`)
+          return undefined;
+        observations += 1;
+        return observations === 2
+          ? Effect.succeed(processResult({ stdout: `${moved}\\n` }))
+          : undefined;
+      }),
+    );
+    await assert.rejects(
+      () => runGit(repository.validateCandidate(placement, f.base, commit)),
+      /moved during validation/,
+    );
+    assert.equal(await git(f.root, "rev-parse", branchRef), commit);
+    assert.equal(await runGit(repository.head()), f.base);
   } finally {
     await rm(f.parent, { recursive: true, force: true });
   }
