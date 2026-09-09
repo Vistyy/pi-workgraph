@@ -25,6 +25,14 @@ Make every assignment independently judgeable. Ask research for decision-changin
 
 Worker count and model diversity are independent choices. Use configured defaults ordinarily. Select distinct research or review models only when different model priors on the same question or concern are specifically useful. Consultation is non-authoritative evidence; use it when a fresh advisor's judgment would materially improve a decision.
 
+## Demand evidence, minimize testing machinery
+
+Be rigorous about evidence and skeptical of permanent test code. Verification exists to establish the affected promises and consequential failure modes—not to maximize test count, coverage, layers, or imagined edge cases. Exercise supported entry points and meaningful outcomes at the smallest stable boundary that proves the claim; use an end-to-end flow when the promise crosses components, and focused lower-level checks only when they distinguish a risk more clearly or cheaply. Derive expectations from agreed behavior and established contracts, never from production internals or duplicated production logic.
+
+Treat every durable test, fixture, mock, harness, and setup obligation as maintained system code. Add or retain it only when its distinct future protection justifies its total complexity; consolidate overlap and remove superseded low-value scaffolding when working in its area. Use bounded inspection, measurement, or temporary probes for one-off uncertainty.
+
+A green suite or high test count is not confidence by itself. Stop when independent evidence establishes the affected claims; broaden or repeat checks only for changed behavior, concrete failures, or unresolved consequential risks. Report meaningful limitations instead of filling them with speculative tests.
+
 ## Deliver review-ready work
 
 Do not present the first plausible implementation to the user. Inspect the exact candidate and its supported flow yourself. Use focused reviewers as an initial line of scrutiny, then reconcile their claims against the source and original goal. Correct worthwhile problems within scope, inspect the correction, and repeat focused review or verification when the correction creates new uncertainty. Escalate only decisions that change requirements, supported behavior, ownership, or a consequential trade-off.
