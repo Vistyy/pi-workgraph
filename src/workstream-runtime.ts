@@ -32,6 +32,7 @@ import type {
   WorktreePlacement,
 } from "./git.js";
 import {
+  type HerdrObservation,
   type HerdrProtocolError,
   herdrWorkerName,
   type WorkerLaunchEffectRequest,
@@ -45,8 +46,6 @@ import {
   loadModelPolicyEffect,
   type ModelPolicy,
   type ModelPolicyError,
-  type ModelTarget,
-  ModelTargetSchema,
   resolveSelection,
   resolveTargetOverride,
   type SelectionRequest,
@@ -54,17 +53,14 @@ import {
 } from "./model-policy.js";
 import type {
   createWorkerSessionEffect,
-  ModelPreflight,
   NativeFailureCategory,
-  NativeSubmissionEvidence,
   PiSessionError,
-  ProviderAvailabilityEvidence,
 } from "./pi-process.js";
 import type { WorkgraphRegistry } from "./registry.js";
 import type { WorkerIdentity } from "./types.js";
 import type {
   CandidateLineage,
-  ConsultationPhase,
+  ResearchEvidenceProjection,
   StoreEffect,
   WorkAssignment,
   WorkAttempt,
@@ -608,6 +604,21 @@ export class WorkstreamRuntime {
       function* (this: WorkstreamRuntime) {
         const currentState = yield* this.storeEffect((store) => store.load());
         const current = findAttempt(currentState, item.id);
+        if (
+          current.state === "running" &&
+          current.consultation?.phase === "enricher" &&
+          current.consultation.frozenEvidence !== undefined &&
+          current.cleanup !== undefined
+        ) {
+          yield* this.cleanup(item.id);
+          const afterCleanup = findAttempt(
+            yield* this.storeEffect((store) => store.load()),
+            item.id,
+          );
+          if (afterCleanup.state === "running" && afterCleanup.cleanup?.state === "completed")
+            yield* this.storeEffect((store) => store.transitionConsultationToAdvisor(item.id));
+          return;
+        }
         if (yield* this.preserveExistingBoundary(currentState, current)) return;
         yield* canRetryCleanupBoundary(currentState, current)
           ? this.cleanup(item.id)
@@ -714,7 +725,7 @@ export class WorkstreamRuntime {
           yield* this.cleanup(id);
           return;
         }
-        if (requiresLaunch(attempt) || isConsultationAdvisorReady(attempt, assignment)) {
+        if (requiresLaunch(attempt)) {
           if (state.lifecycle.state === "active")
             yield* this.launchAttempt(state, attempt, assignment);
           return;
@@ -744,21 +755,46 @@ export class WorkstreamRuntime {
             : initial;
         const worker = required(attempt.worker, "worker identity");
         const observation = yield* this.workers.observe(worker);
+        if (yield* this.reconcileWorkerBoundary(state, attempt, assignment, observation)) return;
+        if (observation.status === "working" || observation.status === "blocked") return;
+        if (
+          assignment.capability === "consultation" &&
+          attempt.consultation?.phase === "enricher"
+        ) {
+          yield* this.reconcileConsultationEnricher(state, attempt, assignment);
+          return;
+        }
+        yield* this.retain(state, attempt, assignment);
+      }.bind(this),
+    );
+  }
+
+  private reconcileWorkerBoundary(
+    state: WorkstreamState,
+    attempt: WorkAttempt,
+    assignment: WorkAssignment,
+    observation: HerdrObservation,
+  ): RuntimeEffect<boolean> {
+    return Effect.gen(
+      function* (this: WorkstreamRuntime) {
+        const worker = required(attempt.worker, "worker identity");
         const pi = runtimePi;
         const started = pi.started(worker.sessionFile, state.id, attempt.id);
         if (started && attempt.submission !== "started")
           yield* this.storeEffect((store) => store.markSubmission(attempt.id, "started"));
-        if (yield* this.resumeUnsentWorker(state, attempt, observation.status, started)) return;
-        if (!pi.settled(worker.sessionFile, state.id, attempt.id)) {
-          yield* this.validateUnsettledWorker(attempt, observation.status, started);
-          return;
-        }
-        if (observation.status === "working" || observation.status === "blocked") return;
-        if (assignment.capability === "consultation") {
-          yield* this.reconcileConsultationSettlement(state, attempt, assignment);
-          return;
-        }
-        yield* this.retain(state, attempt, assignment);
+        if (
+          assignment.capability !== "consultation" &&
+          (yield* this.resumeUnsentWorker(state, attempt, observation.status, started))
+        )
+          return true;
+        if (pi.settled(worker.sessionFile, state.id, attempt.id)) return false;
+        yield* this.validateUnsettledWorker(
+          attempt,
+          observation.status,
+          started,
+          assignment.capability === "consultation",
+        );
+        return true;
       }.bind(this),
     );
   }
@@ -809,8 +845,13 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     status: "idle" | "working" | "blocked" | "done" | "unknown",
     started: boolean,
+    consultation: boolean,
   ): RuntimeEffect<void> {
     return this.runtimeSync("validate unsettled worker", () => {
+      if (consultation && attempt.submission === "not_sent" && !started)
+        throw new Error(
+          "Consultation launch has no native submission checkpoint; no automatic resend is permitted. Inspect the retained session before retrying.",
+        );
       if (status === "blocked")
         throw new Error("Worker is blocked; inspect its visible session before proceeding.");
       if (attempt.submission === "uncertain" && !started)
@@ -870,8 +911,6 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     assignment: WorkAssignment,
   ): RuntimeEffect<void> {
-    if (assignment.capability === "consultation" && attempt.consultation?.phase === "advisor")
-      return this.launchConsultationAdvisor(state, attempt, assignment);
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const isolated = requiresIsolatedPlacement(
@@ -929,81 +968,6 @@ export class WorkstreamRuntime {
     );
   }
 
-  private reconcileConsultationSettlement(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        if (attempt.consultation?.phase === "enricher")
-          yield* this.reconcileConsultationEnricher(state, attempt, assignment);
-        else yield* this.reconcileConsultationAdvisorSettlement(state, attempt, assignment);
-        const latest = yield* this.storeEffect((store) => store.load());
-        const advanced = findAttempt(latest, attempt.id);
-        if (advanced.resultId !== undefined)
-          yield* this.advanceRetainedResult(attempt.id, assignment);
-      }.bind(this),
-    );
-  }
-
-  private reconcileConsultationAdvisorSettlement(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const target = required(
-          attempt.consultation?.selectedAdvisor ?? attempt.models?.advisor,
-          "selected advisor",
-        );
-        const evidence = yield* consultationLaunchEvidence(
-          attempt,
-          { runId: state.id, nodeId: attempt.id },
-          target,
-        );
-        if (
-          assignment.advisorOverride !== undefined &&
-          consultationUnavailableBeforeSubmission(target, attempt, evidence)
-        ) {
-          yield* this.cancelUnavailableAdvisor(state, attempt, attempt.id);
-          const reason = required(
-            consultationFallbackReason(target, evidence),
-            "consultation unavailability reason",
-          );
-          yield* this.storeEffect((store) =>
-            store.recordAttention(attempt.id, `Exact advisor target unavailable: ${reason}`),
-          );
-        } else if (consultationFallbackAllowed(assignment, attempt, target, evidence))
-          yield* this.advanceConsultationAdvisorFallback(state, attempt, target, evidence);
-        else {
-          const terminalText = yield* runtimePi.advisorText(
-            required(attempt.sessionFile, "advisor session"),
-            { runId: state.id, nodeId: attempt.id },
-          );
-          if (
-            terminalText === undefined &&
-            consultationSubmissionUncertain(attempt, target, evidence)
-          ) {
-            const failure = yield* runtimePi.observeFailure(
-              required(attempt.sessionFile, "advisor session"),
-              { runId: state.id, nodeId: attempt.id },
-            );
-            const detail =
-              failure === undefined
-                ? "Advisor settled without terminal assistant text; submission may have occurred."
-                : `Advisor settled with ${failure}; submission may have occurred.`;
-            yield* this.storeEffect((store) =>
-              store.recordConsultationUncertainty(attempt.id, detail),
-            );
-          }
-          yield* this.retainConsultationAdvisor(state, attempt, assignment);
-        }
-      }.bind(this),
-    );
-  }
-
   private reconcileConsultationEnricher(
     state: WorkstreamState,
     attempt: WorkAttempt,
@@ -1013,329 +977,22 @@ export class WorkstreamRuntime {
       function* (this: WorkstreamRuntime) {
         const sessionFile = required(attempt.sessionFile, "enricher session");
         const generation = { runId: state.id, nodeId: attempt.id };
-        const packetRead = yield* runtimePi.enrichment(sessionFile, generation);
-        if (packetRead.packet === undefined) {
-          yield* this.retainConsultationFailure(
-            state,
-            attempt,
-            assignment,
-            packetRead.error ?? "The enricher did not produce a strict bounded packet.",
-          );
+        const read = yield* runtimePi.readReport(sessionFile, generation);
+        const report = read.report;
+        if (report === undefined || report.kind !== "research" || report.status !== "completed") {
+          // An invalid or non-completed enrichment uses the ordinary research result path;
+          // it is visible as the sole consultation outcome and never starts an advisor.
+          yield* this.retain(state, attempt, assignment);
           return;
         }
-        const packet = required(packetRead.packet, "enrichment packet");
-        const effective = yield* runtimePi.models(sessionFile, generation);
-        const phase = consultationPhaseRecord(
-          "enricher",
-          attempt,
-          attempt.models?.guide,
-          effective,
-        );
-        const packetId = `enrichment-${attempt.id}`;
         yield* this.storeEffect((store) =>
-          store.recordConsultationEnrichment({
+          store.recordConsultationEvidence({
             id: attempt.id,
-            packetId,
-            packet,
-            phase,
+            evidence: boundedResearchEvidence(report),
           }),
         );
-        const latest = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
-        const worker = required(latest.worker, "enricher worker identity");
-        const closed = yield* this.workers.cleanup(worker);
-        if (closed.state === "pending") return;
-        if (closed.state !== "completed")
-          return yield* this.runtimeSync("validate enricher cleanup", () => {
-            throw new Error(closed.detail || "Enricher cleanup was not proven complete.");
-          });
-        yield* this.storeEffect((store) => store.closeConsultationEnricher(attempt.id));
-      }.bind(this),
-    );
-  }
-
-  private retainConsultationFailure(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-    detail: string,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const sessionFile = required(attempt.sessionFile, "enricher session");
-        const generation = { runId: state.id, nodeId: attempt.id };
-        const report: WorkerReport = {
-          kind: "consultation",
-          status: "failed",
-          text: detail,
-          summary: "Consultation could not produce its required enrichment packet.",
-          evidence: [],
-          findings: [{ severity: "error", title: "Missing enrichment packet", detail }],
-        };
-        const resultId = attempt.resultId ?? `result-${attempt.id}`;
-        if (!state.results.some((item) => item.id === resultId))
-          yield* this.storeEffect((store) =>
-            store.retainResult({
-              id: resultId,
-              assignmentId: assignment.id,
-              assignmentIntentVersion: assignment.intentVersion,
-              validity: "typed",
-              report,
-            }),
-          );
-        const effectiveModels = yield* runtimePi.models(sessionFile, generation);
-        yield* this.storeEffect((store) =>
-          store.settleAttempt({ id: attempt.id, resultId, effectiveModels }),
-        );
-      }.bind(this),
-    );
-  }
-
-  private retainConsultationAdvisor(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const sessionFile = required(attempt.sessionFile, "advisor session");
-        const generation = { runId: state.id, nodeId: attempt.id };
-        const text = yield* runtimePi.advisorText(sessionFile, generation);
-        const effectiveModels = yield* runtimePi.models(sessionFile, generation);
-        const target = required(attempt.models?.advisor, "selected advisor");
-        const phase = consultationPhaseRecord("advisor", attempt, target, effectiveModels);
-        yield* this.storeEffect((store) =>
-          store.recordConsultationAdvisorPhase(attempt.id, phase, effectiveModels),
-        );
-        const resultId = attempt.resultId ?? `result-${attempt.id}`;
-        if (!state.results.some((item) => item.id === resultId)) {
-          const report: WorkerReport =
-            text !== undefined && text !== ""
-              ? {
-                  kind: "consultation",
-                  status: "completed",
-                  text,
-                  summary: "Advisor terminal text retained as consultation evidence.",
-                  evidence: [],
-                  findings: [],
-                }
-              : {
-                  kind: "consultation",
-                  status: "failed",
-                  text: "Advisor settled without terminal assistant text.",
-                  summary: "Consultation advisor produced no terminal assistant text.",
-                  evidence: [],
-                  findings: [
-                    {
-                      severity: "error",
-                      title: "Missing advisor text",
-                      detail:
-                        "The advisor session settled without a terminal assistant text response.",
-                    },
-                  ],
-                };
-          yield* this.storeEffect((store) =>
-            store.retainResult({
-              id: resultId,
-              assignmentId: assignment.id,
-              assignmentIntentVersion: assignment.intentVersion,
-              validity: "typed",
-              report,
-            }),
-          );
-        }
-        yield* this.storeEffect((store) =>
-          store.settleAttempt({ id: attempt.id, resultId, effectiveModels }),
-        );
-      }.bind(this),
-    );
-  }
-
-  private launchConsultationAdvisor(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const target = required(
-          attempt.consultation?.selectedAdvisor ?? attempt.models?.advisor,
-          "selected advisor",
-        );
-        yield* this.storeEffect((store) =>
-          store.recordConsultationAdvisorSelection(attempt.id, target),
-        );
-        const latest = findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id);
-        const workerCwd = state.projectRoot;
-        const sessionRequest = workerSessionRequest(
-          state,
-          latest,
-          assignment,
-          workerCwd,
-          latest.baseRevision,
-        );
-        const sessionFile = yield* runtimePi.createSession(sessionRequest);
-        yield* this.storeEffect((store) => store.recordSessionFile(attempt.id, sessionFile));
-        yield* this.ownershipEffect();
-        const models = required(latest.models, "consultation models");
-        yield* this.workers
-          .launch(
-            workerLaunchRequest(
-              this.launch.workspaceId,
-              state,
-              findAttempt(yield* this.storeEffect((store) => store.load()), attempt.id),
-              assignment,
-              workerCwd,
-              sessionFile,
-              { ...models, guide: target },
-              latest.baseRevision,
-              this.store,
-            ),
-          )
-          .pipe(
-            Effect.catch((error) =>
-              this.handleConsultationLaunchFailure(state, attempt.id, assignment, error),
-            ),
-          );
-      }.bind(this),
-    );
-  }
-
-  private handleConsultationLaunchFailure(
-    state: WorkstreamState,
-    attemptId: string,
-    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-    error: RuntimeError,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const latestState = yield* this.storeEffect((store) => store.load());
-        const attempt = findAttempt(latestState, attemptId);
-        const target = required(
-          attempt.consultation?.selectedAdvisor ?? attempt.models?.advisor,
-          "selected advisor",
-        );
-        const evidence = yield* consultationLaunchEvidence(
-          attempt,
-          { runId: state.id, nodeId: attemptId },
-          target,
-        );
-        yield* this.recordConsultationAdvisorPhaseIfNeeded(attemptId, attempt, target, evidence);
-        if (!consultationFallbackAllowed(assignment, attempt, target, evidence)) {
-          if (
-            assignment.advisorOverride !== undefined &&
-            consultationUnavailableBeforeSubmission(target, attempt, evidence)
-          ) {
-            yield* this.cancelUnavailableAdvisor(latestState, attempt, attemptId);
-            yield* this.storeEffect((store) => store.recordAttention(attemptId, error.message));
-            return;
-          }
-          return yield* this.blockConsultationAdvisor(
-            attemptId,
-            attempt,
-            target,
-            evidence,
-            error.message,
-          );
-        }
-        yield* this.advanceConsultationAdvisorFallback(latestState, attempt, target, evidence);
-      }.bind(this),
-    );
-  }
-
-  private recordConsultationAdvisorPhaseIfNeeded(
-    attemptId: string,
-    attempt: WorkAttempt,
-    target: ModelTarget,
-    evidence: { submission: NativeSubmissionEvidence },
-  ): RuntimeEffect<void> {
-    if (attempt.consultation?.advisor !== undefined || attempt.sessionFile === undefined)
-      return Effect.void;
-    const phase = consultationPhaseRecord("advisor", attempt, target, []);
-    if (evidence.submission === "submitted") phase.submission = "submitted";
-    return this.storeEffect((store) => store.recordConsultationAdvisorPhase(attemptId, phase));
-  }
-
-  private blockConsultationAdvisor(
-    attemptId: string,
-    attempt: WorkAttempt,
-    target: ModelTarget,
-    evidence: ConsultationLaunchEvidence,
-    detail: string,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        if (!consultationSubmissionUncertain(attempt, target, evidence)) {
-          yield* this.storeEffect((store) => store.recordAttention(attemptId, detail));
-          return;
-        }
-        if (attempt.submission === "not_sent") {
-          yield* this.storeEffect((store) => store.markSubmission(attemptId, "uncertain"));
-          if (evidence.submission === "submitted")
-            yield* this.storeEffect((store) => store.markSubmission(attemptId, "submitted"));
-          const marked = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
-          const phase = marked.consultation?.advisor;
-          if (phase !== undefined)
-            yield* this.storeEffect((store) =>
-              store.recordConsultationAdvisorPhase(attemptId, {
-                ...phase,
-                submission: marked.submission ?? "uncertain",
-              }),
-            );
-        }
-        yield* this.storeEffect((store) => store.recordConsultationUncertainty(attemptId, detail));
-        yield* this.storeEffect((store) => store.recordAttention(attemptId, detail));
-      }.bind(this),
-    );
-  }
-
-  private advanceConsultationAdvisorFallback(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    target: ModelTarget,
-    evidence: ConsultationLaunchEvidence,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const reason = consultationFallbackReason(target, evidence);
-        if (reason === undefined)
-          return yield* this.runtimeSync("validate consultation fallback", () => {
-            throw new Error("Consultation fallback lacks conclusive target-bound unavailability.");
-          });
-        yield* this.recordConsultationAdvisorPhaseIfNeeded(attempt.id, attempt, target, evidence);
-        yield* this.storeEffect((store) =>
-          store.recordConsultationFallback(attempt.id, target, reason),
-        );
-        yield* this.cancelUnavailableAdvisor(state, attempt, attempt.id);
-        const next = nextAdvisorCandidate(attempt, target);
-        if (next !== undefined)
-          yield* this.storeEffect((store) => store.retryConsultationAdvisor(attempt.id, next));
-        else
-          yield* this.storeEffect((store) =>
-            store.recordAttention(
-              attempt.id,
-              `No configured consultation advisor remained after ${target.model} was unavailable.`,
-            ),
-          );
-      }.bind(this),
-    );
-  }
-
-  private cancelUnavailableAdvisor(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    attemptId: string,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const recoveredWorker = yield* this.recoverCancellationWorker(state, attempt);
-        yield* this.storeEffect((store) => store.cancelAttempt(attemptId));
-        const cancelled = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
-        if (
-          cancelled.state === "cancel_requested" &&
-          hasProvenNoNativeLaunchAfterSession(cancelled)
-        )
-          yield* this.finishUnlaunchedCancellation(attemptId);
-        else yield* this.cancelOwnedWorker(attemptId, cancelled.state, recoveredWorker);
+        yield* this.beginCleanupIfNeeded(attempt);
+        yield* this.cleanup(attempt.id);
       }.bind(this),
     );
   }
@@ -1648,7 +1305,6 @@ export class WorkstreamRuntime {
               throw new Error(result.detail ?? "Worker cleanup is not proven complete.");
             });
           yield* this.storeEffect((store) => store.markWorkerClosed(attempt.id));
-          yield* this.closeConsultationPhaseIfNeeded(attempt, assignment);
         }
         yield* this.ownershipEffect();
         yield* this.cleanupPlacement(state, attempt, cleanup, assignment);
@@ -1692,25 +1348,6 @@ export class WorkstreamRuntime {
       }.bind(this),
     );
   }
-
-  private closeConsultationPhaseIfNeeded(
-    attempt: WorkAttempt,
-    assignment: WorkAssignment,
-  ): RuntimeEffect<void> {
-    if (assignment.capability !== "consultation") return Effect.void;
-    if (
-      attempt.consultation?.phase === "enricher" &&
-      (attempt.consultation.enricher !== undefined || attempt.sessionFile !== undefined)
-    )
-      return this.storeEffect((store) => store.markConsultationEnricherClosed(attempt.id));
-    if (
-      attempt.consultation?.phase === "advisor" &&
-      (attempt.consultation.advisor !== undefined || attempt.sessionFile !== undefined)
-    )
-      return this.storeEffect((store) => store.markConsultationAdvisorClosed(attempt.id));
-    return Effect.void;
-  }
-
   private cleanupPlacement(
     state: WorkstreamState,
     attempt: WorkAttempt,
@@ -1874,7 +1511,7 @@ export class WorkstreamRuntime {
       attempt.state !== "starting" ||
       attempt.sessionFile === undefined ||
       attempt.worker !== undefined ||
-      (attempt.launchPane !== undefined && assignment?.capability !== "consultation")
+      attempt.launchPane !== undefined
     )
       return Effect.succeed(attempt.worker);
     return Effect.gen(
@@ -1938,32 +1575,6 @@ type EnqueuedAttempt = {
 };
 type WorkerReport = Extract<WorkResult, { validity: "typed" }>["report"];
 
-function consultationPhaseRecord(
-  phase: "enricher" | "advisor",
-  attempt: WorkAttempt,
-  target: ModelTarget | undefined,
-  effective: ReadonlyArray<{ model: string; thinking?: string }>,
-): ConsultationPhase {
-  const exactTarget = required(target, `${phase} model target`);
-  const record: ConsultationPhase = {
-    phase,
-    sessionFile: required(attempt.sessionFile, `${phase} session`),
-    target: { model: exactTarget.model, thinking: exactTarget.thinking },
-    submission: required(attempt.submission, `${phase} submission`),
-  };
-  if (attempt.launchPane !== undefined) record.launchPane = structuredClone(attempt.launchPane);
-  if (attempt.resource !== undefined) record.resource = structuredClone(attempt.resource);
-  if (attempt.worker !== undefined) record.worker = structuredClone(attempt.worker);
-  const models = effective.map((model) => {
-    const candidate = { model: model.model, thinking: model.thinking ?? "off" };
-    if (!Value.Check(ModelTargetSchema, candidate))
-      throw new Error(`Invalid effective ${phase} model evidence.`);
-    return Value.Decode(ModelTargetSchema, candidate);
-  });
-  if (models.length > 0) record.effectiveModels = models;
-  return record;
-}
-
 function implementationAttempt(
   policy: ModelPolicy,
   options: QueueOptions,
@@ -1982,32 +1593,20 @@ function consultationAttempt(
   input: Omit<Extract<WorkAssignment, { capability: "consultation" }>, "createdAt">,
   base: QueueBase,
 ): EnqueuedAttempt {
-  const advisorCandidates: ModelTarget[] = input.advisorOverride
-    ? [{ ...input.advisorOverride }]
-    : policy.roles["consultation.advisor"].map((choice) => ({
-        model: choice.model,
-        thinking: choice.thinking,
-      }));
   const enricher = { ...policy.roles["consultation.enricher"] };
-  const advisor = advisorCandidates[0];
-  if (advisor === undefined) throw new Error("Consultation advisor policy must be nonempty.");
-  if (
-    new Set(advisorCandidates.map((candidate) => `${candidate.model}\0${candidate.thinking}`))
-      .size !== advisorCandidates.length
-  )
-    throw new Error("Consultation advisor policy cannot contain duplicate exact model targets.");
+  const advisor =
+    input.advisorOverride === undefined
+      ? { ...policy.roles["consultation.advisor"] }
+      : { ...input.advisorOverride };
   const attempt: EnqueuedAttempt = {
     id: `attempt-${randomUUID()}`,
     models: {
       guide: enricher,
-      advisor: { ...advisor },
       source: input.advisorOverride === undefined ? "policy" : "override",
     },
     consultation: {
       phase: "enricher",
-      advisorCandidates,
-      advisorHistory: [],
-      fallbackHistory: [],
+      advisorTarget: advisor,
     },
   };
   if (base.revision !== undefined) attempt.baseRevision = base.revision;
@@ -2109,14 +1708,6 @@ function canRetryCleanupBoundary(state: WorkstreamState, attempt: WorkAttempt): 
 function requiresLaunch(attempt: WorkAttempt): boolean {
   return attempt.state === "queued";
 }
-function isConsultationAdvisorReady(attempt: WorkAttempt, assignment: WorkAssignment): boolean {
-  return (
-    assignment.capability === "consultation" &&
-    attempt.consultation?.phase === "advisor" &&
-    attempt.sessionFile === undefined
-  );
-}
-
 function exactReviewRevision(
   input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
 ): string | undefined {
@@ -2162,128 +1753,6 @@ function hasProvenNoNativeLaunch(attempt: WorkAttempt): boolean {
     attempt.resource === undefined &&
     attempt.worker === undefined
   );
-}
-function hasProvenNoNativeLaunchAfterSession(attempt: WorkAttempt): boolean {
-  return (
-    attempt.sessionFile !== undefined &&
-    attempt.launchPane === undefined &&
-    attempt.resource === undefined &&
-    attempt.worker === undefined
-  );
-}
-function sameTarget(left: ModelTarget, right: ModelTarget): boolean {
-  return left.model === right.model && left.thinking === right.thinking;
-}
-type ConsultationLaunchEvidence = {
-  submission: NativeSubmissionEvidence;
-  preflight: ModelPreflight | undefined;
-  availability: ProviderAvailabilityEvidence;
-};
-
-function consultationLaunchEvidence(
-  attempt: WorkAttempt,
-  generation: { runId: string; nodeId: string },
-  target: ModelTarget,
-): RuntimeEffect<ConsultationLaunchEvidence> {
-  return Effect.gen(function* () {
-    const submission =
-      attempt.sessionFile === undefined
-        ? ("absent" as const)
-        : yield* runtimePi.submissionEvidence(attempt.sessionFile, generation);
-    const preflight =
-      attempt.sessionFile === undefined
-        ? undefined
-        : yield* runtimePi.preflight(attempt.sessionFile, generation);
-    const availability =
-      attempt.sessionFile === undefined
-        ? ("absent" as const)
-        : yield* runtimePi.providerAvailability(attempt.sessionFile, generation, target);
-    return { submission, preflight, availability };
-  });
-}
-function matchingUnavailablePreflight(
-  target: ModelTarget,
-  preflight: ModelPreflight | undefined,
-): ModelPreflight | undefined {
-  if (
-    preflight === undefined ||
-    preflight.model !== target.model ||
-    preflight.thinking !== target.thinking ||
-    !["missing_model", "missing_credentials", "unsupported_thinking"].includes(preflight.state)
-  )
-    return undefined;
-  return preflight;
-}
-function matchingUnavailableProvider(
-  target: ModelTarget,
-  availability: ProviderAvailabilityEvidence,
-): Extract<ProviderAvailabilityEvidence, { state: "unavailable" }> | undefined {
-  if (
-    availability === "absent" ||
-    availability === "contradictory" ||
-    availability.model !== target.model ||
-    availability.thinking !== target.thinking
-  )
-    return undefined;
-  return availability;
-}
-function consultationSubmissionUncertain(
-  attempt: WorkAttempt,
-  target: ModelTarget,
-  evidence: ConsultationLaunchEvidence,
-): boolean {
-  if (evidence.submission === "submitted" || evidence.submission === "contradictory") return true;
-  if (matchingUnavailablePreflight(target, evidence.preflight) !== undefined)
-    return (attempt.submission ?? "not_sent") !== "not_sent";
-  if (matchingUnavailableProvider(target, evidence.availability) !== undefined) return false;
-  return !(
-    (attempt.submission ?? "not_sent") === "not_sent" &&
-    attempt.worker === undefined &&
-    attempt.launchPane === undefined &&
-    attempt.resource === undefined
-  );
-}
-function consultationFallbackReason(
-  target: ModelTarget,
-  evidence: ConsultationLaunchEvidence,
-): string | undefined {
-  const preflight = matchingUnavailablePreflight(target, evidence.preflight);
-  if (preflight !== undefined) return preflight.detail;
-  return matchingUnavailableProvider(target, evidence.availability)?.reason;
-}
-function consultationUnavailableBeforeSubmission(
-  target: ModelTarget,
-  attempt: WorkAttempt,
-  evidence: ConsultationLaunchEvidence,
-): boolean {
-  if (
-    consultationFallbackReason(target, evidence) === undefined ||
-    evidence.submission === "submitted" ||
-    evidence.submission === "contradictory"
-  )
-    return false;
-  if (matchingUnavailablePreflight(target, evidence.preflight) !== undefined)
-    return (attempt.submission ?? "not_sent") === "not_sent";
-  return matchingUnavailableProvider(target, evidence.availability) !== undefined;
-}
-function consultationFallbackAllowed(
-  assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-  attempt: WorkAttempt,
-  target: ModelTarget,
-  evidence: ConsultationLaunchEvidence,
-): boolean {
-  if (assignment.advisorOverride !== undefined) return false;
-  const preflight = matchingUnavailablePreflight(target, evidence.preflight);
-  const provider = matchingUnavailableProvider(target, evidence.availability);
-  if (preflight === undefined && provider === undefined) return false;
-  if (evidence.submission === "submitted" || evidence.submission === "contradictory") return false;
-  if (preflight !== undefined) return (attempt.submission ?? "not_sent") === "not_sent";
-  return provider !== undefined;
-}
-function nextAdvisorCandidate(attempt: WorkAttempt, target: ModelTarget): ModelTarget | undefined {
-  const candidates = attempt.consultation?.advisorCandidates ?? [];
-  const currentIndex = candidates.findIndex((candidate) => sameTarget(candidate, target));
-  return currentIndex < 0 ? undefined : candidates[currentIndex + 1];
 }
 function hasRetainedSession(attempt: WorkAttempt): boolean {
   return (
@@ -2363,45 +1832,12 @@ function workerLaunchRequest(
     environment.set("PI_CODING_AGENT_DIR", codingAgentDir);
   if (assignment.artifactIntent === "disposable_experiment")
     environment.set("PI_WORKGRAPH_EXPERIMENT", "1");
-  const phase = phaseFor(attempt);
-  const phaseTarget = phase === "advisor" && models.advisor ? models.advisor : models.guide;
-  environment.set("PI_WORKGRAPH_TARGET_MODEL", phaseTarget.model);
-  environment.set("PI_WORKGRAPH_TARGET_THINKING", phaseTarget.thinking);
   if (models.executor !== undefined) {
     environment.set("PI_WORKGRAPH_IMPLEMENTATION_START", "guide");
     environment.set("PI_WORKGRAPH_EXECUTOR_MODEL", models.executor.model);
     environment.set("PI_WORKGRAPH_EXECUTOR_THINKING", models.executor.thinking);
   }
   const env = Object.fromEntries(environment);
-  const preflight:
-    | (() => Effect.Effect<
-        void,
-        RuntimeError | WorkstreamStoreError,
-        FileSystem.FileSystem | Path.Path
-      >)
-    | undefined =
-    assignment.capability === "consultation" && phase === "advisor"
-      ? () =>
-          Effect.gen(function* () {
-            const evidence = yield* runtimePi.preflight(sessionFile, {
-              runId: state.id,
-              nodeId: attempt.id,
-            });
-            if (
-              evidence?.state !== "ready" ||
-              evidence.model !== phaseTarget.model ||
-              evidence.thinking !== phaseTarget.thinking
-            )
-              return yield* new RuntimeOperationError({
-                operation: "consultation model preflight",
-                cause: new Error(
-                  evidence?.detail ??
-                    "No generation-scoped model preflight evidence was recorded before advisor submission.",
-                ),
-              });
-            yield* store.markSubmission(attempt.id, "uncertain");
-          })
-      : undefined;
   const launch: WorkerLaunchEffectRequest<
     RuntimeError | WorkstreamStoreError,
     FileSystem.FileSystem | Path.Path
@@ -2416,27 +1852,17 @@ function workerLaunchRequest(
     cwd,
     sessionFile,
     prompt: workerPrompt(state, attempt, assignment, cwd, baseRevision),
-    model:
-      phaseFor(attempt) === "advisor" && models.advisor ? models.advisor.model : models.guide.model,
-    thinking:
-      phaseFor(attempt) === "advisor" && models.advisor
-        ? models.advisor.thinking
-        : models.guide.thinking,
+    model: models.guide.model,
+    thinking: models.guide.thinking,
     env,
     onTab: (pane) => store.recordLaunchPane(attempt.id, pane).pipe(Effect.asVoid),
     onResource: (resource) => store.recordResource(attempt.id, resource).pipe(Effect.asVoid),
-    onIdentity: (worker) => {
-      const recorded = store.recordWorker(attempt.id, worker);
-      if (assignment.capability === "consultation" && phase === "advisor")
-        return recorded.pipe(Effect.asVoid);
-      return recorded.pipe(
-        Effect.andThen(store.markSubmission(attempt.id, "uncertain")),
-        Effect.asVoid,
-      );
-    },
+    onIdentity: (worker) =>
+      store
+        .recordWorker(attempt.id, worker)
+        .pipe(Effect.andThen(store.markSubmission(attempt.id, "uncertain")), Effect.asVoid),
     onSubmitted: () => store.markSubmission(attempt.id, "submitted").pipe(Effect.asVoid),
   };
-  if (preflight !== undefined) launch.onPreflight = preflight;
   return launch;
 }
 function isNoChangeImplementation(
@@ -2541,23 +1967,47 @@ function phaseFor(attempt: WorkAttempt): "enricher" | "advisor" | undefined {
 
 function workerRoleFor(
   assignment: WorkAssignment,
-  phase: "enricher" | "advisor" | undefined,
-): "implement" | "research" | "review" | "consultation" | "consultation_enricher" {
-  if (assignment.capability !== "consultation")
-    return assignment.capability === "implement" ? "implement" : assignment.capability;
-  return phase === "enricher" ? "consultation_enricher" : "consultation";
+  _phase: "enricher" | "advisor" | undefined,
+): "implement" | "research" | "review" {
+  if (assignment.capability === "implement") return "implement";
+  if (assignment.capability === "review") return "review";
+  return "research";
 }
 
 function modeFor(
   assignment: WorkAssignment,
-  phase?: "enricher" | "advisor",
-): "implementation" | "review" | "research" | "consultation" | "consultation_enricher" {
+  _phase?: "enricher" | "advisor",
+): "implementation" | "review" | "research" {
   if (assignment.capability === "implement") return "implementation";
   if (assignment.capability === "review") return "review";
-  if (assignment.capability === "consultation")
-    return phase === "enricher" ? "consultation_enricher" : "consultation";
   return "research";
 }
+function boundedResearchEvidence(
+  report: Extract<WorkerReport, { kind: "research" }>,
+): ResearchEvidenceProjection {
+  const projection: ResearchEvidenceProjection = {
+    summary: report.summary.slice(0, 4_000),
+    evidence: report.evidence.slice(0, 20).map((item) => {
+      const evidence: ResearchEvidenceProjection["evidence"][number] = {
+        label: item.label.slice(0, 500),
+        observation: item.observation.slice(0, 4_000),
+      };
+      if (item.class !== undefined) evidence.class = item.class;
+      if (item.command !== undefined) evidence.command = item.command.slice(0, 4_000);
+      if (item.artifact !== undefined) evidence.artifact = item.artifact.slice(0, 2_000);
+      return evidence;
+    }),
+    findings: report.findings.slice(0, 20).map((item) => ({
+      severity: item.severity,
+      title: item.title.slice(0, 500),
+      detail: item.detail.slice(0, 4_000),
+    })),
+  };
+  if (report.uncertainty !== undefined)
+    projection.uncertainty = report.uncertainty.slice(0, 20).map((item) => item.slice(0, 2_000));
+  return projection;
+}
+
 function appendCandidatePrompt(
   lines: string[],
   state: WorkstreamState,
@@ -2615,7 +2065,7 @@ function appendConsultationObjective(
   assignment: Extract<WorkAssignment, { capability: "consultation" }>,
   attempt: WorkAttempt,
 ): void {
-  lines.push(`Question: ${assignment.question}`);
+  // The common Assignment line already carries the precise question once.
   if (assignment.context !== undefined)
     lines.push(`Coordinator-known context: ${assignment.context}`);
   if (assignment.enrichmentFocus !== undefined)
@@ -2623,13 +2073,13 @@ function appendConsultationObjective(
   if (phaseFor(attempt) === "advisor") {
     lines.push(
       "This is a fresh advisor session. The enricher transcript is not available and must not be inferred.",
-      `Frozen enrichment packet: ${JSON.stringify(attempt.consultation?.packet)}`,
-      "Provide advice as evidence only; do not claim coordinator acceptance or authority.",
+      `Frozen enricher research evidence: ${JSON.stringify(attempt.consultation?.frozenEvidence)}`,
+      "Use ordinary read-only research tools and finish with workgraph_report. Provide advice as evidence only; do not claim coordinator acceptance or authority.",
     );
     return;
   }
   lines.push(
-    "Enrichment is mandatory. Use read-only tools, collect source observations and counterevidence, record local state identity and explicit gaps, and finish with workgraph_enrichment. Do not decide or summarize the answer.",
+    "This is the evidence-only enrichment phase. Use ordinary read-only research tools to gather observations relevant to the question, without deciding or summarizing the answer. Finish with workgraph_report.",
   );
 }
 

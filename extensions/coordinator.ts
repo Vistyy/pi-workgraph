@@ -473,7 +473,7 @@ export default function workgraphCoordinator(
     name: "workgraph_models",
     label: "Workgraph Models",
     description:
-      "Get model defaults and their configuration path, or persist an implementation default, singleton consultation enricher, or ordered research/review/consultation advisor list backed by a retained interactive or RPC input receipt. Assignment selection or per-role models overrides use policy defaults without changing policy or the coordinator model.",
+      "Get model defaults and their configuration path, or persist an implementation or consultation target, or a research/review selection list backed by a retained interactive or RPC input receipt. Consultation has one exact enricher and advisor target; assignment selection or per-role model overrides use policy defaults without changing policy or the coordinator model.",
     promptSnippet: "Inspect or configure Workgraph model defaults",
     parameters: Type.Object({
       action: StringEnum(["get", "set", "set_list", "rates"] as const),
@@ -585,8 +585,8 @@ export default function workgraphCoordinator(
     name: "workgraph_consult",
     label: "Workgraph Consult",
     description:
-      "Queue one evidence-only consultation under the established current intent. A fresh read-only enricher produces a strict frozen packet before a fresh advisor phase. The advisor returns evidence, not authority or acceptance.",
-    promptSnippet: "Consult an ordered evidence advisor",
+      "Queue one evidence-only consultation under the established current intent. An ordinary research enricher produces bounded frozen evidence before cleanup, then a fresh ordinary research advisor returns a standard report. Advice is evidence, not authority or acceptance.",
+    promptSnippet: "Consult one evidence advisor",
     parameters: Type.Object(
       {
         id: Type.String({ minLength: 1 }),
@@ -1099,14 +1099,12 @@ function researchAssignment(
 }
 
 function isModelListRole(role: (typeof MODEL_ROLES)[number] | undefined): role is ListModelRole {
-  return role === "research" || role === "review" || role === "consultation.advisor";
+  return role === "research" || role === "review";
 }
 
 function requiredModelListRole(role: (typeof MODEL_ROLES)[number] | undefined): ListModelRole {
   if (!isModelListRole(role))
-    throw new Error(
-      "Model list operations require research, review, or consultation.advisor role.",
-    );
+    throw new Error("Model list operations require research or review role.");
   return role;
 }
 
@@ -1119,9 +1117,7 @@ function validateModelRequest(
   if (action === "set" && (role === undefined || target === undefined))
     throw new Error("Setting a model default requires role and target.");
   if (action === "set_list" && (!isModelListRole(role) || list === undefined))
-    throw new Error(
-      "Setting a model list requires research, review, or consultation.advisor role and a nonempty list.",
-    );
+    throw new Error("Setting a model list requires research or review role and a nonempty list.");
 }
 
 function resolveModelPolicyEffect(
@@ -1147,7 +1143,7 @@ function policyModelIds(policy: ModelPolicy): string[] {
     policy.roles["implementation.guide"],
     policy.roles["implementation.executor"],
     policy.roles["consultation.enricher"],
-    ...policy.roles["consultation.advisor"],
+    policy.roles["consultation.advisor"],
   ].reduce<string[]>((models, target) => {
     if (!models.includes(target.model)) models.push(target.model);
     return models;

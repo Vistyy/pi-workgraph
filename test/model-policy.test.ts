@@ -27,7 +27,7 @@ await test("policy defaults, legacy reads, and independent role-list writes use 
       version: 5,
       roles: {
         "consultation.enricher": { model: "openai-codex/gpt-5.6-luna", thinking: "high" },
-        "consultation.advisor": [{ model: "openai-codex/gpt-6-astra", thinking: "high" }],
+        "consultation.advisor": { model: "openai-codex/gpt-6-astra", thinking: "high" },
         research: [{ model: "openai-codex/gpt-5.6-luna", thinking: "high" }],
         "implementation.guide": { model: "openai-codex/gpt-6-astra", thinking: "low" },
         "implementation.executor": { model: "openai-codex/gpt-5.6-luna", thinking: "xhigh" },
@@ -114,62 +114,24 @@ await test("policy defaults, legacy reads, and independent role-list writes use 
     assert.equal(written.version, 5);
 
     await runNodePlatformPromise(
-      setModelListEffect(
+      setModelRoleEffect(
         "consultation.advisor",
-        [
-          {
-            model: "fixture/advisor",
-            thinking: "high",
-            useWhen: "Use for architecture trade-offs.",
-          },
-        ],
+        { model: "fixture/advisor", thinking: "high" },
         path,
       ),
     );
     await runNodePlatformPromise(
-      setModelListEffect(
-        "research",
-        [{ model: "fixture/research", thinking: "high", useWhen: "Research only." }],
-        path,
-      ),
+      setModelListEffect("research", [{ model: "fixture/research", thinking: "high" }], path),
     );
     const annotated = await loadModelPolicy(path);
-    assert.deepEqual(annotated.roles["consultation.advisor"], [
-      { model: "fixture/advisor", thinking: "high", useWhen: "Use for architecture trade-offs." },
-    ]);
-    assert.deepEqual(annotated.roles.research, [
-      { model: "fixture/research", thinking: "high", useWhen: "Research only." },
-    ]);
+    assert.deepEqual(annotated.roles["consultation.advisor"], {
+      model: "fixture/advisor",
+      thinking: "high",
+    });
+    assert.deepEqual(annotated.roles.research, [{ model: "fixture/research", thinking: "high" }]);
     assert.deepEqual(resolveSelection("research", { count: 1 }, annotated).selected, [
       { model: "fixture/research", thinking: "high" },
     ]);
-
-    await assert.rejects(
-      runNodePlatformPromise(
-        setModelListEffect(
-          "consultation.advisor",
-          [
-            { model: "fixture/duplicate", thinking: "high", useWhen: "First" },
-            { model: "fixture/duplicate", thinking: "high", useWhen: "Second" },
-          ],
-          path,
-        ),
-      ),
-      /duplicate exact model targets/,
-    );
-    await writeFile(
-      path,
-      JSON.stringify({
-        version: 5,
-        roles: {
-          "consultation.advisor": [
-            { model: "fixture/duplicate", thinking: "high" },
-            { model: "fixture/duplicate", thinking: "high" },
-          ],
-        },
-      }),
-    );
-    await assert.rejects(loadModelPolicy(path), /duplicate exact model targets/);
     await assert.rejects(
       runNodePlatformPromise(setModelListEffect("research", [], path)),
       /Invalid model list/,

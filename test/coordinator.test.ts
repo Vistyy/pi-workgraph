@@ -282,6 +282,12 @@ void test("registered consultation keeps a precise question, context, and exact 
     const question = "Should the fixture keep its current file strategy?";
     await f.runner.emitInput(question, undefined, "interactive");
     await f.call("workgraph_intent", { statement: question });
+    assert.ok(f.runner.getToolDefinition("workgraph_consult"));
+    assert.ok(f.runner.getToolDefinition("workgraph_research"));
+    assert.notEqual(
+      f.runner.getToolDefinition("workgraph_consult")?.name,
+      f.runner.getToolDefinition("workgraph_research")?.name,
+    );
     const response = await f.call("workgraph_consult", {
       id: "fixture-consult",
       question,

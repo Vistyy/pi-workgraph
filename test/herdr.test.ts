@@ -48,8 +48,6 @@ await test("worker tabs use concise task text while native names remain unique a
     ["implement", "I"],
     ["research", "R"],
     ["review", "V"],
-    ["consultation", "C"],
-    ["consultation_enricher", "E"],
   ] as const satisfies ReadonlyArray<readonly [WorkerRole, string]>;
   for (const [role, marker] of roleMarkers) {
     const roleLabel = herdrWorkerTabLabel({ ...request, role });

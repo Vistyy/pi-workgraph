@@ -331,24 +331,13 @@ function validateConsultationRecord(state: WorkstreamState, attempt: WorkAttempt
     throw new InvalidWorkstreamStateError(
       `Consultation attempt ${attempt.id} has no phase envelope.`,
     );
-  if (consultation.advisorCandidates.length === 0)
+  if (!Value.Check(ModelTargetSchema, consultation.advisorTarget))
     throw new InvalidWorkstreamStateError(
-      `Consultation attempt ${attempt.id} has no advisor candidates.`,
+      `Consultation attempt ${attempt.id} has an invalid advisor target.`,
     );
-  if (consultation.phase === "advisor" && consultation.packet === undefined)
+  if (consultation.phase === "advisor" && consultation.frozenEvidence === undefined)
     throw new InvalidWorkstreamStateError(
-      `Consultation advisor ${attempt.id} has no frozen packet.`,
-    );
-  if (consultation.packet !== undefined && consultation.packetId === undefined)
-    throw new InvalidWorkstreamStateError(
-      `Consultation attempt ${attempt.id} has an unnamed frozen packet.`,
-    );
-  if (
-    consultation.selectedAdvisor !== undefined &&
-    !Value.Check(ModelTargetSchema, consultation.selectedAdvisor)
-  )
-    throw new InvalidWorkstreamStateError(
-      `Consultation attempt ${attempt.id} has an invalid selected advisor.`,
+      `Consultation advisor ${attempt.id} has no frozen evidence.`,
     );
 }
 

@@ -1,16 +1,9 @@
-import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Data, DateTime, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { ThinkingSchema } from "../src/model-policy.js";
-import { MODEL_PREFLIGHT_MARKER } from "../src/pi-process.js";
-import {
-  EnrichmentPacketSchema,
-  isWorkerReport,
-  isWorkerReportInput,
-  reportSchemaForMode,
-} from "../src/report-schema.js";
+import { isWorkerReport, isWorkerReportInput, reportSchemaForMode } from "../src/report-schema.js";
 import type {
   ImplementationReport,
   WorkerMode,
@@ -33,8 +26,6 @@ const WorkerEnvironmentConfig = Config.all({
     Config.withDefault(""),
   ),
   experiment: Config.string("PI_WORKGRAPH_EXPERIMENT").pipe(Config.withDefault("")),
-  targetModel: Config.string("PI_WORKGRAPH_TARGET_MODEL").pipe(Config.withDefault("")),
-  targetThinking: Config.string("PI_WORKGRAPH_TARGET_THINKING").pipe(Config.withDefault("off")),
 });
 
 // One concise, worker-owned plan survives the guide/executor handoff. Status is
@@ -187,11 +178,6 @@ const AttemptIdentitySchema = Type.Object({
   runId: Type.String(),
   nodeId: Type.String(),
 });
-const EnrichmentEntrySchema = Type.Intersect([
-  AttemptIdentitySchema,
-  Type.Object({ packet: EnrichmentPacketSchema }),
-]);
-
 type WorkerPlan = Static<typeof WorkerPlanSchema>;
 type WorkerPlanToolInput = Static<typeof WorkerPlanToolSchema>;
 
@@ -413,15 +399,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   const environment = Effect.runSync(WorkerEnvironmentConfig.parse(ConfigProvider.fromEnv()));
   const mode = Effect.runSync(readMode(environment.mode));
   if (mode === null) return;
-  const {
-    runId,
-    nodeId,
-    executorModel,
-    executorThinking,
-    baseCommit,
-    targetModel,
-    targetThinking,
-  } = environment;
+  const { runId, nodeId, executorModel, executorThinking, baseCommit } = environment;
   const generation = { runId, nodeId };
   const continued = environment.implementationStart === "executor";
   const experiment = environment.experiment === "1";
@@ -596,70 +574,36 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         );
       },
     });
-  if (mode === "consultation_enricher") {
-    pi.registerTool({
-      name: "workgraph_enrichment",
-      label: "Workgraph Enrichment",
-      description:
-        "Persist the strict bounded evidence packet for the consultation enricher. This packet records observations, counterevidence, local state and gaps; it must not decide or summarize the answer.",
-      promptSnippet: "Finish the consultation evidence packet",
-      parameters: EnrichmentPacketSchema,
-      execute(_id, params) {
-        if (terminal)
-          return Promise.reject(
-            new WorkerContractError({ message: "The enrichment packet is already terminal." }),
-          );
-        if (!Value.Check(EnrichmentPacketSchema, params))
-          return Promise.reject(
-            new WorkerContractError({
-              message: "Enrichment packet is outside its strict bounded contract.",
-            }),
-          );
-        pi.appendEntry("pi-workgraph-enrichment", {
-          ...generation,
-          packet: structuredClone(params),
-        });
-        terminal = true;
-        return Promise.resolve({
-          content: [
-            { type: "text" as const, text: "Frozen consultation enrichment packet recorded." },
-          ],
-          details: { packet: structuredClone(params), attempt: generation },
-          terminate: true,
-        });
-      },
-    });
-  } else if (mode !== "consultation")
-    pi.registerTool({
-      name: "workgraph_report",
-      label: "Workgraph Report",
-      description: "Return the terminal report for this bounded assignment.",
-      promptSnippet: "Finish assigned work with a typed report",
-      promptGuidelines: [
-        "Use workgraph_report as the final action, with actual evidence and explicit limitations.",
-      ],
-      parameters: reportSchemaForMode(mode),
-      execute(_id, params: WorkerReportInput, _signal, _update, ctx) {
-        return Effect.runPromise(
-          Effect.gen(function* () {
-            const result = yield* handleWorkerReport(pi, ctx.cwd, params, {
-              mode,
-              phase,
-              plan,
-              planStatus,
-              reminderCount,
-              switchedAt,
-              switchError,
-              continued,
-              baseCommit,
-              hasExecutorMessage: () => hasExecutorMessage(ctx.sessionManager.getBranch()),
-            });
-            if (result.terminate === true) terminal = true;
-            return result;
-          }),
-        );
-      },
-    });
+  pi.registerTool({
+    name: "workgraph_report",
+    label: "Workgraph Report",
+    description: "Return the terminal report for this bounded assignment.",
+    promptSnippet: "Finish assigned work with a typed report",
+    promptGuidelines: [
+      "Use workgraph_report as the final action, with actual evidence and explicit limitations.",
+    ],
+    parameters: reportSchemaForMode(mode),
+    execute(_id, params: WorkerReportInput, _signal, _update, ctx) {
+      return Effect.runPromise(
+        Effect.gen(function* () {
+          const result = yield* handleWorkerReport(pi, ctx.cwd, params, {
+            mode,
+            phase,
+            plan,
+            planStatus,
+            reminderCount,
+            switchedAt,
+            switchError,
+            continued,
+            baseCommit,
+            hasExecutorMessage: () => hasExecutorMessage(ctx.sessionManager.getBranch()),
+          });
+          if (result.terminate === true) terminal = true;
+          return result;
+        }),
+      );
+    },
+  });
 
   pi.on("tool_execution_end", (event, ctx) => {
     if (mode !== "implementation" || phase !== "guide") return;
@@ -827,25 +771,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     return { kind: "absent" };
   }
 
-  function hasTerminalEnrichment(entries: SessionEntry[]): boolean {
-    const boundary = entries.findLastIndex(
-      (entry) =>
-        entry.type === "custom_message" &&
-        entry.customType === "pi-workgraph-objective" &&
-        isCurrentAttemptData(entry.details),
-    );
-    if (boundary < 0) return false;
-    return entries
-      .slice(boundary + 1)
-      .some(
-        (entry) =>
-          entry.type === "custom" &&
-          entry.customType === "pi-workgraph-enrichment" &&
-          isCurrentAttemptData(entry.data) &&
-          Value.Check(EnrichmentEntrySchema, entry.data),
-      );
-  }
-
   function hasTerminalReport(entries: SessionEntry[]): boolean {
     const boundary = entries.findLastIndex(
       (entry) =>
@@ -966,37 +891,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       .join("\n");
   }
 
-  function appendModelPreflight(ctx: ExtensionContext): void {
-    if (targetModel === "") return;
-    const slash = targetModel.indexOf("/");
-    const model =
-      slash > 0
-        ? ctx.modelRegistry.find(targetModel.slice(0, slash), targetModel.slice(slash + 1))
-        : undefined;
-    let state: "ready" | "missing_model" | "missing_credentials" | "unsupported_thinking" = "ready";
-    let detail = `Model ${targetModel} and thinking ${targetThinking} passed local preflight.`;
-    if (model === undefined) {
-      state = "missing_model";
-      detail = `Model ${targetModel} is not registered in Pi.`;
-    } else if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
-      state = "missing_credentials";
-      detail = `Model ${targetModel} has no usable configured credentials.`;
-    } else if (
-      !Value.Check(ThinkingSchema, targetThinking) ||
-      !getSupportedThinkingLevels(model).includes(targetThinking)
-    ) {
-      state = "unsupported_thinking";
-      detail = `Model ${targetModel} does not support thinking ${targetThinking}.`;
-    }
-    pi.appendEntry(MODEL_PREFLIGHT_MARKER, {
-      ...generation,
-      model: targetModel,
-      thinking: targetThinking,
-      state,
-      detail,
-    });
-  }
-
   function assignmentDisables(name: string): boolean {
     // Keep editing tools for implementation and authorized research experiments.
     // This filters model tool availability; bash remains available and is not sandboxed.
@@ -1020,8 +914,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     reminderCount = 0;
     switchError = undefined;
     switchedAt = undefined;
-    terminal =
-      mode === "consultation_enricher" ? hasTerminalEnrichment(branch) : hasTerminalReport(branch);
+    terminal = hasTerminalReport(branch);
     const attempt = latestAttemptState(branch);
     stateWarning = attempt.malformed
       ? "The latest current-attempt worker state was malformed and was ignored; continue conservatively and report the limitation."
@@ -1049,7 +942,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       .then((configuredTools) => {
         disabledTools = new Set(configuredTools);
         reconcileWorkerTools();
-        appendModelPreflight(ctx);
         restoreWorkerSession(ctx.sessionManager.getBranch());
       }),
   );
@@ -1295,18 +1187,12 @@ const researchInstructions =
   "[WORKGRAPH RESEARCH]\nAnswer only the assigned question using read-only evidence from the live project cwd. Tracked and untracked local changes may be present; do not require cleanliness, copy files, or modify them. Supply the requested observations and retain material unknowns. Do not delegate another worker. Finish with workgraph_report.";
 function instructionForMode(mode: WorkerSessionMode, experiment: boolean): string {
   if (mode === "review") return reviewInstructions;
-  if (mode === "consultation") return consultationInstructions;
-  if (mode === "consultation_enricher") return consultationEnricherInstructions;
   if (mode === "implementation") return guideInstructions;
   return experiment ? experimentInstructions : researchInstructions;
 }
 
 const experimentInstructions =
   "[WORKGRAPH EXPERIMENT]\nAnswer the question within the explicitly permitted effects and stop condition in this disposable worktree. Leave all outputs in the assigned worktree and report direct observations, failures and limits; the coordinator decides when to release the worktree. Do not compose, publish, or delegate another worker. Finish with workgraph_report.";
-const consultationEnricherInstructions =
-  "[WORKGRAPH CONSULTATION ENRICHER]\nYou are an evidence-only enricher. Answer no part of the consultation question and do not summarize or decide it. Use read-only local tools to collect relevant source observations, counterevidence, exact local/uncommitted state identity, and explicit gaps. Finish only with workgraph_enrichment using the strict bounded packet contract.";
-const consultationInstructions =
-  "[WORKGRAPH CONSULTATION ADVISOR]\nYou are the final evidence-only advisor. You receive a fresh context containing the precise question, constraints, coordinator-known context, and a frozen enrichment packet. The enricher transcript is not available. You may use read-only local tools to fill gaps. Return your final advice as assistant text; do not claim coordinator authority, acceptance, or implementation.";
 const reviewInstructions =
   "[WORKGRAPH REVIEW]\nReview only the identified subject and concern. Ordinary result, artifact, and comparison reviews may observe the live project cwd. An exact revision review runs in an owned worktree checked out at the requested SHA; inspect that exact commit with Git (for example git show, git diff, and git ls-tree) and cite that revision in evidence. Do not silently treat live working files as that commit or claim tests against another revision. Execute verification only when it genuinely targets the requested subject. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
 const guideInstructions =
@@ -1343,13 +1229,7 @@ function gitFailure(message: string) {
 
 function readMode(value: string) {
   if (value.length === 0) return Effect.succeed<WorkerSessionMode | null>(null);
-  if (
-    value === "research" ||
-    value === "review" ||
-    value === "implementation" ||
-    value === "consultation" ||
-    value === "consultation_enricher"
-  )
+  if (value === "research" || value === "review" || value === "implementation")
     return Effect.succeed<WorkerSessionMode | null>(value);
   return contractFailure(`Invalid PI_WORKGRAPH_MODE: ${value}`);
 }

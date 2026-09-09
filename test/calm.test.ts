@@ -286,7 +286,6 @@ void test("calm defaults own Pi and Workgraph tools while user additions are mer
   assert.deepEqual([...hidden], [...DEFAULT_CALM_HIDDEN_TOOLS]);
   assert.ok(hidden.has("bash"));
   assert.ok(hidden.has("workgraph_consult"));
-  assert.ok(hidden.has("workgraph_enrichment"));
   assert.ok(hidden.has("workgraph_report"));
   assert.ok(hidden.has("workgraph_notepad"));
   assert.ok(!hidden.has("web_search"));

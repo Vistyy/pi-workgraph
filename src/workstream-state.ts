@@ -5,7 +5,11 @@ import { Data } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { ModelTargetSchema } from "./model-policy.js";
-import { EnrichmentPacketSchema, EvidenceSchema, WorkerReportSchema } from "./report-schema.js";
+import {
+  EvidenceSchema,
+  ResearchEvidenceProjectionSchema,
+  WorkerReportSchema,
+} from "./report-schema.js";
 
 export const WORKSTREAM_STATE_VERSION = 7 as const;
 export const WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
@@ -238,7 +242,6 @@ const ModelsSchema = Type.Object(
   {
     guide: ModelTargetSchema,
     executor: Type.Optional(ModelTargetSchema),
-    advisor: Type.Optional(ModelTargetSchema),
     source: StringEnum(["policy", "override"] as const),
     overrideReason: Type.Optional(NonEmptyStringSchema),
     selection: Type.Optional(SelectionReceiptSchema),
@@ -256,63 +259,11 @@ const ResourceSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const PhaseCleanupSchema = Type.Object(
-  {
-    state: StringEnum(["pending", "blocked", "completed"] as const),
-    expectedHead: Type.Optional(NonEmptyStringSchema),
-    workerClosed: Type.Boolean(),
-    error: Type.Optional(NonEmptyStringSchema),
-  },
-  { additionalProperties: false },
-);
-const ConsultationPhaseSchema = Type.Object(
+const ConsultationProgressSchema = Type.Object(
   {
     phase: StringEnum(["enricher", "advisor"] as const),
-    sessionFile: NonEmptyStringSchema,
-    target: ModelTargetSchema,
-    launchPane: Type.Optional(
-      Type.Object(
-        { workspaceId: NonEmptyStringSchema, paneId: NonEmptyStringSchema },
-        { additionalProperties: false },
-      ),
-    ),
-    resource: Type.Optional(ResourceSchema),
-    worker: Type.Optional(
-      Type.Object(
-        {
-          workspaceId: NonEmptyStringSchema,
-          tabId: NonEmptyStringSchema,
-          paneId: NonEmptyStringSchema,
-          terminalId: NonEmptyStringSchema,
-          agentName: NonEmptyStringSchema,
-          cwd: NonEmptyStringSchema,
-          sessionFile: NonEmptyStringSchema,
-        },
-        { additionalProperties: false },
-      ),
-    ),
-    submission: StringEnum(["not_sent", "uncertain", "submitted", "started"] as const),
-    effectiveModels: Type.Optional(Type.Array(ModelTargetSchema)),
-    cleanup: Type.Optional(PhaseCleanupSchema),
-  },
-  { additionalProperties: false },
-);
-const ConsultationFallbackSchema = Type.Object(
-  { target: ModelTargetSchema, reason: NonEmptyStringSchema },
-  { additionalProperties: false },
-);
-const ConsultationEnvelopeSchema = Type.Object(
-  {
-    phase: StringEnum(["enricher", "advisor"] as const),
-    packetId: Type.Optional(NonEmptyStringSchema),
-    packet: Type.Optional(EnrichmentPacketSchema),
-    enricher: Type.Optional(ConsultationPhaseSchema),
-    advisor: Type.Optional(ConsultationPhaseSchema),
-    advisorCandidates: Type.Array(ModelTargetSchema, { minItems: 1 }),
-    selectedAdvisor: Type.Optional(ModelTargetSchema),
-    advisorHistory: Type.Array(ConsultationPhaseSchema, { maxItems: 20 }),
-    fallbackHistory: Type.Array(ConsultationFallbackSchema),
-    uncertainty: Type.Optional(NonEmptyStringSchema),
+    frozenEvidence: Type.Optional(ResearchEvidenceProjectionSchema),
+    advisorTarget: ModelTargetSchema,
   },
   { additionalProperties: false },
 );
@@ -347,7 +298,7 @@ const AttemptSchema = Type.Object(
       "cancelled",
     ] as const),
     models: Type.Optional(ModelsSchema),
-    consultation: Type.Optional(ConsultationEnvelopeSchema),
+    consultation: Type.Optional(ConsultationProgressSchema),
     effectiveModels: Type.Optional(
       Type.Array(
         Type.Object(
@@ -574,9 +525,8 @@ export type Intent = Static<typeof IntentSchema>;
 export type AuthorityReference = Static<typeof AuthorityReferenceSchema>;
 export type ResultSubject = Static<typeof ResultSubjectSchema>;
 export type WorkAssignment = Static<typeof AssignmentSchema>;
-export type ConsultationPhase = Static<typeof ConsultationPhaseSchema>;
-export type ConsultationEnvelope = Static<typeof ConsultationEnvelopeSchema>;
-export type EnrichmentPacket = Static<typeof EnrichmentPacketSchema>;
+export type ConsultationProgress = Static<typeof ConsultationProgressSchema>;
+export type ResearchEvidenceProjection = Static<typeof ResearchEvidenceProjectionSchema>;
 export type RetainedArtifact = Static<typeof ArtifactSchema>;
 export type WorkResult = Static<typeof ResultSchema>;
 export type WorkAttempt = Static<typeof AttemptSchema>;

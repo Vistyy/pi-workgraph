@@ -55,7 +55,6 @@ export const DEFAULT_CALM_HIDDEN_TOOLS = [
   "workgraph_fork",
   "workgraph_complete",
   "workgraph_plan",
-  "workgraph_enrichment",
   "workgraph_report",
 ] as const;
 

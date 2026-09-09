@@ -322,7 +322,6 @@ function reportPreview(result: WorkResult) {
       findings: report.findings.length,
     },
   };
-  if (report.kind === "consultation") return { ...preview, text: compactText(report.text, 640) };
   return preview;
 }
 
@@ -721,31 +720,8 @@ function boundedText(
 function consultationProjection(consultation: NonNullable<WorkAttempt["consultation"]>) {
   return {
     phase: consultation.phase,
-    packetId: consultation.packetId,
-    frozenPacket: consultation.packet,
-    selectedAdvisor: consultation.selectedAdvisor,
-    advisorCandidates: consultation.advisorCandidates,
-    advisorHistory: consultation.advisorHistory,
-    fallbackHistory: consultation.fallbackHistory,
-    enricher:
-      consultation.enricher === undefined ? undefined : phaseProjection(consultation.enricher),
-    advisor: consultation.advisor === undefined ? undefined : phaseProjection(consultation.advisor),
-    uncertainty: consultation.uncertainty,
-  };
-}
-
-function phaseProjection(phase: NonNullable<WorkAttempt["consultation"]>["enricher"]) {
-  if (phase === undefined) return undefined;
-  return {
-    phase: phase.phase,
-    sessionFile: phase.sessionFile,
-    target: phase.target,
-    launchPane: phase.launchPane,
-    resource: phase.resource,
-    worker: phase.worker,
-    submission: phase.submission,
-    effectiveModels: phase.effectiveModels,
-    cleanup: phase.cleanup,
+    frozenEvidence: consultation.frozenEvidence,
+    advisorTarget: consultation.advisorTarget,
   };
 }
 
@@ -766,13 +742,6 @@ function projectedModels(attempt: WorkAttempt) {
               : {
                   model: compactText(models.executor.model, 160),
                   thinking: models.executor.thinking,
-                },
-          advisor:
-            models.advisor === undefined
-              ? undefined
-              : {
-                  model: compactText(models.advisor.model, 160),
-                  thinking: models.advisor.thinking,
                 },
           overrideReason:
             models.overrideReason === undefined
@@ -1154,11 +1123,6 @@ export function resultNotification(state: WorkstreamState, resultId: string): st
     `[WORKGRAPH OUTCOME] Task ${compactText(result.assignmentId, 120)} produced ${outcomeHandle(state, result)}.`,
     "Decide from this bounded outcome; inspect only when uncertainty or truncated detail matters.",
     JSON.stringify(view, null, 2),
-    ...((resultOwnerAttempt(state, result)?.consultation?.fallbackHistory.length ?? 0) > 0
-      ? [
-          "WARNING: one or more configured consultation advisors were conclusively unavailable before submission; inspect fallbackHistory before relying on this evidence.",
-        ]
-      : []),
     "A repeated notification is transport recurrence, not new work or semantic acceptance.",
   ].join("\n");
 }

@@ -1,11 +1,10 @@
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Data, Effect, FileSystem } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { EnrichmentPacketSchema, isWorkerReport } from "./report-schema.js";
-import type { EnrichmentPacket, WorkerReport, WorkerSessionMode } from "./types.js";
+import { isWorkerReport } from "./report-schema.js";
+import type { WorkerReport, WorkerSessionMode } from "./types.js";
 
 type Generation = { runId: string; nodeId: string };
 const GenerationDataSchema = Type.Object({
@@ -13,50 +12,6 @@ const GenerationDataSchema = Type.Object({
   nodeId: Type.String({ minLength: 1 }),
 });
 const ReportDetailsSchema = Type.Object({ report: Type.Unknown() });
-const EnrichmentDetailsSchema = Type.Intersect([
-  GenerationDataSchema,
-  Type.Object({ packet: EnrichmentPacketSchema }),
-]);
-const NativeSubmissionMarkerSchema = Type.Object(
-  {
-    runId: Type.String({ minLength: 1 }),
-    nodeId: Type.String({ minLength: 1 }),
-    state: Type.Union([Type.Literal("not_submitted"), Type.Literal("submitted")]),
-  },
-  { additionalProperties: false },
-);
-const ProviderAvailabilityMarkerSchema = Type.Object(
-  {
-    runId: Type.String({ minLength: 1 }),
-    nodeId: Type.String({ minLength: 1 }),
-    model: Type.String({ minLength: 1 }),
-    thinking: Type.String({ minLength: 1 }),
-    availability: Type.Literal("unavailable"),
-    submission: Type.Literal("not_submitted"),
-    reason: Type.String({ minLength: 1 }),
-  },
-  { additionalProperties: false },
-);
-const ModelPreflightSchema = Type.Object(
-  {
-    runId: Type.String({ minLength: 1 }),
-    nodeId: Type.String({ minLength: 1 }),
-    model: Type.String({ minLength: 1 }),
-    thinking: Type.String({ minLength: 1 }),
-    state: Type.Union([
-      Type.Literal("ready"),
-      Type.Literal("missing_model"),
-      Type.Literal("missing_credentials"),
-      Type.Literal("unsupported_thinking"),
-    ]),
-    detail: Type.String({ minLength: 1 }),
-  },
-  { additionalProperties: false },
-);
-/** Provider adapters may append these generation-scoped entries; absence is never proof of non-submission. */
-export const NATIVE_SUBMISSION_MARKER = "pi-workgraph-native-submission" as const;
-export const PROVIDER_AVAILABILITY_MARKER = "pi-workgraph-provider-availability" as const;
-export const MODEL_PREFLIGHT_MARKER = "pi-workgraph-model-preflight" as const;
 const EffectiveModelSchema = Type.Intersect([
   GenerationDataSchema,
   Type.Object({ model: Type.String({ minLength: 1 }), thinking: Type.String({ minLength: 1 }) }),
@@ -213,25 +168,6 @@ export interface WorkgraphReportRead {
   error?: string;
 }
 
-export interface EnrichmentPacketRead {
-  packet?: EnrichmentPacket;
-  invalid: boolean;
-  unreadable: boolean;
-  error?: string;
-}
-
-export type NativeSubmissionEvidence = "not_submitted" | "submitted" | "contradictory" | "absent";
-export type ModelPreflight = {
-  state: "ready" | "missing_model" | "missing_credentials" | "unsupported_thinking";
-  model: string;
-  thinking: string;
-  detail: string;
-};
-export type ProviderAvailabilityEvidence =
-  | { state: "unavailable"; model: string; thinking: string; reason: string }
-  | "contradictory"
-  | "absent";
-
 export function readWorkgraphReportResult(
   sessionFile: string,
   generation: Generation,
@@ -265,155 +201,6 @@ export function readWorkgraphReportResult(
     };
   }
   return { invalid: false, unreadable: false };
-}
-
-export function readEnrichmentPacketResult(
-  sessionFile: string,
-  generation: Generation,
-): EnrichmentPacketRead {
-  try {
-    const entries = attemptEntries(sessionFile, generation);
-    for (const entry of [...entries].reverse()) {
-      if (entry.type !== "custom" || entry.customType !== "pi-workgraph-enrichment") continue;
-      if (!markerMatches(entry.data, generation)) continue;
-      const details = Value.Check(EnrichmentDetailsSchema, entry.data)
-        ? Value.Decode(EnrichmentDetailsSchema, entry.data)
-        : undefined;
-      if (details === undefined)
-        return {
-          invalid: true,
-          unreadable: false,
-          error: "The enrichment packet has an invalid shape.",
-        };
-      return { packet: details.packet, invalid: false, unreadable: false };
-    }
-  } catch (error) {
-    return {
-      invalid: false,
-      unreadable: true,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-  return { invalid: false, unreadable: false };
-}
-
-export function readModelPreflight(
-  sessionFile: string,
-  generation: Generation,
-): ModelPreflight | undefined {
-  try {
-    let matched: ModelPreflight | undefined;
-    for (const entry of attemptEntries(sessionFile, generation)) {
-      if (entry.type !== "custom" || entry.customType !== MODEL_PREFLIGHT_MARKER) continue;
-      if (!Value.Check(ModelPreflightSchema, entry.data)) return undefined;
-      const data = Value.Decode(ModelPreflightSchema, entry.data);
-      if (!markerMatches(data, generation)) continue;
-      const current = {
-        state: data.state,
-        model: data.model,
-        thinking: data.thinking,
-        detail: data.detail,
-      };
-      if (matched !== undefined && !samePreflight(matched, current)) return undefined;
-      matched = current;
-    }
-    return matched;
-  } catch {
-    return undefined;
-  }
-}
-
-function samePreflight(left: ModelPreflight, right: ModelPreflight): boolean {
-  return (
-    left.state === right.state &&
-    left.model === right.model &&
-    left.thinking === right.thinking &&
-    left.detail === right.detail
-  );
-}
-
-export function providerAvailabilityEvidence(
-  sessionFile: string,
-  generation: Generation,
-  target: { model: string; thinking: string },
-): ProviderAvailabilityEvidence {
-  try {
-    let matched: Extract<ProviderAvailabilityEvidence, { state: "unavailable" }> | undefined;
-    for (const entry of attemptEntries(sessionFile, generation)) {
-      const observation = providerAvailabilityObservation(entry, generation, target);
-      if (observation === "ignore") continue;
-      if (observation === "contradictory") return observation;
-      if (matched !== undefined && matched.reason !== observation.reason) return "contradictory";
-      matched = observation;
-    }
-    return matched ?? "absent";
-  } catch {
-    return "absent";
-  }
-}
-
-function providerAvailabilityObservation(
-  entry: SessionEntry,
-  generation: Generation,
-  target: { model: string; thinking: string },
-): Extract<ProviderAvailabilityEvidence, { state: "unavailable" }> | "ignore" | "contradictory" {
-  if (entry.type !== "custom" || entry.customType !== PROVIDER_AVAILABILITY_MARKER) return "ignore";
-  if (!Value.Check(ProviderAvailabilityMarkerSchema, entry.data)) return "contradictory";
-  const data = Value.Decode(ProviderAvailabilityMarkerSchema, entry.data);
-  if (
-    !markerMatches(data, generation) ||
-    data.model !== target.model ||
-    data.thinking !== target.thinking
-  )
-    return "ignore";
-  const reason = data.reason.trim();
-  if (reason === "") return "contradictory";
-  return { state: data.availability, model: data.model, thinking: data.thinking, reason };
-}
-
-export function nativeSubmissionEvidence(
-  sessionFile: string,
-  generation: Generation,
-): NativeSubmissionEvidence {
-  try {
-    let marker: "not_submitted" | "submitted" | undefined;
-    for (const entry of attemptEntries(sessionFile, generation)) {
-      const observation = submissionEntryObservation(entry, generation);
-      const next = mergeSubmissionObservation(marker, observation);
-      if (next === "contradictory") return next;
-      marker = next;
-    }
-    return marker ?? "absent";
-  } catch {
-    return "absent";
-  }
-}
-
-function mergeSubmissionObservation(
-  previous: "not_submitted" | "submitted" | undefined,
-  observation: "not_submitted" | "submitted" | "contradictory" | undefined,
-): "not_submitted" | "submitted" | "contradictory" | undefined {
-  if (observation === undefined) return previous;
-  if (observation === "contradictory") return observation;
-  return previous === undefined || previous === observation ? observation : "contradictory";
-}
-
-function submissionEntryObservation(
-  entry: SessionEntry,
-  generation: Generation,
-): "not_submitted" | "submitted" | "contradictory" | undefined {
-  if (
-    entry.type === "message" &&
-    entry.message.role === "assistant" &&
-    entry.message.provider !== "workgraph" &&
-    ["stop", "length", "toolUse", "pending"].includes(entry.message.stopReason)
-  )
-    return "submitted";
-  if (entry.type !== "custom" || entry.customType !== NATIVE_SUBMISSION_MARKER) return undefined;
-  if (!Value.Check(NativeSubmissionMarkerSchema, entry.data)) return "contradictory";
-  const data = Value.Decode(NativeSubmissionMarkerSchema, entry.data);
-  if (!markerMatches(data, generation)) return undefined;
-  return data.state;
 }
 
 export function hasNativeAgentStarted(sessionFile: string, runId: string, nodeId: string): boolean {
@@ -535,24 +322,6 @@ export function readWorkerText(sessionFile: string, generation: Generation): str
         .join("\n")
         .trim();
       if (text) return text;
-    }
-  } catch {
-    return undefined;
-  }
-  return undefined;
-}
-
-/** Returns text only when the latest provider assistant message is terminal success. */
-export function readTerminalText(sessionFile: string, generation: Generation): string | undefined {
-  try {
-    for (const message of attemptMessages(sessionFile, generation).reverse()) {
-      if (message.role !== "assistant" || message.provider === "workgraph") continue;
-      if (message.stopReason !== "stop") return undefined;
-      const text = message.content
-        .filter((block) => block.type === "text")
-        .map((block) => block.text)
-        .join("\n");
-      return text.trim() === "" ? undefined : text;
     }
   } catch {
     return undefined;

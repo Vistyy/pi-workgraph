@@ -8,17 +8,7 @@ import {
   WorkerLaunchError,
   type WorkerRecoveryRequest,
 } from "../src/herdr.js";
-import {
-  MODEL_PREFLIGHT_MARKER,
-  NATIVE_SUBMISSION_MARKER,
-  PROVIDER_AVAILABILITY_MARKER,
-} from "../src/pi-process.js";
-import type {
-  EnrichmentPacket,
-  WorkerIdentity,
-  WorkerReport,
-  WorkerResourceIdentity,
-} from "../src/types.js";
+import type { WorkerIdentity, WorkerReport, WorkerResourceIdentity } from "../src/types.js";
 import { required } from "./decoders.js";
 
 export const FIXTURE_TIMESTAMP = 1_700_000_000_000;
@@ -68,13 +58,6 @@ export function workerEnvironment(
   return required(request.env[variable], `${variable} environment variable`);
 }
 
-function requestEnv(
-  request: { env: Record<string, string> },
-  variable: string,
-): string | undefined {
-  return request.env[variable];
-}
-
 function fixtureCheckpoint<E, R, A>(
   phase: WorkerLaunchError<E>["phase"],
   checkpoint: ((value: A) => Effect.Effect<void, E, R>) | undefined,
@@ -106,121 +89,22 @@ export class Worker {
   readonly checkpointEvents: string[] = [];
   deferWork = false;
   absent = false;
+  cleanupPending = false;
   status: HerdrObservation["status"] = "idle";
   failBeforePane = false;
   failBeforeSubmission = false;
-  readonly failBeforeSubmissionForModels = new Set<string>();
-  readonly unavailableBeforeSubmissionForModels = new Set<string>();
-  readonly settledUnavailableForModels = new Set<string>();
-  readonly settledUnavailableSuccessfulModels = new Set<string>();
-  readonly settledUnavailableSubmittedMarkerModels = new Set<string>();
-  readonly settledUnavailableContradictoryMarkerModels = new Set<string>();
-  readonly preflightStateForModels = new Map<
-    string,
-    "missing_model" | "missing_credentials" | "unsupported_thinking"
-  >();
   failAfterSubmission = false;
-  readonly failAfterSubmissionForModels = new Set<string>();
-  readonly settledFailureForModels = new Map<string, "error" | "aborted">();
-  enrichmentPacket: ((request: FixtureLaunchRequest) => EnrichmentPacket | undefined) | undefined;
-  enrichmentTranscript: string | undefined;
   // oxlint-disable-next-line effecttsgo/async-function -- The controlled worker callback preserves the existing Promise-based RuntimeWorkerPort seam.
   onWork: (request: FixtureLaunchRequest) => Promise<WorkerReport | undefined> = async () =>
     researchReport;
   onInspect: () => void = () => {};
 
-  private failsBeforeSubmission(request: WorkerLaunchEffectRequest<unknown, unknown>): boolean {
-    return (
-      this.failBeforeSubmission ||
-      (request.model !== undefined && this.failBeforeSubmissionForModels.has(request.model))
-    );
+  private failsBeforeSubmission(): boolean {
+    return this.failBeforeSubmission;
   }
 
-  private isSettledUnavailable(request: WorkerLaunchEffectRequest<unknown, unknown>): boolean {
-    return (
-      requestEnv(request, "PI_WORKGRAPH_MODE") === "consultation" &&
-      request.model !== undefined &&
-      this.settledUnavailableForModels.has(request.model)
-    );
-  }
-
-  private failsAfterSubmission(request: WorkerLaunchEffectRequest<unknown, unknown>): boolean {
-    return (
-      this.failAfterSubmission ||
-      (request.model !== undefined && this.failAfterSubmissionForModels.has(request.model))
-    );
-  }
-
-  private appendPreflight(request: WorkerLaunchEffectRequest<unknown, unknown>): void {
-    if (requestEnv(request, "PI_WORKGRAPH_MODE") !== "consultation") return;
-    const preflightState =
-      request.model === undefined ? undefined : this.preflightStateForModels.get(request.model);
-    SessionManager.open(request.sessionFile).appendCustomEntry(MODEL_PREFLIGHT_MARKER, {
-      runId: request.runId,
-      nodeId: request.nodeId,
-      model: request.model ?? "fixture/unknown",
-      thinking: requestEnv(request, "PI_WORKGRAPH_TARGET_THINKING") ?? "high",
-      state: preflightState ?? "ready",
-      detail:
-        preflightState === undefined
-          ? "Fixture model passed local preflight."
-          : `Fixture preflight rejected ${request.model} with ${preflightState}.`,
-    });
-  }
-
-  private appendSettledUnavailable(
-    session: ReturnType<typeof SessionManager.open>,
-    request: WorkerLaunchEffectRequest<unknown, unknown>,
-  ): void {
-    session.appendCustomEntry(PROVIDER_AVAILABILITY_MARKER, {
-      runId: request.runId,
-      nodeId: request.nodeId,
-      model: request.model ?? "fixture/unknown",
-      thinking: requestEnv(request, "PI_WORKGRAPH_TARGET_THINKING") ?? "high",
-      availability: "unavailable",
-      submission: "not_submitted",
-      reason: `Fixture provider cannot use ${request.model ?? "the selected target"}.`,
-    });
-    session.appendMessage({
-      role: "assistant",
-      content: [],
-      api: "test",
-      provider: "test",
-      model: "worker",
-      usage,
-      stopReason: "error",
-      errorMessage: "Fixture provider bridge unavailable before remote submission.",
-      timestamp: FIXTURE_TIMESTAMP,
-    });
-    if (this.settledUnavailableSuccessfulModels.has(request.model ?? ""))
-      session.appendMessage({
-        role: "assistant",
-        content: [{ type: "text", text: "Unexpected remote provider response" }],
-        api: "test",
-        provider: "test",
-        model: "worker",
-        usage,
-        stopReason: "stop",
-        timestamp: FIXTURE_TIMESTAMP,
-      });
-    if (this.settledUnavailableSubmittedMarkerModels.has(request.model ?? ""))
-      session.appendCustomEntry(NATIVE_SUBMISSION_MARKER, {
-        runId: request.runId,
-        nodeId: request.nodeId,
-        state: "submitted",
-      });
-    if (this.settledUnavailableContradictoryMarkerModels.has(request.model ?? "")) {
-      session.appendCustomEntry(NATIVE_SUBMISSION_MARKER, {
-        runId: request.runId,
-        nodeId: request.nodeId,
-        state: "not_submitted",
-      });
-      session.appendCustomEntry(NATIVE_SUBMISSION_MARKER, {
-        runId: request.runId,
-        nodeId: request.nodeId,
-        state: "submitted",
-      });
-    }
+  private failsAfterSubmission(): boolean {
+    return this.failAfterSubmission;
   }
 
   private submittedCheckpoint<E, R>(
@@ -237,27 +121,20 @@ export class Worker {
     );
   }
 
-  private launchAfterPreflight<E, R>(
+  private launchAfterReadiness<E, R>(
     request: WorkerLaunchEffectRequest<E, R>,
     resource: WorkerResourceIdentity,
   ) {
     return Effect.gen(
       function* (this: Worker) {
-        const settledUnavailable = this.isSettledUnavailable(request);
-        if (settledUnavailable) {
-          // Pi records local prompt delivery before the provider performs its bridge check.
-          yield* this.submittedCheckpoint(request, resource);
-          yield* this.deferWork ? Effect.void : this.produceEffect(request.sessionFile);
-        } else {
-          yield* this.deferWork ? Effect.void : this.produceEffect(request.sessionFile);
-          if (this.failsAfterSubmission(request))
-            return yield* new HerdrProtocolError({
-              operation: "launch fixture worker",
-              reason: "process",
-              detail: "fixture uncertain prompt receipt",
-            });
-          yield* this.submittedCheckpoint(request, resource);
-        }
+        yield* this.deferWork ? Effect.void : this.produceEffect(request.sessionFile);
+        if (this.failsAfterSubmission())
+          return yield* new HerdrProtocolError({
+            operation: "launch fixture worker",
+            reason: "process",
+            detail: "fixture uncertain prompt receipt",
+          });
+        yield* this.submittedCheckpoint(request, resource);
       }.bind(this),
     );
   }
@@ -297,13 +174,7 @@ export class Worker {
         this.identities.set(identity.agentName, identity);
         this.checkpointEvents.push("onResource");
         yield* fixtureCheckpoint("onResource", request.onResource, resource, resource);
-        if (this.failsBeforeSubmission(request)) {
-          if (
-            request.model !== undefined &&
-            this.unavailableBeforeSubmissionForModels.has(request.model)
-          )
-            this.markConsultationUnavailable(request);
-          else this.markConsultationNotSubmitted(request);
+        if (this.failsBeforeSubmission()) {
           return yield* new HerdrProtocolError({
             operation: "launch fixture worker",
             reason: "process",
@@ -312,12 +183,7 @@ export class Worker {
         }
         this.checkpointEvents.push("onIdentity");
         yield* fixtureCheckpoint("onIdentity", request.onIdentity, identity, identity);
-        // The real worker writes this generation-scoped marker at session start;
-        // the fixture writes the equivalent ready evidence before the launch preflight.
-        this.appendPreflight(request);
-        this.checkpointEvents.push("onPreflight");
-        yield* fixtureCheckpoint("onPreflight", request.onPreflight, undefined, resource);
-        yield* this.launchAfterPreflight(request, resource);
+        yield* this.launchAfterReadiness(request, resource);
         return { identity, status: "working" as const, observedAt: FIXTURE_OBSERVED_AT };
       }.bind(this),
     );
@@ -384,7 +250,7 @@ export class Worker {
   readonly cleanup = (identity: WorkerIdentity) =>
     Effect.sync(() => {
       this.cleanupIdentities.push(identity);
-      if (this.status === "working")
+      if (this.cleanupPending || this.status === "working")
         return {
           state: "pending" as const,
           identity,
@@ -405,30 +271,6 @@ export class Worker {
         detail: this.absent ? "Exact fixture worker is absent." : "Exact fixture worker closed.",
       };
     });
-
-  private markConsultationNotSubmitted(request: FixtureLaunchRequest): void {
-    if (requestEnv(request, "PI_WORKGRAPH_MODE") !== "consultation") return;
-    SessionManager.open(request.sessionFile).appendCustomEntry("pi-workgraph-native-submission", {
-      runId: request.runId,
-      nodeId: request.nodeId,
-      state: "not_submitted",
-    });
-  }
-
-  private markConsultationUnavailable(request: FixtureLaunchRequest): void {
-    if (requestEnv(request, "PI_WORKGRAPH_MODE") !== "consultation") return;
-    const model = request.model;
-    if (model === undefined) return;
-    SessionManager.open(request.sessionFile).appendCustomEntry(PROVIDER_AVAILABILITY_MARKER, {
-      runId: request.runId,
-      nodeId: request.nodeId,
-      model,
-      thinking: requestEnv(request, "PI_WORKGRAPH_TARGET_THINKING") ?? "high",
-      availability: "unavailable",
-      submission: "not_submitted",
-      reason: `Fixture provider cannot use ${model}.`,
-    });
-  }
 
   produceEffect(sessionFile: string): Effect.Effect<void, HerdrProtocolError> {
     const produce = this.producers.get(sessionFile);
@@ -456,62 +298,22 @@ export class Worker {
   private async produce<E, R>(request: WorkerLaunchEffectRequest<E, R>): Promise<void> {
     this.promptCount++;
     const session = SessionManager.open(request.sessionFile);
-    const settledUnavailable = this.isSettledUnavailable(request);
-    if (!settledUnavailable)
-      session.appendCustomEntry("pi-workgraph-agent-running", {
-        runId: request.runId,
-        nodeId: request.nodeId,
-      });
+    session.appendCustomEntry("pi-workgraph-agent-running", {
+      runId: request.runId,
+      nodeId: request.nodeId,
+    });
     const report = await this.onWork(request);
-    if (requestEnv(request, "PI_WORKGRAPH_MODE") === "consultation_enricher") {
-      if (this.enrichmentTranscript !== undefined)
-        session.appendMessage({
-          role: "assistant",
-          content: [{ type: "text", text: this.enrichmentTranscript }],
-          api: "test",
-          provider: "test",
-          model: "enricher",
-          usage,
-          stopReason: "stop",
-          timestamp: FIXTURE_TIMESTAMP,
-        });
-      const packet = this.enrichmentPacket?.(request);
-      if (packet !== undefined)
-        session.appendCustomEntry("pi-workgraph-enrichment", {
-          runId: request.runId,
-          nodeId: request.nodeId,
-          packet,
-        });
-    }
-    // The provider checks its bridge after Pi records local prompt delivery. Its
-    // unavailable marker plus error must still prove that no remote request occurred.
-    const settledFailure =
-      request.model === undefined ? undefined : this.settledFailureForModels.get(request.model);
-    if (settledUnavailable) this.appendSettledUnavailable(session, request);
-    else if (settledFailure !== undefined)
-      session.appendMessage({
-        role: "assistant",
-        content: [],
-        api: "test",
-        provider: "test",
-        model: "worker",
-        usage,
-        stopReason: settledFailure,
-        errorMessage: `Fixture settled with ${settledFailure}.`,
-        timestamp: FIXTURE_TIMESTAMP,
-      });
-    else
-      session.appendMessage({
-        role: "assistant",
-        content: [{ type: "text", text: "Actual fixture worker evidence" }],
-        api: "test",
-        provider: "test",
-        model: "worker",
-        usage,
-        stopReason: "stop",
-        timestamp: FIXTURE_TIMESTAMP,
-      });
-    if (report !== undefined && requestEnv(request, "PI_WORKGRAPH_MODE") !== "consultation")
+    session.appendMessage({
+      role: "assistant",
+      content: [{ type: "text", text: "Actual fixture worker evidence" }],
+      api: "test",
+      provider: "test",
+      model: "worker",
+      usage,
+      stopReason: "stop",
+      timestamp: FIXTURE_TIMESTAMP,
+    });
+    if (report !== undefined)
       session.appendMessage({
         role: "toolResult",
         toolCallId: "report",

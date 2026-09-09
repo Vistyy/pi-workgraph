@@ -37,17 +37,10 @@ export const ModelTargetSchema = Type.Object(
   { additionalProperties: false },
 );
 export type ModelTarget = Static<typeof ModelTargetSchema>;
-export const ModelChoiceSchema = Type.Object(
-  {
-    model: Type.String({ pattern: "^[^/\\s]+/\\S+$" }),
-    thinking: ThinkingSchema,
-    useWhen: Type.Optional(Type.String({ minLength: 1, maxLength: 2000 })),
-  },
-  { additionalProperties: false },
-);
+export const ModelChoiceSchema = ModelTargetSchema;
 export type ModelChoice = Static<typeof ModelChoiceSchema>;
 
-/** Policy guidance is presentation-only, never an executable target. */
+/** Policy values are exact executable targets; list order is only a research/review selection choice. */
 function exactTarget(target: ModelTarget): ModelTarget {
   return { model: target.model, thinking: target.thinking };
 }
@@ -77,13 +70,16 @@ export const SelectionRequestSchema = Type.Object(
 );
 export type SelectionRequest = Static<typeof SelectionRequestSchema>;
 
-export type ListModelRole = "research" | "review" | "consultation.advisor";
+export type ListModelRole = "research" | "review";
 export type ImplementationModelRole = "implementation.guide" | "implementation.executor";
 export type ModelTargetList = [ModelChoice, ...ModelChoice[]];
 
 export interface ModelPolicy {
   version: 5;
-  roles: Record<ImplementationModelRole | "consultation.enricher", ModelTarget> &
+  roles: Record<
+    ImplementationModelRole | "consultation.enricher" | "consultation.advisor",
+    ModelTarget
+  > &
     Record<ListModelRole, ModelTargetList>;
 }
 
@@ -119,7 +115,7 @@ export const DEFAULT_MODEL_POLICY: ModelPolicy = {
   version: 5,
   roles: {
     "consultation.enricher": { model: "openai-codex/gpt-5.6-luna", thinking: "high" },
-    "consultation.advisor": [{ model: "openai-codex/gpt-6-astra", thinking: "high" }],
+    "consultation.advisor": { model: "openai-codex/gpt-6-astra", thinking: "high" },
     research: DEFAULT_RESEARCH_MODELS,
     "implementation.guide": DEFAULT_GUIDE_TARGET,
     "implementation.executor": DEFAULT_EXECUTOR_TARGET,
@@ -212,8 +208,6 @@ function decodeModelList(value: unknown, role: ModelRole): ModelTargetList {
     throw new Error(`Invalid model list for ${role}.`);
   // SAFETY: The preceding Value.Check establishes a nonempty array of ModelTarget values.
   const decoded = Value.Decode(ModelTargetListSchema, value) as ModelTargetList;
-  if (role === "consultation.advisor" && hasDuplicateExecutableTargets(decoded))
-    throw new Error("Consultation advisor policy cannot contain duplicate exact model targets.");
   return decoded;
 }
 
@@ -401,18 +395,8 @@ function targetKey(target: ModelTarget): string {
   return `${target.model}\0${target.thinking}`;
 }
 
-function hasDuplicateExecutableTargets(targets: ReadonlyArray<ModelTarget>): boolean {
-  const seen = new Set<string>();
-  for (const target of targets) {
-    const key = targetKey(target);
-    if (seen.has(key)) return true;
-    seen.add(key);
-  }
-  return false;
-}
-
 function isListModelRole(role: ModelRole): role is ListModelRole {
-  return role === "research" || role === "review" || role === "consultation.advisor";
+  return role === "research" || role === "review";
 }
 
 export function setModelListEffect(

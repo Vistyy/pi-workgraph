@@ -2,12 +2,7 @@ import { createHash } from "node:crypto";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Herdr names are derived from the host repository path.
 import { basename } from "node:path";
 
-export type WorkerRole =
-  | "implement"
-  | "research"
-  | "review"
-  | "consultation"
-  | "consultation_enricher";
+export type WorkerRole = "implement" | "research" | "review";
 
 export interface WorkerNamingContext {
   runId: string;
@@ -31,8 +26,6 @@ const WORKER_TAB_ROLE_MARKERS: Record<WorkerRole, string> = {
   implement: "I",
   research: "R",
   review: "V",
-  consultation: "C",
-  consultation_enricher: "E",
 };
 const TAB_SUBJECT_LIMIT = 24;
 const GENERIC_ASSIGNMENT_IDS = new Set([
