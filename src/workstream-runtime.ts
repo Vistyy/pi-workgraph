@@ -1141,8 +1141,10 @@ export class WorkstreamRuntime {
         const attempt = findAttempt(state, attemptId);
         const assignment = findAssignment(state, attempt.assignmentId);
         const result = state.results.find((item) => item.id === attempt.resultId);
-        const sourceCommit = validApplicationCommit(result);
-        const candidate = required(candidateLineageForAttempt(attempt), "candidate base revision");
+        const sourceCommit =
+          attempt.application?.state === "applied"
+            ? attempt.application.commit
+            : validApplicationCommit(result);
         yield* this.runtimeSync("validate explicit application", () =>
           validateExplicitApplication(
             state,
@@ -1152,6 +1154,15 @@ export class WorkstreamRuntime {
             this.store.isAssignmentCurrent(state, assignment.id),
           ),
         );
+        if (attempt.application?.state === "applied")
+          return yield* this.releaseOutputEffect(
+            attemptId,
+            `Applied source ${sourceCommit} to destination ${required(
+              attempt.application.revision,
+              "applied revision",
+            )}.`,
+          );
+        const candidate = required(candidateLineageForAttempt(attempt), "candidate base revision");
         const validated = yield* this.repository.validateCandidate(
           placementOf(attempt),
           candidate.rootCommit,
@@ -1253,16 +1264,18 @@ export class WorkstreamRuntime {
           )
             throw new Error("Candidate output changed before application.");
         });
-        const prepared = yield* this.repository.prepareCandidateApplication(source, destination);
+        if (attempt.application?.state === "pending") {
+          const recovered = yield* this.recoverApplication(attempt, source, destination);
+          if (recovered) return;
+        }
         yield* Effect.gen(
           function* (this: WorkstreamRuntime) {
+            const prepared = yield* this.repository.prepareCandidateApplication(
+              source,
+              destination,
+            );
             const revision = yield* this.repository.applyCandidate(prepared);
             yield* this.storeEffect((store) => store.finishApplication(attempt.id, revision));
-            yield* this.recordApplicationArtifact(
-              attempt,
-              revision,
-              `Applied candidate history through ${source.commit} (${source.commits.length} commit${source.commits.length === 1 ? "" : "s"}).`,
-            );
           }.bind(this),
         ).pipe(
           Effect.catch((error: RuntimeError) =>
@@ -1277,47 +1290,25 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     source: CandidateApplicationSource,
     destination: CandidateApplicationDestination,
-    originalError: RuntimeError,
-  ): RuntimeEffect<void> {
+    originalError?: RuntimeError,
+  ): RuntimeEffect<boolean> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const recovery = yield* this.repository
           .recoverCandidateApplication(destination, source)
           .pipe(Effect.option);
         if (Option.isNone(recovery)) {
-          yield* this.storeEffect((store) =>
-            store.blockApplication(attempt.id, originalError.message),
-          );
-          return;
+          const reason =
+            originalError?.message ?? "Application recovery found an incompatible destination.";
+          yield* this.storeEffect((store) => store.blockApplication(attempt.id, reason));
+          return true;
         }
-        if (recovery.value === undefined) return;
+        if (recovery.value === undefined) return false;
         const recovered = recovery.value;
         yield* this.storeEffect((store) => store.finishApplication(attempt.id, recovered.head));
-        yield* this.recordApplicationArtifact(
-          attempt,
-          recovered.head,
-          `Recovered application of candidate history through ${source.commit}.`,
-        );
+        return true;
       }.bind(this),
     );
-  }
-
-  private recordApplicationArtifact(
-    attempt: WorkAttempt,
-    revision: string,
-    summary: string,
-  ): RuntimeEffect<void> {
-    return this.storeEffect((store) =>
-      store.addResultArtifacts(required(attempt.resultId, "result"), [
-        {
-          id: "maintained-revision",
-          kind: "revision",
-          reference: revision,
-          retention: "retained",
-          summary,
-        },
-      ]),
-    ).pipe(Effect.asVoid);
   }
 
   private cleanup(id: string): RuntimeEffect<void> {
@@ -1941,12 +1932,11 @@ function validateExplicitApplication(
     throw new Error("Attempt is not settled maintained implementation output.");
   if (attempt.cleanup?.state !== "completed" || attempt.cleanup.workerClosed !== true)
     throw new Error("Attempt worker and owned output have not settled for application.");
-  if (attempt.outputRelease !== undefined)
-    throw new Error("Retained output has already entered release; it cannot be applied.");
   if (!current)
     throw new Error("Intent changed; retained implementation is stale and cannot be applied.");
-  if (attempt.application?.state === "applied")
-    throw new Error("Application already has an applied checkpoint.");
+  if (attempt.application?.state === "applied") return;
+  if (attempt.outputRelease !== undefined)
+    throw new Error("Retained output has already entered release; it cannot be applied.");
   if (attempt.application?.state === "blocked")
     throw new Error(
       attempt.application.error ??

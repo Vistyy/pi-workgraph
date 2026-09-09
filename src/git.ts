@@ -44,6 +44,7 @@ export type CandidateApplicationAction =
   | { kind: "fast-forward"; target: string };
 
 export interface PreparedCandidateApplication {
+  destination: CandidateApplicationDestination;
   action: CandidateApplicationAction;
 }
 
@@ -287,23 +288,30 @@ export class GitRepository {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
-      if (prepared.action.kind === "already-integrated") return prepared.action.revision;
-      const target = prepared.action.target;
-      return yield* Effect.uninterruptible(
-        Effect.gen(function* () {
-          const result = yield* git.process(
-            root,
-            ["merge", "--ff-only", "--no-edit", target],
-            120_000,
-          );
-          if (!processSucceeded(result))
-            return yield* fail(
-              `Fast-forward application of ${target} failed: ${diagnostic(result)}`,
+      let revision: string;
+      if (prepared.action.kind === "already-integrated") revision = prepared.action.revision;
+      else {
+        const target = prepared.action.target;
+        revision = yield* Effect.uninterruptible(
+          Effect.gen(function* () {
+            const result = yield* git.process(
+              root,
+              ["merge", "--ff-only", "--no-edit", target],
+              120_000,
             );
-          yield* assertStableCleanHead(git, root, target, "Fast-forward application");
-          return target;
-        }),
-      );
+            if (!processSucceeded(result))
+              return yield* fail(
+                `Fast-forward application of ${target} failed: ${diagnostic(result)}`,
+              );
+            return target;
+          }),
+        );
+      }
+      yield* assertApplicationDestination(git, root, {
+        expectedRef: prepared.destination.expectedRef,
+        expectedHead: revision,
+      });
+      return revision;
     });
   };
 
@@ -446,7 +454,7 @@ function prepareCandidateApplication(
     const topology = yield* applicationTopology(git, root, source, destination);
     if (topology.kind === "already-integrated") {
       yield* assertApplicationDestination(git, root, destination);
-      return { action: topology };
+      return { destination, action: topology };
     }
     let target = source.commit;
     if (topology.mergeTree !== undefined) {
@@ -464,7 +472,7 @@ function prepareCandidateApplication(
         return yield* fail("Candidate application merge commit was not an exact commit id.");
     }
     yield* assertApplicationDestination(git, root, destination);
-    return { action: { kind: "fast-forward" as const, target } };
+    return { destination, action: { kind: "fast-forward" as const, target } };
   });
 }
 type ApplicationTopology =

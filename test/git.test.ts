@@ -398,13 +398,26 @@ void test("candidate application validates lineage, ref identity, and fast-forwa
     );
     assert.equal(await runGit(f.repository.head()), f.base);
     assert.equal(mergeAttempts, 1);
+    const preparedFastForward = await runGit(
+      f.repository.prepareCandidateApplication(source, destination),
+    );
+    await git(f.root, "branch", "switched-ff", f.base);
+    await git(f.root, "switch", "switched-ff");
+    try {
+      await assert.rejects(
+        () => runGit(f.repository.applyCandidate(preparedFastForward)),
+        /Application destination changed/,
+      );
+    } finally {
+      await git(f.root, "switch", "main");
+      await git(f.root, "branch", "-D", "switched-ff");
+    }
     assert.equal(await applyCandidate(f.repository, source, destination), second);
     assert.equal(await runGit(f.repository.head()), second);
     assert.equal(await git(f.root, "rev-list", "--count", `${f.base}..HEAD`), "2");
     assert.deepEqual(await runGit(f.repository.recoverCandidateApplication(destination, source)), {
       head: second,
     });
-
     await writeFile(join(f.root, "data.txt"), "moved\n");
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Move destination");

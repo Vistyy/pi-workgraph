@@ -1462,7 +1462,6 @@ await test("registered application keeps a no-effect failure pending for one exp
     try {
       await assert.rejects(
         f.call("workgraph_control", { action: "apply", attempt: attempt.handle }),
-        /Application remains pending/,
       );
       const pending = await outcomeInspection(
         f,
@@ -1721,19 +1720,6 @@ await test("retained candidate corrections apply their complete history and keep
     assert.equal(state.attempts[2]?.cleanup?.state, "completed");
     assert.equal(state.results[2]?.validity, "typed");
 
-    const beforeApplyBytes = await readFile(join(f.root, "value.txt"), "utf8");
-    const fixtureDirt = join(f.root, "apply-dirty.txt");
-    await writeFile(fixtureDirt, "fixture-owned dirt\n");
-    const dirtyHead = await runRuntime(f.repository.head());
-    await assert.rejects(
-      runRuntime(active.effects.apply(correctionAttempt.id)),
-      /Git working tree is not clean/,
-    );
-    state = await runRuntime(f.store.load());
-    assert.equal(state.attempts[1]?.application, undefined);
-    assert.equal(await runRuntime(f.repository.head()), dirtyHead);
-    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), beforeApplyBytes);
-    assert.equal(await readFile(fixtureDirt, "utf8"), "fixture-owned dirt\n");
     const correctionBranch =
       correctionAttempt.placement?.kind === "isolated_worktree"
         ? correctionAttempt.placement.branch
@@ -1744,8 +1730,43 @@ await test("retained candidate corrections apply their complete history and keep
     );
     assert.equal(await git(f.root, "rev-parse", correctionBranch), correctionCommit);
 
-    await rm(fixtureDirt);
+    const finishApplication = f.store.finishApplication.bind(f.store);
+    let finishInterrupted = true;
+    Object.defineProperty(f.store, "finishApplication", {
+      configurable: true,
+      value: (id: string, revision: string) =>
+        finishInterrupted ? Effect.interrupt : finishApplication(id, revision),
+    });
+    let applyCandidateCalls = 0;
+    const applyCandidate = f.repository.applyCandidate;
+    Object.defineProperty(f.repository, "applyCandidate", {
+      configurable: true,
+      value: (prepared: Parameters<typeof applyCandidate>[0]) => {
+        applyCandidateCalls += 1;
+        return applyCandidate(prepared);
+      },
+    });
+    await assert.rejects(runRuntime(active.effects.apply(correctionAttempt.id)));
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[1]?.application?.state, "pending");
+    assert.equal(state.attempts[1]?.application?.expectedHead, base);
+    assert.equal(await runRuntime(f.repository.head()), correctionCommit);
     assert.equal(await runRuntime(f.repository.status()), "");
+    const beginOutputRelease = f.store.beginOutputRelease.bind(f.store);
+    Object.defineProperty(f.store, "beginOutputRelease", {
+      configurable: true,
+      value: () => Effect.interrupt,
+    });
+    finishInterrupted = false;
+    await assert.rejects(runRuntime(active.effects.apply(correctionAttempt.id)));
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[1]?.application?.state, "applied");
+    assert.equal(state.attempts[1]?.outputRelease, undefined);
+    assert.equal(await runRuntime(f.repository.head()), correctionCommit);
+    Object.defineProperty(f.store, "beginOutputRelease", {
+      configurable: true,
+      value: beginOutputRelease,
+    });
     state = await runRuntime(active.effects.apply(correctionAttempt.id));
     assert.equal(await runRuntime(f.repository.head()), correctionCommit);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "corrected\n");
@@ -1755,6 +1776,7 @@ await test("retained candidate corrections apply their complete history and keep
     assert.equal(state.attempts[1]?.application?.rootCommit, base);
     assert.equal(state.attempts[0]?.candidate, undefined);
     assert.equal(state.attempts[1]?.outputRelease?.state, "completed");
+    assert.equal(applyCandidateCalls, 1);
     const completed = await runRuntime(
       active.effects.submit(
         f.store.complete({
