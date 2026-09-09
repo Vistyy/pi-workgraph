@@ -81,20 +81,22 @@ void test("coordinator exposes only the read/add/update/remove notepad and edits
   }
 });
 
-void test("notepad snapshot has a stable prefix, restores after reload, and is reintroduced after compaction", async () => {
+void test("notepad stays on demand during ordinary turns and restores only nonempty state after compaction", async () => {
   const f = await fixture();
   try {
     await f.runner.emit({ type: "session_start", reason: "startup" });
-    await f.call("workgraph_notepad", { action: "add", id: "later", text: "Follow up." });
-    const first = (await reminderText(f)) ?? "";
-    assert.match(first, /^\[WORKGRAPH PENDING ITEMS\]/);
-    assert.match(first, /later: Follow up\./);
-    f.session.appendCustomMessageEntry("pi-workgraph-coordinator-notepad", first, false);
     assert.equal(await reminderText(f), undefined);
+    await f.call("workgraph_notepad", { action: "add", id: "later", text: "Follow up." });
+    assert.equal(await reminderText(f), undefined);
+    assert.equal(f.messages.length, 0);
 
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
     await f.runner.emit({ type: "session_start", reason: "reload" });
     assert.equal(await reminderText(f), undefined);
+    const restored = await f.call("workgraph_notepad", { action: "read" });
+    assert.deepEqual(decodeTestValue(NotepadDetailsSchema, restored.details).notepad.items, [
+      { id: "later", text: "Follow up." },
+    ]);
 
     const kept = f.session.appendMessage({
       role: "user",
@@ -114,7 +116,32 @@ void test("notepad snapshot has a stable prefix, restores after reload, and is r
     });
     assert.equal(f.messages.length, 1);
     assert.equal(f.messages[0]?.customType, "pi-workgraph-coordinator-notepad");
-    assert.equal(f.messages[0]?.content, first);
+    const content = f.messages[0]?.content;
+    const text = Array.isArray(content)
+      ? content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
+      : content;
+    assert.match(text ?? "", /^\[WORKGRAPH PENDING ITEMS\]/);
+    assert.match(text ?? "", /later: Follow up\./);
+
+    f.session.appendCustomMessageEntry("pi-workgraph-coordinator-notepad", text ?? "", false);
+    await f.runner.emit({
+      type: "session_compact",
+      compactionEntry: compaction,
+      fromExtension: false,
+      reason: "manual",
+      willRetry: false,
+    });
+    assert.equal(f.messages.length, 1);
+
+    await f.call("workgraph_notepad", { action: "remove", id: "later" });
+    await f.runner.emit({
+      type: "session_compact",
+      compactionEntry: compaction,
+      fromExtension: false,
+      reason: "manual",
+      willRetry: false,
+    });
+    assert.equal(f.messages.length, 1);
   } finally {
     await f.dispose();
   }

@@ -59,7 +59,6 @@ import type { WorkgraphRegistry } from "./registry.js";
 import type { WorkerIdentity } from "./types.js";
 import type {
   CandidateLineage,
-  ResearchEvidenceProjection,
   StoreEffect,
   WorkAssignment,
   WorkAttempt,
@@ -596,21 +595,6 @@ export class WorkstreamRuntime {
       function* (this: WorkstreamRuntime) {
         const currentState = yield* this.storeEffect((store) => store.load());
         const current = findAttempt(currentState, item.id);
-        if (
-          current.state === "running" &&
-          current.consultation?.phase === "enricher" &&
-          current.consultation.frozenEvidence !== undefined &&
-          current.cleanup !== undefined
-        ) {
-          yield* this.cleanup(item.id);
-          const afterCleanup = findAttempt(
-            yield* this.storeEffect((store) => store.load()),
-            item.id,
-          );
-          if (afterCleanup.state === "running" && afterCleanup.cleanup?.state === "completed")
-            yield* this.storeEffect((store) => store.transitionConsultationToAdvisor(item.id));
-          return;
-        }
         if (yield* this.preserveExistingBoundary(currentState, current)) return;
         yield* canRetryCleanupBoundary(currentState, current)
           ? this.cleanup(item.id)
@@ -747,15 +731,8 @@ export class WorkstreamRuntime {
             : initial;
         const worker = required(attempt.worker, "worker identity");
         const observation = yield* this.workers.observe(worker);
-        if (yield* this.reconcileWorkerBoundary(state, attempt, assignment, observation)) return;
+        if (yield* this.reconcileWorkerBoundary(state, attempt, observation)) return;
         if (observation.status === "working" || observation.status === "blocked") return;
-        if (
-          assignment.capability === "consultation" &&
-          attempt.consultation?.phase === "enricher"
-        ) {
-          yield* this.reconcileConsultationEnricher(state, attempt, assignment);
-          return;
-        }
         yield* this.retain(state, attempt, assignment);
       }.bind(this),
     );
@@ -764,7 +741,6 @@ export class WorkstreamRuntime {
   private reconcileWorkerBoundary(
     state: WorkstreamState,
     attempt: WorkAttempt,
-    assignment: WorkAssignment,
     observation: HerdrObservation,
   ): RuntimeEffect<boolean> {
     return Effect.gen(
@@ -774,18 +750,10 @@ export class WorkstreamRuntime {
         const started = pi.started(worker.sessionFile, state.id, attempt.id);
         if (started && attempt.submission !== "started")
           yield* this.storeEffect((store) => store.markSubmission(attempt.id, "started"));
-        if (
-          assignment.capability !== "consultation" &&
-          (yield* this.resumeUnsentWorker(state, attempt, observation.status, started))
-        )
+        if (yield* this.resumeUnsentWorker(state, attempt, observation.status, started))
           return true;
         if (pi.settled(worker.sessionFile, state.id, attempt.id)) return false;
-        yield* this.validateUnsettledWorker(
-          attempt,
-          observation.status,
-          started,
-          assignment.capability === "consultation",
-        );
+        yield* this.validateUnsettledWorker(attempt, observation.status, started);
         return true;
       }.bind(this),
     );
@@ -837,13 +805,8 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     status: "idle" | "working" | "blocked" | "done" | "unknown",
     started: boolean,
-    consultation: boolean,
   ): RuntimeEffect<void> {
     return this.runtimeSync("validate unsettled worker", () => {
-      if (consultation && attempt.submission === "not_sent" && !started)
-        throw new Error(
-          "Consultation launch has no native submission checkpoint; no automatic resend is permitted. Inspect the retained session before retrying.",
-        );
       if (status === "blocked")
         throw new Error("Worker is blocked; inspect its visible session before proceeding.");
       if (attempt.submission === "uncertain" && !started)
@@ -956,35 +919,6 @@ export class WorkstreamRuntime {
           this.store,
         );
         yield* this.workers.launch(request);
-      }.bind(this),
-    );
-  }
-
-  private reconcileConsultationEnricher(
-    state: WorkstreamState,
-    attempt: WorkAttempt,
-    assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-  ): RuntimeEffect<void> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const sessionFile = required(attempt.sessionFile, "enricher session");
-        const generation = { runId: state.id, nodeId: attempt.id };
-        const read = yield* runtimePi.readReport(sessionFile, generation);
-        const report = read.report;
-        if (report === undefined || report.kind !== "research" || report.status !== "completed") {
-          // An invalid or non-completed enrichment uses the ordinary research result path;
-          // it is visible as the sole consultation outcome and never starts an advisor.
-          yield* this.retain(state, attempt, assignment);
-          return;
-        }
-        yield* this.storeEffect((store) =>
-          store.recordConsultationEvidence({
-            id: attempt.id,
-            evidence: boundedResearchEvidence(report),
-          }),
-        );
-        yield* this.beginCleanupIfNeeded(attempt);
-        yield* this.cleanup(attempt.id);
       }.bind(this),
     );
   }
@@ -1539,7 +1473,6 @@ export class WorkstreamRuntime {
 type EnqueuedAttempt = {
   id: string;
   models: NonNullable<WorkAttempt["models"]>;
-  consultation?: NonNullable<WorkAttempt["consultation"]>;
   continuationOf?: string;
   candidate?: CandidateLineage;
   baseRevision?: string;
@@ -1564,17 +1497,12 @@ function consultationAttempt(
   input: Omit<Extract<WorkAssignment, { capability: "consultation" }>, "createdAt">,
   base: QueueBase,
 ): EnqueuedAttempt {
-  const enricher = { ...policy.roles["consultation.enricher"] };
   const advisor = configuredTarget(policy, "consultation.advisor", input.advisorModel);
   const attempt: EnqueuedAttempt = {
     id: `attempt-${randomUUID()}`,
     models: {
-      guide: enricher,
-      source: "policy",
-    },
-    consultation: {
-      phase: "enricher",
-      advisorTarget: advisor,
+      guide: advisor,
+      source: input.advisorModel === undefined ? "policy" : "requested-model",
     },
   };
   if (base.revision !== undefined) attempt.baseRevision = base.revision;
@@ -1727,7 +1655,7 @@ function workerRecoveryRequest(
       attemptId: attempt.id,
       assignmentId: assignment.id,
       objective: assignment.objective,
-      role: workerRoleFor(assignment, phaseFor(attempt)),
+      role: workerRoleFor(assignment),
     }),
     cwd: attempt.placement?.path ?? state.projectRoot,
     sessionFile: required(attempt.sessionFile, "session file"),
@@ -1746,7 +1674,7 @@ function workerSessionRequest(
     targetCwd: workerCwd,
     sessionDir: join(dirname(state.statePath), "sessions"),
     objective: objectiveFor(state, attempt, assignment, workerCwd, baseRevision),
-    mode: modeFor(assignment, phaseFor(attempt)),
+    mode: modeFor(assignment),
     runId: state.id,
     nodeId: attempt.id,
   };
@@ -1772,7 +1700,7 @@ function workerLaunchRequest(
   FileSystem.FileSystem | Path.Path
 > {
   const environment = new Map<string, string>([
-    ["PI_WORKGRAPH_MODE", modeFor(assignment, phaseFor(attempt))],
+    ["PI_WORKGRAPH_MODE", modeFor(assignment)],
     ["PI_WORKGRAPH_RUN_ID", state.id],
     ["PI_WORKGRAPH_NODE_ID", attempt.id],
     ["PI_WORKGRAPH_REPOSITORY", state.projectRoot],
@@ -1799,7 +1727,7 @@ function workerLaunchRequest(
     attemptId: attempt.id,
     assignmentId: assignment.id,
     objective: assignment.objective,
-    role: workerRoleFor(assignment, phaseFor(attempt)),
+    role: workerRoleFor(assignment),
     cwd,
     sessionFile,
     prompt: workerPrompt(state, attempt, assignment, cwd, baseRevision),
@@ -1920,53 +1848,17 @@ function absentResultDetail(failure: NativeFailureCategory | undefined): string 
   }
 }
 
-function phaseFor(attempt: WorkAttempt): "enricher" | "advisor" | undefined {
-  return attempt.consultation?.phase;
-}
-
-function workerRoleFor(
-  assignment: WorkAssignment,
-  _phase: "enricher" | "advisor" | undefined,
-): "implement" | "research" | "review" {
+function workerRoleFor(assignment: WorkAssignment): "implement" | "research" | "review" {
   if (assignment.capability === "implement") return "implement";
   if (assignment.capability === "review") return "review";
   return "research";
 }
 
-function modeFor(
-  assignment: WorkAssignment,
-  _phase?: "enricher" | "advisor",
-): "implementation" | "review" | "research" {
+function modeFor(assignment: WorkAssignment): "implementation" | "review" | "research" {
   if (assignment.capability === "implement") return "implementation";
   if (assignment.capability === "review") return "review";
   return "research";
 }
-function boundedResearchEvidence(
-  report: Extract<WorkerReport, { kind: "research" }>,
-): ResearchEvidenceProjection {
-  const projection: ResearchEvidenceProjection = {
-    summary: report.summary.slice(0, 4_000),
-    evidence: report.evidence.slice(0, 20).map((item) => {
-      const evidence: ResearchEvidenceProjection["evidence"][number] = {
-        label: item.label.slice(0, 500),
-        observation: item.observation.slice(0, 4_000),
-      };
-      if (item.class !== undefined) evidence.class = item.class;
-      if (item.command !== undefined) evidence.command = item.command.slice(0, 4_000);
-      if (item.artifact !== undefined) evidence.artifact = item.artifact.slice(0, 2_000);
-      return evidence;
-    }),
-    findings: report.findings.slice(0, 20).map((item) => ({
-      severity: item.severity,
-      title: item.title.slice(0, 500),
-      detail: item.detail.slice(0, 4_000),
-    })),
-  };
-  if (report.uncertainty !== undefined)
-    projection.uncertainty = report.uncertainty.slice(0, 20).map((item) => item.slice(0, 2_000));
-  return projection;
-}
-
 function appendCandidatePrompt(
   lines: string[],
   state: WorkstreamState,
@@ -2022,23 +1914,11 @@ function workerPrompt(
 function appendConsultationObjective(
   lines: string[],
   assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-  attempt: WorkAttempt,
 ): void {
-  // The common Assignment line already carries the precise question once.
   if (assignment.context !== undefined)
     lines.push(`Coordinator-known context: ${assignment.context}`);
-  if (assignment.enrichmentFocus !== undefined)
-    lines.push(`Enrichment focus: ${assignment.enrichmentFocus}`);
-  if (phaseFor(attempt) === "advisor") {
-    lines.push(
-      "This is a fresh advisor session. The enricher transcript is not available and must not be inferred.",
-      `Frozen enricher research evidence: ${JSON.stringify(attempt.consultation?.frozenEvidence)}`,
-      "Provide advice as evidence only; do not claim coordinator acceptance or authority.",
-    );
-    return;
-  }
   lines.push(
-    "This is the evidence-only enrichment phase. Use ordinary read-only research tools to gather observations relevant to the question, without deciding or summarizing the answer. Finish with workgraph_report.",
+    "Provide decision-oriented advice using the available read-only research tools as needed. Advice is evidence only; do not claim coordinator acceptance or authority. Finish with workgraph_report.",
   );
 }
 
@@ -2064,8 +1944,7 @@ function objectiveFor(
   appendCandidatePrompt(common, state, attempt);
   if (assignment.capability === "research")
     common.push(`Expected evidence: ${assignment.expectedEvidence.join("; ")}`);
-  if (assignment.capability === "consultation")
-    appendConsultationObjective(common, assignment, attempt);
+  if (assignment.capability === "consultation") appendConsultationObjective(common, assignment);
   if (assignment.artifactIntent === "disposable_experiment")
     common.push(
       `Permitted effects: ${assignment.permittedEffects.join("; ")}`,

@@ -483,8 +483,7 @@ function settlement(state: WorkstreamState, result: WorkResult) {
             attempt: attempt.id,
           },
   };
-  if (attempt?.consultation === undefined) return projection;
-  return { ...projection, consultation: consultationProjection(attempt.consultation) };
+  return projection;
 }
 
 function itemPage<T, U>(
@@ -727,14 +726,6 @@ function boundedText(
   return projection;
 }
 
-function consultationProjection(consultation: NonNullable<WorkAttempt["consultation"]>) {
-  return {
-    phase: consultation.phase,
-    frozenEvidence: consultation.frozenEvidence,
-    advisorTarget: consultation.advisorTarget,
-  };
-}
-
 function projectedModels(attempt: WorkAttempt) {
   const models = attempt.models;
   const selected =
@@ -841,8 +832,6 @@ function recoveryView(
     attentionHistory: attempt.attentionHistory,
     models: attempt.models,
     effectiveModels: attempt.effectiveModels,
-    consultation:
-      attempt.consultation === undefined ? undefined : consultationProjection(attempt.consultation),
     delivery: state.deliveries.find((item) => item.resultId === attempt.resultId),
   };
   const blocker =

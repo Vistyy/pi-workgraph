@@ -12,7 +12,7 @@ import {
   candidateParent,
   retainedCandidate,
 } from "./candidate.js";
-import { EvidenceSchema, ResearchEvidenceProjectionSchema } from "./report-schema.js";
+import { EvidenceSchema } from "./report-schema.js";
 import {
   assertLegacySourceFile,
   claimWorkstreamDirectory,
@@ -35,14 +35,12 @@ import {
   type CandidateLineage,
   CommitSchema,
   type CompletionAccounting,
-  type ConsultationProgress,
   type HumanInputReceipt,
   type HumanInputSource,
   type Intent,
   InvalidWorkstreamStateError,
   isLegacyWorkstreamPath,
   pathForWorkstream,
-  type ResearchEvidenceProjection,
   ResultSchema,
   type ResultSubject,
   ResultSubjectSchema,
@@ -86,11 +84,9 @@ export type {
   AuthorityReference,
   CandidateLineage,
   CompletionAccounting,
-  ConsultationProgress,
   HumanInputReceipt,
   HumanInputSource,
   Intent,
-  ResearchEvidenceProjection,
   ResultSubject,
   RetainedArtifact,
   SessionIdentity,
@@ -122,7 +118,6 @@ type ApplicationInput = {
 type QueuedAttempt = {
   id: string;
   models: NonNullable<WorkAttempt["models"]>;
-  consultation?: NonNullable<WorkAttempt["consultation"]>;
   continuationOf?: string;
   candidate?: CandidateLineage;
   baseRevision?: string;
@@ -513,59 +508,6 @@ export class WorkstreamStoreEffects {
           baseRevision: input.baseRevision,
         }),
       input.now,
-    );
-  }
-
-  recordConsultationEvidence(input: {
-    id: string;
-    evidence: ResearchEvidenceProjection;
-    now?: Date;
-  }): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      input.id,
-      (attempt) => {
-        const current = consultationFor(attempt, input.id, "enricher");
-        if (!Value.Check(ResearchEvidenceProjectionSchema, input.evidence))
-          throw new Error("Consultation evidence is outside its bounded report projection.");
-        if (current.frozenEvidence !== undefined) {
-          if (sameValue(current.frozenEvidence, input.evidence)) return;
-          throw new Error(`Attempt ${input.id} has contradictory consultation evidence.`);
-        }
-        attempt.consultation = { ...current, frozenEvidence: structuredClone(input.evidence) };
-      },
-      input.now,
-    );
-  }
-
-  transitionConsultationToAdvisor(id: string, now?: Date): StoreEffect<WorkstreamState> {
-    return this.changeAttempt(
-      id,
-      (attempt) => {
-        if (attempt.state !== "running")
-          throw new Error(`Attempt ${id} is not in the running enricher state.`);
-        const current = consultationFor(attempt, id, "enricher");
-        if (current.frozenEvidence === undefined)
-          throw new Error(`Attempt ${id} has no durably retained consultation evidence.`);
-        if (attempt.cleanup?.state !== "completed" || !attempt.cleanup.workerClosed)
-          throw new Error(`Attempt ${id} advisor transition requires a closed enricher.`);
-        attempt.consultation = { ...current, phase: "advisor" };
-        if (attempt.models !== undefined)
-          attempt.models = { ...attempt.models, guide: { ...current.advisorTarget } };
-        attempt.state = "queued";
-        delete attempt.sessionFile;
-        delete attempt.placement;
-        delete attempt.baseRevision;
-        delete attempt.launchPane;
-        delete attempt.resource;
-        delete attempt.worker;
-        delete attempt.submission;
-        delete attempt.steering;
-        delete attempt.effectiveModels;
-        delete attempt.cleanup;
-        delete attempt.resultId;
-        delete attempt.error;
-      },
-      now,
     );
   }
 
@@ -1376,17 +1318,6 @@ function requireAssignment(state: WorkstreamState, id: string): WorkAssignment {
   const assignment = state.assignments.find((candidate) => candidate.id === id);
   if (!assignment) throw new Error(`Unknown assignment ${id}.`);
   return assignment;
-}
-
-function consultationFor(
-  attempt: WorkAttempt,
-  id: string,
-  phase: ConsultationProgress["phase"],
-): ConsultationProgress {
-  const consultation = attempt.consultation;
-  if (!consultation || consultation.phase !== phase)
-    throw new Error(`Attempt ${id} is not in its ${phase} phase.`);
-  return consultation;
 }
 
 function requireAuthority(state: WorkstreamState, authority: AuthorityReference): void {

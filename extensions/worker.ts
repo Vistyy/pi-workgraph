@@ -580,7 +580,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     description: "Return the terminal report for this bounded assignment.",
     promptSnippet: "Finish assigned work with a typed report",
     promptGuidelines: [
-      "Use workgraph_report as the final action, with actual evidence and explicit limitations.",
+      "Use workgraph_report as the final action. Choose the status that matches the actual outcome; report failures as failed rather than implying completion, and include actual evidence and explicit limitations.",
     ],
     parameters: reportSchemaForMode(mode),
     execute(_id, params: WorkerReportInput, _signal, _update, ctx) {

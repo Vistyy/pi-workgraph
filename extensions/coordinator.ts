@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- The extension loads one immutable packaged instruction asset before registering runtime Effects.
+import { readFileSync } from "node:fs";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Effect, type FileSystem, type Path, Semaphore } from "effect";
@@ -42,6 +44,10 @@ import { isLegacyWorkstreamPath } from "../src/workstream-state.js";
 
 const POINTER = "pi-workgraph-workstream";
 const INPUT = "pi-workgraph-human-input";
+const COORDINATOR_GUIDANCE = readFileSync(
+  new URL("../COORDINATOR.md", import.meta.url),
+  "utf8",
+).trim();
 
 const WorkstreamPointer = Type.Object({ path: Type.String({ minLength: 1 }) });
 const InputReceipt = HumanInputReceiptSchema;
@@ -449,20 +455,15 @@ export default function workgraphCoordinator(
     const active = runtime;
     return runCallback(active === undefined ? Effect.void : active.effects.close);
   });
-  pi.on("before_agent_start", () => ({
-    message: {
-      customType: "pi-workgraph-policy",
-      content:
-        "[WORKGRAPH]\nAfter queuing work, do immediately useful independent work if any; otherwise end the turn so retained-result notifications can resume coordination. Do not poll status or run waits for workers. Finish the requested work through verification and correction within scope.",
-      display: false,
-    },
+  pi.on("before_agent_start", (event) => ({
+    systemPrompt: `${event.systemPrompt}\n\n${COORDINATOR_GUIDANCE}`,
   }));
 
   pi.registerTool({
     name: "workgraph_models",
     label: "Workgraph Models",
     description:
-      "Read the configured ordered targets for research, review, or consultation.advisor.",
+      "Return the configured ordered model targets for research, review, or consultation.advisor.",
     promptSnippet: "Inspect configured Workgraph model targets",
     parameters: Type.Object(
       { role: StringEnum(MODEL_LIST_ROLES) },
@@ -488,7 +489,7 @@ export default function workgraphCoordinator(
     name: "workgraph_research",
     label: "Workgraph Research",
     description:
-      "Delegate a specific evidence question under the established current intent, not responsibility for choosing the design. Identify the relevant scope and required observations. Disposable experiments also require explicitly authorized effects and a stopping condition.",
+      "Queue bounded evidence work within the established intent. State the question and observations needed; an optional disposable experiment must also bound its permitted effects and stopping condition.",
     promptSnippet: "Delegate research or a bounded experiment",
     parameters: Type.Object(
       {
@@ -541,14 +542,13 @@ export default function workgraphCoordinator(
     name: "workgraph_consult",
     label: "Workgraph Consult",
     description:
-      "Queue one evidence-only consultation under the established current intent. An ordinary research enricher produces bounded frozen evidence before cleanup, then a fresh ordinary research advisor returns a standard report. Advice is evidence, not authority or acceptance.",
+      "Queue one read-only advisor under the established intent. It receives the question and optional coordinator context. Advice is evidence, not authority or acceptance.",
     promptSnippet: "Consult one evidence advisor",
     parameters: Type.Object(
       {
         id: Type.String({ minLength: 1 }),
         question: Type.String({ minLength: 1, maxLength: 20_000 }),
         context: Type.Optional(Type.String({ maxLength: 20_000 })),
-        enrichmentFocus: Type.Optional(Type.String({ maxLength: 4_000 })),
         advisor: Type.Optional(Type.String({ pattern: "^[^/\\s]+/\\S+$" })),
       },
       { additionalProperties: false },
@@ -563,16 +563,13 @@ export default function workgraphCoordinator(
             capability: "consultation",
             artifactIntent: "evidence_only",
             objective: params.question,
-            question: params.question,
             intentVersion: intent.version,
           };
           if (params.context !== undefined) assignment.context = params.context;
-          if (params.enrichmentFocus !== undefined)
-            assignment.enrichmentFocus = params.enrichmentFocus;
           if (params.advisor !== undefined) assignment.advisorModel = params.advisor;
           const state = yield* active.effects.queue(assignment);
           return mutationResult(
-            `Queued consultation ${params.id}; enrichment and advice are observed asynchronously.`,
+            `Queued consultation ${params.id}; advisor execution is observed asynchronously.`,
             yield* remember(state, ctx),
             { action: "workgraph_consult", assignmentId: params.id, outcome: "queued" },
           );
@@ -585,7 +582,7 @@ export default function workgraphCoordinator(
     name: "workgraph_intent",
     label: "Workgraph Intent",
     description:
-      "Explicitly establish or revise the coordinator's semantic scope against a retained human input receipt. This is required before delegation; receiving or selecting a receipt alone does not change scope, and earlier results remain tied to their old intent.",
+      "Establish or revise the shared Workgraph goal and constraints from retained human input. The first intent fixes the repository; later revisions cannot switch it. Required before delegation.",
     parameters: Type.Object(
       {
         statement: Type.String({ minLength: 1 }),
@@ -642,7 +639,7 @@ export default function workgraphCoordinator(
     name: "workgraph_implement",
     label: "Workgraph Implement",
     description:
-      "Delegate implementation only after the boundary-level design has been settled and, for nontrivial work, externalized in the coordinator conversation and carried into the objective; a local change beneath stable contracts needs only its direct contract and flow. Use the vocabulary of the work. The guide may choose mechanics beneath that design, but must not invent responsibility ownership, retained or removed mechanisms, interaction contracts, consumer and integration changes, end-to-end flow, or failure, ordering, precedence, concurrency, and lifetime behavior. The default keeps current scope even when newer input is retained; changed scope must first be recorded with workgraph_intent.",
+      "Queue a maintained change only after its consequential design is settled with the user. Carry that design and observable acceptance conditions in the assignment; the worker chooses only local mechanics. Newer input does not change the established intent automatically.",
     promptSnippet: "Delegate an authorized maintained change",
     parameters: Type.Object(
       {
@@ -688,7 +685,7 @@ export default function workgraphCoordinator(
     name: "workgraph_review",
     label: "Workgraph Review",
     description:
-      "Delegate read-only independent review under the established current intent of a retained result, artifact, exact revision, or comparison of retained results for a specific concern. State the expected behavior or constraint to check; request discrepancies and supporting evidence, not an acceptance decision. Exact-revision evidence must come from that revision, not live working files.",
+      "Queue read-only review of an exact retained result, artifact, revision, or comparison for one specific concern. Request discrepancies and supporting evidence, not an acceptance decision. Revision review inspects that revision rather than live files.",
     promptSnippet: "Delegate selective review",
     parameters: Type.Object(
       {
@@ -760,7 +757,7 @@ export default function workgraphCoordinator(
     name: "workgraph_inspect",
     label: "Workgraph Inspect",
     description:
-      "Inspect one unified bounded view of workstream overview, retained human context, a semantic task or complete assignment, its outcome/evidence, completion, or exact recovery. Notifications already include a bounded actionable outcome; inspect only for uncertainty, blockers, repeated attempts, or truncated content. Detail reads are character-bounded and lossless through the returned next handle, including exact inputs, intents, assignments, completion, and untyped or malformed reports.",
+      "Read a bounded view of workstream state, retained context, assignments, outcomes, evidence, completion, or recovery. Notifications normally contain enough to act; inspect when uncertainty, blockers, repeated attempts, or truncation could change the decision.",
     promptSnippet:
       "Inspect Workgraph overview, retained context, complete assignments, outcomes, completion, or recovery",
     parameters: Type.Object({
@@ -802,7 +799,7 @@ export default function workgraphCoordinator(
     name: "workgraph_control",
     label: "Workgraph Control",
     description:
-      "Suspend or resume coordination, cancel or steer one exact worker attempt, apply one exact retained maintained output, or release one exact retained output. Settlement never applies output; cancellation preserves output. Application observes destination state and derives the retained source under current intent. Inspect resulting effects before retrying uncertain application or release.",
+      "Suspend or resume coordination; cancel or steer one exact attempt; apply one exact retained maintained output; or release one exact retained output. Settlement never applies output, and cancellation preserves output.",
     parameters: ControlSchema,
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
@@ -829,7 +826,7 @@ export default function workgraphCoordinator(
     name: "workgraph_adopt",
     label: "Workgraph Adopt",
     description:
-      "Attach a retained workstream only after expired prior ownership is authoritatively dead. Preserve suspension and original human receipts.",
+      "Transfer a retained workstream from a coordinator proven dead to the current coordinator session. This preserves its repository, scope, suspension state, and human-input history; lease expiry alone is insufficient.",
     parameters: Type.Object({ statePath: Type.String() }),
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
@@ -873,7 +870,7 @@ export default function workgraphCoordinator(
     name: "workgraph_fork",
     label: "Workgraph Fork",
     description:
-      "Explicitly fork the coordinator conversation into a new no-focus Herdr workspace; workers remain tabs in that coordinator workspace, not a worker continuation or workstream adoption.",
+      "Fork the coordinator conversation into a new unfocused Herdr workspace at the requested working directory. This starts separate coordination rather than continuing or adopting a workstream.",
     parameters: Type.Object({ targetCwd: Type.String() }),
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
@@ -905,7 +902,7 @@ export default function workgraphCoordinator(
     name: "workgraph_complete",
     label: "Workgraph Complete",
     description:
-      "Complete after owned workers and resources settle. Runtime derives factual unresolved accounting from retained state; provide the coordinator's conclusion, nonempty evidence, and optional limitations.",
+      "Record the coordinator's goal-level conclusion, supporting evidence, and limitations after owned work and resources settle. Runtime-derived unresolved accounting still blocks completion.",
     parameters: CompleteSchema,
     execute(_id, params, signal, _update, ctx) {
       return runCallback(

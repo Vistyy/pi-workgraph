@@ -10,7 +10,7 @@ import { runNodePlatformPromise } from "./node-platform.js";
 
 export const MODEL_LIST_ROLES = ["research", "review", "consultation.advisor"] as const;
 export type ListModelRole = (typeof MODEL_LIST_ROLES)[number];
-export type ImplementationModelRole = "implementation.guide" | "implementation.executor";
+export type SingletonModelRole = "implementation.guide" | "implementation.executor";
 export const ThinkingSchema = StringEnum([
   "off",
   "minimal",
@@ -41,7 +41,6 @@ const ModelPolicySchema = Type.Object(
         "implementation.guide": ModelTargetSchema,
         "implementation.executor": ModelTargetSchema,
         review: ModelTargetListSchema,
-        "consultation.enricher": ModelTargetSchema,
         "consultation.advisor": ModelTargetListSchema,
       },
       { additionalProperties: false },
@@ -52,8 +51,7 @@ const ModelPolicySchema = Type.Object(
 
 export interface ModelPolicy {
   version: 6;
-  roles: Record<ListModelRole, ModelTargetList> &
-    Record<ImplementationModelRole | "consultation.enricher", ModelTarget>;
+  roles: Record<ListModelRole, ModelTargetList> & Record<SingletonModelRole, ModelTarget>;
 }
 
 export const SelectionRequestSchema = Type.Object(

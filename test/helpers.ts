@@ -44,7 +44,6 @@ export const fixturePolicy: ModelPolicy = {
     ],
     "implementation.guide": { model: "fixture/guide", thinking: "high" },
     "implementation.executor": { model: "fixture/executor", thinking: "xhigh" },
-    "consultation.enricher": { model: "fixture/enricher", thinking: "high" },
     "consultation.advisor": [
       { model: "fixture/advisor", thinking: "low" },
       { model: "fixture/advisor-2", thinking: "medium" },

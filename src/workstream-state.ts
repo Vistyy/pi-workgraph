@@ -5,11 +5,7 @@ import { Data } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { ModelTargetSchema } from "./model-policy.js";
-import {
-  EvidenceSchema,
-  ResearchEvidenceProjectionSchema,
-  WorkerReportSchema,
-} from "./report-schema.js";
+import { EvidenceSchema, WorkerReportSchema } from "./report-schema.js";
 
 export const WORKSTREAM_STATE_VERSION = 7 as const;
 export const WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
@@ -161,9 +157,7 @@ const ConsultationAssignmentSchema = Type.Object(
     ...AssignmentBase,
     capability: Type.Literal("consultation"),
     artifactIntent: Type.Literal("evidence_only"),
-    question: Type.String({ minLength: 1, maxLength: 20_000 }),
     context: Type.Optional(Type.String({ maxLength: 20_000 })),
-    enrichmentFocus: Type.Optional(Type.String({ maxLength: 4_000 })),
     advisorModel: Type.Optional(Type.String({ pattern: "^[^/\\s]+/\\S+$" })),
   },
   { additionalProperties: false },
@@ -256,14 +250,6 @@ const ResourceSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const ConsultationProgressSchema = Type.Object(
-  {
-    phase: StringEnum(["enricher", "advisor"] as const),
-    frozenEvidence: Type.Optional(ResearchEvidenceProjectionSchema),
-    advisorTarget: ModelTargetSchema,
-  },
-  { additionalProperties: false },
-);
 export const AttemptPlacementSchema = Type.Union([
   Type.Object(
     {
@@ -295,7 +281,6 @@ const AttemptSchema = Type.Object(
       "cancelled",
     ] as const),
     models: Type.Optional(ModelsSchema),
-    consultation: Type.Optional(ConsultationProgressSchema),
     effectiveModels: Type.Optional(
       Type.Array(
         Type.Object(
@@ -523,8 +508,6 @@ export type Intent = Static<typeof IntentSchema>;
 export type AuthorityReference = Static<typeof AuthorityReferenceSchema>;
 export type ResultSubject = Static<typeof ResultSubjectSchema>;
 export type WorkAssignment = Static<typeof AssignmentSchema>;
-export type ConsultationProgress = Static<typeof ConsultationProgressSchema>;
-export type ResearchEvidenceProjection = Static<typeof ResearchEvidenceProjectionSchema>;
 export type RetainedArtifact = Static<typeof ArtifactSchema>;
 export type WorkResult = Static<typeof ResultSchema>;
 export type WorkAttempt = Static<typeof AttemptSchema>;

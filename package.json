@@ -9,11 +9,7 @@
   },
   "license": "MIT",
   "bin": {
-    "pi-workgraph": "./bin/pi-workgraph.mjs",
-    "pi-workgraph-chatgpt-web-install": "./bin/codex-web-gpt-lifecycle.sh",
-    "pi-workgraph-chatgpt-web-start": "./bin/codex-web-gpt-lifecycle.sh",
-    "pi-workgraph-chatgpt-web-status": "./bin/codex-web-gpt-lifecycle.sh",
-    "pi-workgraph-chatgpt-web-stop": "./bin/codex-web-gpt-lifecycle.sh"
+    "pi-workgraph": "./bin/pi-workgraph.mjs"
   },
   "keywords": [
     "pi-package",
@@ -25,8 +21,7 @@
     "bin",
     "extensions",
     "src",
-    "scripts/codex-web-gpt-headless",
-    "skills",
+    "COORDINATOR.md",
     "README.md"
   ],
   "scripts": {
@@ -37,16 +32,12 @@
     "check:exports": "knip --no-progress --include exports,nsExports",
     "check": "pnpm run quality && pnpm run check:exports && pnpm run test",
     "verify:native": "node --import tsx scripts/live/controlled-native.ts",
-    "verify:package": "node --import tsx scripts/live/package-check.ts"
+    "verify:package": "node --import tsx scripts/live/package-smoke.ts"
   },
   "pi": {
     "extensions": [
       "./extensions/coordinator.ts",
-      "./extensions/worker.ts",
-      "./extensions/chatgpt-web-provider.ts"
-    ],
-    "skills": [
-      "./skills"
+      "./extensions/worker.ts"
     ]
   },
   "dependencies": {

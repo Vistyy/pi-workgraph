@@ -401,104 +401,53 @@ const consultation = (id: string) => ({
   capability: "consultation" as const,
   artifactIntent: "evidence_only" as const,
   objective: "Which strategy should be retained?",
-  question: "Which strategy should be retained?",
   context: "The coordinator needs a bounded recommendation.",
   intentVersion: 0,
 });
 
-await test("consultation uses two ordinary research sessions and delivers one bounded final result", async () => {
+await test("consultation launches one advisor with direct context and retains one research result", async () => {
   const f = await fixture();
   try {
     const policy = structuredClone(fixturePolicy);
-    policy.roles["consultation.enricher"] = { model: "fixture/enricher", thinking: "high" };
     policy.roles["consultation.advisor"] = [
       { model: "fixture/policy-advisor", thinking: "low" },
       { model: "fixture/policy-advisor-2", thinking: "medium" },
     ];
     await f.writePolicy(policy);
     const active = await f.runtime();
-    const reports = [
-      {
-        kind: "research" as const,
-        status: "completed" as const,
-        summary: "E".repeat(8_000),
-        evidence: [{ label: "source", observation: "enricher evidence" }],
-        findings: [],
-      },
-      {
-        kind: "research" as const,
-        status: "completed" as const,
-        summary: "Advisor conclusion",
-        evidence: [{ label: "advice", observation: "fresh advisor evidence" }],
-        findings: [],
-      },
-    ];
-    f.workers.onWork = async (request) => {
-      const report = reports[f.workers.requests.length - 1] ?? reports[1];
-      if (f.workers.requests.length === 1)
-        SessionManager.open(request.sessionFile).appendMessage({
-          role: "assistant",
-          content: [{ type: "text", text: "ENRICHER PRIVATE TRANSCRIPT" }],
-          api: "test",
-          provider: "test",
-          model: "enricher",
-          usage,
-          stopReason: "stop",
-          timestamp: FIXTURE_TIMESTAMP,
-        });
-      return report;
-    };
+    f.workers.onWork = async () => ({
+      kind: "research",
+      status: "completed",
+      summary: "Advisor conclusion",
+      evidence: [{ label: "advice", observation: "direct advisor evidence" }],
+      findings: [],
+    });
     await runRuntime(
       active.effects.queue({
-        id: "thin-consultation",
+        id: "direct-consultation",
         capability: "consultation",
         artifactIntent: "evidence_only",
         objective: "Which file strategy should be retained?",
-        question: "Which file strategy should be retained?",
         context: "The coordinator needs a bounded architecture recommendation.",
         advisorModel: "fixture/policy-advisor-2",
         intentVersion: 0,
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(f.store.load());
-    const enricher = required(state.attempts[0], "enricher attempt");
-    assert.equal(enricher.consultation?.phase, "enricher");
-    assert.equal(enricher.cleanup?.state, "completed");
+    for (let index = 0; index < 5; index++) await runRuntime(active.effects.reconcile);
+    const state = await runRuntime(f.store.load());
+    assert.equal(state.attempts[0]?.models?.source, "requested-model");
     assert.equal(f.workers.requests.length, 1);
-    assert.equal(f.workers.cleanupIdentities.length, 1);
-    assert.ok((enricher.consultation?.frozenEvidence?.summary.length ?? 0) <= 4_000);
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(f.store.load());
-    assert.equal(state.attempts[0]?.consultation?.phase, "advisor");
-    assert.deepEqual(state.attempts[0]?.consultation?.advisorTarget, {
-      model: "fixture/policy-advisor-2",
-      thinking: "medium",
-    });
-    assert.equal(state.attempts[0]?.models?.guide.model, "fixture/policy-advisor-2");
-    assert.equal(state.attempts[0]?.sessionFile, undefined);
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(f.store.load());
-    assert.equal(f.workers.requests.length, 2);
+    const request = required(f.workers.requests[0], "advisor request");
     assert.deepEqual(
-      f.workers.requests.map((request) => [
+      [
         request.role,
         request.model,
         request.thinking,
         workerEnvironment(request, "PI_WORKGRAPH_MODE"),
-      ]),
-      [
-        ["research", "fixture/enricher", "high", "research"],
-        ["research", "fixture/policy-advisor-2", "medium", "research"],
       ],
+      ["research", "fixture/policy-advisor-2", "medium", "research"],
     );
-    const advisorFile = required(f.workers.requests[1], "advisor request").sessionFile;
-    assert.notEqual(advisorFile, f.workers.requests[0]?.sessionFile);
-    assert.equal(SessionManager.open(advisorFile).getHeader()?.parentSession, undefined);
-    const advisorSession = JSON.stringify(SessionManager.open(advisorFile).getBranch());
+    const advisorSession = JSON.stringify(SessionManager.open(request.sessionFile).getBranch());
     assert.equal(advisorSession.split("Which file strategy should be retained").length - 1, 1);
     assert.equal(
       advisorSession.split("The coordinator needs a bounded architecture recommendation.").length -
@@ -506,14 +455,15 @@ await test("consultation uses two ordinary research sessions and delivers one bo
       1,
     );
     assert.match(advisorSession, /Advisor conclusion/);
-    assert.match(advisorSession, /fresh advisor evidence/);
-    assert.doesNotMatch(advisorSession, /ENRICHER PRIVATE TRANSCRIPT/);
+    assert.match(advisorSession, /direct advisor evidence/);
+    assert.doesNotMatch(advisorSession, /enrich|frozen evidence/i);
     assert.equal(state.results.length, 1);
     assert.equal(state.results[0]?.validity, "typed");
     if (state.results[0]?.validity === "typed") {
       assert.equal(state.results[0].report.kind, "research");
       assert.equal(state.results[0].report.summary, "Advisor conclusion");
     }
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(f.delivered.length, 1);
     assert.equal(f.delivered[0], state.results[0]?.id);
   } finally {
@@ -529,7 +479,7 @@ await test("consultation defaults to the first configured advisor and rejects un
       active.effects.queue(consultation("default-consultation")),
     );
     for (let index = 0; index < 5; index++) await runRuntime(active.effects.reconcile);
-    assert.deepEqual(defaultState.attempts[0]?.consultation?.advisorTarget, {
+    assert.deepEqual(defaultState.attempts[0]?.models?.guide, {
       model: "fixture/advisor",
       thinking: "low",
     });
@@ -546,11 +496,60 @@ await test("consultation defaults to the first configured advisor and rejects un
     const after = await runRuntime(f.store.load());
     assert.equal(after.assignments.length, before.assignments.length);
     assert.equal(after.attempts.length, before.attempts.length);
-    assert.equal(f.workers.requests.length, 2);
+    assert.equal(f.workers.requests.length, 1);
     assert.deepEqual(
-      [f.workers.requests[1]?.model, f.workers.requests[1]?.thinking],
+      [f.workers.requests[0]?.model, f.workers.requests[0]?.thinking],
       ["fixture/advisor", "low"],
     );
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("consultation retains failed and escalated advisor outcomes faithfully", async () => {
+  for (const status of ["failed", "escalated"] as const) {
+    const f = await fixture();
+    try {
+      const active = await f.runtime();
+      f.workers.onWork = async () => ({
+        kind: "research",
+        status,
+        summary: `Advisor ${status}`,
+        evidence: [],
+        findings: [],
+      });
+      await runRuntime(active.effects.queue(consultation(`consultation-${status}`)));
+      for (let index = 0; index < 5; index++) await runRuntime(active.effects.reconcile);
+      const state = await runRuntime(f.store.load());
+      const result = required(state.results[0], `${status} consultation result`);
+      assert.equal(result.validity, "typed");
+      if (result.validity === "typed") {
+        assert.equal(result.report.kind, "research");
+        assert.equal(result.report.status, status);
+      }
+      assert.equal(state.attempts[0]?.cleanup?.state, "completed");
+      assert.equal(f.workers.requests.length, 1);
+      assert.equal(f.delivered.length, 1);
+    } finally {
+      await f.dispose();
+    }
+  }
+});
+
+await test("consultation recovers an uncertain launch without duplicate submission", async () => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    f.workers.failAfterSubmission = true;
+    f.workers.onWork = async () => undefined;
+    await runRuntime(active.effects.queue(consultation("uncertain-consultation")));
+    for (let index = 0; index < 5; index++) await runRuntime(active.effects.reconcile);
+    const state = await runRuntime(f.store.load());
+    assert.equal(f.workers.requests.length, 1);
+    assert.equal(f.workers.promptCount, 1);
+    assert.equal(state.results.length, 1);
+    assert.equal(state.results[0]?.validity, "untyped");
+    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
   } finally {
     await f.dispose();
   }
@@ -624,7 +623,7 @@ await test("predecessor-v7 model metadata normalizes on SQLite read and persists
     if (restored.assignments[0]?.capability !== "consultation")
       throw new Error("Expected consultation");
     assert.equal(restored.assignments[0].advisorModel, "fixture/advisor-2");
-    assert.equal(restored.attempts[0]?.consultation?.advisorTarget.model, "fixture/advisor");
+    assert.equal(restored.attempts[0]?.models?.guide.model, "fixture/advisor");
     assert.equal(restored.attempts[0]?.models?.source, "requested-model");
     assert.deepEqual(restored.attempts[0]?.models?.selection, {
       role: "research",
@@ -657,105 +656,6 @@ await test("predecessor-v7 model metadata normalizes on SQLite read and persists
     );
     assert.equal("advisorOverride" in persistedAssignment, false);
     assert.equal("overrideReason" in mutable(persistedAttempt.models, "persisted models"), false);
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("cancelled consultation does not cross the frozen-enrichment cleanup boundary", async () => {
-  const f = await fixture();
-  try {
-    const active = await f.runtime();
-    await runRuntime(active.effects.queue(consultation("cancelled-consultation")));
-    await runRuntime(active.effects.reconcile);
-    f.workers.cleanupPending = true;
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(f.store.load());
-    const attempt = required(state.attempts[0], "cancelled consultation attempt");
-    assert.equal(attempt.state, "running");
-    assert.equal(attempt.consultation?.phase, "enricher");
-    assert.ok(attempt.consultation?.frozenEvidence);
-    assert.equal(attempt.cleanup?.state, "pending");
-    await runRuntime(active.effects.cancel(attempt.id));
-    state = await runRuntime(f.store.load());
-    assert.equal(state.attempts[0]?.state, "cancel_requested");
-    assert.equal(state.attempts[0]?.cleanup?.state, "pending");
-    await assert.rejects(
-      submit(active, f.store.transitionConsultationToAdvisor(attempt.id)),
-      /running enricher state/,
-    );
-    f.workers.cleanupPending = false;
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(f.store.load());
-    assert.equal(state.attempts[0]?.state, "cancelled");
-    assert.equal(state.attempts[0]?.consultation?.phase, "enricher");
-    assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-    await assert.rejects(
-      submit(active, f.store.transitionConsultationToAdvisor(attempt.id)),
-      /running enricher state/,
-    );
-    assert.equal(state.results.length, 0);
-    assert.equal(f.delivered.length, 0);
-    assert.equal(f.workers.requests.length, 1);
-    assert.equal(f.workers.promptCount, 1);
-    assert.equal(f.workers.checkpointEvents.filter((event) => event === "onSubmitted").length, 1);
-    assert.equal(f.workers.cleanupIdentities.length, 3);
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("failed and escalated enrichment remain the sole consultation result", async () => {
-  for (const status of ["failed", "escalated"] as const) {
-    const f = await fixture();
-    try {
-      const active = await f.runtime();
-      f.workers.onWork = async () => ({
-        kind: "research",
-        status,
-        summary: `Enricher ${status}`,
-        evidence: [],
-        findings: [],
-      });
-      await runRuntime(active.effects.queue(consultation(`consultation-${status}`)));
-      await runRuntime(active.effects.reconcile);
-      await runRuntime(active.effects.reconcile);
-      await runRuntime(active.effects.reconcile);
-      await runRuntime(active.effects.reconcile);
-      const state = await runRuntime(f.store.load());
-      const result = required(state.results[0], `${status} consultation result`);
-      assert.equal(result.validity, "typed");
-      if (result.validity === "typed") {
-        assert.equal(result.report.kind, "research");
-        assert.equal(result.report.status, status);
-      }
-      assert.equal(state.attempts[0]?.consultation?.phase, "enricher");
-      assert.equal(state.attempts[0]?.cleanup?.state, "completed");
-      assert.equal(f.workers.requests.length, 1);
-      assert.equal(f.delivered.length, 1);
-    } finally {
-      await f.dispose();
-    }
-  }
-});
-
-await test("uncertain consultation launch is retained without an automatic resend", async () => {
-  const f = await fixture();
-  try {
-    const active = await f.runtime();
-    f.workers.failAfterSubmission = true;
-    f.workers.onWork = async () => undefined;
-    await runRuntime(active.effects.queue(consultation("uncertain-consultation")));
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
-    const state = await runRuntime(f.store.load());
-    assert.equal(f.workers.requests.length, 1);
-    assert.equal(f.workers.promptCount, 1);
-    assert.equal(state.results.length, 1);
-    assert.equal(state.attempts[0]?.consultation?.phase, "enricher");
   } finally {
     await f.dispose();
   }

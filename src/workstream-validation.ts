@@ -370,7 +370,6 @@ function validateAssignments(state: WorkstreamState): Set<string> {
         );
     }
     if (assignment.capability === "review") validateSubject(state, assignment.subject);
-    if (assignment.capability === "consultation") validateConsultationAssignment(assignment);
   }
   return assignmentIds;
 }
@@ -423,48 +422,10 @@ function validateAttempts(
     }
     validateCandidateRecord(state, attempt);
     validateApplicationRecord(attempt);
-    validateConsultationRecord(state, attempt);
     if (attempt.models?.selection && attempt.models.selection.selected.length === 0)
       throw new InvalidWorkstreamStateError(`Attempt ${attempt.id} has an empty model selection.`);
     validateOutputRelease(state, attempt);
   }
-}
-
-function validateConsultationAssignment(
-  assignment: Extract<WorkAssignment, { capability: "consultation" }>,
-): void {
-  if (assignment.question.trim() !== assignment.objective.trim())
-    throw new InvalidWorkstreamStateError(
-      `Consultation assignment ${assignment.id} question does not match its objective.`,
-    );
-  if (assignment.advisorModel !== undefined && !/^[^/\s]+\/\S+$/.test(assignment.advisorModel))
-    throw new InvalidWorkstreamStateError(
-      `Consultation assignment ${assignment.id} has an invalid advisor model ID.`,
-    );
-}
-
-function validateConsultationRecord(state: WorkstreamState, attempt: WorkAttempt): void {
-  const assignment = state.assignments.find((item) => item.id === attempt.assignmentId);
-  if (assignment?.capability !== "consultation") {
-    if (attempt.consultation !== undefined)
-      throw new InvalidWorkstreamStateError(
-        `Attempt ${attempt.id} has consultation state for a non-consultation assignment.`,
-      );
-    return;
-  }
-  const consultation = attempt.consultation;
-  if (consultation === undefined)
-    throw new InvalidWorkstreamStateError(
-      `Consultation attempt ${attempt.id} has no phase envelope.`,
-    );
-  if (!Value.Check(ModelTargetSchema, consultation.advisorTarget))
-    throw new InvalidWorkstreamStateError(
-      `Consultation attempt ${attempt.id} has an invalid advisor target.`,
-    );
-  if (consultation.phase === "advisor" && consultation.frozenEvidence === undefined)
-    throw new InvalidWorkstreamStateError(
-      `Consultation advisor ${attempt.id} has no frozen evidence.`,
-    );
 }
 
 function validateCandidateRecord(state: WorkstreamState, attempt: WorkAttempt): void {

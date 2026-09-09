@@ -89,36 +89,6 @@ function implementationReportSchema(content: ReportContentFields) {
 // These schemas decode retained reports and preserve fields accepted by the old contracts.
 const ResearchReportSchema = readOnlyReportSchema("research", LegacyReportContentFields, true);
 const ReviewReportSchema = readOnlyReportSchema("review", LegacyReportContentFields, true);
-const ProjectionEvidenceSchema = Type.Object(
-  {
-    label: Type.String({ minLength: 1, maxLength: 500 }),
-    observation: Type.String({ minLength: 1, maxLength: 4_000 }),
-    class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
-    command: Type.Optional(Type.String({ maxLength: 4_000 })),
-    artifact: Type.Optional(Type.String({ maxLength: 2_000 })),
-  },
-  { additionalProperties: false },
-);
-/** Bounded report content persisted solely across the two consultation research sessions. */
-export const ResearchEvidenceProjectionSchema = Type.Object(
-  {
-    summary: Type.String({ minLength: 1, maxLength: 4_000 }),
-    uncertainty: Type.Optional(Type.Array(Type.String({ maxLength: 2_000 }), { maxItems: 20 })),
-    evidence: Type.Array(ProjectionEvidenceSchema, { maxItems: 20 }),
-    findings: Type.Array(
-      Type.Object(
-        {
-          severity: StringEnum(["info", "warning", "error", "blocker"] as const),
-          title: Type.String({ minLength: 1, maxLength: 500 }),
-          detail: Type.String({ minLength: 1, maxLength: 4_000 }),
-        },
-        { additionalProperties: false },
-      ),
-      { maxItems: 20 },
-    ),
-  },
-  { additionalProperties: false },
-);
 export const ImplementationReportSchema = implementationReportSchema(LegacyReportContentFields);
 export const WorkerReportSchema = Type.Union([
   ResearchReportSchema,

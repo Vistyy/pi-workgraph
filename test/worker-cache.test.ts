@@ -288,7 +288,10 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
       cwd: f.root,
       agentDir: join(f.parent, "agent"),
       settingsManager: settings,
-      additionalExtensionPaths: [resolve("extensions/worker.ts")],
+      additionalExtensionPaths: [
+        resolve("extensions/coordinator.ts"),
+        resolve("extensions/worker.ts"),
+      ],
       noContextFiles: true,
       noPromptTemplates: true,
       noSkills: true,
@@ -317,6 +320,7 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
     assertPrefix(provider.requests);
     for (const request of provider.requests) {
       const messages = JSON.stringify(request.messages);
+      assert.doesNotMatch(request.raw, /# Workgraph coordinator/);
       assert.equal(messages.split("[WORKGRAPH LOCAL PREWALK - GUIDE]").length - 1, 1);
       assert.equal(
         messages.split("[WORKGRAPH EXECUTOR]").length - 1,
@@ -523,7 +527,7 @@ void test("real Pi worker excludes configured built-in and extension tools befor
   }
 });
 
-void test("real Pi coordinator transports a notepad result through the bound extension", async () => {
+void test("real Pi coordinator preserves the provider prefix across agent starts", async () => {
   const f = await fixture();
   const previous = configureFixtureEnvironment({
     PI_WORKGRAPH_MODE: null,
@@ -556,6 +560,14 @@ void test("real Pi coordinator transports a notepad result through the bound ext
         throw new Error("Notepad tool result did not reach the next request.");
       assert.match(JSON.stringify(result), /Result crossed the real Pi boundary/);
       return { text: "Notepad result received." };
+    },
+    (request) => {
+      assert.ok(
+        request.messages.some((message) =>
+          JSON.stringify(message).includes("Confirm the stable coordinator prompt."),
+        ),
+      );
+      return { text: "Coordinator prompt remained stable." };
     },
   ]);
   let agent: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
@@ -607,9 +619,16 @@ void test("real Pi coordinator transports a notepad result through the bound ext
     agent = created.session;
     await agent.bindExtensions({});
     await promptWithDeadline(agent, "Add the controlled pending item.");
+    await promptWithDeadline(agent, "Confirm the stable coordinator prompt.");
     provider.assertComplete();
     assertPrefix(provider.requests);
-    assert.ok(JSON.stringify(session.getBranch()).includes("Result crossed the real Pi boundary."));
+    for (const request of provider.requests) {
+      assert.equal(request.raw.split("# Workgraph coordinator").length - 1, 1);
+      assert.match(request.raw, /Worker count and model diversity are independent/);
+    }
+    const branch = JSON.stringify(session.getBranch());
+    assert.ok(branch.includes("Result crossed the real Pi boundary."));
+    assert.doesNotMatch(branch, /# Workgraph coordinator/);
   } finally {
     await agent?.abort();
     agent?.dispose();

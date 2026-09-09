@@ -27,7 +27,6 @@ const valid: ModelPolicy = {
     review: [{ model: "fixture/review", thinking: "medium" }],
     "implementation.guide": { model: "fixture/guide", thinking: "low" },
     "implementation.executor": { model: "fixture/executor", thinking: "xhigh" },
-    "consultation.enricher": { model: "fixture/enricher", thinking: "high" },
     "consultation.advisor": [{ model: "fixture/advisor", thinking: "off" }],
   },
 };

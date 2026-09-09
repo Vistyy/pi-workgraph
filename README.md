@@ -1,60 +1,78 @@
 # Pi Workgraph
 
-Delegate repository work from a normal [Pi](https://github.com/earendil-works/pi-mono) conversation, with workers in visible Herdr tabs and retained results you can inspect.
+Pi Workgraph lets Pi coordinate repository work through workers in visible Herdr tabs. It can gather evidence, seek a second opinion, implement changes in isolated Git worktrees, and review retained results without applying them automatically.
 
-The coordinator chooses research, disposable experiments, implementation, and independent review as needed—not as a mandatory pipeline.
+## Install
 
-## Get started
+Requirements: Node.js 24+, Git, Pi, and a Herdr-managed Pi pane with Herdr's Pi state integration.
 
-You need Node.js 24+, Git, Pi, and a Herdr-managed pane with Herdr's Pi state integration installed.
+```bash
+pi install git:github.com/Vistyy/pi-workgraph
+```
 
-From this checkout:
+For a development checkout:
 
 ```bash
 pnpm install --frozen-lockfile
+pi install /absolute/path/to/pi-workgraph
+# Or load it for one run:
 pi -e /absolute/path/to/pi-workgraph
 ```
 
-Describe the outcome you want and any constraints. You don't need to prescribe tools or worker counts.
+Pi packages execute code with your user permissions. Review third-party source before installation.
 
-Optional ChatGPT Web Pro consultation is provided by the bundled `scripts/codex-web-gpt-headless/` source and its separate Pi provider extension. The scripts install only the pinned launcher into the private external root `~/.local/share/codex-web-gpt-headless`; they do not copy credentials, browser profiles, logs, or runtime state. The provider invokes the bundled `consult.py` through `python3`, accepts only `PI_WORKGRAPH_CHATGPT_WEB_CLIENT` for tests or alternate installations, and retains stable advisor artifacts under that private root. A coherent completed artifact replays locally; every other existing state or uncertain invocation blocks and must be inspected rather than resubmitted. Routine checks use a fake client and do not make live ChatGPT or browser requests. Setup, login, lifecycle, pinning, and security details live in the [bundled bridge README](scripts/codex-web-gpt-headless/README.md).
+## Configure models
 
-The coordinator first uses `workgraph_intent` to establish the agreed goal and create its workstream. The repository defaults to the coordinator's cwd; `targetRepository` on that intent can select another repository, fixed for the workstream. Assignments inherit the scope and repository rather than defining them.
+Before using Workgraph, create `~/.pi/agent/workgraph/models.json`. It must be a complete version 6 policy. Workgraph supplies no model defaults and never rewrites this file.
 
-## How work is handled
+```json
+{
+  "version": 6,
+  "roles": {
+    "research": [
+      { "model": "provider/research-model", "thinking": "high" }
+    ],
+    "implementation.guide": {
+      "model": "provider/guide-model",
+      "thinking": "medium"
+    },
+    "implementation.executor": {
+      "model": "provider/executor-model",
+      "thinking": "high"
+    },
+    "review": [
+      { "model": "provider/review-model", "thinking": "high" }
+    ],
+    "consultation.advisor": [
+      { "model": "provider/advisor-model", "thinking": "medium" }
+    ]
+  }
+}
+```
 
-- **Research and ordinary review** are read-only assignments in the selected repository and can see uncommitted files. An exact-revision review instead runs in an owned worktree at the named existing Git revision; it does not need a prior Workgraph result.
-- **Consultation** is an optional evidence-only decision aid: `workgraph_consult` queues one assignment whose enricher and advisor both use ordinary read-only research sessions and the standard `workgraph_report`. The bounded enricher projection is frozen before cleanup; a fresh advisor receives the precise question, coordinator context, and projection, never the enricher transcript. The advisor's research report is the sole delivered consultation result. Advice is non-authoritative and never acceptance or a scope change. Policy and per-call configuration each select one exact target; uncertain or failed launch remains visible and is never automatically resubmitted.
-- **Implementation and experiments** run in isolated Git worktrees. Successful clean output is compacted after worker closure: changed implementations and advanced disposable experiments retain an exact branch, while zero-commit experiments, no-change, and read-only output remove their temporary branch. This is not a filesystem or security sandbox.
-- **Results are retained, not automatically applied.** The coordinator judges the evidence and explicitly selects the exact attempt to apply. Application proves the retained source, previews a clean attached destination and conflicts off-checkout, then records an already-integrated result, fast-forwards a linear candidate, or creates and fast-forwards a fresh ordered-parent merge commit with `git merge --ff-only`; both paths verify the returned revision on the expected attached ref. Interrupted pending application is structurally recovered on explicit retry, while an applied checkpoint retry skips Git and resumes exact output release. A retained candidate can be corrected with `workgraph_implement` and `candidateOf`; conflicts, rewritten/unrelated history, or semantic integration use `candidateOf` with the exact current `baseRevision`.
-- **Failed or uncertain output stays available** and visibly blocks completion until the worker is closed and the coordinator explicitly releases the exact attempt. Branch-only useful output may outlive semantic completion and remains releasable.
-- **Completion assesses the goal**, with evidence and limitations. Operational failures and unapplied work remain visible automatically; settled workers alone do not establish that the goal was met.
+Replace every example ID with a model configured in Pi. Thinking may be `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`.
 
-Tool descriptions explain arguments and restrictions. For delegation and quality judgment, see the [coordination skill](skills/workgraph-coordination/SKILL.md).
+Research, review, and consultation advisors are ordered lists; the first target is the default. Implementation guide and executor are single targets. Additional list entries let the coordinator choose another configured model when a task benefits from it. Thinking levels always come from this policy.
 
-## Everyday controls
+## Use Workgraph
 
-**Less visual noise:** `/calm` hides thinking/reasoning and operational rows while keeping assistant answers and an ephemeral current-activity whisper plus the compact Workgraph indicator visible. The whisper reports typed coordinator activity, temporarily hides its detail while a blocking UI prompt is open, and resumes the same activity afterward; it never enters execution or model context. `/calm default on` saves the preference for new sessions.
+Describe the outcome you want and any important constraints. Workgraph fixes one repository for that effort, delegates only when useful, and retains evidence and implementation output for the coordinator to inspect.
 
-Calm hides Pi's built-in tools and Workgraph's own operational rows only in coordinator presentation. Add tools owned by other installed extensions to Calm's visual hiding through the Workgraph namespace in global Pi settings (`~/.pi/agent/settings.json`):
+Research and ordinary review can inspect the live repository, including uncommitted files. Implementation and authorized disposable experiments use isolated worktrees; these are ownership boundaries, not security sandboxes. Results remain unapplied until the coordinator has inspected them and deliberately integrates the selected output.
+
+
+## Customize presentation and worker tools
+
+`/calm` hides coordinator reasoning and operational rows while retaining answers and compact activity. `/calm default on` saves that preference.
+
+Configure additional presentation-only hidden tools and tools unavailable to every worker in `~/.pi/agent/settings.json`:
 
 ```json
 {
   "pi-workgraph": {
     "calm": {
       "additionalHiddenTools": ["web_search", "rename_resource"]
-    }
-  }
-}
-```
-
-Those additions are merged with Calm's presentation defaults and loaded when a coordinator session starts, including after `/reload`.
-
-To remove tools from every Workgraph worker's **model tool availability** (without preventing extensions, hooks, commands, skills, or context from loading), configure the global worker denylist in that same file:
-
-```json
-{
-  "pi-workgraph": {
+    },
     "worker": {
       "disabledTools": ["rename_resource"]
     }
@@ -62,23 +80,4 @@ To remove tools from every Workgraph worker's **model tool availability** (witho
 }
 ```
 
-Worker entries must be non-whitespace tool names. The list is deduplicated and covers built-in and extension-provided tools, independently of Calm's coordinator-only visual hiding. Adding a disabled name takes effect when a worker reloads; removing one takes effect for new workers and does not reactivate it in an existing worker.
-
-**Models:** ask the coordinator to inspect or change defaults with `workgraph_models`. Research/review use `selection` for replication, diversity, and overrides; consultation uses one exact enricher and advisor target and may receive one exact advisor override; implementation uses `models.guide` and `models.executor` overrides. Omitted model/thinking components use role defaults. Per-assignment choices do not change saved policy.
-
-**Pending items:** `workgraph_notepad` holds compact coordinator reminders. They are not approvals or completion gates.
-
-For interrupted work or missing evidence, see [Recovery and inspection](OPERATIONS.md).
-
-## Contributing
-
-```bash
-pnpm check       # Quality checks and deterministic tests; no model or Herdr calls
-pnpm typecheck   # Independent compiler check
-pnpm verify:package  # Pack/install the exact tarball in a disposable consumer (needs network)
-pnpm verify:native   # Opt-in controlled Herdr/provider continuation check (requires HERDR_ENV=1)
-```
-
-`verify:native` is not part of the routine gate and must be run only with an operator-owned Herdr pane. It uses a loopback scripted provider, performs one bounded coordinator notification continuation, and retains uncertain native resources for reconciliation. Optional real-model observations remain task-specific rather than a maintained mechanical smoke gate.
-
-[Contributor instructions](AGENTS.md) · [Design](DESIGN.md) · [Verification](VERIFICATION.md)
+`additionalHiddenTools` affects only coordinator presentation. `disabledTools` changes model tool availability for workers; it does not prevent extensions, hooks, commands, skills, or context from loading.

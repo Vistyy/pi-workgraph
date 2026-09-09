@@ -147,33 +147,33 @@ export function installCoordinatorSessionState(
   pi.on("session_start", (_event, ctx) => restore(ctx, true));
   pi.on("session_tree", (_event, ctx) => restore(ctx, false));
 
-  // Inject a compact snapshot only when the current branch does not already contain it.
-  // The stable prefix makes the snapshot cache-friendly while state entries survive compaction.
-  pi.on("before_agent_start", (_event, ctx) => {
-    const content = reminderContent(state, ctx);
-    return content === undefined
-      ? undefined
-      : { message: { customType: "pi-workgraph-coordinator-notepad", content, display: false } };
-  });
+  // Compaction removes earlier tool results, so restore only current nonempty pending memory.
   pi.on("session_compact", (_event, ctx) => {
-    const content = reminderContent(state, ctx);
-    if (content !== undefined)
-      pi.sendMessage({
-        customType: "pi-workgraph-coordinator-notepad",
-        content,
-        display: false,
-      });
+    if (state.items.length === 0) return;
+    const content = formatNotepad(state);
+    const latest = ctx.sessionManager
+      .buildContextEntries()
+      .findLast(
+        (entry) =>
+          entry.type === "custom_message" &&
+          entry.customType === "pi-workgraph-coordinator-notepad",
+      );
+    if (latest?.type === "custom_message" && latest.content === content) return;
+    pi.sendMessage({
+      customType: "pi-workgraph-coordinator-notepad",
+      content,
+      display: false,
+    });
   });
 
   pi.registerTool({
     name: "workgraph_notepad",
     label: "Workgraph Notepad",
     description:
-      "Read or edit the coordinator's current session-owned pending items. Actions are read, add, update, and remove. Items are plain id/text reminders, not acknowledgments, human receipts, authority, delivery state, evidence dispositions, or an append-only history. Removal is allowed whenever an item is mistaken or no longer useful; nothing expires or resolves automatically.",
-    promptSnippet: "Read or edit coordinator pending items",
+      "Read or edit sparse session-owned reminders that must survive compaction. Items are not approvals, authority, delivery state, or completion accounting; add, update, or remove them whenever their pending substance changes.",
+    promptSnippet: "Read or edit coordinator pending reminders",
     promptGuidelines: [
-      "Use workgraph_notepad only in the coordinator when a compact pending item will help future coordination; read it on demand instead of copying the list into every response.",
-      "Use workgraph_notepad remove when an item is mistaken or no longer useful; do not infer acknowledgment, parse replies, or require a human receipt to edit pending items.",
+      "Use workgraph_notepad only for pending information worth restoring after compaction, and remove stale items promptly.",
     ],
     parameters: NotepadRequestSchema,
     execute(_toolCallId, params, _signal, _update, _ctx) {
@@ -257,20 +257,6 @@ function formatNotepad(state: CoordinatorNotepadState): string {
 
 function compactLine(text: string): string {
   return text.replace(/\s+/g, " ").trim();
-}
-
-function reminderContent(
-  state: CoordinatorNotepadState,
-  ctx: ExtensionContext,
-): string | undefined {
-  const content = formatNotepad(state);
-  const latest = ctx.sessionManager
-    .buildContextEntries()
-    .findLast(
-      (entry) =>
-        entry.type === "custom_message" && entry.customType === "pi-workgraph-coordinator-notepad",
-    );
-  return latest?.type === "custom_message" && latest.content === content ? undefined : content;
 }
 
 function migrateLegacyState(legacy: {
