@@ -71,6 +71,9 @@ const OutcomeInspectionDetailsSchema = Type.Object({
       application: Type.Object({
         state: Type.String(),
         revision: Type.Optional(Type.String()),
+        expectedDestination: Type.Optional(
+          Type.Object({ ref: Type.Optional(Type.String()), head: Type.String() }),
+        ),
       }),
     }),
   }),
@@ -1407,6 +1410,107 @@ await test("registered maintained changes preserve identity, apply explicitly, a
   }
 });
 
+await test("registered application keeps a no-effect failure pending for one explicit retry", async () => {
+  const f = await registeredFixture();
+  try {
+    f.workers.onWork = async (request) => {
+      await writeFile(join(request.cwd, "value.txt"), "candidate\n");
+      await git(request.cwd, "add", ".");
+      await git(request.cwd, "commit", "-m", "candidate");
+      return {
+        kind: "implementation",
+        status: "completed",
+        outcome: "changed",
+        summary: "Created candidate",
+        commit: await git(request.cwd, "rev-parse", "HEAD"),
+        evidence: [],
+        findings: [],
+      };
+    };
+    await f.input("Implement the retained value change.");
+    await f.call("workgraph_intent", {
+      statement: "Implement the retained value change in the current repository.",
+      constraints: ["Keep application explicit."],
+    });
+    await f.call("workgraph_implement", {
+      id: "retryable-application",
+      objective: "Create a candidate value",
+      acceptance: ["candidate exists"],
+    });
+    const task = await poll(async () => {
+      const view = await taskInspection(f, "retryable-application");
+      return view.latestAttempt?.outcome === undefined ? undefined : view;
+    }, "retryable candidate result");
+    const attempt = required(task.latestAttempt, "retryable candidate attempt");
+    const outcome = await outcomeInspection(
+      f,
+      required(attempt.outcome, "retryable candidate outcome"),
+      "retryable-application",
+    );
+    const sourceCommit = outcome.report.reportedCommit;
+    const initialHead = await git(f.root, "rev-parse", "HEAD");
+    const initialBytes = await readFile(join(f.root, "value.txt"), "utf8");
+    const retainedBranch =
+      (await git(f.root, "branch", "--list", "pi-workgraph/*"))
+        .split("\n")
+        .map((line) => line.trim())
+        .find((line) => line.length > 0) ?? assert.fail("Expected a retained candidate branch.");
+    assert.equal(await git(f.root, "rev-parse", retainedBranch), sourceCommit);
+
+    const lock = join(f.root, ".git", "index.lock");
+    await writeFile(lock, "owned by retry flow\n");
+    try {
+      await assert.rejects(
+        f.call("workgraph_control", { action: "apply", attempt: attempt.handle }),
+        /Application remains pending/,
+      );
+      const pending = await outcomeInspection(
+        f,
+        required(attempt.outcome, "retryable application outcome"),
+        "retryable-application",
+      );
+      assert.equal(pending.settlement.application.state, "pending");
+      assert.deepEqual(pending.settlement.application.expectedDestination, {
+        ref: "refs/heads/main",
+        head: initialHead,
+      });
+      assert.equal(await git(f.root, "rev-parse", "HEAD"), initialHead);
+      assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), initialBytes);
+      assert.equal(await git(f.root, "symbolic-ref", "--quiet", "HEAD"), "refs/heads/main");
+      assert.equal(await git(f.root, "status", "--porcelain", "--untracked-files=all"), "");
+      await assert.rejects(() => git(f.root, "rev-parse", "--verify", "--quiet", "MERGE_HEAD"));
+      assert.equal(await git(f.root, "rev-parse", retainedBranch), sourceCommit);
+    } finally {
+      await rm(lock, { force: true });
+    }
+
+    const applied = await f.call("workgraph_control", {
+      action: "apply",
+      attempt: attempt.handle,
+    });
+    assert.equal(
+      decodeTestValue(ControlActionDetailsSchema, applied.details).view.action.outcome,
+      "recorded",
+    );
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), sourceCommit);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "candidate\n");
+    assert.equal(await git(f.root, "status", "--porcelain", "--untracked-files=all"), "");
+    assert.equal(
+      (
+        await outcomeInspection(
+          f,
+          required(attempt.outcome, "retryable application outcome"),
+          "retryable-application",
+        )
+      ).settlement.application.state,
+      "applied",
+    );
+    assert.equal(await git(f.root, "branch", "--list", retainedBranch), "");
+  } finally {
+    await f.dispose();
+  }
+});
+
 await test("unapplied candidate revisions are reviewed in their retained exact worktree", async () => {
   const f = await fixture();
   try {
@@ -1727,10 +1831,7 @@ await test("moved candidate application is blocked without mutation and supports
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Move destination");
     const moved = await runRuntime(f.repository.head());
-    await assert.rejects(
-      runRuntime(active.effects.apply(parent.id)),
-      /Destination HEAD .*candidate root/,
-    );
+    await assert.rejects(runRuntime(active.effects.apply(parent.id)), /conflict preview/);
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(await runRuntime(f.repository.head()), moved);
@@ -1778,6 +1879,101 @@ await test("moved candidate application is blocked without mutation and supports
     assert.deepEqual(state.attempts[1]?.application?.commits, [integrationCommit]);
     assert.equal(await git(f.root, "rev-parse", parentBranch), parentCommit);
     assert.notEqual(original, moved);
+  } finally {
+    await f.dispose();
+  }
+});
+
+await test("application records compatible results and rejects conflicting divergence", async () => {
+  const f = await fixture();
+  try {
+    const active = await f.runtime();
+    const authority = await f.authority(active);
+    const values = ["candidate\n", "already-integrated\n", "conflict-candidate\n"];
+    let candidateNumber = 0;
+    f.workers.onWork = async (request) => {
+      await writeFile(join(request.cwd, "value.txt"), values[candidateNumber++] ?? "candidate\n");
+      await git(request.cwd, "add", ".");
+      await git(request.cwd, "commit", "-m", "Candidate");
+      return {
+        kind: "implementation",
+        status: "completed",
+        outcome: "changed",
+        summary: "Changed value",
+        commit: await git(request.cwd, "rev-parse", "HEAD"),
+        evidence: [],
+        findings: [],
+      };
+    };
+    const candidate = async (id: string) => {
+      await runRuntime(
+        active.effects.queue({
+          id,
+          capability: "implement",
+          artifactIntent: "maintained_change",
+          objective: "Make a candidate",
+          intentVersion: 1,
+          authority,
+          acceptance: ["candidate value"],
+        }),
+      );
+      await runRuntime(active.effects.reconcile);
+      const state = await runRuntime(active.effects.reconcile);
+      const attempt = required(state.attempts.at(-1), `${id} attempt`);
+      const result = required(state.results.at(-1), `${id} result`);
+      const commit =
+        result.validity === "typed" &&
+        result.report.kind === "implementation" &&
+        result.report.status === "completed" &&
+        result.report.outcome === "changed"
+          ? required(result.report.commit, `${id} commit`)
+          : assert.fail(`Expected changed ${id}.`);
+      return { attempt, commit };
+    };
+
+    const diverged = await candidate("diverged");
+    await writeFile(join(f.root, "destination.txt"), "destination\n");
+    await git(f.root, "add", ".");
+    await git(f.root, "commit", "-m", "Move destination independently");
+    const destination = await runRuntime(f.repository.head());
+    let state = await runRuntime(active.effects.apply(diverged.attempt.id));
+    const applied = required(state.attempts.at(-1)?.application, "divergent application");
+    const revision = required(applied.revision, "structural merge revision");
+    assert.equal(applied.expectedRef, "refs/heads/main");
+    assert.equal(applied.expectedHead, destination);
+    assert.equal(await runRuntime(f.repository.head()), revision);
+    assert.equal(
+      await git(f.root, "rev-list", "--parents", "-n", "1", revision),
+      `${revision} ${destination} ${diverged.commit}`,
+    );
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "candidate\n");
+    assert.equal(await readFile(join(f.root, "destination.txt"), "utf8"), "destination\n");
+
+    const integrated = await candidate("already-integrated");
+    await git(f.root, "merge", "--ff-only", integrated.commit);
+    const integratedHead = await runRuntime(f.repository.head());
+    const integratedBytes = await readFile(join(f.root, "value.txt"), "utf8");
+    state = await runRuntime(active.effects.apply(integrated.attempt.id));
+    assert.equal(await runRuntime(f.repository.head()), integratedHead);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), integratedBytes);
+    assert.equal(state.attempts.at(-1)?.application?.state, "applied");
+    assert.equal(state.attempts.at(-1)?.application?.revision, integratedHead);
+
+    const conflicting = await candidate("conflicting");
+    await writeFile(join(f.root, "value.txt"), "conflict-destination\n");
+    await git(f.root, "add", ".");
+    await git(f.root, "commit", "-m", "Conflicting destination");
+    const conflictingDestination = await runRuntime(f.repository.head());
+    await assert.rejects(
+      runRuntime(active.effects.apply(conflicting.attempt.id)),
+      /conflict preview/,
+    );
+    state = await runRuntime(f.store.load());
+    assert.equal(state.attempts.at(-1)?.application, undefined);
+    assert.equal(await runRuntime(f.repository.head()), conflictingDestination);
+    assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "conflict-destination\n");
+    assert.equal(await git(f.root, "status", "--porcelain"), "");
+    await assert.rejects(() => git(f.root, "rev-parse", "--verify", "--quiet", "MERGE_HEAD"));
   } finally {
     await f.dispose();
   }

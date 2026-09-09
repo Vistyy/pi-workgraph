@@ -3,7 +3,7 @@ import { lstat, mkdir, realpath } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Node path operations are the lexical identity boundary for Git worktrees.
 import { basename, dirname, join, resolve } from "node:path";
 import { Data, Effect } from "effect";
-import { ProcessExecutionError, type ProcessResult, processEffect } from "./process.js";
+import { type ProcessExecutionError, type ProcessResult, processEffect } from "./process.js";
 
 export interface RepositoryInfo {
   root: string;
@@ -32,6 +32,19 @@ export interface CandidateApplicationSource {
   rootCommit: string;
   commit: string;
   commits: string[];
+}
+
+export interface CandidateApplicationDestination {
+  expectedRef: string;
+  expectedHead: string;
+}
+
+export type CandidateApplicationAction =
+  | { kind: "already-integrated"; revision: string }
+  | { kind: "fast-forward"; target: string };
+
+export interface PreparedCandidateApplication {
+  action: CandidateApplicationAction;
 }
 
 export interface WorktreeCleanupResult {
@@ -89,17 +102,10 @@ export class GitParseError extends Data.TaggedError("GitParseError")<{
   readonly output: string;
 }> {}
 
-export class GitStateUncertainError extends Data.TaggedError("GitStateUncertainError")<{
-  readonly message: string;
-  readonly operationDiagnostic: string;
-  readonly followupDiagnostic: string;
-}> {}
-
 export type GitFailure =
   | GitOperationError
   | GitFileSystemError
   | GitParseError
-  | GitStateUncertainError
   | ProcessExecutionError;
 export type GitEffect<A> = Effect.Effect<A, GitFailure>;
 
@@ -260,110 +266,42 @@ export class GitRepository {
       return { ...validated, rootCommit, commits };
     });
   };
-  readonly recoverCandidateApplication = (
-    expectedHead: string,
+  readonly preflightCandidateApplication = (
     source: CandidateApplicationSource,
-  ): GitEffect<{ head: string } | undefined> => {
-    const root = this.root;
-    const git = this.git;
-    return Effect.gen(function* () {
-      yield* assertClean(git, root);
-      const head = yield* git.text(root, ["rev-parse", "HEAD"]);
-      if (head === expectedHead) return undefined;
-      if (expectedHead !== source.rootCommit || head !== source.commit) {
-        return yield* fail(
-          `Could not attribute unrecorded candidate application HEAD ${head} to ${source.commit} rooted at ${source.rootCommit}.`,
-        );
-      }
-      const commits = yield* candidateCommitChain(git, root, source.rootCommit, source.commit);
-      if (!sameCommitChain(commits, source.commits)) {
-        return yield* fail("Candidate application recovery found a changed commit chain.");
-      }
-      yield* assertStableCleanHead(git, root, head, "Candidate application recovery");
-      return { head };
-    });
-  };
+  ): GitEffect<CandidateApplicationDestination> =>
+    previewCandidateApplication(this.git, this.root, source);
 
-  readonly applyCandidate = (
+  readonly prepareCandidateApplication = (
     source: CandidateApplicationSource,
-    expectedHead: string,
-  ): GitEffect<string> => {
+    destination: CandidateApplicationDestination,
+  ): GitEffect<PreparedCandidateApplication> =>
+    prepareCandidateApplication(this.git, this.root, source, destination);
+
+  readonly recoverCandidateApplication = (
+    destination: CandidateApplicationDestination,
+    source: CandidateApplicationSource,
+  ): GitEffect<{ head: string } | undefined> =>
+    classifyApplicationState(this.git, this.root, source, destination);
+
+  readonly applyCandidate = (prepared: PreparedCandidateApplication): GitEffect<string> => {
     const root = this.root;
     const git = this.git;
     return Effect.gen(function* () {
-      yield* assertClean(git, root);
-      if (!/^[0-9a-f]{40,64}$/.test(expectedHead))
-        return yield* fail("Application destination must be an exact commit id.");
-      const resolvedRoot = yield* resolveRevision(git, root, source.rootCommit);
-      const resolvedCommit = yield* resolveRevision(git, root, source.commit);
-      if (resolvedRoot !== source.rootCommit || resolvedCommit !== source.commit)
-        return yield* fail("Candidate application requires exact source revisions.");
-      const commits = yield* candidateCommitChain(git, root, source.rootCommit, source.commit);
-      if (!sameCommitChain(commits, source.commits))
-        return yield* fail("Candidate source commit chain changed before application.");
-      const before = yield* git.text(root, ["rev-parse", "HEAD"]);
-      if (before !== expectedHead)
-        return yield* fail(`Application HEAD changed: expected ${expectedHead}, found ${before}.`);
-      if (before !== source.rootCommit)
-        return yield* fail(
-          `Destination HEAD ${before} does not equal candidate root ${source.rootCommit}; integrate the retained candidate onto the moved destination first.`,
-        );
-      const priorMerge = yield* inspectRef(
-        git,
-        root,
-        "MERGE_HEAD",
-        (result) => `Could not inspect pre-application merge state: ${diagnostic(result)}`,
-      );
-      if (priorMerge.state === "present")
-        return yield* fail(
-          `Application found pre-existing merge state at ${priorMerge.head}; no mutation was attempted.`,
-        );
+      if (prepared.action.kind === "already-integrated") return prepared.action.revision;
+      const target = prepared.action.target;
       return yield* Effect.uninterruptible(
         Effect.gen(function* () {
           const result = yield* git.process(
             root,
-            ["merge", "--ff-only", "--no-edit", source.commit],
+            ["merge", "--ff-only", "--no-edit", target],
             120_000,
           );
-          if (!processSucceeded(result)) {
-            const after = yield* git
-              .text(root, ["rev-parse", "HEAD"])
-              .pipe(
-                Effect.catch((error) =>
-                  uncertain(
-                    "Fast-forward application failed and the resulting HEAD is unavailable; no recovery mutation was attempted.",
-                    `Fast-forward application of ${source.commit}: ${diagnostic(result)}`,
-                    failureDiagnostic(error),
-                  ),
-                ),
-              );
-            if (after === before) {
-              yield* assertStableCleanHead(
-                git,
-                root,
-                before,
-                "Fast-forward application failure",
-              ).pipe(
-                Effect.catch((error) =>
-                  uncertain(
-                    "Fast-forward application failed and its unchanged destination state is uncertain.",
-                    `Fast-forward application of ${source.commit}: ${diagnostic(result)}`,
-                    failureDiagnostic(error),
-                  ),
-                ),
-              );
-              return yield* fail(
-                `Fast-forward application of ${source.commit} failed: ${diagnostic(result)}`,
-              );
-            }
-            return yield* uncertain(
-              "Fast-forward application returned failure after destination state changed; no rollback was attempted.",
-              `Fast-forward application of ${source.commit}: ${diagnostic(result)}`,
-              `Observed HEAD ${after}, expected unchanged ${before} or final ${source.commit}.`,
+          if (!processSucceeded(result))
+            return yield* fail(
+              `Fast-forward application of ${target} failed: ${diagnostic(result)}`,
             );
-          }
-          yield* assertStableCleanHead(git, root, source.commit, "Fast-forward application");
-          return source.commit;
+          yield* assertStableCleanHead(git, root, target, "Fast-forward application");
+          return target;
         }),
       );
     });
@@ -476,6 +414,276 @@ function inspectRef(
     }
     if (result.exitCode === 1) return { state: "absent" as const };
     return yield* fail(inspectionFailure(result));
+  });
+}
+
+function previewCandidateApplication(
+  git: GitClient,
+  root: string,
+  source: CandidateApplicationSource,
+): GitEffect<CandidateApplicationDestination> {
+  return Effect.gen(function* () {
+    yield* validateApplicationSourceShape(source);
+    const destination = yield* inspectDestinationIdentity(git, root);
+    yield* applicationTopology(git, root, source, destination);
+    yield* assertApplicationDestination(git, root, destination);
+    return destination;
+  });
+}
+function prepareCandidateApplication(
+  git: GitClient,
+  root: string,
+  source: CandidateApplicationSource,
+  expected: CandidateApplicationDestination,
+): GitEffect<PreparedCandidateApplication> {
+  return Effect.gen(function* () {
+    yield* validateApplicationSourceShape(source);
+    const destination = yield* inspectDestinationIdentity(git, root);
+    if (!sameDestination(destination, expected))
+      return yield* fail(
+        `Application destination changed: expected ${expected.expectedRef} at ${expected.expectedHead}, found ${destination.expectedRef} at ${destination.expectedHead}.`,
+      );
+    const topology = yield* applicationTopology(git, root, source, destination);
+    if (topology.kind === "already-integrated") {
+      yield* assertApplicationDestination(git, root, destination);
+      return { action: topology };
+    }
+    let target = source.commit;
+    if (topology.mergeTree !== undefined) {
+      target = yield* git.text(root, [
+        "commit-tree",
+        topology.mergeTree,
+        "-p",
+        destination.expectedHead,
+        "-p",
+        source.commit,
+        "-m",
+        `Apply retained candidate ${source.commit}`,
+      ]);
+      if (!/^[0-9a-f]{40,64}$/.test(target))
+        return yield* fail("Candidate application merge commit was not an exact commit id.");
+    }
+    yield* assertApplicationDestination(git, root, destination);
+    return { action: { kind: "fast-forward" as const, target } };
+  });
+}
+type ApplicationTopology =
+  | { kind: "already-integrated"; revision: string }
+  | { kind: "fast-forward"; mergeTree?: string };
+
+function applicationTopology(
+  git: GitClient,
+  root: string,
+  source: CandidateApplicationSource,
+  destination: CandidateApplicationDestination,
+): GitEffect<ApplicationTopology> {
+  return Effect.gen(function* () {
+    if (!(yield* isAncestor(git, root, source.rootCommit, destination.expectedHead)))
+      return yield* fail(
+        `Destination HEAD ${destination.expectedHead} is not descended from candidate root ${source.rootCommit}.`,
+      );
+    if (yield* isAncestor(git, root, source.commit, destination.expectedHead))
+      return { kind: "already-integrated", revision: destination.expectedHead };
+    if (yield* isAncestor(git, root, destination.expectedHead, source.commit))
+      return { kind: "fast-forward" };
+    return {
+      kind: "fast-forward",
+      mergeTree: yield* mergedTree(git, root, destination.expectedHead, source.commit),
+    };
+  });
+}
+
+function inspectDestinationIdentity(
+  git: GitClient,
+  root: string,
+): GitEffect<CandidateApplicationDestination> {
+  return Effect.gen(function* () {
+    yield* assertClean(git, root);
+    const ref = yield* attachedRef(git, root);
+    const head = yield* git.text(root, ["rev-parse", "HEAD"]);
+    const refHead = yield* git.text(root, ["rev-parse", "--verify", ref]);
+    if (refHead !== head)
+      return yield* fail(`Attached destination ref ${ref} points to ${refHead}, not HEAD ${head}.`);
+    const priorMerge = yield* inspectRef(
+      git,
+      root,
+      "MERGE_HEAD",
+      (result) => `Could not inspect pre-application merge state: ${diagnostic(result)}`,
+    );
+    if (priorMerge.state === "present")
+      return yield* fail(
+        `Application found pre-existing merge state at ${priorMerge.head}; no mutation was attempted.`,
+      );
+    return { expectedRef: ref, expectedHead: head };
+  });
+}
+function sameDestination(
+  actual: CandidateApplicationDestination,
+  expected: CandidateApplicationDestination,
+): boolean {
+  return (
+    actual.expectedRef === expected.expectedRef && actual.expectedHead === expected.expectedHead
+  );
+}
+
+function assertApplicationDestination(
+  git: GitClient,
+  root: string,
+  expected: CandidateApplicationDestination,
+): GitEffect<void> {
+  return Effect.gen(function* () {
+    const current = yield* inspectDestinationIdentity(git, root);
+    if (!sameDestination(current, expected))
+      return yield* fail(
+        `Application destination changed: expected ${expected.expectedRef} at ${expected.expectedHead}, found ${current.expectedRef} at ${current.expectedHead}.`,
+      );
+  });
+}
+function attachedRef(git: GitClient, root: string): GitEffect<string> {
+  return Effect.gen(function* () {
+    const result = yield* git.process(root, ["symbolic-ref", "--quiet", "HEAD"]);
+    if (!processSucceeded(result))
+      return yield* fail(
+        `Application destination must be an attached clean branch: ${diagnostic(result)}`,
+      );
+    if (!/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(result.stdout))
+      return yield* fail(`Application destination has an invalid attached ref ${result.stdout}.`);
+    return result.stdout;
+  });
+}
+
+function validateApplicationSourceShape(source: CandidateApplicationSource): GitEffect<void> {
+  if (
+    !/^[0-9a-f]{40,64}$/.test(source.rootCommit) ||
+    !/^[0-9a-f]{40,64}$/.test(source.commit) ||
+    !sameCommitChainShape(source.commits, source.commit)
+  )
+    return fail("Candidate application requires exact source revisions.");
+  return Effect.void;
+}
+
+function sameCommitChainShape(commits: readonly string[], commit: string): boolean {
+  return (
+    commits.length > 0 &&
+    commits.every((value) => /^[0-9a-f]{40,64}$/.test(value)) &&
+    commits.at(-1) === commit
+  );
+}
+
+function isAncestor(
+  git: GitClient,
+  root: string,
+  ancestor: string,
+  descendant: string,
+): GitEffect<boolean> {
+  return Effect.gen(function* () {
+    const result = yield* git.process(root, ["merge-base", "--is-ancestor", ancestor, descendant]);
+    if (result.timedOut || result.stdoutTruncated || result.stderrTruncated)
+      return yield* fail(`Could not inspect Git ancestry: ${diagnostic(result)}`);
+    if (result.exitCode === 0) return true;
+    if (result.exitCode === 1) return false;
+    return yield* fail(`Could not inspect Git ancestry: ${diagnostic(result)}`);
+  });
+}
+
+function mergedTree(git: GitClient, root: string, ours: string, theirs: string): GitEffect<string> {
+  return Effect.gen(function* () {
+    const result = yield* git.process(root, [
+      "merge-tree",
+      "--write-tree",
+      "--messages",
+      ours,
+      theirs,
+    ]);
+    if (!processSucceeded(result) || result.stdoutTruncated)
+      return yield* fail(`Candidate application conflict preview failed: ${diagnostic(result)}`);
+    const tree = result.stdout.split("\n", 1)[0] ?? "";
+    if (!/^[0-9a-f]{40,64}$/.test(tree))
+      return yield* fail("Candidate application conflict preview returned no exact merge tree.");
+    return tree;
+  });
+}
+
+function classifyApplicationState(
+  git: GitClient,
+  root: string,
+  source: CandidateApplicationSource,
+  expected: CandidateApplicationDestination,
+): GitEffect<{ head: string } | undefined> {
+  return Effect.gen(function* () {
+    yield* validateApplicationSourceShape(source);
+    const destination = yield* inspectDestinationIdentity(git, root);
+    if (destination.expectedRef !== expected.expectedRef)
+      return yield* fail(
+        `Application recovery found destination ref ${destination.expectedRef}; expected ${expected.expectedRef}.`,
+      );
+    if (!(yield* isAncestor(git, root, source.rootCommit, expected.expectedHead)))
+      return yield* fail(
+        `Application recovery found expected destination ${expected.expectedHead} outside candidate root ${source.rootCommit}.`,
+      );
+    const classification =
+      destination.expectedHead === expected.expectedHead
+        ? classifyUnchangedApplication(git, root, source, destination)
+        : destination.expectedHead === source.commit
+          ? classifyCandidateApplication(git, root, expected, destination)
+          : classifyMergeApplication(git, root, source, expected, destination);
+    return yield* classification;
+  });
+}
+
+function classifyUnchangedApplication(
+  git: GitClient,
+  root: string,
+  source: CandidateApplicationSource,
+  destination: CandidateApplicationDestination,
+): GitEffect<{ head: string } | undefined> {
+  return Effect.gen(function* () {
+    if (!(yield* isAncestor(git, root, source.commit, destination.expectedHead))) return undefined;
+    yield* assertApplicationDestination(git, root, destination);
+    return { head: destination.expectedHead };
+  });
+}
+
+function classifyCandidateApplication(
+  git: GitClient,
+  root: string,
+  expected: CandidateApplicationDestination,
+  destination: CandidateApplicationDestination,
+): GitEffect<{ head: string }> {
+  return Effect.gen(function* () {
+    if (!(yield* isAncestor(git, root, expected.expectedHead, destination.expectedHead)))
+      return yield* fail("Candidate application recovery found an invalid candidate head.");
+    yield* assertApplicationDestination(git, root, destination);
+    return { head: destination.expectedHead };
+  });
+}
+
+function classifyMergeApplication(
+  git: GitClient,
+  root: string,
+  source: CandidateApplicationSource,
+  expected: CandidateApplicationDestination,
+  destination: CandidateApplicationDestination,
+): GitEffect<{ head: string }> {
+  return Effect.gen(function* () {
+    const parents = yield* git.text(root, [
+      "rev-list",
+      "--parents",
+      "-n",
+      "1",
+      destination.expectedHead,
+    ]);
+    const tree = yield* git.text(root, ["rev-parse", `${destination.expectedHead}^{tree}`]);
+    const expectedTree = yield* mergedTree(git, root, expected.expectedHead, source.commit);
+    if (
+      parents !== `${destination.expectedHead} ${expected.expectedHead} ${source.commit}` ||
+      tree !== expectedTree
+    )
+      return yield* fail(
+        `Candidate application recovery found an ambiguous destination HEAD ${destination.expectedHead}.`,
+      );
+    yield* assertApplicationDestination(git, root, destination);
+    return { head: destination.expectedHead };
   });
 }
 
@@ -1035,10 +1243,6 @@ function candidateCommitChain(
   });
 }
 
-function sameCommitChain(left: readonly string[], right: readonly string[]): boolean {
-  return left.length === right.length && left.every((commit, index) => commit === right[index]);
-}
-
 function nextCandidateCommit(line: string, parent: string): string | undefined {
   const parts = line.split(" ");
   const current = parts.length === 2 && parts[1] === parent ? parts[0] : undefined;
@@ -1087,20 +1291,6 @@ function fail(message: string): GitEffect<never> {
   return Effect.fail(new GitOperationError({ message }));
 }
 
-function uncertain(
-  summary: string,
-  operationDiagnostic: string,
-  followupDiagnostic: string,
-): GitEffect<never> {
-  return Effect.fail(
-    new GitStateUncertainError({
-      message: `${summary} Original operation: ${operationDiagnostic} Follow-up: ${followupDiagnostic}`,
-      operationDiagnostic,
-      followupDiagnostic,
-    }),
-  );
-}
-
 function processSucceeded(result: ProcessResult): boolean {
   return !result.timedOut && result.exitCode === 0;
 }
@@ -1111,14 +1301,6 @@ function diagnostic(result: ProcessResult): string {
   if (result.stderr.length > 0) details.push(result.stderr);
   else if (result.stdout.length > 0) details.push(result.stdout);
   return details.join("; ");
-}
-
-function failureDiagnostic(error: GitFailure): string {
-  if (error instanceof ProcessExecutionError) {
-    const cause = error.cause instanceof Error ? error.cause.message : String(error.cause);
-    return `${error.command} ${error.args.join(" ")} could not execute: ${cause}`;
-  }
-  return error.message;
 }
 
 function validIdentity(value: string): boolean {

@@ -338,6 +338,7 @@ const AttemptSchema = Type.Object(
         {
           state: StringEnum(["pending", "applied", "blocked"] as const),
           commit: NonEmptyStringSchema,
+          expectedRef: Type.Optional(NonEmptyStringSchema),
           expectedHead: NonEmptyStringSchema,
           rootCommit: Type.Optional(CommitSchema),
           commits: Type.Optional(Type.Array(CommitSchema, { minItems: 1 })),

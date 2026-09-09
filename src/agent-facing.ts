@@ -367,6 +367,7 @@ function applicationProjection(attempt: WorkAttempt | undefined, result: WorkRes
     return {
       state: "applied" as const,
       revision: application.revision,
+      expectedDestination: { ref: application.expectedRef, head: application.expectedHead },
       reportedCommit: application.commit,
       candidate,
       rootCommit: application.rootCommit,
@@ -375,6 +376,7 @@ function applicationProjection(attempt: WorkAttempt | undefined, result: WorkRes
   if (application !== undefined)
     return {
       state: application.state,
+      expectedDestination: { ref: application.expectedRef, head: application.expectedHead },
       reportedCommit: application.commit,
       candidate,
       rootCommit: application.rootCommit,
@@ -782,6 +784,7 @@ function recordedApplication(attempt: WorkAttempt) {
   return {
     state: application.state,
     revision: application.revision,
+    expectedDestination: { ref: application.expectedRef, head: application.expectedHead },
     commit: application.commit,
     rootCommit: application.rootCommit,
     ...boundedCommitChain(application.commits),

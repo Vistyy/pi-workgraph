@@ -110,6 +110,15 @@ type AssignmentInput = OmitEach<WorkAssignment, "createdAt">;
 type ResultInput = OmitEach<WorkResult, "observedAt" | "artifacts"> & {
   artifacts?: RetainedArtifact[];
 };
+type ApplicationInput = {
+  id: string;
+  commit: string;
+  expectedRef?: string;
+  expectedHead: string;
+  rootCommit?: string;
+  commits?: string[];
+  now?: Date;
+};
 type QueuedAttempt = {
   id: string;
   models: NonNullable<WorkAttempt["models"]>;
@@ -721,33 +730,10 @@ export class WorkstreamStoreEffects {
     );
   }
 
-  beginApplication(input: {
-    id: string;
-    commit: string;
-    expectedHead: string;
-    rootCommit?: string;
-    commits?: string[];
-    now?: Date;
-  }): StoreEffect<WorkstreamState> {
+  beginApplication(input: ApplicationInput): StoreEffect<WorkstreamState> {
     return this.changeAttempt(
       input.id,
-      (attempt) => {
-        if (attempt.application !== undefined) {
-          if (samePendingApplication(attempt.application, input)) return;
-          throw new Error(`Application for ${input.id} is already recorded.`);
-        }
-        if (!Value.Check(CommitSchema, input.expectedHead))
-          throw new Error("Application destination requires an exact commit id.");
-        validateApplicationHistory(input.commit, input.rootCommit, input.commits);
-        const application: NonNullable<WorkAttempt["application"]> = {
-          state: "pending",
-          commit: input.commit,
-          expectedHead: input.expectedHead,
-        };
-        if (input.rootCommit !== undefined) application.rootCommit = input.rootCommit;
-        if (input.commits !== undefined) application.commits = [...input.commits];
-        attempt.application = application;
-      },
+      (attempt) => beginApplicationTransition(attempt, input),
       input.now,
     );
   }
@@ -1326,13 +1312,41 @@ function addAssignment(
   draft.assignments.push(assignment);
 }
 
+function beginApplicationTransition(attempt: WorkAttempt, input: ApplicationInput): void {
+  if (attempt.application !== undefined) {
+    if (samePendingApplication(attempt.application, input)) return;
+    throw new Error(`Application for ${input.id} is already recorded.`);
+  }
+  if (!Value.Check(CommitSchema, input.expectedHead))
+    throw new Error("Application destination requires an exact commit id.");
+  validateApplicationHistory(input.commit, input.rootCommit, input.commits);
+  if (input.expectedRef !== undefined && !/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(input.expectedRef))
+    throw new Error("Application destination requires an exact attached branch ref.");
+  const application: NonNullable<WorkAttempt["application"]> = {
+    state: "pending",
+    commit: input.commit,
+    expectedHead: input.expectedHead,
+  };
+  if (input.expectedRef !== undefined) application.expectedRef = input.expectedRef;
+  if (input.rootCommit !== undefined) application.rootCommit = input.rootCommit;
+  if (input.commits !== undefined) application.commits = [...input.commits];
+  attempt.application = application;
+}
+
 function samePendingApplication(
   application: NonNullable<WorkAttempt["application"]>,
-  input: { commit: string; expectedHead: string; rootCommit?: string; commits?: string[] },
+  input: {
+    commit: string;
+    expectedRef?: string;
+    expectedHead: string;
+    rootCommit?: string;
+    commits?: string[];
+  },
 ): boolean {
   return (
     application.state === "pending" &&
     application.commit === input.commit &&
+    application.expectedRef === input.expectedRef &&
     application.expectedHead === input.expectedHead &&
     application.rootCommit === input.rootCommit &&
     sameValue(application.commits, input.commits)

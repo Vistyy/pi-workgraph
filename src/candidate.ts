@@ -14,9 +14,12 @@ type CandidateAttempt = Pick<WorkAttempt, "id" | "baseRevision" | "candidate">;
 type CandidateAssignment = Pick<WorkAssignment, "capability" | "intentVersion">;
 
 type CandidateApplicationRecord = {
+  state?: "pending" | "applied" | "blocked";
   commit: string;
+  expectedRef?: string | undefined;
   rootCommit?: string | undefined;
   commits?: string[] | undefined;
+  revision?: string | undefined;
 };
 
 /** Return the explicit content lineage, or the historical implicit initial candidate. */
@@ -223,6 +226,15 @@ export function applicationRecordIssue(
 ): string | undefined {
   if (!Value.Check(CommitSchema, application.commit))
     return "Application source requires an exact commit id.";
+  if (application.state === "applied" && !Value.Check(CommitSchema, application.revision ?? ""))
+    return "Applied application requires an exact revision.";
+  if (application.state !== "applied" && application.revision !== undefined)
+    return "Unfinished application cannot retain an applied revision.";
+  if (
+    application.expectedRef !== undefined &&
+    !/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(application.expectedRef)
+  )
+    return "Application destination requires an exact attached branch ref.";
   if ((application.rootCommit === undefined) !== (application.commits === undefined))
     return "Application lineage requires both rootCommit and commits.";
   if (
@@ -252,7 +264,7 @@ export function includedByAppliedCandidateDescendant(
       application?.state !== "applied" ||
       application.rootCommit === undefined ||
       application.commits === undefined ||
-      application.revision !== application.commit
+      application.revision === undefined
     )
       continue;
     const history = candidateHistory(state, descendant);

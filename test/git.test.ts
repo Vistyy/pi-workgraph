@@ -7,11 +7,12 @@ import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
 import {
+  type CandidateApplicationDestination,
+  type CandidateApplicationSource,
   GitParseError,
   type GitProcessRequest,
   type GitProcessRunner,
   GitRepository,
-  GitStateUncertainError,
   openRepository,
   parseWorktreeList,
 } from "../src/git.js";
@@ -19,6 +20,15 @@ import { ProcessExecutionError, type ProcessResult, processEffect } from "../src
 import { git } from "./helpers.js";
 
 const runGit = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
+
+async function applyCandidate(
+  repository: GitRepository,
+  source: CandidateApplicationSource,
+  destination: CandidateApplicationDestination,
+): Promise<string> {
+  const prepared = await runGit(repository.prepareCandidateApplication(source, destination));
+  return runGit(repository.applyCandidate(prepared));
+}
 
 async function waitForFile(path: string): Promise<string> {
   for (let attempt = 0; attempt < 200; attempt += 1) {
@@ -329,7 +339,7 @@ void test("cleanup independently rechecks the exact branch after worktree regist
   }
 });
 
-void test("candidate validation retains the complete direct history and refuses moved or dirty destinations", async () => {
+void test("candidate application validates lineage, ref identity, and fast-forwards once", async () => {
   const f = await fixture();
   try {
     const firstPlacement = await runGit(f.repository.createWorktree("run", "first", f.base));
@@ -350,41 +360,48 @@ void test("candidate validation retains the complete direct history and refuses 
       commits: [first, second],
     });
     const source = { rootCommit: f.base, commit: second, commits: [first, second] };
-    assert.equal(await runGit(f.repository.recoverCandidateApplication(f.base, source)), undefined);
+    const destination = await runGit(f.repository.preflightCandidateApplication(source));
+    assert.equal(
+      await runGit(f.repository.recoverCandidateApplication(destination, source)),
+      undefined,
+    );
     await assert.rejects(
-      () => runGit(f.repository.applyCandidate({ ...source, commits: [f.base] }, f.base)),
-      /Candidate source commit chain changed before application/,
+      () => applyCandidate(f.repository, { ...source, commits: [f.base] }, destination),
+      /exact source revisions/,
     );
     assert.equal(await runGit(f.repository.head()), f.base);
     const mergeHead = join(f.repository.commonDir, "MERGE_HEAD");
     await writeFile(mergeHead, `${first}\n`);
     try {
       await assert.rejects(
-        () => runGit(f.repository.applyCandidate(source, f.base)),
+        () => applyCandidate(f.repository, source, destination),
         /pre-existing merge state/,
       );
       assert.equal(await runGit(f.repository.head()), f.base);
     } finally {
       await rm(mergeHead, { force: true });
     }
+    let mergeAttempts = 0;
     const unchangedFailureRepository = new GitRepository(
       f.root,
       f.repository.commonDir,
-      interceptProcess((request) =>
-        request.args.join("\\0") === `merge\\0--ff-only\\0--no-edit\\0${second}`
-          ? Effect.succeed(processResult({ exitCode: 7, stderr: "merge failed" }))
-          : undefined,
-      ),
+      interceptProcess((request) => {
+        if (request.args.join("\\0") !== `merge\\0--ff-only\\0--no-edit\\0${second}`)
+          return undefined;
+        mergeAttempts += 1;
+        return Effect.succeed(processResult({ exitCode: 7, stderr: "merge failed" }));
+      }),
     );
     await assert.rejects(
-      () => runGit(unchangedFailureRepository.applyCandidate(source, f.base)),
+      () => applyCandidate(unchangedFailureRepository, source, destination),
       /Fast-forward application.*failed/,
     );
     assert.equal(await runGit(f.repository.head()), f.base);
-    assert.equal(await runGit(f.repository.applyCandidate(source, f.base)), second);
+    assert.equal(mergeAttempts, 1);
+    assert.equal(await applyCandidate(f.repository, source, destination), second);
     assert.equal(await runGit(f.repository.head()), second);
     assert.equal(await git(f.root, "rev-list", "--count", `${f.base}..HEAD`), "2");
-    assert.deepEqual(await runGit(f.repository.recoverCandidateApplication(f.base, source)), {
+    assert.deepEqual(await runGit(f.repository.recoverCandidateApplication(destination, source)), {
       head: second,
     });
 
@@ -393,14 +410,24 @@ void test("candidate validation retains the complete direct history and refuses 
     await git(f.root, "commit", "-m", "Move destination");
     const moved = await runGit(f.repository.head());
     const movedBytes = await readFile(join(f.root, "data.txt"), "utf8");
-    await assert.rejects(
-      () => runGit(f.repository.applyCandidate(source, moved)),
-      /candidate root/,
+    assert.equal(
+      await applyCandidate(f.repository, source, {
+        expectedRef: "refs/heads/main",
+        expectedHead: moved,
+      }),
+      moved,
     );
     assert.equal(await runGit(f.repository.head()), moved);
     assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), movedBytes);
     await writeFile(join(f.root, "unrelated.txt"), "dirty\n");
-    await assert.rejects(() => runGit(f.repository.applyCandidate(source, moved)), /not clean/);
+    await assert.rejects(
+      () =>
+        applyCandidate(f.repository, source, {
+          expectedRef: "refs/heads/main",
+          expectedHead: moved,
+        }),
+      /not clean/,
+    );
     assert.equal(await runGit(f.repository.head()), moved);
     assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), movedBytes);
     assert.equal(await readFile(join(f.root, "unrelated.txt"), "utf8"), "dirty\n");
@@ -413,77 +440,41 @@ void test("candidate validation retains the complete direct history and refuses 
   }
 });
 
-void test("unavailable post-failure HEAD leaves candidate application uncertain without recovery mutation", async () => {
+void test("candidate application creates the exact off-checkout merge tree", async () => {
   const f = await fixture();
-  const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
+  const placement = await runGit(f.repository.createWorktree("run", "candidate", f.base));
   try {
     await writeFile(join(placement.path, "data.txt"), "candidate\n");
     await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Candidate output");
-    const commit = await runGit(f.repository.head(placement.path));
-    const source = { rootCommit: f.base, commit, commits: [commit] };
-    let headObservations = 0;
-    let mergeAttempts = 0;
-    const repository = new GitRepository(
-      f.root,
-      f.repository.commonDir,
-      interceptProcess((request) => {
-        const args = request.args.join("\\0");
-        if (args === "rev-parse\\0HEAD") {
-          headObservations += 1;
-          if (headObservations === 2)
-            return Effect.fail(processUnavailable(request, "destination HEAD unavailable"));
-        }
-        if (args === `merge\\0--ff-only\\0--no-edit\\0${commit}`) {
-          mergeAttempts += 1;
-          return Effect.succeed(processResult({ exitCode: 7, stderr: "transport lost" }));
-        }
-        return undefined;
-      }),
+    await git(placement.path, "commit", "-m", "Candidate");
+    const candidate = await runGit(f.repository.head(placement.path));
+    await writeFile(join(f.root, "other.txt"), "destination\n");
+    await git(f.root, "add", ".");
+    await git(f.root, "commit", "-m", "Destination");
+    const destinationHead = await runGit(f.repository.head());
+    const source = { rootCommit: f.base, commit: candidate, commits: [candidate] };
+    const destination = await runGit(f.repository.preflightCandidateApplication(source));
+    const expectedTree = (
+      await git(f.root, "merge-tree", "--write-tree", "--messages", destinationHead, candidate)
+    ).split("\n", 1)[0];
+    const applied = await applyCandidate(f.repository, source, destination);
+    assert.equal(
+      await git(f.root, "rev-list", "--parents", "-n", "1", applied),
+      `${applied} ${destinationHead} ${candidate}`,
     );
-    const failure = await Effect.runPromise(Effect.flip(repository.applyCandidate(source, f.base)));
-    assert.ok(failure instanceof GitStateUncertainError);
-    assert.match(failure.message, /resulting HEAD is unavailable/);
-    assert.match(failure.operationDiagnostic, /Fast-forward application/);
-    assert.match(failure.followupDiagnostic, /destination HEAD unavailable/);
-    assert.equal(mergeAttempts, 1);
-    assert.equal(await runGit(f.repository.head()), f.base);
-    assert.equal(await runGit(f.repository.status()), "");
-    assert.equal(await runGit(repository.recoverCandidateApplication(f.base, source)), undefined);
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("uncertain candidate application is attributed only after exact postcondition recovery", async () => {
-  const f = await fixture();
-  const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
-  try {
-    await writeFile(join(placement.path, "data.txt"), "candidate\n");
-    await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Candidate output");
-    const commit = await runGit(f.repository.head(placement.path));
-    const source = { rootCommit: f.base, commit, commits: [commit] };
-    const repository = new GitRepository(
-      f.root,
-      f.repository.commonDir,
-      interceptProcess((request) => {
-        if (request.args.join("\\0") !== `merge\\0--ff-only\\0--no-edit\\0${commit}`)
-          return undefined;
-        return Effect.promise(async () => {
-          await git(f.root, "merge", "--ff-only", "--no-edit", commit);
-          return processResult({ exitCode: 7, stderr: "transport lost after merge" });
-        });
-      }),
-    );
-    const failure = await Effect.runPromise(Effect.flip(repository.applyCandidate(source, f.base)));
-    assert.ok(failure instanceof GitStateUncertainError);
-    assert.match(failure.message, /state changed/);
-    assert.equal(await runGit(f.repository.head()), commit);
-    assert.equal(await runGit(f.repository.status()), "");
-    assert.deepEqual(await runGit(repository.recoverCandidateApplication(f.base, source)), {
-      head: commit,
+    assert.equal(await git(f.root, "rev-parse", `${applied}^{tree}`), expectedTree);
+    assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), "candidate\n");
+    assert.equal(await readFile(join(f.root, "other.txt"), "utf8"), "destination\n");
+    assert.deepEqual(await runGit(f.repository.recoverCandidateApplication(destination, source)), {
+      head: applied,
     });
+    await writeFile(join(f.root, "after.txt"), "later\n");
+    await git(f.root, "add", ".");
+    await git(f.root, "commit", "-m", "Descendant after application");
+    await assert.rejects(
+      () => runGit(f.repository.recoverCandidateApplication(destination, source)),
+      /ambiguous/,
+    );
   } finally {
     await rm(f.parent, { recursive: true, force: true });
   }

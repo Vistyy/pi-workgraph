@@ -25,6 +25,7 @@ import {
   retainedCandidate,
 } from "./candidate.js";
 import type {
+  CandidateApplicationDestination,
   CandidateApplicationSource,
   GitFailure,
   GitRepository,
@@ -1151,14 +1152,6 @@ export class WorkstreamRuntime {
             this.store.isAssignmentCurrent(state, assignment.id),
           ),
         );
-        const destinationHead = yield* this.repository.head();
-        yield* this.runtimeSync("validate application destination", () => {
-          if (destinationHead !== candidate.rootCommit)
-            throw new Error(
-              `Destination HEAD ${destinationHead} does not equal candidate root ${candidate.rootCommit}; integrate the retained candidate onto the moved destination first.`,
-            );
-        });
-        yield* this.repository.assertClean();
         const validated = yield* this.repository.validateCandidate(
           placementOf(attempt),
           candidate.rootCommit,
@@ -1169,13 +1162,40 @@ export class WorkstreamRuntime {
           commit: validated.commit,
           commits: validated.commits,
         };
-        yield* this.applyMaintainedOutput(attempt, assignment, source, destinationHead).pipe(
-          Effect.catch((error) => this.recoverApplication(attempt, source, destinationHead, error)),
-        );
+        const checkpoint =
+          attempt.application?.state === "pending"
+            ? {
+                expectedRef: required(
+                  attempt.application.expectedRef,
+                  "application destination ref",
+                ),
+                expectedHead: attempt.application.expectedHead,
+              }
+            : yield* this.repository.preflightCandidateApplication(source);
+        if (attempt.application?.state === "pending")
+          yield* this.runtimeSync("validate application checkpoint", () => {
+            const application = required(attempt.application, "application checkpoint");
+            if (
+              application.commit !== source.commit ||
+              application.rootCommit !== source.rootCommit ||
+              application.commits === undefined ||
+              application.commits.length !== source.commits.length ||
+              application.commits.some((commit, index) => commit !== source.commits[index])
+            )
+              throw new Error("Application checkpoint does not match the retained candidate.");
+          });
+        yield* this.applyMaintainedOutput(attempt, assignment, source, checkpoint);
         const applied = findAttempt(yield* this.storeEffect((store) => store.load()), attemptId);
         if (applied.application?.state !== "applied")
           return yield* this.runtimeSync("validate application postcondition", () => {
-            throw new Error("Application did not establish an applied destination revision.");
+            if (applied.application?.state === "blocked")
+              throw new Error(
+                applied.application.error ??
+                  "Application is blocked; inspect the destination and retained output.",
+              );
+            throw new Error(
+              "Application remains pending; inspect the unchanged destination and retry explicitly.",
+            );
           });
         return yield* this.releaseOutputEffect(
           attemptId,
@@ -1192,7 +1212,7 @@ export class WorkstreamRuntime {
     attempt: WorkAttempt,
     assignment: WorkAssignment,
     source: CandidateApplicationSource,
-    expectedHead: string,
+    destination: CandidateApplicationDestination,
   ): RuntimeEffect<void> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
@@ -1200,7 +1220,8 @@ export class WorkstreamRuntime {
           store.beginApplication({
             id: attempt.id,
             commit: source.commit,
-            expectedHead,
+            expectedRef: destination.expectedRef,
+            expectedHead: destination.expectedHead,
             rootCommit: source.rootCommit,
             commits: source.commits,
           }),
@@ -1213,12 +1234,40 @@ export class WorkstreamRuntime {
             );
         });
         yield* this.ownershipEffect();
-        const revision = yield* this.repository.applyCandidate(source, expectedHead);
-        yield* this.storeEffect((store) => store.finishApplication(attempt.id, revision));
-        yield* this.recordApplicationArtifact(
-          attempt,
-          revision,
-          `Applied candidate history through ${source.commit} (${source.commits.length} commit${source.commits.length === 1 ? "" : "s"}).`,
+        const latestAttempt = findAttempt(state, attempt.id);
+        const candidate = required(
+          candidateLineageForAttempt(latestAttempt),
+          "candidate base revision",
+        );
+        const validated = yield* this.repository.validateCandidate(
+          placementOf(latestAttempt),
+          candidate.rootCommit,
+          source.commit,
+        );
+        yield* this.runtimeSync("validate candidate output before application", () => {
+          if (
+            validated.rootCommit !== source.rootCommit ||
+            validated.commit !== source.commit ||
+            validated.commits.length !== source.commits.length ||
+            validated.commits.some((commit, index) => commit !== source.commits[index])
+          )
+            throw new Error("Candidate output changed before application.");
+        });
+        const prepared = yield* this.repository.prepareCandidateApplication(source, destination);
+        yield* Effect.gen(
+          function* (this: WorkstreamRuntime) {
+            const revision = yield* this.repository.applyCandidate(prepared);
+            yield* this.storeEffect((store) => store.finishApplication(attempt.id, revision));
+            yield* this.recordApplicationArtifact(
+              attempt,
+              revision,
+              `Applied candidate history through ${source.commit} (${source.commits.length} commit${source.commits.length === 1 ? "" : "s"}).`,
+            );
+          }.bind(this),
+        ).pipe(
+          Effect.catch((error: RuntimeError) =>
+            this.recoverApplication(attempt, source, destination, error),
+          ),
         );
       }.bind(this),
     );
@@ -1227,21 +1276,21 @@ export class WorkstreamRuntime {
   private recoverApplication(
     attempt: WorkAttempt,
     source: CandidateApplicationSource,
-    expectedHead: string,
+    destination: CandidateApplicationDestination,
     originalError: RuntimeError,
   ): RuntimeEffect<void> {
-    // A command or persistence error can occur after Git changed HEAD. Inspect before retry.
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const recovery = yield* this.repository
-          .recoverCandidateApplication(expectedHead, source)
+          .recoverCandidateApplication(destination, source)
           .pipe(Effect.option);
-        if (Option.isNone(recovery) || recovery.value === undefined) {
+        if (Option.isNone(recovery)) {
           yield* this.storeEffect((store) =>
             store.blockApplication(attempt.id, originalError.message),
           );
           return;
         }
+        if (recovery.value === undefined) return;
         const recovered = recovery.value;
         yield* this.storeEffect((store) => store.finishApplication(attempt.id, recovered.head));
         yield* this.recordApplicationArtifact(
@@ -1896,8 +1945,17 @@ function validateExplicitApplication(
     throw new Error("Retained output has already entered release; it cannot be applied.");
   if (!current)
     throw new Error("Intent changed; retained implementation is stale and cannot be applied.");
-  if (attempt.application !== undefined)
-    throw new Error("Application already has a recorded checkpoint; inspect it before recovery.");
+  if (attempt.application?.state === "applied")
+    throw new Error("Application already has an applied checkpoint.");
+  if (attempt.application?.state === "blocked")
+    throw new Error(
+      attempt.application.error ??
+        "Application is blocked; inspect the exact destination and retained output before retrying.",
+    );
+  if (attempt.application?.state === "pending" && attempt.application.expectedRef === undefined)
+    throw new Error(
+      "Application checkpoint has no exact destination ref; inspect it before retrying.",
+    );
   const issue = candidateApplicationIssue(state, assignment, attempt, reportedCommit);
   if (issue !== undefined) throw new Error(issue);
 }
