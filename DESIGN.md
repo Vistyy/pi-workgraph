@@ -4,6 +4,12 @@ This document owns the durable rationale and constraints for Workgraph's coordin
 It describes the direction to preserve, not a claim that every target is already implemented.
 API details, operating instructions, verification policy, and historical findings belong elsewhere.
 
+## Decision records
+
+Focused accepted decisions with meaningful reversal cost are recorded in [`docs/adr/`](docs/adr/). This document remains the integrated rationale for the complete system.
+
+- [ADR 0001: Use TypeBox for schemas, Effect for lifecycles, and Node at host boundaries](docs/adr/0001-own-schemas-effects-and-host-adapters.md)
+
 ## Vision
 
 Workgraph should help an agent make better coordination decisions while preserving the facts needed to trust, inspect, and recover those decisions.
