@@ -1,34 +1,19 @@
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Native paths are part of the public configuration API.
 import { join } from "node:path";
-import { StringEnum } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Data, Effect, FileSystem } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import { type ModelTarget, ModelTargetSchema } from "./domain/model-target.js";
 import { runNodePlatformPromise } from "./node-platform.js";
+
+export type { ModelTarget, Thinking } from "./domain/model-target.js";
+export { ModelTargetSchema, ThinkingSchema } from "./domain/model-target.js";
 
 export const MODEL_LIST_ROLES = ["research", "review", "consultation.advisor"] as const;
 export type ListModelRole = (typeof MODEL_LIST_ROLES)[number];
 export type SingletonModelRole = "implementation.guide" | "implementation.executor";
-export const ThinkingSchema = StringEnum([
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-] as const);
-export type Thinking = Static<typeof ThinkingSchema>;
-export const ModelTargetSchema = Type.Object(
-  {
-    model: Type.String({ pattern: "^[^/\\s]+/\\S+$" }),
-    thinking: ThinkingSchema,
-  },
-  { additionalProperties: false },
-);
-export type ModelTarget = Static<typeof ModelTargetSchema>;
 export type ModelTargetList = [ModelTarget, ...ModelTarget[]];
 
 const ModelTargetListSchema = Type.Array(ModelTargetSchema, { minItems: 1 });

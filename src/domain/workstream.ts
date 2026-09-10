@@ -1,31 +1,107 @@
-import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { ModelTargetSchema } from "../model-policy.js";
-import { WorkerReportInputSchema } from "../report-schema.js";
+import { ModelTargetSchema } from "./model-target.js";
 
-export const CANONICAL_WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
-export const CANONICAL_WORKSTREAM_SCHEMA = "coordination-domain" as const;
-export const CANONICAL_WORKSTREAM_SCHEMA_VERSION = 1 as const;
+const CANONICAL_WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
+const CANONICAL_WORKSTREAM_SCHEMA = "coordination-domain" as const;
+const CANONICAL_WORKSTREAM_SCHEMA_VERSION = 1 as const;
 
 const NonEmptyString = Type.String({ minLength: 1 });
 const Timestamp = Type.String({ minLength: 1 });
 const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
-const DurableId = Type.String({ pattern: "^[a-z][a-z0-9_-]{0,127}$" });
-const stringLiterals = StringEnum;
+const stringLiterals = <const Values extends readonly string[]>(values: Values) =>
+  Type.Unsafe<Values[number]>({ type: "string", enum: [...values] });
 
-export const RepositoryIdentitySchema = Type.Object(
+const EvidenceSchema = Type.Object(
+  {
+    label: Type.String(),
+    observation: Type.String(),
+    class: Type.Optional(stringLiterals(["direct", "inference", "conflict", "unknown"] as const)),
+    command: Type.Optional(Type.String()),
+    artifact: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+const FindingSchema = Type.Object(
+  {
+    severity: stringLiterals(["info", "warning", "error", "blocker"] as const),
+    title: Type.String(),
+    detail: Type.String(),
+  },
+  { additionalProperties: false },
+);
+const ReportContent = {
+  summary: Type.String(),
+  uncertainty: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
+  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
+  findings: Type.Array(FindingSchema, { maxItems: 20 }),
+};
+const ResearchReportSchema = Type.Object(
+  {
+    kind: Type.Literal("research"),
+    status: stringLiterals(["completed", "escalated", "failed"] as const),
+    ...ReportContent,
+  },
+  { additionalProperties: false },
+);
+const ReviewReportSchema = Type.Object(
+  {
+    kind: Type.Literal("review"),
+    status: stringLiterals(["completed", "escalated", "failed"] as const),
+    ...ReportContent,
+  },
+  { additionalProperties: false },
+);
+const ImplementationReportSchema = Type.Union([
+  Type.Object(
+    {
+      kind: Type.Literal("implementation"),
+      status: Type.Literal("completed"),
+      outcome: Type.Literal("changed"),
+      ...ReportContent,
+      commit: Commit,
+      changedFiles: Type.Optional(Type.Array(Type.String())),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("implementation"),
+      status: Type.Literal("completed"),
+      outcome: Type.Literal("no_change"),
+      ...ReportContent,
+      revision: Commit,
+      reason: NonEmptyString,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("implementation"),
+      status: stringLiterals(["escalated", "failed"] as const),
+      ...ReportContent,
+    },
+    { additionalProperties: false },
+  ),
+]);
+const WorkerReportInputSchema = Type.Union([
+  ResearchReportSchema,
+  ReviewReportSchema,
+  ImplementationReportSchema,
+]);
+
+const RepositoryIdentitySchema = Type.Object(
   { projectRoot: NonEmptyString, gitCommonDir: NonEmptyString },
   { additionalProperties: false },
 );
-export const CoordinatorIdentitySchema = Type.Object(
+const CoordinatorIdentitySchema = Type.Object(
   { sessionId: NonEmptyString, sessionFile: NonEmptyString },
   { additionalProperties: false },
 );
-export const HumanInputReceiptSchema = Type.Object(
+const HumanInputReceiptSchema = Type.Object(
   {
     kind: Type.Literal("human_input_receipt"),
-    id: DurableId,
+    id: NonEmptyString,
     sessionId: NonEmptyString,
     sessionFile: NonEmptyString,
     source: stringLiterals(["interactive", "rpc"] as const),
@@ -37,9 +113,9 @@ export const HumanInputReceiptSchema = Type.Object(
 export const HandoffGrantSchema = Type.Object(
   {
     kind: Type.Literal("handoff_grant"),
-    id: DurableId,
+    id: NonEmptyString,
     parentReceipt: HumanInputReceiptSchema,
-    parentWorkstreamId: DurableId,
+    parentWorkstreamId: NonEmptyString,
     parentRepository: RepositoryIdentitySchema,
     parentIntentIndex: Type.Integer({ minimum: 0 }),
     parentIntentStatement: NonEmptyString,
@@ -50,7 +126,7 @@ export const HandoffGrantSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const IntentGroundingSchema = Type.Union([HumanInputReceiptSchema, HandoffGrantSchema]);
+const IntentGroundingSchema = Type.Union([HumanInputReceiptSchema, HandoffGrantSchema]);
 export const IntentSchema = Type.Object(
   {
     statement: NonEmptyString,
@@ -61,7 +137,7 @@ export const IntentSchema = Type.Object(
   { additionalProperties: false },
 );
 
-export const ReviewSubjectSchema = Type.Union([
+const ReviewSubjectSchema = Type.Union([
   Type.Object(
     { kind: Type.Literal("outcome"), outcomeId: NonEmptyString },
     { additionalProperties: false },
@@ -71,7 +147,7 @@ export const ReviewSubjectSchema = Type.Union([
     { additionalProperties: false },
   ),
   Type.Object(
-    { kind: Type.Literal("artifact"), outcomeId: NonEmptyString, artifactId: DurableId },
+    { kind: Type.Literal("artifact"), outcomeId: NonEmptyString, artifactId: NonEmptyString },
     { additionalProperties: false },
   ),
   Type.Object(
@@ -79,7 +155,6 @@ export const ReviewSubjectSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-
 export const CandidateLineageSchema = Type.Union([
   Type.Object(
     { kind: Type.Literal("initial"), rootCommit: Commit },
@@ -89,7 +164,7 @@ export const CandidateLineageSchema = Type.Union([
     {
       kind: Type.Literal("correction"),
       rootCommit: Commit,
-      parentAttemptId: DurableId,
+      parentAttemptId: NonEmptyString,
       parentCommit: Commit,
     },
     { additionalProperties: false },
@@ -98,43 +173,31 @@ export const CandidateLineageSchema = Type.Union([
     {
       kind: Type.Literal("integration"),
       rootCommit: Commit,
-      parentAttemptId: DurableId,
+      parentAttemptId: NonEmptyString,
       parentCommit: Commit,
     },
     { additionalProperties: false },
   ),
 ]);
 
-const SelectionSourceSchema = stringLiterals(["policy", "requested-model"] as const);
-export const SelectedModelsSchema = Type.Union([
-  Type.Object(
-    {
-      role: stringLiterals(["research", "review"] as const),
-      count: Type.Integer({ minimum: 1, maximum: 32 }),
-      distinctModels: Type.Boolean(),
-      selected: Type.Array(ModelTargetSchema, { minItems: 1, maxItems: 32 }),
-      source: SelectionSourceSchema,
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      role: Type.Literal("consultation"),
-      selected: Type.Array(ModelTargetSchema, { minItems: 1, maxItems: 1 }),
-      source: SelectionSourceSchema,
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      role: Type.Literal("implementation"),
-      guide: ModelTargetSchema,
-      executor: ModelTargetSchema,
-      source: Type.Literal("policy"),
-    },
-    { additionalProperties: false },
-  ),
-]);
+const ReadOnlySelectionSchema = Type.Object(
+  {
+    role: stringLiterals(["research", "review", "consultation"] as const),
+    target: ModelTargetSchema,
+    source: Type.Literal("policy"),
+  },
+  { additionalProperties: false },
+);
+const ImplementationSelectionSchema = Type.Object(
+  {
+    role: Type.Literal("implementation"),
+    guide: ModelTargetSchema,
+    executor: ModelTargetSchema,
+    source: Type.Literal("policy"),
+  },
+  { additionalProperties: false },
+);
+const SelectionSchema = Type.Union([ReadOnlySelectionSchema, ImplementationSelectionSchema]);
 const EffectiveModelSchema = Type.Object(
   {
     model: NonEmptyString,
@@ -153,21 +216,6 @@ const PlacementSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-const LaunchPaneSchema = Type.Object(
-  { workspaceId: NonEmptyString, paneId: NonEmptyString },
-  { additionalProperties: false },
-);
-const ResourceSchema = Type.Object(
-  {
-    workspaceId: NonEmptyString,
-    tabId: NonEmptyString,
-    paneId: NonEmptyString,
-    terminalId: NonEmptyString,
-    agentName: NonEmptyString,
-    cwd: NonEmptyString,
-  },
-  { additionalProperties: false },
-);
 const WorkerIdentitySchema = Type.Object(
   {
     workspaceId: NonEmptyString,
@@ -195,9 +243,6 @@ const CancellationObservationSchema = Type.Object(
 export const WorkerExecutionSchema = Type.Object(
   {
     placement: Type.Optional(PlacementSchema),
-    launchPane: Type.Optional(LaunchPaneSchema),
-    resource: Type.Optional(ResourceSchema),
-    sessionFile: Type.Optional(NonEmptyString),
     worker: Type.Optional(WorkerIdentitySchema),
     submission: Type.Optional(
       stringLiterals(["not_sent", "uncertain", "submitted", "started"] as const),
@@ -213,8 +258,8 @@ export const ApplicationSchema = Type.Object(
     commit: Commit,
     expectedRef: Type.Optional(NonEmptyString),
     expectedHead: Commit,
-    rootCommit: Type.Optional(Commit),
-    commits: Type.Optional(Type.Array(Commit, { minItems: 1 })),
+    rootCommit: Commit,
+    commits: Type.Array(Commit, { minItems: 1 }),
     revision: Type.Optional(Commit),
     error: Type.Optional(NonEmptyString),
   },
@@ -229,7 +274,7 @@ export const CleanupSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const OutputReleaseSchema = Type.Object(
+const OutputReleaseSchema = Type.Object(
   {
     state: stringLiterals(["pending", "blocked", "completed"] as const),
     expectedHead: Commit,
@@ -242,10 +287,9 @@ const AttentionSchema = Type.Object(
   { detail: NonEmptyString, at: Timestamp },
   { additionalProperties: false },
 );
-
-export const RetainedArtifactSchema = Type.Object(
+const RetainedArtifactSchema = Type.Object(
   {
-    id: DurableId,
+    id: NonEmptyString,
     kind: stringLiterals(["path", "revision", "reference"] as const),
     reference: NonEmptyString,
     retention: stringLiterals(["retained", "discarded"] as const),
@@ -257,7 +301,7 @@ const DeliveryFailureSchema = Type.Object(
   { at: Timestamp, detail: NonEmptyString },
   { additionalProperties: false },
 );
-export const DeliverySchema = Type.Union([
+const DeliverySchema = Type.Union([
   Type.Object(
     {
       state: Type.Literal("pending"),
@@ -284,7 +328,7 @@ const OutcomeBase = {
   artifacts: Type.Array(RetainedArtifactSchema),
   delivery: DeliverySchema,
 };
-export const OutcomeSchema = Type.Union([
+const OutcomeSchema = Type.Union([
   Type.Object(
     { ...OutcomeBase, kind: Type.Literal("reported"), report: WorkerReportInputSchema },
     { additionalProperties: false },
@@ -306,16 +350,16 @@ export const OutcomeSchema = Type.Union([
 
 export const AttemptSchema = Type.Object(
   {
-    id: DurableId,
+    id: NonEmptyString,
     state: stringLiterals(["queued", "active", "finished"] as const),
     createdAt: Timestamp,
     updatedAt: Timestamp,
-    continuationOf: Type.Optional(DurableId),
+    continuationOf: Type.Optional(NonEmptyString),
     candidate: Type.Optional(CandidateLineageSchema),
-    selectedModels: Type.Optional(SelectedModelsSchema),
+    baseRevision: Type.Optional(Commit),
+    selection: SelectionSchema,
     effectiveModels: Type.Optional(Type.Array(EffectiveModelSchema, { minItems: 1 })),
     execution: Type.Optional(WorkerExecutionSchema),
-    baseRevision: Type.Optional(Commit),
     application: Type.Optional(ApplicationSchema),
     cleanup: Type.Optional(CleanupSchema),
     outputRelease: Type.Optional(OutputReleaseSchema),
@@ -325,7 +369,7 @@ export const AttemptSchema = Type.Object(
   { additionalProperties: false },
 );
 const TaskBase = {
-  id: DurableId,
+  id: NonEmptyString,
   objective: NonEmptyString,
   intentIndex: Type.Integer({ minimum: 0 }),
   createdAt: Timestamp,
@@ -376,27 +420,17 @@ export const TaskSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-
-const StrictEvidenceSchema = Type.Object(
-  {
-    label: Type.String(),
-    observation: Type.String(),
-    class: Type.Optional(stringLiterals(["direct", "inference", "conflict", "unknown"] as const)),
-    command: Type.Optional(Type.String()),
-    artifact: Type.Optional(Type.String()),
-  },
-  { additionalProperties: false },
-);
-export const CompletionAccountingSchema = Type.Union([
+const StrictEvidenceSchema = EvidenceSchema;
+const CompletionAccountingSchema = Type.Union([
   Type.Object(
-    { kind: Type.Literal("unresolved_task"), taskId: DurableId, reason: NonEmptyString },
+    { kind: Type.Literal("unresolved_task"), taskId: NonEmptyString, reason: NonEmptyString },
     { additionalProperties: false },
   ),
   Type.Object(
     {
       kind: Type.Literal("unresolved_attempt"),
-      taskId: DurableId,
-      attemptId: DurableId,
+      taskId: NonEmptyString,
+      attemptId: NonEmptyString,
       reason: NonEmptyString,
     },
     { additionalProperties: false },
@@ -414,7 +448,7 @@ export const CompletionAccountingSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-export const CompletionSchema = Type.Object(
+const CompletionSchema = Type.Object(
   {
     conclusion: NonEmptyString,
     evidence: Type.Array(StrictEvidenceSchema, { minItems: 1 }),
@@ -430,7 +464,7 @@ export const WorkstreamSchema = Type.Object(
     schema: Type.Literal(CANONICAL_WORKSTREAM_SCHEMA),
     schemaVersion: Type.Literal(CANONICAL_WORKSTREAM_SCHEMA_VERSION),
     revision: Type.Integer({ minimum: 0 }),
-    id: DurableId,
+    id: NonEmptyString,
     purpose: NonEmptyString,
     repository: RepositoryIdentitySchema,
     coordinator: CoordinatorIdentitySchema,
@@ -445,11 +479,12 @@ export const WorkstreamSchema = Type.Object(
 );
 
 export type RepositoryIdentity = Static<typeof RepositoryIdentitySchema>;
+export type CoordinatorIdentity = Static<typeof CoordinatorIdentitySchema>;
 export type HumanInputReceipt = Static<typeof HumanInputReceiptSchema>;
 export type HandoffGrant = Static<typeof HandoffGrantSchema>;
 export type Intent = Static<typeof IntentSchema>;
 export type CandidateLineage = Static<typeof CandidateLineageSchema>;
-export type SelectedModels = Static<typeof SelectedModelsSchema>;
+export type ModelSelection = Static<typeof SelectionSchema>;
 export type WorkerExecution = Static<typeof WorkerExecutionSchema>;
 export type RetainedArtifact = Static<typeof RetainedArtifactSchema>;
 export type Delivery = Static<typeof DeliverySchema>;
@@ -459,7 +494,6 @@ export type Task = Static<typeof TaskSchema>;
 export type CompletionAccounting = Static<typeof CompletionAccountingSchema>;
 export type Completion = Static<typeof CompletionSchema>;
 export type Workstream = Static<typeof WorkstreamSchema>;
-
 export type AttemptKey = Readonly<{ taskId: string; attemptId: string }>;
 export type TerminalObservation =
   | Readonly<{
@@ -485,7 +519,7 @@ export type TerminalObservation =
       deliveryRequestedAt: string;
     }>;
 
-export function outcomeIdForAttempt(attemptId: string): string {
+function outcomeIdForAttempt(attemptId: string): string {
   return `${attemptId}:outcome`;
 }
 
@@ -497,7 +531,7 @@ export function validateWorkstream(value: Workstream): void {
     );
   }
   validateGrounding(value);
-  const taskIds = unique(
+  unique(
     value.tasks.map((task) => task.id),
     "Task",
   );
@@ -506,32 +540,43 @@ export function validateWorkstream(value: Workstream): void {
     attempts.map((attempt) => attempt.id),
     "Attempt",
   );
-  const outcomeIds = attempts.flatMap((attempt) => (attempt.outcome ? [attempt.outcome.id] : []));
-  unique(outcomeIds, "Outcome");
+  unique(
+    attempts.flatMap((attempt) => (attempt.outcome ? [attempt.outcome.id] : [])),
+    "Outcome",
+  );
+  if (
+    new Set([
+      value.id,
+      ...value.tasks.map((task) => task.id),
+      ...attempts.map((attempt) => attempt.id),
+    ]).size !==
+    1 + value.tasks.length + attempts.length
+  )
+    throw new Error("Workstream, Task, and Attempt ids must be distinct.");
   for (const task of value.tasks) {
     if (task.intentIndex >= value.intents.length)
       throw new Error(`Task ${task.id} references unknown Intent index ${task.intentIndex}.`);
     validateTask(value, task);
   }
-  if (taskIds.has(value.id)) throw new Error("Workstream and Task ids must be distinct.");
   validateLifecycle(value);
 }
 
 function validateGrounding(workstream: Workstream): void {
   for (const [index, intent] of workstream.intents.entries()) {
-    const grounding = intent.grounding;
-    if (grounding.kind === "human_input_receipt") {
+    if (intent.grounding.kind === "human_input_receipt") {
       if (
-        grounding.sessionId !== workstream.coordinator.sessionId ||
-        grounding.sessionFile !== workstream.coordinator.sessionFile
+        intent.grounding.sessionId !== workstream.coordinator.sessionId ||
+        intent.grounding.sessionFile !== workstream.coordinator.sessionFile
       )
         throw new Error(`Intent ${index} direct receipt belongs to another coordinator session.`);
-    } else if (!sameValue(grounding.targetRepository, workstream.repository)) {
-      throw new Error(`Intent ${index} Handoff Grant targets another repository.`);
+    } else {
+      if (index !== 0)
+        throw new Error("Handoff Grant grounding is only valid for the first Intent.");
+      if (!sameValue(intent.grounding.targetRepository, workstream.repository))
+        throw new Error(`Intent ${index} Handoff Grant targets another repository.`);
     }
   }
 }
-
 function validateTask(workstream: Workstream, task: Task): void {
   if (task.kind === "review") validateReviewSubject(workstream, task);
   for (const [index, attempt] of task.attempts.entries()) {
@@ -545,7 +590,6 @@ function validateTask(workstream: Workstream, task: Task): void {
     }
   }
 }
-
 function validateReviewSubject(
   workstream: Workstream,
   task: Extract<Task, { kind: "review" }>,
@@ -568,7 +612,13 @@ function validateReviewSubject(
       throw new Error(`Review Task ${task.id} references an artifact that is not retained.`);
   }
 }
-
+function expectedReportKind(task: Task): "research" | "review" | "implementation" {
+  return task.kind === "review"
+    ? "review"
+    : task.kind === "implementation"
+      ? "implementation"
+      : "research";
+}
 function validateAttempt(workstream: Workstream, task: Task, attempt: Attempt): void {
   if ((attempt.state === "finished") !== (attempt.outcome !== undefined))
     throw new Error(`Attempt ${attempt.id} must embed exactly one Outcome iff finished.`);
@@ -581,6 +631,11 @@ function validateAttempt(workstream: Workstream, task: Task, attempt: Attempt): 
     );
     if (attempt.outcome.delivery.attemptCount < attempt.outcome.delivery.failureHistory.length)
       throw new Error(`Outcome ${attempt.outcome.id} delivery history exceeds its attempt count.`);
+    if (
+      attempt.outcome.kind === "reported" &&
+      attempt.outcome.report.kind !== expectedReportKind(task)
+    )
+      throw new Error(`Attempt ${attempt.id} Report kind does not match Task kind ${task.kind}.`);
   }
   if (attempt.state === "queued" && hasOperationalFacts(attempt))
     throw new Error(`Queued Attempt ${attempt.id} contains execution or terminal facts.`);
@@ -590,13 +645,12 @@ function validateAttempt(workstream: Workstream, task: Task, attempt: Attempt): 
   )
     throw new Error(`Unfinished Attempt ${attempt.id} contains output settlement facts.`);
   validateExecution(attempt);
+  validateSelection(task, attempt);
   validateCandidate(workstream, task, attempt);
   validateApplication(task, attempt);
   validateCleanup(attempt);
   validateOutputRelease(attempt);
-  validateSelectedModels(task, attempt);
 }
-
 function hasOperationalFacts(attempt: Attempt): boolean {
   return (
     attempt.execution !== undefined ||
@@ -608,52 +662,36 @@ function hasOperationalFacts(attempt: Attempt): boolean {
     attempt.outcome !== undefined
   );
 }
-
 function validateExecution(attempt: Attempt): void {
   const execution = attempt.execution;
   if (execution === undefined) return;
   if (
-    (execution.resource !== undefined || execution.launchPane !== undefined) &&
-    execution.placement === undefined
+    execution.worker !== undefined &&
+    execution.placement !== undefined &&
+    execution.worker.cwd !== execution.placement.path
   )
-    throw new Error(`Attempt ${attempt.id} has a native launch identity without placement.`);
-  if (execution.worker !== undefined) {
-    if (
-      execution.sessionFile !== execution.worker.sessionFile ||
-      execution.placement === undefined ||
-      execution.worker.cwd !== execution.placement.path
-    )
-      throw new Error(`Attempt ${attempt.id} Worker identity does not match its launch.`);
-  }
+    throw new Error(`Attempt ${attempt.id} Worker identity does not match its placement.`);
   if (execution.submission !== undefined && execution.placement === undefined)
     throw new Error(`Attempt ${attempt.id} has submission state without placement.`);
   if (
     execution.submission !== undefined &&
     execution.submission !== "not_sent" &&
-    execution.sessionFile === undefined
+    execution.worker?.sessionFile === undefined
   )
-    throw new Error(`Attempt ${attempt.id} sent submission has no exact session.`);
+    throw new Error(`Attempt ${attempt.id} sent submission has no exact Worker session.`);
 }
-
-function validateSelectedModels(task: Task, attempt: Attempt): void {
-  const selection = attempt.selectedModels;
-  if (selection === undefined) return;
-  if (
-    selection.role !== task.kind &&
-    !(task.kind === "experiment" && selection.role === "research")
-  )
-    throw new Error(`Attempt ${attempt.id} model selection does not match Task kind ${task.kind}.`);
-  if ("selected" in selection) {
-    if ("count" in selection && selection.count !== selection.selected.length)
-      throw new Error(`Attempt ${attempt.id} model selection count is not exact.`);
-    if ("distinctModels" in selection && selection.distinctModels)
-      unique(
-        selection.selected.map((target) => target.model),
-        `selected model in Attempt ${attempt.id}`,
-      );
+function validateSelection(task: Task, attempt: Attempt): void {
+  const selection = attempt.selection;
+  if (task.kind === "implementation") {
+    if (selection.role !== "implementation")
+      throw new Error(`Attempt ${attempt.id} selection does not match implementation Task.`);
+  } else {
+    const expected: "research" | "review" | "consultation" =
+      task.kind === "experiment" ? "research" : task.kind;
+    if (selection.role !== expected)
+      throw new Error(`Attempt ${attempt.id} selection does not match Task kind ${task.kind}.`);
   }
 }
-
 function validateCandidate(workstream: Workstream, task: Task, attempt: Attempt): void {
   const candidate = attempt.candidate;
   if (candidate === undefined) return;
@@ -662,63 +700,77 @@ function validateCandidate(workstream: Workstream, task: Task, attempt: Attempt)
       `Attempt ${attempt.id} candidate lineage is only valid for based implementation work.`,
     );
   if (candidate.kind === "initial") {
-    if (candidate.rootCommit !== attempt.baseRevision)
-      throw new Error(
-        `Attempt ${attempt.id} initial candidate is not rooted at its base revision.`,
-      );
+    validateInitialCandidate(attempt, candidate.rootCommit);
     return;
   }
+  validateDerivedCandidate(workstream, attempt, candidate);
+}
+function validateInitialCandidate(attempt: Attempt, rootCommit: string): void {
+  if (rootCommit !== attempt.baseRevision)
+    throw new Error(`Attempt ${attempt.id} initial candidate is not rooted at its base revision.`);
+}
+function validateDerivedCandidate(
+  workstream: Workstream,
+  attempt: Attempt,
+  candidate: Extract<CandidateLineage, { kind: "correction" | "integration" }>,
+): void {
   const parentLocated = findAttemptLocation(workstream, candidate.parentAttemptId);
   if (parentLocated === undefined || parentLocated.task.kind !== "implementation")
     throw new Error(`Attempt ${attempt.id} candidate references an unknown implementation parent.`);
-  if (parentLocated.task.intentIndex !== task.intentIndex)
-    throw new Error(`Attempt ${attempt.id} candidate parent belongs to another Intent.`);
   const parent = parentLocated.attempt;
   const parentCommit = changedImplementationCommit(parent);
   if (parentCommit !== candidate.parentCommit)
     throw new Error(`Attempt ${attempt.id} candidate parent commit is not exact.`);
-  if (candidate.kind === "correction") {
-    if (
-      attempt.baseRevision !== candidate.parentCommit ||
-      candidate.rootCommit !== parent.candidate?.rootCommit
-    )
-      throw new Error(`Attempt ${attempt.id} correction does not continue its exact candidate.`);
-  } else if (candidate.rootCommit !== attempt.baseRevision) {
+  if (parent.candidate === undefined || parent.baseRevision === undefined)
+    throw new Error(`Attempt ${attempt.id} candidate parent lineage is incomplete.`);
+  if (parent.candidate.rootCommit !== candidate.rootCommit || !validCandidateBase(parent))
+    throw new Error(`Attempt ${attempt.id} candidate parent lineage is not exact.`);
+  if (candidate.kind === "correction" && attempt.baseRevision !== candidate.parentCommit)
+    throw new Error(`Attempt ${attempt.id} correction does not continue its exact candidate.`);
+  if (candidate.kind === "integration" && candidate.rootCommit !== attempt.baseRevision)
     throw new Error(`Attempt ${attempt.id} integration is not rooted at its destination base.`);
-  }
 }
-
+function validCandidateBase(attempt: Attempt): boolean {
+  const candidate = attempt.candidate;
+  if (candidate === undefined || attempt.baseRevision === undefined) return false;
+  return candidate.kind === "initial"
+    ? attempt.baseRevision === candidate.rootCommit
+    : candidate.kind === "correction"
+      ? attempt.baseRevision === candidate.parentCommit
+      : attempt.baseRevision === candidate.rootCommit;
+}
 function validateApplication(task: Task, attempt: Attempt): void {
   const application = attempt.application;
   if (application === undefined) return;
   if (task.kind !== "implementation" || attempt.execution?.placement?.kind !== "isolated_worktree")
     throw new Error(`Attempt ${attempt.id} application is outside isolated implementation work.`);
-  if ((application.rootCommit === undefined) !== (application.commits === undefined))
-    throw new Error(`Attempt ${attempt.id} application lineage is incomplete.`);
-  if (application.commits !== undefined && application.commits.at(-1) !== application.commit)
+  const candidateCommit = changedImplementationCommit(attempt);
+  if (
+    candidateCommit === undefined ||
+    attempt.candidate === undefined ||
+    application.commit !== candidateCommit
+  )
     throw new Error(
-      `Attempt ${attempt.id} application history does not end at its candidate commit.`,
+      `Attempt ${attempt.id} application is not bound to its reported changed candidate.`,
     );
+  if (
+    application.rootCommit !== attempt.candidate.rootCommit ||
+    application.commits[0] !== application.rootCommit ||
+    application.commits.at(-1) !== application.commit
+  )
+    throw new Error(`Attempt ${attempt.id} application lineage is not exact.`);
   if ((application.state === "applied") !== (application.revision !== undefined))
     throw new Error(`Attempt ${attempt.id} application revision does not match applied state.`);
-  if (
-    application.expectedRef !== undefined &&
-    !/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(application.expectedRef)
-  )
-    throw new Error(`Attempt ${attempt.id} application destination is not an exact branch ref.`);
   if ((application.state === "blocked") !== (application.error !== undefined))
     throw new Error(`Attempt ${attempt.id} application blocker does not match its state.`);
 }
-
 function validateCleanup(attempt: Attempt): void {
-  const cleanup = attempt.cleanup;
-  if (cleanup === undefined) return;
-  if ((cleanup.state === "blocked") !== (cleanup.error !== undefined))
+  if (attempt.cleanup === undefined) return;
+  if ((attempt.cleanup.state === "blocked") !== (attempt.cleanup.error !== undefined))
     throw new Error(`Attempt ${attempt.id} cleanup blocker does not match its state.`);
-  if (cleanup.state === "completed" && !cleanup.workerClosed)
+  if (attempt.cleanup.state === "completed" && !attempt.cleanup.workerClosed)
     throw new Error(`Attempt ${attempt.id} completed cleanup has no closed Worker.`);
 }
-
 function validateOutputRelease(attempt: Attempt): void {
   const release = attempt.outputRelease;
   if (release === undefined) return;
@@ -732,29 +784,27 @@ function validateOutputRelease(attempt: Attempt): void {
   if ((release.state === "blocked") !== (release.error !== undefined))
     throw new Error(`Attempt ${attempt.id} output release blocker does not match its state.`);
 }
-
 function validateLifecycle(workstream: Workstream): void {
   if ((workstream.lifecycle === "completed") !== (workstream.completion !== undefined))
     throw new Error("Completed lifecycle and Completion must appear together.");
   if (workstream.completion === undefined) return;
-  if (!workstream.tasks.flatMap((task) => task.attempts).every(isReattemptStable))
-    throw new Error("Completed Workstream contains an operationally unstable Attempt.");
   const expected = deriveCompletionAccounting(workstream);
-  if (!sameValue(expected, workstream.completion.accounting))
-    throw new Error("Completion accounting does not exactly match derived accounting.");
+  if (
+    expected.length !== 0 ||
+    workstream.completion.accounting.length !== 0 ||
+    !sameValue(expected, workstream.completion.accounting)
+  )
+    throw new Error("Completion accounting must be the exact empty derived set.");
 }
 
 export function findTask(workstream: Workstream, taskId: string): Task | undefined {
   return workstream.tasks.find((task) => task.id === taskId);
 }
-
 export function findAttempt(task: Task, attemptId: string): Attempt | undefined {
   return task.attempts.find((attempt) => attempt.id === attemptId);
 }
-
 type AttemptLocation = { task: Task; attempt: Attempt };
-
-export function findAttemptLocation(
+function findAttemptLocation(
   workstream: Workstream,
   attemptId: string,
 ): AttemptLocation | undefined {
@@ -764,15 +814,13 @@ export function findAttemptLocation(
   }
   return undefined;
 }
-
-export function findOutcome(workstream: Workstream, outcomeId: string): Outcome | undefined {
+function findOutcome(workstream: Workstream, outcomeId: string): Outcome | undefined {
   for (const task of workstream.tasks)
     for (const attempt of task.attempts)
       if (attempt.outcome?.id === outcomeId) return attempt.outcome;
   return undefined;
 }
-
-export function requireAttempt(workstream: Workstream, key: AttemptKey): AttemptLocation {
+function requireAttempt(workstream: Workstream, key: AttemptKey): AttemptLocation {
   const task = findTask(workstream, key.taskId);
   if (task === undefined) throw new Error(`Unknown Task ${key.taskId}.`);
   const attempt = findAttempt(task, key.attemptId);
@@ -785,7 +833,7 @@ export function createWorkstream(input: {
   id: string;
   purpose: string;
   repository: RepositoryIdentity;
-  coordinator: Static<typeof CoordinatorIdentitySchema>;
+  coordinator: CoordinatorIdentity;
   intent: Intent;
   createdAt: string;
 }): Workstream {
@@ -807,18 +855,20 @@ export function createWorkstream(input: {
   validateWorkstream(workstream);
   return workstream;
 }
-
 export function reviseIntent(
   workstream: Workstream,
   intent: Intent,
   updatedAt: string,
 ): Workstream {
   assertActive(workstream, "revise Intent");
-  return mutate(workstream, updatedAt, (draft) => {
-    draft.intents.push(clone(intent));
-  });
+  if (
+    intent.grounding.kind !== "human_input_receipt" ||
+    intent.grounding.sessionId !== workstream.coordinator.sessionId ||
+    intent.grounding.sessionFile !== workstream.coordinator.sessionFile
+  )
+    throw new Error("Revised Intent requires a direct receipt from the current coordinator.");
+  return mutate(workstream, updatedAt, (draft) => draft.intents.push(clone(intent)));
 }
-
 export function createTask(workstream: Workstream, task: Task, updatedAt: string): Workstream {
   assertActive(workstream, "create Task");
   if (task.intentIndex !== workstream.intents.length - 1)
@@ -826,12 +876,9 @@ export function createTask(workstream: Workstream, task: Task, updatedAt: string
   if (
     !task.attempts.every((attempt) => attempt.state === "queued" && !hasOperationalFacts(attempt))
   )
-    throw new Error(`Task ${task.id} must begin with one or more pristine queued Attempts.`);
-  return mutate(workstream, updatedAt, (draft) => {
-    draft.tasks.push(clone(task));
-  });
+    throw new Error(`Task ${task.id} must begin with pristine queued Attempts.`);
+  return mutate(workstream, updatedAt, (draft) => draft.tasks.push(clone(task)));
 }
-
 export function appendAttempt(
   workstream: Workstream,
   taskId: string,
@@ -847,11 +894,10 @@ export function appendAttempt(
     throw new Error(`Task ${taskId} has an unfinished or operationally unstable prior Attempt.`);
   if (attempt.state !== "queued" || hasOperationalFacts(attempt))
     throw new Error(`Appended Attempt ${attempt.id} must be pristine and queued.`);
-  return mutate(workstream, updatedAt, (draft) => {
-    findTask(draft, taskId)?.attempts.push(clone(attempt));
-  });
+  return mutate(workstream, updatedAt, (draft) =>
+    findTask(draft, taskId)?.attempts.push(clone(attempt)),
+  );
 }
-
 export function activateAttempt(
   workstream: Workstream,
   key: AttemptKey,
@@ -872,49 +918,136 @@ export function activateAttempt(
   });
 }
 
-export type AttemptProgress = Readonly<{
-  execution?: Partial<WorkerExecution>;
-  selectedModels?: SelectedModels;
-  effectiveModels?: Attempt["effectiveModels"];
-  application?: Attempt["application"];
-  cleanup?: Attempt["cleanup"];
-  outputRelease?: Attempt["outputRelease"];
-  attention?: Static<typeof AttentionSchema>;
-}>;
-
-export function progressAttempt(
+export function recordEffectiveModel(
   workstream: Workstream,
   key: AttemptKey,
-  progress: AttemptProgress,
+  observation: NonNullable<Attempt["effectiveModels"]>[number],
   updatedAt: string,
 ): Workstream {
-  const existing = requireAttempt(workstream, key).attempt;
-  if (existing.state === "queued")
+  const current = requireAttempt(workstream, key).attempt;
+  if (current.state === "queued")
     throw new Error(`Attempt ${key.attemptId} is not active or finished.`);
-  if (
-    existing.selectedModels !== undefined &&
-    progress.selectedModels !== undefined &&
-    !sameValue(existing.selectedModels, progress.selectedModels)
-  )
-    throw new Error(`Attempt ${key.attemptId} selected model facts are immutable.`);
+  assertActive(workstream, "record effective model");
+  if (current.effectiveModels?.some((item) => sameValue(item, observation)) === true)
+    return workstream;
   return mutate(workstream, updatedAt, (draft) => {
     const attempt = requireAttempt(draft, key).attempt;
-    if (progress.execution !== undefined)
-      attempt.execution = { ...attempt.execution, ...clone(progress.execution) };
-    assignDefined(attempt, "selectedModels", progress.selectedModels);
-    assignDefined(attempt, "effectiveModels", progress.effectiveModels);
-    assignDefined(attempt, "application", progress.application);
-    assignDefined(attempt, "cleanup", progress.cleanup);
-    assignDefined(attempt, "outputRelease", progress.outputRelease);
-    if (progress.attention !== undefined) {
-      attempt.attentionHistory ??= [];
-      attempt.attentionHistory.push(clone(progress.attention));
-    }
+    attempt.effectiveModels ??= [];
+    attempt.effectiveModels.push(clone(observation));
     attempt.updatedAt = updatedAt;
+  });
+}
+export function recordWorkerExecution(
+  workstream: Workstream,
+  key: AttemptKey,
+  execution: WorkerExecution,
+  updatedAt: string,
+): Workstream {
+  assertActive(workstream, "record Worker execution");
+  const current = requireAttempt(workstream, key).attempt;
+  if (current.state === "queued")
+    throw new Error(`Attempt ${key.attemptId} is not active or finished.`);
+  if (current.execution !== undefined && !sameValue(current.execution, execution))
+    throw new Error(`Attempt ${key.attemptId} Worker execution identity is immutable.`);
+  return mutate(workstream, updatedAt, (draft) => {
+    const attempt = requireAttempt(draft, key).attempt;
+    if (attempt.execution === undefined) attempt.execution = clone(execution);
+    attempt.updatedAt = updatedAt;
+  });
+}
+export function checkpointApplication(
+  workstream: Workstream,
+  key: AttemptKey,
+  application: Static<typeof ApplicationSchema>,
+  updatedAt: string,
+): Workstream {
+  const current = requireAttempt(workstream, key).attempt;
+  if (current.state !== "finished")
+    throw new Error(`Attempt ${key.attemptId} must be finished before application.`);
+  if (current.application !== undefined && !monotonicApplication(current.application, application))
+    throw new Error(
+      `Attempt ${key.attemptId} application transition rewrites identity or is not monotonic.`,
+    );
+  return mutate(workstream, updatedAt, (draft) => {
+    requireAttempt(draft, key).attempt.application = clone(application);
+    requireAttempt(draft, key).attempt.updatedAt = updatedAt;
     refreshCompletion(draft);
   });
 }
-
+export function checkpointCleanup(
+  workstream: Workstream,
+  key: AttemptKey,
+  cleanup: Static<typeof CleanupSchema>,
+  updatedAt: string,
+): Workstream {
+  const current = requireAttempt(workstream, key).attempt;
+  if (current.cleanup !== undefined && !monotonicCleanup(current.cleanup, cleanup))
+    throw new Error(
+      `Attempt ${key.attemptId} cleanup transition is not monotonic or rewrites identity.`,
+    );
+  return mutate(workstream, updatedAt, (draft) => {
+    requireAttempt(draft, key).attempt.cleanup = clone(cleanup);
+    requireAttempt(draft, key).attempt.updatedAt = updatedAt;
+    refreshCompletion(draft);
+  });
+}
+export function checkpointOutputRelease(
+  workstream: Workstream,
+  key: AttemptKey,
+  release: Static<typeof OutputReleaseSchema>,
+  updatedAt: string,
+): Workstream {
+  const current = requireAttempt(workstream, key).attempt;
+  if (current.outputRelease !== undefined && !monotonicRelease(current.outputRelease, release))
+    throw new Error(
+      `Attempt ${key.attemptId} output release transition is not monotonic or rewrites identity.`,
+    );
+  return mutate(workstream, updatedAt, (draft) => {
+    requireAttempt(draft, key).attempt.outputRelease = clone(release);
+    requireAttempt(draft, key).attempt.updatedAt = updatedAt;
+    refreshCompletion(draft);
+  });
+}
+function monotonicApplication(
+  old: NonNullable<Attempt["application"]>,
+  next: NonNullable<Attempt["application"]>,
+): boolean {
+  if (
+    old.commit !== next.commit ||
+    old.expectedHead !== next.expectedHead ||
+    old.rootCommit !== next.rootCommit ||
+    !sameValue(old.commits, next.commits) ||
+    old.expectedRef !== next.expectedRef
+  )
+    return false;
+  if (old.state === "applied")
+    return next.state === "applied" && old.revision === next.revision && old.error === next.error;
+  if (old.state === "blocked")
+    return (next.state === "blocked" && old.error === next.error) || next.state === "applied";
+  return next.state === "pending" || next.state === "blocked" || next.state === "applied";
+}
+function monotonicCleanup(old: Attempt["cleanup"], next: Attempt["cleanup"]): boolean {
+  if (old === undefined || next === undefined) return false;
+  if (sameValue(old, next)) return true;
+  if (old.expectedHead !== next.expectedHead || (old.workerClosed && !next.workerClosed))
+    return false;
+  if (old.state === "completed") return false;
+  if (old.state === "blocked")
+    return next.state === "completed" && next.error === undefined && next.workerClosed;
+  if (next.state === "pending") return old.error === undefined;
+  if (next.state === "blocked") return next.error !== undefined;
+  return next.state === "completed" && next.error === undefined && next.workerClosed;
+}
+function monotonicRelease(old: Attempt["outputRelease"], next: Attempt["outputRelease"]): boolean {
+  if (old === undefined || next === undefined) return false;
+  if (sameValue(old, next)) return true;
+  if (old.expectedHead !== next.expectedHead || old.reason !== next.reason) return false;
+  if (old.state === "completed") return false;
+  if (old.state === "blocked") return next.state === "completed" && next.error === undefined;
+  if (next.state === "pending") return next.error === undefined;
+  if (next.state === "blocked") return next.error !== undefined;
+  return next.state === "completed" && next.error === undefined;
+}
 export function requestCancellation(
   workstream: Workstream,
   key: AttemptKey,
@@ -924,13 +1057,17 @@ export function requestCancellation(
   assertActive(workstream, "request cancellation");
   const attempt = requireAttempt(workstream, key).attempt;
   if (attempt.state !== "active") throw new Error(`Attempt ${key.attemptId} is not active.`);
-  if (attempt.execution?.cancellation !== undefined) {
-    if (sameValue(attempt.execution.cancellation, cancellation)) return workstream;
+  const execution = attempt.execution;
+  if (execution?.cancellation !== undefined) {
+    if (sameValue(execution.cancellation, cancellation)) return workstream;
     throw new Error(`Attempt ${key.attemptId} has a conflicting cancellation request.`);
   }
-  return progressAttempt(workstream, key, { execution: { cancellation } }, updatedAt);
+  return mutate(workstream, updatedAt, (draft) => {
+    const next = requireAttempt(draft, key).attempt;
+    next.execution = { ...next.execution, cancellation: clone(cancellation) };
+    next.updatedAt = updatedAt;
+  });
 }
-
 export function terminalizeAttempt(
   workstream: Workstream,
   key: AttemptKey,
@@ -943,8 +1080,7 @@ export function terminalizeAttempt(
     if (sameTerminalSubstance(current.outcome, expected)) return workstream;
     throw new Error(`Attempt ${key.attemptId} already has a conflicting terminal Outcome.`);
   }
-  if (workstream.lifecycle === "completed")
-    throw new Error("Cannot terminalize an Attempt after completion.");
+  assertActive(workstream, "terminalize Attempt");
   if (current.state !== "active" && current.state !== "queued")
     throw new Error(`Attempt ${key.attemptId} cannot be terminalized from ${current.state}.`);
   return mutate(workstream, updatedAt, (draft) => {
@@ -954,13 +1090,13 @@ export function terminalizeAttempt(
     attempt.updatedAt = updatedAt;
   });
 }
-
 export function recordDeliveryFailure(
   workstream: Workstream,
   key: AttemptKey,
   failure: Static<typeof DeliveryFailureSchema>,
   updatedAt: string,
 ): Workstream {
+  assertObligation(workstream);
   const outcome = requireAttempt(workstream, key).attempt.outcome;
   if (outcome === undefined) throw new Error(`Attempt ${key.attemptId} has no Outcome delivery.`);
   if (outcome.delivery.state !== "pending")
@@ -972,16 +1108,15 @@ export function recordDeliveryFailure(
     next.delivery.attemptCount += 1;
     next.delivery.failureHistory.push(clone(failure));
     requireAttempt(draft, key).attempt.updatedAt = updatedAt;
-    refreshCompletion(draft);
   });
 }
-
 export function recordDeliverySuccess(
   workstream: Workstream,
   key: AttemptKey,
   deliveredAt: string,
   updatedAt: string,
 ): Workstream {
+  assertObligation(workstream);
   const outcome = requireAttempt(workstream, key).attempt.outcome;
   if (outcome === undefined) throw new Error(`Attempt ${key.attemptId} has no Outcome delivery.`);
   if (outcome.delivery.state === "delivered") {
@@ -1000,17 +1135,15 @@ export function recordDeliverySuccess(
       deliveredAt,
     };
     attempt.updatedAt = updatedAt;
-    refreshCompletion(draft);
   });
 }
 
 export type OutputDisposition =
   | { kind: "not_applicable" }
-  | { kind: "remove_checkout_and_branch"; checkout: "preserved_or_uncertain" | "removed" }
   | { kind: "retain_branch"; checkout: "preserved_or_uncertain" | "removed"; commit?: string }
   | { kind: "preserve_checkout"; reason: string }
-  | { kind: "released" };
-
+  | { kind: "released" }
+  | { kind: "remove_checkout_and_branch"; checkout: "preserved_or_uncertain" | "removed" };
 export function outputDisposition(task: Task, attempt: Attempt): OutputDisposition {
   if (attempt.outputRelease?.state === "completed") return { kind: "released" };
   if (attempt.execution?.placement?.kind !== "isolated_worktree") return { kind: "not_applicable" };
@@ -1030,74 +1163,74 @@ export function outputDisposition(task: Task, attempt: Attempt): OutputDispositi
     return { kind: "retain_branch", checkout, commit };
   return { kind: "remove_checkout_and_branch", checkout };
 }
-
-export function isReattemptStable(attempt: Attempt): boolean {
+function isReattemptStable(attempt: Attempt): boolean {
   if (attempt.state !== "finished") return false;
-  if (attempt.execution === undefined) return true;
   if (attempt.application?.state === "pending" || attempt.application?.state === "blocked")
     return false;
   if (attempt.outputRelease?.state === "pending" || attempt.outputRelease?.state === "blocked")
     return false;
   if (attempt.outputRelease?.state === "completed") return true;
-  return attempt.cleanup?.state === "completed" && attempt.cleanup.workerClosed;
+  return (
+    attempt.execution === undefined ||
+    (attempt.cleanup?.state === "completed" && attempt.cleanup.workerClosed)
+  );
 }
-
 export function deriveCompletionAccounting(workstream: Workstream): CompletionAccounting[] {
-  const accounting: CompletionAccounting[] = [];
-  for (const task of workstream.tasks) {
-    if (!task.attempts.every((attempt) => attemptResolved(workstream, task, attempt)))
-      accounting.push({
-        kind: "unresolved_task",
+  return workstream.tasks.flatMap((task) =>
+    task.attempts.flatMap((attempt) => accountingForAttempt(workstream, task, attempt)),
+  );
+}
+function accountingForAttempt(
+  workstream: Workstream,
+  task: Task,
+  attempt: Attempt,
+): CompletionAccounting[] {
+  if (attempt.state !== "finished")
+    return [
+      {
+        kind: "unresolved_attempt",
         taskId: task.id,
-        reason: "Task has an unresolved Attempt Outcome.",
-      });
-    for (const attempt of task.attempts) {
-      if (!attemptResolved(workstream, task, attempt))
-        accounting.push({
-          kind: "unresolved_attempt",
-          taskId: task.id,
-          attemptId: attempt.id,
-          reason: attemptAccountingReason(workstream, task, attempt),
-        });
-      if (attempt.outcome !== undefined && !outcomeResolved(workstream, task, attempt))
-        accounting.push({
-          kind: "unresolved_outcome",
-          outcomeId: attempt.outcome.id,
-          reason: outcomeAccountingReason(task, attempt),
-        });
-      if (attempt.outcome?.delivery.state === "pending")
-        accounting.push({
-          kind: "undelivered_outcome",
-          outcomeId: attempt.outcome.id,
-          reason: "Outcome delivery is pending.",
-        });
-    }
-  }
+        attemptId: attempt.id,
+        reason: "Attempt has not finished.",
+      },
+    ];
+  const accounting: CompletionAccounting[] = [];
+  if (!isReattemptStable(attempt))
+    accounting.push({
+      kind: "unresolved_attempt",
+      taskId: task.id,
+      attemptId: attempt.id,
+      reason: "Attempt execution or owned output is not operationally stable.",
+    });
+  if (attempt.outcome !== undefined && !outcomeResolved(workstream, task, attempt))
+    accounting.push({
+      kind: "unresolved_outcome",
+      outcomeId: attempt.outcome.id,
+      reason: outcomeAccountingReason(workstream, task, attempt),
+    });
+  if (attempt.outcome?.delivery.state === "pending")
+    accounting.push({
+      kind: "undelivered_outcome",
+      outcomeId: attempt.outcome.id,
+      reason: "Outcome delivery is pending.",
+    });
   return accounting;
 }
-
-function attemptResolved(workstream: Workstream, task: Task, attempt: Attempt): boolean {
-  return isReattemptStable(attempt) && outcomeResolved(workstream, task, attempt);
-}
-
 function outcomeResolved(workstream: Workstream, task: Task, attempt: Attempt): boolean {
   const outcome = attempt.outcome;
-  if (outcome?.kind !== "reported" || outcome.report.status !== "completed") return false;
+  if (outcome === undefined) return false;
+  if (outcome.kind !== "reported") return true;
+  if (outcome.report.status !== "completed") return true;
   if (task.kind !== "implementation") return true;
   if (outcome.report.kind !== "implementation") return false;
   if (outcome.report.outcome === "no_change") return true;
   return (
-    attempt.application?.state === "applied" || includedByAppliedDescendant(workstream, attempt.id)
+    attempt.application?.state === "applied" ||
+    attempt.outputRelease?.state === "completed" ||
+    includedByAppliedDescendant(workstream, attempt.id)
   );
 }
-
-function attemptAccountingReason(workstream: Workstream, task: Task, attempt: Attempt): string {
-  if (!isReattemptStable(attempt))
-    return "Attempt execution or owned output is not operationally stable.";
-  return outcomeAccountingReason(task, attempt, workstream);
-}
-
-function outcomeAccountingReason(task: Task, attempt: Attempt, workstream?: Workstream): string {
+function outcomeAccountingReason(workstream: Workstream, task: Task, attempt: Attempt): string {
   const outcome = attempt.outcome;
   if (outcome === undefined) return "Attempt has no terminal Outcome.";
   if (outcome.kind !== "reported") return `Attempt Outcome is ${outcome.kind}.`;
@@ -1107,40 +1240,37 @@ function outcomeAccountingReason(task: Task, attempt: Attempt, workstream?: Work
     task.kind === "implementation" &&
     outcome.report.kind === "implementation" &&
     outcome.report.outcome === "changed" &&
-    attempt.application?.state !== "applied" &&
-    (workstream === undefined || !includedByAppliedDescendant(workstream, attempt.id))
+    !outcomeResolved(workstream, task, attempt)
   )
-    return "Maintained candidate is not applied or included by an applied descendant.";
+    return "Maintained candidate is not applied, included, or explicitly released.";
   return "Outcome does not satisfy the Task contract.";
 }
-
 function includedByAppliedDescendant(workstream: Workstream, attemptId: string): boolean {
-  for (const task of workstream.tasks) {
-    for (const candidate of task.attempts) {
-      if (candidate.application?.state !== "applied" || candidate.application.commits === undefined)
-        continue;
-      const target = findAttemptLocation(workstream, attemptId)?.attempt;
-      const commit = target === undefined ? undefined : changedImplementationCommit(target);
-      if (commit !== undefined && candidate.application.commits.includes(commit)) return true;
-    }
-  }
-  return false;
+  const target = findAttemptLocation(workstream, attemptId)?.attempt;
+  const commit = target === undefined ? undefined : changedImplementationCommit(target);
+  if (commit === undefined) return false;
+  return workstream.tasks.some((task) =>
+    task.attempts.some(
+      (candidate) =>
+        candidate.application?.state === "applied" &&
+        candidate.application.commits.includes(commit),
+    ),
+  );
 }
-
 export function completeWorkstream(
   workstream: Workstream,
   input: Omit<Completion, "accounting">,
   updatedAt: string,
 ): Workstream {
   assertActive(workstream, "complete Workstream");
-  if (!workstream.tasks.flatMap((task) => task.attempts).every(isReattemptStable))
-    throw new Error("Cannot complete while an Attempt is operationally unstable.");
+  const accounting = deriveCompletionAccounting(workstream);
+  if (accounting.length !== 0)
+    throw new Error("Cannot complete Workstream while derived obligations remain.");
   return mutate(workstream, updatedAt, (draft) => {
     draft.lifecycle = "completed";
-    draft.completion = { ...clone(input), accounting: deriveCompletionAccounting(draft) };
+    draft.completion = { ...clone(input), accounting: [] };
   });
 }
-
 function outcomeFromObservation(attemptId: string, observation: TerminalObservation): Outcome {
   const common = {
     id: outcomeIdForAttempt(attemptId),
@@ -1165,19 +1295,20 @@ function outcomeFromObservation(attemptId: string, observation: TerminalObservat
   if (observation.rawWorkerText !== undefined) unreported.rawWorkerText = observation.rawWorkerText;
   return unreported;
 }
-
 function sameTerminalSubstance(left: Outcome, right: Outcome): boolean {
-  if (left.kind !== right.kind || left.id !== right.id || left.observedAt !== right.observedAt)
+  if (
+    left.kind !== right.kind ||
+    left.id !== right.id ||
+    left.observedAt !== right.observedAt ||
+    !sameValue(left.artifacts, right.artifacts)
+  )
     return false;
-  if (!sameValue(left.artifacts, right.artifacts)) return false;
   if (left.kind === "reported" && right.kind === "reported")
     return sameValue(left.report, right.report);
   if (left.kind === "unreported" && right.kind === "unreported")
     return left.reason === right.reason && left.rawWorkerText === right.rawWorkerText;
-  if (left.kind === "cancelled" && right.kind === "cancelled") return left.reason === right.reason;
-  return false;
+  return left.kind === "cancelled" && right.kind === "cancelled" && left.reason === right.reason;
 }
-
 function changedImplementationCommit(attempt: Attempt): string | undefined {
   const outcome = attempt.outcome;
   return outcome?.kind === "reported" &&
@@ -1187,12 +1318,14 @@ function changedImplementationCommit(attempt: Attempt): string | undefined {
     ? outcome.report.commit
     : undefined;
 }
-
 function refreshCompletion(workstream: Workstream): void {
-  if (workstream.completion !== undefined)
-    workstream.completion.accounting = deriveCompletionAccounting(workstream);
+  if (workstream.completion !== undefined) {
+    const accounting = deriveCompletionAccounting(workstream);
+    if (accounting.length !== 0)
+      throw new Error("Completed Workstream cannot acquire a pending obligation.");
+    workstream.completion.accounting = [];
+  }
 }
-
 function mutate(
   workstream: Workstream,
   updatedAt: string,
@@ -1205,33 +1338,22 @@ function mutate(
   validateWorkstream(draft);
   return draft;
 }
-
 function assertActive(workstream: Workstream, operation: string): void {
   if (workstream.lifecycle !== "active")
     throw new Error(`Cannot ${operation} on a completed Workstream.`);
 }
-
+function assertObligation(workstream: Workstream): void {
+  if (workstream.lifecycle === "completed" && workstream.completion === undefined)
+    throw new Error("Completed Workstream has no completion record.");
+}
 function unique(values: readonly string[], label: string): Set<string> {
   const result = new Set(values);
   if (result.size !== values.length) throw new Error(`Duplicate ${label} id.`);
   return result;
 }
-
-function assignDefined<Key extends keyof Attempt>(
-  attempt: Attempt,
-  key: Key,
-  value: Attempt[Key] | undefined,
-): void {
-  if (value !== undefined) {
-    // SAFETY: The caller supplies a value for the matching Attempt key; the enclosing mutation is schema-validated.
-    attempt[key] = clone(value) as Attempt[Key];
-  }
-}
-
 function clone<Value>(value: Value): Value {
   return structuredClone(value);
 }
-
 function sameValue<Value>(left: Value, right: Value): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return Value.Equal(left, right);
 }
