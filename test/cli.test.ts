@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The test uses native temporary path identities.
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,7 @@ import { runCli } from "../src/cli.js";
 import { inspectSections, parseCliRequest } from "../src/cli-parse.js";
 import type { CoordinatorLaunchRequest } from "../src/herdr.js";
 
+import { configureFixtureEnvironment, restoreFixtureEnvironment } from "./decoders.js";
 import { git, persistentSession } from "./helpers.js";
 
 void test("CLI parser preserves inspection sections, bounded options, and rejects invalid combinations", () => {
@@ -113,6 +114,8 @@ void test("CLI status preserves historical JSON and resolves a registered run re
 
 void test("CLI fork composes native Git and Pi effects with an injectable native Herdr effect", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-cli-fork-"));
+  const agentDir = join(parent, "agent");
+  const previousEnvironment = configureFixtureEnvironment({ PI_CODING_AGENT_DIR: agentDir });
   try {
     await git(parent, "init");
     await git(parent, "config", "user.email", "fixture@example.com");
@@ -125,7 +128,7 @@ void test("CLI fork composes native Git and Pi effects with an injectable native
     assert.ok(parentSessionFile !== undefined);
     const result = await runCli(
       ["fork", "--parent-session-file", parentSessionFile, "--target-cwd", parent],
-      { PI_WORKGRAPH_HERDR_BIN: "fake-herdr" },
+      { PI_CODING_AGENT_DIR: agentDir, PI_WORKGRAPH_HERDR_BIN: "fake-herdr" },
       (command) => {
         assert.equal(command, "fake-herdr");
         return {
@@ -148,8 +151,10 @@ void test("CLI fork composes native Git and Pi effects with an injectable native
       assert.equal(result.identity.cwd, parent);
       assert.equal(result.identity.sessionFile, result.sessionFile);
       assert.notEqual(result.sessionFile, parentSessionFile);
+      assert.equal(relative(agentDir, result.sessionFile).startsWith(`sessions${sep}`), true);
     }
   } finally {
+    restoreFixtureEnvironment(previousEnvironment);
     await rm(parent, { recursive: true, force: true });
   }
 });
