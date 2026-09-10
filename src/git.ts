@@ -132,6 +132,17 @@ export class GitRepository {
 
   readonly assertClean = (cwd: string = this.root): GitEffect<void> => assertClean(this.git, cwd);
 
+  /**
+   * The one pure deterministic placement derivation. Reconciliation calls this for the
+   * durable `activate` declaration and again for ensure/recovery, so both use
+   * exactly the same path, branch, and base without touching Git state.
+   */
+  readonly deriveWorktreePlacement = (
+    runId: string,
+    nodeId: string,
+    baseCommit = "",
+  ): WorktreePlacement | undefined => worktreePlacement(this.root, runId, nodeId, baseCommit);
+
   readonly createWorktree = (
     runId: string,
     nodeId: string,
@@ -668,24 +679,30 @@ function classifyMergeApplication(
   });
 }
 
+function worktreePlacement(
+  root: string,
+  runId: string,
+  nodeId: string,
+  baseCommit: string,
+): WorktreePlacement | undefined {
+  if (!validIdentity(runId) || !validIdentity(nodeId)) return undefined;
+  const worktreeRoot = join(dirname(root), ".pi-workgraph-worktrees", basename(root), runId);
+  return {
+    path: join(worktreeRoot, nodeId),
+    branch: `pi-workgraph/${runId}/${nodeId}`,
+    baseCommit,
+  };
+}
+
 function worktreeIdentity(
   root: string,
   runId: string,
   nodeId: string,
   baseCommit: string,
 ): GitEffect<WorktreeIdentity> {
-  if (!validIdentity(runId) || !validIdentity(nodeId)) {
-    return fail("Invalid worktree identity.");
-  }
-  const worktreeRoot = join(dirname(root), ".pi-workgraph-worktrees", basename(root), runId);
-  return Effect.succeed({
-    worktreeRoot,
-    placement: {
-      path: join(worktreeRoot, nodeId),
-      branch: `pi-workgraph/${runId}/${nodeId}`,
-      baseCommit,
-    },
-  });
+  const placement = worktreePlacement(root, runId, nodeId, baseCommit);
+  if (placement === undefined) return fail("Invalid worktree identity.");
+  return Effect.succeed({ worktreeRoot: dirname(placement.path), placement });
 }
 
 function worktreeRecords(git: GitClient, root: string): GitEffect<WorktreeRecord[]> {

@@ -674,23 +674,6 @@ await test("runtime queue persists repeated and distinct policy selections for r
       ],
     );
 
-    const explicitResearch = await runRuntime(
-      active.queue(research("runtime-explicit-research"), {
-        selection: { count: 2, model: "fixture/research-2" },
-      }),
-    );
-    assert.deepEqual(
-      explicitResearch.attempts.slice(-2).map((attempt) => ({
-        model: attempt.models?.guide.model,
-        thinking: attempt.models?.guide.thinking,
-        source: attempt.models?.source,
-      })),
-      [
-        { model: "fixture/research-2", thinking: "medium", source: "requested-model" },
-        { model: "fixture/research-2", thinking: "medium", source: "requested-model" },
-      ],
-    );
-
     const distinctResearch = await runRuntime(
       active.queue(research("runtime-distinct-research"), {
         selection: { count: 2, distinctModels: true },
@@ -2316,7 +2299,7 @@ await test("worker continuation uses an isolated new workspace and current gener
     await runRuntime(
       active.queue(research("followup"), {
         continuationOf: previous.id,
-        selection: { model: "fixture/research-2" },
+        selection: { count: 1 },
       }),
     );
     await runRuntime(active.reconcile());
@@ -2325,8 +2308,8 @@ await test("worker continuation uses an isolated new workspace and current gener
     assert.equal(state.attempts[1]?.placement?.kind, "shared_project");
     assert.equal(state.attempts[1]?.placement?.path, f.root);
     assert.notEqual(state.attempts[1]?.sessionFile, previous.sessionFile);
-    assert.equal(state.attempts[1]?.models?.guide.model, "fixture/research-2");
-    assert.equal(state.attempts[1]?.models?.source, "requested-model");
+    assert.equal(state.attempts[1]?.models?.guide.model, "fixture/research");
+    assert.equal(state.attempts[1]?.models?.source, "policy");
   } finally {
     await f.dispose();
   }

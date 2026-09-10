@@ -1,6 +1,6 @@
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { Data, Effect, FileSystem } from "effect";
-import type { PlatformError } from "effect/PlatformError";
+import { Cause, Data, Effect, Exit, FileSystem, Option, Path } from "effect";
+import { PlatformError } from "effect/PlatformError";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { isWorkerReport } from "./report-schema.js";
@@ -201,6 +201,85 @@ export function readWorkgraphReportResult(
     };
   }
   return { invalid: false, unreadable: false };
+}
+
+/**
+ * Exact pre-creation inspection of one Workgraph worker-session directory.
+ * Directory absence alone proves no current-generation session; any unreadable
+ * or undecodable candidate is ambiguous, and an unrecorded exact session is
+ * reported to the driver (which blocks rather than duplicating a launch).
+ */
+export type WorkerSessionResolution =
+  | { readonly state: "none" }
+  | { readonly state: "exact"; readonly sessionFile: string }
+  | { readonly state: "ambiguous"; readonly detail: string };
+
+export function inspectWorkerSessionDirectory(
+  sessionDir: string,
+  generation: Generation,
+): Effect.Effect<WorkerSessionResolution, never, FileSystem.FileSystem | Path.Path> {
+  return Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const listing = yield* Effect.exit(fileSystem.readDirectory(sessionDir));
+    if (Exit.isFailure(listing))
+      return isNotFound(listing.cause)
+        ? { state: "none" as const }
+        : {
+            state: "ambiguous" as const,
+            detail: "Worker session directory could not be inspected.",
+          };
+    return yield* matchGenerationSessions(listing.value, sessionDir, generation, path);
+  });
+}
+
+function matchGenerationSessions(
+  entries: readonly string[],
+  sessionDir: string,
+  generation: Generation,
+  path: Path.Path,
+): Effect.Effect<WorkerSessionResolution> {
+  return Effect.gen(function* () {
+    const matches: string[] = [];
+    for (const name of entries.filter((entry) => entry.endsWith(".jsonl"))) {
+      const sessionFile = path.join(sessionDir, name);
+      const read = yield* Effect.exit(
+        Effect.try(() => hasGenerationObjective(sessionFile, generation)),
+      );
+      if (Exit.isFailure(read))
+        return {
+          state: "ambiguous" as const,
+          detail: `Worker session ${name} could not be read or decoded; no conclusion was made.`,
+        };
+      if (read.value) matches.push(sessionFile);
+    }
+    if (matches.length === 0) return { state: "none" as const };
+    const [sessionFile] = matches;
+    if (matches.length === 1 && sessionFile !== undefined)
+      return { state: "exact" as const, sessionFile };
+    return {
+      state: "ambiguous" as const,
+      detail: `Worker session directory contains ${matches.length} sessions for the current Attempt generation.`,
+    };
+  });
+}
+
+function isNotFound(cause: Cause.Cause<unknown>): boolean {
+  const failure = Cause.findErrorOption(cause);
+  if (Option.isNone(failure)) return false;
+  const error = failure.value;
+  return error instanceof PlatformError && error.reason._tag === "NotFound";
+}
+
+function hasGenerationObjective(sessionFile: string, generation: Generation): boolean {
+  return SessionManager.open(sessionFile)
+    .getBranch()
+    .some(
+      (entry) =>
+        entry.type === "custom_message" &&
+        entry.customType === "pi-workgraph-objective" &&
+        markerMatches(entry.details, generation),
+    );
 }
 
 export function hasNativeAgentStarted(sessionFile: string, runId: string, nodeId: string): boolean {

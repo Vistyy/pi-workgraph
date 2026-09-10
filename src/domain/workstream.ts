@@ -60,7 +60,7 @@ export const IntentSchema = Type.Object(
   { additionalProperties: false },
 );
 
-const ReviewSubjectSchema = Type.Union([
+export const ReviewSubjectSchema = Type.Union([
   Type.Object(
     { kind: Type.Literal("outcome"), outcomeId: NonEmptyString },
     { additionalProperties: false },
@@ -176,10 +176,36 @@ const SteeringObservationSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const CancellationObservationSchema = Type.Object(
-  { requestedAt: Timestamp, reason: NonEmptyString },
-  { additionalProperties: false },
-);
+const CancellationCheckpointSchema = Type.Union([
+  Type.Object(
+    {
+      state: Type.Literal("requested"),
+      requestedAt: Timestamp,
+      reason: NonEmptyString,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      state: Type.Literal("uncertain"),
+      requestedAt: Timestamp,
+      reason: NonEmptyString,
+      dispatchAt: Timestamp,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      state: Type.Literal("submitted_or_observed"),
+      requestedAt: Timestamp,
+      reason: NonEmptyString,
+      dispatchAt: Timestamp,
+      observedAt: Timestamp,
+      evidence: stringLiterals(["interrupt_submitted", "idle", "done", "absent"] as const),
+    },
+    { additionalProperties: false },
+  ),
+]);
 export const WorkerExecutionSchema = Type.Object(
   {
     placement: Type.Optional(PlacementSchema),
@@ -189,7 +215,7 @@ export const WorkerExecutionSchema = Type.Object(
       stringLiterals(["not_sent", "uncertain", "submitted", "started"] as const),
     ),
     steering: Type.Optional(SteeringObservationSchema),
-    cancellation: Type.Optional(CancellationObservationSchema),
+    cancellation: Type.Optional(CancellationCheckpointSchema),
   },
   { additionalProperties: false },
 );
@@ -427,11 +453,19 @@ export type CandidateLineage = Static<typeof CandidateLineageSchema>;
 export type ModelSelection = Static<typeof SelectionSchema>;
 export type LaunchCheckpoint = Static<typeof LaunchCheckpointSchema>;
 export type WorkerExecution = Static<typeof WorkerExecutionSchema>;
+export type CancellationCheckpoint = Static<typeof CancellationCheckpointSchema>;
+export type Placement = Static<typeof PlacementSchema>;
 export type RetainedArtifact = Static<typeof RetainedArtifactSchema>;
 export type Delivery = Static<typeof DeliverySchema>;
 export type Outcome = Static<typeof OutcomeSchema>;
 export type Attempt = Static<typeof AttemptSchema>;
 export type Task = Static<typeof TaskSchema>;
+/** An immutable Task contract; sibling Attempts are deliberately not exposed. */
+export type TaskContract = Task extends infer Item
+  ? Item extends Task
+    ? Omit<Item, "attempts">
+    : never
+  : never;
 export type CompletionAccounting = Static<typeof CompletionAccountingSchema>;
 export type Completion = Static<typeof CompletionSchema>;
 export type Workstream = Static<typeof WorkstreamSchema>;
@@ -562,23 +596,10 @@ function expectedReportKind(task: Task): "research" | "review" | "implementation
 function validateAttempt(workstream: Workstream, task: Task, attempt: Attempt): void {
   if ((attempt.state === "finished") !== (attempt.outcome !== undefined))
     throw new Error(`Attempt ${attempt.id} must embed exactly one Outcome iff finished.`);
-  if (attempt.outcome !== undefined) {
-    if (attempt.outcome.id !== outcomeIdForAttempt(attempt.id))
-      throw new Error(`Attempt ${attempt.id} has a non-deterministic Outcome id.`);
-    unique(
-      attempt.outcome.artifacts.map((artifact) => artifact.id),
-      `artifact in Outcome ${attempt.outcome.id}`,
-    );
-    if (attempt.outcome.delivery.attemptCount < attempt.outcome.delivery.failureHistory.length)
-      throw new Error(`Outcome ${attempt.outcome.id} delivery history exceeds its attempt count.`);
-    if (
-      attempt.outcome.kind === "reported" &&
-      attempt.outcome.report.kind !== expectedReportKind(task)
-    )
-      throw new Error(`Attempt ${attempt.id} Report kind does not match Task kind ${task.kind}.`);
-  }
+  if (attempt.outcome !== undefined) validateOutcome(task, attempt, attempt.outcome);
   if (attempt.state === "queued" && hasOperationalFacts(attempt))
     throw new Error(`Queued Attempt ${attempt.id} contains execution or terminal facts.`);
+  validateActiveDeclaration(attempt);
   if (
     attempt.state !== "finished" &&
     (attempt.application !== undefined || attempt.outputRelease !== undefined)
@@ -590,6 +611,38 @@ function validateAttempt(workstream: Workstream, task: Task, attempt: Attempt): 
   validateApplication(task, attempt);
   validateCleanup(attempt);
   validateOutputRelease(task, attempt);
+}
+function validateOutcome(
+  task: Task,
+  attempt: Attempt,
+  outcome: NonNullable<Attempt["outcome"]>,
+): void {
+  if (outcome.id !== outcomeIdForAttempt(attempt.id))
+    throw new Error(`Attempt ${attempt.id} has a non-deterministic Outcome id.`);
+  unique(
+    outcome.artifacts.map((artifact) => artifact.id),
+    `artifact in Outcome ${outcome.id}`,
+  );
+  const failureCount = outcome.delivery.failureHistory.length;
+  const expectedDeliveryCount =
+    outcome.delivery.state === "pending" ? failureCount : failureCount + 1;
+  if (outcome.delivery.attemptCount !== expectedDeliveryCount)
+    throw new Error(`Outcome ${outcome.id} delivery attempt count is not exact.`);
+  if (outcome.kind === "reported" && outcome.report.kind !== expectedReportKind(task))
+    throw new Error(`Attempt ${attempt.id} Report kind does not match Task kind ${task.kind}.`);
+}
+/**
+ * An active Attempt must carry its exact deterministic placement declaration and
+ * initial not-sent submission checkpoint. The declaration precedes any external
+ * creation and does not prove a worktree or Worker resource exists.
+ */
+function validateActiveDeclaration(attempt: Attempt): void {
+  if (attempt.state !== "active") return;
+  if (attempt.execution?.placement !== undefined && attempt.execution.submission !== undefined)
+    return;
+  throw new Error(
+    `Active Attempt ${attempt.id} must begin with its exact placement declaration and not-sent submission checkpoint.`,
+  );
 }
 function hasOperationalFacts(attempt: Attempt): boolean {
   return (
@@ -643,14 +696,7 @@ function assertSingleExecutionAdvancement(
   next: WorkerExecution,
   allowPlacementDeclaration: boolean,
 ): void {
-  const fields = [
-    "placement",
-    "sessionFile",
-    "launch",
-    "submission",
-    "steering",
-    "cancellation",
-  ] as const;
+  const fields = ["placement", "sessionFile", "launch", "submission", "steering"] as const;
   const advanced = fields.filter(
     (field) => next[field] !== undefined && !sameValue(current?.[field], next[field]),
   );
@@ -680,14 +726,7 @@ function mergeExecution(
   next: WorkerExecution,
 ): WorkerExecution {
   const merged: WorkerExecution = { ...current };
-  for (const field of [
-    "placement",
-    "sessionFile",
-    "launch",
-    "submission",
-    "steering",
-    "cancellation",
-  ] as const)
+  for (const field of ["placement", "sessionFile", "launch", "submission", "steering"] as const)
     if (next[field] !== undefined) Object.assign(merged, { [field]: next[field] });
   return merged;
 }
@@ -708,12 +747,10 @@ function assertImmutableExecutionFields(
     current.sessionFile !== next.sessionFile
   )
     throw new Error(`Attempt ${attemptId} Worker session file is immutable.`);
-  if (
-    current?.cancellation !== undefined &&
-    next.cancellation !== undefined &&
-    !sameValue(current.cancellation, next.cancellation)
-  )
-    throw new Error(`Attempt ${attemptId} Worker cancellation checkpoint conflicts.`);
+  if (next.cancellation !== undefined)
+    throw new Error(
+      `Attempt ${attemptId} cancellation must use the cancellation checkpoint transition.`,
+    );
 }
 function assertLaunchTransition(
   attemptId: string,
@@ -893,11 +930,45 @@ function validateApplication(task: Task, attempt: Attempt): void {
     throw new Error(`Attempt ${attempt.id} application blocker does not match its state.`);
 }
 function validateCleanup(attempt: Attempt): void {
-  if (attempt.cleanup === undefined) return;
-  if ((attempt.cleanup.state === "blocked") !== (attempt.cleanup.error !== undefined))
+  const cleanup = attempt.cleanup;
+  if (cleanup !== undefined) {
+    validateCleanupShape(attempt, cleanup);
+    if (attempt.state === "active") validateActiveCleanup(attempt, cleanup);
+  }
+  if (isCancelledWorkerSettlement(attempt)) validateCancelledWorkerSettlement(attempt, cleanup);
+}
+function isCancelledWorkerSettlement(attempt: Attempt): boolean {
+  return (
+    attempt.state === "finished" &&
+    attempt.outcome?.kind === "cancelled" &&
+    attempt.execution !== undefined
+  );
+}
+function validateCleanupShape(attempt: Attempt, cleanup: NonNullable<Attempt["cleanup"]>): void {
+  if ((cleanup.state === "blocked") !== (cleanup.error !== undefined))
     throw new Error(`Attempt ${attempt.id} cleanup blocker does not match its state.`);
-  if (attempt.cleanup.state === "completed" && !attempt.cleanup.workerClosed)
+  if (cleanup.state === "completed" && !cleanup.workerClosed)
     throw new Error(`Attempt ${attempt.id} completed cleanup has no closed Worker.`);
+}
+/** The active cleanup path exists only for an observed cancellation, and only its start. */
+function validateActiveCleanup(attempt: Attempt, cleanup: NonNullable<Attempt["cleanup"]>): void {
+  if (attempt.execution?.cancellation?.state !== "submitted_or_observed")
+    throw new Error(
+      `Attempt ${attempt.id} active cleanup requires an observed cancellation checkpoint.`,
+    );
+  if (cleanup.state !== "pending")
+    throw new Error(`Attempt ${attempt.id} active cleanup may only be pending.`);
+}
+/** A cancelled Worker settlement keeps its exact interruption proof and durable closure. */
+function validateCancelledWorkerSettlement(attempt: Attempt, cleanup: Attempt["cleanup"]): void {
+  if (attempt.execution?.cancellation?.state !== "submitted_or_observed")
+    throw new Error(
+      `Attempt ${attempt.id} cancelled Worker settlement requires a submitted-or-observed cancellation checkpoint.`,
+    );
+  if (cleanup?.workerClosed !== true)
+    throw new Error(
+      `Attempt ${attempt.id} cancelled Worker settlement requires durable Worker closure.`,
+    );
 }
 function validateOutputRelease(task: Task, attempt: Attempt): void {
   const release = attempt.outputRelease;
@@ -922,6 +993,15 @@ function validateOutputRelease(task: Task, attempt: Attempt): void {
 function validateLifecycle(workstream: Workstream): void {
   if ((workstream.lifecycle === "completed") !== (workstream.completion !== undefined))
     throw new Error("Completed lifecycle and Completion must appear together.");
+  if (workstream.lifecycle === "completed") {
+    // A completed Workstream cannot retain any unfinished Attempt; this mirrors
+    // `completeWorkstream` at the persisted read boundary without widening the
+    // existing completion accounting rules.
+    for (const task of workstream.tasks)
+      for (const attempt of task.attempts)
+        if (attempt.state !== "finished")
+          throw new Error(`Completed Workstream contains unfinished Attempt ${attempt.id}.`);
+  }
   if (workstream.completion === undefined) return;
   const expected = deriveCompletionAccounting(workstream);
   if (!sameValue(expected, workstream.completion.accounting))
@@ -945,7 +1025,7 @@ function findAttemptLocation(
   }
   return undefined;
 }
-function findOutcome(workstream: Workstream, outcomeId: string): Outcome | undefined {
+export function findOutcome(workstream: Workstream, outcomeId: string): Outcome | undefined {
   for (const task of workstream.tasks)
     for (const attempt of task.attempts)
       if (attempt.outcome?.id === outcomeId) return attempt.outcome;
@@ -1010,30 +1090,41 @@ export function createTask(workstream: Workstream, task: Task, updatedAt: string
     throw new Error(`Task ${task.id} must begin with pristine queued Attempts.`);
   return mutate(workstream, updatedAt, (draft) => draft.tasks.push(clone(task)));
 }
-export function appendAttempt(
+export function appendAttempts(
   workstream: Workstream,
   taskId: string,
-  attempt: Attempt,
+  attempts: readonly Attempt[],
   updatedAt: string,
 ): Workstream {
-  assertActive(workstream, "append Attempt");
+  assertActive(workstream, "append Attempts");
   const task = findTask(workstream, taskId);
   if (task === undefined) throw new Error(`Unknown Task ${taskId}.`);
   if (task.intentIndex !== workstream.intents.length - 1)
     throw new Error(`Task ${taskId} no longer belongs to the current Intent.`);
   if (!task.attempts.every((attempt) => isReattemptStable(task, attempt)))
     throw new Error(`Task ${taskId} has an unfinished or operationally unstable prior Attempt.`);
-  if (attempt.state !== "queued" || hasOperationalFacts(attempt))
-    throw new Error(`Appended Attempt ${attempt.id} must be pristine and queued.`);
-  return mutate(workstream, updatedAt, (draft) =>
-    findTask(draft, taskId)?.attempts.push(clone(attempt)),
-  );
+  if (attempts.length === 0) throw new Error(`Task ${taskId} requires at least one new Attempt.`);
+  for (const attempt of attempts) {
+    if (attempt.state !== "queued" || hasOperationalFacts(attempt))
+      throw new Error(`Appended Attempt ${attempt.id} must be pristine and queued.`);
+    validateSelection(task, attempt);
+  }
+  return mutate(workstream, updatedAt, (draft) => {
+    const target = findTask(draft, taskId);
+    if (target === undefined) throw new Error(`Unknown Task ${taskId}.`);
+    target.attempts.push(...clone(attempts));
+  });
 }
+/**
+ * Activate only by durably declaring the exact deterministic placement and the
+ * initial not-sent submission checkpoint. This declaration precedes and does
+ * not prove any external worktree or Worker resource creation.
+ */
 export function activateAttempt(
   workstream: Workstream,
   key: AttemptKey,
   updatedAt: string,
-  execution?: WorkerExecution,
+  execution: WorkerExecution,
 ): Workstream {
   assertActive(workstream, "activate Attempt");
   const located = requireAttempt(workstream, key);
@@ -1041,15 +1132,20 @@ export function activateAttempt(
     throw new Error(`Attempt ${key.attemptId} no longer belongs to the current Intent.`);
   if (located.attempt.state !== "queued")
     throw new Error(`Attempt ${key.attemptId} is not queued.`);
-  const initialExecution =
-    execution === undefined
-      ? undefined
-      : executionTransition(key.attemptId, undefined, execution, true);
+  if (
+    execution.placement === undefined ||
+    execution.submission !== "not_sent" ||
+    Object.keys(execution).some((field) => field !== "placement" && field !== "submission")
+  )
+    throw new Error(
+      `Attempt ${key.attemptId} activation requires only exact placement and not-sent submission declaration.`,
+    );
+  const initialExecution = executionTransition(key.attemptId, undefined, execution, true);
   return mutate(workstream, updatedAt, (draft) => {
     const attempt = requireAttempt(draft, key).attempt;
     attempt.state = "active";
     attempt.updatedAt = updatedAt;
-    if (initialExecution !== undefined) attempt.execution = clone(initialExecution);
+    attempt.execution = clone(initialExecution);
   });
 }
 
@@ -1121,10 +1217,21 @@ export function checkpointCleanup(
   updatedAt: string,
 ): Workstream {
   const current = requireAttempt(workstream, key).attempt;
-  if (current.state !== "finished")
-    throw new Error(`Attempt ${key.attemptId} must be finished before cleanup.`);
   if (current.execution?.placement === undefined)
     throw new Error(`Attempt ${key.attemptId} cleanup has no Worker placement.`);
+  if (current.state === "active") {
+    // Only the cancellation path may checkpoint cleanup while the Attempt is
+    // still active, and only its pending start. Active normal-work cleanup and
+    // active completed/blocked placement cleanup are forbidden.
+    if (current.execution?.cancellation?.state !== "submitted_or_observed")
+      throw new Error(
+        `Attempt ${key.attemptId} active cleanup requires an observed cancellation checkpoint.`,
+      );
+    if (cleanup.state !== "pending")
+      throw new Error(`Attempt ${key.attemptId} active cleanup may only begin pending.`);
+  } else if (current.state !== "finished") {
+    throw new Error(`Attempt ${key.attemptId} must be finished before cleanup.`);
+  }
   if (workstream.lifecycle === "completed" && current.cleanup === undefined)
     assertCompletedObligation(workstream, key, "cleanup");
   if (current.cleanup !== undefined && !monotonicCleanup(current.cleanup, cleanup))
@@ -1182,8 +1289,9 @@ function monotonicApplication(
 function monotonicCleanup(old: Attempt["cleanup"], next: Attempt["cleanup"]): boolean {
   if (old === undefined || next === undefined) return false;
   if (sameValue(old, next)) return true;
-  if (old.expectedHead !== next.expectedHead || (old.workerClosed && !next.workerClosed))
-    return false;
+  // A known expected head is immutable; an unknown head may only become known.
+  if (old.workerClosed && !next.workerClosed) return false;
+  if (old.expectedHead !== undefined && old.expectedHead !== next.expectedHead) return false;
   if (old.state === "completed") return false;
   if (old.state === "blocked")
     return next.state === "completed" && next.error === undefined && next.workerClosed;
@@ -1201,25 +1309,38 @@ function monotonicRelease(old: Attempt["outputRelease"], next: Attempt["outputRe
   if (next.state === "blocked") return next.error !== undefined;
   return next.state === "completed" && next.error === undefined;
 }
-export function requestCancellation(
+/** Own the one monotonic durable interrupt protocol for an active Attempt. */
+export function checkpointCancellation(
   workstream: Workstream,
   key: AttemptKey,
-  cancellation: Static<typeof CancellationObservationSchema>,
+  checkpoint: CancellationCheckpoint,
   updatedAt: string,
 ): Workstream {
-  assertActive(workstream, "request cancellation");
+  assertActive(workstream, "checkpoint cancellation");
   const attempt = requireAttempt(workstream, key).attempt;
   if (attempt.state !== "active") throw new Error(`Attempt ${key.attemptId} is not active.`);
-  const execution = attempt.execution;
-  if (execution?.cancellation !== undefined) {
-    if (sameValue(execution.cancellation, cancellation)) return workstream;
-    throw new Error(`Attempt ${key.attemptId} has a conflicting cancellation request.`);
-  }
+  const current = attempt.execution?.cancellation;
+  if (current !== undefined && sameValue(current, checkpoint)) return workstream;
+  if (!validCancellationTransition(current, checkpoint))
+    throw new Error(
+      `Attempt ${key.attemptId} cancellation checkpoint is conflicting or not monotonic.`,
+    );
   return mutate(workstream, updatedAt, (draft) => {
     const next = requireAttempt(draft, key).attempt;
-    next.execution = { ...next.execution, cancellation: clone(cancellation) };
+    next.execution = { ...next.execution, cancellation: clone(checkpoint) };
     next.updatedAt = updatedAt;
   });
+}
+function validCancellationTransition(
+  current: CancellationCheckpoint | undefined,
+  next: CancellationCheckpoint,
+): boolean {
+  if (current === undefined) return next.state === "requested";
+  if (current.requestedAt !== next.requestedAt || current.reason !== next.reason) return false;
+  if (current.state === "requested") return next.state === "uncertain";
+  if (current.state === "uncertain")
+    return next.state === "submitted_or_observed" && current.dispatchAt === next.dispatchAt;
+  return false;
 }
 export function terminalizeAttempt(
   workstream: Workstream,
@@ -1236,6 +1357,19 @@ export function terminalizeAttempt(
   assertActive(workstream, "terminalize Attempt");
   if (current.state !== "active" && current.state !== "queued")
     throw new Error(`Attempt ${key.attemptId} cannot be terminalized from ${current.state}.`);
+  if (observation.kind === "cancelled" && current.state === "active") {
+    // Durable cancelled settlement is gated on the exact cancellation evidence:
+    // a submitted-or-observed interruption whose cleanup already proved Worker
+    // closure. A queued pristine Attempt needs no Worker facts.
+    if (current.execution?.cancellation?.state !== "submitted_or_observed")
+      throw new Error(
+        `Attempt ${key.attemptId} active cancelled settlement requires a submitted-or-observed cancellation checkpoint.`,
+      );
+    if (current.cleanup?.workerClosed !== true)
+      throw new Error(
+        `Attempt ${key.attemptId} active cancelled settlement requires durable Worker closure.`,
+      );
+  }
   return mutate(workstream, updatedAt, (draft) => {
     const attempt = requireAttempt(draft, key).attempt;
     attempt.state = "finished";
@@ -1297,16 +1431,19 @@ export type OutputDisposition =
   | { kind: "preserve_checkout"; reason: string }
   | { kind: "released" }
   | { kind: "remove_checkout_and_branch"; checkout: "preserved_or_uncertain" | "removed" };
-export function outputDisposition(task: Task, attempt: Attempt): OutputDisposition {
+export function outputDisposition(task: Pick<Task, "kind">, attempt: Attempt): OutputDisposition {
   if (attempt.outputRelease?.state === "completed") return { kind: "released" };
   return outputDispositionBeforeRelease(task, attempt);
 }
-function outputReleaseEligible(task: Task, attempt: Attempt): boolean {
+function outputReleaseEligible(task: Pick<Task, "kind">, attempt: Attempt): boolean {
   return ["preserve_checkout", "retain_branch"].includes(
     outputDispositionBeforeRelease(task, attempt).kind,
   );
 }
-function outputDispositionBeforeRelease(task: Task, attempt: Attempt): OutputDisposition {
+function outputDispositionBeforeRelease(
+  task: Pick<Task, "kind">,
+  attempt: Attempt,
+): OutputDisposition {
   if (attempt.execution?.placement?.kind !== "isolated_worktree") return { kind: "not_applicable" };
   if (attempt.execution.launch?.phase !== "ready")
     return { kind: "preserve_checkout", reason: "Worker launch is only partially checkpointed." };
@@ -1326,7 +1463,7 @@ function outputDispositionBeforeRelease(task: Task, attempt: Attempt): OutputDis
     return { kind: "retain_branch", checkout, commit };
   return { kind: "remove_checkout_and_branch", checkout };
 }
-function isOperationallyStable(task: Task, attempt: Attempt): boolean {
+export function isOperationallyStable(task: Task, attempt: Attempt): boolean {
   if (attempt.state !== "finished" || attempt.outcome?.delivery.state !== "delivered") return false;
   if (attempt.execution?.placement === undefined) return true;
   const cleanup = attempt.cleanup;

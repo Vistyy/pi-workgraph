@@ -43,7 +43,7 @@ function fixtureCheckpoint<E, R, A>(
         new WorkerLaunchError({
           phase,
           locator,
-          resource: "terminalId" in locator ? locator : undefined,
+          resource: locator !== undefined && "terminalId" in locator ? locator : undefined,
           cause,
         }),
     ),

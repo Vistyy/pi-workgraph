@@ -13,7 +13,6 @@ export { ModelTargetSchema, ThinkingSchema } from "./domain/model-target.js";
 
 export const MODEL_LIST_ROLES = ["research", "review", "consultation.advisor"] as const;
 export type ListModelRole = (typeof MODEL_LIST_ROLES)[number];
-export type SingletonModelRole = "implementation.guide" | "implementation.executor";
 export type ModelTargetList = [ModelTarget, ...ModelTarget[]];
 
 const ModelTargetListSchema = Type.Array(ModelTargetSchema, { minItems: 1 });
@@ -25,6 +24,7 @@ const ModelPolicySchema = Type.Object(
         research: ModelTargetListSchema,
         "implementation.guide": ModelTargetSchema,
         "implementation.executor": ModelTargetSchema,
+        "implementation.escalationExecutor": Type.Optional(ModelTargetSchema),
         review: ModelTargetListSchema,
         "consultation.advisor": ModelTargetListSchema,
       },
@@ -36,14 +36,17 @@ const ModelPolicySchema = Type.Object(
 
 export interface ModelPolicy {
   version: 6;
-  roles: Record<ListModelRole, ModelTargetList> & Record<SingletonModelRole, ModelTarget>;
+  roles: Record<ListModelRole, ModelTargetList> & {
+    "implementation.guide": ModelTarget;
+    "implementation.executor": ModelTarget;
+    "implementation.escalationExecutor"?: ModelTarget;
+  };
 }
 
 export const SelectionRequestSchema = Type.Object(
   {
     count: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })),
     distinctModels: Type.Optional(Type.Boolean()),
-    model: Type.Optional(Type.String({ pattern: "^[^/\\s]+/\\S+$" })),
   },
   { additionalProperties: false },
 );
@@ -165,9 +168,6 @@ export function resolveSelection(
     throw new Error(`Invalid model selection request for ${role}.`);
   const count = normalized.count ?? 1;
   const distinctModels = normalized.distinctModels ?? false;
-  if (distinctModels && normalized.model !== undefined)
-    throw new Error(`model is incompatible with distinctModels=true for ${role}.`);
-
   let selected: ModelTarget[];
   if (distinctModels) {
     const configured = policy.roles[role];
@@ -177,16 +177,10 @@ export function resolveSelection(
       );
     selected = configured.slice(0, count).map(exactTarget);
   } else {
-    const target = configuredTarget(policy, role, normalized.model);
+    const target = configuredTarget(policy, role);
     selected = Array.from({ length: count }, () => exactTarget(target));
   }
-  return {
-    role,
-    count,
-    distinctModels,
-    selected,
-    source: normalized.model === undefined ? "policy" : "requested-model",
-  };
+  return { role, count, distinctModels, selected, source: "policy" };
 }
 
 export interface SelectionReceipt {
@@ -194,7 +188,25 @@ export interface SelectionReceipt {
   count: number;
   distinctModels: boolean;
   selected: ModelTarget[];
-  source: "policy" | "requested-model";
+  source: "policy";
+}
+
+/**
+ * Exact implementation guide plus the configured default executor or, only when
+ * the caller explicitly requests it, the configured escalation executor.
+ */
+export function implementationTargets(policy: ModelPolicy, useEscalationExecutor: boolean) {
+  const executor = useEscalationExecutor
+    ? policy.roles["implementation.escalationExecutor"]
+    : policy.roles["implementation.executor"];
+  if (executor === undefined)
+    throw new Error(
+      "The required Workgraph model policy configures no implementation.escalationExecutor.",
+    );
+  return {
+    guide: exactTarget(policy.roles["implementation.guide"]),
+    executor: exactTarget(executor),
+  };
 }
 
 function exactTarget(target: ModelTarget): ModelTarget {

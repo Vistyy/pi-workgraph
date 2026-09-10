@@ -6,9 +6,10 @@ import {
   type Attempt,
   AttemptSchema,
   activateAttempt,
-  appendAttempt,
+  appendAttempts,
   CandidateLineageSchema,
   checkpointApplication,
+  checkpointCancellation,
   checkpointCleanup,
   checkpointOutputRelease,
   completeWorkstream,
@@ -26,7 +27,6 @@ import {
   recordDeliverySuccess,
   recordEffectiveModel,
   recordWorkerExecution,
-  requestCancellation,
   reviseIntent,
   type Task,
   TaskSchema,
@@ -144,14 +144,18 @@ function resourceForTest() {
     cwd: "/repo-work",
   };
 }
+/** The one durable placement declaration activating a canonical Attempt. */
+function declare(
+  placement: NonNullable<NonNullable<Attempt["execution"]>["placement"]>,
+): NonNullable<Parameters<typeof activateAttempt>[3]> {
+  return { placement, submission: "not_sent" };
+}
 function recordLaunchProgress(
   workstream: ReturnType<typeof add>,
   key: { taskId: string; attemptId: string },
-  execution: NonNullable<Parameters<typeof activateAttempt>[3]>,
+  execution: NonNullable<Parameters<typeof recordWorkerExecution>[2]>,
 ): ReturnType<typeof add> {
   let active = workstream;
-  if (execution.placement !== undefined)
-    active = recordWorkerExecution(active, key, { placement: execution.placement }, "t1a");
   if (execution.sessionFile !== undefined)
     active = recordWorkerExecution(active, key, { sessionFile: execution.sessionFile }, "t1b");
   if (execution.launch !== undefined) {
@@ -171,8 +175,8 @@ function recordLaunchProgress(
   return active;
 }
 function isolatedPaneLaunch(key: { taskId: string; attemptId: string }): ReturnType<typeof add> {
-  return recordLaunchProgress(activateAttempt(add(), key, "t1"), key, {
-    placement: { kind: "isolated_worktree", path: "/repo-work", branch: "branch" },
+  const placement = { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" };
+  return recordLaunchProgress(activateAttempt(add(), key, "t1", declare(placement)), key, {
     sessionFile: "/worker.json",
     launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" },
   });
@@ -185,17 +189,49 @@ function finish(
   execution?: Parameters<typeof activateAttempt>[3],
 ) {
   const key = { taskId, attemptId: id };
-  let active = activateAttempt(workstream, key, "t1");
+  const placement = execution?.placement ?? { kind: "shared_project" as const, path: "/repo" };
+  let active = activateAttempt(workstream, key, "t1", declare(placement));
   if (execution !== undefined) active = recordLaunchProgress(active, key, execution);
-  if (execution?.submission !== undefined) {
-    active = recordWorkerExecution(active, key, { submission: "not_sent" }, "t1f");
-    if (execution.submission !== "not_sent") {
-      active = recordWorkerExecution(active, key, { submission: "uncertain" }, "t1g");
-      if (execution.submission !== "uncertain")
-        active = recordWorkerExecution(active, key, { submission: execution.submission }, "t1h");
-    }
+  if (execution?.submission !== undefined && execution.submission !== "not_sent") {
+    active = recordWorkerExecution(active, key, { submission: "uncertain" }, "t1g");
+    if (execution.submission !== "uncertain")
+      active = recordWorkerExecution(active, key, { submission: execution.submission }, "t1h");
   }
-  return terminalizeAttempt(active, key, observation, "t2");
+  // An active cancelled settlement is gated on the full interrupt protocol plus
+  // durably proven Worker closure, so the fixture satisfies it before settling.
+  if (observation.kind === "cancelled") {
+    const requested = {
+      state: "requested" as const,
+      requestedAt: "t1i",
+      reason: observation.reason,
+    };
+    active = checkpointCancellation(active, key, requested, "t1i");
+    active = checkpointCancellation(
+      active,
+      key,
+      { ...requested, state: "uncertain", dispatchAt: "t1j" },
+      "t1j",
+    );
+    active = checkpointCancellation(
+      active,
+      key,
+      {
+        ...requested,
+        state: "submitted_or_observed",
+        dispatchAt: "t1j",
+        observedAt: "t1k",
+        evidence: "done",
+      },
+      "t1k",
+    );
+    active = checkpointCleanup(active, key, { state: "pending", workerClosed: true }, "t1l");
+  }
+  active = terminalizeAttempt(active, key, observation, "t2");
+  // A default shared placement has no isolated output, so its only remaining
+  // operational obligation is exact Worker closure.
+  return execution === undefined
+    ? checkpointCleanup(active, key, { state: "completed", workerClosed: true }, "t2a")
+    : active;
 }
 function deliver(workstream: ReturnType<typeof add>, id: string, taskId = "Task opaque") {
   return recordDeliverySuccess(workstream, { taskId, attemptId: id }, "t4", "t4");
@@ -293,14 +329,16 @@ void test("launch checkpoints enforce ordered single-stage execution mutations",
   assert.equal(initialized.tasks[0]?.attempts[0]?.execution?.submission, "not_sent");
   assert.throws(
     () => activateAttempt(add(), key, "t1", { placement, sessionFile: "/worker.json" }),
-    /exactly one new external-effect stage/,
+    /activation requires only exact placement/,
   );
   assert.throws(
+    // The declaration is the activation boundary; later stages are still
+    // recorded exactly one at a time.
     () =>
       recordWorkerExecution(
-        activateAttempt(add(), key, "t1"),
+        activateAttempt(add(), key, "t1", declare(placement)),
         key,
-        { placement, submission: "not_sent" },
+        { sessionFile: "/worker.json", launch: pane },
         "t2",
       ),
     /exactly one new external-effect stage/,
@@ -347,8 +385,8 @@ void test("launch checkpoints enforce ordered single-stage execution mutations",
         workstream,
         key,
         {
+          launch: { phase: "pane", workspaceId: "workspace", paneId: "late" },
           steering: { text: "Stop", state: "uncertain", observedAt: "t11" },
-          cancellation: { requestedAt: "t11", reason: "Stop" },
         },
         "t11",
       ),
@@ -625,7 +663,13 @@ void test("partial shared launches settle after exact closure without output rel
 });
 
 void test("selection is one policy-owned target, while implementation retains guide and executor", () => {
-  let workstream = activateAttempt(add(), { taskId: "Task opaque", attemptId: "Attempt A" }, "t2");
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  let workstream = activateAttempt(
+    add(),
+    key,
+    "t2",
+    declare({ kind: "shared_project", path: "/repo" }),
+  );
   const task = findTask(workstream, "Task opaque");
   assert.ok(task);
   assert.equal(findAttempt(task, "Attempt A")?.selection?.role, "research");
@@ -652,7 +696,6 @@ void test("selection is one policy-owned target, while implementation retains gu
     },
     submission: "not_sent" as const,
   };
-  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
   workstream = recordWorkerExecution(workstream, key, { placement: execution.placement }, "t3");
   const stagedTask = findTask(workstream, key.taskId);
   assert.ok(stagedTask);
@@ -758,26 +801,31 @@ void test("selection is one policy-owned target, while implementation retains gu
   const conflictedTask = findTask(workstream, key.taskId);
   assert.ok(conflictedTask);
   assert.equal(findAttempt(conflictedTask, key.attemptId)?.execution?.submission, "started");
-  workstream = requestCancellation(
+  workstream = checkpointCancellation(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
-    { requestedAt: "t6", reason: "Stop." },
+    { state: "requested", requestedAt: "t6", reason: "Stop." },
     "t6",
   );
   const updatedTask = findTask(workstream, "Task opaque");
   assert.ok(updatedTask);
   assert.equal(findAttempt(updatedTask, "Attempt A")?.execution?.cancellation?.reason, "Stop.");
-  let late = activateAttempt(add(), { taskId: "Task opaque", attemptId: "Attempt A" }, "t7");
+  let late = activateAttempt(
+    add(),
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    "t7",
+    declare({ kind: "shared_project", path: "/repo" }),
+  );
   late = recordWorkerExecution(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { placement: execution.placement },
     "t8",
   );
-  late = requestCancellation(
+  late = checkpointCancellation(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
-    { requestedAt: "t9", reason: "Stop before worker session." },
+    { state: "requested", requestedAt: "t9", reason: "Stop before worker session." },
     "t9",
   );
   late = recordWorkerExecution(
@@ -914,7 +962,7 @@ void test("terminal failures and cancellation settle once operational obligation
   workstream = deliver(finish(workstream, "Cancelled", cancelled()), "Cancelled");
   assert.deepEqual(deriveCompletionAccounting(workstream), []);
   let fanout = deliver(finish(add(), "Attempt A", reported()), "Attempt A");
-  fanout = appendAttempt(fanout, "Task opaque", attempt("Sibling"), "t5");
+  fanout = appendAttempts(fanout, "Task opaque", [attempt("Sibling")], "t5");
   assert.equal(findTask(fanout, "Task opaque")?.attempts.length, 2);
   workstream = completeWorkstream(
     workstream,
@@ -929,6 +977,60 @@ void test("terminal failures and cancellation settle once operational obligation
   assert.deepEqual(workstream.completion?.accounting, []);
   assert.throws(() => createTask(workstream, researchTask("New"), "t6"), /completed/);
   assert.throws(() => reviseIntent(workstream, intent, "t6"), /completed/);
+});
+
+void test("appendAttempts is one atomic nonempty batch that preserves order and validates the result", () => {
+  const stable = deliver(finish(add(), "Attempt A", reported()), "Attempt A");
+  const batch = appendAttempts(
+    stable,
+    "Task opaque",
+    [attempt("Attempt B"), attempt("Attempt C"), attempt("Attempt D")],
+    "t5",
+  );
+  assert.deepEqual(
+    findTask(batch, "Task opaque")?.attempts.map((item) => item.id),
+    ["Attempt A", "Attempt B", "Attempt C", "Attempt D"],
+  );
+  assert.equal(batch.revision, stable.revision + 1);
+  validateWorkstream(batch);
+
+  assert.throws(() => appendAttempts(stable, "Task opaque", [], "t5"), /at least one new Attempt/);
+  assert.throws(
+    () =>
+      appendAttempts(stable, "Task opaque", [{ ...attempt("Attempt B"), state: "active" }], "t5"),
+    /pristine and queued/,
+  );
+  assert.throws(
+    () =>
+      appendAttempts(
+        stable,
+        "Task opaque",
+        [
+          attempt("Attempt B", {
+            selection: {
+              role: "review",
+              target: { model: "provider/review", thinking: "low" },
+              source: "policy",
+            },
+          }),
+        ],
+        "t5",
+      ),
+    /does not match Task kind/,
+  );
+  assert.throws(
+    () => appendAttempts(stable, "Unknown", [attempt("Attempt B")], "t5"),
+    /Unknown Task/,
+  );
+
+  // An unstable pre-existing Attempt rejects the whole batch without a partial append.
+  const unstable = finish(add(), "Attempt A", reported());
+  assert.throws(
+    () =>
+      appendAttempts(unstable, "Task opaque", [attempt("Attempt B"), attempt("Attempt C")], "t5"),
+    /operationally unstable/,
+  );
+  assert.equal(findTask(unstable, "Task opaque")?.attempts.length, 1);
 });
 
 void test("isolated failed output remains blocked through cleanup until exact release, including after completion", () => {
@@ -995,7 +1097,7 @@ void test("isolated failed output remains blocked through cleanup until exact re
   assert.notDeepEqual(workstream.completion?.accounting, []);
   workstream = deliver(workstream, "Attempt A");
   assert.throws(
-    () => appendAttempt(workstream, "Task opaque", attempt("Later"), "t6"),
+    () => appendAttempts(workstream, "Task opaque", [attempt("Later")], "t6"),
     /completed/,
   );
   workstream = checkpointOutputRelease(
@@ -1039,6 +1141,8 @@ void test("isolated failed output remains blocked through cleanup until exact re
     },
     "t5",
   );
+  // A shared placement is settled by exact Worker closure; once cleanup is
+  // completed it cannot be replayed with different identity.
   assert.throws(
     () =>
       checkpointCleanup(
@@ -1051,7 +1155,7 @@ void test("isolated failed output remains blocked through cleanup until exact re
         },
         "t6",
       ),
-    /no Worker placement/,
+    /not monotonic/,
   );
 });
 
@@ -1073,7 +1177,7 @@ void test("shared Worker closure and delivery gate reattempt and accounting", ()
   let workstream = finish(add(), "Attempt A", reported(), "Task opaque", execution);
   assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
   assert.throws(
-    () => appendAttempt(workstream, "Task opaque", attempt("Later"), "t3"),
+    () => appendAttempts(workstream, "Task opaque", [attempt("Later")], "t3"),
     /operationally unstable/,
   );
   workstream = deliver(workstream, "Attempt A");
@@ -1086,7 +1190,7 @@ void test("shared Worker closure and delivery gate reattempt and accounting", ()
   );
   assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
   assert.throws(
-    () => appendAttempt(workstream, "Task opaque", attempt("Still blocked"), "t6"),
+    () => appendAttempts(workstream, "Task opaque", [attempt("Still blocked")], "t6"),
     /operationally unstable/,
   );
   workstream = completeWorkstream(
@@ -1225,4 +1329,228 @@ void test("implementation candidate ancestry may cross Intents but application i
       ),
     /eligible retained output/,
   );
+});
+
+void test("activation declares durable placement before any external effect", () => {
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  const placement = { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" };
+
+  // The declaration is placement plus the initial not-sent submission checkpoint.
+  const declared = activateAttempt(add(), key, "t1", declare(placement));
+  assert.deepEqual(declared.tasks[0]?.attempts[0]?.execution, {
+    placement,
+    submission: "not_sent",
+  });
+
+  // A missing placement or a pre-progressed submission can never begin activation.
+  assert.throws(
+    () => activateAttempt(add(), key, "t1", { submission: "not_sent" }),
+    /exact placement and not-sent submission/,
+  );
+  assert.throws(
+    () => activateAttempt(add(), key, "t1", { placement, submission: "uncertain" }),
+    /exact placement and not-sent submission/,
+  );
+  assert.throws(
+    () =>
+      activateAttempt(add(), key, "t1", {
+        placement,
+        submission: "not_sent",
+        sessionFile: "/worker.json",
+      }),
+    /exact placement and not-sent submission/,
+  );
+
+  // Aggregate validation rejects a persisted active Attempt that lacks its
+  // declaration; the durable placement is the invariant, not proof a worktree exists.
+  const undeclared = structuredClone(declared);
+  const undeclaredAttempt = undeclared.tasks[0]?.attempts[0];
+  assert.ok(undeclaredAttempt?.execution);
+  Reflect.deleteProperty(undeclaredAttempt, "execution");
+  assert.throws(() => validateWorkstream(undeclared), /exact placement declaration/);
+
+  const progressed = recordWorkerExecution(declared, key, { sessionFile: "/worker.json" }, "t2");
+  const progressedActive = progressed.tasks[0]?.attempts[0]?.execution;
+  assert.ok(progressedActive);
+  Reflect.deleteProperty(progressedActive, "submission");
+  assert.throws(() => validateWorkstream(progressed), /not-sent submission checkpoint/);
+});
+
+void test("cancellation is one monotonic interrupt protocol with exact evidence", () => {
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  const placement = { kind: "shared_project" as const, path: "/repo" };
+  const active = activateAttempt(add(), key, "t1", declare(placement));
+  const requested = { state: "requested" as const, requestedAt: "t2", reason: "Stop." };
+  const uncertain = { ...requested, state: "uncertain" as const, dispatchAt: "t3" };
+  const observed = {
+    ...uncertain,
+    state: "submitted_or_observed" as const,
+    observedAt: "t4",
+    evidence: "done" as const,
+  };
+
+  let workstream = checkpointCancellation(active, key, requested, "t2");
+  assert.equal(workstream.tasks[0]?.attempts[0]?.execution?.cancellation?.state, "requested");
+  // Exact replay is a structural no-op; the request identity and reason persist.
+  assert.strictEqual(checkpointCancellation(workstream, key, requested, "t2b"), workstream);
+  // No skip and no backward move.
+  assert.throws(() => checkpointCancellation(workstream, key, observed, "t2c"), /not monotonic/);
+  // A different request identity cannot overwrite the durable request.
+  assert.throws(
+    () =>
+      checkpointCancellation(
+        workstream,
+        key,
+        { state: "uncertain", requestedAt: "t9", reason: "Other.", dispatchAt: "t3" },
+        "t2e",
+      ),
+    /not monotonic/,
+  );
+  workstream = checkpointCancellation(workstream, key, uncertain, "t3");
+  assert.equal(workstream.tasks[0]?.attempts[0]?.execution?.cancellation?.state, "uncertain");
+  assert.throws(
+    () => checkpointCancellation(workstream, key, { ...uncertain, dispatchAt: "t9" }, "t3b"),
+    /not monotonic/,
+  );
+  workstream = checkpointCancellation(workstream, key, observed, "t4");
+  const terminal = workstream.tasks[0]?.attempts[0]?.execution?.cancellation;
+  assert.deepEqual(terminal, observed);
+  assert.strictEqual(checkpointCancellation(workstream, key, observed, "t4b"), workstream);
+  // A terminal checkpoint cannot be rewritten or moved backward.
+  assert.throws(() => checkpointCancellation(workstream, key, uncertain, "t5"), /not monotonic/);
+
+  // An active cancelled settlement needs both observed cancellation and durable
+  // closure; while active, cleanup may only be the cancellation path's start.
+  const pending = { state: "pending" as const, workerClosed: true };
+  assert.throws(() => terminalizeAttempt(active, key, cancelled(), "t5"), /submitted-or-observed/);
+  assert.throws(
+    () => terminalizeAttempt(workstream, key, cancelled(), "t5"),
+    /durable Worker closure/,
+  );
+  assert.throws(() => checkpointCleanup(active, key, pending, "t5"), /observed cancellation/);
+  assert.throws(
+    () => checkpointCleanup(workstream, key, { state: "completed", workerClosed: true }, "t5"),
+    /only begin pending/,
+  );
+  // The fully proven path settles cancelled, then ordinary cleanup resumes.
+  const closed = checkpointCleanup(workstream, key, pending, "t6");
+  const settled = terminalizeAttempt(closed, key, cancelled(), "t7");
+  assert.equal(settled.tasks[0]?.attempts[0]?.state, "finished");
+  assert.equal(settled.tasks[0]?.attempts[0]?.outcome?.kind, "cancelled");
+  const completed = checkpointCleanup(
+    settled,
+    key,
+    { state: "completed", workerClosed: true, expectedHead: changedCommit },
+    "t8",
+  );
+  assert.equal(completed.tasks[0]?.attempts[0]?.cleanup?.state, "completed");
+  // A queued pristine Attempt settles cancelled without any Worker facts.
+  assert.equal(
+    terminalizeAttempt(add(), key, cancelled(), "t9").tasks[0]?.attempts[0]?.state,
+    "finished",
+  );
+});
+
+void test("persisted read validation mirrors cancellation settlement and completion lifecycle", () => {
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  const placement = { kind: "shared_project" as const, path: "/repo" };
+  const requested = { state: "requested" as const, requestedAt: "t2", reason: "Stop." };
+  const uncertain = { ...requested, state: "uncertain" as const, dispatchAt: "t3" };
+  const observed = {
+    ...uncertain,
+    state: "submitted_or_observed" as const,
+    observedAt: "t4",
+    evidence: "done" as const,
+  };
+  let active = checkpointCancellation(
+    activateAttempt(add(), key, "t1", declare(placement)),
+    key,
+    requested,
+    "t2",
+  );
+  active = checkpointCancellation(active, key, uncertain, "t3");
+  active = checkpointCancellation(active, key, observed, "t4");
+
+  // A pending active cancellation cleanup and a pristine queued cancellation
+  // settlement are both valid persisted states.
+  const pendingCleanup = checkpointCleanup(
+    active,
+    key,
+    { state: "pending", workerClosed: true },
+    "t5",
+  );
+  assert.doesNotThrow(() => validateWorkstream(pendingCleanup));
+  assert.doesNotThrow(() => validateWorkstream(terminalizeAttempt(add(), key, cancelled(), "t5")));
+
+  // Active completed or blocked cleanup is rejected on read exactly as the
+  // transition boundary rejects it.
+  const completedCleanup = structuredClone(active);
+  const completedAttempt = completedCleanup.tasks[0]?.attempts[0];
+  assert.ok(completedAttempt);
+  completedAttempt.cleanup = { state: "completed", workerClosed: true };
+  assert.throws(() => validateWorkstream(completedCleanup), /active cleanup may only be pending/);
+  const blockedCleanup = structuredClone(active);
+  const blockedAttempt = blockedCleanup.tasks[0]?.attempts[0];
+  assert.ok(blockedAttempt);
+  blockedAttempt.cleanup = { state: "blocked", workerClosed: false, error: "Cleanup blocked." };
+  assert.throws(() => validateWorkstream(blockedCleanup), /active cleanup may only be pending/);
+
+  // A finished cancelled Worker settlement keeps its exact interruption proof and
+  // durable Worker closure on read.
+  const settled = terminalizeAttempt(pendingCleanup, key, cancelled(), "t6");
+  assert.doesNotThrow(() => validateWorkstream(settled));
+  const withoutCancellation = structuredClone(settled);
+  const uncancelledAttempt = withoutCancellation.tasks[0]?.attempts[0];
+  assert.ok(uncancelledAttempt?.execution);
+  Reflect.deleteProperty(uncancelledAttempt.execution, "cancellation");
+  assert.throws(() => validateWorkstream(withoutCancellation), /submitted-or-observed/);
+  const reopenedWorker = structuredClone(settled);
+  const reopenedAttempt = reopenedWorker.tasks[0]?.attempts[0];
+  assert.ok(reopenedAttempt?.cleanup);
+  reopenedAttempt.cleanup.workerClosed = false;
+  assert.throws(() => validateWorkstream(reopenedWorker), /durable Worker closure/);
+
+  // A completed Workstream cannot retain an unfinished Attempt on read.
+  const complete = completeWorkstream(
+    deliver(finish(add(), key.attemptId, reported()), key.attemptId),
+    {
+      conclusion: "Complete.",
+      evidence: [{ label: "completion", observation: "The Workstream completed." }],
+      limitations: [],
+      completedAt: "t6",
+    },
+    "t6",
+  );
+  const stillWorking = structuredClone(complete);
+  const task = stillWorking.tasks[0];
+  assert.ok(task);
+  task.attempts.push(attempt("Attempt B"));
+  assert.throws(() => validateWorkstream(stillWorking), /unfinished Attempt/);
+});
+
+void test("delivery attempt counts are exact against failure history", () => {
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  let workstream = finish(add(), key.attemptId, reported());
+  workstream = deliver(workstream, key.attemptId);
+  const delivered = workstream.tasks[0]?.attempts[0]?.outcome?.delivery;
+  assert.equal(delivered?.state, "delivered");
+  assert.equal(delivered?.attemptCount, 1);
+  assert.equal(delivered?.failureHistory.length, 0);
+
+  // Pending counts equal its failures; delivered counts equal failures + 1.
+  const pending = finish(add(), key.attemptId, reported());
+  const corrupted = structuredClone(pending);
+  const corruptedDelivery = corrupted.tasks[0]?.attempts[0]?.outcome?.delivery;
+  assert.ok(corruptedDelivery);
+  corruptedDelivery.attemptCount = 1;
+  assert.throws(() => validateWorkstream(corrupted), /attempt count is not exact/);
+  let failed = recordDeliveryFailure(pending, key, { at: "t3", detail: "Retry." }, "t3");
+  failed = recordDeliveryFailure(failed, key, { at: "t4", detail: "Retry again." }, "t4");
+  const failedDelivery = failed.tasks[0]?.attempts[0]?.outcome?.delivery;
+  assert.equal(failedDelivery?.attemptCount, 2);
+  assert.equal(failedDelivery?.failureHistory.length, 2);
+  const accepted = recordDeliverySuccess(failed, key, "t5", "t5");
+  const acceptedDelivery = accepted.tasks[0]?.attempts[0]?.outcome?.delivery;
+  assert.equal(acceptedDelivery?.attemptCount, 3);
+  assert.equal(acceptedDelivery?.failureHistory.length, 2);
 });

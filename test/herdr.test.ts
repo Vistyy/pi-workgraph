@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are exact native Herdr resource identities.
 import { join } from "node:path";
 import test from "node:test";
-import { Deferred, Effect } from "effect";
+import { Data, Deferred, Effect } from "effect";
 import {
   CoordinatorLaunchError,
   HERDR_PROTOCOL_OUTPUT_LIMIT,
@@ -1185,6 +1185,78 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       assert.equal((await commandLog(log)).length, callCount, `${phase} launched detached work`);
       assert.equal(await readFile(durable, "utf8"), `${phase}:settled\\n`);
     }
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+await test("progressive launch fences the lease immediately before each mutating remote call", async () => {
+  class FenceLostError extends Data.TaggedError("FenceLostError")<{ readonly detail: string }> {}
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-fence-"));
+  const log = join(parent, "commands.jsonl");
+  const command = join(parent, "fake-herdr-fence.mjs");
+  const cwd = join(parent, "worktree");
+  const sessionFile = join(parent, "worker.jsonl");
+  const naming = {
+    runId: "run",
+    nodeId: "node",
+    attemptId: "attempt",
+    assignmentId: "fence",
+    role: "implement" as const,
+  };
+  const agent = {
+    workspace_id: "workspace-1",
+    tab_id: "workspace-1:tab-1",
+    pane_id: "workspace-1:pane-1",
+    terminal_id: "terminal-1",
+    agent_status: "working",
+    name: herdrWorkerName(naming),
+    cwd,
+    agent_session: { value: sessionFile },
+  };
+  await writeFile(
+    command,
+    `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nconst args = process.argv.slice(2);\nappendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");\nif (args[0] === "tab") console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-1"}}}));\nelse if (args[0] === "agent") console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));\nelse console.log(JSON.stringify({result:{accepted:true}}));\n`,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, {
+    HERDR_ENV: "1",
+    HERDR_WORKSPACE_ID: "workspace-1",
+  });
+  let fenceCount = 0;
+  try {
+    const failure = await runEffect(
+      Effect.flip(
+        runtime.launch({
+          workspaceId: "workspace-1",
+          ...naming,
+          cwd,
+          sessionFile,
+          prompt: "Continue.",
+          env: {},
+          onFence: () =>
+            Effect.gen(function* () {
+              fenceCount += 1;
+              if (fenceCount === 2)
+                return yield* new FenceLostError({ detail: "lease lost before agent start" });
+            }),
+        }),
+      ),
+    );
+    assert.ok(failure instanceof WorkerLaunchError);
+    assert.equal(failure.phase, "fence");
+    assert.equal(fenceCount, 2);
+    const calls = await commandLog(log);
+    assert.equal(calls.filter((args) => args[0] === "tab" && args[1] === "create").length, 1);
+    assert.equal(
+      calls.some((args) => args[0] === "agent" && args[1] === "start"),
+      false,
+      "a fence failure must prevent the next mutating remote call",
+    );
+    assert.equal(
+      calls.some((args) => args[0] === "agent" && args[1] === "prompt"),
+      false,
+    );
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

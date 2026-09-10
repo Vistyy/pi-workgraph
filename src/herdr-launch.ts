@@ -46,6 +46,11 @@ export interface WorkerLaunchEffectRequest<E = never, R = never> extends WorkerL
   /** Generation-scoped preflight runs after local worker identity and before remote inference. */
   onPreflight?: () => Effect.Effect<void, E, R>;
   onSubmitted?: () => Effect.Effect<void, E, R>;
+  /**
+   * Lease-lifetime fence invoked immediately before every mutating Herdr remote
+   * call, including after an intervening durable checkpoint.
+   */
+  onFence?: () => Effect.Effect<void, E, R>;
 }
 
 export class WorkerLaunchReadinessError extends Data.TaggedError("WorkerLaunchReadinessError")<{
@@ -58,8 +63,8 @@ export class WorkerLaunchReadinessError extends Data.TaggedError("WorkerLaunchRe
 }
 
 export class WorkerLaunchError<Cause = unknown> extends Data.TaggedError("WorkerLaunchError")<{
-  readonly phase: "onTab" | "onResource" | "onIdentity" | "onPreflight" | "onSubmitted";
-  readonly locator: WorkerLaunchLocator;
+  readonly phase: "fence" | "onTab" | "onResource" | "onIdentity" | "onPreflight" | "onSubmitted";
+  readonly locator: WorkerLaunchLocator | undefined;
   readonly resource: WorkerResourceIdentity | undefined;
   readonly cause: Cause;
 }> {
@@ -119,23 +124,26 @@ export class HerdrWorkerLauncher {
       function* (this: HerdrWorkerLauncher) {
         const workerName = herdrWorkerName(request);
         const paneLocator = yield* checkpointAfterRemote(
-          this.host.transport
-            .call(
-              [
-                "tab",
-                "create",
-                "--workspace",
-                request.workspaceId,
-                "--cwd",
-                request.cwd,
-                "--label",
-                herdrWorkerTabLabel(request),
-                "--no-focus",
-                ...envArgs(request.env),
-              ],
-              decodeTabCreateResponse,
-            )
-            .pipe(Effect.map((paneId) => ({ workspaceId: request.workspaceId, paneId }))),
+          fenced(
+            request,
+            this.host.transport
+              .call(
+                [
+                  "tab",
+                  "create",
+                  "--workspace",
+                  request.workspaceId,
+                  "--cwd",
+                  request.cwd,
+                  "--label",
+                  herdrWorkerTabLabel(request),
+                  "--no-focus",
+                  ...envArgs(request.env),
+                ],
+                decodeTabCreateResponse,
+              )
+              .pipe(Effect.map((paneId) => ({ workspaceId: request.workspaceId, paneId }))),
+          ),
           "onTab",
           request.onTab,
           (locator) => locator,
@@ -155,21 +163,24 @@ export class HerdrWorkerLauncher {
         if (request.model !== undefined) args.push("--model", request.model);
         if (request.thinking !== undefined) args.push("--thinking", request.thinking);
         const resource = yield* checkpointAfterRemote(
-          this.host.transport.call(args, decodeAgentResponse, 45_000).pipe(
-            Effect.flatMap((decoded) =>
-              protocolTry(args, () => {
-                const started = parseAgent(decoded);
-                assertWorkerLaunchPlacement(
-                  {
-                    workspaceId: request.workspaceId,
-                    paneId: paneLocator.paneId,
-                    agentName: workerName,
-                    cwd: request.cwd,
-                  },
-                  started,
-                );
-                return resourceOf(started);
-              }),
+          fenced(
+            request,
+            this.host.transport.call(args, decodeAgentResponse, 45_000).pipe(
+              Effect.flatMap((decoded) =>
+                protocolTry(args, () => {
+                  const started = parseAgent(decoded);
+                  assertWorkerLaunchPlacement(
+                    {
+                      workspaceId: request.workspaceId,
+                      paneId: paneLocator.paneId,
+                      agentName: workerName,
+                      cwd: request.cwd,
+                    },
+                    started,
+                  );
+                  return resourceOf(started);
+                }),
+              ),
             ),
           ),
           "onResource",
@@ -192,10 +203,13 @@ export class HerdrWorkerLauncher {
           );
           const onSubmitted = request.onSubmitted;
           yield* checkpointAfterRemote(
-            this.host.transport.call(
-              ["agent", "prompt", workerName, request.prompt],
-              decodeSuccessResponse,
-              15_000,
+            fenced(
+              request,
+              this.host.transport.call(
+                ["agent", "prompt", workerName, request.prompt],
+                decodeSuccessResponse,
+                15_000,
+              ),
             ),
             "onSubmitted",
             onSubmitted === undefined ? undefined : () => onSubmitted(),
@@ -214,7 +228,11 @@ export class HerdrWorkerLauncher {
 }
 
 function checkpointAfterRemote<A, E, R, Locator extends WorkerLaunchLocator>(
-  remote: Effect.Effect<A, HerdrProtocolError | WorkerLaunchReadinessError, R>,
+  remote: Effect.Effect<
+    A,
+    HerdrProtocolError | WorkerLaunchReadinessError | WorkerLaunchError<E>,
+    R
+  >,
   phase: WorkerLaunchError["phase"],
   checkpoint: ((value: A) => Effect.Effect<void, E, R>) | undefined,
   locatorOf: (value: A) => Locator,
@@ -225,6 +243,22 @@ function checkpointAfterRemote<A, E, R, Locator extends WorkerLaunchLocator>(
         invokeCheckpoint(phase, checkpoint, value, locatorOf(value)).pipe(Effect.as(value)),
       ),
     ),
+  );
+}
+
+/** Fence the exact lease immediately before one mutating remote call. */
+function fenced<A, E, R>(
+  request: { readonly onFence?: () => Effect.Effect<void, E, R> },
+  remote: Effect.Effect<A, HerdrProtocolError | WorkerLaunchReadinessError, R>,
+): Effect.Effect<A, HerdrProtocolError | WorkerLaunchReadinessError | WorkerLaunchError<E>, R> {
+  const onFence = request.onFence;
+  if (onFence === undefined) return remote;
+  return onFence().pipe(
+    Effect.mapError(
+      (cause) =>
+        new WorkerLaunchError({ phase: "fence", locator: undefined, resource: undefined, cause }),
+    ),
+    Effect.andThen(remote),
   );
 }
 

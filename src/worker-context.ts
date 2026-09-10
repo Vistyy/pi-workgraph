@@ -1,6 +1,8 @@
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import type { ResolvedReviewInput } from "./canonical-reconciliation.js";
+import type { CandidateLineage, Intent, TaskContract } from "./domain/workstream.js";
 import type { WorkerSessionMode } from "./types.js";
 
 export type WorkerPhase = "guide" | "executor";
@@ -190,4 +192,195 @@ function belongsToIdentity(
   identity: WorkerContextIdentity,
 ): boolean {
   return data.runId === identity.runId && data.nodeId === identity.nodeId;
+}
+
+/** One concrete canonical worker assignment; every launch fact is built once here. */
+export interface CanonicalWorkerAssignment {
+  readonly mode: WorkerSessionMode;
+  readonly role: "implement" | "research" | "review";
+  readonly objective: string;
+  readonly prompt: string;
+  readonly environment: Record<string, string>;
+}
+
+export interface CanonicalAssignmentInput {
+  task: TaskContract;
+  intent: Intent;
+  intentIndex: number;
+  repositoryRoot: string;
+  workerCwd: string;
+  runId: string;
+  attemptId: string;
+  baseRevision?: string;
+  candidate?: CandidateLineage;
+  /** Resolved review content; an unresolved review falls back to its own subject. */
+  reviewSubject?: ResolvedReviewInput;
+  executor?: { model: string; thinking?: string };
+  codingAgentDir?: string;
+  continuationOf?: string;
+}
+
+export function canonicalWorkerAssignment(
+  input: CanonicalAssignmentInput,
+): CanonicalWorkerAssignment {
+  const capability = capabilityForKind(input.task.kind);
+  const experiment = input.task.kind === "experiment";
+  return {
+    mode: workerMode(capability),
+    role: workerRole(capability),
+    objective: canonicalObjective(input),
+    prompt: canonicalPrompt(input),
+    environment: canonicalEnvironment(input, capability, experiment),
+  };
+}
+
+/** Session mode for one canonical Task; the kind-to-fact policy lives only here. */
+export function canonicalSessionMode(task: TaskContract): WorkerSessionMode {
+  return workerMode(capabilityForKind(task.kind));
+}
+
+type WorkerCapability = "implement" | "research" | "review" | "consultation";
+
+function capabilityForKind(kind: TaskContract["kind"]): WorkerCapability {
+  if (kind === "implementation") return "implement";
+  if (kind === "review") return "review";
+  if (kind === "consultation") return "consultation";
+  return "research";
+}
+
+function workerMode(capability: WorkerCapability): WorkerSessionMode {
+  if (capability === "implement") return "implementation";
+  if (capability === "review") return "review";
+  return "research";
+}
+
+function workerRole(capability: WorkerCapability): CanonicalWorkerAssignment["role"] {
+  if (capability === "implement") return "implement";
+  if (capability === "review") return "review";
+  return "research";
+}
+
+function workerPolicyRole(
+  capability: WorkerCapability,
+  disposableExperiment: boolean,
+): WorkerPolicyRole {
+  if (disposableExperiment) return "experiment";
+  if (capability === "consultation") return "consultation";
+  return workerMode(capability);
+}
+
+const CONTINUATION_INSTRUCTION = "Continue the assigned Workgraph objective now.";
+const EXPERIMENT_NOTES = [
+  "On successful clean isolated output the checkout is compacted and this exact output branch is retained until explicit release.",
+  "Experimental changes are not maintained product changes and must not be applied to the destination.",
+];
+
+function canonicalObjective(input: CanonicalAssignmentInput): string {
+  const { task, intent, baseRevision } = input;
+  const lines = [
+    `Assignment: ${task.objective}`,
+    `Intent index: ${input.intentIndex}`,
+    `Intent: ${intent.statement}`,
+    `Repository: ${input.repositoryRoot}`,
+    `Assigned working directory: ${input.workerCwd}`,
+    `Constraints: ${intent.constraints.join("; ")}`,
+  ];
+  if (baseRevision !== undefined) lines.push(`Exact base/review revision: ${baseRevision}`);
+  appendCandidateLines(lines, input.candidate);
+  if (task.kind === "research")
+    lines.push(`Expected evidence: ${task.expectedEvidence.join("; ")}`);
+  if (task.kind === "consultation" && task.context !== undefined)
+    lines.push(`Coordinator-known context: ${task.context}`);
+  if (task.kind === "experiment") {
+    lines.push(
+      `Permitted effects: ${task.permittedEffects.join("; ")}`,
+      `Stop condition: ${task.stopCondition}`,
+      `Expected evidence: ${task.expectedEvidence.join("; ")}`,
+      ...EXPERIMENT_NOTES,
+    );
+  }
+  if (task.kind === "implementation")
+    lines.push(
+      `Acceptance: ${task.acceptance.join("; ")}`,
+      "If a change is needed, create one clean maintained commit and report its exact commit for application. If the requirement already holds, verify it and report no_change with the inspected base revision and reason.",
+    );
+  if (task.kind === "review")
+    lines.push(
+      `Concern: ${task.concern}`,
+      `Subject: ${JSON.stringify(reviewSubjectFor(input))}`,
+      "Do not edit files.",
+    );
+  return lines.join("\n");
+}
+
+function canonicalPrompt(input: CanonicalAssignmentInput): string {
+  const { task } = input;
+  const lines = [
+    `Workgraph assignment for Task ${task.id}.`,
+    `Repository: ${input.repositoryRoot}`,
+    `Assigned working directory: ${input.workerCwd}`,
+  ];
+  if (input.baseRevision !== undefined)
+    lines.push(`Exact base/review revision: ${input.baseRevision}`);
+  appendCandidateLines(lines, input.candidate);
+  if (task.kind === "implementation")
+    lines.push(
+      "For a changed result, use the assigned worktree, create exactly one direct commit on the exact base, and leave it clean; report that commit. For no change, report the unchanged exact base without a commit. Do not integrate into the coordinator repository or push.",
+    );
+  if (task.kind === "review")
+    lines.push(
+      "Review only the assigned subject; an exact revision must be inspected as that revision.",
+    );
+  lines.push(CONTINUATION_INSTRUCTION);
+  return lines.join("\n");
+}
+
+function canonicalEnvironment(
+  input: CanonicalAssignmentInput,
+  capability: WorkerCapability,
+  experiment: boolean,
+): Record<string, string> {
+  const environment = new Map<string, string>([
+    ["PI_WORKGRAPH_MODE", workerMode(capability)],
+    ["PI_WORKGRAPH_POLICY_ROLE", workerPolicyRole(capability, experiment)],
+    ["PI_WORKGRAPH_RUN_ID", input.runId],
+    ["PI_WORKGRAPH_NODE_ID", input.attemptId],
+    ["PI_WORKGRAPH_REPOSITORY", input.repositoryRoot],
+    ["PI_WORKGRAPH_WORKER_CWD", input.workerCwd],
+  ]);
+  if (input.baseRevision !== undefined)
+    environment.set("PI_WORKGRAPH_BASE_COMMIT", input.baseRevision);
+  if (input.codingAgentDir !== undefined && input.codingAgentDir !== "")
+    environment.set("PI_CODING_AGENT_DIR", input.codingAgentDir);
+  if (experiment) environment.set("PI_WORKGRAPH_EXPERIMENT", "1");
+  if (input.executor !== undefined) {
+    environment.set("PI_WORKGRAPH_IMPLEMENTATION_START", "guide");
+    environment.set("PI_WORKGRAPH_EXECUTOR_MODEL", input.executor.model);
+    if (input.executor.thinking !== undefined)
+      environment.set("PI_WORKGRAPH_EXECUTOR_THINKING", input.executor.thinking);
+  }
+  if (input.continuationOf !== undefined)
+    environment.set("PI_WORKGRAPH_CONTINUATION_OF", input.continuationOf);
+  return Object.fromEntries(environment);
+}
+
+function appendCandidateLines(lines: string[], candidate: CandidateLineage | undefined): void {
+  if (candidate === undefined) return;
+  lines.push(`Candidate lineage: ${candidate.kind}; root commit ${candidate.rootCommit}.`);
+  if (candidate.kind === "initial") return;
+  lines.push(
+    `Retained parent candidate: attempt ${candidate.parentAttemptId}, exact commit ${candidate.parentCommit}.`,
+  );
+  lines.push(
+    candidate.kind === "correction"
+      ? "This is an isolated correction: continue the retained candidate history from the parent commit and preserve a direct commit."
+      : "This is an explicit isolated integration: integrate the retained parent candidate's content into the assigned current destination base, then report only the new candidate commit and its current-base evidence.",
+  );
+}
+
+function reviewSubjectFor(
+  input: CanonicalAssignmentInput,
+): ResolvedReviewInput | Extract<TaskContract, { kind: "review" }>["subject"] | undefined {
+  if (input.reviewSubject !== undefined) return input.reviewSubject;
+  return input.task.kind === "review" ? input.task.subject : undefined;
 }

@@ -8,6 +8,7 @@ import test from "node:test";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
 import {
+  implementationTargets,
   loadModelPolicy,
   loadModelPolicyEffect,
   type ModelPolicy,
@@ -105,39 +106,33 @@ await test("selection repeats independently or takes distinct policy-order targe
     ["fixture/research-first", "fixture/research-second"],
   );
   assert.deepEqual(
-    resolveSelection(
-      "research",
-      { count: 2, model: "fixture/research-second" },
-      policy,
-    ).selected.map((target) => target.model),
-    ["fixture/research-second", "fixture/research-second"],
-  );
-  assert.deepEqual(
     resolveSelection("review", { count: 2 }, policy).selected.map((target) => target.model),
-    ["fixture/review", "fixture/review"],
-  );
-  assert.deepEqual(
-    resolveSelection("review", { count: 2, model: "fixture/review" }, policy).selected.map(
-      (target) => target.model,
-    ),
     ["fixture/review", "fixture/review"],
   );
   assert.throws(
     () => resolveSelection("review", { count: 2, distinctModels: true }, policy),
     /only 1/,
   );
-  assert.throws(
-    () =>
-      resolveSelection(
-        "research",
-        { distinctModels: true, model: "fixture/research-first" },
-        policy,
-      ),
-    /incompatible/,
-  );
-  assert.throws(
-    () => resolveSelection("research", { model: "fixture/unknown" }, policy),
-    /not configured/,
-  );
   assert.equal(Value.Check(SelectionRequestSchema, { diversity: "distinct-models" }), false);
+  // Callers cannot supply arbitrary targets or thinking levels.
+  assert.equal(Value.Check(SelectionRequestSchema, { model: "fixture/research-first" }), false);
+});
+
+await test("implementation uses its configured executor and only an explicitly requested escalation", () => {
+  assert.deepEqual(implementationTargets(valid, false), {
+    guide: { model: "fixture/guide", thinking: "low" },
+    executor: { model: "fixture/executor", thinking: "xhigh" },
+  });
+  assert.throws(() => implementationTargets(valid, true), /escalationExecutor/);
+  const escalated: ModelPolicy = {
+    ...valid,
+    roles: {
+      ...valid.roles,
+      "implementation.escalationExecutor": { model: "fixture/escalation", thinking: "max" },
+    },
+  };
+  assert.deepEqual(implementationTargets(escalated, true), {
+    guide: { model: "fixture/guide", thinking: "low" },
+    executor: { model: "fixture/escalation", thinking: "max" },
+  });
 });

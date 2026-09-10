@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- This is a real native SessionManager filesystem boundary test.
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Native temporary paths are part of the SessionManager test boundary.
 import { join } from "node:path";
@@ -14,6 +14,7 @@ import {
   forkConversationSessionEffect,
   hasNativeAgentSettled,
   hasNativeAgentStarted,
+  inspectWorkerSessionDirectory,
   observeNativeFailure,
   PiSessionError,
   readWorkgraphReportResult,
@@ -22,6 +23,36 @@ import { usage } from "./helpers.js";
 
 const runSession = (request: Parameters<typeof createWorkerSessionEffect>[0]) =>
   Effect.runPromise(Effect.provide(createWorkerSessionEffect(request), liveLayer));
+
+await test("session-directory inspection reports absence, exact adoption, and unreadable ambiguity", async () => {
+  const root = await mkdtemp(join(tmpdir(), "workgraph-session-scan-"));
+  const generation = { runId: "scan", nodeId: "first" };
+  const inspect = (sessionDir: string) =>
+    Effect.runPromise(
+      Effect.provide(inspectWorkerSessionDirectory(sessionDir, generation), liveLayer),
+    );
+  try {
+    const dir = join(root, "sessions");
+    assert.deepEqual(await inspect(dir), { state: "none" });
+
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    const malformed = join(dir, "malformed.jsonl");
+    await writeFile(malformed, '{"type":"session"\n');
+    assert.equal((await inspect(dir)).state, "ambiguous");
+
+    await rm(malformed, { force: true });
+    const file = await runSession({
+      ...generation,
+      targetCwd: root,
+      sessionDir: dir,
+      objective: "Observe exact bytes",
+      mode: "research",
+    });
+    assert.deepEqual(await inspect(dir), { state: "exact", sessionFile: file });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 await test("fresh worker context and generation-scoped reports remain distinct", async () => {
   const root = await mkdtemp(join(tmpdir(), "workgraph-session-"));

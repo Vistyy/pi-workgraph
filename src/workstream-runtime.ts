@@ -1618,7 +1618,7 @@ function selectedAttempts(
       id: `attempt-${randomUUID()}`,
       models: {
         guide: target,
-        source: selection.source === "policy" ? "policy" : "requested-model",
+        source: selection.source,
         selection,
       },
     };

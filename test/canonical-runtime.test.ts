@@ -1,0 +1,967 @@
+import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- The Linux-gated closure test observes the process file-descriptor table.
+import { readdirSync, readlinkSync } from "node:fs";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- These flows exercise real private SQLite storage and the required policy file at the node:test boundary.
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are real host repository identities.
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import test from "node:test";
+import { Clock, Effect, Exit, Fiber, type FileSystem, Option, type Path, Scope } from "effect";
+import { TestClock } from "effect/testing";
+import { Value } from "typebox/value";
+import {
+  CanonicalAppendCommandSchema,
+  CanonicalEnqueueCommandSchema,
+} from "../src/canonical-queue.js";
+import type {
+  ReconciliationCommit,
+  ReconciliationDriver,
+  ReconciliationMutation,
+  ReconciliationOutcome,
+} from "../src/canonical-reconciliation.js";
+import {
+  CanonicalRuntime,
+  type CanonicalRuntimeAcquisition,
+  type CanonicalRuntimeError,
+  CanonicalRuntimeIdentityError,
+  CanonicalRuntimeLeaseError,
+  CanonicalRuntimeOperationError,
+  CanonicalRuntimeStaleError,
+  CanonicalRuntimeStoppedError,
+} from "../src/canonical-runtime.js";
+import {
+  CanonicalStoreConflictError,
+  type CanonicalStoreError,
+  CanonicalStoreInvalidError,
+  CanonicalWorkstreamStore,
+} from "../src/canonical-workstream-store.js";
+import {
+  type Attempt,
+  type CoordinatorIdentity,
+  createTask,
+  createWorkstream,
+  type Intent,
+  type RepositoryIdentity,
+  recordDeliverySuccess,
+  type TerminalObservation,
+  terminalizeAttempt,
+  type Workstream,
+} from "../src/domain/workstream.js";
+import type { ModelPolicy } from "../src/model-policy.js";
+import { liveLayer } from "../src/node-platform.js";
+
+const ID = "runtime";
+const COORDINATOR: CoordinatorIdentity = {
+  sessionId: "coordinator-a",
+  sessionFile: "/sessions/coordinator-a.jsonl",
+};
+const OTHER: CoordinatorIdentity = {
+  sessionId: "coordinator-b",
+  sessionFile: "/sessions/coordinator-b.jsonl",
+};
+const T0 = "2024-01-01T00:00:00.000Z";
+const START_MILLIS = 1_700_000_000_000;
+const BASE_REVISION = "a".repeat(40);
+const RESEARCH = { model: "fixture/research", thinking: "high" } as const;
+const POLICY: ModelPolicy = {
+  version: 6,
+  roles: {
+    research: [RESEARCH, { model: "fixture/research-2", thinking: "medium" }],
+    review: [
+      { model: "fixture/review", thinking: "high" },
+      { model: "fixture/review-2", thinking: "low" },
+    ],
+    "implementation.guide": { model: "fixture/guide", thinking: "low" },
+    "implementation.executor": { model: "fixture/executor", thinking: "xhigh" },
+    "consultation.advisor": [
+      { model: "fixture/advisor", thinking: "off" },
+      { model: "fixture/advisor-2", thinking: "medium" },
+    ],
+  },
+};
+const ESCALATED_POLICY: ModelPolicy = {
+  ...POLICY,
+  roles: {
+    ...POLICY.roles,
+    "implementation.escalationExecutor": { model: "fixture/escalation", thinking: "max" },
+  },
+};
+
+interface Fixture {
+  readonly parent: string;
+  readonly repository: RepositoryIdentity;
+  readonly policyPath: string;
+}
+
+async function withFixture(run: (f: Fixture) => Promise<void>): Promise<void> {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-runtime-"));
+  const projectRoot = join(parent, "project");
+  const gitCommonDir = join(projectRoot, ".git");
+  await mkdir(gitCommonDir, { recursive: true, mode: 0o700 });
+  await chmod(projectRoot, 0o700);
+  await chmod(gitCommonDir, 0o700);
+  const policyPath = join(parent, "models.json");
+  await writePolicy(policyPath, POLICY);
+  try {
+    await run({ parent, repository: { projectRoot, gitCommonDir }, policyPath });
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+}
+
+function writePolicy(path: string, policy: ModelPolicy): Promise<void> {
+  return writeFile(path, `${JSON.stringify(policy)}\n`, { mode: 0o600 });
+}
+
+/** Run one program under a real caller Scope, optionally with a virtual Clock. */
+function runCanonical<A, E>(
+  program: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path | Scope.Scope>,
+  clock?: Clock.Clock,
+): Promise<A> {
+  const withClock =
+    clock === undefined ? program : Effect.provideService(program, Clock.Clock, clock);
+  return Effect.runPromise(Effect.scoped(withClock).pipe(Effect.provide(liveLayer)));
+}
+
+function initialWorkstream(f: Fixture, coordinator = COORDINATOR): Workstream {
+  const statement = "Own the canonical runtime.";
+  const first: Intent = {
+    statement,
+    constraints: [],
+    grounding: {
+      kind: "human_input_receipt",
+      id: "receipt-1",
+      sessionId: coordinator.sessionId,
+      sessionFile: coordinator.sessionFile,
+      source: "interactive",
+      text: statement,
+      receivedAt: T0,
+    },
+    recordedAt: T0,
+  };
+  return createWorkstream({
+    id: ID,
+    purpose: statement,
+    repository: f.repository,
+    coordinator,
+    intent: first,
+    createdAt: T0,
+  });
+}
+
+function canonicalCreate(f: Fixture, coordinator = COORDINATOR) {
+  return CanonicalWorkstreamStore.create(initialWorkstream(f, coordinator)).pipe(
+    Effect.map((attachment) => attachment.store),
+  );
+}
+
+function openStore(f: Fixture) {
+  return CanonicalWorkstreamStore.open(ID, f.repository).pipe(
+    Effect.map((attachment) => attachment.store),
+  );
+}
+
+function acquire(
+  f: Fixture,
+  coordinator: CoordinatorIdentity = COORDINATOR,
+  extra: Partial<CanonicalRuntimeAcquisition> = {},
+): Effect.Effect<
+  CanonicalRuntime,
+  CanonicalRuntimeError,
+  FileSystem.FileSystem | Path.Path | Scope.Scope
+> {
+  return CanonicalRuntime.acquire({
+    id: ID,
+    repository: f.repository,
+    coordinator,
+    policyPath: f.policyPath,
+    driver: INERT_DRIVER,
+    ...extra,
+  });
+}
+
+/**
+ * The explicit inert driver for runtime command tests: it makes no external effect
+ * and never commits, so the transient scheduler stays quiet. Frontier and
+ * timing behavior is exercised separately with controlled drivers.
+ */
+const INERT_DRIVER: ReconciliationDriver = {
+  reconcile: (): Effect.Effect<ReconciliationOutcome> => Effect.succeed({ kind: "waiting" }),
+};
+
+/** The one attachment read plus the ready runtime, in the caller Scope. */
+function attached(f: Fixture, extra: Partial<CanonicalRuntimeAcquisition> = {}) {
+  return Effect.gen(function* () {
+    const store = yield* canonicalCreate(f);
+    const runtime = yield* acquire(f, COORDINATOR, extra);
+    return { store, runtime };
+  });
+}
+
+function reported(statement: string): TerminalObservation {
+  return {
+    kind: "reported",
+    observedAt: T0,
+    artifacts: [],
+    deliveryRequestedAt: T0,
+    report: {
+      kind: "research",
+      status: "completed",
+      summary: `${statement} reported.`,
+      evidence: [],
+      findings: [],
+    },
+  };
+}
+
+function waitFor(condition: () => boolean): Effect.Effect<Option.Option<void>> {
+  return Effect.gen(function* () {
+    while (!condition()) yield* Effect.sleep("5 millis");
+  }).pipe(Effect.timeoutOption("3 seconds"));
+}
+
+/** Poll the lease row until its heartbeat advances past `previous`. */
+function renews(
+  store: CanonicalWorkstreamStore,
+  previous: string,
+): Effect.Effect<Option.Option<void>, CanonicalStoreError, FileSystem.FileSystem> {
+  return Effect.gen(function* () {
+    while (true) {
+      const lease = yield* store.observeLease();
+      if (lease !== undefined && lease.heartbeatAt !== previous) return;
+      yield* Effect.sleep("5 millis");
+    }
+  }).pipe(Effect.timeoutOption("3 seconds"));
+}
+
+/** Fault-inject one real SQLite row through this test's own private handle. */
+function rawUpdate(path: string, statement: string, ...parameters: Array<string | number>): void {
+  const database = new DatabaseSync(path);
+  try {
+    database.prepare(statement).run(...parameters);
+  } finally {
+    database.close();
+  }
+}
+
+function models(attempts: readonly Attempt[]): string[] {
+  return attempts.map((attempt) =>
+    attempt.selection.role === "implementation"
+      ? attempt.selection.guide.model
+      : attempt.selection.target.model,
+  );
+}
+
+/** Release the exact held lease from an independent, already-closed probe handle. */
+function releaseLeaseExternally(
+  f: Fixture,
+): Effect.Effect<void, CanonicalStoreError, FileSystem.FileSystem | Path.Path> {
+  return Effect.scoped(
+    Effect.gen(function* () {
+      const probe = yield* openStore(f);
+      const lease = yield* probe.observeLease();
+      assert.ok(lease !== undefined);
+      yield* probe.releaseLease(lease);
+    }),
+  );
+}
+
+/** Open file descriptors in this process that resolve to the exact storage path. */
+function handleCount(path: string): number {
+  let count = 0;
+  for (const descriptor of readdirSync("/proc/self/fd"))
+    try {
+      if (readlinkSync(join("/proc/self/fd", descriptor)) === path) count += 1;
+    } catch {
+      // A descriptor can close between listing and reading; ignore it.
+    }
+  return count;
+}
+
+void test("acquisition fences exactly one lease and rejects identity or unproven takeover", async () => {
+  await withFixture(async (f) => {
+    const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+    await Effect.runPromise(clock.setTime(START_MILLIS));
+    const observed = await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* canonicalCreate(f);
+        yield* store.acquireLease(COORDINATOR);
+        const lease = yield* store.observeLease();
+        assert.ok(lease !== undefined);
+        return lease;
+      }),
+      clock,
+    );
+
+    const identity = await runCanonical(Effect.flip(acquire(f, OTHER)), clock);
+    assert.ok(identity instanceof CanonicalRuntimeIdentityError);
+    // An unexpired lease is not replaceable even with caller-supplied death proof.
+    const live = await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* openStore(f);
+        const failure = yield* Effect.flip(acquire(f, COORDINATOR, { priorOwnerLiveness: "dead" }));
+        return { failure, lease: yield* store.observeLease() };
+      }),
+      clock,
+    );
+    assert.ok(live.failure instanceof CanonicalStoreConflictError);
+    assert.deepEqual(live.lease, observed);
+
+    // Alive, unknown, and omitted liveness all remain insufficient after expiry.
+    await Effect.runPromise(clock.setTime(START_MILLIS + 30_001));
+    for (const priorOwnerLiveness of ["alive", "unknown"] as const)
+      assert.ok(
+        (await runCanonical(
+          Effect.flip(acquire(f, COORDINATOR, { priorOwnerLiveness })),
+          clock,
+        )) instanceof CanonicalRuntimeLeaseError,
+        priorOwnerLiveness,
+      );
+    assert.ok(
+      (await runCanonical(Effect.flip(acquire(f, COORDINATOR)), clock)) instanceof
+        CanonicalRuntimeLeaseError,
+    );
+    // Failed acquisitions left the exact observed lease and aggregate untouched.
+    const untouched = await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* openStore(f);
+        assert.deepEqual(yield* store.observeLease(), observed);
+        return yield* store.read();
+      }),
+      clock,
+    );
+    assert.equal(untouched.revision, 0);
+
+    const taken = await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* openStore(f);
+        const runtime = yield* acquire(f, COORDINATOR, { priorOwnerLiveness: "dead" });
+        yield* runtime.checkOwnership();
+        assert.equal((yield* runtime.snapshot()).revision, 0);
+        const state = yield* runtime.enqueue({
+          kind: "research",
+          objective: "Ready",
+          expectedEvidence: ["evidence"],
+        });
+        const lease = yield* store.observeLease();
+        yield* runtime.close();
+        assert.equal(yield* store.observeLease(), undefined);
+        return { state, lease };
+      }),
+      clock,
+    );
+    assert.equal(taken.lease?.owner.sessionId, COORDINATOR.sessionId);
+    assert.notEqual(taken.lease?.token, observed.token);
+    assert.equal(taken.state.revision, 1);
+  });
+});
+
+void test("the caller Scope owns runtime lifetime: abandonment closes it and another runtime reacquires", async () => {
+  await withFixture(async (f) => {
+    await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* canonicalCreate(f);
+        // The acquisition Scope escapes immediately, so the runtime is already
+        // closed: fibers joined, lease released, SQLite handle closed.
+        const escaped = yield* Effect.scoped(acquire(f));
+        yield* escaped.awaitClosed();
+        const stopped = yield* Effect.flip(
+          escaped.enqueue({ kind: "research", objective: "Late", expectedEvidence: ["evidence"] }),
+        );
+        assert.ok(stopped instanceof CanonicalRuntimeStoppedError);
+        assert.equal(yield* store.observeLease(), undefined);
+        assert.equal((yield* store.read()).revision, 0);
+
+        // One explicitly parallel caller Scope owns the runtime, so scope close
+        // races the runtime's own finalizer through the shared idempotent
+        // shutdown claim. Close completes, the exact lease is gone, and no
+        // heartbeat revives it.
+        const parallel = yield* Scope.make("parallel");
+        const leased = yield* acquire(f, COORDINATOR, { heartbeatInterval: "10 millis" }).pipe(
+          Scope.provide(parallel),
+        );
+        assert.notEqual(yield* store.observeLease(), undefined);
+        yield* Scope.close(parallel, Exit.void);
+        yield* leased.awaitClosed();
+        assert.equal(yield* store.observeLease(), undefined);
+        yield* Effect.sleep("60 millis");
+        assert.equal(yield* store.observeLease(), undefined);
+        assert.equal((yield* store.read()).revision, 0);
+
+        // Independent reacquisition succeeds on the released exact lease.
+        const runtime = yield* acquire(f);
+        const state = yield* runtime.enqueue({
+          kind: "research",
+          objective: "Reacquired",
+          expectedEvidence: ["evidence"],
+        });
+        assert.equal(state.revision, 1);
+        yield* runtime.close();
+        assert.equal(yield* store.observeLease(), undefined);
+      }),
+    );
+  });
+});
+
+void test("commands materialize atomically while every public projection stays a defensive clone", async () => {
+  await withFixture(async (f) => {
+    await runCanonical(
+      Effect.gen(function* () {
+        const { store, runtime } = yield* attached(f);
+
+        // Two valid coordinator commands issued concurrently through one runtime
+        // must be serialized by the shared Semaphore: snapshot planning cannot
+        // let both commands observe the same revision, so both succeed with
+        // consecutive revisions and one durable Task each.
+        const [alpha, beta] = yield* Effect.all(
+          [
+            runtime.enqueue({
+              kind: "research",
+              objective: "Alpha",
+              expectedEvidence: ["alpha evidence"],
+              selection: { count: 3 },
+            }),
+            runtime.enqueue({
+              kind: "review",
+              objective: "Beta",
+              subject: { kind: "revision", revision: BASE_REVISION },
+              concern: "Exact review.",
+              selection: { count: 2, distinctModels: true },
+            }),
+          ],
+          { concurrency: "unbounded" },
+        );
+        assert.deepEqual(
+          [alpha.revision, beta.revision].sort((left, right) => left - right),
+          [1, 2],
+        );
+        const durable = yield* runtime.read();
+        assert.equal(durable.revision, 2);
+        assert.equal(new Set(durable.tasks.map((task) => task.id)).size, 2);
+        const researchTask = durable.tasks.find((task) => task.kind === "research");
+        const reviewTask = durable.tasks.find((task) => task.kind === "review");
+        assert.ok(researchTask !== undefined && reviewTask !== undefined);
+        assert.equal(researchTask.attempts.length, 3);
+        assert.deepEqual(models(reviewTask.attempts), ["fixture/review", "fixture/review-2"]);
+
+        // Mutating a returned projection never reaches the runtime's snapshot.
+        const snapshot = yield* runtime.snapshot();
+        snapshot.revision = 999;
+        snapshot.tasks.length = 0;
+        const read = yield* runtime.read();
+        read.revision = 998;
+        assert.equal((yield* runtime.snapshot()).revision, 2);
+
+        // Cross-kind fields are rejected without writing anything at all.
+        const bytes = yield* Effect.promise(() => readFile(store.path));
+        const invalid = yield* Effect.flip(
+          runtime.enqueue({
+            kind: "research",
+            objective: "Bad fields",
+            expectedEvidence: ["evidence"],
+            acceptance: ["not a research field"],
+          }),
+        );
+        assert.ok(invalid instanceof CanonicalRuntimeOperationError);
+        assert.deepEqual(yield* Effect.promise(() => readFile(store.path)), bytes);
+        assert.equal((yield* runtime.read()).revision, 2);
+        yield* runtime.close();
+      }),
+    );
+  });
+});
+
+void test("queue planning resolves policy-owned selections, atomic fanout, and configured consultation", async () => {
+  await withFixture(async (f) => {
+    await runCanonical(
+      Effect.gen(function* () {
+        const { store, runtime } = yield* attached(f);
+
+        const research = yield* runtime.enqueue({
+          kind: "research",
+          objective: "Default research",
+          expectedEvidence: ["evidence"],
+        });
+        assert.deepEqual(research.tasks[0]?.attempts[0]?.selection, {
+          role: "research",
+          target: RESEARCH,
+          source: "policy",
+        });
+        const implementation = yield* runtime.enqueue({
+          kind: "implementation",
+          objective: "Implement",
+          acceptance: ["accepted"],
+          baseRevision: BASE_REVISION,
+        });
+        const impl = implementation.tasks[1]?.attempts[0];
+        assert.equal(impl?.selection.role, "implementation");
+        assert.deepEqual(impl?.selection.guide, { model: "fixture/guide", thinking: "low" });
+        assert.deepEqual(impl?.selection.executor, {
+          model: "fixture/executor",
+          thinking: "xhigh",
+        });
+        assert.equal(impl?.baseRevision, BASE_REVISION);
+
+        const unconfigured = yield* Effect.flip(
+          runtime.enqueue({
+            kind: "implementation",
+            objective: "Escalate without configuration",
+            acceptance: ["accepted"],
+            useEscalationExecutor: true,
+          }),
+        );
+        assert.ok(unconfigured instanceof CanonicalRuntimeOperationError);
+        yield* Effect.promise(() => writePolicy(f.policyPath, ESCALATED_POLICY));
+        const escalated = yield* runtime.enqueue({
+          kind: "implementation",
+          objective: "Escalate",
+          acceptance: ["accepted"],
+          useEscalationExecutor: true,
+        });
+        assert.deepEqual(escalated.tasks[2]?.attempts[0]?.selection, {
+          role: "implementation",
+          guide: { model: "fixture/guide", thinking: "low" },
+          executor: { model: "fixture/escalation", thinking: "max" },
+          source: "policy",
+        });
+
+        // Consultation is one policy-owned advisor: the first configured target by
+        // default, or the exact configured target with its policy-owned thinking.
+        const defaultAdvisor = yield* runtime.enqueue({
+          kind: "consultation",
+          objective: "Advise by default",
+          context: "Coordinator-known context.",
+        });
+        assert.deepEqual(defaultAdvisor.tasks[3]?.attempts[0]?.selection, {
+          role: "consultation",
+          target: { model: "fixture/advisor", thinking: "off" },
+          source: "policy",
+        });
+        const selectedAdvisor = yield* runtime.enqueue({
+          kind: "consultation",
+          objective: "Advise explicitly",
+          advisorModel: "fixture/advisor-2",
+        });
+        assert.deepEqual(selectedAdvisor.tasks[4]?.attempts[0]?.selection, {
+          role: "consultation",
+          target: { model: "fixture/advisor-2", thinking: "medium" },
+          source: "policy",
+        });
+        const beforeUnknown = yield* runtime.read();
+        const unknownAdvisor = yield* Effect.flip(
+          runtime.enqueue({
+            kind: "consultation",
+            objective: "Advise unknown",
+            advisorModel: "fixture/unknown",
+          }),
+        );
+        assert.ok(unknownAdvisor instanceof CanonicalRuntimeOperationError);
+        assert.deepEqual(yield* runtime.read(), beforeUnknown);
+
+        // The append batch is atomic: settle the first Attempt, then append N with
+        // only the first carrying the requested continuation.
+        const task = research.tasks[0];
+        assert.ok(task !== undefined);
+        const attemptId = task.attempts[0]?.id;
+        assert.ok(attemptId !== undefined);
+        const key = { taskId: task.id, attemptId };
+        const lease = yield* store.observeLease();
+        assert.ok(lease !== undefined);
+        yield* store.transition(lease, (current) =>
+          terminalizeAttempt(current, key, reported("Continuation"), T0),
+        );
+        yield* store.transition(lease, (current) => recordDeliverySuccess(current, key, T0, T0));
+        const batchBase = yield* runtime.read();
+        const appended = yield* runtime.appendAttempts({
+          taskId: task.id,
+          continuationOf: attemptId,
+          selection: { count: 2 },
+        });
+        const attempts = appended.tasks[0]?.attempts ?? [];
+        assert.equal(appended.revision, batchBase.revision + 1);
+        assert.equal(attempts.length, 3);
+        assert.equal(attempts[0]?.state, "finished");
+        assert.equal(attempts[1]?.continuationOf, attemptId);
+        assert.equal(attempts[2]?.continuationOf, undefined);
+        assert.deepEqual(models(attempts.slice(1)), ["fixture/research", "fixture/research"]);
+        yield* runtime.close();
+      }),
+    );
+  });
+});
+
+void test("canonical queue schemas remain the strict kind-owned command owner", () => {
+  assert.equal(
+    Value.Check(CanonicalEnqueueCommandSchema, {
+      kind: "research",
+      objective: "Research",
+      expectedEvidence: ["evidence"],
+      acceptance: ["not a research field"],
+    }),
+    false,
+  );
+  assert.equal(
+    Value.Check(CanonicalAppendCommandSchema, { taskId: "task", selection: { model: "any" } }),
+    false,
+  );
+});
+
+void test("a stale projection writes nothing until an authoritative read refreshes it", async () => {
+  await withFixture(async (f) => {
+    await runCanonical(
+      Effect.gen(function* () {
+        const { store, runtime } = yield* attached(f);
+        const first = yield* runtime.enqueue({
+          kind: "research",
+          objective: "First",
+          expectedEvidence: ["evidence"],
+        });
+        assert.equal(first.revision, 1);
+        const direct = createTask(
+          first,
+          {
+            kind: "research",
+            id: "task-direct",
+            objective: "Direct store commit.",
+            intentIndex: 0,
+            createdAt: T0,
+            expectedEvidence: ["evidence"],
+            attempts: [
+              {
+                id: "attempt-direct",
+                state: "queued",
+                createdAt: T0,
+                updatedAt: T0,
+                selection: { role: "research", target: RESEARCH, source: "policy" },
+              },
+            ],
+          },
+          T0,
+        );
+
+        // A direct store commit advances the authoritative aggregate behind the
+        // runtime's committed projection.
+        const lease = yield* store.observeLease();
+        assert.ok(lease !== undefined);
+        yield* store.transition(lease, () => direct);
+        assert.equal((yield* runtime.snapshot()).revision, 1);
+        const bytes = yield* Effect.promise(() => readFile(store.path));
+        const stale = yield* Effect.flip(
+          runtime.enqueue({ kind: "research", objective: "Stale", expectedEvidence: ["evidence"] }),
+        );
+        assert.ok(stale instanceof CanonicalRuntimeStaleError);
+        assert.deepEqual(yield* Effect.promise(() => readFile(store.path)), bytes);
+        // The failed command left the projection untouched; only a read refreshes.
+        assert.equal((yield* runtime.snapshot()).revision, 1);
+        const refreshed = yield* runtime.read();
+        assert.equal(refreshed.revision, 2);
+        assert.equal(refreshed.tasks.length, 2);
+        assert.equal((yield* runtime.snapshot()).revision, 2);
+
+        const retried = yield* runtime.enqueue({
+          kind: "research",
+          objective: "Retried",
+          expectedEvidence: ["evidence"],
+        });
+        assert.equal(retried.revision, 3);
+        assert.equal(retried.tasks.length, 3);
+        assert.equal((yield* runtime.snapshot()).revision, 3);
+        yield* runtime.close();
+      }),
+    );
+  });
+});
+
+void test("one shutdown boundary owns heartbeat, explicit close, close races, and interruption", async () => {
+  await withFixture(async (f) => {
+    await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* canonicalCreate(f);
+
+        // Explicit close is idempotent and no heartbeat survives it to re-create
+        // the released lease.
+        const first = yield* acquire(f, COORDINATOR, { heartbeatInterval: "10 millis" });
+        yield* first.close();
+        yield* first.close();
+        yield* first.awaitClosed();
+        assert.equal(yield* store.observeLease(), undefined);
+        yield* Effect.sleep("60 millis");
+        assert.equal(yield* store.observeLease(), undefined);
+
+        // Every committed raced command is exactly one Task with one Attempt, and
+        // the aggregate never advances without that Task.
+        for (let index = 0; index < 3; index += 1) {
+          const runtime = yield* acquire(f, COORDINATOR, { heartbeatInterval: "10 millis" });
+          yield* Effect.all(
+            [
+              runtime.close(),
+              runtime
+                .enqueue({
+                  kind: "research",
+                  objective: `Race ${index}`,
+                  expectedEvidence: ["evidence"],
+                })
+                .pipe(Effect.exit),
+            ],
+            { concurrency: "unbounded" },
+          );
+          yield* runtime.awaitClosed();
+          assert.equal(yield* store.observeLease(), undefined);
+          const state = yield* store.read();
+          assert.equal(state.revision, state.tasks.length);
+          for (const task of state.tasks) assert.equal(task.attempts.length, 1);
+        }
+
+        // Caller interruption cancels a command through ordinary fiber interruption
+        // and leaves the runtime usable and leased.
+        const runtime = yield* acquire(f);
+        const fiber = yield* Effect.forkChild(
+          runtime
+            .enqueue({ kind: "research", objective: "Interrupted", expectedEvidence: ["evidence"] })
+            .pipe(Effect.exit),
+        );
+        yield* Fiber.interrupt(fiber);
+        const interrupted = yield* runtime.read();
+        assert.ok(interrupted.revision === 0 || interrupted.revision === 1);
+        const next = yield* runtime.enqueue({
+          kind: "research",
+          objective: "After interruption",
+          expectedEvidence: ["evidence"],
+        });
+        assert.equal(next.revision, interrupted.revision + 1);
+        yield* runtime.close();
+        assert.equal(yield* store.observeLease(), undefined);
+
+        // A divergent aggregate row is invisible to lease-only renewal and to a
+        // lease-scoped ownership check; a heartbeat or ownership check that
+        // reloaded history would fail and close the runtime.
+        const beating = yield* acquire(f, COORDINATOR, { heartbeatInterval: "10 millis" });
+        const lease = yield* store.observeLease();
+        assert.ok(lease !== undefined);
+        rawUpdate(store.path, "UPDATE workstream SET revision=? WHERE singleton=1", 99);
+        yield* beating.checkOwnership();
+        const readFailure = yield* Effect.flip(beating.read());
+        assert.ok(readFailure instanceof CanonicalStoreInvalidError);
+        assert.ok(Option.isSome(yield* renews(store, lease.heartbeatAt)), "expected a heartbeat");
+        yield* beating.close();
+        assert.equal(yield* store.observeLease(), undefined);
+      }),
+    );
+  });
+});
+
+void test("fatal lease loss reports one typed episode, closes once, and permits reacquisition", async () => {
+  await withFixture(async (f) => {
+    await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* canonicalCreate(f);
+        let fatal: CanonicalRuntimeError | undefined;
+        let fatalCalls = 0;
+        const runtime = yield* acquire(f, COORDINATOR, {
+          heartbeatInterval: "10 millis",
+          onFatal: (error) =>
+            Effect.sync(() => {
+              fatalCalls += 1;
+              fatal = error;
+            }),
+        });
+        yield* releaseLeaseExternally(f);
+        assert.ok(Option.isSome(yield* waitFor(() => fatal !== undefined)));
+        assert.equal(fatalCalls, 1);
+        assert.ok(fatal instanceof CanonicalStoreConflictError);
+        yield* runtime.awaitClosed();
+        const stopped = yield* Effect.flip(
+          runtime.enqueue({ kind: "research", objective: "Late", expectedEvidence: ["evidence"] }),
+        );
+        assert.ok(stopped instanceof CanonicalRuntimeStoppedError);
+        yield* runtime.close();
+        yield* runtime.close();
+
+        // Removing the lease table fails both renewal (the fatal episode) and the
+        // lease-release finalizer, combined into one typed report.
+        let combined: CanonicalRuntimeError | undefined;
+        let combinedCalls = 0;
+        const failing = yield* acquire(f, COORDINATOR, {
+          heartbeatInterval: "10 millis",
+          onFatal: (error) =>
+            Effect.sync(() => {
+              combinedCalls += 1;
+              combined = error;
+            }),
+        });
+        rawUpdate(store.path, "DROP TABLE lease");
+        assert.ok(Option.isSome(yield* waitFor(() => combined !== undefined)));
+        assert.equal(combinedCalls, 1);
+        assert.ok(combined instanceof CanonicalRuntimeOperationError);
+        assert.ok(combined.cause instanceof AggregateError);
+        assert.ok(
+          (yield* Effect.flip(failing.awaitClosed())) instanceof CanonicalRuntimeOperationError,
+        );
+        assert.ok((yield* Effect.flip(failing.close())) instanceof CanonicalRuntimeOperationError);
+      }),
+    );
+  });
+});
+
+// The /proc/self/fd table only exists on Linux; elsewhere this check is skipped
+// rather than silently passing without observing closure.
+const FD_SKIP =
+  process.platform === "linux"
+    ? false
+    : `file-descriptor inspection via /proc/self/fd is unavailable on ${process.platform}`;
+
+void test("a fatal close releases the runtime's own SQLite file descriptor", {
+  skip: FD_SKIP,
+}, async () => {
+  await withFixture(async (f) => {
+    const path = await runCanonical(canonicalCreate(f).pipe(Effect.map((store) => store.path)));
+    let fatal: CanonicalRuntimeError | undefined;
+    await runCanonical(
+      Effect.gen(function* () {
+        const runtime = yield* acquire(f, COORDINATOR, {
+          heartbeatInterval: "10 millis",
+          onFatal: (error) =>
+            Effect.sync(() => {
+              fatal = error;
+            }),
+        });
+        assert.ok(handleCount(path) >= 1, "expected the runtime SQLite handle to be open");
+        yield* releaseLeaseExternally(f);
+        assert.ok(Option.isSome(yield* waitFor(() => fatal !== undefined)));
+        yield* runtime.awaitClosed();
+        assert.equal(handleCount(path), 0, "expected the runtime SQLite handle to close");
+      }),
+    );
+  });
+});
+
+void test("one runtime control flow drives the cancellation checkpoint, cleanup, terminalize, and replay", async () => {
+  await withFixture(async (f) => {
+    const SHARED = { kind: "shared_project" as const, path: "/repo" };
+    const requested = { state: "requested" as const, requestedAt: T0, reason: "Stop." };
+    const uncertain = { ...requested, state: "uncertain" as const, dispatchAt: T0 };
+    const observed = {
+      ...uncertain,
+      state: "submitted_or_observed" as const,
+      observedAt: T0,
+      evidence: "done" as const,
+    };
+    const cancelled: TerminalObservation = {
+      kind: "cancelled",
+      observedAt: T0,
+      artifacts: [],
+      deliveryRequestedAt: T0,
+      reason: "Stopped.",
+    };
+    const commits: ReconciliationCommit[] = [];
+    const finishedMutation = (attempt: Attempt): ReconciliationMutation | undefined =>
+      attempt.cleanup?.state === "pending"
+        ? { kind: "checkpoint_cleanup", checkpoint: { state: "completed", workerClosed: true } }
+        : undefined;
+    const activeMutation = (attempt: Attempt): ReconciliationMutation | undefined => {
+      const cancellation = attempt.execution?.cancellation;
+      if (cancellation === undefined)
+        return { kind: "checkpoint_cancellation", checkpoint: requested };
+      if (cancellation.state === "requested")
+        return { kind: "checkpoint_cancellation", checkpoint: uncertain };
+      if (cancellation.state === "uncertain")
+        return { kind: "checkpoint_cancellation", checkpoint: observed };
+      if (attempt.cleanup === undefined)
+        return { kind: "checkpoint_cleanup", checkpoint: { state: "pending", workerClosed: true } };
+      return { kind: "terminalize", observation: cancelled };
+    };
+    const nextMutation = (attempt: Attempt): ReconciliationMutation | undefined => {
+      if (attempt.state === "queued") return { kind: "activate", placement: SHARED };
+      if (attempt.state === "finished") return finishedMutation(attempt);
+      return activeMutation(attempt);
+    };
+    // The target Task's objective is the deterministic selector: the second Task is
+    // deliberately left untouched so exact-key notification is observable.
+    const driver: ReconciliationDriver = {
+      reconcile: (_entry, control) =>
+        Effect.gen(function* () {
+          if (control.context().task.objective !== "Cancellable")
+            return { kind: "waiting" } as const;
+          const mutation = nextMutation(control.context().attempt);
+          if (mutation === undefined) return { kind: "waiting" } as const;
+          commits.push(yield* control.commit(mutation));
+          // A replayed terminalize is a durable no-op: no revision and no notify.
+          if (mutation.kind === "terminalize") commits.push(yield* control.commit(mutation));
+          return { kind: "waiting" } as const;
+        }),
+    };
+
+    await runCanonical(
+      Effect.gen(function* () {
+        const { runtime } = yield* attached(f, { driver });
+        const target = yield* runtime.enqueue({
+          kind: "research",
+          objective: "Cancellable",
+          expectedEvidence: ["evidence"],
+        });
+        const other = yield* runtime.enqueue({
+          kind: "research",
+          objective: "Untouched",
+          expectedEvidence: ["evidence"],
+        });
+        const taskId = target.tasks[0]?.id ?? assert.fail("target task");
+        const attemptId = target.tasks[0]?.attempts[0]?.id ?? assert.fail("target attempt");
+        const otherId = other.tasks[1]?.attempts[0]?.id ?? assert.fail("other attempt");
+
+        const settled = Effect.gen(function* () {
+          while (true) {
+            const state = yield* runtime.snapshot();
+            const attempt = state.tasks[0]?.attempts[0];
+            if (attempt?.state === "finished" && attempt.cleanup?.state === "completed") return;
+            yield* Effect.sleep("5 millis");
+          }
+        }).pipe(Effect.timeoutOption("3 seconds"));
+        assert.equal(Option.isSome(yield* settled), true);
+
+        // Each control commit advanced exactly one durable revision; the replayed
+        // terminalize produced one no-op receipt without a revision or a notify.
+        const revisions: number[] = [];
+        let firstReceiptKey: unknown;
+        let noChanges = 0;
+        for (const item of commits)
+          if (item.kind === "committed") {
+            revisions.push(item.receipt.revision);
+            firstReceiptKey ??= item.receipt.key;
+          } else noChanges += 1;
+        assert.equal(noChanges, 1);
+        assert.equal(revisions.length, 7);
+        for (let index = 1; index < revisions.length; index += 1)
+          assert.equal(revisions[index], (revisions[index - 1] ?? 0) + 1);
+        assert.deepEqual(firstReceiptKey, { taskId, attemptId });
+
+        // The committed projection and the authoritative read agree on the exact
+        // terminal facts; the snapshot is a write-through, never authority.
+        const projection = yield* runtime.snapshot();
+        const authoritative = yield* runtime.read();
+        assert.deepEqual(authoritative, projection);
+        assert.equal(projection.revision, revisions.at(-1));
+        const attempt = projection.tasks[0]?.attempts[0];
+        assert.equal(attempt?.state, "finished");
+        assert.equal(attempt?.outcome?.kind, "cancelled");
+        assert.equal(attempt?.execution?.cancellation?.state, "submitted_or_observed");
+        assert.equal(attempt?.cleanup?.state, "completed");
+        assert.equal(attempt?.cleanup?.workerClosed, true);
+
+        // Exact-key progression: only the target key advanced to its retained
+        // pending delivery, while the untouched Attempt stays queued.
+        const entries = yield* runtime.frontierSnapshot();
+        assert.deepEqual(
+          entries.filter((item) => item.key.attemptId === attemptId).map((item) => item.kind),
+          ["delivery"],
+        );
+        assert.deepEqual(
+          entries.filter((item) => item.key.attemptId === otherId).map((item) => item.kind),
+          ["queued"],
+        );
+        yield* runtime.close();
+      }),
+    );
+  });
+});

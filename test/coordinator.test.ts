@@ -842,7 +842,7 @@ void test("mutation responses stay action-focused while retaining handles, model
       id: "focused-research",
       question: "Inspect the focused fixture",
       expectedEvidence: ["bytes"],
-      selection: { model: "fixture/research" },
+      selection: { count: 1 },
     });
     const firstText = decodeTestValue(textContentSchema, first.content[0]).text;
     const firstView = decodeTestValue(actionDetailsSchema, first.details).view;
