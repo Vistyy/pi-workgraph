@@ -824,6 +824,7 @@ function coordinatorEnvironment(env: HerdrProcessEnvironment) {
     result.PI_CODING_AGENT_DIR = agentDirectory;
   for (const key of [
     "PI_WORKGRAPH_MODE",
+    "PI_WORKGRAPH_POLICY_ROLE",
     "PI_WORKGRAPH_RUN_ID",
     "PI_WORKGRAPH_NODE_ID",
     "PI_WORKGRAPH_BASE_COMMIT",

@@ -437,8 +437,9 @@ await test("consultation launches one advisor with direct context and retains on
         request.model,
         request.thinking,
         workerEnvironment(request, "PI_WORKGRAPH_MODE"),
+        workerEnvironment(request, "PI_WORKGRAPH_POLICY_ROLE"),
       ],
-      ["research", "fixture/policy-advisor-2", "medium", "research"],
+      ["research", "fixture/policy-advisor-2", "medium", "research", "consultation"],
     );
     const advisorSession = JSON.stringify(SessionManager.open(request.sessionFile).getBranch());
     assert.equal(advisorSession.split("Which file strategy should be retained").length - 1, 1);

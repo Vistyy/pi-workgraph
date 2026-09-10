@@ -111,6 +111,7 @@ async function fixture(
   actions: Partial<ExtensionActions> = {},
   experiment = false,
   extensionFactories: InlineExtension[] = [],
+  policyRole?: "implementation" | "research" | "review" | "experiment" | "consultation",
 ) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
   const root = join(parent, "repo");
@@ -124,6 +125,7 @@ async function fixture(
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_MODE: mode,
+    PI_WORKGRAPH_POLICY_ROLE: policyRole ?? null,
     PI_WORKGRAPH_RUN_ID: "fixture",
     PI_WORKGRAPH_NODE_ID: "attempt",
     PI_WORKGRAPH_BASE_COMMIT: await git(root, "rev-parse", "HEAD"),
@@ -284,7 +286,7 @@ function messageText(message: { content: unknown }): string {
     .join("\\n");
 }
 
-void test("worker guidance is persisted once per phase and restored once after compaction", async () => {
+void test("worker policy is stable while phase and recovery context are persisted only when needed", async () => {
   const deliveries: Array<{
     customType: string;
     content: unknown;
@@ -319,34 +321,36 @@ void test("worker guidance is persisted once per phase and restored once after c
     const first = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
       cwd: session.getCwd(),
     });
-    const guide = first?.messages?.find((message) => message.customType === "pi-workgraph-guide");
-    assert.ok(guide !== undefined);
-    assert.match(messageText(guide), /Approach: Inspect the worker extension/);
-    assert.match(messageText(guide), /meaningful verification/);
-    assert.match(messageText(guide), /navigation only/);
-    assert.match(messageText(guide), /Acceptance: preserve the exact acceptance text/);
-    assert.match(messageText(guide), /Constraints: preserve the exact constraints text/);
-    session.appendCustomMessageEntry(guide.customType, guide.content, guide.display, guide.details);
-    assert.equal(
-      await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
-        cwd: session.getCwd(),
-      }),
-      undefined,
+    assert.match(first?.systemPrompt ?? "", /\[WORKGRAPH IMPLEMENTATION WORKER POLICY\]/);
+    assert.match(first?.systemPrompt ?? "", /\[GUIDE PHASE RULES\]/);
+    assert.match(first?.systemPrompt ?? "", /\[EXECUTOR PHASE RULES\]/);
+    const guide = first?.messages?.find(
+      (message) => message.customType === "pi-workgraph-worker-phase",
     );
+    assert.ok(guide !== undefined);
+    assert.match(messageText(guide), /Current phase: guide/);
+    assert.doesNotMatch(messageText(guide), /Current plan|Acceptance:|Constraints:/);
+    session.appendCustomMessageEntry(guide.customType, guide.content, guide.display, guide.details);
+
+    const repeated = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+      cwd: session.getCwd(),
+    });
+    assert.equal(repeated?.systemPrompt, first?.systemPrompt);
+    assert.equal(repeated?.messages?.length ?? 0, 0);
 
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
     await f.runner.emit({ type: "session_start", reason: "reload" });
-    assert.equal(
-      await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
-        cwd: session.getCwd(),
-      }),
-      undefined,
-    );
+    const reloaded = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+      cwd: session.getCwd(),
+    });
+    assert.equal(reloaded?.systemPrompt, first?.systemPrompt);
+    assert.equal(reloaded?.messages?.length ?? 0, 0);
     assert.equal(
       session
         .getBranch()
         .filter(
-          (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-guide",
+          (entry) =>
+            entry.type === "custom_message" && entry.customType === "pi-workgraph-worker-phase",
         ).length,
       1,
     );
@@ -367,34 +371,132 @@ void test("worker guidance is persisted once per phase and restored once after c
       willRetry: false,
     });
     assert.equal(deliveries.length, 1);
-    assert.equal(deliveries[0]?.customType, "pi-workgraph-guide");
-    assert.match(messageText(deliveries[0] ?? { content: undefined }), /Current plan/);
-    assert.match(
-      messageText(deliveries[0] ?? { content: undefined }),
-      /Acceptance: preserve the exact acceptance text/,
-    );
-    assert.equal(
-      await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
-        cwd: session.getCwd(),
-      }),
-      undefined,
-    );
+    assert.equal(deliveries[0]?.customType, "pi-workgraph-worker-recovery");
+    const recovery = messageText(deliveries[0] ?? { content: undefined });
+    assert.match(recovery, /Current phase: guide/);
+    assert.match(recovery, /Current plan/);
+    assert.match(recovery, /Acceptance: preserve the exact acceptance text/);
+    assert.doesNotMatch(recovery, /\[GUIDE PHASE RULES\]|\[EXECUTOR PHASE RULES\]/);
+    const afterRecovery = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+      cwd: session.getCwd(),
+    });
+    assert.equal(afterRecovery?.systemPrompt, first?.systemPrompt);
+    assert.equal(afterRecovery?.messages?.length ?? 0, 0);
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
     await f.runner.emit({ type: "session_start", reason: "reload" });
     assert.equal(deliveries.length, 1);
-    assert.equal(
-      session
-        .getBranch()
-        .filter(
-          (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-guide",
-        ).length,
-      2,
-    );
+
+    await writeFile(join(f.root, "value.txt"), "after\n");
+    await f.runner.emit({
+      type: "tool_execution_end",
+      toolCallId: "write",
+      toolName: "write",
+      result: {},
+      isError: false,
+    });
+    assert.equal(deliveries[1]?.customType, "pi-workgraph-worker-phase");
+    assert.match(messageText(deliveries[1] ?? { content: undefined }), /Current phase: executor/);
+    const executorKept = session.appendMessage({
+      role: "user",
+      content: "After executor compaction",
+      timestamp: fixtureTimestamp,
+    });
+    session.appendCompaction("Executor compacted", executorKept, 100);
+    const executorCompaction = session.getLeafEntry();
+    assert.ok(executorCompaction?.type === "compaction");
+    await f.runner.emit({
+      type: "session_compact",
+      compactionEntry: executorCompaction,
+      fromExtension: false,
+      reason: "manual",
+      willRetry: false,
+    });
+    assert.equal(deliveries[2]?.customType, "pi-workgraph-worker-recovery");
+    assert.match(messageText(deliveries[2] ?? { content: undefined }), /Current phase: executor/);
   } finally {
     session = undefined;
     await f.dispose();
   }
 });
+
+for (const [mode, experiment, policyHeader, policyRole] of [
+  ["research", false, "[WORKGRAPH RESEARCH WORKER POLICY]", undefined],
+  ["research", true, "[WORKGRAPH EXPERIMENT WORKER POLICY]", undefined],
+  ["review", false, "[WORKGRAPH REVIEW WORKER POLICY]", undefined],
+  ["research", false, "[WORKGRAPH CONSULTATION ADVISOR POLICY]", "consultation"],
+] as const) {
+  void test(`${policyRole ?? (experiment ? "experiment" : mode)} worker restores only its objective after compaction`, async () => {
+    const deliveries: Array<{
+      customType: string;
+      content: unknown;
+      display: boolean;
+      details?: unknown;
+    }> = [];
+    let session: SessionManager | undefined;
+    const f = await fixture(
+      mode,
+      false,
+      {
+        sendMessage(message) {
+          deliveries.push(message);
+          session?.appendCustomMessageEntry(
+            message.customType,
+            message.content,
+            message.display,
+            message.details,
+          );
+        },
+      },
+      experiment,
+      [],
+      policyRole,
+    );
+    session = f.session;
+    try {
+      const objective = `[WORKGRAPH ${mode.toUpperCase()} OBJECTIVE]\nPreserve this exact objective.`;
+      session.appendCustomMessageEntry("pi-workgraph-objective", objective, true, {
+        runId: "fixture",
+        nodeId: "attempt",
+        mode,
+      });
+      await f.runner.emit({ type: "session_start", reason: "startup" });
+      const initial = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+        cwd: session.getCwd(),
+      });
+      assert.equal(initial?.systemPrompt?.includes(policyHeader), true);
+      assert.equal(initial?.messages?.length ?? 0, 0);
+
+      const kept = session.appendMessage({
+        role: "user",
+        content: "After compaction",
+        timestamp: fixtureTimestamp,
+      });
+      session.appendCompaction("Compacted", kept, 100);
+      const compaction = session.getLeafEntry();
+      assert.ok(compaction?.type === "compaction");
+      await f.runner.emit({
+        type: "session_compact",
+        compactionEntry: compaction,
+        fromExtension: false,
+        reason: "manual",
+        willRetry: false,
+      });
+      assert.equal(deliveries.length, 1);
+      assert.equal(deliveries[0]?.customType, "pi-workgraph-worker-recovery");
+      const recovery = messageText(deliveries[0] ?? { content: undefined });
+      assert.match(recovery, /Preserve this exact objective/);
+      assert.doesNotMatch(recovery, /WORKER POLICY|Current plan|Current phase/);
+      const repeated = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+        cwd: session.getCwd(),
+      });
+      assert.equal(repeated?.systemPrompt, initial?.systemPrompt);
+      assert.equal(repeated?.messages?.length ?? 0, 0);
+    } finally {
+      session = undefined;
+      await f.dispose();
+    }
+  });
+}
 
 void test("guide assigns monotonic IDs; executor updates local knowledge and cannot replace the full plan", async () => {
   const f = await fixture("implementation");
@@ -1044,7 +1146,7 @@ void test("current-attempt identity, malformed plan state, and bounded reminders
       cwd: f.session.getCwd(),
     });
     const recoveryMessage = recovery?.messages?.find(
-      (message) => message.customType === "pi-workgraph-guide",
+      (message) => message.customType === "pi-workgraph-worker-recovery",
     );
     assert.ok(recoveryMessage !== undefined);
     assert.match(messageText(recoveryMessage), /worker state/);
@@ -1400,7 +1502,47 @@ void test("continued implementation requires this attempt's native start and lat
       nodeId: "prior-attempt",
     });
     assistant(f.session);
+    f.session.appendCustomMessageEntry(
+      "pi-workgraph-objective",
+      "[WORKGRAPH IMPLEMENTATION OBJECTIVE]\nContinue only this exact attempt.",
+      true,
+      { runId: "fixture", nodeId: "attempt", mode: "implementation" },
+    );
+    f.session.appendCustomMessageEntry(
+      "pi-workgraph-executor",
+      "[WORKGRAPH EXECUTOR]\nLegacy executor guidance.",
+      false,
+      { runId: "fixture", nodeId: "attempt" },
+    );
     await f.runner.emit({ type: "session_start", reason: "startup" });
+    const initial = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+      cwd: f.session.getCwd(),
+    });
+    assert.match(initial?.systemPrompt ?? "", /\[WORKGRAPH IMPLEMENTATION WORKER POLICY\]/);
+    const activation = initial?.messages?.find(
+      (message) => message.customType === "pi-workgraph-worker-phase",
+    );
+    assert.ok(activation !== undefined);
+    assert.match(messageText(activation), /Current phase: executor/);
+    f.session.appendCustomMessageEntry(
+      activation.customType,
+      activation.content,
+      activation.display,
+      activation.details,
+    );
+    const repeated = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+      cwd: f.session.getCwd(),
+    });
+    assert.equal(repeated?.messages?.length ?? 0, 0);
+    assert.equal(
+      f.session
+        .getBranch()
+        .filter(
+          (entry) =>
+            entry.type === "custom_message" && entry.customType === "pi-workgraph-executor",
+        ).length,
+      1,
+    );
     await writeFile(join(f.root, "value.txt"), "after\n");
     await git(f.root, "commit", "-am", "Continued change");
     await assert.rejects(f.call("workgraph_report", report), /actual executor assistant message/);

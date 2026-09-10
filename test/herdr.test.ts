@@ -316,6 +316,7 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       HERDR_WORKSPACE_ID: "parent-workspace",
       PI_CODING_AGENT_DIR: join(parent, "private-agent"),
       PI_WORKGRAPH_MODE: "implementation",
+      PI_WORKGRAPH_POLICY_ROLE: "implementation",
       PI_WORKGRAPH_RUN_ID: "parent-run",
       PI_WORKGRAPH_NODE_ID: "parent-attempt",
       PI_WORKGRAPH_BASE_COMMIT: "deadbeef",
@@ -345,6 +346,7 @@ else console.log(JSON.stringify({result:{accepted:true}}));
     assert.ok(create.includes(`PI_CODING_AGENT_DIR=${join(parent, "private-agent")}`));
     for (const key of [
       "PI_WORKGRAPH_MODE",
+      "PI_WORKGRAPH_POLICY_ROLE",
       "PI_WORKGRAPH_RUN_ID",
       "PI_WORKGRAPH_NODE_ID",
       "PI_WORKGRAPH_BASE_COMMIT",

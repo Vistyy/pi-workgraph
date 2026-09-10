@@ -11,6 +11,16 @@ import type {
   WorkerReportInput,
   WorkerSessionMode,
 } from "../src/types.js";
+import {
+  hasActiveObjective,
+  hasActivePhase,
+  hasActiveRecovery,
+  phaseActivationMessage,
+  recoveryMessage,
+  type WorkerObjectiveRestore,
+  type WorkerPolicyRole,
+  workerSystemPolicy,
+} from "../src/worker-context.js";
 import { loadWorkerDisabledTools } from "../src/workgraph-settings.js";
 
 const WorkerEnvironmentConfig = Config.all({
@@ -26,6 +36,7 @@ const WorkerEnvironmentConfig = Config.all({
     Config.withDefault(""),
   ),
   experiment: Config.string("PI_WORKGRAPH_EXPERIMENT").pipe(Config.withDefault("")),
+  policyRole: Config.string("PI_WORKGRAPH_POLICY_ROLE").pipe(Config.withDefault("")),
 });
 
 // One concise, worker-owned plan survives the guide/executor handoff. Status is
@@ -218,11 +229,6 @@ type PlanRestore =
       readonly nextStepNumber: number;
     }
   | { readonly kind: "malformed"; readonly nextStepNumber: number };
-type ObjectiveRestore =
-  | { readonly kind: "absent" }
-  | { readonly kind: "valid"; readonly content: string }
-  | { readonly kind: "malformed" };
-
 const MAX_PLAN_REMINDERS = 2;
 const RECONCILIATION_MESSAGE_TYPE = "pi-workgraph-reconciliation";
 const ObjectiveContentSchema = Type.String();
@@ -402,10 +408,13 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   const environment = Effect.runSync(WorkerEnvironmentConfig.parse(ConfigProvider.fromEnv()));
   const mode = Effect.runSync(readMode(environment.mode));
   if (mode === null) return;
+  const workerMode: WorkerSessionMode = mode;
   const { runId, nodeId, executorModel, executorThinking, baseCommit } = environment;
   const generation = { runId, nodeId };
   const continued = environment.implementationStart === "executor";
   const experiment = environment.experiment === "1";
+  const policyRole = Effect.runSync(readPolicyRole(environment.policyRole, workerMode, experiment));
+  const systemPolicy = workerSystemPolicy(policyRole);
   let phase: "guide" | "executor" = mode === "implementation" && !continued ? "guide" : "executor";
   let plan: WorkerPlan | undefined;
   let nextStepNumber = 1;
@@ -664,7 +673,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       switchError = undefined;
       switchedAt = DateTime.formatIso(yield* DateTime.now);
       appendWorkerState(extension);
-      appendRecoverySnapshot(extension, ctx.sessionManager);
+      appendPhaseActivation(extension, ctx.sessionManager);
     });
   }
 
@@ -763,7 +772,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     return latest;
   }
 
-  function latestAttemptObjective(entries: SessionEntry[]): ObjectiveRestore {
+  function latestAttemptObjective(entries: SessionEntry[]): WorkerObjectiveRestore {
     for (const entry of [...entries].reverse()) {
       if (entry.type !== "custom_message" || entry.customType !== "pi-workgraph-objective")
         continue;
@@ -870,30 +879,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     return true;
   }
 
-  function objectiveText(objective: ObjectiveRestore): string {
-    if (objective.kind === "valid")
-      return ["[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]", objective.content].join("\n");
-    if (objective.kind === "malformed")
-      return "[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]\nThe exact current-attempt objective snapshot was malformed and was ignored; do not guess its acceptance or constraints.";
-    return "[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]\nNo exact current-attempt objective snapshot was found; do not infer acceptance, constraints, or authority from the mutable plan.";
-  }
-
-  function currentInstructions(objective: ObjectiveRestore): string {
-    const base = phase === "guide" ? guideInstructions : executorInstructions();
-    return [
-      base,
-      "[WORKGRAPH CURRENT ATTEMPT RECOVERY]",
-      `Attempt identity: ${runId}/${nodeId}. Continue the inherited bounded assignment; do not invent new scope or infer authority from this message.`,
-      "The objective below is restored verbatim from the latest matching raw session entry. Older objective and model snapshots are historical context and must not be replayed. Later workgraph_plan tool results supersede this snapshot's plan.",
-      objectiveText(objective),
-      planText(),
-      planStateWarning ?? "",
-      stateWarning ?? "",
-    ]
-      .filter((line) => line.length > 0)
-      .join("\n");
-  }
-
   function assignmentDisables(name: string): boolean {
     // Keep editing tools for implementation and authorized research experiments.
     // This filters model tool availability; bash remains available and is not sandboxed.
@@ -978,62 +963,52 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       settledAt: DateTime.formatIso(DateTime.nowUnsafe()),
     });
   });
-  function recoverySnapshot(
-    session: ExtensionContext["sessionManager"],
-  ):
-    | Pick<
-        Parameters<ExtensionAPI["sendMessage"]>[0],
-        "customType" | "content" | "display" | "details"
-      >
-    | undefined {
-    const customType = phase === "guide" ? "pi-workgraph-guide" : "pi-workgraph-executor";
-    if (
-      session
-        .buildContextEntries()
-        .some(
-          (entry) =>
-            entry.type === "custom_message" &&
-            entry.customType === customType &&
-            isCurrentAttemptData(entry.details),
-        )
-    )
-      return undefined;
-    return {
-      customType,
-      content: currentInstructions(latestAttemptObjective(session.getBranch())),
-      display: false,
-      details: generation,
+  function currentRecovery(session: ExtensionContext["sessionManager"], restorePlan: boolean) {
+    const active = session.buildContextEntries();
+    if (hasActiveRecovery(active, generation, phase)) return undefined;
+    const objective = latestAttemptObjective(session.getBranch());
+    const needsObjective = !hasActiveObjective(active, generation) || objective.kind !== "valid";
+    const hasWarning = planStateWarning !== undefined || stateWarning !== undefined;
+    if (!restorePlan && !needsObjective && !hasWarning) return undefined;
+    const recovery = {
+      identity: generation,
+      mode: workerMode,
+      phase,
+      objective,
+      warnings: [planStateWarning, stateWarning],
     };
+    return workerMode === "implementation"
+      ? recoveryMessage({ ...recovery, planText: planText() })
+      : recoveryMessage(recovery);
   }
 
-  function appendRecoverySnapshot(
+  function currentPhaseActivation(session: ExtensionContext["sessionManager"]) {
+    if (mode !== "implementation") return undefined;
+    return hasActivePhase(session.buildContextEntries(), generation, phase)
+      ? undefined
+      : phaseActivationMessage(generation, phase);
+  }
+
+  function appendPhaseActivation(
     extension: ExtensionAPI,
     session: ExtensionContext["sessionManager"],
   ): void {
-    const snapshot = recoverySnapshot(session);
-    if (snapshot !== undefined) extension.sendMessage(snapshot);
+    const message = currentPhaseActivation(session);
+    if (message !== undefined) extension.sendMessage(message);
   }
 
-  // Persist guidance at real transcript boundaries, never move a synthetic tail
-  // behind new assistant/tool history on every provider request.
+  // Stable package policy stays in the system prefix. Assignment, phase, and
+  // mutable plan state enter conversation history only at genuine boundaries.
   pi.on("session_compact", (_event, ctx) => {
-    if (mode !== "implementation") return;
-    appendRecoverySnapshot(pi, ctx.sessionManager);
+    const snapshot = currentRecovery(ctx.sessionManager, mode === "implementation");
+    if (snapshot !== undefined) pi.sendMessage(snapshot);
   });
-  pi.on("before_agent_start", (_event, ctx) => {
+  pi.on("before_agent_start", (event, ctx) => {
     reconcileWorkerTools();
-    if (mode === "implementation") {
-      const message = recoverySnapshot(ctx.sessionManager);
-      return message === undefined ? undefined : { message };
-    }
-    return {
-      message: {
-        customType: `pi-workgraph-${mode}`,
-        content: instructionForMode(mode, experiment),
-        display: false,
-        details: generation,
-      },
-    };
+    const recovery = currentRecovery(ctx.sessionManager, false);
+    const message = recovery ?? currentPhaseActivation(ctx.sessionManager);
+    const systemPrompt = `${event.systemPrompt}\n\n${systemPolicy}`;
+    return message === undefined ? { systemPrompt } : { systemPrompt, message };
   });
 }
 
@@ -1186,23 +1161,6 @@ function terminalReport(report: WorkerReport, state: WorkerTerminalState) {
     terminate: true,
   };
 }
-const researchInstructions =
-  "[WORKGRAPH RESEARCH]\nAnswer only the assigned question using read-only evidence from the live project cwd. Tracked and untracked local changes may be present; do not require cleanliness, copy files, or modify them. Supply the requested observations and retain material unknowns. Do not delegate another worker. Finish with workgraph_report.";
-function instructionForMode(mode: WorkerSessionMode, experiment: boolean): string {
-  if (mode === "review") return reviewInstructions;
-  if (mode === "implementation") return guideInstructions;
-  return experiment ? experimentInstructions : researchInstructions;
-}
-
-const experimentInstructions =
-  "[WORKGRAPH EXPERIMENT]\nAnswer the question within the explicitly permitted effects and stop condition in this disposable worktree. Leave all outputs in the assigned worktree and report direct observations, failures and limits; the coordinator decides when to release the worktree. Do not compose, publish, or delegate another worker. Finish with workgraph_report.";
-const reviewInstructions =
-  "[WORKGRAPH REVIEW]\nReview only the identified subject and concern. Ordinary result, artifact, and comparison reviews may observe the live project cwd. An exact revision review runs in an owned worktree checked out at the requested SHA; inspect that exact commit with Git (for example git show, git diff, and git ls-tree) and cite that revision in evidence. Do not silently treat live working files as that commit or claim tests against another revision. Execute verification only when it genuinely targets the requested subject. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
-const guideInstructions =
-  "[WORKGRAPH LOCAL PREWALK - GUIDE]\nInspect the assignment and current isolated worktree. Treat its settled decisions as constraints; ground the local plan in code without replacing the intended solution. If implementation requires choosing an unsettled responsibility owner, retained or removed mechanism, interaction contract, consumer or integration change, end-to-end flow, or failure, ordering, precedence, concurrency, or lifetime behavior, escalate before editing. Return specific contradictions or consequential decisions outside the stated discretion to the coordinator rather than silently resolving them. If the requirement already holds, verify it and report no_change with the inspected base revision and reason; no edit or executor turn is required. If a change is needed, use workgraph_plan with action update to record one concise plan grounded in inspected code. Prefer 5-9 meaningful implementation or verification steps, use fewer for genuinely small work, and retain every explicitly required task. Record the local approach and rationale, concrete risks or unknowns, and meaningful verification. The update assigns stable step IDs. Then make the first useful implementation edit yourself. Recording or revising the plan does not switch models. The first successful edit or observed Git change triggers the executor switch; do not stop or wait for a handoff after planning. Changed work must complete through the executor. Missing plan state does not block truthful implementation, failure, or escalation. If required work crosses the authorized scope, report escalation without editing.";
-function executorInstructions(): string {
-  return "[WORKGRAPH EXECUTOR]\nContinue this same worker trajectory in the isolated worktree and preserve the inherited assignment. Adjust local implementation knowledge and execution steps within its stated discretion; return conflicts with settled decisions or missing consequential decisions to the coordinator rather than redesigning the solution. If later evidence exposes an unsettled responsibility owner, retained or removed mechanism, interaction contract, consumer or integration change, end-to-end flow, or failure, ordering, precedence, concurrency, or lifetime behavior, stop editing and escalate. Inspect the current plan with stable step IDs and independently reconcile it against the worktree. Use workgraph_plan targeted actions only (get, update_overview, update_step, add_step, remove_step): keep the local approach, rationale, risks, step text, statuses, and notes current as evidence changes, but never replace the full plan. Escalate consequential conflicts to the coordinator instead of inferring new scope; the immutable assignment remains authoritative and no schema verifies semantic conformity. When the plan is absent or malformed, do not author replacement direction; continue only with truthful work, report, or escalation and explain that no scope was inferred. Plan statuses are not correctness evidence and unfinished steps do not block a truthful failure or escalation. Complete the bounded assignment and run meaningful verification. For changed code, create exactly one direct commit on the supplied base and leave the worktree clean. If verification establishes no change is needed and the worktree is clean at the supplied base, report no_change with that revision and reason instead. Return workgraph_report with evidence and explicit limitations. Escalate required work beyond the authorized scope.";
-}
 function gitEffect(pi: ExtensionAPI, cwd: string, args: string[], allowEmpty = false) {
   return Effect.gen(function* () {
     const result = yield* Effect.tryPromise({
@@ -1228,6 +1186,14 @@ function contractFailure(message: string) {
 
 function gitFailure(message: string) {
   return Effect.fail(new WorkerGitError({ message }));
+}
+
+function readPolicyRole(value: string, mode: WorkerSessionMode, experiment: boolean) {
+  const defaultRole: WorkerPolicyRole = mode === "research" && experiment ? "experiment" : mode;
+  const role = value.length === 0 ? defaultRole : value;
+  if (role === defaultRole || (role === "consultation" && mode === "research" && !experiment))
+    return Effect.succeed<WorkerPolicyRole>(role);
+  return contractFailure(`Invalid PI_WORKGRAPH_POLICY_ROLE ${value} for worker mode ${mode}`);
 }
 
 function readMode(value: string) {

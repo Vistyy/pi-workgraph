@@ -34,7 +34,8 @@ type WorkerEnvironmentVariable =
   | "PI_WORKGRAPH_BASE_COMMIT"
   | "PI_WORKGRAPH_EXECUTOR_MODEL"
   | "PI_WORKGRAPH_EXPERIMENT"
-  | "PI_WORKGRAPH_MODE";
+  | "PI_WORKGRAPH_MODE"
+  | "PI_WORKGRAPH_POLICY_ROLE";
 
 export type FixtureLaunchRequest = Pick<
   WorkerLaunchEffectRequest,

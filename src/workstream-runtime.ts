@@ -1790,6 +1790,7 @@ function workerLaunchRequest(
 > {
   const environment = new Map<string, string>([
     ["PI_WORKGRAPH_MODE", modeFor(assignment)],
+    ["PI_WORKGRAPH_POLICY_ROLE", policyRoleFor(assignment)],
     ["PI_WORKGRAPH_RUN_ID", state.id],
     ["PI_WORKGRAPH_NODE_ID", attempt.id],
     ["PI_WORKGRAPH_REPOSITORY", state.projectRoot],
@@ -1961,6 +1962,14 @@ function modeFor(assignment: WorkAssignment): "implementation" | "review" | "res
   if (assignment.capability === "review") return "review";
   return "research";
 }
+
+function policyRoleFor(
+  assignment: WorkAssignment,
+): "implementation" | "review" | "research" | "experiment" | "consultation" {
+  if (assignment.artifactIntent === "disposable_experiment") return "experiment";
+  if (assignment.capability === "consultation") return "consultation";
+  return modeFor(assignment);
+}
 function appendCandidatePrompt(
   lines: string[],
   state: WorkstreamState,
@@ -2013,15 +2022,12 @@ function workerPrompt(
   lines.push("Continue the assigned Workgraph objective now.");
   return lines.join("\n");
 }
-function appendConsultationObjective(
+function appendConsultationContext(
   lines: string[],
   assignment: Extract<WorkAssignment, { capability: "consultation" }>,
 ): void {
   if (assignment.context !== undefined)
     lines.push(`Coordinator-known context: ${assignment.context}`);
-  lines.push(
-    "Provide decision-oriented advice using the available read-only research tools as needed. Advice is evidence only; do not claim coordinator acceptance or authority. Finish with workgraph_report.",
-  );
 }
 
 function objectiveFor(
@@ -2046,7 +2052,7 @@ function objectiveFor(
   appendCandidatePrompt(common, state, attempt);
   if (assignment.capability === "research")
     common.push(`Expected evidence: ${assignment.expectedEvidence.join("; ")}`);
-  if (assignment.capability === "consultation") appendConsultationObjective(common, assignment);
+  if (assignment.capability === "consultation") appendConsultationContext(common, assignment);
   if (assignment.artifactIntent === "disposable_experiment")
     common.push(
       `Permitted effects: ${assignment.permittedEffects.join("; ")}`,

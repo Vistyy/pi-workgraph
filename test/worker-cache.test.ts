@@ -40,6 +40,7 @@ async function fixture() {
     PI_WORKGRAPH_EXECUTOR_THINKING: "off",
     PI_WORKGRAPH_IMPLEMENTATION_START: null,
     PI_WORKGRAPH_MODE: "implementation",
+    PI_WORKGRAPH_POLICY_ROLE: "implementation",
     PI_WORKGRAPH_NODE_ID: "attempt",
     PI_WORKGRAPH_RUN_ID: "fixture",
   });
@@ -99,9 +100,10 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
   const provider = await startControlledProvider([
     (request) => {
       assert.equal(request.model, "guide");
+      assert.match(request.raw, /\[WORKGRAPH IMPLEMENTATION WORKER POLICY\]/);
       assert.ok(
         request.messages.some((message) =>
-          JSON.stringify(message).includes("[WORKGRAPH LOCAL PREWALK - GUIDE]"),
+          JSON.stringify(message).includes("Current phase: guide."),
         ),
       );
       return {
@@ -163,7 +165,7 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
       assert.equal(request.model, "executor");
       assert.ok(
         request.messages.some((message) =>
-          JSON.stringify(message).includes("[WORKGRAPH EXECUTOR]"),
+          JSON.stringify(message).includes("Current phase: executor."),
         ),
       );
       return {
@@ -321,11 +323,14 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
     for (const request of provider.requests) {
       const messages = JSON.stringify(request.messages);
       assert.doesNotMatch(request.raw, /# Workgraph coordinator/);
-      assert.equal(messages.split("[WORKGRAPH LOCAL PREWALK - GUIDE]").length - 1, 1);
+      assert.equal(request.raw.split("[WORKGRAPH IMPLEMENTATION WORKER POLICY]").length - 1, 1);
+      assert.equal(messages.split("Current phase: guide.").length - 1, 1);
+      assert.equal(messages.split("Authorized: change only value.txt").length - 1, 1);
       assert.equal(
-        messages.split("[WORKGRAPH EXECUTOR]").length - 1,
+        messages.split("Current phase: executor.").length - 1,
         request.model === "executor" ? 1 : 0,
       );
+      assert.doesNotMatch(messages, /\[WORKGRAPH LOCAL PREWALK - GUIDE\]|\[WORKGRAPH EXECUTOR\]/);
     }
     assert.ok(
       provider.requests.some((request) =>
@@ -367,7 +372,7 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
   }
 });
 
-void test("real Pi worker excludes configured built-in and extension tools before initial and dynamic follow-up requests", async () => {
+void test("real Pi research worker keeps stable policy and tool filtering across agent starts", async () => {
   const f = await fixture();
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(f.parent, "agent"),
@@ -376,6 +381,7 @@ void test("real Pi worker excludes configured built-in and extension tools befor
     PI_WORKGRAPH_EXECUTOR_THINKING: "off",
     PI_WORKGRAPH_IMPLEMENTATION_START: null,
     PI_WORKGRAPH_MODE: "research",
+    PI_WORKGRAPH_POLICY_ROLE: "research",
     PI_WORKGRAPH_NODE_ID: "attempt",
     PI_WORKGRAPH_RUN_ID: "fixture",
   });
@@ -441,6 +447,15 @@ void test("real Pi worker excludes configured built-in and extension tools befor
       assert.doesNotMatch(schemas, /"write"/);
       assert.doesNotMatch(schemas, /"session_denied"/);
       assert.doesNotMatch(schemas, /"dynamic_denied"/);
+      return { text: "First research turn settled." };
+    },
+    (request) => {
+      const schemas = JSON.stringify(request.tools);
+      assert.doesNotMatch(schemas, /"read"/);
+      assert.doesNotMatch(schemas, /"edit"/);
+      assert.doesNotMatch(schemas, /"write"/);
+      assert.doesNotMatch(schemas, /"session_denied"/);
+      assert.doesNotMatch(schemas, /"dynamic_denied"/);
       return {
         tool: {
           id: "report",
@@ -477,6 +492,12 @@ void test("real Pi worker excludes configured built-in and extension tools befor
       retry: { enabled: false },
     });
     const session = SessionManager.create(f.root, join(f.parent, "worker-denylist-sessions"));
+    session.appendCustomMessageEntry(
+      "pi-workgraph-objective",
+      "[WORKGRAPH RESEARCH OBJECTIVE]\nInspect worker tool filtering.",
+      true,
+      { runId: "fixture", nodeId: "attempt", mode: "research" },
+    );
     const loader = new DefaultResourceLoader({
       cwd: f.root,
       agentDir: join(f.parent, "agent"),
@@ -515,8 +536,23 @@ void test("real Pi worker excludes configured built-in and extension tools befor
     agent = created.session;
     await agent.bindExtensions({});
     await promptWithDeadline(agent, "Exercise the worker denylist.");
+    await promptWithDeadline(agent, "Finish the same bounded research assignment.");
     provider.assertComplete();
-    assert.equal(provider.requests.length, 2);
+    assert.equal(provider.requests.length, 3);
+    assertPrefix(provider.requests);
+    for (const request of provider.requests) {
+      assert.equal(request.raw.split("[WORKGRAPH RESEARCH WORKER POLICY]").length - 1, 1);
+      assert.equal(request.raw.split("Inspect worker tool filtering.").length - 1, 1);
+    }
+    assert.equal(
+      session
+        .getBranch()
+        .filter(
+          (entry) =>
+            entry.type === "custom_message" && entry.customType === "pi-workgraph-research",
+        ).length,
+      0,
+    );
   } finally {
     await agent?.abort();
     agent?.dispose();
@@ -531,6 +567,7 @@ void test("real Pi coordinator preserves the provider prefix across agent starts
   const f = await fixture();
   const previous = configureFixtureEnvironment({
     PI_WORKGRAPH_MODE: null,
+    PI_WORKGRAPH_POLICY_ROLE: null,
     PI_WORKGRAPH_BASE_COMMIT: null,
     PI_WORKGRAPH_EXECUTOR_MODEL: null,
     PI_WORKGRAPH_EXECUTOR_THINKING: null,
