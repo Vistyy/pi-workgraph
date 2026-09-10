@@ -206,7 +206,7 @@ await test("absent native failures project sanitized actionable notifications wi
     );
     for (const id of ["rate-limit", "abort", "generic", "fallback", "untyped", "typed"])
       await Effect.runPromise(
-        runtime.effects
+        runtime
           .queue({
             id,
             capability: "research",
@@ -218,10 +218,8 @@ await test("absent native failures project sanitized actionable notifications wi
           .pipe(Effect.provide(liveLayer)),
       );
 
-    await Effect.runPromise(runtime.effects.reconcile.pipe(Effect.provide(liveLayer)));
-    const state = await Effect.runPromise(
-      runtime.effects.reconcile.pipe(Effect.provide(liveLayer)),
-    );
+    await Effect.runPromise(runtime.reconcile().pipe(Effect.provide(liveLayer)));
+    const state = await Effect.runPromise(runtime.reconcile().pipe(Effect.provide(liveLayer)));
     const rateLimit = state.results.find((result) => result.assignmentId === "rate-limit");
     const aborted = state.results.find((result) => result.assignmentId === "abort");
     const generic = state.results.find((result) => result.assignmentId === "generic");
@@ -264,7 +262,7 @@ await test("absent native failures project sanitized actionable notifications wi
     assert.equal(projected.includes(RAW_SECRET), false);
     assert.equal(JSON.stringify(state).includes(RAW_SECRET), false);
   } finally {
-    if (runtime !== undefined) await Effect.runPromise(runtime.effects.close);
+    if (runtime !== undefined) await Effect.runPromise(runtime.close);
     registry?.close();
     await rm(parent, { recursive: true, force: true });
   }

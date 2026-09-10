@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { Deferred, Effect } from "effect";
+import { Effect } from "effect";
 import { TestClock } from "effect/testing";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -245,27 +245,24 @@ async function fixture() {
     return value;
   }
   async function authority(active: WorkstreamRuntime) {
-    return submit(
-      active,
-      Effect.gen(function* () {
-        const recorded = yield* store.recordInputEvent({
-          ...owner,
-          source: "interactive",
-          text: "Implement value.txt and run bounded disposable experiments in this repository.",
-        });
-        yield* store.reviseIntent({
-          authorityReceiptId: recorded.receipt.id,
-          statement: "Change fixture safely",
-          constraints: [],
-        });
-        return { receiptId: recorded.receipt.id, intentVersion: 1 };
+    const recorded = await runRuntime(
+      active.recordInput({
+        ...owner,
+        source: "interactive",
+        text: "Implement value.txt and run bounded disposable experiments in this repository.",
       }),
     );
+    await runRuntime(
+      active.reviseIntent({
+        authorityReceiptId: recorded.receipt.id,
+        statement: "Change fixture safely",
+        constraints: [],
+      }),
+    );
+    return { receiptId: recorded.receipt.id, intentVersion: 1 };
   }
   async function dispose(ignoreCloseErrors = false) {
-    const closed = await Promise.allSettled(
-      runtimes.map((active) => runRuntime(active.effects.close)),
-    );
+    const closed = await Promise.allSettled(runtimes.map((active) => runRuntime(active.close)));
     registry.close();
     await rm(parent, { recursive: true, force: true });
     if (!ignoreCloseErrors && closed.some((result) => result.status === "rejected"))
@@ -384,10 +381,6 @@ function worktreeBranch(worktrees: string, path: string): string {
 function runRuntime<A, E>(effect: RuntimeEffect<A, E> | Effect.Effect<A, E>): Promise<A> {
   return Effect.runPromise(effect.pipe(Effect.provide(liveLayer)));
 }
-function submit<A, E>(active: WorkstreamRuntime, effect: RuntimeEffect<A, E>): Promise<A> {
-  return runRuntime(active.effects.submit(effect));
-}
-
 const research = (id: string, intentVersion = 0) => ({
   id,
   capability: "research" as const,
@@ -423,7 +416,7 @@ await test("consultation launches one advisor with direct context and retains on
       findings: [],
     });
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "direct-consultation",
         capability: "consultation",
         artifactIntent: "evidence_only",
@@ -433,7 +426,7 @@ await test("consultation launches one advisor with direct context and retains on
         intentVersion: 0,
       }),
     );
-    for (let index = 0; index < 5; index++) await runRuntime(active.effects.reconcile);
+    for (let index = 0; index < 5; index++) await runRuntime(active.reconcile());
     const state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.models?.source, "requested-model");
     assert.equal(f.workers.requests.length, 1);
@@ -475,10 +468,8 @@ await test("consultation defaults to the first configured advisor and rejects un
   const f = await fixture();
   try {
     const active = await f.runtime();
-    const defaultState = await runRuntime(
-      active.effects.queue(consultation("default-consultation")),
-    );
-    for (let index = 0; index < 5; index++) await runRuntime(active.effects.reconcile);
+    const defaultState = await runRuntime(active.queue(consultation("default-consultation")));
+    for (let index = 0; index < 5; index++) await runRuntime(active.reconcile());
     assert.deepEqual(defaultState.attempts[0]?.models?.guide, {
       model: "fixture/advisor",
       thinking: "low",
@@ -486,7 +477,7 @@ await test("consultation defaults to the first configured advisor and rejects un
     const before = await runRuntime(f.store.load());
     await assert.rejects(
       runRuntime(
-        active.effects.queue({
+        active.queue({
           ...consultation("unknown-consultation"),
           advisorModel: "fixture/missing",
         }),
@@ -518,8 +509,8 @@ await test("consultation retains failed and escalated advisor outcomes faithfull
         evidence: [],
         findings: [],
       });
-      await runRuntime(active.effects.queue(consultation(`consultation-${status}`)));
-      for (let index = 0; index < 5; index++) await runRuntime(active.effects.reconcile);
+      await runRuntime(active.queue(consultation(`consultation-${status}`)));
+      for (let index = 0; index < 5; index++) await runRuntime(active.reconcile());
       const state = await runRuntime(f.store.load());
       const result = required(state.results[0], `${status} consultation result`);
       assert.equal(result.validity, "typed");
@@ -542,8 +533,8 @@ await test("consultation recovers an uncertain launch without duplicate submissi
     const active = await f.runtime();
     f.workers.failAfterSubmission = true;
     f.workers.onWork = async () => undefined;
-    await runRuntime(active.effects.queue(consultation("uncertain-consultation")));
-    for (let index = 0; index < 5; index++) await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(consultation("uncertain-consultation")));
+    for (let index = 0; index < 5; index++) await runRuntime(active.reconcile());
     const state = await runRuntime(f.store.load());
     assert.equal(f.workers.requests.length, 1);
     assert.equal(f.workers.promptCount, 1);
@@ -581,7 +572,7 @@ await test("predecessor-v7 model metadata normalizes on SQLite read and persists
   const f = await fixture();
   try {
     const active = await f.runtime();
-    await runRuntime(active.effects.queue(consultation("legacy-consultation")));
+    await runRuntime(active.queue(consultation("legacy-consultation")));
     const currentRaw = parsePersistedObject(
       await runRuntime(WorkstreamStoreEffects.readRaw(f.store.path)),
     );
@@ -641,7 +632,7 @@ await test("predecessor-v7 model metadata normalizes on SQLite read and persists
       "unchanged assignment",
     );
     assert.equal("advisorOverride" in unchangedAssignment, true);
-    await runRuntime(active.effects.queue(research("after-legacy")));
+    await runRuntime(active.queue(research("after-legacy")));
     const persisted = mutable(
       parsePersistedObject(await runRuntime(WorkstreamStoreEffects.readRaw(f.store.path))),
       "persisted raw state",
@@ -666,7 +657,7 @@ await test("runtime queue persists repeated and distinct policy selections for r
   try {
     const active = await f.runtime();
     const defaultResearch = await runRuntime(
-      active.effects.queue(research("runtime-default-research"), {
+      active.queue(research("runtime-default-research"), {
         selection: { count: 2 },
       }),
     );
@@ -683,7 +674,7 @@ await test("runtime queue persists repeated and distinct policy selections for r
     );
 
     const explicitResearch = await runRuntime(
-      active.effects.queue(research("runtime-explicit-research"), {
+      active.queue(research("runtime-explicit-research"), {
         selection: { count: 2, model: "fixture/research-2" },
       }),
     );
@@ -700,7 +691,7 @@ await test("runtime queue persists repeated and distinct policy selections for r
     );
 
     const distinctResearch = await runRuntime(
-      active.effects.queue(research("runtime-distinct-research"), {
+      active.queue(research("runtime-distinct-research"), {
         selection: { count: 2, distinctModels: true },
       }),
     );
@@ -717,7 +708,7 @@ await test("runtime queue persists repeated and distinct policy selections for r
     );
 
     const distinctReview = await runRuntime(
-      active.effects.queue(
+      active.queue(
         {
           id: "runtime-distinct-review",
           capability: "review",
@@ -760,7 +751,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
     const beforeCapacityFailure = await runRuntime(f.store.load());
     await assert.rejects(
       runRuntime(
-        active.effects.queue(research("capacity-failure"), {
+        active.queue(research("capacity-failure"), {
           selection: { count: 3, distinctModels: true },
         }),
       ),
@@ -770,7 +761,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
     assert.equal(afterCapacityFailure.assignments.length, beforeCapacityFailure.assignments.length);
     assert.equal(afterCapacityFailure.attempts.length, beforeCapacityFailure.attempts.length);
     const queued = await runRuntime(
-      active.effects.queue(research("shared-base"), {
+      active.queue(research("shared-base"), {
         selection: { count: 2, distinctModels: true },
       }),
     );
@@ -786,7 +777,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
     const retainedBefore = (await runRuntime(f.store.load())).assignments.length;
     await assert.rejects(
       runRuntime(
-        active.effects.queue(
+        active.queue(
           {
             id: "conflicting-review",
             capability: "review",
@@ -806,7 +797,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
     assert.equal(state.attempts.length, 2);
 
     const directReview = await runRuntime(
-      active.effects.queue(
+      active.queue(
         {
           id: "direct-review",
           capability: "review",
@@ -824,7 +815,7 @@ await test("multi-attempt queueing resolves one shared validated base and exact-
     assert.equal(directReview.attempts.at(-1)?.baseRevision, initial);
     await assert.rejects(
       runRuntime(
-        active.effects.queue(
+        active.queue(
           {
             id: "missing-direct-review",
             capability: "review",
@@ -883,7 +874,7 @@ await test("direct exact revision review uses an owned exact-base checkout", asy
     };
     const active = await f.runtime();
     const queued = await runRuntime(
-      active.effects.queue(
+      active.queue(
         {
           id: "direct-exact-review",
           capability: "review",
@@ -898,8 +889,8 @@ await test("direct exact revision review uses an owned exact-base checkout", asy
     );
     assert.equal(queued.results.length, 0);
     assert.equal(queued.attempts.at(-1)?.baseRevision, base);
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    await runRuntime(active.reconcile());
     const state = await runRuntime(f.store.load());
     assert.equal(state.results[0]?.validity, "typed");
     assert.equal(
@@ -948,8 +939,8 @@ await test("new runtime drives fresh research through native evidence, durable r
         }),
       ),
     );
-    await runRuntime(first.effects.queue(research("inspect")));
-    await runRuntime(first.effects.reconcile);
+    await runRuntime(first.queue(research("inspect")));
+    await runRuntime(first.reconcile());
     const request = f.workers.requests[0];
     assert.ok(request);
     assert.equal(request.assignmentId, "inspect");
@@ -961,21 +952,21 @@ await test("new runtime drives fresh research through native evidence, durable r
     assert.ok(session.includes(f.root));
     assert.ok(session.includes("File evidence"));
     assert.equal(session.includes("UNRELATED_PARENT_SECRET"), false);
-    let state = await runRuntime(first.effects.reconcile);
+    let state = await runRuntime(first.reconcile());
     assert.equal(state.results[0]?.validity, "typed");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.deliveries[0]?.state, "pending");
     assert.equal(state.attempts[0]?.effectiveModels?.[0]?.model, "test/worker");
-    await runRuntime(first.effects.reconcile);
+    await runRuntime(first.reconcile());
     assert.equal(f.workers.promptCount, 1);
-    await runRuntime(first.effects.close);
+    await runRuntime(first.close);
     const next = await f.runtime();
-    state = await runRuntime(next.effects.reconcile);
+    state = await runRuntime(next.reconcile());
     assert.equal(state.results.length, 1);
     assert.equal(state.deliveries[0]?.state, "delivered");
     assert.deepEqual(f.delivered, [state.results[0]?.id]);
     assert.ok(state.results[0], "delivered result");
-    await runRuntime(next.effects.reconcile);
+    await runRuntime(next.reconcile());
     assert.equal(f.delivered.length, 1);
     assert.equal(
       (await git(f.root, "worktree", "list", "--porcelain")).split("worktree ").length - 1,
@@ -1015,9 +1006,9 @@ await test("disposable experiments remove zero-commit output and retain advanced
       expectedEvidence: ["The experiment output"],
     });
 
-    await runRuntime(active.effects.queue(experiment("zero-experiment")));
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(experiment("zero-experiment")));
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     const zero = required(state.attempts[0], "zero-commit experiment");
     assert.equal(zero.cleanup?.state, "completed");
     assert.deepEqual(state.results[0]?.artifacts, []);
@@ -1032,9 +1023,9 @@ await test("disposable experiments remove zero-commit output and retain advanced
     );
     assert.equal(await git(f.root, "branch", "--list", zeroPlacement.branch), "");
 
-    await runRuntime(active.effects.queue(experiment("advanced-experiment")));
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(experiment("advanced-experiment")));
+    await runRuntime(active.reconcile());
+    state = await runRuntime(active.reconcile());
     const advanced = required(state.attempts[1], "advanced experiment");
     const placement = required(advanced.placement, "advanced experiment placement");
     if (placement.kind !== "isolated_worktree")
@@ -1058,9 +1049,7 @@ await test("disposable experiments remove zero-commit output and retain advanced
     assert.deepEqual(state.results[1]?.artifacts, []);
     assert.equal(await git(f.root, "rev-parse", "HEAD"), destinationHead);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), destinationBytes);
-    await runRuntime(
-      active.effects.releaseOutput(advanced.id, "Release the inspected experiment branch."),
-    );
+    await runRuntime(active.releaseOutput(advanced.id, "Release the inspected experiment branch."));
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[1]?.cleanup?.state, "completed");
     assert.equal(state.attempts[1]?.outputRelease?.state, "completed");
@@ -1086,7 +1075,7 @@ await test("blocked dirty successful exact review output releases, finishes clea
       };
     };
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "dirty-review",
         capability: "review",
         artifactIntent: "evidence_only",
@@ -1096,8 +1085,8 @@ await test("blocked dirty successful exact review output releases, finishes clea
         concern: "The review output must remain inspectable.",
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     const attempt = required(state.attempts[0], "dirty review attempt");
     const placement = required(attempt.placement, "dirty review placement");
     if (placement.kind !== "isolated_worktree")
@@ -1105,7 +1094,7 @@ await test("blocked dirty successful exact review output releases, finishes clea
     assert.equal(state.results[0]?.validity, "typed");
     assert.equal(attempt.cleanup?.state, "blocked");
     assert.equal(attempt.cleanup?.workerClosed, true);
-    await runRuntime(active.effects.releaseOutput(attempt.id, "Release dirty read-only output."));
+    await runRuntime(active.releaseOutput(attempt.id, "Release dirty read-only output."));
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
@@ -1114,7 +1103,7 @@ await test("blocked dirty successful exact review output releases, finishes clea
       false,
     );
     assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
-    await runRuntime(active.effects.releaseOutput(attempt.id, "Retry dirty read-only release."));
+    await runRuntime(active.releaseOutput(attempt.id, "Retry dirty read-only release."));
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
@@ -1131,7 +1120,7 @@ await test("blocked exact-revision release recovers its cleanup checkpoint witho
     const destinationHead = await runRuntime(f.repository.head());
     f.workers.onWork = async () => researchReport;
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "malformed-review",
         capability: "review",
         artifactIntent: "evidence_only",
@@ -1141,8 +1130,8 @@ await test("blocked exact-revision release recovers its cleanup checkpoint witho
         concern: "The review report must be well-formed.",
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     const attempt = required(state.attempts[0], "malformed review attempt");
     const placement = required(attempt.placement, "malformed review placement");
     if (placement.kind !== "isolated_worktree")
@@ -1165,7 +1154,7 @@ await test("blocked exact-revision release recovers its cleanup checkpoint witho
       Effect.fail(new Error("simulated cleanup checkpoint interruption")),
     );
     await assert.rejects(
-      runRuntime(active.effects.releaseOutput(attempt.id, "Release malformed review output.")),
+      runRuntime(active.releaseOutput(attempt.id, "Release malformed review output.")),
       /simulated cleanup checkpoint interruption/,
     );
     state = await runRuntime(f.store.load());
@@ -1174,10 +1163,10 @@ await test("blocked exact-revision release recovers its cleanup checkpoint witho
     assert.equal(releaseCalls, 1);
 
     interruptedFinish.mock.restore();
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
-    await runRuntime(active.effects.releaseOutput(attempt.id, "Retry the completed release."));
+    await runRuntime(active.releaseOutput(attempt.id, "Retry the completed release."));
     assert.equal(releaseCalls, 1);
     const worktrees = await git(f.root, "worktree", "list", "--porcelain");
     assert.match(worktrees, new RegExp(`worktree ${f.root}`));
@@ -1205,17 +1194,17 @@ await test("shared research sees dirty tracked and untracked files and leaves th
       return researchReport;
     };
     const active = await f.runtime();
-    await runRuntime(active.effects.queue(research("dirty-shared")));
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(research("dirty-shared")));
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.placement?.kind, "shared_project");
     assert.equal(state.attempts[0]?.placement?.path, f.root);
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "local tracked edit\\n");
     assert.equal(await readFile(local, "utf8"), "local untracked edit\\n");
-    await runRuntime(active.effects.close);
+    await runRuntime(active.close);
     const retry = await f.runtime();
-    state = await runRuntime(retry.effects.reconcile);
+    state = await runRuntime(retry.reconcile());
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "local tracked edit\\n");
     assert.equal(await readFile(local, "utf8"), "local untracked edit\\n");
@@ -1247,7 +1236,7 @@ await test("completed no-change implementations retain explicit attribution, ski
       findings: [],
     });
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "already-holds",
         capability: "implement",
         artifactIntent: "maintained_change",
@@ -1257,8 +1246,8 @@ await test("completed no-change implementations retain explicit attribution, ski
         acceptance: ["Existing behavior remains correct"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    const state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    const state = await runRuntime(active.reconcile());
     const attempt = required(state.attempts[0], "no-change attempt");
     const result = required(state.results[0], "no-change result");
     assert.equal(result.validity, "typed");
@@ -1311,7 +1300,7 @@ await test("dirty isolated trees cannot settle a successful no-change implementa
       };
     };
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "false-no-change",
         capability: "implement",
         artifactIntent: "maintained_change",
@@ -1321,15 +1310,15 @@ await test("dirty isolated trees cannot settle a successful no-change implementa
         acceptance: ["Existing behavior remains correct"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     assert.equal(state.results[0]?.validity, "invalid");
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.equal(await runRuntime(f.repository.head()), base);
     const attempt = required(state.attempts[0], "dirty no-change attempt");
-    await runRuntime(active.effects.releaseOutput(attempt.id, "Release dirty no-change output."));
+    await runRuntime(active.releaseOutput(attempt.id, "Release dirty no-change output."));
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.outputRelease?.state, "completed");
@@ -1361,7 +1350,7 @@ await test("advanced isolated trees cannot settle a successful no-change impleme
       };
     };
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "advanced-no-change",
         capability: "implement",
         artifactIntent: "maintained_change",
@@ -1371,8 +1360,8 @@ await test("advanced isolated trees cannot settle a successful no-change impleme
         acceptance: ["Existing behavior remains correct"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    const state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    const state = await runRuntime(active.reconcile());
     assert.equal(state.results[0]?.validity, "invalid");
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
@@ -1406,7 +1395,7 @@ await test("implementation roles always resolve from policy and do not accept qu
       authority,
       acceptance: ["value changes"],
     };
-    await runRuntime(active.effects.queue(assignment));
+    await runRuntime(active.queue(assignment));
     let state = await runRuntime(f.store.load());
     assert.deepEqual(state.attempts[0]?.models, {
       guide: { model: "fixture/guide-default", thinking: "high" },
@@ -1417,7 +1406,7 @@ await test("implementation roles always resolve from policy and do not accept qu
 
     await assert.rejects(
       runRuntime(
-        active.effects.queue(
+        active.queue(
           { ...assignment, id: "invalid-implementation-options" },
           { selection: { count: 1 } },
         ),
@@ -1731,7 +1720,7 @@ await test("unapplied candidate revisions are reviewed in their retained exact w
       };
     };
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "candidate",
         capability: "implement",
         artifactIntent: "maintained_change",
@@ -1741,8 +1730,8 @@ await test("unapplied candidate revisions are reviewed in their retained exact w
         acceptance: ["candidate exists"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     const result = required(state.results[0], "candidate result");
     const commit =
       result.validity === "typed" &&
@@ -1752,7 +1741,7 @@ await test("unapplied candidate revisions are reviewed in their retained exact w
         ? required(result.report.commit, "candidate commit")
         : assert.fail("Expected a changed candidate.");
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "candidate-review",
         capability: "review",
         artifactIntent: "evidence_only",
@@ -1762,8 +1751,8 @@ await test("unapplied candidate revisions are reviewed in their retained exact w
         concern: "Candidate bytes",
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[1]?.baseRevision, commit);
     assert.equal(state.attempts[1]?.placement?.kind, "isolated_worktree");
     assert.equal(state.attempts[1]?.cleanup?.state, "completed");
@@ -1803,7 +1792,7 @@ await test("retained candidate corrections apply their complete history and keep
     };
     const base = await runRuntime(f.repository.head());
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "first",
         capability: "implement",
         artifactIntent: "maintained_change",
@@ -1813,8 +1802,8 @@ await test("retained candidate corrections apply their complete history and keep
         acceptance: ["value changes"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     const firstAttempt = required(state.attempts[0], "first candidate attempt");
     const firstResult = required(state.results[0], "first candidate result");
     const firstCommit =
@@ -1857,7 +1846,7 @@ await test("retained candidate corrections apply their complete history and keep
     });
 
     await runRuntime(
-      active.effects.queue(
+      active.queue(
         {
           id: "correction",
           capability: "implement",
@@ -1870,8 +1859,8 @@ await test("retained candidate corrections apply their complete history and keep
         { candidateOf: firstAttempt.id },
       ),
     );
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    state = await runRuntime(active.reconcile());
     const correctionAttempt = required(state.attempts[1], "correction attempt");
     const correctionResult = required(state.results[1], "correction result");
     const correctionCommit =
@@ -1891,7 +1880,7 @@ await test("retained candidate corrections apply their complete history and keep
     assert.equal(await runRuntime(f.repository.head()), base);
 
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "correction-review",
         capability: "review",
         artifactIntent: "evidence_only",
@@ -1901,8 +1890,8 @@ await test("retained candidate corrections apply their complete history and keep
         concern: "Exact correction history",
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[2]?.cleanup?.state, "completed");
     assert.equal(state.results[2]?.validity, "typed");
 
@@ -1932,7 +1921,7 @@ await test("retained candidate corrections apply their complete history and keep
         return applyCandidate(prepared);
       },
     });
-    await assert.rejects(runRuntime(active.effects.apply(correctionAttempt.id)));
+    await assert.rejects(runRuntime(active.apply(correctionAttempt.id)));
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[1]?.application?.state, "pending");
     assert.equal(state.attempts[1]?.application?.expectedHead, base);
@@ -1944,7 +1933,7 @@ await test("retained candidate corrections apply their complete history and keep
       value: () => Effect.interrupt,
     });
     finishInterrupted = false;
-    await assert.rejects(runRuntime(active.effects.apply(correctionAttempt.id)));
+    await assert.rejects(runRuntime(active.apply(correctionAttempt.id)));
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[1]?.application?.state, "applied");
     assert.equal(state.attempts[1]?.outputRelease, undefined);
@@ -1953,7 +1942,7 @@ await test("retained candidate corrections apply their complete history and keep
       configurable: true,
       value: beginOutputRelease,
     });
-    state = await runRuntime(active.effects.apply(correctionAttempt.id));
+    state = await runRuntime(active.apply(correctionAttempt.id));
     assert.equal(await runRuntime(f.repository.head()), correctionCommit);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "corrected\n");
     assert.equal(await git(f.root, "rev-list", "--count", `${base}..HEAD`), "2");
@@ -1964,15 +1953,11 @@ await test("retained candidate corrections apply their complete history and keep
     assert.equal(state.attempts[1]?.outputRelease?.state, "completed");
     assert.equal(applyCandidateCalls, 1);
     const completed = await runRuntime(
-      active.effects.submit(
-        f.store.complete({
-          conclusion: "The correction chain is complete.",
-          evidence: [
-            { label: "chain", observation: "The applied candidate retained both commits." },
-          ],
-          limitations: [],
-        }),
-      ),
+      active.complete({
+        conclusion: "The correction chain is complete.",
+        evidence: [{ label: "chain", observation: "The applied candidate retained both commits." }],
+        limitations: [],
+      }),
     );
     assert.equal(completed.lifecycle.state, "completed");
     assert.deepEqual(completed.completion?.accounting, []);
@@ -2009,7 +1994,7 @@ await test("moved candidate application is blocked without mutation and supports
     };
     const original = await runRuntime(f.repository.head());
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "candidate",
         capability: "implement",
         artifactIntent: "maintained_change",
@@ -2019,8 +2004,8 @@ await test("moved candidate application is blocked without mutation and supports
         acceptance: ["candidate value"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     const parent = required(state.attempts[0], "retained candidate");
     const result = required(state.results[0], "retained candidate result");
     const parentCommit =
@@ -2039,7 +2024,7 @@ await test("moved candidate application is blocked without mutation and supports
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Move destination");
     const moved = await runRuntime(f.repository.head());
-    await assert.rejects(runRuntime(active.effects.apply(parent.id)), /conflict preview/);
+    await assert.rejects(runRuntime(active.apply(parent.id)), /conflict preview/);
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.application, undefined);
     assert.equal(await runRuntime(f.repository.head()), moved);
@@ -2047,7 +2032,7 @@ await test("moved candidate application is blocked without mutation and supports
     assert.equal(await git(f.root, "rev-parse", parentBranch), parentCommit);
 
     await runRuntime(
-      active.effects.queue(
+      active.queue(
         {
           id: "integration",
           capability: "implement",
@@ -2060,8 +2045,8 @@ await test("moved candidate application is blocked without mutation and supports
         { candidateOf: parent.id, baseRevision: moved },
       ),
     );
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    state = await runRuntime(active.reconcile());
     const integration = required(state.attempts[1], "integration attempt");
     const integrationResult = required(state.results[1], "integration result");
     const integrationCommit =
@@ -2079,7 +2064,7 @@ await test("moved candidate application is blocked without mutation and supports
     });
     assert.equal(integration.baseRevision, moved);
     assert.equal(await runRuntime(f.repository.head()), moved);
-    state = await runRuntime(active.effects.apply(integration.id));
+    state = await runRuntime(active.apply(integration.id));
     assert.equal(await runRuntime(f.repository.head()), integrationCommit);
     assert.equal(await git(f.root, "rev-list", "--count", `${moved}..HEAD`), "1");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "integrated\n");
@@ -2115,7 +2100,7 @@ await test("application records compatible results and rejects conflicting diver
     };
     const candidate = async (id: string) => {
       await runRuntime(
-        active.effects.queue({
+        active.queue({
           id,
           capability: "implement",
           artifactIntent: "maintained_change",
@@ -2125,8 +2110,8 @@ await test("application records compatible results and rejects conflicting diver
           acceptance: ["candidate value"],
         }),
       );
-      await runRuntime(active.effects.reconcile);
-      const state = await runRuntime(active.effects.reconcile);
+      await runRuntime(active.reconcile());
+      const state = await runRuntime(active.reconcile());
       const attempt = required(state.attempts.at(-1), `${id} attempt`);
       const result = required(state.results.at(-1), `${id} result`);
       const commit =
@@ -2144,7 +2129,7 @@ await test("application records compatible results and rejects conflicting diver
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Move destination independently");
     const destination = await runRuntime(f.repository.head());
-    let state = await runRuntime(active.effects.apply(diverged.attempt.id));
+    let state = await runRuntime(active.apply(diverged.attempt.id));
     const applied = required(state.attempts.at(-1)?.application, "divergent application");
     const revision = required(applied.revision, "structural merge revision");
     assert.equal(applied.expectedRef, "refs/heads/main");
@@ -2161,7 +2146,7 @@ await test("application records compatible results and rejects conflicting diver
     await git(f.root, "merge", "--ff-only", integrated.commit);
     const integratedHead = await runRuntime(f.repository.head());
     const integratedBytes = await readFile(join(f.root, "value.txt"), "utf8");
-    state = await runRuntime(active.effects.apply(integrated.attempt.id));
+    state = await runRuntime(active.apply(integrated.attempt.id));
     assert.equal(await runRuntime(f.repository.head()), integratedHead);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), integratedBytes);
     assert.equal(state.attempts.at(-1)?.application?.state, "applied");
@@ -2172,10 +2157,7 @@ await test("application records compatible results and rejects conflicting diver
     await git(f.root, "add", ".");
     await git(f.root, "commit", "-m", "Conflicting destination");
     const conflictingDestination = await runRuntime(f.repository.head());
-    await assert.rejects(
-      runRuntime(active.effects.apply(conflicting.attempt.id)),
-      /conflict preview/,
-    );
+    await assert.rejects(runRuntime(active.apply(conflicting.attempt.id)), /conflict preview/);
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts.at(-1)?.application, undefined);
     assert.equal(await runRuntime(f.repository.head()), conflictingDestination);
@@ -2201,14 +2183,14 @@ await test("wrong-mode and stale maintained results remain retained without appl
       authority,
       acceptance: ["Changed"],
     });
-    await runRuntime(active.effects.queue(input("wrong-mode")));
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(input("wrong-mode")));
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     assert.equal(state.results[0]?.validity, "invalid");
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     await runRuntime(
-      active.effects.releaseOutput(
+      active.releaseOutput(
         required(state.attempts[0], "invalid output attempt").id,
         "Release malformed output after inspection.",
       ),
@@ -2227,24 +2209,22 @@ await test("wrong-mode and stale maintained results remain retained without appl
         commit: await git(request.cwd, "rev-parse", "HEAD"),
       };
     };
-    await runRuntime(active.effects.queue(input("stale")));
-    await runRuntime(active.effects.reconcile);
-    await submit(
-      active,
-      f.store.reviseIntent({
+    await runRuntime(active.queue(input("stale")));
+    await runRuntime(active.reconcile());
+    await runRuntime(
+      active.reviseIntent({
         authorityReceiptId: authority.receiptId,
         statement: "New constraints",
         constraints: ["Do not apply old value"],
       }),
     );
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.results[1]?.validity, "typed");
     assert.equal(state.attempts[1]?.application, undefined);
     assert.equal(state.attempts[1]?.cleanup?.state, "completed");
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "initial\n");
-    const completed = await submit(
-      active,
-      f.store.complete({
+    const completed = await runRuntime(
+      active.complete({
         conclusion: "done",
         evidence: [{ label: "limit", observation: "Not done" }],
         limitations: ["stale"],
@@ -2269,13 +2249,13 @@ await test("launch recovery distinguishes proven unsent from uncertain submitted
       const first = await f.runtime();
       f.workers.failBeforeSubmission = window === "before";
       f.workers.failAfterSubmission = window === "after";
-      await runRuntime(first.effects.queue(research("inspect")));
-      let state = await runRuntime(first.effects.reconcile);
+      await runRuntime(first.queue(research("inspect")));
+      let state = await runRuntime(first.reconcile());
       assert.equal(state.attempts[0]?.submission, window === "before" ? "not_sent" : "uncertain");
-      await runRuntime(first.effects.close);
+      await runRuntime(first.close);
       const next = await f.runtime();
-      await runRuntime(next.effects.reconcile);
-      state = await runRuntime(next.effects.reconcile);
+      await runRuntime(next.reconcile());
+      state = await runRuntime(next.reconcile());
       assert.equal(f.workers.requests.length, 1);
       assert.equal(f.workers.promptCount, 1);
       assert.equal(state.results.length, 1);
@@ -2291,11 +2271,11 @@ await test("exclusive lease fences same-session duplicates and dead-owner adopti
   try {
     const first = await f.runtime();
     await f.authority(first);
-    await runRuntime(first.effects.queue(research("inspect", 1)));
-    await runRuntime(first.effects.reconcile);
+    await runRuntime(first.queue(research("inspect", 1)));
+    await runRuntime(first.reconcile());
     const receipts = (await runRuntime(f.store.load())).inputs;
     await assert.rejects(f.runtime(), /already has a runtime owner/);
-    await submit(first, f.store.setLifecycle({ state: "suspended", reason: "Keep stopped" }));
+    await runRuntime(first.setLifecycle({ state: "suspended", reason: "Keep stopped" }));
     SqliteWorkstreamDatabase.use(f.store.path, (database) => {
       database.db
         .prepare("UPDATE lease SET expires_at=? WHERE singleton=1")
@@ -2309,13 +2289,13 @@ await test("exclusive lease fences same-session duplicates and dead-owner adopti
       owner: nextOwner,
       priorOwnerLiveness: "dead",
     });
-    const state = await runRuntime(adopted.effects.reconcile);
+    const state = await runRuntime(adopted.reconcile());
     assert.equal(state.coordinator.sessionId, "new-owner");
     assert.equal(state.lifecycle.state, "suspended");
     assert.deepEqual(state.inputs, receipts);
     assert.equal(state.results.length, 1);
     assert.equal(state.deliveries[0]?.state, "pending");
-    await assert.rejects(runRuntime(first.effects.reconcile), /live lease/);
+    await assert.rejects(runRuntime(first.reconcile()), /live lease/);
     assert.equal(f.workers.requests.length, 1);
   } finally {
     await f.dispose();
@@ -2326,20 +2306,20 @@ await test("worker continuation uses an isolated new workspace and current gener
   const f = await fixture();
   try {
     const active = await f.runtime();
-    await runRuntime(active.effects.queue(research("first")));
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(research("first")));
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     const previous = state.attempts[0];
     assert.ok(previous);
     f.workers.onWork = async () => undefined;
     await runRuntime(
-      active.effects.queue(research("followup"), {
+      active.queue(research("followup"), {
         continuationOf: previous.id,
         selection: { model: "fixture/research-2" },
       }),
     );
-    await runRuntime(active.effects.reconcile);
-    state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    state = await runRuntime(active.reconcile());
     assert.equal(state.results[1]?.validity, "untyped");
     assert.equal(state.attempts[1]?.placement?.kind, "shared_project");
     assert.equal(state.attempts[1]?.placement?.path, f.root);
@@ -2364,9 +2344,9 @@ await test("failed notification is not retried by polling and pending delivery r
         }),
       );
     });
-    await runRuntime(active.effects.queue(research("read")));
-    await runRuntime(active.effects.reconcile);
-    const state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(research("read")));
+    await runRuntime(active.reconcile());
+    const state = await runRuntime(active.reconcile());
     const result = state.results[0];
     assert.ok(result);
     const completion = {
@@ -2374,7 +2354,7 @@ await test("failed notification is not retried by polling and pending delivery r
       evidence: [{ label: "Read", observation: "value.txt says initial" }],
       limitations: [],
     };
-    const completed = await submit(active, f.store.complete(completion));
+    const completed = await runRuntime(active.complete(completion));
     assert.equal(completed.lifecycle.state, "completed");
     assert.equal(
       completed.completion?.accounting.some((item) =>
@@ -2382,10 +2362,10 @@ await test("failed notification is not retried by polling and pending delivery r
       ) ?? false,
       true,
     );
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    await runRuntime(active.reconcile());
     assert.equal(notifications, 1);
-    const pending = await runRuntime(active.effects.reconcile);
+    const pending = await runRuntime(active.reconcile());
     assert.equal(pending.deliveries[0]?.state, "pending");
     assert.equal(notifications, 1);
   } finally {
@@ -2432,14 +2412,14 @@ await test("Effect-owned fibers use deterministic cadence and close before relea
   await Effect.runPromise(clock.setTime(nativeLeaseTimestamp()));
   try {
     const active = await f.runtime(undefined, { clock });
-    await runRuntime(active.effects.queue(research("clocked")));
+    await runRuntime(active.queue(research("clocked")));
     await Effect.runPromise(clock.adjust("999 millis"));
     assert.equal(f.workers.requests.length, 0);
     await Effect.runPromise(clock.adjust("1 millis"));
-    await submit(active, Effect.void);
+    await runRuntime(active.read());
     assert.equal(f.workers.requests.length, 1);
-    await runRuntime(active.effects.close);
-    await assert.rejects(submit(active, Effect.void), /stopped|lease/i);
+    await runRuntime(active.close);
+    await assert.rejects(runRuntime(active.read()), /stopped|lease/i);
   } finally {
     await f.dispose();
   }
@@ -2451,7 +2431,7 @@ await test("fatal heartbeat loss releases ownership and permits a clean reattach
   await Effect.runPromise(clock.setTime(nativeLeaseTimestamp()));
   try {
     const active = await f.runtime(undefined, { clock });
-    await submit(active, Effect.void);
+    await runRuntime(active.read());
     SqliteWorkstreamDatabase.use(f.store.path, (database) =>
       database.db.prepare("DELETE FROM lease WHERE singleton=1").run(),
     );
@@ -2465,167 +2445,9 @@ await test("fatal heartbeat loss releases ownership and permits a clean reattach
       undefined,
     );
     const reattached = await f.runtime();
-    await submit(reattached, Effect.void);
-    await runRuntime(active.effects.close);
+    await runRuntime(reattached.read());
+    await runRuntime(active.close);
   } finally {
-    await f.dispose();
-  }
-});
-
-await test("Effect submissions cancel queued work immediately and await running interruption", async () => {
-  const f = await fixture();
-  try {
-    const active = await f.runtime();
-    await submit(active, Effect.void);
-    const entered = Deferred.makeUnsafe<void>();
-    const interrupted = Deferred.makeUnsafe<void>();
-    let queuedMutationRan = false;
-    const runningController = new AbortController();
-    const running = Effect.runPromise(
-      active.effects
-        .submit(
-          Deferred.succeed(entered, undefined).pipe(
-            Effect.andThen(Effect.never),
-            Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined).pipe(Effect.asVoid)),
-          ),
-        )
-        .pipe(Effect.provide(liveLayer)),
-      { signal: runningController.signal },
-    );
-    await Effect.runPromise(Deferred.await(entered));
-
-    const queuedController = new AbortController();
-    const queued = Effect.runPromise(
-      active.effects
-        .submit(
-          Effect.sync(() => {
-            queuedMutationRan = true;
-          }),
-        )
-        .pipe(Effect.provide(liveLayer)),
-      { signal: queuedController.signal },
-    );
-    queuedController.abort();
-    await assert.rejects(queued, /abort|interrupt/i);
-    assert.equal(queuedMutationRan, false);
-
-    runningController.abort();
-    await assert.rejects(running, /abort|interrupt/i);
-    await Effect.runPromise(Deferred.await(interrupted));
-    await submit(active, Effect.void);
-    assert.equal(queuedMutationRan, false);
-  } finally {
-    await f.dispose();
-  }
-});
-
-await test("close interrupts a suspended store operation and fails queued replies before releasing the lease", {
-  timeout: 30_000,
-}, async () => {
-  const f = await fixture();
-  const entered = Deferred.makeUnsafe<void>();
-  const finalizerEntered = Deferred.makeUnsafe<void>();
-  const releaseFinalizer = Deferred.makeUnsafe<void>();
-  let queuedMutationRan = false;
-  let closeSettled = false;
-  let active: WorkstreamRuntime | undefined;
-  let running: Promise<unknown> | undefined;
-  let queued: Promise<unknown> | undefined;
-  let close: Promise<void> | undefined;
-  try {
-    active = await f.runtime();
-    await submit(active, Effect.void);
-    running = runRuntime(
-      active.effects.submit(
-        f.store
-          .load()
-          .pipe(
-            Effect.andThen(Deferred.succeed(entered, undefined)),
-            Effect.andThen(Effect.never),
-            Effect.ensuring(
-              Effect.uninterruptible(
-                Deferred.succeed(finalizerEntered, undefined).pipe(
-                  Effect.andThen(Deferred.await(releaseFinalizer)),
-                ),
-              ),
-            ),
-          ),
-      ),
-    );
-    void running.catch(() => undefined);
-    await Effect.runPromise(Deferred.await(entered).pipe(Effect.timeout("5 seconds")));
-
-    queued = runRuntime(
-      active.effects.submit(
-        Effect.sync(() => {
-          queuedMutationRan = true;
-        }),
-      ),
-    );
-    void queued.catch(() => undefined);
-    const leaseBeforeClose = SqliteWorkstreamDatabase.use(f.store.path, (database) =>
-      database.db
-        .prepare(
-          `SELECT token, owner_session_id, owner_session_file, acquired_at, heartbeat_at, expires_at
-             FROM lease WHERE singleton=1`,
-        )
-        .get(),
-    );
-    assert.notEqual(leaseBeforeClose, undefined);
-
-    close = runRuntime(active.effects.close);
-    void close.then(
-      () => {
-        closeSettled = true;
-      },
-      () => {
-        closeSettled = true;
-      },
-    );
-    await Effect.runPromise(Deferred.await(finalizerEntered).pipe(Effect.timeout("5 seconds")));
-
-    assert.deepEqual(
-      SqliteWorkstreamDatabase.use(f.store.path, (database) =>
-        database.db
-          .prepare(
-            `SELECT token, owner_session_id, owner_session_file, acquired_at, heartbeat_at, expires_at
-               FROM lease WHERE singleton=1`,
-          )
-          .get(),
-      ),
-      leaseBeforeClose,
-    );
-    assert.equal(closeSettled, false);
-    assert.equal(queuedMutationRan, false);
-
-    await Effect.runPromise(Deferred.succeed(releaseFinalizer, undefined));
-    const closePromise = close;
-    assert.notEqual(closePromise, undefined);
-    await runRuntime(Effect.tryPromise(() => closePromise).pipe(Effect.timeout("5 seconds")));
-    await assert.rejects(running, /stopped|interrupt/i);
-    await assert.rejects(queued, /stopped|interrupt/i);
-    assert.equal(
-      SqliteWorkstreamDatabase.use(f.store.path, (database) =>
-        database.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(),
-      ),
-      undefined,
-    );
-  } finally {
-    await Effect.runPromise(Deferred.succeed(releaseFinalizer, undefined));
-    if (close === undefined && active !== undefined) close = runRuntime(active.effects.close);
-    if (close !== undefined)
-      await runRuntime(
-        Effect.tryPromise(() => Promise.allSettled([close])).pipe(Effect.timeout("5 seconds")),
-      );
-    if (running !== undefined || queued !== undefined)
-      await runRuntime(
-        Effect.tryPromise(() =>
-          Promise.allSettled([
-            ...(running === undefined ? [] : [running]),
-            ...(queued === undefined ? [] : [queued]),
-          ]),
-        ).pipe(Effect.timeout("5 seconds")),
-      );
     await f.dispose();
   }
 });
@@ -2633,7 +2455,7 @@ await test("close interrupts a suspended store operation and fails queued replie
 await test("close surfaces private lease release failures after attempting the exact release", async (t) => {
   const f = await fixture();
   const active = await f.runtime();
-  await submit(active, Effect.void);
+  await runRuntime(active.read());
   const release = f.store.releaseLease.bind(f.store);
   t.mock.method(f.store, "releaseLease", (lease: Lease) =>
     release(lease).pipe(
@@ -2642,7 +2464,7 @@ await test("close surfaces private lease release failures after attempting the e
     ),
   );
   try {
-    await assert.rejects(runRuntime(active.effects.close), /private lease release failure/);
+    await assert.rejects(runRuntime(active.close), /private lease release failure/);
     assert.match(f.errors[0] ?? "", /private lease release failure/);
     assert.equal(
       SqliteWorkstreamDatabase.use(f.store.path, (database) =>
@@ -2661,11 +2483,11 @@ await test("owned idle-worker cancellation closes without a model turn or fabric
   try {
     f.workers.deferWork = true;
     const active = await f.runtime();
-    await runRuntime(active.effects.queue(research("cancel-idle-no-turn")));
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(research("cancel-idle-no-turn")));
+    await runRuntime(active.reconcile());
     const attempt = required((await runRuntime(f.store.load())).attempts[0], "idle worker attempt");
     assert.equal(f.workers.promptCount, 0);
-    await runRuntime(active.effects.cancel(attempt.id));
+    await runRuntime(active.cancel(attempt.id));
     const state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
@@ -2916,15 +2738,15 @@ await test("reconcile settles cancellation only after proven external worker abs
   try {
     f.workers.deferWork = true;
     const active = await f.runtime();
-    await runRuntime(active.effects.queue(research("cancel-externally-absent")));
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(research("cancel-externally-absent")));
+    await runRuntime(active.reconcile());
     const attempt = required(
       (await runRuntime(f.store.load())).attempts[0],
       "absent worker attempt",
     );
-    await submit(active, f.store.cancelAttempt(attempt.id));
+    await runRuntime(active.requestCancellation(attempt.id));
     f.workers.absent = true;
-    const state = await runRuntime(active.effects.reconcile);
+    const state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.results.length, 0);
@@ -2940,7 +2762,7 @@ await test("working cancellation stays pending and quiet until the exact worker 
     const active = await f.runtime();
     const authority = await f.authority(active);
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "cancel-working-retained",
         capability: "research",
         artifactIntent: "disposable_experiment",
@@ -2952,7 +2774,7 @@ await test("working cancellation stays pending and quiet until the exact worker 
         expectedEvidence: ["No fabricated result"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
     const attempt = required(
       (await runRuntime(f.store.load())).attempts[0],
       "working cancellation attempt",
@@ -2960,7 +2782,7 @@ await test("working cancellation stays pending and quiet until the exact worker 
     const placement = required(attempt.placement, "working cancellation placement");
     const worker = required(attempt.worker, "working cancellation worker");
     f.workers.status = "working";
-    await runRuntime(active.effects.cancel(attempt.id));
+    await runRuntime(active.cancel(attempt.id));
     let state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.state, "cancel_requested");
     assert.equal(state.attempts[0]?.cleanup?.state, "pending");
@@ -2973,7 +2795,7 @@ await test("working cancellation stays pending and quiet until the exact worker 
       true,
     );
 
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.state, "cancel_requested");
     assert.equal(state.attempts[0]?.cleanup?.state, "pending");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, false);
@@ -2986,7 +2808,7 @@ await test("working cancellation stays pending and quiet until the exact worker 
     );
 
     f.workers.status = "idle";
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
@@ -3008,7 +2830,7 @@ await test("reconcile proves exact absence after closure before its worker check
     const active = await f.runtime();
     const authority = await f.authority(active);
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "cancel-checkpoint-interruption",
         capability: "research",
         artifactIntent: "disposable_experiment",
@@ -3020,7 +2842,7 @@ await test("reconcile proves exact absence after closure before its worker check
         expectedEvidence: ["Exact worker absence"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
     const attempt = required(
       (await runRuntime(f.store.load())).attempts[0],
       "checkpoint interruption attempt",
@@ -3029,9 +2851,7 @@ await test("reconcile proves exact absence after closure before its worker check
     const worker = required(attempt.worker, "checkpoint interruption worker");
     f.workers.status = "idle";
     t.mock.method(f.store, "markWorkerClosed", () => Effect.never);
-    await assert.rejects(
-      runRuntime(active.effects.cancel(attempt.id).pipe(Effect.timeout("100 millis"))),
-    );
+    await assert.rejects(runRuntime(active.cancel(attempt.id).pipe(Effect.timeout("100 millis"))));
     t.mock.restoreAll();
 
     let state = await runRuntime(f.store.load());
@@ -3040,7 +2860,7 @@ await test("reconcile proves exact absence after closure before its worker check
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, false);
     assert.equal(state.results.length, 0);
     f.workers.absent = true;
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
@@ -3061,7 +2881,7 @@ await test("checkpointed retained cleanup closes an absent worker without deleti
     const active = await f.runtime();
     const authority = await f.authority(active);
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "recover-retained-cleanup",
         capability: "research",
         artifactIntent: "disposable_experiment",
@@ -3073,7 +2893,7 @@ await test("checkpointed retained cleanup closes an absent worker without deleti
         expectedEvidence: ["Retained output"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
     const launched = required(
       (await runRuntime(f.store.load())).attempts[0],
       "retained cleanup attempt",
@@ -3083,7 +2903,7 @@ await test("checkpointed retained cleanup closes an absent worker without deleti
     const retainedFile = join(placement.path, "retained.txt");
     await writeFile(retainedFile, "retained across cleanup recovery\n");
     const markWorkerClosed = t.mock.method(f.store, "markWorkerClosed", () => Effect.never);
-    await assert.rejects(runRuntime(active.effects.reconcile.pipe(Effect.timeout("100 millis"))));
+    await assert.rejects(runRuntime(active.reconcile().pipe(Effect.timeout("100 millis"))));
     markWorkerClosed.mock.restore();
 
     let state = await runRuntime(f.store.load());
@@ -3095,7 +2915,7 @@ await test("checkpointed retained cleanup closes an absent worker without deleti
     assert.equal(await readFile(join(placement.path, "value.txt"), "utf8"), "initial\n");
 
     f.workers.absent = true;
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.match(state.attempts[0]?.cleanup?.error ?? "", /not clean|dirty worktree/);
@@ -3108,7 +2928,7 @@ await test("checkpointed retained cleanup closes an absent worker without deleti
     assert.equal(await readFile(retainedFile, "utf8"), "retained across cleanup recovery\n");
     assert.equal(await readFile(join(placement.path, "value.txt"), "utf8"), "initial\n");
 
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.match(state.attempts[0]?.error ?? "", /not clean|dirty worktree/);
@@ -3141,7 +2961,7 @@ await test("checkpointed non-retained isolated cleanup stays pending for diagnos
       findings: [],
     });
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "preserve-destructive-cleanup-boundary",
         capability: "implement",
         artifactIntent: "maintained_change",
@@ -3151,20 +2971,20 @@ await test("checkpointed non-retained isolated cleanup stays pending for diagnos
         acceptance: ["The existing behavior remains correct"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
     const launched = required(
       (await runRuntime(f.store.load())).attempts[0],
       "non-retained cleanup attempt",
     );
     const placement = required(launched.placement, "non-retained cleanup placement");
     t.mock.method(f.repository, "cleanupWorktree", () => Effect.never);
-    await assert.rejects(runRuntime(active.effects.reconcile.pipe(Effect.timeout("2 seconds"))));
+    await assert.rejects(runRuntime(active.reconcile().pipe(Effect.timeout("2 seconds"))));
     t.mock.restoreAll();
 
     let state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.cleanup?.state, "pending");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.cleanup?.workerClosed, true);
     assert.equal(state.attempts[0]?.error, undefined);
@@ -3184,15 +3004,15 @@ await test("unknown worker state remains blocked rather than becoming absent", a
   try {
     f.workers.deferWork = true;
     const active = await f.runtime();
-    await runRuntime(active.effects.queue(research("cancel-unknown-worker")));
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(research("cancel-unknown-worker")));
+    await runRuntime(active.reconcile());
     const attempt = required(
       (await runRuntime(f.store.load())).attempts[0],
       "unknown worker attempt",
     );
-    await submit(active, f.store.cancelAttempt(attempt.id));
+    await runRuntime(active.requestCancellation(attempt.id));
     f.workers.status = "unknown";
-    const state = await runRuntime(active.effects.reconcile);
+    const state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.state, "cancel_requested");
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
     assert.equal(state.results.length, 0);
@@ -3217,7 +3037,7 @@ await test("pre-session cancellation cleans only the known placement and never l
       ),
     );
     await runRuntime(
-      active.effects.queue({
+      active.queue({
         id: "cancel-before-session-checkpoint",
         capability: "research",
         artifactIntent: "disposable_experiment",
@@ -3229,14 +3049,14 @@ await test("pre-session cancellation cleans only the known placement and never l
         expectedEvidence: ["No native worker is launched"],
       }),
     );
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
     let state = await runRuntime(f.store.load());
     const attempt = required(state.attempts[0], "pre-session attempt");
     assert.equal(attempt.state, "starting");
     assert.equal(attempt.sessionFile, undefined);
     assert.equal(attempt.launchPane, undefined);
     assert.equal(f.workers.requests.length, 0);
-    await runRuntime(active.effects.cancel(attempt.id));
+    await runRuntime(active.cancel(attempt.id));
     state = await runRuntime(f.store.load());
     assert.equal(state.attempts[0]?.state, "cancelled");
     assert.equal(state.attempts[0]?.cleanup?.state, "blocked");
@@ -3257,9 +3077,9 @@ await test("healthy startup/running is quiet; a blocked boundary is recorded onc
   try {
     f.workers.deferWork = true;
     const active = await f.runtime();
-    await runRuntime(active.effects.queue(research("read")));
-    await runRuntime(active.effects.reconcile);
-    let state = await runRuntime(active.effects.reconcile);
+    await runRuntime(active.queue(research("read")));
+    await runRuntime(active.reconcile());
+    let state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.error, undefined);
     assert.deepEqual(f.errors, []);
     const request = f.workers.requests[0];
@@ -3270,21 +3090,21 @@ await test("healthy startup/running is quiet; a blocked boundary is recorded onc
       nodeId: request.nodeId,
     });
     f.workers.status = "working";
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.submission, "started");
     assert.equal(state.attempts[0]?.error, undefined);
     assert.deepEqual(f.errors, []);
     f.workers.status = "blocked";
-    await runRuntime(active.effects.reconcile);
-    await runRuntime(active.effects.reconcile);
+    await runRuntime(active.reconcile());
+    await runRuntime(active.reconcile());
     assert.equal(f.errors.length, 1);
     f.workers.status = "working";
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.error, undefined);
     assert.equal(state.attempts[0]?.attentionHistory?.length, 1);
     await runRuntime(f.workers.produceEffect(request.sessionFile));
     f.workers.status = "idle";
-    state = await runRuntime(active.effects.reconcile);
+    state = await runRuntime(active.reconcile());
     assert.equal(state.attempts[0]?.cleanup?.state, "completed");
     assert.equal(state.attempts[0]?.error, undefined);
     assert.match(state.attempts[0]?.attentionHistory?.[0]?.detail ?? "", /blocked/);

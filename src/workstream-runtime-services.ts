@@ -1,5 +1,6 @@
 import type { FileSystem, Path, Scope } from "effect";
 import { Cause, Data, Effect } from "effect";
+import type { GitRepository } from "./git.js";
 import type { HerdrCliRuntime } from "./herdr.js";
 import {
   createWorkerSessionEffect,
@@ -19,10 +20,49 @@ import {
 } from "./workstream-persistence.js";
 import { legacyPathForWorkstream } from "./workstream-state.js";
 
-export type RuntimeWorkerPort = Pick<
+export type WorkerHost = Pick<
   HerdrCliRuntime,
-  "launch" | "recover" | "inspectLaunch" | "inspect" | "observe" | "interrupt" | "steer" | "cleanup"
+  "launch" | "recover" | "observe" | "interrupt" | "steer" | "cleanup"
 >;
+
+export type RepositoryGateway = Pick<
+  GitRepository,
+  | "root"
+  | "head"
+  | "resolveRevision"
+  | "assertClean"
+  | "createWorktree"
+  | "validateWorkerNoChange"
+  | "validateCandidate"
+  | "preflightCandidateApplication"
+  | "prepareCandidateApplication"
+  | "recoverCandidateApplication"
+  | "applyCandidate"
+  | "releaseOutput"
+  | "cleanupWorktree"
+>;
+
+export interface WorkerSessionReader {
+  readonly createSession: typeof createWorkerSessionEffect;
+  readonly readReport: (
+    sessionFile: string,
+    generation: { runId: string; nodeId: string },
+  ) => ReturnType<typeof piReadReport>;
+  readonly readText: (
+    sessionFile: string,
+    generation: { runId: string; nodeId: string },
+  ) => ReturnType<typeof piReadText>;
+  readonly observeFailure: (
+    sessionFile: string,
+    generation: { runId: string; nodeId: string },
+  ) => ReturnType<typeof piObserveFailure>;
+  readonly models: (
+    sessionFile: string,
+    generation: { runId: string; nodeId: string },
+  ) => ReturnType<typeof piModels>;
+  readonly started: typeof hasNativeAgentStarted;
+  readonly settled: typeof hasNativeAgentSettled;
+}
 
 export class RuntimeRegistryError extends Data.TaggedError("RuntimeRegistryError")<{
   readonly operation: string;
@@ -147,17 +187,22 @@ export function acquireRuntimeLease(
   });
 }
 
-/** Immutable native Pi operations used by the cohesive runtime resource. */
-export const runtimePi = {
+const piReadReport = (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+  pi("read worker report", () => readWorkgraphReportResult(sessionFile, generation));
+const piReadText = (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+  pi("read worker text", () => readWorkerText(sessionFile, generation));
+const piObserveFailure = (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+  pi("observe worker failure", () => observeNativeFailure(sessionFile, generation));
+const piModels = (sessionFile: string, generation: { runId: string; nodeId: string }) =>
+  pi("read effective models", () => effectiveModelObservations(sessionFile, generation));
+
+/** Native Pi/session adapter for the application-owned WorkerSessionReader port. */
+export const liveWorkerSessionReader: WorkerSessionReader = {
   createSession: createWorkerSessionEffect,
-  readReport: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
-    pi("read worker report", () => readWorkgraphReportResult(sessionFile, generation)),
-  readText: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
-    pi("read worker text", () => readWorkerText(sessionFile, generation)),
-  observeFailure: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
-    pi("observe worker failure", () => observeNativeFailure(sessionFile, generation)),
-  models: (sessionFile: string, generation: { runId: string; nodeId: string }) =>
-    pi("read effective models", () => effectiveModelObservations(sessionFile, generation)),
+  readReport: piReadReport,
+  readText: piReadText,
+  observeFailure: piObserveFailure,
+  models: piModels,
   started: hasNativeAgentStarted,
   settled: hasNativeAgentSettled,
 };

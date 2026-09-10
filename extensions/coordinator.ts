@@ -29,17 +29,15 @@ import { liveLayer } from "../src/node-platform.js";
 import { forkConversationSessionEffect } from "../src/pi-process.js";
 import { EvidenceSchema } from "../src/report-schema.js";
 import { loadCalmAdditionalHiddenTools } from "../src/workgraph-settings.js";
+import type { SessionIdentity, WorkstreamState } from "../src/workstream.js";
 import {
-  type SessionIdentity,
-  type WorkstreamState,
-  WorkstreamStoreEffects,
-} from "../src/workstream.js";
-import {
+  type QueueAssignment,
   type QueueOptions,
+  type RuntimeAuthorizationSelection,
   type RuntimeError,
   WorkstreamRuntime,
 } from "../src/workstream-runtime.js";
-import { RuntimeHostError, type RuntimeWorkerPort } from "../src/workstream-runtime-services.js";
+import { RuntimeHostError, type WorkerHost } from "../src/workstream-runtime-services.js";
 import { isLegacyWorkstreamPath } from "../src/workstream-state.js";
 
 const POINTER = "pi-workgraph-workstream";
@@ -120,7 +118,7 @@ const ModelOptions = {
 
 export default function workgraphCoordinator(
   pi: ExtensionAPI,
-  runtimeWorker: () => RuntimeWorkerPort = () => new HerdrCliRuntime(),
+  runtimeWorker: () => WorkerHost = () => new HerdrCliRuntime(),
 ): void {
   if (!isCoordinatorScope(process.env)) return;
   const calm = installCalmMode(pi, { loadAdditionalHiddenTools: loadCalmAdditionalHiddenTools });
@@ -164,16 +162,17 @@ export default function workgraphCoordinator(
     });
   const attachOwned = (
     ctx: ExtensionContext,
-    target: WorkstreamStoreEffects,
+    targetPath: string,
     priorOwnerLiveness: "alive" | "dead" | "unknown" = "unknown",
+    targetOwner: SessionIdentity = owner(ctx),
   ): CoordinatorEffect<WorkstreamRuntime> =>
     Effect.suspend(() => {
       const attached = runtime;
-      if (attached?.store.path === target.path)
-        return attached.effects.submit(Effect.void).pipe(Effect.as(attached));
+      if (attached?.statePath === targetPath) return attached.read().pipe(Effect.as(attached));
       return Effect.gen(function* () {
         const previous = runtime;
-        const state = yield* target.load();
+        const state = yield* WorkstreamRuntime.inspect(targetPath);
+        const target = WorkstreamRuntime.open(targetPath, targetOwner);
         const { HERDR_WORKSPACE_ID: workspaceId } = process.env;
         let next: WorkstreamRuntime;
         next = yield* WorkstreamRuntime.acquire(
@@ -221,29 +220,26 @@ export default function workgraphCoordinator(
           },
         );
         if (previous !== undefined)
-          yield* previous.effects.close.pipe(
-            Effect.onError(() => next.effects.close.pipe(Effect.ignore)),
-          );
+          yield* previous.close.pipe(Effect.onError(() => next.close.pipe(Effect.ignore)));
         runtime = next;
         return next;
       });
     });
   const attachEffect = (
     ctx: ExtensionContext,
-    target: WorkstreamStoreEffects,
+    targetPath: string,
     priorOwnerLiveness: "alive" | "dead" | "unknown" = "unknown",
+    targetOwner?: SessionIdentity,
   ): CoordinatorEffect<WorkstreamRuntime> =>
-    attachmentSemaphore.withPermit(attachOwned(ctx, target, priorOwnerLiveness));
+    attachmentSemaphore.withPermit(attachOwned(ctx, targetPath, priorOwnerLiveness, targetOwner));
   const importInputsEffect = (active: WorkstreamRuntime): CoordinatorEffect<void> =>
-    hostSemaphore.withPermit(Effect.sync(() => [...pending])).pipe(
-      Effect.flatMap((receipts) =>
-        active.effects.submit(
-          Effect.forEach(receipts, (receipt) => active.store.recordInputEvent(receipt), {
-            discard: true,
-          }),
+    hostSemaphore
+      .withPermit(Effect.sync(() => [...pending]))
+      .pipe(
+        Effect.flatMap((receipts) =>
+          Effect.forEach(receipts, (receipt) => active.recordInput(receipt), { discard: true }),
         ),
-      ),
-    );
+      );
   installCoordinatorSessionState(pi, {
     owner,
     serialize: (run) =>
@@ -261,13 +257,13 @@ export default function workgraphCoordinator(
       const active = runtime;
       if (active === undefined) return Promise.resolve();
       return runCallback(
-        active.effects
-          .submit(active.store.load())
+        active
+          .read()
           .pipe(
             Effect.flatMap((state) =>
               state.lifecycle.state !== "active" && state.lifecycle.state !== "suspended"
                 ? Effect.void
-                : active.effects.submit(active.store.recordInputEvent(receipt).pipe(Effect.asVoid)),
+                : active.recordInput(receipt),
             ),
           ),
       );
@@ -299,11 +295,11 @@ export default function workgraphCoordinator(
     Effect.gen(function* () {
       if (runtime === undefined) return undefined;
       const attached = runtime;
-      const state = yield* attached.effects.submit(attached.store.load());
+      const state = yield* attached.read();
       if (state.lifecycle.state === "suspended")
         throw new Error("Workstream is suspended; resume explicitly before delegating.");
       if (state.lifecycle.state !== "active") {
-        yield* attached.effects.close;
+        yield* attached.close;
         if (runtime === attached) runtime = undefined;
         return undefined;
       }
@@ -320,14 +316,14 @@ export default function workgraphCoordinator(
         const existing = yield* reuseOrStopEffect(targetRepository);
         if (existing !== undefined) return existing;
         const repository = yield* inspectRepository(targetRepository ?? ctx.cwd);
-        const created = yield* WorkstreamStoreEffects.create({
+        const created = yield* WorkstreamRuntime.create({
           id: `ws-${randomUUID()}`,
           purpose,
           projectRoot: repository.root,
           gitCommonDir: repository.commonDir,
           coordinator: owner(ctx),
         });
-        const active = yield* attachOwned(ctx, created.store);
+        const active = yield* attachOwned(ctx, created.store.path);
         yield* importInputsEffect(active);
         yield* sdk("retain workstream pointer", () =>
           pi.appendEntry(POINTER, { path: created.store.path }),
@@ -337,24 +333,8 @@ export default function workgraphCoordinator(
     );
   const establishedScopeEffect = (
     active: WorkstreamRuntime,
-  ): CoordinatorEffect<{ state: WorkstreamState; authorization: AuthorizationSelection }> =>
-    active.effects.submit(
-      Effect.gen(function* () {
-        const state = yield* active.store.load();
-        const intent = requiredValue(state.intents.at(-1), "workstream intent");
-        if (intent.version === 0)
-          throw new Error(
-            "Current scope is not established. Record it explicitly with workgraph_intent before delegation.",
-          );
-        const selected = selectWorkstreamAuthority(state);
-        const authorization: AuthorizationSelection = {
-          authority: { receiptId: selected.receiptId, intentVersion: intent.version },
-        };
-        if (selected.latestObservedInput !== undefined)
-          authorization.latestObservedInput = selected.latestObservedInput;
-        return { state, authorization };
-      }),
-    );
+  ): CoordinatorEffect<{ state: WorkstreamState; authorization: RuntimeAuthorizationSelection }> =>
+    active.establishedScope();
   const activeEstablishedScopeEffect = (): CoordinatorEffect<{
     active: WorkstreamRuntime;
     state: WorkstreamState;
@@ -370,13 +350,9 @@ export default function workgraphCoordinator(
       return { active, state, authorization };
     });
 
-  const reattach = (
-    ctx: ExtensionContext,
-    identity: SessionIdentity,
-    path: string,
-  ): CoordinatorEffect<void> =>
+  const reattach = (ctx: ExtensionContext, path: string): CoordinatorEffect<void> =>
     Effect.gen(function* () {
-      const inspection = yield* WorkstreamStoreEffects.inspectForReattachment(path);
+      const inspection = yield* WorkstreamRuntime.inspectReattachment(path);
       if (inspection.kind === "retained_terminal") {
         yield* sdk("report retained terminal workstream", () =>
           ctx.ui.notify(
@@ -401,9 +377,9 @@ export default function workgraphCoordinator(
         inspection.state.lifecycle.state === "abandoned"
       )
         return;
-      const active = yield* attachEffect(ctx, WorkstreamStoreEffects.open(path, identity));
+      const active = yield* attachEffect(ctx, path);
       yield* importInputsEffect(active);
-      const state = yield* active.effects.submit(active.store.load());
+      const state = yield* active.read();
       yield* remember(state, ctx);
     }).pipe(
       Effect.catch((error) =>
@@ -420,7 +396,7 @@ export default function workgraphCoordinator(
     runCallback(
       Effect.gen(function* () {
         const active = runtime;
-        if (active !== undefined) yield* active.effects.close;
+        if (active !== undefined) yield* active.close;
         runtime = undefined;
         const identity = owner(ctx);
         const entries = ctx.sessionManager.getBranch();
@@ -447,13 +423,13 @@ export default function workgraphCoordinator(
             );
           return;
         }
-        yield* reattach(ctx, identity, data.path);
+        yield* reattach(ctx, data.path);
       }),
     ),
   );
   pi.on("session_shutdown", () => {
     const active = runtime;
-    return runCallback(active === undefined ? Effect.void : active.effects.close);
+    return runCallback(active === undefined ? Effect.void : active.close);
   });
   pi.on("before_agent_start", (event) => ({
     systemPrompt: `${event.systemPrompt}\n\n${COORDINATOR_GUIDANCE}`,
@@ -520,7 +496,7 @@ export default function workgraphCoordinator(
           const intent = requiredValue(stateBefore.intents.at(-1), "established workstream intent");
           const authority = params.experiment === undefined ? undefined : authorization;
           const assignment = researchAssignment(params, intent.version, authority?.authority);
-          const state = yield* active.effects.queue(assignment, queueOptions(params));
+          const state = yield* active.queue(assignment, queueOptions(params));
           const projection: Parameters<typeof actionView>[1] = {
             action: "workgraph_research",
             assignmentId: params.id,
@@ -558,7 +534,7 @@ export default function workgraphCoordinator(
         Effect.gen(function* () {
           const { active, state: before } = yield* activeEstablishedScopeEffect();
           const intent = requiredValue(before.intents.at(-1), "established workstream intent");
-          const assignment: Parameters<WorkstreamStoreEffects["enqueue"]>[0] = {
+          const assignment: QueueAssignment = {
             id: params.id,
             capability: "consultation",
             artifactIntent: "evidence_only",
@@ -567,7 +543,7 @@ export default function workgraphCoordinator(
           };
           if (params.context !== undefined) assignment.context = params.context;
           if (params.advisor !== undefined) assignment.advisorModel = params.advisor;
-          const state = yield* active.effects.queue(assignment);
+          const state = yield* active.queue(assignment);
           return mutationResult(
             `Queued consultation ${params.id}; advisor execution is observed asynchronously.`,
             yield* remember(state, ctx),
@@ -602,10 +578,7 @@ export default function workgraphCoordinator(
       return runCallback(
         Effect.gen(function* () {
           const attached = runtime;
-          const attachedState =
-            attached === undefined
-              ? undefined
-              : yield* attached.effects.submit(attached.store.load());
+          const attachedState = attached === undefined ? undefined : yield* attached.read();
           const canRevise =
             attachedState?.lifecycle.state === "active" ||
             attachedState?.lifecycle.state === "suspended";
@@ -619,13 +592,11 @@ export default function workgraphCoordinator(
             receiptId = selectSessionAuthority(pending, params.authorityReceiptId).receiptId;
             active = yield* ensureEffect(ctx, params.statement, params.targetRepository);
           }
-          const state = yield* active.effects.submit(
-            active.store.reviseIntent({
-              authorityReceiptId: receiptId,
-              statement: params.statement,
-              constraints: params.constraints ?? [],
-            }),
-          );
+          const state = yield* active.reviseIntent({
+            authorityReceiptId: receiptId,
+            statement: params.statement,
+            constraints: params.constraints ?? [],
+          });
           return mutationResult("Recorded intent revision.", yield* remember(state, ctx), {
             action: "workgraph_intent",
             outcome: "recorded",
@@ -654,7 +625,7 @@ export default function workgraphCoordinator(
       return runCallback(
         Effect.gen(function* () {
           const { active, authorization } = yield* activeEstablishedScopeEffect();
-          const state = yield* active.effects.queue(
+          const state = yield* active.queue(
             {
               id: params.id,
               capability: "implement",
@@ -731,7 +702,7 @@ export default function workgraphCoordinator(
         Effect.gen(function* () {
           const { active, state: before } = yield* activeEstablishedScopeEffect();
           const intent = requiredValue(before.intents.at(-1), "established workstream intent");
-          const state = yield* active.effects.queue(
+          const state = yield* active.queue(
             {
               id: params.id,
               capability: "review",
@@ -784,7 +755,7 @@ export default function workgraphCoordinator(
       return runCallback(
         Effect.gen(function* () {
           const active = current();
-          const state = yield* active.effects.submit(active.store.load());
+          const state = yield* active.read();
           const view = inspectView(state, { ...params, section: params.section });
           return {
             content: [{ type: "text" as const, text: formatInspection(view) }],
@@ -809,7 +780,7 @@ export default function workgraphCoordinator(
             ? yield* controlAttemptEffect(active, params)
             : yield* lifecycleControlEffect(active, params);
           const message = controlMessage(params.action);
-          const state = yield* active.effects.submit(active.store.load());
+          const state = yield* active.read();
           const projection: Parameters<typeof actionView>[1] = {
             action: `workgraph_control:${params.action}`,
             message,
@@ -831,7 +802,7 @@ export default function workgraphCoordinator(
     execute(_id, params, signal, _update, ctx) {
       return runCallback(
         Effect.gen(function* () {
-          let state = yield* WorkstreamStoreEffects.inspect(params.statePath);
+          let state = yield* WorkstreamRuntime.inspect(params.statePath);
           const repository = yield* inspectRepository(state.projectRoot);
           if (repository.commonDir !== state.gitCommonDir)
             throw new Error("The retained workstream belongs to another repository.");
@@ -839,20 +810,16 @@ export default function workgraphCoordinator(
           const liveness = yield* herdr.coordinatorLiveness(state.coordinator.sessionFile);
           let targetPath = params.statePath;
           if (isLegacyWorkstreamPath(state.statePath)) {
-            const migrated = yield* WorkstreamStoreEffects.migrateLegacy(
-              params.statePath,
-              liveness,
-            );
+            const migrated = yield* WorkstreamRuntime.migrateLegacy(params.statePath, liveness);
             state = migrated.state;
             targetPath = migrated.path;
           }
-          const target = WorkstreamStoreEffects.open(targetPath, state.coordinator);
-          const active = yield* attachEffect(ctx, target, liveness);
+          const active = yield* attachEffect(ctx, targetPath, liveness, state.coordinator);
           yield* sdk("retain adopted workstream pointer", () =>
-            pi.appendEntry(POINTER, { path: target.path }),
+            pi.appendEntry(POINTER, { path: active.statePath }),
           );
           yield* importInputsEffect(active);
-          const adopted = yield* active.effects.submit(active.store.load());
+          const adopted = yield* active.read();
           return mutationResult(
             "Adopted without changing lifecycle.",
             yield* remember(adopted, ctx),
@@ -908,12 +875,10 @@ export default function workgraphCoordinator(
       return runCallback(
         Effect.gen(function* () {
           const active = current();
-          const state = yield* active.effects.submit(
-            active.store.complete({
-              ...params,
-              limitations: params.limitations ?? [],
-            }),
-          );
+          const state = yield* active.complete({
+            ...params,
+            limitations: params.limitations ?? [],
+          });
           // Keep the scoped owner available for exact retained-output release after
           // semantic completion. Terminal lifecycle prevents launches or resume;
           // extension shutdown remains the native owner close boundary.
@@ -952,13 +917,7 @@ type ObservedInputReceipt = {
   source: "interactive" | "rpc";
 };
 
-type AuthorizationSelection = {
-  authority: {
-    receiptId: string;
-    intentVersion: number;
-  };
-  latestObservedInput?: ObservedInputReceipt;
-};
+type AuthorizationSelection = RuntimeAuthorizationSelection;
 
 type WorkstreamAuthoritySelection = {
   receiptId: string;
@@ -993,22 +952,6 @@ function selectIntentAuthority(
   return { receiptId };
 }
 
-function selectWorkstreamAuthority(state: WorkstreamState): WorkstreamAuthoritySelection {
-  const intent = requiredValue(state.intents.at(-1), "workstream intent");
-  const latestReceipt = state.inputs.at(-1);
-  const selectedReceipt = state.inputs.findLast((receipt) =>
-    intent.authorityReceiptIds.includes(receipt.id),
-  );
-  const receiptId = requiredAuthorityReceipt(selectedReceipt?.id);
-  if (selectedReceipt === undefined)
-    throw new Error(`Current intent ${intent.version} has no retained authority receipt.`);
-  if (latestReceipt === undefined || latestReceipt.id === receiptId) return { receiptId };
-  return {
-    receiptId,
-    latestObservedInput: { receiptId: latestReceipt.id, source: latestReceipt.source },
-  };
-}
-
 function selectSessionAuthority(
   receipts: Static<typeof InputReceipt>[],
   requestedReceiptId: string | undefined,
@@ -1028,7 +971,7 @@ function researchAssignment(
   params: ResearchParams,
   intentVersion: number,
   authority: { receiptId: string; intentVersion: number } | undefined,
-): Parameters<WorkstreamStoreEffects["enqueue"]>[0] {
+): QueueAssignment {
   const common = {
     id: params.id,
     capability: "research" as const,
@@ -1064,9 +1007,7 @@ function controlAttemptEffect(
   params: AttemptControlParams,
 ): CoordinatorEffect<string, RuntimeError | Error> {
   return Effect.gen(function* () {
-    const state = yield* active.effects.submit(active.store.load());
-    const attempt = state.attempts.find((item) => item.id === params.attempt);
-    if (attempt === undefined) throw new Error(`Unknown exact attempt ${params.attempt}.`);
+    const attempt = yield* active.readAttempt(params.attempt);
     yield* executeAttemptControl(active, params, attempt.id);
     return attempt.id;
   });
@@ -1077,23 +1018,21 @@ function executeAttemptControl(
   params: AttemptControlParams,
   attemptId: string,
 ): CoordinatorEffect<void> {
-  if (params.action === "cancel") return active.effects.cancel(attemptId);
-  if (params.action === "steer") return active.effects.steer(attemptId, params.instruction);
-  if (params.action === "apply") return active.effects.apply(attemptId).pipe(Effect.asVoid);
-  return active.effects.releaseOutput(attemptId, params.reason).pipe(Effect.asVoid);
+  if (params.action === "cancel") return active.cancel(attemptId);
+  if (params.action === "steer") return active.steer(attemptId, params.instruction);
+  if (params.action === "apply") return active.apply(attemptId).pipe(Effect.asVoid);
+  return active.releaseOutput(attemptId, params.reason).pipe(Effect.asVoid);
 }
 
 function lifecycleControlEffect(
   active: WorkstreamRuntime,
   params: LifecycleControlParams,
 ): CoordinatorEffect<undefined> {
-  return active.effects
-    .submit(
-      active.store.setLifecycle({
-        state: params.action === "suspend" ? "suspended" : "active",
-        reason: params.reason,
-      }),
-    )
+  return active
+    .setLifecycle({
+      state: params.action === "suspend" ? "suspended" : "active",
+      reason: params.reason,
+    })
     .pipe(Effect.as(undefined));
 }
 
