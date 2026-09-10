@@ -121,9 +121,14 @@ export function createCalmActivityTracker(onChange: () => void = () => {}): Calm
       changed();
     },
     messageUpdate(eventType: string): void {
-      if (eventType.startsWith("thinking_")) phase = "thinking";
-      else if (eventType.startsWith("text_")) phase = "responding";
-      else return;
+      // Repeated deltas of the same kind are not a new semantic state, so publication stays quiet.
+      const next: CalmActivityPhase | undefined = eventType.startsWith("thinking_")
+        ? "thinking"
+        : eventType.startsWith("text_")
+          ? "responding"
+          : undefined;
+      if (next === undefined || next === phase) return;
+      phase = next;
       changed();
     },
     toolStart(toolCallId: string, toolName: string, args: unknown): void {

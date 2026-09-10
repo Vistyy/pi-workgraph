@@ -61,18 +61,17 @@ Describe the outcome you want and any important constraints. Workgraph fixes one
 Research and ordinary review can inspect the live repository, including uncommitted files. Implementation and authorized disposable experiments use isolated worktrees; these are ownership boundaries, not security sandboxes. Results remain unapplied until the coordinator has inspected them and deliberately integrates the selected output.
 
 
-## Customize presentation and worker tools
+## Calm presentation
 
-`/calm` hides coordinator reasoning and operational rows while retaining answers and compact activity. `/calm default on` saves that preference.
+`/calm` shows only conversation: your messages, assistant prose, and compact skill invocations, with a subdued separator between adjacent assistant answers. Coordinator activity stays in a bounded rail above the editor. `/calm default on` saves that preference for new coordinator sessions.
 
-Configure additional presentation-only hidden tools and tools unavailable to every worker in `~/.pi/agent/settings.json`:
+## Disable worker tools
+
+Configure tools unavailable to every worker in `~/.pi/agent/settings.json`:
 
 ```json
 {
   "pi-workgraph": {
-    "calm": {
-      "additionalHiddenTools": ["web_search", "rename_resource"]
-    },
     "worker": {
       "disabledTools": ["rename_resource"]
     }
@@ -80,4 +79,4 @@ Configure additional presentation-only hidden tools and tools unavailable to eve
 }
 ```
 
-`additionalHiddenTools` affects only coordinator presentation. `disabledTools` changes model tool availability for workers; it does not prevent extensions, hooks, commands, skills, or context from loading.
+`disabledTools` changes model tool availability for workers; it does not prevent extensions, hooks, commands, skills, or context from loading.

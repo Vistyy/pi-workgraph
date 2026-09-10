@@ -1,16 +1,5 @@
-// SAFETY: Pi's bundled runtime is inspected read-only to locate its actual presentation module.
-// oxlint-disable-next-line effecttsgo/node-builtin-import
-import { readdir, readFile } from "node:fs/promises";
-// SAFETY: These paths locate the read-only installed Pi bundle; no installed file is modified.
-// oxlint-disable-next-line effecttsgo/node-builtin-import
-import { dirname, join } from "node:path";
-// SAFETY: This converts the discovered installed module path to an import URL only.
-import { pathToFileURL } from "node:url";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-  ExtensionUIContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -20,8 +9,8 @@ import {
   isCalmActivityActive,
 } from "./calm-activity.js";
 import { type CalmPreferences, calmPreferences } from "./calm-preferences.js";
-import { attachCalmSeparators } from "./calm-separators.js";
-import { type AssistantPresentationConstructor, attachCalmThinking } from "./calm-thinking.js";
+import { attachCalmProjection, type CalmProjection, discoverCalmChat } from "./calm-projection.js";
+import { type CalmChatRuntime, loadCalmChatRuntime } from "./pi-chat-runtime.js";
 
 export {
   calmActivityLines,
@@ -29,162 +18,115 @@ export {
   isCalmActivityActive,
 } from "./calm-activity.js";
 
-// SAFETY: This module is the narrowly guarded internal Pi rendering compatibility boundary.
-// Its unknown/reflection checks parse runtime exports and instances so a changed seam falls back visibly.
-// oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-runtime-typeof, anti-slop/no-reflect-get
-
-export const DEFAULT_CALM_HIDDEN_TOOLS = [
-  "bash",
-  "edit",
-  "find",
-  "grep",
-  "ls",
-  "powershell",
-  "read",
-  "write",
-  "workgraph_notepad",
-  "workgraph_models",
-  "workgraph_research",
-  "workgraph_consult",
-  "workgraph_intent",
-  "workgraph_implement",
-  "workgraph_review",
-  "workgraph_inspect",
-  "workgraph_control",
-  "workgraph_adopt",
-  "workgraph_fork",
-  "workgraph_complete",
-  "workgraph_plan",
-  "workgraph_report",
-] as const;
-
-const CALM_OPERATIONAL_MESSAGE_TYPES = [
-  "pi-workgraph-workstream",
-  "pi-workgraph-attention",
-] as const;
-
 const CALM_INTERVAL_MS = 400;
+const CALM_WIDGET = "calm";
+const CALM_PROBE_WIDGET = "calm-probe";
+const CALM_STATUS = "calm";
 const CALM_SESSION_ENTRY = "pi-workgraph-calm-preference";
 const CalmSessionSchema = Type.Object({ sessionId: Type.String(), on: Type.Boolean() });
-const PATCH_OWNER = Symbol.for("@vistyy/pi-workgraph/calm-presentation");
-
-type Render = (width: number) => string[];
-type CalmMouseEvent = {
-  readonly [key: string]: string | number | boolean | undefined;
-};
-type MouseHandler = (event: CalmMouseEvent) => CalmMouseEvent | undefined;
-type PresentationInstance = {
-  render: Render;
-  handleMouse: MouseHandler | undefined;
-};
-type PresentationPrototype = PresentationInstance & {
-  readonly [PATCH_OWNER]?: unknown;
-};
-type PresentationConstructor = {
-  prototype: PresentationPrototype;
-};
-export interface CalmPresentationModule {
-  readonly ToolExecutionComponent: PresentationConstructor;
-  readonly CustomMessageComponent: PresentationConstructor;
-  readonly AssistantMessageComponent: AssistantPresentationConstructor;
-  readonly UserMessageComponent: PresentationConstructor;
-}
-
-export interface CalmPresentationState {
-  on: boolean;
-  readonly hiddenTools: ReadonlySet<string>;
-  readonly hiddenMessageTypes: ReadonlySet<string>;
-}
 
 export interface CalmMode {
   setActiveWorkers(count: number): void;
 }
 
-type Detach = () => void;
 type Diagnostic = (message: string) => void;
-type PresentationLoader = () => Promise<unknown>;
 
 export function isCoordinatorScope(env: { readonly PI_WORKGRAPH_MODE?: string }): boolean {
   return env.PI_WORKGRAPH_MODE === undefined || env.PI_WORKGRAPH_MODE === "";
 }
 
-export function calmHiddenTools(additional: readonly string[] = []): string[] {
-  return [...new Set([...DEFAULT_CALM_HIDDEN_TOOLS, ...additional])];
+interface CalmSessionEntryLike {
+  readonly type: string;
+  readonly customType?: string;
+  readonly data?: unknown;
 }
 
-export function attachCalmPresentation(
-  module: CalmPresentationModule,
-  state: CalmPresentationState,
-  diagnostic: Diagnostic,
-  separatorStyle: (text: string) => string = (text) => text,
-): Detach {
-  const detaches: Detach[] = [];
+/** Read the last saved Calm on/off choice for one session from Pi's persisted entries. */
+function savedCalmChoice(
+  entries: readonly CalmSessionEntryLike[],
+  sessionId: string,
+): boolean | undefined {
+  const saved = entries.findLast(
+    (entry) =>
+      entry.type === "custom" &&
+      entry.customType === CALM_SESSION_ENTRY &&
+      Value.Check(CalmSessionSchema, entry.data) &&
+      entry.data.sessionId === sessionId,
+  );
+  if (saved === undefined || !Value.Check(CalmSessionSchema, saved.data)) return undefined;
+  return saved.data.on;
+}
+
+interface CalmSessionStart {
+  readonly isCurrent: () => boolean;
+  readonly appendSavedChoice: ((on: boolean) => void) | undefined;
+  readonly setOn: (on: boolean) => void;
+  readonly loadRuntime: () => Promise<CalmChatRuntime>;
+  readonly attach: (runtime: CalmChatRuntime) => void;
+  readonly setReady: (ready: boolean) => void;
+  readonly diagnose: Diagnostic;
+  readonly syncChrome: () => void;
+}
+
+/** Apply one resolved Calm startup choice: load the live runtime, attach, and publish chrome. */
+// oxlint-disable-next-line effecttsgo/async-function -- Loading the running Pi module is a native dynamic import that must settle before attachment.
+async function startCalmSession(start: CalmSessionStart, on: boolean): Promise<void> {
+  if (!start.isCurrent()) return;
+  start.appendSavedChoice?.(on);
+  start.setOn(on);
   try {
-    detaches.push(
-      patchPrototype(
-        module.ToolExecutionComponent.prototype,
-        "tool rows",
-        (component) => readStringProperty(component, "toolName"),
-        (name) => state.hiddenTools.has(name),
-        state,
-        diagnostic,
-      ),
-    );
-    detaches.push(
-      patchPrototype(
-        module.CustomMessageComponent.prototype,
-        "custom messages",
-        (component) => readStringProperty(readProperty(component, "message"), "customType"),
-        (name) => state.hiddenMessageTypes.has(name),
-        state,
-        diagnostic,
-      ),
-    );
-    detaches.push(
-      attachCalmThinking(module.AssistantMessageComponent.prototype, () => state.on, diagnostic),
-    );
-    detaches.push(
-      attachCalmSeparators(
-        module.AssistantMessageComponent.prototype,
-        module.UserMessageComponent.prototype,
-        () => state.on,
-        separatorStyle,
-        diagnostic,
-      ),
-    );
+    const chatRuntime = await start.loadRuntime();
+    if (!start.isCurrent()) return;
+    start.attach(chatRuntime);
+    start.setReady(true);
   } catch (error) {
-    for (const detach of detaches.reverse()) detach();
-    throw error;
+    // A superseded session's rejection must not mutate, detach, or report through the current one.
+    if (!start.isCurrent()) return;
+    start.setReady(false);
+    start.setOn(false);
+    start.diagnose(error instanceof Error ? error.message : String(error));
   }
-  let attached = true;
-  return () => {
-    if (!attached) return;
-    attached = false;
-    for (const detach of detaches.reverse()) detach();
-  };
+  start.syncChrome();
 }
 
+/** Load the saved startup default, reporting a read failure once as a non-fatal warning. */
+function loadDefaultCalm(
+  ui: ExtensionUIContext,
+  preferences: CalmPreferences,
+  isCurrent: () => boolean,
+): Promise<boolean> {
+  return preferences.load().catch((error) => {
+    if (isCurrent())
+      ui.notify(
+        `Could not load Calm default: ${error instanceof Error ? error.message : String(error)}`,
+        "warning",
+      );
+    return false;
+  });
+}
+
+/**
+ * Calm replaces coordinator presentation, not coordination state.
+ *
+ * It discovers the live Pi chat once, binds one guarded projection adapter to that exact instance,
+ * and pushes Calm on/off through the adapter. Any discovery, binding, or classification failure
+ * disables the projection and returns the native transcript instead of leaving partial filtering.
+ */
 export function installCalmMode(
   pi: ExtensionAPI,
   options: {
-    readonly hiddenTools?: readonly string[];
-    readonly loadAdditionalHiddenTools?: () => Promise<readonly string[]>;
-    readonly loadPresentation?: PresentationLoader;
     readonly intervalMs?: number;
     readonly preferences?: CalmPreferences;
+    /** Tests inject the running Pi presentation classes; production loads them from the live CLI. */
+    readonly loadRuntime?: () => Promise<CalmChatRuntime>;
   } = {},
 ): CalmMode {
-  const hiddenTools = new Set(options.hiddenTools ?? calmHiddenTools());
-  const state: CalmPresentationState = {
-    on: false,
-    hiddenTools,
-    hiddenMessageTypes: new Set(CALM_OPERATIONAL_MESSAGE_TYPES),
-  };
   const preferences = options.preferences ?? calmPreferences();
-  const loadPresentation = options.loadPresentation ?? loadPiPresentation;
+  const loadRuntime = options.loadRuntime ?? loadCalmChatRuntime;
   const intervalMs = options.intervalMs ?? CALM_INTERVAL_MS;
+  const state = { on: false };
   let ui: ExtensionUIContext | undefined;
-  let detach: Detach | undefined;
+  let projection: CalmProjection | undefined;
   let adapterReady = false;
   let coordinatorActive = false;
   let waitingForInput = false;
@@ -193,8 +135,13 @@ export function installCalmMode(
   let timer: ReturnType<typeof setInterval> | undefined;
   let generation = 0;
   let widgetVisible = false;
+  let widgetSignature: string | undefined;
+  let statusPublished = false;
+  let workingHidden = false;
   let requestWidgetRender: (() => void) | undefined;
-  const diagnosed = new Set<string>();
+  // Dedupe within one session generation so a real incompatibility is reported again in a later
+  // session instead of being suppressed for the process lifetime.
+  const diagnosed = new Map<string, number>();
   let activityTracker: ReturnType<typeof createCalmActivityTracker>;
 
   const activity = (): CalmActivityState => ({
@@ -204,30 +151,39 @@ export function installCalmMode(
     waitingForInput,
     ...activityTracker.snapshot(),
   });
+  const pulsing = (): boolean => state.on && coordinatorActive && !waitingForInput;
+  const renderSignature = (): string =>
+    JSON.stringify([activity(), pulsing() ? frame % 4 < 2 : false]);
   const stopTimer = (): void => {
     if (timer !== undefined) clearInterval(timer);
     timer = undefined;
   };
-  const renderStatus = (): void => {
-    if (!state.on || ui === undefined) return;
-    ui.setStatus("calm", ui.theme.fg("dim", "calm"));
+  const publishStatus = (visible: boolean): void => {
+    if (ui === undefined || visible === statusPublished) return;
+    statusPublished = visible;
+    ui.setStatus(CALM_STATUS, visible ? ui.theme.fg("dim", "calm") : undefined);
   };
   const clearWidget = (): void => {
-    if (widgetVisible && ui !== undefined) ui.setWidget("calm", undefined);
+    if (widgetVisible && ui !== undefined) ui.setWidget(CALM_WIDGET, undefined);
     widgetVisible = false;
+    widgetSignature = undefined;
     requestWidgetRender = undefined;
   };
   const syncWidget = (): void => {
-    if (ui === undefined || !isCalmActivityActive(activity())) {
+    if (ui === undefined || !state.on || !isCalmActivityActive(activity())) {
       clearWidget();
       return;
     }
+    const signature = renderSignature();
     if (widgetVisible) {
+      if (signature === widgetSignature) return;
+      widgetSignature = signature;
       requestWidgetRender?.();
       return;
     }
     widgetVisible = true;
-    ui.setWidget("calm", (tui, theme) => {
+    widgetSignature = signature;
+    ui.setWidget(CALM_WIDGET, (tui, theme) => {
       const request: () => void = () => tui.requestRender();
       requestWidgetRender = request;
       return {
@@ -240,20 +196,16 @@ export function installCalmMode(
     });
   };
   const syncTimer = (): void => {
-    if (
-      ui === undefined ||
-      !isCalmActivityActive(activity()) ||
-      (waitingForInput && activeWorkers === 0)
-    ) {
+    if (ui === undefined || !pulsing()) {
       stopTimer();
       return;
     }
     if (timer !== undefined) return;
-    // SAFETY: This timer only drives presentation animation and is cleared by stopTimer/shutdown.
+    // SAFETY: This timer only advances the rail pulse and is cleared by stopTimer and shutdown.
     // oxlint-disable-next-line effecttsgo/global-timers
     timer = setInterval(() => {
       frame += 1;
-      requestWidgetRender?.();
+      syncWidget();
     }, intervalMs);
   };
   activityTracker = createCalmActivityTracker(() => {
@@ -262,42 +214,88 @@ export function installCalmMode(
   });
   const syncChrome = (): void => {
     if (ui === undefined) return;
-    // Both views own the single activity surface; never stack Pi's spinner above it.
-    ui.setWorkingVisible(false);
-    if (state.on) renderStatus();
-    else ui.setStatus("calm", undefined);
+    projection?.setEnabled(state.on);
+    if (state.on) {
+      if (!workingHidden) {
+        // Calm owns the single activity surface; Pi keeps its working indicator hidden.
+        ui.setWorkingVisible(false);
+        workingHidden = true;
+      }
+      publishStatus(true);
+    } else {
+      if (workingHidden) {
+        ui.setWorkingVisible(true);
+        workingHidden = false;
+      }
+      publishStatus(false);
+    }
     syncWidget();
     syncTimer();
   };
-  const diagnose = (message: string): void => {
-    if (diagnosed.has(message)) return;
-    diagnosed.add(message);
-    queueMicrotask(() =>
-      ui?.notify(`Calm unavailable: ${message} Rows remain visible.`, "warning"),
-    );
+  // Calm becomes unavailable only for a real incompatibility that disables the projection; a
+  // non-fatal compatibility warning must not. Both are deduplicated and reported once.
+  const diagnose: Diagnostic = (message) => {
+    if (diagnosed.get(message) === generation) return;
+    diagnosed.set(message, generation);
+    const diagnosedGeneration = generation;
+    queueMicrotask(() => {
+      // A stale failure must not disable a newer attachment or rewrite current chrome.
+      if (diagnosedGeneration !== generation) return;
+      if (state.on) state.on = false;
+      adapterReady = false;
+      const current = projection;
+      projection = undefined;
+      current?.detach();
+      syncChrome();
+      ui?.notify(`Calm unavailable: ${message} Native rows remain visible.`, "warning");
+    });
   };
-  const detachPresentation = (): void => {
-    detach?.();
-    detach = undefined;
-    adapterReady = false;
+  const warn: Diagnostic = (message) => {
+    if (diagnosed.get(message) === generation) return;
+    diagnosed.set(message, generation);
+    ui?.notify(`Calm compatibility warning: ${message}`, "warning");
   };
   const shutdown = (): void => {
     generation += 1;
     state.on = false;
     activityTracker.clear();
     stopTimer();
-    detachPresentation();
+    projection?.detach();
+    projection = undefined;
+    adapterReady = false;
     if (ui !== undefined) {
       clearWidget();
-      ui.setStatus("calm", undefined);
-      ui.setWorkingIndicator();
-      ui.setWorkingVisible(true);
+      publishStatus(false);
+      if (workingHidden) {
+        ui.setWorkingVisible(true);
+        workingHidden = false;
+      }
     }
     ui = undefined;
     coordinatorActive = false;
     waitingForInput = false;
     activeWorkers = 0;
     frame = 0;
+  };
+  const captureTui = (context: ExtensionUIContext): TUI | undefined => {
+    let captured: TUI | undefined;
+    context.setWidget(CALM_PROBE_WIDGET, (tui) => {
+      captured = tui;
+      return { render: () => [], invalidate() {}, dispose() {} };
+    });
+    context.setWidget(CALM_PROBE_WIDGET, undefined);
+    return captured;
+  };
+  const attachProjection = (chatRuntime: CalmChatRuntime): void => {
+    if (ui === undefined) throw new Error("the Pi TUI is unavailable.");
+    const tui = captureTui(ui);
+    if (tui === undefined) throw new Error("the Pi TUI root seam is missing.");
+    projection = attachCalmProjection(discoverCalmChat(tui, chatRuntime), {
+      runtime: chatRuntime,
+      styleSeparator: (text) => ui?.theme.fg("dim", text) ?? text,
+      onIncompatible: diagnose,
+      onWarning: warn,
+    });
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -307,80 +305,39 @@ export function installCalmMode(
     coordinatorActive = !ctx.isIdle();
     const currentGeneration = generation;
     const sessionId = ctx.sessionManager.getSessionId();
-    const saved = ctx.sessionManager
-      .getEntries()
-      .findLast(
-        (entry) =>
-          entry.type === "custom" &&
-          entry.customType === CALM_SESSION_ENTRY &&
-          Value.Check(CalmSessionSchema, entry.data) &&
-          entry.data.sessionId === sessionId,
-      );
-    const sessionChoice =
-      saved?.type === "custom" && Value.Check(CalmSessionSchema, saved.data)
-        ? saved.data.on
-        : undefined;
+    const sessionChoice = savedCalmChoice(ctx.sessionManager.getEntries(), sessionId);
     const initial =
       sessionChoice === undefined
-        ? preferences.load().catch((error: unknown) => {
-            if (currentGeneration === generation)
-              ctx.ui.notify(`Could not load Calm default: ${errorMessage(error)}`, "warning");
-            return false;
-          })
+        ? loadDefaultCalm(ctx.ui, preferences, () => currentGeneration === generation)
         : Promise.resolve(sessionChoice);
-    const configuredHiddenTools =
-      options.hiddenTools !== undefined
-        ? Promise.resolve(options.hiddenTools)
-        : options.loadAdditionalHiddenTools === undefined
-          ? Promise.resolve([])
-          : options.loadAdditionalHiddenTools().catch((error: unknown) => {
-              if (currentGeneration === generation)
-                ctx.ui.notify(
-                  `Could not load Calm tool settings: ${errorMessage(error)} Using built-in defaults.`,
-                  "warning",
-                );
-              return [];
-            });
-    return Promise.all([initial, configuredHiddenTools])
-      .then(([on, configured]) => {
-        if (currentGeneration !== generation) return;
-        hiddenTools.clear();
-        for (const name of options.hiddenTools === undefined
-          ? calmHiddenTools(configured)
-          : configured)
-          hiddenTools.add(name);
-        if (sessionChoice === undefined) pi.appendEntry(CALM_SESSION_ENTRY, { sessionId, on });
-        state.on = on;
-        return loadPresentation();
-      })
-      .then((loaded) => {
-        if (currentGeneration !== generation) return;
-        const presentation = decodePresentationModule(loaded);
-        if (presentation === undefined)
-          throw new Error("this Pi version does not expose the expected component classes.");
-        detach = attachCalmPresentation(
-          presentation,
-          state,
+    return initial.then((on) =>
+      startCalmSession(
+        {
+          isCurrent: () => currentGeneration === generation,
+          appendSavedChoice:
+            sessionChoice === undefined
+              ? (value) => pi.appendEntry(CALM_SESSION_ENTRY, { sessionId, on: value })
+              : undefined,
+          setOn: (value) => {
+            state.on = value;
+          },
+          loadRuntime,
+          attach: attachProjection,
+          setReady: (ready) => {
+            adapterReady = ready;
+          },
           diagnose,
-          (text) => ui?.theme.fg("dim", text) ?? text,
-        );
-        adapterReady = true;
-        syncChrome();
-      })
-      .catch((error: unknown) => {
-        if (currentGeneration !== generation) return;
-        detachPresentation();
-        state.on = false;
-        syncChrome();
-        diagnose(errorMessage(error));
-      });
+          syncChrome,
+        },
+        on,
+      ),
+    );
   });
   pi.on("agent_start", () => {
     coordinatorActive = true;
+    frame = 0;
     activityTracker.startAgent();
-    renderStatus();
-    syncWidget();
-    syncTimer();
+    syncChrome();
   });
   pi.on("message_update", (event) => {
     if (event.message.role === "assistant")
@@ -397,20 +354,16 @@ export function installCalmMode(
     coordinatorActive = false;
     activityTracker.settle(activeWorkers > 0);
     frame = 0;
-    renderStatus();
-    syncWidget();
-    syncTimer();
+    syncChrome();
   });
   pi.on("ui_prompt_start", () => {
     waitingForInput = true;
-    syncWidget();
-    syncTimer();
+    syncChrome();
   });
   pi.on("ui_prompt_end", () => {
     waitingForInput = false;
     if (!coordinatorActive && activeWorkers === 0) activityTracker.clear();
-    syncWidget();
-    syncTimer();
+    syncChrome();
   });
   pi.on("session_shutdown", () => shutdown());
 
@@ -458,148 +411,23 @@ export function installCalmMode(
           );
           return;
         })
-        .catch((error: unknown) => {
-          ctx.ui.notify(`Could not save Calm preference: ${errorMessage(error)}`, "error");
+        .catch((error) => {
+          ctx.ui.notify(
+            `Could not save Calm preference: ${error instanceof Error ? error.message : String(error)}`,
+            "error",
+          );
         }),
   });
 
   return {
     setActiveWorkers(count: number): void {
-      activeWorkers = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+      const next = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+      if (next === activeWorkers) return;
+      activeWorkers = next;
       if (activeWorkers === 0 && !coordinatorActive && !waitingForInput) activityTracker.clear();
-      renderStatus();
-      syncWidget();
-      syncTimer();
+      syncChrome();
     },
   };
-}
-
-function patchPrototype(
-  prototype: PresentationPrototype,
-  label: string,
-  readName: (component: unknown) => string | undefined,
-  shouldHideName: (name: string) => boolean,
-  state: CalmPresentationState,
-  diagnostic: Diagnostic,
-): Detach {
-  if (typeof prototype?.render !== "function")
-    throw new Error(`the Pi ${label} render seam is missing.`);
-  if (readProperty(prototype, PATCH_OWNER) !== undefined)
-    throw new Error(`the Pi ${label} render seam is already adapted.`);
-  const originalRender = prototype.render;
-  const originalRenderDescriptor = Object.getOwnPropertyDescriptor(prototype, "render");
-  const originalMouse = prototype.handleMouse;
-  const originalMouseDescriptor = Object.getOwnPropertyDescriptor(prototype, "handleMouse");
-  let metadataWarning = false;
-  const hidden = (component: unknown): boolean => {
-    if (!state.on) return false;
-    const name = readName(component);
-    if (name !== undefined) return shouldHideName(name);
-    if (!metadataWarning) {
-      metadataWarning = true;
-      diagnostic(`the Pi ${label} metadata seam changed.`);
-    }
-    return false;
-  };
-  const wrappedRender: Render = function (this: PresentationInstance, width): string[] {
-    try {
-      if (hidden(this)) return [];
-    } catch (error) {
-      diagnostic(`the Pi ${label} filter failed: ${errorMessage(error)}.`);
-    }
-    return originalRender.call(this, width);
-  };
-  const wrappedMouse: MouseHandler | undefined =
-    originalMouse === undefined
-      ? undefined
-      : function (this: PresentationInstance, event): CalmMouseEvent | undefined {
-          try {
-            if (hidden(this)) return undefined;
-          } catch (error) {
-            diagnostic(`the Pi ${label} mouse filter failed: ${errorMessage(error)}.`);
-          }
-          return originalMouse.call(this, event);
-        };
-
-  const restore = (): void => {
-    if (originalRenderDescriptor === undefined) Reflect.deleteProperty(prototype, "render");
-    else Object.defineProperty(prototype, "render", originalRenderDescriptor);
-    if (wrappedMouse !== undefined) {
-      if (originalMouseDescriptor === undefined) Reflect.deleteProperty(prototype, "handleMouse");
-      else Object.defineProperty(prototype, "handleMouse", originalMouseDescriptor);
-    }
-    Reflect.deleteProperty(prototype, PATCH_OWNER);
-  };
-  try {
-    prototype.render = wrappedRender;
-    if (wrappedMouse !== undefined) prototype.handleMouse = wrappedMouse;
-    Object.defineProperty(prototype, PATCH_OWNER, {
-      configurable: true,
-      value: wrappedRender,
-    });
-  } catch (error) {
-    restore();
-    throw error;
-  }
-  let attached = true;
-  return () => {
-    if (!attached) return;
-    attached = false;
-    if (prototype.render !== wrappedRender)
-      diagnostic(`the Pi ${label} render seam changed before cleanup.`);
-    if (wrappedMouse !== undefined && prototype.handleMouse !== wrappedMouse)
-      diagnostic(`the Pi ${label} mouse seam changed before cleanup.`);
-    restore();
-  };
-}
-
-function decodePresentationModule(value: unknown): CalmPresentationModule | undefined {
-  const tool = readProperty(value, "ToolExecutionComponent");
-  const custom = readProperty(value, "CustomMessageComponent");
-  const assistant = readProperty(value, "AssistantMessageComponent");
-  const user = readProperty(value, "UserMessageComponent");
-  if (
-    !isPresentationConstructor(tool) ||
-    !isPresentationConstructor(custom) ||
-    !isAssistantPresentationConstructor(assistant) ||
-    !isPresentationConstructor(user)
-  )
-    return undefined;
-  return {
-    ToolExecutionComponent: tool,
-    CustomMessageComponent: custom,
-    AssistantMessageComponent: assistant,
-    UserMessageComponent: user,
-  };
-}
-
-function isPresentationConstructor(value: unknown): value is PresentationConstructor {
-  if (typeof value !== "function") return false;
-  const prototype = readProperty(value, "prototype");
-  return readProperty(prototype, "render") instanceof Function;
-}
-
-function isAssistantPresentationConstructor(
-  value: unknown,
-): value is AssistantPresentationConstructor {
-  if (!isPresentationConstructor(value)) return false;
-  const prototype = readProperty(value, "prototype");
-  return readProperty(prototype, "updateContent") instanceof Function;
-}
-
-function readProperty(value: unknown, key: PropertyKey): unknown {
-  if ((typeof value !== "object" && typeof value !== "function") || value === null)
-    return undefined;
-  return Reflect.get(value, key);
-}
-
-function readStringProperty(value: unknown, key: PropertyKey): string | undefined {
-  const property = readProperty(value, key);
-  return typeof property === "string" ? property : undefined;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 export function activeWorkerCount(state: {
@@ -616,36 +444,3 @@ export function updateCalmWorkers(
 ): void {
   calm.setActiveWorkers(activeWorkerCount(state));
 }
-
-function loadPiPresentation(): Promise<unknown> {
-  const entrypoint = process.argv[1];
-  if (entrypoint === undefined || entrypoint === "")
-    return import("@earendil-works/pi-coding-agent");
-  const chunks = join(dirname(entrypoint), "chunks");
-  return readdir(chunks, { withFileTypes: true })
-    .then((entries) =>
-      Promise.all(
-        entries
-          .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
-          .map((entry) => {
-            const path = join(chunks, entry.name);
-            return readFile(path, "utf8").then((source) => ({ path, source }));
-          }),
-      ),
-    )
-    .then((candidates) => {
-      const match = candidates.find(
-        ({ source }) =>
-          source.includes("ToolExecutionComponent") &&
-          source.includes("CustomMessageComponent") &&
-          source.includes("AssistantMessageComponent") &&
-          source.includes("UserMessageComponent"),
-      );
-      return match === undefined
-        ? import("@earendil-works/pi-coding-agent")
-        : import(pathToFileURL(match.path).href);
-    })
-    .catch(() => import("@earendil-works/pi-coding-agent"));
-}
-
-export type CalmContext = Pick<ExtensionContext, "mode" | "ui">;

@@ -28,7 +28,6 @@ import {
 import { liveLayer } from "../src/node-platform.js";
 import { forkConversationSessionEffect } from "../src/pi-process.js";
 import { EvidenceSchema } from "../src/report-schema.js";
-import { loadCalmAdditionalHiddenTools } from "../src/workgraph-settings.js";
 import type { SessionIdentity, WorkstreamState } from "../src/workstream.js";
 import {
   type QueueAssignment,
@@ -124,7 +123,7 @@ export default function workgraphCoordinator(
   runtimeWorker: () => WorkerHost = () => new HerdrCliRuntime(),
 ): void {
   if (!isCoordinatorScope(process.env)) return;
-  const calm = installCalmMode(pi, { loadAdditionalHiddenTools: loadCalmAdditionalHiddenTools });
+  const calm = installCalmMode(pi);
   let runtime: WorkstreamRuntime | undefined;
   let pending: Static<typeof InputReceipt>[] = [];
   const hostSemaphore = Semaphore.makeUnsafe(1);

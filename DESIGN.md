@@ -9,6 +9,7 @@ API details, operating instructions, verification policy, and historical finding
 Focused accepted decisions with meaningful reversal cost are recorded in [`docs/adr/`](docs/adr/). This document remains the integrated rationale for the complete system.
 
 - [ADR 0001: Use TypeBox for schemas, Effect for lifecycles, and Node at host boundaries](docs/adr/0001-own-schemas-effects-and-host-adapters.md)
+- [ADR 0002: Project Calm over the live Pi chat instead of filtering Pi components](docs/adr/0002-project-calm-over-the-live-pi-chat.md)
 
 ## Vision
 

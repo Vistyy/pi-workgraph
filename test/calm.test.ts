@@ -1,618 +1,893 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { stripVTControlCharacters } from "node:util";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import {
-  AssistantMessageComponent,
-  type ExtensionAPI,
-  type ExtensionContext,
-  initTheme,
-  SessionManager,
-} from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { initTheme } from "@earendil-works/pi-coding-agent";
+import { type Component, visibleWidth } from "@earendil-works/pi-tui";
 
-// SAFETY: These fakes terminate at the test boundary; production Pi values are decoded by the adapter.
-// oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion
 import {
   activeWorkerCount,
-  attachCalmPresentation,
   calmActivityLines,
-  calmHiddenTools,
   createCalmActivityTracker,
-  DEFAULT_CALM_HIDDEN_TOOLS,
-  installCalmMode,
   isCalmActivityActive,
   isCoordinatorScope,
 } from "../src/calm.js";
-import { attachCalmThinking } from "../src/calm-thinking.js";
+import { discoverCalmChat } from "../src/calm-projection.js";
+import type { CalmChatRuntime } from "../src/pi-chat-runtime.js";
+import {
+  assistantMessage,
+  classificationChecks,
+  FixtureAssistant,
+  FixtureContainer,
+  FixtureSkill,
+  FixtureUser,
+  fixtureRuntime,
+  projected,
+  renderedLines,
+  skillBlock,
+  strip,
+  textPart,
+  thinkingPart,
+  toolCallPart,
+} from "./calm-fixture.js";
+import {
+  calmHarness,
+  command,
+  fakeTheme,
+  fakeTuiRoot,
+  fixture,
+  messageUpdate,
+  shutdown,
+  start,
+} from "./calm-harness.js";
 
-type FakeMouseEvent = {
-  readonly y?: number;
-  readonly width?: number;
-  readonly [key: string]: string | number | boolean | undefined;
-};
+initTheme("dark", false);
 
-class FakeToolRow {
-  toolName: string;
-
-  constructor(toolName: string) {
-    this.toolName = toolName;
-  }
-
-  render(this: FakeToolRow, width: number): string[] {
-    return [`tool:${this.toolName}:${width}`];
-  }
-
-  handleMouse(this: void, event: FakeMouseEvent): FakeMouseEvent {
-    return event;
-  }
+interface RenderOverridable {
+  render(width: number): string[];
 }
 
-class FakeContainer {
-  children: Array<{
-    render(width: number): string[];
-    handleMouse?: (event: FakeMouseEvent) => FakeMouseEvent;
-  }> = [];
-  mouseLayout?: {
-    width: number;
-    children: Array<{
-      component: {
-        render(width: number): string[];
-        handleMouse?: (event: FakeMouseEvent) => FakeMouseEvent;
-      };
-      height: number;
-    }>;
-  };
+class CountingRow implements Component {
+  renders = 0;
+  clicks = 0;
+  readonly label: string;
 
-  addChild(component: (typeof this.children)[number]): void {
-    this.children.push(component);
+  constructor(label: string) {
+    this.label = label;
   }
 
-  render(width: number): string[] {
-    const lines: string[] = [];
-    const children = this.children.map((component) => {
-      const rendered = component.render(width);
-      lines.push(...rendered);
-      return { component, height: rendered.length };
-    });
-    this.mouseLayout = { width, children };
-    return lines;
+  render(): string[] {
+    this.renders += 1;
+    return [this.label];
   }
 
-  handleMouse(event: FakeMouseEvent): FakeMouseEvent | undefined {
-    const eventWidth = event.width ?? 0;
-    const eventY = event.y ?? -1;
-    const layout = this.mouseLayout;
-    const children =
-      layout?.width === eventWidth
-        ? layout.children
-        : this.children.map((component) => ({
-            component,
-            height: component.render(eventWidth).length,
-          }));
-    let childY = 0;
-    for (const { component, height } of children) {
-      if (eventY >= childY && eventY < childY + height)
-        return component.handleMouse?.({ ...event, y: eventY - childY });
-      childY += height;
-    }
+  invalidate(): void {}
+
+  handleMouse(): undefined {
+    this.clicks += 1;
     return undefined;
   }
 }
 
-type FakeAssistantPart =
-  | { readonly type: "text"; readonly text: string }
-  | { readonly type: "thinking"; readonly thinking: string }
-  | { readonly type: "toolCall"; readonly name: string };
-type FakeAssistantMessage = {
-  readonly role: "assistant";
-  readonly content: readonly FakeAssistantPart[];
-  readonly stopReason?: string;
-};
+class MouseUser extends FixtureUser {
+  clicks = 0;
 
-class FakeAssistantRow extends FakeContainer {
-  lines: string[];
-  lastMessage?: FakeAssistantMessage;
-  isStreaming = false;
+  override handleMouse(): undefined {
+    this.clicks += 1;
+    return undefined;
+  }
+}
 
-  constructor(...lines: string[]) {
+/**
+ * A projection Container that counts externally meaningful child add/clear operations, so a rebuild
+ * of the displayed membership is observable without any test-only production API.
+ */
+class CounterContainer extends FixtureContainer {
+  static readonly instances: CounterContainer[] = [];
+  adds = 0;
+  clears = 0;
+
+  constructor() {
     super();
-    this.lines = lines;
+    CounterContainer.instances.push(this);
   }
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Model Pi's runtime message seam in the fixture.
-  updateContent(message: unknown, isStreaming = false): void {
-    // SAFETY: The fixture only calls this Pi-compatible seam with assistant messages.
-    const assistantMessage = message as FakeAssistantMessage;
-    this.lastMessage = assistantMessage;
-    this.isStreaming = isStreaming;
-    this.lines = assistantMessage.content.map((part) => {
-      if (part.type === "text") return part.text;
-      if (part.type === "thinking") return `thinking:${part.thinking}`;
-      return `tool:${part.name}`;
+  override addChild(component: Component): void {
+    this.adds += 1;
+    super.addChild(component);
+  }
+
+  override clear(): void {
+    this.clears += 1;
+    super.clear();
+  }
+}
+
+const counterRuntime: CalmChatRuntime = { ...fixtureRuntime, container: CounterContainer };
+
+/** A live assistant whose native update path fails, so deferred restoration must contain it. */
+class FailingRefreshAssistant extends FixtureAssistant {
+  attempts = 0;
+  readonly #failure: string;
+
+  constructor(failure: string) {
+    super();
+    this.#failure = failure;
+  }
+
+  override updateContent(_message: AssistantMessage, _isStreaming?: boolean): void {
+    this.attempts += 1;
+    throw new Error(this.#failure);
+  }
+}
+
+/** A live chat whose native invalidation fails, so restoration must contain that too. */
+class ThrowingInvalidateContainer extends FixtureContainer {
+  invalidations = 0;
+
+  override invalidate(): void {
+    this.invalidations += 1;
+    throw new Error("native invalidation failed");
+  }
+}
+
+void test("Calm shows conversation only and separates adjacent assistant prose", () => {
+  const chat = new FixtureContainer();
+  const user = new FixtureUser("hello there");
+  const first = new FixtureAssistant(assistantMessage([textPart("first answer")]));
+  const hiddenTool = new CountingRow("tool-row");
+  const second = new FixtureAssistant(assistantMessage([textPart("second answer")]));
+  const hiddenMessage = new CountingRow("custom-row");
+  chat.addChild(user);
+  chat.addChild(first);
+  chat.addChild(hiddenTool);
+  chat.addChild(second);
+  chat.addChild(hiddenMessage);
+  const projection = projected(chat);
+  try {
+    const lines = renderedLines(chat);
+    assert.deepEqual(lines, ["hello there", "first answer", "---", "second answer"]);
+    for (let frame = 0; frame < 5; frame += 1) assert.deepEqual(renderedLines(chat), lines);
+    assert.equal(hiddenTool.renders, 0);
+    assert.equal(hiddenMessage.renders, 0);
+  } finally {
+    projection.detach();
+  }
+  assert.ok(renderedLines(chat).includes("tool-row"));
+  assert.ok(renderedLines(chat).includes("custom-row"));
+});
+
+void test("animation frames neither classify nor render excluded native history", () => {
+  const chat = new FixtureContainer();
+  const hidden: CountingRow[] = [];
+  for (let index = 0; index < 50; index += 1) {
+    const row = new CountingRow(`hidden-${index}`);
+    hidden.push(row);
+    chat.addChild(row);
+    chat.addChild(new FixtureAssistant(assistantMessage([textPart(`answer ${index}`)])));
+  }
+  const projection = projected(chat);
+  try {
+    const checks = classificationChecks();
+    for (let frame = 0; frame < 20; frame += 1) chat.render(80);
+    assert.equal(classificationChecks(), checks);
+    for (const row of hidden) assert.equal(row.renders, 0);
+  } finally {
+    projection.detach();
+  }
+});
+
+void test("thinking-only and tool-only assistant records create neither rows nor phantom separators", () => {
+  const chat = new FixtureContainer();
+  const visibleFirst = new FixtureAssistant(assistantMessage([textPart("visible one")]));
+  const thinkingOnly = new FixtureAssistant(assistantMessage([thinkingPart("private reasoning")]));
+  const toolOnly = new FixtureAssistant(assistantMessage([toolCallPart("read")]));
+  const visibleSecond = new FixtureAssistant(assistantMessage([textPart("visible two")]));
+  chat.addChild(visibleFirst);
+  chat.addChild(thinkingOnly);
+  chat.addChild(new CountingRow("hidden"));
+  chat.addChild(visibleSecond);
+  chat.addChild(toolOnly);
+  const projection = projected(chat);
+  try {
+    assert.deepEqual(renderedLines(chat), ["visible one", "---", "visible two"]);
+    assert.doesNotMatch(renderedLines(chat).join("\n"), /private reasoning|hidden/);
+  } finally {
+    projection.detach();
+  }
+});
+
+void test("skill pairing follows metadata, not the next user sibling", () => {
+  // A skill-only invocation followed by an unrelated user message keeps its compact line.
+  const skillOnly = new FixtureContainer();
+  skillOnly.addChild(new FixtureSkill(skillBlock("calm")));
+  skillOnly.addChild(new FixtureUser("an unrelated follow-up"));
+  const skillProjection = projected(skillOnly);
+  try {
+    assert.deepEqual(renderedLines(skillOnly), ["/skill:calm", "an unrelated follow-up"]);
+    assert.doesNotMatch(renderedLines(skillOnly).join("\n"), /INJECTED-SKILL-CONTENT|\[skill\]/);
+  } finally {
+    skillProjection.detach();
+  }
+
+  // An actual skill + user pairing hides only the injected skill details.
+  const skillWithUser = new FixtureContainer();
+  skillWithUser.addChild(new FixtureSkill(skillBlock("calm", "please do the thing")));
+  skillWithUser.addChild(new FixtureUser("please do the thing"));
+  const withUserProjection = projected(skillWithUser);
+  try {
+    assert.deepEqual(renderedLines(skillWithUser), ["please do the thing"]);
+    assert.doesNotMatch(
+      renderedLines(skillWithUser).join("\n"),
+      /INJECTED-SKILL-CONTENT|\[skill\]/,
+    );
+  } finally {
+    withUserProjection.detach();
+  }
+});
+
+void test("streaming updates only the projected assistant and finalizes streaming state", () => {
+  const chat = new FixtureContainer();
+  const projection = projected(chat);
+  const beforeInstances = FixtureAssistant.instances.length;
+  const streaming = new FixtureAssistant();
+  try {
+    chat.addChild(streaming);
+    assert.deepEqual(renderedLines(chat), []);
+    streaming.updateContent(assistantMessage([thinkingPart("hmm")]), true);
+    assert.deepEqual(renderedLines(chat), []);
+    streaming.updateContent(assistantMessage([textPart("streamed answer")]), true);
+    assert.deepEqual(renderedLines(chat), ["streamed answer"]);
+    // Calm owns the visible assistant; the hidden native assistant must not be rebuilt for deltas.
+    assert.equal(streaming.updates, 0);
+    const projectedAssistant = FixtureAssistant.instances
+      .slice(beforeInstances)
+      .find((instance) => instance !== streaming);
+    assert.ok(projectedAssistant);
+    assert.equal(projectedAssistant.isStreaming, true);
+
+    // Identical prose with a changed streaming state must still update the projected copy.
+    const updates = projectedAssistant.updates;
+    streaming.updateContent(assistantMessage([textPart("streamed answer")]), false);
+    assert.equal(streaming.updates, 0, "finalization must not build the hidden native assistant");
+    assert.equal(projectedAssistant.updates, updates + 1);
+    assert.equal(projectedAssistant.isStreaming, false);
+    assert.deepEqual(renderedLines(chat), ["streamed answer"]);
+
+    // Restoring native presentation folds the retained latest source back into the native tree.
+    projection.setEnabled(false);
+    assert.equal(streaming.updates, 1);
+    assert.deepEqual(renderedLines(chat), ["streamed answer"]);
+
+    projection.setEnabled(true);
+    chat.clear();
+    assert.deepEqual(renderedLines(chat), []);
+    const replacement = new FixtureAssistant(assistantMessage([textPart("replayed answer")]));
+    chat.addChild(replacement);
+    assert.deepEqual(renderedLines(chat), ["replayed answer"]);
+  } finally {
+    projection.detach();
+  }
+});
+
+void test("repeated toggles restore native rendering and assistant thinking", () => {
+  const chat = new FixtureContainer();
+  const assistant = new FixtureAssistant(
+    assistantMessage([thinkingPart("hidden reasoning"), textPart("answer")]),
+  );
+  chat.addChild(assistant);
+  chat.addChild(new CountingRow("operational-row"));
+  const projection = projected(chat);
+  try {
+    for (let toggle = 0; toggle < 3; toggle += 1) {
+      projection.setEnabled(true);
+      assert.deepEqual(renderedLines(chat), ["answer"]);
+      projection.setEnabled(false);
+      const native = renderedLines(chat).join("\n");
+      assert.match(native, /hidden reasoning/);
+      assert.match(native, /answer/);
+      assert.match(native, /operational-row/);
+    }
+    // A Calm-off/Calm-on cycle re-arms restoration for the next deferred streaming update.
+    const deferred = new FixtureAssistant();
+    chat.addChild(deferred);
+    projection.setEnabled(true);
+    deferred.updateContent(assistantMessage([textPart("second answer")]), true);
+    assert.equal(deferred.updates, 0);
+    projection.setEnabled(false);
+    assert.equal(deferred.updates, 1);
+    assert.match(renderedLines(chat).join("\n"), /second answer/);
+  } finally {
+    projection.detach();
+  }
+});
+
+void test("detach restores native rendering, update behavior, and mouse dispatch", () => {
+  const chat = new FixtureContainer();
+  const user = new MouseUser("hi");
+  const first = new FixtureAssistant(assistantMessage([textPart("first")]));
+  const hiddenTool = new CountingRow("tool-row");
+  const second = new FixtureAssistant(assistantMessage([textPart("second")]));
+  chat.addChild(user);
+  chat.addChild(first);
+  chat.addChild(hiddenTool);
+  chat.addChild(second);
+  const width = 40;
+  const projection = projected(chat);
+  const userHeight = user.render(width).length;
+  const firstHeight = first.render(width).length;
+  const projectedLines = chat.render(width);
+  try {
+    assert.equal(chat.handleMouse({ y: 0, width, height: projectedLines.length }), undefined);
+    assert.equal(user.clicks, 1);
+    assert.equal(
+      chat.handleMouse({ y: userHeight + firstHeight, width, height: projectedLines.length }),
+      undefined,
+    );
+    assert.equal(hiddenTool.clicks, 0);
+  } finally {
+    projection.detach();
+  }
+  assert.equal(
+    Object.getOwnPropertyDescriptor(first, "updateContent"),
+    undefined,
+    "detach must restore the native assistant update seam",
+  );
+  const nativeLines = chat.render(width);
+  assert.ok(nativeLines.some((line) => strip(line).includes("tool-row")));
+  chat.handleMouse({ y: userHeight + firstHeight, width, height: nativeLines.length });
+  assert.equal(hiddenTool.clicks, 1);
+
+  first.updateContent(assistantMessage([textPart("updated natively")]));
+  assert.match(renderedLines(chat).join("\n"), /updated natively/);
+});
+
+void test("projection invalidation follows native chat invalidation", () => {
+  const chat = new FixtureContainer();
+  chat.addChild(new FixtureUser("hello"));
+  chat.addChild(new FixtureAssistant(assistantMessage([textPart("answer")])));
+  const before = new Set(FixtureAssistant.instances);
+  const projection = projected(chat);
+  try {
+    const projectedAssistants = FixtureAssistant.instances.filter(
+      (instance) => !before.has(instance),
+    );
+    assert.ok(projectedAssistants.length >= 1);
+    const invalidations = projectedAssistants.map((instance) => instance.invalidations);
+    chat.invalidate();
+    projectedAssistants.forEach((instance, index) => {
+      assert.equal(instance.invalidations, (invalidations[index] ?? 0) + 1);
     });
+    assert.deepEqual(renderedLines(chat), ["hello", "answer"]);
+  } finally {
+    projection.detach();
   }
+});
 
-  invalidate(): void {
-    if (this.lastMessage !== undefined) this.updateContent(this.lastMessage, this.isStreaming);
+void test("Calm-on invalidation refreshes the projection without traversing native history", () => {
+  const chat = new FixtureContainer();
+  const user = new FixtureUser("hello");
+  const first = new FixtureAssistant(assistantMessage([textPart("first")]));
+  const second = new FixtureAssistant(assistantMessage([textPart("second")]));
+  chat.addChild(user);
+  chat.addChild(first);
+  chat.addChild(second);
+  const projection = projected(chat);
+  try {
+    const nativeInvalidations = first.invalidations + second.invalidations;
+    const userInvalidations = user.invalidations;
+    chat.invalidate();
+    assert.equal(
+      first.invalidations + second.invalidations,
+      nativeInvalidations,
+      "hidden native assistants must not be traversed while Calm is on",
+    );
+    assert.equal(
+      user.invalidations,
+      userInvalidations + 1,
+      "the reused user row must be invalidated exactly once",
+    );
+    assert.deepEqual(renderedLines(chat), ["hello", "first", "---", "second"]);
+  } finally {
+    projection.detach();
   }
+});
 
-  setHideThinkingBlock(): void {
-    if (this.lastMessage !== undefined) this.updateContent(this.lastMessage);
+void test("tail conversation additions append rows instead of rebuilding the projection", () => {
+  CounterContainer.instances.length = 0;
+  const chat = new CounterContainer();
+  const projection = projected(chat, counterRuntime);
+  try {
+    const surface = CounterContainer.instances.find((instance) => instance !== chat);
+    assert.ok(surface, "the projected Container is discoverable");
+    surface.clears = 0;
+    surface.adds = 0;
+
+    chat.addChild(new FixtureUser("one"));
+    assert.deepEqual(renderedLines(chat), ["one"]);
+    assert.equal(surface.clears, 0, "a user row must not rebuild the projection");
+    assert.equal(surface.adds, 1);
+
+    chat.addChild(new FixtureAssistant(assistantMessage([textPart("a")])));
+    assert.equal(surface.clears, 0, "an assistant row must not rebuild the projection");
+    assert.equal(surface.adds, 2);
+
+    chat.addChild(new FixtureUser("two"));
+    assert.equal(surface.clears, 0);
+    assert.equal(surface.adds, 3);
+
+    chat.addChild(new FixtureAssistant(assistantMessage([textPart("b")])));
+    assert.equal(surface.clears, 0);
+    assert.equal(surface.adds, 4);
+
+    const third = new FixtureAssistant();
+    chat.addChild(third);
+    third.updateContent(assistantMessage([textPart("c")]), true);
+    assert.equal(surface.clears, 0);
+    assert.equal(surface.adds, 6, "a second adjacent assistant appends a separator and its row");
+    assert.deepEqual(renderedLines(chat), ["one", "a", "two", "b", "---", "c"]);
+
+    const adds = surface.adds;
+    third.updateContent(assistantMessage([textPart("c continues")]), true);
+    assert.equal(surface.adds, adds, "streaming prose updates the projected row in place");
+    assert.equal(surface.clears, 0);
+
+    const userOne = chat.children[0];
+    assert.ok(userOne);
+    chat.removeChild(userOne);
+    assert.ok(surface.clears > 0, "a non-tail removal genuinely changes order and rebuilds");
+    assert.deepEqual(renderedLines(chat), ["a", "two", "b", "---", "c continues"]);
+
+    const clears = surface.clears;
+    chat.removeChild(third);
+    assert.equal(surface.clears, clears, "a tail removal truncates without rebuilding");
+    assert.deepEqual(renderedLines(chat), ["a", "two", "b"]);
+  } finally {
+    projection.detach();
   }
+});
 
-  setHiddenThinkingLabel(): void {
-    if (this.lastMessage !== undefined) this.updateContent(this.lastMessage);
+void test("a superseded session's runtime rejection cannot disable the current attachment", async () => {
+  const chat = new FixtureContainer();
+  const tui = fakeTuiRoot(() => new FixtureContainer(), chat);
+  const pending: {
+    resolve: (runtime: CalmChatRuntime) => void;
+    reject: (error: Error) => void;
+  }[] = [];
+  const { ui, pi, context } = calmHarness({
+    runtime: fixtureRuntime,
+    tui,
+    preferences: { load: () => Promise.resolve(true), save: () => Promise.resolve() },
+    loadRuntime: () =>
+      // oxlint-disable-next-line effecttsgo/new-promise -- The session lifecycle under test settles this promise directly to reproduce a stale load rejection.
+      new Promise<CalmChatRuntime>((resolve, reject) => {
+        pending.push({ resolve, reject });
+      }),
+  });
+  const unusable = (): number =>
+    ui.notifications.filter((message) => message.includes("Calm unavailable")).length;
+
+  const first = start(pi, context);
+  await delay(0);
+  const second = start(pi, context);
+  await delay(0);
+  assert.equal(pending.length, 2, "each session start loads its own runtime");
+
+  pending[0]?.reject(new Error("stale bundle"));
+  await first;
+  await delay(0);
+  assert.equal(
+    unusable(),
+    0,
+    "a superseded rejection must not report or disable the current session",
+  );
+
+  pending[1]?.reject(new Error("stale bundle"));
+  await second;
+  await delay(0);
+  assert.equal(unusable(), 1, "the current session reports its real compatibility failure");
+
+  const third = start(pi, context);
+  await delay(0);
+  pending[2]?.reject(new Error("stale bundle"));
+  await third;
+  await delay(0);
+  assert.equal(unusable(), 2, "the same failure is reported again in a later session");
+  await shutdown(pi, context);
+});
+
+void test("separators stay width-safe and truncate with the viewport", () => {
+  const chat = new FixtureContainer();
+  chat.addChild(new FixtureAssistant(assistantMessage([textPart("a")])));
+  chat.addChild(new FixtureAssistant(assistantMessage([textPart("b")])));
+  const projection = projected(chat);
+  try {
+    assert.deepEqual(renderedLines(chat, 40), ["a", "---", "b"]);
+    assert.ok(renderedLines(chat, 2).includes("--"));
+    assert.ok(renderedLines(chat, 1).includes("-"));
+    for (const width of [1, 2, 5, 80]) {
+      const separators = renderedLines(chat, width).filter((line) => /^-+$/.test(line));
+      assert.ok(separators.length >= 1);
+      for (const line of separators) assert.ok(visibleWidth(line) <= width);
+    }
+  } finally {
+    projection.detach();
   }
+});
 
-  setOutputPad(): void {
-    if (this.lastMessage !== undefined) this.updateContent(this.lastMessage);
+void test("discovery validates the inspected TUI layout and returns the live chat", () => {
+  const chat = new FixtureContainer();
+  const tui = fakeTuiRoot(() => new FixtureContainer(), chat);
+  assert.equal(discoverCalmChat(tui, fixtureRuntime), chat);
+  const malformed = fakeTuiRoot(() => new FixtureContainer());
+  malformed.children.length = 0;
+  const document = new FixtureContainer();
+  document.addChild(new FixtureContainer());
+  malformed.addChild(document);
+  assert.throws(() => discoverCalmChat(malformed, fixtureRuntime), /document layout seam/);
+});
+
+void test("classification failure fails open, detaches, and refuses re-enabling", () => {
+  const chat = new FixtureContainer();
+  const hidden = new CountingRow("native-row");
+  chat.addChild(hidden);
+  const diagnostics: string[] = [];
+  const projection = projected(chat, fixtureRuntime, (message) => diagnostics.push(message));
+  try {
+    assert.deepEqual(renderedLines(chat), []);
+    // An empty skill name is type-valid but fails the guarded metadata check at classification.
+    chat.addChild(new FixtureSkill(skillBlock("")));
+    assert.equal(diagnostics.length, 1);
+    assert.match(diagnostics[0] ?? "", /skill invocation metadata seam is malformed/);
+    assert.ok(renderedLines(chat).includes("native-row"));
+    // The incompatibility is terminal for this attachment: re-enabling cannot claim filtering.
+    projection.setEnabled(true);
+    assert.ok(renderedLines(chat).includes("native-row"));
+  } finally {
+    projection.detach();
   }
+});
 
-  override render(_width: number): string[] {
-    return [...this.lines];
-  }
+void test("a failing native assistant refresh releases every wrapper, continues, and reports once", () => {
+  const chat = new FixtureContainer();
+  const diagnostics: string[] = [];
+  const projection = projected(chat, fixtureRuntime, (message) => diagnostics.push(message));
+  const first = new FailingRefreshAssistant("first native update failed");
+  const middle = new FixtureAssistant();
+  const last = new FailingRefreshAssistant("last native update failed");
+  chat.addChild(first);
+  chat.addChild(middle);
+  chat.addChild(last);
+  first.updateContent(assistantMessage([textPart("one")]), true);
+  middle.updateContent(assistantMessage([textPart("two")]), true);
+  last.updateContent(assistantMessage([textPart("three")]), true);
+  assert.deepEqual(renderedLines(chat), ["one", "---", "two", "---", "three"]);
 
-  override handleMouse(event: FakeMouseEvent): FakeMouseEvent {
-    return event;
-  }
-}
+  projection.setEnabled(false);
 
-class FakeUserRow extends FakeContainer {
-  readonly lines: string[];
+  // Every assistant is attempted exactly once; cleanup never recursively retries the failing refresh.
+  assert.equal(first.attempts, 1);
+  assert.equal(last.attempts, 1);
+  // Cleanup continued past the first failure and restored the healthy assistant in between.
+  assert.equal(middle.updates, 1);
+  // No adapter-owned assistant or chat seam survives the failure.
+  for (const assistant of [first, middle, last])
+    assert.equal(Object.getOwnPropertyDescriptor(assistant, "updateContent"), undefined);
+  assert.equal(Object.getOwnPropertyDescriptor(chat, "render"), undefined);
+  assert.equal(Object.getOwnPropertyDescriptor(chat, "invalidate"), undefined);
+  // The combined, most useful detail is reported exactly once.
+  assert.equal(diagnostics.length, 1);
+  assert.match(diagnostics[0] ?? "", /first native update failed/);
+  assert.match(diagnostics[0] ?? "", /last native update failed/);
+  // The attachment is terminal: re-enabling cannot claim filtering after a failed teardown.
+  projection.setEnabled(true);
+  assert.equal(first.attempts, 1);
+  assert.deepEqual(renderedLines(chat), ["two"]);
+});
 
-  constructor(...lines: string[]) {
-    super();
-    this.lines = lines;
-  }
+void test("a failing native chat invalidation still releases every wrapper and reports once", () => {
+  const chat = new ThrowingInvalidateContainer();
+  const assistant = new FixtureAssistant(assistantMessage([textPart("answer")]));
+  chat.addChild(assistant);
+  const diagnostics: string[] = [];
+  const projection = projected(chat, fixtureRuntime, (message) => diagnostics.push(message));
+  assert.equal(chat.invalidations, 0);
+  // Calm owns the hidden native tree, so this update is deferred until Calm turns off.
+  assistant.updateContent(assistantMessage([textPart("answer")]), true);
+  const updatesBefore = assistant.updates;
 
-  override render(_width: number): string[] {
-    return [...this.lines];
-  }
+  // Turning Calm off restores the native assistant first, then fails on the native chat invalidation.
+  projection.setEnabled(false);
+  assert.equal(chat.invalidations, 1);
+  assert.equal(assistant.updates, updatesBefore + 1, "native rows are restored before the failure");
+  assert.equal(Object.getOwnPropertyDescriptor(assistant, "updateContent"), undefined);
+  assert.equal(Object.getOwnPropertyDescriptor(chat, "invalidate"), undefined);
+  assert.equal(diagnostics.length, 1);
+  assert.match(diagnostics[0] ?? "", /native invalidation failed/);
+  // The terminal failure is not retried or reported a second time through cleanup or re-enabling.
+  projection.detach();
+  projection.setEnabled(false);
+  assert.equal(chat.invalidations, 1);
+  assert.equal(diagnostics.length, 1);
+  assert.deepEqual(renderedLines(chat), ["answer"]);
+});
 
-  override handleMouse(event: FakeMouseEvent): FakeMouseEvent {
-    return event;
-  }
-}
+void test("missing or non-boolean assistant isStreaming is a hard compatibility failure", () => {
+  const chat = new FixtureContainer();
+  chat.addChild(new CountingRow("native-row"));
+  const diagnostics: string[] = [];
+  const projection = projected(chat, fixtureRuntime, (message) => diagnostics.push(message));
+  const assistant = new FixtureAssistant(assistantMessage([textPart("answer")]));
+  chat.addChild(assistant);
+  assert.deepEqual(renderedLines(chat), ["answer"]);
 
-class FakeMessageRow {
-  message: { customType: string };
+  // Pi's native updateContent keeps the component's current boolean; a malformed live value is not
+  // an omitted argument and must fail the whole projection instead of keeping a stale state.
+  Object.defineProperty(assistant, "isStreaming", {
+    configurable: true,
+    writable: true,
+    value: "streaming",
+  });
+  assistant.updateContent(assistantMessage([textPart("answer again")]));
+  assert.equal(diagnostics.length, 1);
+  assert.match(diagnostics[0] ?? "", /isStreaming field is malformed/);
+  assert.equal(Object.getOwnPropertyDescriptor(assistant, "updateContent"), undefined);
+  assert.ok(renderedLines(chat).includes("native-row"));
+  assert.ok(renderedLines(chat).includes("answer"));
+  projection.detach();
 
-  constructor(customType: string) {
-    this.message = { customType };
-  }
+  // A missing descriptor is equally terminal, whether it appears during classification or update.
+  const missingChat = new FixtureContainer();
+  const missingDiagnostics: string[] = [];
+  const missingProjection = projected(missingChat, fixtureRuntime, (message) =>
+    missingDiagnostics.push(message),
+  );
+  const broken = new FixtureAssistant(assistantMessage([textPart("broken")]));
+  Reflect.deleteProperty(broken, "isStreaming");
+  missingChat.addChild(broken);
+  assert.equal(missingDiagnostics.length, 1);
+  assert.match(missingDiagnostics[0] ?? "", /isStreaming field is missing/);
+  assert.equal(Object.getOwnPropertyDescriptor(broken, "updateContent"), undefined);
+  missingProjection.detach();
+});
 
-  render(this: FakeMessageRow, width: number): string[] {
-    return [`message:${this.message.customType}:${width}`];
-  }
-
-  handleMouse(this: void, event: FakeMouseEvent): FakeMouseEvent {
-    return event;
-  }
-}
-
-type FakeTheme = {
-  fg(color: string, text: string): string;
-  italic(text: string): string;
-};
-
-function fakeTheme(): FakeTheme {
-  return {
-    fg: (color, text) => `\u001b[38;5;${color === "accent" ? 183 : 146}m${text}\u001b[39m`,
-    italic: (text) => `\u001b[3m${text}\u001b[23m`,
+void test("a failing native refresh disables Calm, restores chrome, and refuses re-enabling", async () => {
+  const chat = new FixtureContainer();
+  const runtime: CalmChatRuntime = {
+    ...fixtureRuntime,
+    assistant: fixture<CalmChatRuntime["assistant"]>(FailingRefreshAssistant),
   };
-}
+  const { ui, pi, context } = calmHarness({
+    runtime,
+    tui: fakeTuiRoot(() => new runtime.container(), chat),
+    preferences: { load: () => Promise.resolve(true), save: () => Promise.resolve() },
+  });
+  await start(pi, context);
+  assert.ok(ui.statuses.get("calm") !== undefined, "Calm should attach");
+  chat.addChild(new CountingRow("native-row"));
+  const assistant = new FailingRefreshAssistant("native update failed");
+  chat.addChild(assistant);
+  assistant.updateContent(assistantMessage([textPart("answer")]), true);
 
-function fakeUi() {
-  const statuses = new Map<string, string | undefined>();
-  type WorkingIndicator = { readonly frames?: readonly string[]; readonly intervalMs?: number };
-  type CalmWidget = { render(width: number): string[] };
-  type Widget = (tui: { requestRender(): void }, theme: FakeTheme) => CalmWidget;
-  const widgets = new Map<string, Widget | undefined>();
-  const notifications: string[] = [];
-  const ui = {
-    statuses,
-    indicator: undefined as WorkingIndicator | undefined,
-    workingVisible: true,
-    widgets,
-    notifications,
-    theme: fakeTheme(),
-    setStatus(key: string, text: string | undefined) {
-      statuses.set(key, text);
-    },
-    setWorkingIndicator(options?: WorkingIndicator) {
-      ui.indicator = options;
-    },
-    setWorkingVisible(visible: boolean) {
-      ui.workingVisible = visible;
-    },
-    setWidget(key: string, content: Widget | undefined) {
-      widgets.set(key, content);
-    },
-    notify(message: string) {
-      notifications.push(message);
-    },
+  // Turning Calm off defers to the native refresh, which fails terminally exactly once.
+  await command(pi, context);
+  await delay(0);
+  assert.ok(ui.notifications.some((message) => message.includes("Calm unavailable")));
+  assert.equal(ui.statuses.get("calm"), undefined);
+  assert.equal(ui.widgets.get("calm"), undefined);
+  assert.equal(ui.workingVisible, true, "the working indicator is restored");
+  assert.equal(assistant.attempts, 1);
+  assert.ok(renderedLines(chat).includes("native-row"), "native presentation is restored");
+
+  // The terminal failure is not retried, and /calm refuses to claim filtering again.
+  await command(pi, context);
+  assert.ok(ui.notifications.some((message) => message.includes("Calm is unavailable")));
+  assert.equal(assistant.attempts, 1);
+  await shutdown(pi, context);
+});
+
+void test("direct children.splice bypass stays native-only", () => {
+  const chat = new FixtureContainer();
+  const bypassed = new CountingRow("bypassed-row");
+  // A caller that mutates chat.children directly bypasses the owned lifecycle seams.
+  chat.children.push(bypassed);
+  const projection = projected(chat);
+  try {
+    assert.deepEqual(renderedLines(chat), []);
+    assert.equal(bypassed.renders, 0);
+  } finally {
+    projection.detach();
+  }
+  assert.deepEqual(renderedLines(chat), ["bypassed-row"]);
+});
+
+void test("detach restores only seams this adapter still owns", () => {
+  const chat = new FixtureContainer();
+  chat.addChild(new FixtureUser("hello"));
+  const warnings: string[] = [];
+  const projection = projected(
+    chat,
+    fixtureRuntime,
+    () => {},
+    (message) => warnings.push(message),
+  );
+  let foreignRenders = 0;
+  const foreignRender = (): string[] => {
+    foreignRenders += 1;
+    return ["foreign"];
   };
-  return ui;
-}
+  // SAFETY: The live chat instance exposes `render`; this names it for deliberate replacement.
+  const overridable = chat as RenderOverridable;
+  overridable.render = foreignRender;
+  projection.detach();
+  assert.equal(Object.getOwnPropertyDescriptor(chat, "render")?.value, foreignRender);
+  assert.equal(foreignRenders, 0);
+  assert.ok(warnings.some((message) => message.includes("render seam changed")));
+  assert.equal(renderedLines(chat).join("\n"), "foreign");
+});
 
-function fakePi() {
-  // SAFETY: The fake dispatch table intentionally accepts each typed Pi event fixture.
-  // oxlint-disable-next-line anti-slop/no-unsafe-dictionary-type
-  type FakeEvent = { readonly [key: string]: string | object | boolean | undefined };
-  type FakeContext = ExtensionContext;
-  type FakeHandlerResult = void | Promise<void>;
-  const events = new Map<string, (event: FakeEvent, context: FakeContext) => FakeHandlerResult>();
-  const commands = new Map<string, (args: string, context: FakeContext) => FakeHandlerResult>();
-  const session = SessionManager.inMemory();
-  return {
-    events,
-    commands,
-    session,
-    appendEntry(customType: string, data: { sessionId: string; on: boolean }) {
-      session.appendCustomEntry(customType, data);
+void test("Calm rail keeps activity first, worker status second, and clears when Calm turns off", async () => {
+  const chat = new FixtureContainer();
+  const { ui, pi, context } = calmHarness({
+    runtime: fixtureRuntime,
+    tui: fakeTuiRoot(() => new FixtureContainer(), chat),
+  });
+  await start(pi, context);
+  await command(pi, context);
+  await pi.events.get("agent_start")?.({}, context);
+  const rail = ui.widgets.get("calm");
+  assert.ok(rail);
+  const activityLines = renderedLines(rail);
+  assert.equal(activityLines.length, 2);
+  assert.match(activityLines[0] ?? "", /thinking/);
+  assert.match(activityLines[1] ?? "", /Workgraph/);
+  assert.equal(ui.workingVisible, false);
+
+  await pi.events.get("tool_execution_start")?.(
+    { toolCallId: "read-1", toolName: "read", args: { path: "/workspace/calm.ts" } },
+    context,
+  );
+  const withTool = renderedLines(rail);
+  assert.equal(withTool.length, 2);
+  assert.match(withTool[0] ?? "", /read calm\.ts/);
+  assert.match(withTool[1] ?? "", /Workgraph/);
+
+  await command(pi, context);
+  assert.equal(ui.widgets.get("calm"), undefined);
+  assert.equal(ui.statuses.get("calm"), undefined);
+  assert.equal(ui.workingVisible, true);
+  await shutdown(pi, context);
+});
+
+void test("Calm animation runs only for active non-waiting coordinator execution", async () => {
+  const { tui, ui, pi, calm, context } = calmHarness({ runtime: fixtureRuntime, intervalMs: 5 });
+  await start(pi, context);
+  await command(pi, context);
+  await pi.events.get("agent_start")?.({}, context);
+  const before = tui.requests;
+  await delay(40);
+  assert.ok(tui.requests > before, "coordinator execution should animate");
+
+  await pi.events.get("ui_prompt_start")?.({}, context);
+  const waiting = tui.requests;
+  await delay(40);
+  assert.equal(tui.requests, waiting, "waiting for input must stay static");
+
+  await pi.events.get("ui_prompt_end")?.({}, context);
+  await pi.events.get("agent_settled")?.({}, context);
+  calm.setActiveWorkers(2);
+  const workerOnly = tui.requests;
+  const rail = ui.widgets.get("calm");
+  assert.ok(rail);
+  assert.match(renderedLines(rail).join(" "), /2 workers active/);
+  calm.setActiveWorkers(2);
+  assert.equal(tui.requests, workerOnly, "an unchanged worker count must not request a render");
+  await delay(40);
+  assert.equal(tui.requests, workerOnly, "worker-only state must stay static");
+  await shutdown(pi, context);
+});
+
+void test("semantic no-op updates do not request renders", async () => {
+  const { tui, pi, context } = calmHarness({ runtime: fixtureRuntime });
+  await start(pi, context);
+  await command(pi, context);
+  await pi.events.get("agent_start")?.({}, context);
+  const before = tui.requests;
+  await messageUpdate(pi, context, "text_delta");
+  assert.equal(tui.requests, before + 1);
+  await messageUpdate(pi, context, "text_delta");
+  assert.equal(tui.requests, before + 1, "a repeated semantic state must not request a render");
+  await shutdown(pi, context);
+});
+
+void test("Calm presentation is unavailable when the chat seam cannot be discovered", async () => {
+  const malformed = fakeTuiRoot(() => new FixtureContainer());
+  malformed.children.length = 0;
+  const document = new FixtureContainer();
+  document.addChild(new FixtureContainer());
+  malformed.addChild(document);
+  const { ui, pi, context } = calmHarness({ runtime: fixtureRuntime, tui: malformed });
+  await start(pi, context);
+  await delay(0);
+  assert.ok(ui.notifications.some((message) => message.includes("Calm unavailable")));
+  await command(pi, context);
+  assert.equal(ui.widgets.get("calm"), undefined);
+  assert.equal(ui.workingVisible, true);
+  await shutdown(pi, context);
+});
+
+void test("Calm session default persists across reload, resume, and new sessions", async () => {
+  let defaultOn = false;
+  let saves = 0;
+  const { ui, pi, context } = calmHarness({
+    runtime: fixtureRuntime,
+    preferences: {
+      load: () => Promise.resolve(defaultOn),
+      save: (on) => {
+        defaultOn = on;
+        saves += 1;
+        return Promise.resolve();
+      },
     },
-    on(name: string, handler: (event: FakeEvent, context: FakeContext) => FakeHandlerResult) {
-      events.set(name, handler);
+  });
+  const isOn = (): boolean => ui.statuses.get("calm") !== undefined;
+  await start(pi, context);
+  assert.equal(isOn(), false);
+  await command(pi, context, "default on");
+  assert.equal(defaultOn, true);
+  assert.equal(isOn(), false, "changing the default must not flip this session");
+  await shutdown(pi, context);
+  await start(pi, context);
+  assert.equal(isOn(), false, "a reload keeps the frozen startup choice");
+  await command(pi, context);
+  assert.equal(isOn(), true);
+  await shutdown(pi, context);
+  await start(pi, context);
+  assert.equal(isOn(), true, "a resumed session restores its own choice");
+  await command(pi, context);
+  assert.equal(isOn(), false);
+  await command(pi, context, "default maybe");
+  assert.equal(saves, 1, "only real default changes save");
+  await shutdown(pi, context);
+  pi.session.newSession();
+  await start(pi, context);
+  assert.equal(isOn(), true, "a new session follows the saved default");
+  await command(pi, context, "default off");
+  assert.equal(isOn(), true, "changing the default still does not flip this session");
+  await shutdown(pi, context);
+});
+
+void test("Calm on projects the chat while shutdown restores native presentation and stops timers", async () => {
+  const chat = new FixtureContainer();
+  const tui = fakeTuiRoot(() => new FixtureContainer(), chat);
+  const { ui, pi, context } = calmHarness({
+    runtime: fixtureRuntime,
+    tui,
+    preferences: {
+      load: () => Promise.resolve(true),
+      save: () => Promise.resolve(),
     },
-    registerCommand(
-      name: string,
-      definition: { handler: (args: string, context: FakeContext) => FakeHandlerResult },
-    ) {
-      commands.set(name, definition.handler);
-    },
-  };
-}
+  });
+  await start(pi, context);
+  const hidden = new CountingRow("native-row");
+  chat.addChild(new FixtureAssistant(assistantMessage([textPart("answer")])));
+  chat.addChild(hidden);
+  assert.deepEqual(renderedLines(chat), ["answer"]);
+  await pi.events.get("agent_start")?.({}, context);
+  await shutdown(pi, context);
+  assert.equal(ui.widgets.get("calm"), undefined);
+  assert.equal(ui.statuses.get("calm"), undefined);
+  assert.equal(ui.workingVisible, true);
+  assert.ok(renderedLines(chat).includes("native-row"));
+  const requests = tui.requests;
+  await delay(40);
+  assert.equal(tui.requests, requests, "shutdown must stop the pulse timer");
+});
 
-function moduleForFakeRows() {
-  return {
-    ToolExecutionComponent: FakeToolRow,
-    CustomMessageComponent: FakeMessageRow,
-    AssistantMessageComponent: FakeAssistantRow,
-    UserMessageComponent: FakeUserRow,
-  };
-}
-
-function stripAnsiLikeTheme(value: string): string {
-  return stripVTControlCharacters(value);
-}
-
-void test("calm defaults own Pi and Workgraph tools while user additions are merged", () => {
+void test("coordinator scope and worker accounting remain unchanged", () => {
   assert.equal(isCoordinatorScope({}), true);
   assert.equal(isCoordinatorScope({ PI_WORKGRAPH_MODE: "" }), true);
   assert.equal(isCoordinatorScope({ PI_WORKGRAPH_MODE: "implementation" }), false);
-  const hidden = new Set<string>(calmHiddenTools());
-  assert.deepEqual([...hidden], [...DEFAULT_CALM_HIDDEN_TOOLS]);
-  assert.ok(hidden.has("bash"));
-  assert.ok(hidden.has("workgraph_consult"));
-  assert.ok(hidden.has("workgraph_report"));
-  assert.ok(hidden.has("workgraph_notepad"));
-  assert.ok(!hidden.has("web_search"));
-  assert.ok(!hidden.has("rename_resource"));
-  assert.ok(!hidden.has("herdr_rename"));
-  assert.deepEqual(calmHiddenTools(["web_search", "rename_resource", "bash"]), [
-    ...DEFAULT_CALM_HIDDEN_TOOLS,
-    "web_search",
-    "rename_resource",
-  ]);
-});
-
-void test("presentation adapter hides and restores existing tool and operational-message rows", () => {
-  const tool = new FakeToolRow("read");
-  const message = new FakeMessageRow("pi-workgraph-attention");
-  const state = {
-    on: true,
-    hiddenTools: new Set(["read"]),
-    hiddenMessageTypes: new Set(["pi-workgraph-attention"]),
-  };
-  const diagnostics: string[] = [];
-  const detach = attachCalmPresentation(moduleForFakeRows(), state, (message) =>
-    diagnostics.push(message),
-  );
-  try {
-    assert.deepEqual(tool.render(80), []);
-    assert.deepEqual(message.render(80), []);
-    assert.equal(tool.handleMouse({ kind: "click" }), undefined);
-    state.on = false;
-    assert.deepEqual(tool.render(80), ["tool:read:80"]);
-    assert.deepEqual(message.render(80), ["message:pi-workgraph-attention:80"]);
-    const click = {};
-    assert.equal(tool.handleMouse(click), click);
-    assert.deepEqual(diagnostics, []);
-  } finally {
-    detach();
-  }
-  assert.deepEqual(tool.render(80), ["tool:read:80"]);
-  assert.deepEqual(message.render(80), ["message:pi-workgraph-attention:80"]);
-});
-
-void test("Calm filters assistant thinking structurally and restores the original message on toggles", () => {
-  const message: FakeAssistantMessage = {
-    role: "assistant",
-    content: [
-      { type: "thinking", thinking: "private reasoning" },
-      { type: "text", text: "answer" },
-      { type: "toolCall", name: "read" },
-    ],
-  };
-  const row = new FakeAssistantRow();
-  row.updateContent(message, true);
-  const originalContent = [...message.content];
-  const state = {
-    on: true,
-    hiddenTools: new Set<string>(),
-    hiddenMessageTypes: new Set<string>(),
-  };
-  const diagnostics: string[] = [];
-  let streamed: FakeAssistantMessage | undefined;
-  const detach = attachCalmPresentation(moduleForFakeRows(), state, (diagnostic) =>
-    diagnostics.push(diagnostic),
-  );
-  try {
-    assert.deepEqual(row.render(80), ["answer", "tool:read"]);
-    assert.deepEqual(message.content, originalContent);
-
-    row.invalidate();
-    row.setHideThinkingBlock();
-    row.setHiddenThinkingLabel();
-    row.setOutputPad();
-    assert.deepEqual(row.render(80), ["answer", "tool:read"]);
-    assert.deepEqual(row.lastMessage?.content, [
-      { type: "text", text: "answer" },
-      { type: "toolCall", name: "read" },
-    ]);
-    assert.deepEqual(message.content, originalContent);
-
-    for (let toggle = 0; toggle < 3; toggle += 1) {
-      state.on = false;
-      assert.deepEqual(row.render(80), ["thinking:private reasoning", "answer", "tool:read"]);
-      state.on = true;
-      assert.deepEqual(row.render(80), ["answer", "tool:read"]);
-      row.invalidate();
-      row.setHideThinkingBlock();
-    }
-
-    streamed = {
-      role: "assistant",
-      content: [
-        { type: "thinking", thinking: "updated reasoning" },
-        { type: "text", text: "updated answer" },
-      ],
-    };
-    row.updateContent(streamed, true);
-    row.setHiddenThinkingLabel();
-    row.setOutputPad();
-    row.invalidate();
-    assert.deepEqual(row.render(80), ["updated answer"]);
-    state.on = false;
-    assert.deepEqual(row.render(80), ["thinking:updated reasoning", "updated answer"]);
-    assert.deepEqual(streamed.content, [
-      { type: "thinking", thinking: "updated reasoning" },
-      { type: "text", text: "updated answer" },
-    ]);
-    assert.deepEqual(diagnostics, []);
-  } finally {
-    detach();
-  }
-  assert.deepEqual(row.render(80), ["thinking:updated reasoning", "updated answer"]);
-  assert.equal(row.lastMessage, streamed);
-  assert.deepEqual(row.lastMessage?.content, streamed?.content);
-});
-
-void test("the installed Pi assistant component remains compatible with Calm thinking filtering", () => {
-  initTheme("dark", false);
-  const source: AssistantMessage = {
-    role: "assistant",
-    content: [
-      { type: "thinking", thinking: "private reasoning" },
-      { type: "text", text: "visible answer" },
-      { type: "toolCall", id: "tool-1", name: "read", arguments: {} },
-    ],
-    api: "openai-completions",
-    provider: "fixture",
-    model: "fixture-model",
-    usage: {
-      input: 0,
-      output: 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-      totalTokens: 0,
-      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-    },
-    stopReason: "toolUse",
-    timestamp: 0,
-  };
-  const originalContent = [...source.content];
-  const state = { on: true };
-  const diagnostics: string[] = [];
-  const detach = attachCalmThinking(
-    AssistantMessageComponent.prototype,
-    () => state.on,
-    (diagnostic) => diagnostics.push(diagnostic),
-  );
-  const row = new AssistantMessageComponent();
-  const visible = (): string => row.render(80).map(stripVTControlCharacters).join("\\n");
-  try {
-    row.updateContent(source, true);
-    assert.doesNotMatch(visible(), /private reasoning/);
-    assert.match(visible(), /visible answer/);
-    assert.deepEqual(source.content, originalContent);
-
-    row.invalidate();
-    row.setHideThinkingBlock(true);
-    row.setHiddenThinkingLabel("hidden");
-    row.setOutputPad(0);
-    assert.doesNotMatch(visible(), /private reasoning|hidden/);
-    assert.match(visible(), /visible answer/);
-    assert.deepEqual(source.content, originalContent);
-
-    for (let toggle = 0; toggle < 2; toggle += 1) {
-      state.on = false;
-      row.setHideThinkingBlock(false);
-      assert.match(visible(), /private reasoning/);
-      state.on = true;
-      assert.doesNotMatch(visible(), /private reasoning/);
-      row.invalidate();
-      row.setHideThinkingBlock(false);
-      row.setHiddenThinkingLabel("still hidden");
-      row.setOutputPad(1);
-      assert.doesNotMatch(visible(), /private reasoning|still hidden/);
-    }
-
-    const updated: AssistantMessage = {
-      ...source,
-      content: [
-        { type: "thinking", thinking: "updated private reasoning" },
-        { type: "text", text: "updated visible answer" },
-      ],
-    };
-    row.updateContent(updated, false);
-    row.invalidate();
-    assert.doesNotMatch(visible(), /updated private reasoning/);
-    assert.match(visible(), /updated visible answer/);
-    assert.deepEqual(updated.content, [
-      { type: "thinking", thinking: "updated private reasoning" },
-      { type: "text", text: "updated visible answer" },
-    ]);
-  } finally {
-    detach();
-  }
-  assert.match(visible(), /updated visible answer/);
-  assert.match(visible(), /updated private reasoning/);
-  assert.deepEqual(source.content, originalContent);
-  assert.deepEqual(diagnostics, []);
-});
-
-void test("thinking-only assistant rows do not create separators", () => {
-  const hiddenThinking = new FakeAssistantRow();
-  hiddenThinking.updateContent({
-    role: "assistant",
-    content: [{ type: "thinking", thinking: "only reasoning" }],
-  });
-  const visibleA = new FakeAssistantRow("answer A");
-  const visibleB = new FakeAssistantRow("answer B");
-  const chat = new FakeContainer();
-  chat.addChild(visibleA);
-  chat.addChild(hiddenThinking);
-  chat.addChild(new FakeToolRow("read"));
-  chat.addChild(visibleB);
-  const state = {
-    on: true,
-    hiddenTools: new Set(["read"]),
-    hiddenMessageTypes: new Set<string>(),
-  };
-  const detach = attachCalmPresentation(moduleForFakeRows(), state, () => {});
-  try {
-    assert.deepEqual(chat.render(40), ["answer A", "---", "answer B"]);
-    assert.equal(chat.handleMouse({ y: 1, width: 40 }), undefined);
-    assert.deepEqual(chat.handleMouse({ y: 2, width: 40 }), { y: 0, width: 40 });
-    state.on = false;
-    assert.deepEqual(chat.render(40), [
-      "answer A",
-      "thinking:only reasoning",
-      "tool:read:40",
-      "answer B",
-    ]);
-  } finally {
-    detach();
-  }
-});
-
-void test("assistant seam failures restore earlier patches and diagnose changed cleanup seams", () => {
-  const tool = new FakeToolRow("read");
-  const message = new FakeMessageRow("pi-workgraph-attention");
-  const state = {
-    on: true,
-    hiddenTools: new Set(["read"]),
-    hiddenMessageTypes: new Set(["pi-workgraph-attention"]),
-  };
-  const diagnostics: string[] = [];
-  class MissingAssistant extends FakeContainer {
-    override render(width: number): string[] {
-      return [`missing:${width}`];
-    }
-  }
-  const broken = {
-    ...moduleForFakeRows(),
-    AssistantMessageComponent: MissingAssistant,
-  } as unknown as Parameters<typeof attachCalmPresentation>[0];
-  assert.throws(
-    () => attachCalmPresentation(broken, state, (diagnostic) => diagnostics.push(diagnostic)),
-    /assistant message presentation seam/,
-  );
-  assert.deepEqual(tool.render(80), ["tool:read:80"]);
-  assert.deepEqual(message.render(80), ["message:pi-workgraph-attention:80"]);
-
-  // oxlint-disable-next-line typescript/unbound-method -- Capture the native seam for cleanup verification.
-  const nativeUpdate = FakeAssistantRow.prototype.updateContent;
-  const detach = attachCalmPresentation(moduleForFakeRows(), state, (diagnostic) =>
-    diagnostics.push(diagnostic),
-  );
-  // oxlint-disable-next-line typescript/unbound-method -- Call through the temporarily replaced seam.
-  const adaptedUpdate = FakeAssistantRow.prototype.updateContent;
-  FakeAssistantRow.prototype.updateContent = function (
-    message: FakeAssistantMessage,
-    isStreaming?: boolean,
-  ): void {
-    adaptedUpdate.call(this, message, isStreaming);
-  };
-  detach();
-  assert.ok(diagnostics.some((diagnostic) => diagnostic.includes("update seam changed")));
-  // oxlint-disable-next-line typescript/unbound-method -- Verify cleanup restores the native seam.
-  assert.equal(FakeAssistantRow.prototype.updateContent, nativeUpdate);
-});
-
-void test("Calm separates visible assistant blocks with inert, width-safe rows", () => {
-  const state = {
-    on: true,
-    hiddenTools: new Set(["read"]),
-    hiddenMessageTypes: new Set(["pi-workgraph-attention"]),
-  };
-  const width = 32;
-  const chat = new FakeContainer();
-  chat.addChild(new FakeAssistantRow("first"));
-  chat.addChild(new FakeToolRow("read"));
-  chat.addChild(new FakeMessageRow("pi-workgraph-attention"));
-  chat.addChild(new FakeAssistantRow("second"));
-  const detach = attachCalmPresentation(moduleForFakeRows(), state, () => {});
-  try {
-    assert.deepEqual(chat.render(width), ["first", "---", "second"]);
-    assert.equal(chat.handleMouse({ y: 1, width }), undefined);
-    assert.deepEqual(chat.handleMouse({ y: 2, width }), { y: 0, width });
-
-    const narrowChat = new FakeContainer();
-    narrowChat.addChild(new FakeAssistantRow("a"));
-    narrowChat.addChild(new FakeAssistantRow("b"));
-    const narrowLines = narrowChat.render(2);
-    assert.deepEqual(narrowLines, ["a", "--", "b"]);
-    assert.ok(narrowLines.every((line) => visibleWidth(line) <= 2));
-  } finally {
-    detach();
-  }
-});
-
-void test("adapter diagnostics fall back to visible rendering when row metadata changes", () => {
-  const tool = new FakeToolRow("read");
-  Object.defineProperty(tool, "toolName", { get: () => 42 });
-  const diagnostics: string[] = [];
-  const state = {
-    on: true,
-    hiddenTools: new Set(["read"]),
-    hiddenMessageTypes: new Set<string>(),
-  };
-  const detach = attachCalmPresentation(moduleForFakeRows(), state, (message) =>
-    diagnostics.push(message),
-  );
-  try {
-    assert.deepEqual(tool.render(80), ["tool:42:80"]);
-    assert.equal(diagnostics.length, 1);
-  } finally {
-    detach();
-  }
-});
-
-void test("activity indicator remains active for coordinator or workers and settles cleanly", () => {
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 0 }), false);
   assert.equal(isCalmActivityActive({ coordinatorActive: true, activeWorkers: 0 }), true);
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 2 }), true);
@@ -624,38 +899,8 @@ void test("activity indicator remains active for coordinator or workers and sett
   );
 });
 
-void test("activity status remains truthful and width-safe", () => {
+void test("activity tracker bounds history, live labels, width, and secrets", () => {
   const theme = fakeTheme();
-  assert.notDeepEqual(
-    calmActivityLines({ coordinatorActive: true, activeWorkers: 0 }, 1, 80, theme),
-    calmActivityLines({ coordinatorActive: true, activeWorkers: 0 }, 2, 80, theme),
-  );
-  assert.match(
-    stripAnsiLikeTheme(
-      calmActivityLines({ coordinatorActive: false, activeWorkers: 2 }, 0, 80, theme)[0] ?? "",
-    ),
-    /2 workers active/,
-  );
-  assert.doesNotMatch(
-    stripAnsiLikeTheme(
-      calmActivityLines({ coordinatorActive: false, activeWorkers: 2 }, 0, 80, theme)[0] ?? "",
-    ),
-    /coordinating/,
-  );
-  assert.match(
-    stripAnsiLikeTheme(
-      calmActivityLines(
-        { coordinatorActive: true, activeWorkers: 0, waitingForInput: true },
-        0,
-        80,
-        theme,
-      )[0] ?? "",
-    ),
-    /awaiting input/,
-  );
-});
-
-void test("activity tracker keeps IDs and path hints safe", () => {
   const tracker = createCalmActivityTracker();
   tracker.startAgent();
   tracker.messageUpdate("text_delta");
@@ -665,40 +910,6 @@ void test("activity tracker keeps IDs and path hints safe", () => {
   assert.deepEqual(tracker.snapshot().activeTools, [
     { toolCallId: "read-1", toolName: "read", pathHint: "calm.ts" },
   ]);
-  assert.equal(tracker.snapshot().phase, undefined);
-  tracker.toolEnd("read-1");
-  assert.deepEqual(
-    tracker.snapshot().completedTools?.map((tool) => tool.toolName),
-    ["bash", "read"],
-  );
-  assert.equal(tracker.snapshot().phase, undefined);
-
-  for (const args of [
-    { path: "unsafe\u0001.ts" },
-    { path: "unsafe name.ts" },
-    { path: 42 },
-    { command: "secret", query: "private" },
-    null,
-    "not-an-object",
-  ] as unknown[]) {
-    tracker.toolStart("unsafe", "read", args);
-    assert.deepEqual((tracker.snapshot().activeTools ?? []).at(-1), {
-      toolCallId: "unsafe",
-      toolName: "read",
-    });
-    tracker.toolEnd("unsafe");
-  }
-  const getterArgs = {};
-  Object.defineProperty(getterArgs, "path", {
-    get: () => {
-      throw new Error("path getter must not run");
-    },
-  });
-  tracker.toolStart("getter", "read", getterArgs);
-  assert.deepEqual((tracker.snapshot().activeTools ?? []).at(-1), {
-    toolCallId: "getter",
-    toolName: "read",
-  });
 
   const lines = calmActivityLines(
     {
@@ -712,334 +923,28 @@ void test("activity tracker keeps IDs and path hints safe", () => {
     },
     0,
     80,
-    fakeTheme(),
+    theme,
   );
-  assert.equal(stripAnsiLikeTheme(lines[0] ?? ""), "bash › web_search");
-  assert.doesNotMatch(stripAnsiLikeTheme(lines[0] ?? ""), /secret|query|never-render/);
-});
+  assert.equal(lines[0], "bash › web_search");
+  assert.doesNotMatch(lines.join(" "), /secret|never-render/);
 
-void test("activity rail bounds history, live labels, and width", () => {
-  const tracker = createCalmActivityTracker();
-  tracker.startAgent();
-  for (const [id, name] of [
-    ["one", "read"],
-    ["two", "edit"],
-    ["three", "bash"],
-    ["four", "write"],
-  ] as const) {
-    tracker.toolStart(id, name, {});
-    tracker.toolEnd(id);
-  }
-  assert.deepEqual(
-    tracker.snapshot().completedTools?.map((tool) => tool.toolName),
-    ["edit", "bash", "write"],
-  );
-
-  const state = {
-    calmOn: true,
-    coordinatorActive: true,
-    activeWorkers: 0,
-    completedTools: [{ toolCallId: "old", toolName: "old" }],
-    activeTools: [
-      { toolCallId: "1", toolName: "read" },
-      { toolCallId: "2", toolName: "edit" },
-      { toolCallId: "3", toolName: "write" },
-    ],
-  };
-  const three = calmActivityLines(state, 0, 80, fakeTheme()).map(stripAnsiLikeTheme);
-  assert.deepEqual(three, ["read › edit › write", "• Workgraph"]);
-  assert.doesNotMatch(three[0] ?? "", /old/);
-
-  const many = calmActivityLines(
-    {
-      ...state,
-      activeTools: [
-        ...state.activeTools,
-        { toolCallId: "4", toolName: "bash" },
-        { toolCallId: "5", toolName: "web_search" },
-      ],
-    },
+  const waiting = calmActivityLines(
+    { coordinatorActive: false, activeWorkers: 2, waitingForInput: true },
     0,
     80,
-    fakeTheme(),
-  ).map(stripAnsiLikeTheme);
-  assert.deepEqual(many, ["read › edit › +3 tools", "• Workgraph"]);
+    theme,
+  );
+  assert.match(waiting.join(" "), /awaiting input/);
+  assert.match(waiting.join(" "), /2 workers active/);
+
   for (const width of [1, 8, 12, 80]) {
     assert.ok(
-      calmActivityLines(state, 0, width, fakeTheme()).every((line) => visibleWidth(line) <= width),
+      calmActivityLines(
+        { calmOn: true, coordinatorActive: true, activeWorkers: 0 },
+        0,
+        width,
+        theme,
+      ).every((line) => visibleWidth(line) <= width),
     );
-  }
-});
-
-void test("coordinator calm command defaults to hiding workgraph notes and restores them when off", async () => {
-  const pi = fakePi();
-  const ui = fakeUi();
-  const calm = installCalmMode(pi as unknown as ExtensionAPI, {
-    loadAdditionalHiddenTools: async () => ["web_search"],
-    loadPresentation: async () => moduleForFakeRows(),
-    intervalMs: 10_000,
-    preferences: { load: async () => false, save: async () => {} },
-  });
-  // SAFETY: The fixture supplies only the ExtensionContext fields consumed by Calm.
-  const context = {
-    mode: "tui",
-    ui,
-    isIdle: () => true,
-    sessionManager: pi.session,
-  } as unknown as ExtensionContext;
-  await pi.events.get("session_start")?.({}, context);
-  const tool = new FakeToolRow("workgraph_notepad");
-  const addedTool = new FakeToolRow("web_search");
-  assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
-  assert.deepEqual(addedTool.render(80), ["tool:web_search:80"]);
-  calm.setActiveWorkers(1);
-  await pi.commands.get("calm")?.("", context);
-  assert.deepEqual(tool.render(80), []);
-  assert.deepEqual(addedTool.render(80), []);
-  assert.match(ui.statuses.get("calm") ?? "", /calm/);
-  const widgetFactory = ui.widgets.get("calm");
-  assert.ok(widgetFactory);
-  const widget = widgetFactory({ requestRender() {} }, ui.theme);
-  assert.equal(widget.render(80).length, 1);
-  assert.match(widget.render(80)[0] ?? "", /Workgraph/);
-  assert.equal(ui.workingVisible, false);
-  calm.setActiveWorkers(0);
-  assert.equal(ui.widgets.get("calm"), undefined);
-  calm.setActiveWorkers(1);
-  await pi.commands.get("calm")?.("", context);
-  assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
-  assert.deepEqual(addedTool.render(80), ["tool:web_search:80"]);
-  const compactFactory = ui.widgets.get("calm");
-  assert.ok(compactFactory);
-  assert.equal(compactFactory({ requestRender() {} }, ui.theme).render(80).length, 1);
-  assert.equal(ui.statuses.get("calm"), undefined);
-  assert.equal(ui.workingVisible, false);
-  await pi.events.get("session_shutdown")?.({}, context);
-  assert.equal(ui.widgets.get("calm"), undefined);
-  assert.equal(ui.workingVisible, true);
-  assert.deepEqual(tool.render(80), ["tool:workgraph_notepad:80"]);
-});
-
-void test("invalid Calm tool additions warn and retain package defaults", async () => {
-  const pi = fakePi();
-  const ui = fakeUi();
-  installCalmMode(pi as unknown as ExtensionAPI, {
-    loadAdditionalHiddenTools: async () => {
-      throw new Error("invalid global additions");
-    },
-    loadPresentation: async () => moduleForFakeRows(),
-    preferences: { load: async () => true, save: async () => {} },
-  });
-  const context = {
-    mode: "tui",
-    ui,
-    isIdle: () => true,
-    sessionManager: pi.session,
-  } as unknown as ExtensionContext;
-  try {
-    await pi.events.get("session_start")?.({}, context);
-    assert.deepEqual(new FakeToolRow("read").render(80), []);
-    assert.deepEqual(new FakeToolRow("web_search").render(80), ["tool:web_search:80"]);
-    assert.ok(
-      ui.notifications.some((notification) => notification.includes("Using built-in defaults")),
-    );
-  } finally {
-    await pi.events.get("session_shutdown")?.({}, context);
-  }
-});
-
-void test("missing internal seam leaves rows visible and reports a diagnostic", async () => {
-  const tool = new FakeToolRow("read");
-  const message = new FakeMessageRow("pi-workgraph-attention");
-  const toolOutput = tool.render(80);
-  const messageOutput = message.render(80);
-  const toolClick = { kind: "tool-click" };
-  const messageClick = { kind: "message-click" };
-  const pi = fakePi();
-  const ui = fakeUi();
-  const calm = installCalmMode(pi as unknown as ExtensionAPI, {
-    loadPresentation: async () => {
-      throw new Error("unsupported Pi seam");
-    },
-    preferences: { load: async () => false, save: async () => {} },
-    intervalMs: 5,
-  });
-  // SAFETY: The fixture supplies only the ExtensionContext fields consumed by Calm.
-  const context = {
-    mode: "tui",
-    ui,
-    isIdle: () => true,
-    sessionManager: pi.session,
-  } as unknown as ExtensionContext;
-  let renderRequests = 0;
-  try {
-    await pi.events.get("session_start")?.({}, context);
-    calm.setActiveWorkers(1);
-    const widgetFactory = ui.widgets.get("calm");
-    assert.ok(widgetFactory);
-    widgetFactory({ requestRender: () => renderRequests++ }, ui.theme);
-    await delay(20);
-    assert.ok(renderRequests > 0);
-
-    await pi.commands.get("calm")?.("", context);
-    assert.deepEqual(tool.render(80), toolOutput);
-    assert.deepEqual(message.render(80), messageOutput);
-    assert.equal(tool.handleMouse(toolClick), toolClick);
-    assert.equal(message.handleMouse(messageClick), messageClick);
-    assert.ok(
-      ui.notifications.some((notification) => notification.includes("Rows remain visible")),
-    );
-  } finally {
-    await pi.events.get("session_shutdown")?.({}, context);
-    const requestsAfterShutdown = renderRequests;
-    await delay(20);
-    assert.equal(renderRequests, requestsAfterShutdown);
-    assert.equal(ui.widgets.get("calm"), undefined);
-    assert.equal(ui.indicator, undefined);
-    assert.equal(ui.workingVisible, true);
-  }
-});
-
-void test("saved default affects new sessions, while local choice survives reload and resume", async () => {
-  const pi = fakePi();
-  const ui = fakeUi();
-  let defaultOn = false;
-  let saves = 0;
-  installCalmMode(pi as unknown as ExtensionAPI, {
-    loadPresentation: async () => moduleForFakeRows(),
-    preferences: {
-      load: async () => defaultOn,
-      save: async (on) => {
-        defaultOn = on;
-        saves += 1;
-      },
-    },
-    intervalMs: 10_000,
-  });
-  const context = {
-    mode: "tui",
-    ui,
-    isIdle: () => true,
-    sessionManager: pi.session,
-  } as unknown as ExtensionContext;
-  const row = new FakeToolRow("read");
-  const start = () => pi.events.get("session_start")?.({}, context);
-  const shutdown = () => pi.events.get("session_shutdown")?.({}, context);
-  const command = (args: string) => pi.commands.get("calm")?.(args, context);
-  try {
-    await start();
-    await command("default on");
-    assert.equal(defaultOn, true);
-    assert.notDeepEqual(row.render(80), []); // Existing session unchanged.
-    await shutdown();
-    await start();
-    assert.notDeepEqual(row.render(80), []); // Frozen startup choice survives reload.
-    await command("");
-    assert.deepEqual(row.render(80), []);
-    await shutdown();
-    await start();
-    assert.deepEqual(row.render(80), []); // Local override restored from actual session entries.
-    await command("");
-    assert.equal(saves, 1); // Debug toggle never writes global default.
-    await command("default maybe");
-    assert.equal(saves, 1);
-    await shutdown();
-    pi.session.newSession();
-    await start();
-    assert.deepEqual(row.render(80), []); // New session follows saved default.
-    await command("default off");
-    assert.deepEqual(row.render(80), []); // Changing default never flips current state.
-  } finally {
-    await shutdown();
-  }
-});
-
-void test("registered Calm widget covers the activity rail lifecycle", async () => {
-  const pi = fakePi();
-  const ui = fakeUi();
-  const calm = installCalmMode(pi as unknown as ExtensionAPI, {
-    loadPresentation: async () => moduleForFakeRows(),
-    preferences: { load: async () => false, save: async () => {} },
-    intervalMs: 10_000,
-  });
-  const context = {
-    mode: "tui",
-    ui,
-    isIdle: () => true,
-    sessionManager: pi.session,
-  } as unknown as ExtensionContext;
-  const lines = (widget: { render(width: number): string[] }): string[] =>
-    widget.render(80).map(stripAnsiLikeTheme);
-  try {
-    await pi.events.get("session_start")?.({}, context);
-    await pi.events.get("agent_start")?.({}, context);
-    const factory = ui.widgets.get("calm");
-    assert.ok(factory);
-    const widget = factory({ requestRender() {} }, ui.theme);
-    assert.deepEqual(lines(widget), ["• Workgraph"]);
-
-    await pi.commands.get("calm")?.("", context);
-    assert.deepEqual(lines(widget), ["thinking", "• Workgraph"]);
-    await pi.events.get("message_update")?.(
-      {
-        message: { role: "assistant" },
-        assistantMessageEvent: { type: "text_delta" },
-      },
-      context,
-    );
-    assert.equal(lines(widget)[0], "responding");
-    await pi.events.get("tool_execution_start")?.(
-      {
-        toolCallId: "read-1",
-        toolName: "read",
-        args: { path: "/workspace/calm.ts", command: "never show" },
-      },
-      context,
-    );
-    assert.equal(lines(widget)[0], "read calm.ts");
-    await pi.events.get("tool_execution_start")?.(
-      {
-        toolCallId: "bash-1",
-        toolName: "bash",
-        args: { command: "secret query never show" },
-      },
-      context,
-    );
-    assert.equal(lines(widget)[0], "read calm.ts › bash");
-    await pi.events.get("tool_execution_end")?.(
-      { toolCallId: "read-1", result: [], isError: false },
-      context,
-    );
-    assert.equal(lines(widget)[0], "read calm.ts › bash");
-
-    await pi.events.get("ui_prompt_start")?.({}, context);
-    assert.equal(lines(widget).length, 1);
-    assert.match(lines(widget)[0] ?? "", /awaiting input/);
-    await pi.events.get("ui_prompt_end")?.({}, context);
-    assert.equal(lines(widget)[0], "read calm.ts › bash");
-
-    await pi.events.get("tool_execution_end")?.(
-      { toolCallId: "bash-1", result: [], isError: false },
-      context,
-    );
-    assert.equal(lines(widget)[0], "read calm.ts › bash");
-    await pi.events.get("message_update")?.(
-      {
-        message: { role: "assistant" },
-        assistantMessageEvent: { type: "thinking_delta" },
-      },
-      context,
-    );
-    assert.equal(lines(widget)[0], "read calm.ts › bash › thinking");
-    assert.doesNotMatch(lines(widget).join(" "), /secret|never show/);
-
-    calm.setActiveWorkers(2);
-    await pi.events.get("agent_settled")?.({}, context);
-    assert.deepEqual(lines(widget), ["read calm.ts › bash", "• Workgraph · 2 workers active"]);
-    calm.setActiveWorkers(0);
-    assert.equal(ui.widgets.get("calm"), undefined);
-    assert.deepEqual(lines(widget), []);
-  } finally {
-    await pi.events.get("session_shutdown")?.({}, context);
   }
 });

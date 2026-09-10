@@ -8,19 +8,12 @@ import { Value } from "typebox/value";
 import { runNodePlatformPromise } from "./node-platform.js";
 
 const ToolNameSchema = Type.String({ minLength: 1, pattern: "^\\S+$" });
-const CalmSettingsSchema = Type.Object(
-  { additionalHiddenTools: Type.Optional(Type.Array(ToolNameSchema)) },
-  { additionalProperties: true },
-);
 const WorkerSettingsSchema = Type.Object(
   { disabledTools: Type.Optional(Type.Array(ToolNameSchema)) },
   { additionalProperties: true },
 );
 const WorkgraphSettingsDocumentSchema = Type.Object(
-  {
-    calm: Type.Optional(Type.Unknown()),
-    worker: Type.Optional(Type.Unknown()),
-  },
+  { worker: Type.Optional(Type.Unknown()) },
   { additionalProperties: true },
 );
 const GlobalSettingsDocumentSchema = Type.Object(
@@ -55,7 +48,7 @@ function parseGlobalSettingsDocument(value: unknown, path: string): GlobalSettin
 
 function workgraphSettings(
   settings: GlobalSettingsDocument,
-  section: "calm" | "worker",
+  section: "worker",
   path: string,
 ): WorkgraphSettingsDocument | undefined {
   const workgraph = settings["pi-workgraph"];
@@ -67,18 +60,6 @@ function workgraphSettings(
       message: `Invalid pi-workgraph.${section} settings in ${path}.`,
     });
   return Value.Decode(WorkgraphSettingsDocumentSchema, workgraph);
-}
-
-function decodeCalm(value: GlobalSettingsDocument, path: string): readonly string[] {
-  const calm = workgraphSettings(value, "calm", path)?.calm;
-  if (calm === undefined) return [];
-  if (!Value.Check(CalmSettingsSchema, calm))
-    throw new WorkgraphSettingsError({
-      operation: "decode",
-      path,
-      message: `Invalid pi-workgraph.calm.additionalHiddenTools in ${path}; expected an array of non-whitespace tool names.`,
-    });
-  return unique(Value.Decode(CalmSettingsSchema, calm).additionalHiddenTools ?? []);
 }
 
 function decodeWorker(value: GlobalSettingsDocument, path: string): readonly string[] {
@@ -124,13 +105,7 @@ function unique(names: readonly string[]): readonly string[] {
   return [...new Set(names)];
 }
 
-/** Promise facades for Pi's extension callback boundary. */
-export function loadCalmAdditionalHiddenTools(
-  path = globalSettingsPath(),
-): Promise<readonly string[]> {
-  return runNodePlatformPromise(loadGlobalSettingsEffect(decodeCalm, path));
-}
-
+/** Promise facade for Pi's extension callback boundary. */
 export function loadWorkerDisabledTools(path = globalSettingsPath()): Promise<readonly string[]> {
   return runNodePlatformPromise(loadGlobalSettingsEffect(decodeWorker, path));
 }

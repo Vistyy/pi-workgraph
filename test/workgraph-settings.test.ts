@@ -7,16 +7,12 @@ import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import
 import { join } from "node:path";
 import test from "node:test";
-import {
-  loadCalmAdditionalHiddenTools,
-  loadWorkerDisabledTools,
-} from "../src/workgraph-settings.js";
+import { loadWorkerDisabledTools } from "../src/workgraph-settings.js";
 
-void test("global Pi settings validate Calm and worker tool settings independently", async () => {
+void test("global Pi settings validate worker tool settings and ignore Calm sections", async () => {
   const root = await mkdtemp(join(tmpdir(), "wg-workgraph-settings-"));
   const path = join(root, "settings.json");
   try {
-    assert.deepEqual(await loadCalmAdditionalHiddenTools(path), []);
     assert.deepEqual(await loadWorkerDisabledTools(path), []);
 
     await writeFile(
@@ -24,36 +20,32 @@ void test("global Pi settings validate Calm and worker tool settings independent
       JSON.stringify({
         defaultModel: "fixture/model",
         "pi-workgraph": {
-          calm: { additionalHiddenTools: ["web_search", "rename_resource", "web_search"] },
           worker: { disabledTools: ["rename_resource", "rename_resource", "custom_lookup"] },
         },
       }),
     );
-    assert.deepEqual(await loadCalmAdditionalHiddenTools(path), ["web_search", "rename_resource"]);
     assert.deepEqual(await loadWorkerDisabledTools(path), ["rename_resource", "custom_lookup"]);
 
+    // Retired Calm presentation settings must not invalidate the retained worker settings.
     await writeFile(
       path,
       JSON.stringify({
         "pi-workgraph": {
-          calm: { additionalHiddenTools: "web_search" },
+          calm: { additionalHiddenTools: ["web_search"] },
           worker: { disabledTools: ["rename_resource"] },
         },
       }),
     );
-    await assert.rejects(loadCalmAdditionalHiddenTools(path), /calm.additionalHiddenTools/);
     assert.deepEqual(await loadWorkerDisabledTools(path), ["rename_resource"]);
 
     await writeFile(
       path,
       JSON.stringify({
         "pi-workgraph": {
-          calm: { additionalHiddenTools: ["web_search"] },
           worker: { disabledTools: "rename_resource" },
         },
       }),
     );
-    assert.deepEqual(await loadCalmAdditionalHiddenTools(path), ["web_search"]);
     await assert.rejects(loadWorkerDisabledTools(path), /worker.disabledTools/);
 
     await writeFile(path, "{");
