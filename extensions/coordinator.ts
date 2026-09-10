@@ -50,36 +50,39 @@ const COORDINATOR_GUIDANCE = readFileSync(
 const WorkstreamPointer = Type.Object({ path: Type.String({ minLength: 1 }) });
 const InputReceipt = HumanInputReceiptSchema;
 const NonemptyString = Type.String({ minLength: 1 });
-const ControlSchema = Type.Union([
-  Type.Object(
-    { action: StringEnum(["suspend", "resume"] as const), reason: NonemptyString },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    { action: StringEnum(["cancel"] as const), attempt: NonemptyString },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      action: StringEnum(["steer"] as const),
-      attempt: NonemptyString,
-      instruction: NonemptyString,
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    { action: StringEnum(["apply"] as const), attempt: NonemptyString },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      action: StringEnum(["release_output"] as const),
-      attempt: NonemptyString,
-      reason: NonemptyString,
-    },
-    { additionalProperties: false },
-  ),
-]);
+const ControlSchema = Type.Union(
+  [
+    Type.Object(
+      { action: StringEnum(["suspend", "resume"] as const), reason: NonemptyString },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      { action: StringEnum(["cancel"] as const), attempt: NonemptyString },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      {
+        action: StringEnum(["steer"] as const),
+        attempt: NonemptyString,
+        instruction: NonemptyString,
+      },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      { action: StringEnum(["apply"] as const), attempt: NonemptyString },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      {
+        action: StringEnum(["release_output"] as const),
+        attempt: NonemptyString,
+        reason: NonemptyString,
+      },
+      { additionalProperties: false },
+    ),
+  ],
+  { type: "object" },
+);
 const CompleteSchema = Type.Object(
   {
     conclusion: NonemptyString,

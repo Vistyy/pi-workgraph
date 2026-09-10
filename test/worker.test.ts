@@ -168,6 +168,20 @@ void test("research workers do not expose coordinator notes or implementation pl
   }
 });
 
+void test("implementation worker tools expose object-root schemas", async () => {
+  const f = await fixture("implementation");
+  try {
+    for (const name of ["workgraph_plan", "workgraph_report"]) {
+      const tool = f.runner.getToolDefinition(name);
+      assert.ok(tool !== undefined);
+      // SAFETY: Registered tool parameters are TypeBox JSON Schema objects.
+      assert.equal((tool.parameters as { readonly type?: unknown }).type, "object");
+    }
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("registered worker observes a non-edit mutation, switches locally, reports a direct commit and native settlement", async () => {
   const f = await fixture("implementation");
   try {

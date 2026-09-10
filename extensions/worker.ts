@@ -157,14 +157,17 @@ const WorkerPlanRemoveStepSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const WorkerPlanToolSchema = Type.Union([
-  WorkerPlanGetSchema,
-  WorkerPlanUpdateSchema,
-  WorkerPlanUpdateStepSchema,
-  WorkerPlanUpdateOverviewSchema,
-  WorkerPlanAddStepSchema,
-  WorkerPlanRemoveStepSchema,
-]);
+const WorkerPlanToolSchema = Type.Union(
+  [
+    WorkerPlanGetSchema,
+    WorkerPlanUpdateSchema,
+    WorkerPlanUpdateStepSchema,
+    WorkerPlanUpdateOverviewSchema,
+    WorkerPlanAddStepSchema,
+    WorkerPlanRemoveStepSchema,
+  ],
+  { type: "object" },
+);
 const WorkerPlanEntrySchema = Type.Object(
   {
     runId: Type.String(),

@@ -172,10 +172,14 @@ async function emptyWorkstream(f: Awaited<ReturnType<typeof fixture>>) {
   return created.state;
 }
 
-void test("registered control and completion inputs are closed and action-specific", async () => {
+void test("registered control and completion inputs are object-rooted, closed, and action-specific", async () => {
   const f = await fixture();
   try {
     await emptyWorkstream(f);
+    const control = f.runner.getToolDefinition("workgraph_control");
+    assert.ok(control !== undefined);
+    // SAFETY: Registered tool parameters are TypeBox JSON Schema objects.
+    assert.equal((control.parameters as { readonly type?: unknown }).type, "object");
     await assert.rejects(
       f.call("workgraph_control", {
         action: "suspend",

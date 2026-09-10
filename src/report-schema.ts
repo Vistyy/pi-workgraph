@@ -52,38 +52,41 @@ function readOnlyReportSchema<const Kind extends "research" | "review">(
 }
 
 function implementationReportSchema(content: ReportContentFields) {
-  return Type.Union([
-    Type.Object(
-      {
-        kind: Type.Literal("implementation"),
-        status: Type.Literal("completed"),
-        outcome: Type.Literal("changed"),
-        ...content,
-        commit: Type.Optional(Type.String()),
-        changedFiles: Type.Optional(Type.Array(Type.String())),
-      },
-      { additionalProperties: false },
-    ),
-    Type.Object(
-      {
-        kind: Type.Literal("implementation"),
-        status: Type.Literal("completed"),
-        outcome: Type.Literal("no_change"),
-        ...content,
-        revision: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-        reason: Type.String({ minLength: 1 }),
-      },
-      { additionalProperties: false },
-    ),
-    Type.Object(
-      {
-        kind: Type.Literal("implementation"),
-        status: StringEnum(["escalated", "failed"] as const),
-        ...content,
-      },
-      { additionalProperties: false },
-    ),
-  ]);
+  return Type.Union(
+    [
+      Type.Object(
+        {
+          kind: Type.Literal("implementation"),
+          status: Type.Literal("completed"),
+          outcome: Type.Literal("changed"),
+          ...content,
+          commit: Type.Optional(Type.String()),
+          changedFiles: Type.Optional(Type.Array(Type.String())),
+        },
+        { additionalProperties: false },
+      ),
+      Type.Object(
+        {
+          kind: Type.Literal("implementation"),
+          status: Type.Literal("completed"),
+          outcome: Type.Literal("no_change"),
+          ...content,
+          revision: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+          reason: Type.String({ minLength: 1 }),
+        },
+        { additionalProperties: false },
+      ),
+      Type.Object(
+        {
+          kind: Type.Literal("implementation"),
+          status: StringEnum(["escalated", "failed"] as const),
+          ...content,
+        },
+        { additionalProperties: false },
+      ),
+    ],
+    { type: "object" },
+  );
 }
 
 // These schemas decode retained reports and preserve fields accepted by the old contracts.
