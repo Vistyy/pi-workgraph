@@ -1,5 +1,5 @@
-import { type Static, type TSchema, Type } from "typebox";
-import { Value } from "typebox/value";
+import { type Static, Type } from "typebox";
+import { decodeCommand } from "./canonical-commands.js";
 import {
   type Attempt,
   type CandidateLineage,
@@ -51,6 +51,7 @@ export const CanonicalEnqueueCommandSchema = Type.Union([
       kind: Type.Literal("implementation"),
       acceptance: Type.Array(NonEmptyString, { minItems: 1 }),
       useEscalationExecutor: Type.Optional(Type.Boolean()),
+      candidateOf: Type.Optional(NonEmptyString),
       baseRevision: Type.Optional(Commit),
     },
     { additionalProperties: false },
@@ -99,7 +100,6 @@ export interface ResolvedQueueFacts {
 
 export interface EnqueuePlan {
   readonly taskId: string;
-  readonly command: CanonicalEnqueueCommand;
   readonly attemptCount: number;
   materialize(
     attemptIds: readonly string[],
@@ -128,7 +128,6 @@ export function planEnqueue(command: CanonicalEnqueueCommand, policy: ModelPolic
   const selections = taskSelections(command, policy);
   return {
     taskId: command.taskId,
-    command,
     attemptCount: selections.length,
     materialize: (attemptIds, now, intentIndex, facts) => {
       if (attemptIds.length !== selections.length)
@@ -305,15 +304,4 @@ function exactId(ids: readonly string[], index: number): string {
   const id = ids[index];
   if (id === undefined) throw new Error("Canonical Attempt identity is missing.");
   return id;
-}
-
-// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- This local decoder validates before returning to a named command decoder.
-function decodeCommand(schema: TSchema, value: unknown, label: string): unknown {
-  if (!Value.Check(schema, value)) {
-    const issue = Value.Errors(schema, value)[0];
-    const location =
-      issue?.instancePath !== undefined && issue.instancePath !== "" ? issue.instancePath : "/";
-    throw new Error(`Invalid ${label} at ${location}: ${issue?.message ?? "schema mismatch"}.`);
-  }
-  return Value.Decode(schema, value);
 }

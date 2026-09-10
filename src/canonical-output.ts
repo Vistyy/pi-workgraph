@@ -2,10 +2,12 @@ import { Effect } from "effect";
 import {
   type ApplyCommand,
   ApplyCommandSchema,
-  CanonicalCommandError,
+  type CanonicalCommandError,
   type CanonicalCommandPorts,
-  decodeCommand,
+  commandFailure,
+  decodeCommandEffect,
   exactAttempt,
+  exactAttemptEffect,
   type ReleaseOutputCommand,
   ReleaseOutputCommandSchema,
 } from "./canonical-commands.js";
@@ -23,6 +25,7 @@ export interface MaintainedOutputControl<E, R> {
   readonly state: Effect.Effect<Workstream, E, R>;
   readonly commit: (
     operation: string,
+    key: ReturnType<typeof exactAttempt>["key"],
     plan: (state: Workstream) => Workstream,
   ) => Effect.Effect<Workstream, E, R>;
   readonly fence: Effect.Effect<void, E, R>;
@@ -35,12 +38,14 @@ export function applyMaintainedOutput<E, R>(
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict application schema owns this external command boundary.
   value: unknown,
 ): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
-  // The branches mirror durable recovery classifications and must remain explicit at each Git boundary.
-  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: collapsing the checkpoint protocol would hide unsafe effect ordering.
   return Effect.gen(function* () {
-    const input = yield* decode<ApplyCommand>(ApplyCommandSchema, value, "application command");
+    const input = yield* decodeCommandEffect<ApplyCommand>(
+      ApplyCommandSchema,
+      value,
+      "application command",
+    );
     let state = yield* control.state;
-    let located = yield* locate(state, input.attemptId);
+    const located = yield* locate(state, input.attemptId);
     if (state.lifecycle === "active" && located.task.intentIndex !== state.intents.length - 1)
       return yield* failure(
         "apply candidate",
@@ -52,11 +57,11 @@ export function applyMaintainedOutput<E, R>(
         attemptId: input.attemptId,
         reason: located.attempt.outputRelease?.reason ?? "Applied maintained candidate.",
       });
-    let source = yield* sourceFor(control, located.attempt);
+    const source = yield* sourceFor(control, located.attempt);
     if (application === undefined) {
       const destination = yield* control.ports.git.preflightCandidateApplication(source);
       const now = yield* control.now;
-      state = yield* control.commit("checkpoint candidate application", (current) =>
+      state = yield* control.commit("checkpoint candidate application", located.key, (current) =>
         checkpointApplication(
           current,
           located.key,
@@ -82,73 +87,77 @@ export function applyMaintainedOutput<E, R>(
       expectedRef: application.expectedRef,
       expectedHead: application.expectedHead,
     };
-    if (application.state !== "applied") {
-      const recovered = yield* Effect.result(
-        control.ports.git.recoverCandidateApplication(destination, source),
-      );
-      if (recovered._tag === "Success" && recovered.success !== undefined) {
-        state = yield* appliedCheckpoint(control, state, input.attemptId, recovered.success.head);
-      } else if (recovered._tag === "Failure") {
-        yield* blockedApplication(control, state, input.attemptId, recovered.failure.message);
-        return yield* recovered.failure;
-      } else {
-        yield* control.fence;
-        state = yield* control.state;
-        located = yield* locate(state, input.attemptId);
-        source = yield* sourceFor(control, located.attempt);
-        const prepared = yield* Effect.result(
-          control.ports.git.prepareCandidateApplication(source, destination),
-        );
-        if (prepared._tag === "Failure") {
-          const classification = yield* Effect.result(
-            control.ports.git.recoverCandidateApplication(destination, source),
-          );
-          if (classification._tag === "Success" && classification.success !== undefined)
-            state = yield* appliedCheckpoint(
-              control,
-              state,
-              input.attemptId,
-              classification.success.head,
-            );
-          else if (classification._tag === "Failure")
-            yield* blockedApplication(
-              control,
-              state,
-              input.attemptId,
-              classification.failure.message,
-            );
-          return yield* prepared.failure;
-        }
-        yield* control.fence;
-        const applied = yield* Effect.result(control.ports.git.applyCandidate(prepared.success));
-        if (applied._tag === "Success")
-          state = yield* appliedCheckpoint(control, state, input.attemptId, applied.success);
-        else {
-          const classification = yield* Effect.result(
-            control.ports.git.recoverCandidateApplication(destination, source),
-          );
-          if (classification._tag === "Success" && classification.success !== undefined)
-            state = yield* appliedCheckpoint(
-              control,
-              state,
-              input.attemptId,
-              classification.success.head,
-            );
-          else if (classification._tag === "Failure")
-            yield* blockedApplication(
-              control,
-              state,
-              input.attemptId,
-              classification.failure.message,
-            );
-          return yield* applied.failure;
-        }
-      }
-    }
+    if (application.state !== "applied")
+      state = yield* resumeApplication(control, state, input.attemptId, source, destination);
     return yield* releaseMaintainedOutput(control, {
       attemptId: input.attemptId,
-      reason: "Applied maintained candidate.",
+      reason:
+        exactAttempt(state, input.attemptId).attempt.outputRelease?.reason ??
+        "Applied maintained candidate.",
     });
+  });
+}
+
+function resumeApplication<E, R>(
+  control: MaintainedOutputControl<E, R>,
+  state: Workstream,
+  attemptId: string,
+  source: CandidateApplicationSource,
+  destination: { readonly expectedRef: string; readonly expectedHead: string },
+): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
+  return Effect.gen(function* () {
+    const recovered = yield* Effect.result(
+      control.ports.git.recoverCandidateApplication(destination, source),
+    );
+    if (recovered._tag === "Failure") {
+      yield* blockedApplication(control, state, attemptId, recovered.failure.message);
+      return yield* recovered.failure;
+    }
+    if (recovered.success !== undefined)
+      return yield* appliedCheckpoint(control, state, attemptId, recovered.success.head);
+
+    yield* control.fence;
+    state = yield* control.state;
+    const located = yield* locate(state, attemptId);
+    source = yield* sourceFor(control, located.attempt);
+    const prepared = yield* Effect.result(
+      control.ports.git.prepareCandidateApplication(source, destination),
+    );
+    if (prepared._tag === "Failure")
+      return yield* failApplication(
+        control,
+        state,
+        attemptId,
+        source,
+        destination,
+        prepared.failure,
+      );
+
+    yield* control.fence;
+    const applied = yield* Effect.result(control.ports.git.applyCandidate(prepared.success));
+    return applied._tag === "Success"
+      ? yield* appliedCheckpoint(control, state, attemptId, applied.success)
+      : yield* failApplication(control, state, attemptId, source, destination, applied.failure);
+  });
+}
+
+function failApplication<E, R>(
+  control: MaintainedOutputControl<E, R>,
+  state: Workstream,
+  attemptId: string,
+  source: CandidateApplicationSource,
+  destination: { readonly expectedRef: string; readonly expectedHead: string },
+  failure: CanonicalCommandError,
+): Effect.Effect<never, E | CanonicalCommandError, R> {
+  return Effect.gen(function* () {
+    const classification = yield* Effect.result(
+      control.ports.git.recoverCandidateApplication(destination, source),
+    );
+    if (classification._tag === "Success" && classification.success !== undefined)
+      yield* appliedCheckpoint(control, state, attemptId, classification.success.head);
+    else if (classification._tag === "Failure")
+      yield* blockedApplication(control, state, attemptId, classification.failure.message);
+    return yield* failure;
   });
 }
 
@@ -159,7 +168,7 @@ export function releaseMaintainedOutput<E, R>(
 ): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: every branch preserves one destructive-release fence or durable checkpoint.
   return Effect.gen(function* () {
-    const input = yield* decode<ReleaseOutputCommand>(
+    const input = yield* decodeCommandEffect<ReleaseOutputCommand>(
       ReleaseOutputCommandSchema,
       value,
       "output release command",
@@ -178,7 +187,8 @@ export function releaseMaintainedOutput<E, R>(
         "release output",
         `Attempt ${input.attemptId} has no exact closed isolated output.`,
       );
-    if (attempt.outputRelease?.state === "completed") return state;
+    if (attempt.outputRelease?.state === "completed")
+      return yield* completeReleasedCleanup(control, state, located.key, expectedHead);
     const reason = attempt.outputRelease?.reason ?? input.reason;
     if (attempt.outputRelease !== undefined && reason !== input.reason)
       return yield* failure(
@@ -187,7 +197,7 @@ export function releaseMaintainedOutput<E, R>(
       );
     if (attempt.outputRelease === undefined) {
       const now = yield* control.now;
-      state = yield* control.commit("checkpoint pending output release", (current) =>
+      state = yield* control.commit("checkpoint pending output release", located.key, (current) =>
         checkpointOutputRelease(
           current,
           located.key,
@@ -206,7 +216,7 @@ export function releaseMaintainedOutput<E, R>(
     yield* control.fence;
     const now = yield* control.now;
     if (released._tag === "Failure") {
-      yield* control.commit("checkpoint blocked output release", (current) =>
+      yield* control.commit("checkpoint blocked output release", located.key, (current) =>
         checkpointOutputRelease(
           current,
           located.key,
@@ -217,7 +227,7 @@ export function releaseMaintainedOutput<E, R>(
       return yield* released.failure;
     }
     if (released.success.state === "blocked") {
-      state = yield* control.commit("checkpoint blocked output release", (current) =>
+      state = yield* control.commit("checkpoint blocked output release", located.key, (current) =>
         checkpointOutputRelease(
           current,
           located.key,
@@ -227,7 +237,7 @@ export function releaseMaintainedOutput<E, R>(
       );
       return state;
     }
-    state = yield* control.commit("checkpoint completed output release", (current) =>
+    state = yield* control.commit("checkpoint completed output release", located.key, (current) =>
       checkpointOutputRelease(
         current,
         located.key,
@@ -235,17 +245,34 @@ export function releaseMaintainedOutput<E, R>(
         now,
       ),
     );
-    const cleanup = exactAttempt(state, input.attemptId).attempt.cleanup;
-    if (cleanup?.state === "blocked")
-      state = yield* control.commit("complete released output cleanup", (current) =>
-        checkpointCleanup(
-          current,
-          located.key,
-          { state: "completed", expectedHead, workerClosed: true },
-          now,
-        ),
+    return yield* completeReleasedCleanup(control, state, located.key, expectedHead, now);
+  });
+}
+
+function completeReleasedCleanup<E, R>(
+  control: MaintainedOutputControl<E, R>,
+  state: Workstream,
+  key: ReturnType<typeof exactAttempt>["key"],
+  expectedHead: string,
+  completedAt?: string,
+): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
+  return Effect.gen(function* () {
+    const cleanup = exactAttempt(state, key.attemptId).attempt.cleanup;
+    if (cleanup?.state === "completed") return state;
+    if (cleanup?.workerClosed !== true || cleanup.expectedHead !== expectedHead)
+      return yield* failure(
+        "release output",
+        `Attempt ${key.attemptId} released output does not match its closed cleanup checkpoint.`,
       );
-    return state;
+    const now = completedAt ?? (yield* control.now);
+    return yield* control.commit("complete released output cleanup", key, (current) =>
+      checkpointCleanup(
+        current,
+        key,
+        { state: "completed", expectedHead, workerClosed: true },
+        now,
+      ),
+    );
   });
 }
 
@@ -300,7 +327,7 @@ function appliedCheckpoint<E, R>(
       return yield* failure("apply candidate", "Missing pending application checkpoint.");
     const now = yield* control.now;
     const { error: _error, ...identity } = application;
-    return yield* control.commit("checkpoint applied candidate", (current) =>
+    return yield* control.commit("checkpoint applied candidate", located.key, (current) =>
       checkpointApplication(current, located.key, { ...identity, state: "applied", revision }, now),
     );
   });
@@ -319,8 +346,11 @@ function blockedApplication<E, R>(
       return yield* failure("apply candidate", "Missing pending application checkpoint.");
     const now = yield* control.now;
     const { revision: _revision, ...identity } = application;
-    return yield* control.commit("checkpoint blocked candidate application", (current) =>
-      checkpointApplication(current, located.key, { ...identity, state: "blocked", error }, now),
+    return yield* control.commit(
+      "checkpoint blocked candidate application",
+      located.key,
+      (current) =>
+        checkpointApplication(current, located.key, { ...identity, state: "blocked", error }, now),
     );
   });
 }
@@ -336,36 +366,9 @@ function locate(
   state: Workstream,
   id: string,
 ): Effect.Effect<ReturnType<typeof exactAttempt>, CanonicalCommandError> {
-  return Effect.try({
-    try: () => exactAttempt(state, id),
-    catch: (cause) =>
-      failure(
-        "resolve Attempt",
-        cause instanceof Error ? cause.message : "Unknown Attempt.",
-        cause,
-      ),
-  });
-}
-
-function decode<A>(
-  schema: Parameters<typeof decodeCommand>[0],
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The supplied strict command schema decodes this boundary value.
-  value: unknown,
-  label: string,
-): Effect.Effect<A, CanonicalCommandError> {
-  return Effect.try({
-    try: () => decodeCommand<A>(schema, value, label),
-    catch: (cause) =>
-      failure(
-        "decode explicit command",
-        cause instanceof Error ? cause.message : "Invalid command.",
-        cause,
-      ),
-  });
+  return exactAttemptEffect(state, id);
 }
 
 function failure(operation: string, message: string, cause?: unknown): CanonicalCommandError {
-  return new CanonicalCommandError(
-    cause === undefined ? { operation, message } : { operation, message, cause },
-  );
+  return commandFailure(operation, message, cause);
 }

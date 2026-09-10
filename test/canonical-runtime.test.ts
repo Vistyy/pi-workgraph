@@ -12,7 +12,6 @@ import { Clock, Effect, Exit, Fiber, type FileSystem, Option, type Path, Scope }
 import { TestClock } from "effect/testing";
 import { Value } from "typebox/value";
 import { CanonicalCommandError, type CanonicalCommandPorts } from "../src/canonical-commands.js";
-import { liveCanonicalCommandPorts } from "../src/canonical-host.js";
 import {
   CanonicalAppendCommandSchema,
   CanonicalEnqueueCommandSchema,
@@ -44,6 +43,7 @@ import {
   activateAttempt,
   type CoordinatorIdentity,
   checkpointCleanup,
+  checkpointOutputRelease,
   createTask,
   createWorkstream,
   type Intent,
@@ -54,8 +54,6 @@ import {
   terminalizeAttempt,
   type Workstream,
 } from "../src/domain/workstream.js";
-import { GitRepository } from "../src/git.js";
-import { HerdrCliRuntime } from "../src/herdr.js";
 import type { ModelPolicy } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 
@@ -786,6 +784,10 @@ void test("serialized manual cancellation, steering, Intent revision, completion
         assert.equal(exactState(steeredState, steerId).execution?.steering?.state, "submitted");
         assert.equal((yield* runtime.readAttempt(steerId)).attempt.id, steerId);
         assert.ok(
+          (yield* Effect.flip(runtime.readAttempt("unknown-attempt"))) instanceof
+            CanonicalRuntimeOperationError,
+        );
+        assert.ok(
           (yield* Effect.flip(
             runtime.steer({ attemptId: steerId, instruction: "fail" }),
           )) instanceof CanonicalCommandError,
@@ -822,7 +824,7 @@ void test("serialized manual cancellation, steering, Intent revision, completion
   });
 });
 
-void test("completed cleanup-only state permits explicit blocked-output release", async () => {
+void test("completed output release re-entry finishes a matching pending cleanup", async () => {
   await withFixture(async (f) => {
     await runCanonical(
       Effect.gen(function* () {
@@ -880,17 +882,37 @@ void test("completed cleanup-only state permits explicit blocked-output release"
           checkpointCleanup(
             state,
             key,
+            { state: "pending", expectedHead: BASE_REVISION, workerClosed: true },
+            T0,
+          ),
+        );
+        yield* store.transition(lease, (state) =>
+          checkpointOutputRelease(
+            state,
+            key,
             {
-              state: "blocked",
+              state: "completed",
               expectedHead: BASE_REVISION,
-              workerClosed: true,
-              error: "Retained for inspection.",
+              reason: "Discard inspected output.",
             },
             T0,
           ),
         );
         yield* store.releaseLease(lease);
-        const runtime = yield* acquire(f);
+        let releaseCalls = 0;
+        const runtime = yield* acquire(f, COORDINATOR, {
+          commands: {
+            ...COMMANDS,
+            git: {
+              ...COMMANDS.git,
+              releaseOutput: () =>
+                Effect.sync(() => {
+                  releaseCalls += 1;
+                  return assert.fail("completed release must not repeat Git cleanup");
+                }),
+            },
+          },
+        });
         const completed = yield* runtime.complete({
           conclusion: "Stopped with retained output.",
           evidence: [{ label: "closure", observation: "The Worker is closed." }],
@@ -904,7 +926,9 @@ void test("completed cleanup-only state permits explicit blocked-output release"
         const attempt = exactState(released, key.attemptId);
         assert.equal(attempt.outputRelease?.state, "completed");
         assert.equal(attempt.cleanup?.state, "completed");
+        assert.equal(releaseCalls, 0);
         assert.deepEqual(released.completion?.accounting, []);
+        assert.deepEqual(yield* runtime.frontierSnapshot(), []);
         yield* runtime.close();
       }),
     );
@@ -934,6 +958,18 @@ void test("completion derives accounting and rejects later delegation", async ()
           )) instanceof CanonicalRuntimeOperationError,
         );
         yield* runtime.close();
+        const noPorts = yield* CanonicalRuntime.acquire({
+          id: ID,
+          repository: f.repository,
+          coordinator: COORDINATOR,
+          policyPath: f.policyPath,
+          driver: INERT_DRIVER,
+        });
+        const apply = noPorts.apply({ attemptId: "unknown" });
+        const release = noPorts.releaseOutput({ attemptId: "unknown", reason: "Inspect." });
+        assert.ok((yield* Effect.flip(apply)) instanceof CanonicalRuntimeOperationError);
+        assert.ok((yield* Effect.flip(release)) instanceof CanonicalRuntimeOperationError);
+        yield* noPorts.close();
       }),
     );
   });
@@ -947,11 +983,6 @@ function exactState(state: Workstream, attemptId: string): Attempt {
 }
 
 void test("canonical queue schemas remain the strict kind-owned command owner", () => {
-  const livePorts = liveCanonicalCommandPorts(
-    new GitRepository("/project", "/project/.git"),
-    new HerdrCliRuntime("herdr", {}),
-  );
-  assert.equal(livePorts.git.applyCandidate, livePorts.git.applyCandidate);
   assert.equal(
     Value.Check(CanonicalEnqueueCommandSchema, {
       kind: "research",
@@ -965,6 +996,39 @@ void test("canonical queue schemas remain the strict kind-owned command owner", 
     Value.Check(CanonicalAppendCommandSchema, { taskId: "task", selection: { model: "any" } }),
     false,
   );
+  for (const command of [
+    {
+      taskId: "research",
+      kind: "research",
+      objective: "Research",
+      expectedEvidence: ["evidence"],
+      candidateOf: "candidate",
+    },
+    {
+      taskId: "experiment",
+      kind: "experiment",
+      objective: "Experiment",
+      permittedEffects: ["fixture"],
+      stopCondition: "done",
+      expectedEvidence: ["evidence"],
+      candidateOf: "candidate",
+    },
+    {
+      taskId: "review",
+      kind: "review",
+      objective: "Review",
+      subject: { kind: "revision", revision: BASE_REVISION },
+      concern: "Safety",
+      candidateOf: "candidate",
+    },
+    {
+      taskId: "consultation",
+      kind: "consultation",
+      objective: "Consult",
+      candidateOf: "candidate",
+    },
+  ])
+    assert.equal(Value.Check(CanonicalEnqueueCommandSchema, command), false);
 });
 
 void test("a stale projection writes nothing until an authoritative read refreshes it", async () => {

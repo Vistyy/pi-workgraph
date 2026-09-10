@@ -111,6 +111,23 @@ export function decodeCommand<A>(schema: TSchema, value: unknown, label: string)
   return Value.Decode(schema, value) as A;
 }
 
+export function decodeCommandEffect<A>(
+  schema: TSchema,
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The supplied strict schema owns this external command boundary.
+  value: unknown,
+  label: string,
+): CommandEffect<A> {
+  return Effect.try({
+    try: () => decodeCommand<A>(schema, value, label),
+    catch: (cause) =>
+      commandFailure(
+        "decode explicit command",
+        cause instanceof Error ? cause.message : "Invalid command.",
+        cause,
+      ),
+  });
+}
+
 export interface ExactAttempt {
   readonly key: AttemptKey;
   readonly task: Task;
@@ -123,7 +140,23 @@ export function exactAttempt(workstream: Workstream, attemptId: string): ExactAt
   return { key: { taskId: located.task.id, attemptId }, ...located };
 }
 
+export function exactAttemptEffect(
+  workstream: Workstream,
+  attemptId: string,
+): CommandEffect<ExactAttempt> {
+  return Effect.try({
+    try: () => exactAttempt(workstream, attemptId),
+    catch: (cause) =>
+      commandFailure(
+        "resolve Attempt",
+        cause instanceof Error ? cause.message : "Unknown Attempt.",
+        cause,
+      ),
+  });
+}
+
 export function enqueueFacts(
+  workstream: Workstream,
   command: CanonicalEnqueueCommand,
   git: CanonicalCommandGitPort | undefined,
 ): CommandEffect<ResolvedQueueFacts> {
@@ -134,6 +167,12 @@ export function enqueueFacts(
     }
     if (command.kind === "implementation") {
       const port = yield* requireGit(git);
+      if (command.candidateOf !== undefined)
+        return yield* candidateFacts(
+          workstream,
+          candidateRequest(command.candidateOf, command.baseRevision),
+          port,
+        );
       const baseRevision = yield* resolvedBase(port, command.baseRevision);
       return { baseRevision, candidate: { kind: "initial", rootCommit: baseRevision } };
     }
@@ -185,38 +224,16 @@ export function appendFacts(
 
 function candidateFacts(
   workstream: Workstream,
-  command: CanonicalAppendCommand & { readonly candidateOf: string },
+  command: { readonly candidateOf: string; readonly baseRevision?: string },
   commandGit: CanonicalCommandGitPort,
 ): CommandEffect<ResolvedQueueFacts> {
-  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: retained-parent checks are intentionally fail-closed and independently visible.
   return Effect.gen(function* () {
-    const parentLocated = findAttemptLocation(workstream, command.candidateOf);
-    const parent = parentLocated?.attempt;
-    const parentCommit = parent === undefined ? undefined : changedImplementationCommit(parent);
-    if (
-      parentLocated?.task.kind !== "implementation" ||
-      parent === undefined ||
-      parentCommit === undefined ||
-      !isRetainedCandidateParent(parentLocated.task, parent, parentCommit) ||
-      parent.candidate === undefined ||
-      parent.baseRevision === undefined
-    )
-      return yield* commandFailure(
-        "append candidate",
-        `Attempt ${command.candidateOf} is not an eligible retained implementation parent.`,
-      );
-    const placement = parent.execution?.placement;
-    if (placement?.kind !== "isolated_worktree")
-      return yield* commandFailure(
-        "append candidate",
-        "Candidate parent has no isolated placement.",
-      );
-    const validated = yield* commandGit.validateCandidate(
-      { ...placement, baseCommit: parent.baseRevision },
-      parent.candidate.rootCommit,
-      parentCommit,
+    const { parent, parentCommit, rootCommit, placement } = yield* retainedCandidate(
+      workstream,
+      command.candidateOf,
     );
-    if (validated.commit !== parentCommit || validated.rootCommit !== parent.candidate.rootCommit)
+    const validated = yield* commandGit.validateCandidate(placement, rootCommit, parentCommit);
+    if (validated.commit !== parentCommit || validated.rootCommit !== rootCommit)
       return yield* commandFailure(
         "append candidate",
         "Retained candidate Git lineage does not match canonical state.",
@@ -230,7 +247,7 @@ function candidateFacts(
         baseRevision: parentCommit,
         candidate: {
           kind: "correction",
-          rootCommit: parent.candidate.rootCommit,
+          rootCommit,
           parentAttemptId: parent.id,
           parentCommit,
         },
@@ -251,6 +268,53 @@ function candidateFacts(
       },
     };
   });
+}
+
+function candidateRequest(
+  candidateOf: string,
+  baseRevision: string | undefined,
+): { readonly candidateOf: string; readonly baseRevision?: string } {
+  return baseRevision === undefined ? { candidateOf } : { candidateOf, baseRevision };
+}
+
+function retainedCandidate(
+  workstream: Workstream,
+  attemptId: string,
+): CommandEffect<{
+  readonly parent: Attempt;
+  readonly parentCommit: string;
+  readonly rootCommit: string;
+  readonly placement: WorktreePlacement;
+}> {
+  const located = findAttemptLocation(workstream, attemptId);
+  const parent = located?.attempt;
+  const parentCommit = parent === undefined ? undefined : changedImplementationCommit(parent);
+  const candidate = parent?.candidate;
+  const baseCommit = parent?.baseRevision;
+  const placement = parent?.execution?.placement;
+  if (
+    located === undefined ||
+    parent === undefined ||
+    parentCommit === undefined ||
+    !isRetainedCandidateParent(located.task, parent, parentCommit) ||
+    candidate === undefined ||
+    baseCommit === undefined ||
+    placement?.kind !== "isolated_worktree"
+  )
+    return Effect.fail(ineligibleCandidate(attemptId));
+  return Effect.succeed({
+    parent,
+    parentCommit,
+    rootCommit: candidate.rootCommit,
+    placement: { ...placement, baseCommit },
+  });
+}
+
+function ineligibleCandidate(attemptId: string): CanonicalCommandError {
+  return commandFailure(
+    "append candidate",
+    `Attempt ${attemptId} is not an eligible retained implementation parent.`,
+  );
 }
 
 function requireGit(
@@ -304,7 +368,7 @@ function exactRevision(git: CanonicalCommandGitPort, revision: string): CommandE
   });
 }
 
-function commandFailure(
+export function commandFailure(
   operation: string,
   message: string,
   cause?: unknown,

@@ -1,9 +1,6 @@
 /**
- * Production wiring for the external reconciliation driver. It adapts the
- * existing general GitRepository, Herdr runtime, and Pi session/report
- * functions into the driver's narrow ports, and accepts one injected exact
- * Outcome delivery callback. The driver itself stays free of aggregate, store,
- * and frontier state.
+ * Production host adapters for automatic reconciliation and explicit commands.
+ * The reconciliation driver remains free of aggregate, store, and frontier state.
  */
 import { Effect, Path } from "effect";
 import { CanonicalCommandError, type CanonicalCommandPorts } from "./canonical-commands.js";

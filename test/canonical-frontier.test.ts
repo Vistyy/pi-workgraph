@@ -687,6 +687,59 @@ void test("a coalesced wake never blocks a commit while the single driver fiber 
   );
 });
 
+void test("Intent revision removes every superseded queued key before a blocked dispatch resumes", async () => {
+  const entered = await Effect.runPromise(Deferred.make<void>());
+  const gate = await Effect.runPromise(Deferred.make<void>());
+  const seen: string[] = [];
+  const attention: string[] = [];
+  const driver = driverFrom((entry) =>
+    Effect.gen(function* () {
+      seen.push(entry.key.attemptId);
+      yield* Deferred.succeed(entered, undefined);
+      yield* Deferred.await(gate);
+      return { kind: "waiting" } as const;
+    }),
+  );
+  await withFixture((f) =>
+    withRuntime(
+      f,
+      {
+        driver,
+        extra: { onReconciliationAttention: (detail) => Effect.sync(() => attention.push(detail)) },
+      },
+      (runtime) =>
+        Effect.gen(function* () {
+          yield* runtime.enqueue({
+            taskId: "old-first",
+            kind: "research",
+            objective: "Block dispatch",
+            expectedEvidence: ["evidence"],
+          });
+          yield* Deferred.await(entered);
+          const queued = yield* runtime.enqueue({
+            taskId: "old-second",
+            kind: "research",
+            objective: "Must become stale",
+            expectedEvidence: ["evidence"],
+          });
+          const staleId = queued.tasks[1]?.attempts[0]?.id ?? assert.fail("stale Attempt");
+          assert.equal(has(yield* runtime.frontierSnapshot(), "queued", staleId), true);
+          yield* runtime.reviseIntent({
+            statement: "Replace queued work.",
+            constraints: [],
+            grounding: { ...receipt(), id: "receipt-2", text: "Replace queued work." },
+            recordedAt: T1,
+          });
+          assert.deepEqual(yield* runtime.frontierSnapshot(), []);
+          yield* Deferred.succeed(gate, undefined);
+          for (let spin = 0; spin < 100; spin += 1) yield* Effect.yieldNow;
+          assert.deepEqual(seen, [queued.tasks[0]?.attempts[0]?.id]);
+          assert.deepEqual(attention, []);
+        }),
+    ),
+  );
+});
+
 /** One active ready Worker identity plus one finished Attempt with a pending delivery. */
 function clockWorkstream(f: Fixture): Workstream {
   const intent = { statement: "Time it.", constraints: [], grounding: receipt(), recordedAt: T0 };

@@ -1033,7 +1033,7 @@ function validateOutputRelease(task: Task, attempt: Attempt): void {
   if (
     attempt.execution?.placement?.kind !== "isolated_worktree" ||
     attempt.cleanup?.workerClosed !== true ||
-    !["blocked", "completed"].includes(attempt.cleanup.state) ||
+    !["pending", "blocked", "completed"].includes(attempt.cleanup.state) ||
     attempt.cleanup.expectedHead === undefined
   )
     throw new Error(`Attempt ${attempt.id} output release lacks closed isolated ownership.`);

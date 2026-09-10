@@ -1,20 +1,4 @@
-/**
- * Canonical runtime core. It eagerly opens the exact canonical store, takes
- * the validated aggregate read from that one attachment, verifies the supplied
- * coordinator identity, fences one lease, and returns only once a Semaphore, a
- * scoped FiberSet, and the background heartbeat are ready. The store result is
- * the lease-scoped committed snapshot: commands materialize their complete next
- * aggregate from it under the shared Semaphore and then perform exactly one
- * authoritative transition whose callback compares the transaction's current
- * state with that expected projection.
- *
- * The caller's `Scope.Scope` owns the whole lifetime. A distinct child resource
- * Scope holds the database, lease, FiberSet, and heartbeat; a controller fiber
- * forked into the caller Scope waits for a fatal request and closes that child.
- * One uninterruptible, idempotent shutdown claim is shared by explicit close,
- * fatal close, and caller-scope finalization, so a heartbeat or command fiber
- * never closes and awaits its own Scope/FiberSet.
- */
+/** Lease-scoped canonical command and reconciliation owner. */
 import { randomUUID } from "node:crypto";
 import {
   Cause,
@@ -145,21 +129,13 @@ export interface CanonicalRuntimeAcquisition {
   readonly id: string;
   readonly repository: RepositoryIdentity;
   readonly coordinator: CoordinatorIdentity;
-  /** Caller-supplied proof about the previous owner; only `dead` permits a takeover. */
+  /** Only proven prior-owner death permits lease takeover. */
   readonly priorOwnerLiveness?: "alive" | "dead" | "unknown";
   readonly policyPath?: string;
-  /**
-   * Required reconciliation driver. Acquisition never installs a silent
-   * inert default; tests pass one explicit inert or controlled driver.
-   */
   readonly driver: ReconciliationDriver;
-  /** Narrow explicit-command host capabilities; automatic reconciliation remains driver-owned. */
   readonly commands?: CanonicalCommandPorts;
-  /** One callback for contained driver failures and blocked outcomes. */
   readonly onReconciliationAttention?: ReconciliationAttention;
-  /** Test/runtime isolation seam; production uses the settled five-second heartbeat. */
   readonly heartbeatInterval?: Duration.Input;
-  /** One bounded fatal channel: the typed cause of an involuntary runtime close. */
   readonly onFatal?: (error: CanonicalRuntimeError) => Effect.Effect<void, never>;
 }
 
@@ -301,14 +277,7 @@ export class CanonicalRuntime {
   readonly read = (): CanonicalRuntimeEffect<Workstream> =>
     this.serialized(this.fencedRead().pipe(Effect.map((state) => structuredClone(state))));
 
-  /**
-   * The one defensive snapshot of the committed aggregate. It is a derived
-   * write-through projection (planning and frontier input) maintained by
-   * authoritative reads and committed transitions, never authority: SQLite
-   * remains authoritative, commands plan from it under the Semaphore, and the
-   * transition callback compares the transaction's actual current state with
-   * that expected projection before any write.
-   */
+  /** Lease-local projection; SQLite remains authoritative. */
   readonly snapshot = (): Effect.Effect<Workstream> =>
     Ref.get(this.committed).pipe(Effect.map((state) => structuredClone(state)));
 
@@ -329,8 +298,12 @@ export class CanonicalRuntime {
     attemptId: string,
   ): CanonicalRuntimeEffect<ReturnType<typeof exactAttempt>> =>
     this.serialized(
-      this.fencedRead().pipe(
-        Effect.map((state) => structuredClone(exactAttempt(state, attemptId))),
+      Effect.gen(
+        function* (this: CanonicalRuntime) {
+          const state = yield* this.fencedRead();
+          const located = yield* this.try("resolve Attempt", () => exactAttempt(state, attemptId));
+          return structuredClone(located);
+        }.bind(this),
       ),
     );
 
@@ -342,10 +315,18 @@ export class CanonicalRuntime {
           const intent = yield* this.try("decode Intent revision", () =>
             decodeCommand<Intent>(ReviseIntentCommandSchema, command, "Intent revision"),
           );
+          const before = yield* Ref.get(this.committed);
+          const affected = before.tasks.flatMap((task) =>
+            task.attempts
+              .filter((attempt) => attempt.state === "queued")
+              .map((attempt) => ({ taskId: task.id, attemptId: attempt.id })),
+          );
           const now = yield* this.now();
-          return yield* this.authoritative("revise canonical Intent", (state) =>
+          const committed = yield* this.authoritative("revise canonical Intent", (state) =>
             reviseIntent(state, intent, now),
           );
+          yield* this.notifyCommitted(committed, affected);
+          return committed;
         }.bind(this),
       ),
     );
@@ -399,11 +380,19 @@ export class CanonicalRuntime {
 
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
   readonly apply = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
-    this.serialized(applyMaintainedOutput(this.outputControl(), command));
+    this.serialized(
+      Effect.flatMap(this.commandPorts(), (ports) =>
+        applyMaintainedOutput(this.outputControl(ports), command),
+      ),
+    );
 
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
   readonly releaseOutput = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
-    this.serialized(releaseMaintainedOutput(this.outputControl(), command));
+    this.serialized(
+      Effect.flatMap(this.commandPorts(), (ports) =>
+        releaseMaintainedOutput(this.outputControl(ports), command),
+      ),
+    );
 
   /**
    * Defensive frontier projection for inspection. It reads only the
@@ -412,13 +401,7 @@ export class CanonicalRuntime {
   readonly frontierSnapshot = (): Effect.Effect<readonly FrontierEntry[]> =>
     this.scheduler.snapshot();
 
-  /**
-   * One manual reconcile: under the shared Semaphore, perform one fenced
-   * authoritative aggregate read, rebuild the complete frontier, clear transient
-   * in-memory blocks, coalesce a wake for fresh exact inspection through the
-   * reconciliation driver, and return a defensive frontier snapshot. It never directly
-   * retries an unsafe effect.
-   */
+  /** Rebuild transient reconciliation state from one fenced aggregate read. */
   readonly reconcile = (): CanonicalRuntimeEffect<readonly FrontierEntry[]> =>
     this.serialized(
       Effect.gen(
@@ -430,13 +413,7 @@ export class CanonicalRuntime {
       ),
     );
 
-  /**
-   * Exact-key control for one dispatch. The runtime, not the driver, maps the
-   * closed mutation union to domain transitions, commits under the shared
-   * Semaphore with the snapshot fence, updates the projection, and notifies the
-   * exact affected key. The driver never sees the whole Workstream and cannot
-   * reach private store or frontier internals.
-   */
+  /** Restrict one driver dispatch to its exact Attempt. */
   private controlFor(key: AttemptKey): ReconciliationControl {
     return {
       context: () => this.controlContext(key),
@@ -475,11 +452,7 @@ export class CanonicalRuntime {
     return structuredClone(context);
   }
 
-  /**
-   * Map one closed mutation to its domain transition and commit it once under
-   * the shared Semaphore. A durable no-op returns `no_change` without notifying,
-   * so a driver can never manufacture progress by re-asserting current facts.
-   */
+  /** Commit one driver mutation; durable no-ops do not wake reconciliation. */
   private controlCommit(
     key: AttemptKey,
     mutation: ReconciliationMutation,
@@ -542,7 +515,7 @@ export class CanonicalRuntime {
             operation: "enqueue canonical Task",
             message: `Task ${plan.taskId} already exists.`,
           });
-        const facts = yield* enqueueFacts(decoded, this.acquisition.commands?.git);
+        const facts = yield* enqueueFacts(expected, decoded, this.acquisition.commands?.git);
         const now = yield* this.now();
         const attemptIds = Array.from(
           { length: plan.attemptCount },
@@ -603,14 +576,16 @@ export class CanonicalRuntime {
     );
   }
 
-  private outputControl() {
+  private outputControl(ports: CanonicalCommandPorts) {
     return {
       state: Ref.get(this.committed).pipe(Effect.map((state) => structuredClone(state))),
-      commit: (operation: string, plan: (state: Workstream) => Workstream) =>
-        this.authoritative(operation, plan),
+      commit: (operation: string, key: AttemptKey, plan: (state: Workstream) => Workstream) =>
+        Effect.tap(this.authoritative(operation, plan), (committed) =>
+          this.notifyCommitted(committed, [key]),
+        ),
       fence: this.store.checkLease(this.lease),
       now: this.now(),
-      ports: this.commandPorts(),
+      ports,
     };
   }
 
@@ -625,6 +600,7 @@ export class CanonicalRuntime {
             "steering command",
           ),
         );
+        const ports = yield* this.commandPorts();
         const initial = yield* Ref.get(this.committed);
         const located = yield* this.try("resolve steering Attempt", () =>
           exactAttempt(initial, input.attemptId),
@@ -650,7 +626,7 @@ export class CanonicalRuntime {
           ),
         );
         yield* this.store.checkLease(this.lease);
-        yield* this.commandPorts().workers.steer(identity, input.instruction);
+        yield* ports.workers.steer(identity, input.instruction);
         const submittedAt = yield* this.now();
         const committed = yield* this.authoritative("checkpoint submitted steering", (state) =>
           recordWorkerExecution(
@@ -666,25 +642,18 @@ export class CanonicalRuntime {
     );
   }
 
-  private commandPorts(): CanonicalCommandPorts {
-    if (this.acquisition.commands === undefined)
-      throw new CanonicalRuntimeOperationError({
-        operation: "canonical explicit command",
-        message: "Canonical explicit command host ports are unavailable.",
-      });
-    return this.acquisition.commands;
+  private commandPorts(): Effect.Effect<CanonicalCommandPorts, CanonicalRuntimeOperationError> {
+    return this.acquisition.commands === undefined
+      ? Effect.fail(
+          new CanonicalRuntimeOperationError({
+            operation: "canonical explicit command",
+            message: "Canonical explicit command host ports are unavailable.",
+          }),
+        )
+      : Effect.succeed(this.acquisition.commands);
   }
 
-  /**
-   * Perform exactly one authoritative store transition for a command. Under the
-   * Semaphore the complete next aggregate is materialized from the internal
-   * committed projection before any transaction begins; the single transition
-   * callback then compares the transaction's current state exactly with that
-   * expected projection. A mismatch writes nothing and fails as a stale
-   * projection, so an authoritative `read` (or a future manual reconcile) is
-   * required before retry. The snapshot is replaced only from a successful
-   * authoritative result.
-   */
+  /** Fence each planned transition against the exact lease-local projection. */
   private authoritative(
     operation: string,
     plan: (expected: Workstream) => Workstream,
@@ -720,11 +689,7 @@ export class CanonicalRuntime {
     return loadModelPolicyEffect(this.acquisition.policyPath);
   }
 
-  /**
-   * The one affected-key commit hook. Every committed transition that changes
-   * attempted work announces its exact Attempt keys here so the frontier
-   * replaces only those entries; future transitions use the same hook.
-   */
+  /** Update reconciliation for only the Attempts changed by a commit. */
   private notifyCommitted(committed: Workstream, keys: readonly AttemptKey[]): Effect.Effect<void> {
     return this.scheduler.notifyCommitted(committed, keys);
   }
@@ -750,11 +715,7 @@ export class CanonicalRuntime {
     });
   }
 
-  /**
-   * Run one coordinator command under the shared Semaphore. The command is
-   * forked into the scoped FiberSet so that scope close interrupts and joins it,
-   * and caller interruption remains ordinary Effect interruption.
-   */
+  /** Serialize a command in the owned FiberSet so close interrupts and joins it. */
   private serialized<A>(effect: CanonicalRuntimeEffect<A>): CanonicalRuntimeEffect<A> {
     return Effect.suspend(
       function (this: CanonicalRuntime) {
@@ -823,15 +784,7 @@ export class CanonicalRuntime {
     }).pipe(Effect.andThen(Deferred.succeed(this.closeRequest, fatal)), Effect.asVoid);
   }
 
-  /**
-   * Exactly one caller closes the child resource Scope and completes the shared
-   * boundary. That critical section is uninterruptible, so parallel or
-   * sequential caller-Scope finalization cannot strand a claimed shutdown when
-   * it also interrupts the controller. Fatal reporting starts only after the
-   * resources and completion boundary settle; it remains ordinarily
-   * interruptible because ignoring callback failure does not bound callback
-   * duration.
-   */
+  /** One uninterruptible claim closes resources and settles shared completion. */
   private shutdown(): Effect.Effect<void, CanonicalRuntimeError> {
     const close: Effect.Effect<CanonicalRuntimeError | undefined> = Effect.uninterruptible(
       Effect.gen(
@@ -924,13 +877,7 @@ type WritableContext = {
   -readonly [Key in keyof ReconciliationContext]: ReconciliationContext[Key];
 };
 
-/**
- * Resolve one already-validated review subject into only the canonical content
- * the review boundary needs: an exact revision, the referenced Outcome(s) in
- * declared order, or one referenced Outcome plus its exact retained artifact.
- * It fails closed if a durable invariant is somehow absent instead of
- * fabricating partial review input.
- */
+/** Resolve only the canonical content named by a validated review subject. */
 function resolveReviewInput(
   workstream: Workstream,
   subject: Extract<Task, { kind: "review" }>["subject"],
@@ -966,11 +913,6 @@ function requireOutcome(workstream: Workstream, outcomeId: string): Outcome {
   return outcome;
 }
 
-/**
- * Runtime-owned mapping from the closed reconciliation mutation union to canonical domain
- * transitions. Timestamps are runtime-owned except where the value is an
- * external observation the driver actually made.
- */
 function applyReconciliationMutation(
   workstream: Workstream,
   key: AttemptKey,

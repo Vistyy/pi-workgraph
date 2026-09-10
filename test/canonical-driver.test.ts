@@ -9,7 +9,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { FileSystem, Path } from "effect";
 import { Effect, type Scope } from "effect";
-import { CanonicalCommandError } from "../src/canonical-commands.js";
+import { CanonicalCommandError, type CanonicalCommandPorts } from "../src/canonical-commands.js";
 import {
   type CanonicalGitPort,
   type CanonicalReconciliationPorts,
@@ -519,6 +519,7 @@ async function seeded(
     runtime: CanonicalRuntime,
   ) => Effect.Effect<void, CanonicalRuntimeError, FileSystem.FileSystem | Path.Path | Scope.Scope>,
   driverOverride?: ReconciliationDriver,
+  commandOverride: CanonicalCommandPorts = h.commands,
 ): Promise<void> {
   const driver: ReconciliationDriver = driverOverride ?? makeCanonicalReconciliationDriver(h.ports);
   h.gitControl.ensureCount = 0;
@@ -553,7 +554,7 @@ async function seeded(
         coordinator: COORDINATOR,
         policyPath: h.policyPath,
         driver,
-        commands: h.commands,
+        commands: commandOverride,
         onReconciliationAttention: (detail) =>
           Effect.sync(() => {
             h.attention.push(detail);
@@ -1253,36 +1254,70 @@ void test("retained changed output applies with exact checkpoints and releases i
       },
       candidate,
     );
-    await seeded(h, baseAttempt(ATTEMPT, { baseRevision: base }), steps, (runtime) =>
-      Effect.gen(function* () {
-        yield* Effect.promise(() => until(runtime, (item) => item?.cleanup?.state === "completed"));
-        assert.equal(existsSync(placement.path), false);
-        assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), candidate);
-        const correction = yield* runtime.appendAttempts({
-          taskId: "task-1",
-          candidateOf: ATTEMPT,
-        });
-        const correctionAttempt = correction.tasks[0]?.attempts[1];
-        assert.equal(correctionAttempt?.baseRevision, candidate);
-        assert.deepEqual(correctionAttempt?.candidate, {
-          kind: "correction",
-          rootCommit: base,
-          parentAttemptId: ATTEMPT,
-          parentCommit: candidate,
-        });
-        const applied = yield* runtime.apply({ attemptId: ATTEMPT });
-        const attempt = applied.tasks[0]?.attempts[0];
-        assert.ok(attempt);
-        assert.equal(attempt.application?.state, "applied");
-        assert.equal(attempt.application?.revision, candidate);
-        assert.equal(attempt.outputRelease?.state, "completed");
-        assert.equal(yield* h.commands.git.head, candidate);
-        assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), undefined);
-        const replay = yield* runtime.apply({ attemptId: ATTEMPT });
-        assert.deepEqual(replay.tasks[0]?.attempts[0]?.application, attempt.application);
-        assert.deepEqual(replay.tasks[0]?.attempts[0]?.outputRelease, attempt.outputRelease);
-        assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), undefined);
-      }),
+    let releaseCalls = 0;
+    const commands: CanonicalCommandPorts = {
+      ...h.commands,
+      git: {
+        ...h.commands.git,
+        releaseOutput: (ownedPlacement, expectedHead) => {
+          releaseCalls += 1;
+          return releaseCalls === 1
+            ? Effect.succeed({
+                state: "blocked" as const,
+                path: ownedPlacement.path,
+                branch: ownedPlacement.branch,
+                expectedHead,
+                detail: "Retain until application.",
+              })
+            : h.commands.git.releaseOutput(ownedPlacement, expectedHead);
+        },
+      },
+    };
+    await seeded(
+      h,
+      baseAttempt(ATTEMPT, { baseRevision: base }),
+      steps,
+      (runtime) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            until(runtime, (item) => item?.cleanup?.state === "completed"),
+          );
+          assert.equal(existsSync(placement.path), false);
+          assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), candidate);
+          const correction = yield* runtime.appendAttempts({
+            taskId: "task-1",
+            candidateOf: ATTEMPT,
+          });
+          const correctionAttempt = correction.tasks[0]?.attempts[1];
+          assert.equal(correctionAttempt?.baseRevision, candidate);
+          assert.deepEqual(correctionAttempt?.candidate, {
+            kind: "correction",
+            rootCommit: base,
+            parentAttemptId: ATTEMPT,
+            parentCommit: candidate,
+          });
+          const blocked = yield* runtime.releaseOutput({
+            attemptId: ATTEMPT,
+            reason: "Reviewed before application.",
+          });
+          assert.equal(blocked.tasks[0]?.attempts[0]?.outputRelease?.state, "blocked");
+          const applied = yield* runtime.apply({ attemptId: ATTEMPT });
+          const attempt = applied.tasks[0]?.attempts[0];
+          assert.ok(attempt);
+          assert.equal(attempt.application?.state, "applied");
+          assert.equal(attempt.application?.revision, candidate);
+          assert.equal(attempt.outputRelease?.state, "completed");
+          assert.equal(attempt.outputRelease.reason, "Reviewed before application.");
+          assert.equal(releaseCalls, 2);
+          assert.equal(yield* h.commands.git.head, candidate);
+          assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), undefined);
+          const replay = yield* runtime.apply({ attemptId: ATTEMPT });
+          assert.deepEqual(replay.tasks[0]?.attempts[0]?.application, attempt.application);
+          assert.deepEqual(replay.tasks[0]?.attempts[0]?.outputRelease, attempt.outputRelease);
+          assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), undefined);
+        }),
+      undefined,
+      commands,
     );
   });
 });
@@ -1317,12 +1352,39 @@ void test("retained candidate integration resolves only the clean current destin
     await seeded(h, baseAttempt(ATTEMPT, { baseRevision: base }), steps, (runtime) =>
       Effect.gen(function* () {
         yield* Effect.promise(() => until(runtime, (item) => item?.cleanup?.state === "completed"));
-        const integrated = yield* runtime.appendAttempts({
-          taskId: "task-1",
+        yield* runtime.reviseIntent({
+          statement: "Integrate the retained candidate.",
+          constraints: [],
+          grounding: {
+            ...intent().grounding,
+            id: "receipt-2",
+            text: "Integrate the retained candidate.",
+          },
+          recordedAt: T0,
+        });
+        const beforeInvalid = yield* runtime.read();
+        const invalid = yield* Effect.result(
+          runtime.enqueue({
+            taskId: "forged-task",
+            kind: "implementation",
+            objective: "Forge lineage",
+            acceptance: ["Must fail"],
+            candidateOf: "missing-attempt",
+            baseRevision: destination,
+          }),
+        );
+        assert.equal(invalid._tag, "Failure");
+        if (invalid._tag === "Failure") assert.ok(invalid.failure instanceof CanonicalCommandError);
+        assert.deepEqual(yield* runtime.read(), beforeInvalid);
+        const integrated = yield* runtime.enqueue({
+          taskId: "task-2",
+          kind: "implementation",
+          objective: "Integrate",
+          acceptance: ["Candidate is integrated"],
           candidateOf: ATTEMPT,
           baseRevision: destination,
         });
-        const attempt = integrated.tasks[0]?.attempts[1];
+        const attempt = integrated.tasks[1]?.attempts[0];
         assert.equal(attempt?.baseRevision, destination);
         assert.deepEqual(attempt?.candidate, {
           kind: "integration",
