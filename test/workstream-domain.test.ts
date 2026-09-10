@@ -317,6 +317,46 @@ void test("selection is one policy-owned target, while implementation retains gu
       ),
     /immutable/,
   );
+  const uncertainSteering = {
+    steering: { text: "Continue.", state: "uncertain" as const, observedAt: "t4a" },
+  };
+  workstream = recordWorkerExecution(workstream, key, uncertainSteering, "t4a");
+  assert.strictEqual(
+    recordWorkerExecution(workstream, key, uncertainSteering, "replay"),
+    workstream,
+  );
+  assert.throws(
+    () =>
+      recordWorkerExecution(
+        workstream,
+        key,
+        { steering: { text: "Stop.", state: "uncertain", observedAt: "t4b" } },
+        "t4b",
+      ),
+    /cannot be overwritten/,
+  );
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { steering: { text: "Continue.", state: "submitted", observedAt: "t4c" } },
+    "t4c",
+  );
+  assert.throws(
+    () =>
+      recordWorkerExecution(
+        workstream,
+        key,
+        { steering: { text: "Continue.", state: "uncertain", observedAt: "t4d" } },
+        "t4d",
+      ),
+    /progression is not exact/,
+  );
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { steering: { text: "Stop.", state: "uncertain", observedAt: "t4e" } },
+    "t4e",
+  );
   assert.throws(
     () => recordWorkerExecution(workstream, key, { submission: "not_sent" }, "t5a"),
     /monotonic/,
@@ -515,7 +555,12 @@ void test("isolated failed output remains blocked through cleanup until exact re
   workstream = checkpointCleanup(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
-    { state: "completed", workerClosed: true, expectedHead: changedCommit },
+    {
+      state: "blocked",
+      workerClosed: true,
+      expectedHead: changedCommit,
+      error: "Checkout cleanup interrupted.",
+    },
     "t4",
   );
   const isolatedTask = findTask(workstream, "Task opaque");
@@ -546,6 +591,13 @@ void test("isolated failed output remains blocked through cleanup until exact re
     { state: "completed", expectedHead: changedCommit, reason: "Discard failed checkout." },
     "t6",
   );
+  assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
+  workstream = checkpointCleanup(
+    workstream,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { state: "completed", workerClosed: true, expectedHead: changedCommit },
+    "t6a",
+  );
   assert.deepEqual(deriveCompletionAccounting(workstream), []);
   assert.throws(
     () =>
@@ -559,17 +611,9 @@ void test("isolated failed output remains blocked through cleanup until exact re
           rootCommit: baseCommit,
           commits: [commit("d"), changedCommit],
         },
-        "t6a",
+        "t7",
       ),
     /no existing application obligation/,
-  );
-  assert.doesNotThrow(() =>
-    checkpointCleanup(
-      workstream,
-      { taskId: "Task opaque", attemptId: "Attempt A" },
-      { state: "completed", workerClosed: true, expectedHead: changedCommit },
-      "t7",
-    ),
   );
   let shared = deliver(finish(add(), "Attempt A", reported()), "Attempt A");
   shared = completeWorkstream(
@@ -596,6 +640,58 @@ void test("isolated failed output remains blocked through cleanup until exact re
       ),
     /no Worker placement/,
   );
+});
+
+void test("shared Worker closure and delivery gate reattempt and accounting", () => {
+  const execution = {
+    placement: { kind: "shared_project" as const, path: "/repo" },
+    worker: {
+      workspaceId: "w",
+      tabId: "tab",
+      paneId: "pane",
+      terminalId: "term",
+      agentName: "agent",
+      cwd: "/repo",
+      sessionFile: "/worker.json",
+    },
+    submission: "started" as const,
+  };
+  let workstream = finish(add(), "Attempt A", reported(), "Task opaque", execution);
+  assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
+  assert.throws(
+    () => appendAttempt(workstream, "Task opaque", attempt("Later"), "t3"),
+    /operationally unstable/,
+  );
+  workstream = deliver(workstream, "Attempt A");
+  assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
+  workstream = checkpointCleanup(
+    workstream,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { state: "blocked", workerClosed: true, error: "Worker cleanup blocked." },
+    "t5",
+  );
+  assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
+  assert.throws(
+    () => appendAttempt(workstream, "Task opaque", attempt("Still blocked"), "t6"),
+    /operationally unstable/,
+  );
+  workstream = completeWorkstream(
+    workstream,
+    {
+      conclusion: "Shared worker is closed only after recovery.",
+      evidence: [{ label: "cleanup", observation: "blocked" }],
+      limitations: [],
+      completedAt: "t7",
+    },
+    "t7",
+  );
+  workstream = checkpointCleanup(
+    workstream,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { state: "completed", workerClosed: true },
+    "t8",
+  );
+  assert.deepEqual(deriveCompletionAccounting(workstream), []);
 });
 
 void test("implementation candidate ancestry may cross Intents but application is exact and immutable", () => {

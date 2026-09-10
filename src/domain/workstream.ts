@@ -570,7 +570,7 @@ function validateAttempt(workstream: Workstream, task: Task, attempt: Attempt): 
   validateCandidate(workstream, task, attempt);
   validateApplication(task, attempt);
   validateCleanup(attempt);
-  validateOutputRelease(attempt);
+  validateOutputRelease(task, attempt);
 }
 function hasOperationalFacts(attempt: Attempt): boolean {
   return (
@@ -609,6 +609,7 @@ function executionTransition(
   const merged = mergeExecution(current, next);
   assertImmutableExecutionFields(attemptId, current, next);
   assertSubmissionTransition(attemptId, current?.submission, next.submission);
+  assertSteeringTransition(attemptId, current?.steering, next.steering);
   if (current !== undefined && sameValue(current, merged)) return current;
   return merged;
 }
@@ -668,6 +669,19 @@ function validSubmissionTransition(
   if (oldSubmission === "uncertain")
     return newSubmission === "submitted" || newSubmission === "started";
   return oldSubmission === "submitted" && newSubmission === "started";
+}
+function assertSteeringTransition(
+  attemptId: string,
+  current: WorkerExecution["steering"] | undefined,
+  next: WorkerExecution["steering"] | undefined,
+): void {
+  if (next === undefined || current === undefined || sameValue(current, next)) return;
+  if (current.state === "uncertain") {
+    if (next.state === "submitted" && next.text === current.text) return;
+    throw new Error(`Attempt ${attemptId} uncertain steering checkpoint cannot be overwritten.`);
+  }
+  if (next.state === "uncertain" && next.text !== current.text) return;
+  throw new Error(`Attempt ${attemptId} steering checkpoint progression is not exact.`);
 }
 function validateSelection(task: Task, attempt: Attempt): void {
   const selection = attempt.selection;
@@ -759,17 +773,23 @@ function validateCleanup(attempt: Attempt): void {
   if (attempt.cleanup.state === "completed" && !attempt.cleanup.workerClosed)
     throw new Error(`Attempt ${attempt.id} completed cleanup has no closed Worker.`);
 }
-function validateOutputRelease(attempt: Attempt): void {
+function validateOutputRelease(task: Task, attempt: Attempt): void {
   const release = attempt.outputRelease;
   if (release === undefined) return;
   if (
     attempt.execution?.placement?.kind !== "isolated_worktree" ||
-    attempt.cleanup?.state !== "completed" ||
-    attempt.cleanup.workerClosed !== true
+    attempt.cleanup?.workerClosed !== true ||
+    !["blocked", "completed"].includes(attempt.cleanup.state) ||
+    attempt.cleanup.expectedHead === undefined
   )
     throw new Error(`Attempt ${attempt.id} output release lacks closed isolated ownership.`);
   if (attempt.cleanup.expectedHead !== release.expectedHead)
     throw new Error(`Attempt ${attempt.id} output release checkpoint does not match cleanup.`);
+  if (
+    !outputReleaseEligible(task, attempt) &&
+    !(release.state === "completed" && attempt.cleanup.state === "completed")
+  )
+    throw new Error(`Attempt ${attempt.id} output release is not required for its disposition.`);
   if ((release.state === "blocked") !== (release.error !== undefined))
     throw new Error(`Attempt ${attempt.id} output release blocker does not match its state.`);
 }
@@ -995,11 +1015,14 @@ export function checkpointOutputRelease(
   release: Static<typeof OutputReleaseSchema>,
   updatedAt: string,
 ): Workstream {
-  const current = requireAttempt(workstream, key).attempt;
+  const located = requireAttempt(workstream, key);
+  const current = located.attempt;
   if (current.state !== "finished")
     throw new Error(`Attempt ${key.attemptId} must be finished before output release.`);
   if (workstream.lifecycle === "completed" && current.outputRelease === undefined)
     assertCompletedObligation(workstream, key, "release");
+  if (current.outputRelease?.state !== "completed" && !outputReleaseEligible(located.task, current))
+    throw new Error(`Attempt ${key.attemptId} output release is not required for its disposition.`);
   if (current.outputRelease !== undefined && !monotonicRelease(current.outputRelease, release))
     throw new Error(
       `Attempt ${key.attemptId} output release transition is not monotonic or rewrites identity.`,
@@ -1148,6 +1171,14 @@ export type OutputDisposition =
   | { kind: "remove_checkout_and_branch"; checkout: "preserved_or_uncertain" | "removed" };
 export function outputDisposition(task: Task, attempt: Attempt): OutputDisposition {
   if (attempt.outputRelease?.state === "completed") return { kind: "released" };
+  return outputDispositionBeforeRelease(task, attempt);
+}
+function outputReleaseEligible(task: Task, attempt: Attempt): boolean {
+  return ["preserve_checkout", "retain_branch"].includes(
+    outputDispositionBeforeRelease(task, attempt).kind,
+  );
+}
+function outputDispositionBeforeRelease(task: Task, attempt: Attempt): OutputDisposition {
   if (attempt.execution?.placement?.kind !== "isolated_worktree") return { kind: "not_applicable" };
   if (attempt.cleanup?.state === "blocked")
     return { kind: "preserve_checkout", reason: attempt.cleanup.error ?? "Cleanup is blocked." };
@@ -1165,18 +1196,27 @@ export function outputDisposition(task: Task, attempt: Attempt): OutputDispositi
     return { kind: "retain_branch", checkout, commit };
   return { kind: "remove_checkout_and_branch", checkout };
 }
+function isOperationallyStable(task: Task, attempt: Attempt): boolean {
+  if (attempt.state !== "finished" || attempt.outcome?.delivery.state !== "delivered") return false;
+  if (attempt.execution?.placement === undefined) return true;
+  const cleanup = attempt.cleanup;
+  if (cleanup?.state !== "completed" || cleanup.workerClosed !== true) return false;
+  if (attempt.execution.placement.kind === "shared_project") return true;
+  const disposition = outputDispositionBeforeRelease(task, attempt);
+  if (attempt.outputRelease?.state === "completed")
+    return (
+      ["preserve_checkout", "retain_branch"].includes(disposition.kind) &&
+      cleanup.expectedHead !== undefined &&
+      cleanup.expectedHead === attempt.outputRelease.expectedHead
+    );
+  return (
+    (disposition.kind === "retain_branch" || disposition.kind === "remove_checkout_and_branch") &&
+    disposition.checkout === "removed"
+  );
+}
 function isReattemptStable(task: Task, attempt: Attempt): boolean {
-  if (attempt.state !== "finished") return false;
-  if (attempt.application?.state === "pending" || attempt.application?.state === "blocked")
-    return false;
-  if (attempt.outputRelease?.state === "pending" || attempt.outputRelease?.state === "blocked")
-    return false;
-  if (attempt.outputRelease?.state === "completed") return true;
-  if (attempt.execution === undefined) return true;
-  if (attempt.execution.placement?.kind !== "isolated_worktree") return true;
-  if (attempt.cleanup?.state !== "completed" || !attempt.cleanup.workerClosed) return false;
-  const disposition = outputDisposition(task, attempt);
-  return disposition.kind === "retain_branch" || disposition.kind === "remove_checkout_and_branch";
+  if (!isOperationallyStable(task, attempt)) return false;
+  return attempt.application?.state !== "pending" && attempt.application?.state !== "blocked";
 }
 export function deriveCompletionAccounting(workstream: Workstream): CompletionAccounting[] {
   return workstream.tasks.flatMap((task) =>
@@ -1198,12 +1238,16 @@ function accountingForAttempt(
       },
     ];
   const accounting: CompletionAccounting[] = [];
-  if (!isReattemptStable(task, attempt))
+  if (
+    !isOperationallyStable(task, attempt) ||
+    attempt.application?.state === "pending" ||
+    attempt.application?.state === "blocked"
+  )
     accounting.push({
       kind: "unresolved_attempt",
       taskId: task.id,
       attemptId: attempt.id,
-      reason: "Attempt execution or owned output is not operationally stable.",
+      reason: "Attempt execution, application, or owned output is not resolved.",
     });
   if (attempt.outcome !== undefined && !outcomeResolved(workstream, task, attempt))
     accounting.push({
@@ -1355,7 +1399,7 @@ function assertCompletedObligation(
 ): void {
   const located = requireAttempt(workstream, key);
   const attempt = located.attempt;
-  if (kind === "cleanup" && attempt.execution?.placement?.kind === "isolated_worktree") return;
+  if (kind === "cleanup" && attempt.execution?.placement !== undefined) return;
   if (kind === "application") {
     const task = located.task;
     if (
@@ -1368,9 +1412,12 @@ function assertCompletedObligation(
   if (
     kind === "release" &&
     attempt.execution?.placement?.kind === "isolated_worktree" &&
-    attempt.cleanup?.state === "completed" &&
-    attempt.cleanup.workerClosed &&
-    ["preserve_checkout", "retain_branch"].includes(outputDisposition(located.task, attempt).kind)
+    attempt.cleanup?.workerClosed === true &&
+    ["blocked", "completed"].includes(attempt.cleanup.state) &&
+    attempt.cleanup.expectedHead !== undefined &&
+    ["preserve_checkout", "retain_branch"].includes(
+      outputDispositionBeforeRelease(located.task, attempt).kind,
+    )
   )
     return;
   throw new Error(`Attempt ${key.attemptId} has no existing ${kind} obligation after completion.`);
