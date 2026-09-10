@@ -561,6 +561,16 @@ function validateTask(workstream: Workstream, task: Task): void {
         throw new Error(
           `Attempt ${attempt.id} continuation is not an earlier Attempt in Task ${task.id}.`,
         );
+      const parent = task.attempts[parentIndex];
+      if (
+        parent?.state !== "finished" ||
+        parent.execution?.sessionFile === undefined ||
+        parent.cleanup?.state !== "completed" ||
+        !parent.cleanup.workerClosed
+      )
+        throw new Error(
+          `Attempt ${attempt.id} continuation parent has no retained closed Worker session.`,
+        );
     }
   }
 }
@@ -594,6 +604,7 @@ function expectedReportKind(task: Task): "research" | "review" | "implementation
       : "research";
 }
 function validateAttempt(workstream: Workstream, task: Task, attempt: Attempt): void {
+  validateAttemptBase(task, attempt);
   if ((attempt.state === "finished") !== (attempt.outcome !== undefined))
     throw new Error(`Attempt ${attempt.id} must embed exactly one Outcome iff finished.`);
   if (attempt.outcome !== undefined) validateOutcome(task, attempt, attempt.outcome);
@@ -612,6 +623,32 @@ function validateAttempt(workstream: Workstream, task: Task, attempt: Attempt): 
   validateCleanup(attempt);
   validateOutputRelease(task, attempt);
 }
+function validateAttemptBase(task: Task, attempt: Attempt): void {
+  if (task.kind === "experiment") {
+    if (attempt.baseRevision === undefined)
+      throw new Error(`Experiment Attempt ${attempt.id} requires an exact base revision.`);
+    if (attempt.candidate !== undefined)
+      throw new Error(`Experiment Attempt ${attempt.id} cannot contain candidate lineage.`);
+    return;
+  }
+  if (task.kind === "implementation") {
+    if (attempt.baseRevision === undefined || attempt.candidate === undefined)
+      throw new Error(
+        `Implementation Attempt ${attempt.id} requires exact base and candidate lineage.`,
+      );
+    return;
+  }
+  if (task.kind === "review" && task.subject.kind === "revision") {
+    if (attempt.baseRevision !== task.subject.revision)
+      throw new Error(
+        `Revision review Attempt ${attempt.id} must persist its exact subject revision.`,
+      );
+    return;
+  }
+  if (attempt.baseRevision !== undefined || attempt.candidate !== undefined)
+    throw new Error(`Attempt ${attempt.id} contains kind-incompatible Git lineage.`);
+}
+
 function validateOutcome(
   task: Task,
   attempt: Attempt,
@@ -863,18 +900,38 @@ function validateDerivedCandidate(
   const parentCommit = changedImplementationCommit(parent);
   if (parentCommit !== candidate.parentCommit)
     throw new Error(`Attempt ${attempt.id} candidate parent commit is not exact.`);
-  if (!isRetainedCandidateParent(parentLocated.task, parent, parentCommit))
-    throw new Error(`Attempt ${attempt.id} candidate parent is not an eligible retained output.`);
+  if (!isCandidateLineageParent(parentLocated.task, parent, parentCommit))
+    throw new Error(
+      `Attempt ${attempt.id} candidate parent lineage is not retained or released exactly.`,
+    );
   if (parent.candidate === undefined || parent.baseRevision === undefined)
     throw new Error(`Attempt ${attempt.id} candidate parent lineage is incomplete.`);
-  if (parent.candidate.rootCommit !== candidate.rootCommit || !validCandidateBase(parent))
+  if (!validCandidateBase(parent))
     throw new Error(`Attempt ${attempt.id} candidate parent lineage is not exact.`);
-  if (candidate.kind === "correction" && attempt.baseRevision !== candidate.parentCommit)
-    throw new Error(`Attempt ${attempt.id} correction does not continue its exact candidate.`);
+  if (candidate.kind === "correction") {
+    if (parent.candidate.rootCommit !== candidate.rootCommit)
+      throw new Error(`Attempt ${attempt.id} correction does not preserve its candidate root.`);
+    if (attempt.baseRevision !== candidate.parentCommit)
+      throw new Error(`Attempt ${attempt.id} correction does not continue its exact candidate.`);
+  }
   if (candidate.kind === "integration" && candidate.rootCommit !== attempt.baseRevision)
     throw new Error(`Attempt ${attempt.id} integration is not rooted at its destination base.`);
 }
-function isRetainedCandidateParent(task: Task, attempt: Attempt, commit: string): boolean {
+function isCandidateLineageParent(task: Task, attempt: Attempt, commit: string): boolean {
+  if (isRetainedCandidateParent(task, attempt, commit)) return true;
+  return (
+    attempt.state === "finished" &&
+    attempt.execution?.placement?.kind === "isolated_worktree" &&
+    attempt.execution.launch?.phase === "ready" &&
+    attempt.cleanup?.state === "completed" &&
+    attempt.cleanup.workerClosed &&
+    attempt.cleanup.expectedHead === commit &&
+    attempt.outputRelease !== undefined &&
+    attempt.outputRelease.expectedHead === commit
+  );
+}
+
+export function isRetainedCandidateParent(task: Task, attempt: Attempt, commit: string): boolean {
   const cleanup = attempt.cleanup;
   const disposition = outputDispositionBeforeRelease(task, attempt);
   return (
@@ -1014,8 +1071,8 @@ export function findTask(workstream: Workstream, taskId: string): Task | undefin
 export function findAttempt(task: Task, attemptId: string): Attempt | undefined {
   return task.attempts.find((attempt) => attempt.id === attemptId);
 }
-type AttemptLocation = { task: Task; attempt: Attempt };
-function findAttemptLocation(
+export type AttemptLocation = { task: Task; attempt: Attempt };
+export function findAttemptLocation(
   workstream: Workstream,
   attemptId: string,
 ): AttemptLocation | undefined {
@@ -1088,6 +1145,7 @@ export function createTask(workstream: Workstream, task: Task, updatedAt: string
     !task.attempts.every((attempt) => attempt.state === "queued" && !hasOperationalFacts(attempt))
   )
     throw new Error(`Task ${task.id} must begin with pristine queued Attempts.`);
+  assertNewCandidateParentsRetained(workstream, task.attempts);
   return mutate(workstream, updatedAt, (draft) => draft.tasks.push(clone(task)));
 }
 export function appendAttempts(
@@ -1109,12 +1167,31 @@ export function appendAttempts(
       throw new Error(`Appended Attempt ${attempt.id} must be pristine and queued.`);
     validateSelection(task, attempt);
   }
+  assertNewCandidateParentsRetained(workstream, attempts);
   return mutate(workstream, updatedAt, (draft) => {
     const target = findTask(draft, taskId);
     if (target === undefined) throw new Error(`Unknown Task ${taskId}.`);
     target.attempts.push(...clone(attempts));
   });
 }
+function assertNewCandidateParentsRetained(
+  workstream: Workstream,
+  attempts: readonly Attempt[],
+): void {
+  for (const attempt of attempts) {
+    const candidate = attempt.candidate;
+    if (candidate === undefined || candidate.kind === "initial") continue;
+    const parent = findAttemptLocation(workstream, candidate.parentAttemptId);
+    const commit = parent === undefined ? undefined : changedImplementationCommit(parent.attempt);
+    if (
+      parent === undefined ||
+      commit === undefined ||
+      !isRetainedCandidateParent(parent.task, parent.attempt, commit)
+    )
+      throw new Error(`Attempt ${attempt.id} candidate parent is not an eligible retained output.`);
+  }
+}
+
 /**
  * Activate only by durably declaring the exact deterministic placement and the
  * initial not-sent submission checkpoint. This declaration precedes and does
@@ -1625,7 +1702,7 @@ function sameTerminalSubstance(left: Outcome, right: Outcome): boolean {
     return left.reason === right.reason && left.rawWorkerText === right.rawWorkerText;
   return left.kind === "cancelled" && right.kind === "cancelled" && left.reason === right.reason;
 }
-function changedImplementationCommit(attempt: Attempt): string | undefined {
+export function changedImplementationCommit(attempt: Attempt): string | undefined {
   const outcome = attempt.outcome;
   return outcome?.kind === "reported" &&
     outcome.report.kind === "implementation" &&

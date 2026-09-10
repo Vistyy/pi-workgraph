@@ -484,7 +484,12 @@ void test("a control commit is exact-key and runtime-owned, while unchanged wait
     withRuntime(f, { driver, extra }, (runtime) =>
       Effect.gen(function* () {
         const enqueue = (objective: string) =>
-          runtime.enqueue({ kind: "research", objective, expectedEvidence: ["evidence"] });
+          runtime.enqueue({
+            taskId: `task-${objective}`,
+            kind: "research",
+            objective,
+            expectedEvidence: ["evidence"],
+          });
         const activating = yield* enqueue("Activate");
         const activateTask = activating.tasks[0]?.id ?? assert.fail("task");
         const activateId = activating.tasks[0]?.attempts[0]?.id ?? assert.fail("attempt");
@@ -655,6 +660,7 @@ void test("a coalesced wake never blocks a commit while the single driver fiber 
     withRuntime(f, { driver }, (runtime) =>
       Effect.gen(function* () {
         yield* runtime.enqueue({
+          taskId: "queued-canonical-frontier.test-1",
           kind: "research",
           objective: "Gated",
           expectedEvidence: ["evidence"],
@@ -665,6 +671,7 @@ void test("a coalesced wake never blocks a commit while the single driver fiber 
         const burst = yield* Effect.all(
           Array.from({ length: 5 }, (_, index) =>
             runtime.enqueue({
+              taskId: `queued-canonical-frontier.test-${index + 2}`,
               kind: "research",
               objective: `Burst ${index}`,
               expectedEvidence: ["evidence"],
@@ -818,6 +825,7 @@ void test("close interrupts and joins driver work before the lease is released",
         );
         const runtime = yield* acquire(f, driver);
         yield* runtime.enqueue({
+          taskId: "queued-canonical-frontier.test-3",
           kind: "research",
           objective: "Interrupt",
           expectedEvidence: ["evidence"],

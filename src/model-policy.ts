@@ -158,11 +158,11 @@ export function configuredTarget(
   return exactTarget(target);
 }
 
-export function resolveSelection(
-  role: "research" | "review",
+export function resolveSelection<Role extends ListModelRole>(
+  role: Role,
   request: SelectionRequest | undefined,
   policy: ModelPolicy,
-): SelectionReceipt {
+): SelectionReceipt<Role> {
   const normalized = request ?? {};
   if (!Value.Check(SelectionRequestSchema, normalized))
     throw new Error(`Invalid model selection request for ${role}.`);
@@ -183,8 +183,8 @@ export function resolveSelection(
   return { role, count, distinctModels, selected, source: "policy" };
 }
 
-export interface SelectionReceipt {
-  role: "research" | "review";
+export interface SelectionReceipt<Role extends ListModelRole = ListModelRole> {
+  role: Role;
   count: number;
   distinctModels: boolean;
   selected: ModelTarget[];

@@ -1022,6 +1022,16 @@ void test("appendAttempts is one atomic nonempty batch that preserves order and 
     () => appendAttempts(stable, "Unknown", [attempt("Attempt B")], "t5"),
     /Unknown Task/,
   );
+  assert.throws(
+    () =>
+      appendAttempts(
+        stable,
+        "Task opaque",
+        [attempt("Attempt B", { continuationOf: "Attempt A" })],
+        "t5",
+      ),
+    /retained closed Worker session/,
+  );
 
   // An unstable pre-existing Attempt rejects the whole batch without a partial append.
   const unstable = finish(add(), "Attempt A", reported());

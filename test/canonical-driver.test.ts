@@ -9,13 +9,18 @@ import { join } from "node:path";
 import test from "node:test";
 import type { FileSystem, Path } from "effect";
 import { Effect, type Scope } from "effect";
+import { CanonicalCommandError } from "../src/canonical-commands.js";
 import {
   type CanonicalGitPort,
   type CanonicalReconciliationPorts,
   type CanonicalSessionPort,
   makeCanonicalReconciliationDriver,
 } from "../src/canonical-driver.js";
-import { liveGitPort, makeLiveCanonicalReconciliationDriver } from "../src/canonical-host.js";
+import {
+  liveCanonicalCommandPorts,
+  liveGitPort,
+  makeLiveCanonicalReconciliationDriver,
+} from "../src/canonical-host.js";
 import {
   type ReconciliationContext,
   type ReconciliationDriver,
@@ -27,6 +32,7 @@ import {
   type Attempt,
   type AttemptKey,
   activateAttempt,
+  checkpointApplication,
   checkpointCancellation,
   checkpointCleanup,
   checkpointOutputRelease,
@@ -92,6 +98,7 @@ interface Harness {
   readonly repository: RepositoryIdentity;
   readonly git: GitRepository;
   readonly policyPath: string;
+  readonly commands: ReturnType<typeof liveCanonicalCommandPorts>;
   readonly sessions: Map<string, SessionRecord>;
   readonly worker: {
     inspectLaunch: "live" | "absent" | "unknown";
@@ -336,6 +343,7 @@ async function makeHarness(): Promise<Harness> {
     repository,
     git: gitRepository,
     policyPath,
+    commands: liveCanonicalCommandPorts(gitRepository, new HerdrCliRuntime("herdr", {})),
     sessions,
     worker,
     sessionControl,
@@ -363,11 +371,14 @@ async function withHarness(body: (h: Harness) => Promise<void>): Promise<void> {
 }
 
 function baseAttempt(id: string, extra: Partial<Attempt> = {}): Attempt {
+  const baseRevision = extra.baseRevision ?? "a".repeat(40);
   return {
     id,
     state: "queued",
     createdAt: T0,
     updatedAt: T0,
+    baseRevision,
+    candidate: { kind: "initial", rootCommit: baseRevision },
     selection: { role: "implementation", guide: GUIDE, executor: EXECUTOR, source: "policy" },
     ...extra,
   };
@@ -542,6 +553,7 @@ async function seeded(
         coordinator: COORDINATOR,
         policyPath: h.policyPath,
         driver,
+        commands: h.commands,
         onReconciliationAttention: (detail) =>
           Effect.sync(() => {
             h.attention.push(detail);
@@ -602,7 +614,7 @@ async function seedSessionRecord(h: Harness): Promise<string> {
   return sessionFile;
 }
 
-void test("isolated activation declares placement, creates exactly once, and never samples a missing base", async () => {
+void test("isolated activation declares placement and creates exactly once from its persisted base", async () => {
   await withHarness(async (h) => {
     const { base, placement } = await isolated(h);
     h.gitControl.failEnsure = true;
@@ -624,22 +636,6 @@ void test("isolated activation declares placement, creates exactly once, and nev
           listing.split("\n").filter((line) => line === `worktree ${placement.path}`).length,
           1,
         );
-      }),
-    );
-  });
-
-  // A persisted base is required: the driver blocks instead of sampling mutable HEAD.
-  await withHarness(async (h) => {
-    await seeded(h, baseAttempt(ATTEMPT), [], (runtime) =>
-      Effect.gen(function* () {
-        const attempt = yield* Effect.promise(() =>
-          until(runtime, (item) => item?.state === "active"),
-        );
-        assert.equal(attempt.execution?.placement?.kind, "isolated_worktree");
-        yield* Effect.promise(() => waitFor(() => h.attention.length > 0, "base block"));
-        yield* runtime.reconcile();
-        yield* Effect.promise(() => waitFor(() => h.attention.length > 1, "base re-entry block"));
-        assert.equal(h.gitControl.ensureCount, 0);
       }),
     );
   });
@@ -1225,7 +1221,7 @@ void test("finished cleanup removes proven no-change output and replays idempote
   });
 });
 
-void test("retained changed output preserves its exact branch for explicit release", async () => {
+void test("retained changed output applies with exact checkpoints and releases its branch", async () => {
   await withHarness(async (h) => {
     const { base, placement } = await isolated(h);
     await Effect.runPromise(h.git.createWorktree(ID, ATTEMPT, base));
@@ -1262,6 +1258,142 @@ void test("retained changed output preserves its exact branch for explicit relea
         yield* Effect.promise(() => until(runtime, (item) => item?.cleanup?.state === "completed"));
         assert.equal(existsSync(placement.path), false);
         assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), candidate);
+        const correction = yield* runtime.appendAttempts({
+          taskId: "task-1",
+          candidateOf: ATTEMPT,
+        });
+        const correctionAttempt = correction.tasks[0]?.attempts[1];
+        assert.equal(correctionAttempt?.baseRevision, candidate);
+        assert.deepEqual(correctionAttempt?.candidate, {
+          kind: "correction",
+          rootCommit: base,
+          parentAttemptId: ATTEMPT,
+          parentCommit: candidate,
+        });
+        const applied = yield* runtime.apply({ attemptId: ATTEMPT });
+        const attempt = applied.tasks[0]?.attempts[0];
+        assert.ok(attempt);
+        assert.equal(attempt.application?.state, "applied");
+        assert.equal(attempt.application?.revision, candidate);
+        assert.equal(attempt.outputRelease?.state, "completed");
+        assert.equal(yield* h.commands.git.head, candidate);
+        assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), undefined);
+        const replay = yield* runtime.apply({ attemptId: ATTEMPT });
+        assert.deepEqual(replay.tasks[0]?.attempts[0]?.application, attempt.application);
+        assert.deepEqual(replay.tasks[0]?.attempts[0]?.outputRelease, attempt.outputRelease);
+        assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), undefined);
+      }),
+    );
+  });
+});
+
+void test("retained candidate integration resolves only the clean current destination HEAD", async () => {
+  await withHarness(async (h) => {
+    const { base, placement } = await isolated(h);
+    await Effect.runPromise(h.git.createWorktree(ID, ATTEMPT, base));
+    await writeFile(join(placement.path, "candidate.txt"), "candidate\n");
+    await git(placement.path, "add", ".");
+    await git(placement.path, "commit", "-m", "Candidate");
+    const candidate = await git(placement.path, "rev-parse", "HEAD");
+    await writeFile(join(h.repository.projectRoot, "destination.txt"), "destination\n");
+    await git(h.repository.projectRoot, "add", ".");
+    await git(h.repository.projectRoot, "commit", "-m", "Destination");
+    const destination = await git(h.repository.projectRoot, "rev-parse", "HEAD");
+    const steps = finishedSteps(
+      placement,
+      "/sessions/integration.jsonl",
+      {
+        kind: "implementation",
+        status: "completed",
+        outcome: "changed",
+        commit: candidate,
+        changedFiles: ["candidate.txt"],
+        summary: "Candidate.",
+        evidence: [],
+        findings: [],
+      },
+      candidate,
+    );
+    await seeded(h, baseAttempt(ATTEMPT, { baseRevision: base }), steps, (runtime) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => until(runtime, (item) => item?.cleanup?.state === "completed"));
+        const integrated = yield* runtime.appendAttempts({
+          taskId: "task-1",
+          candidateOf: ATTEMPT,
+          baseRevision: destination,
+        });
+        const attempt = integrated.tasks[0]?.attempts[1];
+        assert.equal(attempt?.baseRevision, destination);
+        assert.deepEqual(attempt?.candidate, {
+          kind: "integration",
+          rootCommit: destination,
+          parentAttemptId: ATTEMPT,
+          parentCommit: candidate,
+        });
+      }),
+    );
+  });
+});
+
+void test("pending application recovery blocks an incompatible destination without releasing output", async () => {
+  await withHarness(async (h) => {
+    const { base, placement } = await isolated(h);
+    const worktree = await Effect.runPromise(h.git.createWorktree(ID, ATTEMPT, base));
+    await writeFile(join(placement.path, "candidate.txt"), "candidate\n");
+    await git(placement.path, "add", ".");
+    await git(placement.path, "commit", "-m", "Candidate");
+    const candidate = await git(placement.path, "rev-parse", "HEAD");
+    await Effect.runPromise(h.git.cleanupWorktree(worktree, candidate, true));
+    await writeFile(join(h.repository.projectRoot, "destination.txt"), "destination\n");
+    await git(h.repository.projectRoot, "add", ".");
+    await git(h.repository.projectRoot, "commit", "-m", "Destination moved");
+    const destination = await git(h.repository.projectRoot, "rev-parse", "HEAD");
+    const report: WorkerReport = {
+      kind: "implementation",
+      status: "completed",
+      outcome: "changed",
+      commit: candidate,
+      changedFiles: ["candidate.txt"],
+      summary: "Candidate.",
+      evidence: [],
+      findings: [],
+    };
+    const steps: Step[] = [
+      (s) => activateAttempt(s, key(), T0, { placement, submission: "not_sent" }),
+      ...launchSteps(placement, "/sessions/pending.jsonl", "submitted"),
+      (s) => terminalizeAttempt(s, key(), reported(report), T0),
+      (s) =>
+        checkpointCleanup(
+          s,
+          key(),
+          { state: "completed", workerClosed: true, expectedHead: candidate },
+          T0,
+        ),
+      (s) =>
+        checkpointApplication(
+          s,
+          key(),
+          {
+            state: "pending",
+            commit: candidate,
+            rootCommit: base,
+            commits: [candidate],
+            expectedRef: "refs/heads/main",
+            expectedHead: base,
+          },
+          T0,
+        ),
+    ];
+    await seeded(h, baseAttempt(ATTEMPT, { baseRevision: base }), steps, (runtime) =>
+      Effect.gen(function* () {
+        const result = yield* Effect.result(runtime.apply({ attemptId: ATTEMPT }));
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") assert.ok(result.failure instanceof CanonicalCommandError);
+        const attempt = (yield* runtime.readAttempt(ATTEMPT)).attempt;
+        assert.equal(attempt.application?.state, "blocked");
+        assert.equal(yield* h.commands.git.head, destination);
+        assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), candidate);
+        assert.equal(attempt.outputRelease, undefined);
       }),
     );
   });

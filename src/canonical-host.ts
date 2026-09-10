@@ -6,6 +6,7 @@
  * and frontier state.
  */
 import { Effect, Path } from "effect";
+import { CanonicalCommandError, type CanonicalCommandPorts } from "./canonical-commands.js";
 import type {
   CanonicalDeliveryPort,
   CanonicalGitPort,
@@ -126,6 +127,62 @@ function liveSessionPort(repository: RepositoryIdentity): CanonicalSessionPort {
     started: (sessionFile, runId, nodeId) => hasNativeAgentStarted(sessionFile, runId, nodeId),
     settled: (sessionFile, runId, nodeId) => hasNativeAgentSettled(sessionFile, runId, nodeId),
   };
+}
+
+export function liveCanonicalCommandPorts(
+  git: GitRepository,
+  workers: HerdrCliRuntime,
+): CanonicalCommandPorts {
+  return {
+    git: {
+      resolveRevision: (revision) =>
+        commandHostEffect("resolve Git revision", git.resolveRevision(revision)),
+      head: commandHostEffect("inspect Git HEAD", git.head()),
+      cleanHead: commandHostEffect(
+        "inspect clean destination",
+        git.assertClean().pipe(Effect.andThen(git.head())),
+      ),
+      validateCandidate: (placement, root, commit) =>
+        commandHostEffect(
+          "validate retained candidate",
+          git.validateCandidate(placement, root, commit),
+        ),
+      preflightCandidateApplication: (source) =>
+        commandHostEffect(
+          "preflight candidate application",
+          git.preflightCandidateApplication(source),
+        ),
+      prepareCandidateApplication: (source, destination) =>
+        commandHostEffect(
+          "prepare candidate application",
+          git.prepareCandidateApplication(source, destination),
+        ),
+      recoverCandidateApplication: (destination, source) =>
+        commandHostEffect(
+          "recover candidate application",
+          git.recoverCandidateApplication(destination, source),
+        ),
+      applyCandidate: (prepared) =>
+        commandHostEffect("apply candidate", git.applyCandidate(prepared)),
+      releaseOutput: (placement, head) =>
+        commandHostEffect("release output", git.releaseOutput(placement, head)),
+    },
+    workers: {
+      steer: (identity, instruction) =>
+        commandHostEffect("steer Worker", workers.steer(identity, instruction)),
+    },
+  };
+}
+
+function commandHostEffect<A, E extends { readonly message: string }, R>(
+  operation: string,
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, CanonicalCommandError, R> {
+  return effect.pipe(
+    Effect.mapError(
+      (cause) => new CanonicalCommandError({ operation, message: cause.message, cause }),
+    ),
+  );
 }
 
 export interface CanonicalHostOptions {

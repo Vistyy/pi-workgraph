@@ -11,6 +11,8 @@ import test from "node:test";
 import { Clock, Effect, Exit, Fiber, type FileSystem, Option, type Path, Scope } from "effect";
 import { TestClock } from "effect/testing";
 import { Value } from "typebox/value";
+import { CanonicalCommandError, type CanonicalCommandPorts } from "../src/canonical-commands.js";
+import { liveCanonicalCommandPorts } from "../src/canonical-host.js";
 import {
   CanonicalAppendCommandSchema,
   CanonicalEnqueueCommandSchema,
@@ -39,16 +41,21 @@ import {
 } from "../src/canonical-workstream-store.js";
 import {
   type Attempt,
+  activateAttempt,
   type CoordinatorIdentity,
+  checkpointCleanup,
   createTask,
   createWorkstream,
   type Intent,
   type RepositoryIdentity,
   recordDeliverySuccess,
+  recordWorkerExecution,
   type TerminalObservation,
   terminalizeAttempt,
   type Workstream,
 } from "../src/domain/workstream.js";
+import { GitRepository } from "../src/git.js";
+import { HerdrCliRuntime } from "../src/herdr.js";
 import type { ModelPolicy } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 
@@ -178,6 +185,7 @@ function acquire(
     coordinator,
     policyPath: f.policyPath,
     driver: INERT_DRIVER,
+    commands: COMMANDS,
     ...extra,
   });
 }
@@ -189,6 +197,37 @@ function acquire(
  */
 const INERT_DRIVER: ReconciliationDriver = {
   reconcile: (): Effect.Effect<ReconciliationOutcome> => Effect.succeed({ kind: "waiting" }),
+};
+
+const COMMANDS: CanonicalCommandPorts = {
+  git: {
+    resolveRevision: (revision) => Effect.succeed(revision === "HEAD" ? BASE_REVISION : revision),
+    head: Effect.succeed(BASE_REVISION),
+    cleanHead: Effect.succeed(BASE_REVISION),
+    validateCandidate: (placement, rootCommit, commit) =>
+      Effect.succeed({ commit, rootCommit, commits: [commit], changedFiles: [], placement }),
+    preflightCandidateApplication: () =>
+      Effect.succeed({ expectedRef: "refs/heads/main", expectedHead: BASE_REVISION }),
+    prepareCandidateApplication: (source, destination) =>
+      Effect.succeed({ destination, action: { kind: "fast-forward", target: source.commit } }),
+    // oxlint-disable-next-line effecttsgo/effect-succeed-with-void -- The port distinguishes a safe-retry undefined value from a void operation.
+    recoverCandidateApplication: () => Effect.succeed<{ head: string } | undefined>(undefined),
+    applyCandidate: (prepared) =>
+      Effect.succeed(
+        prepared.action.kind === "already-integrated"
+          ? prepared.action.revision
+          : prepared.action.target,
+      ),
+    releaseOutput: (placement, expectedHead) =>
+      Effect.succeed({
+        state: "completed",
+        path: placement.path,
+        branch: placement.branch,
+        expectedHead,
+        detail: "released",
+      }),
+  },
+  workers: { steer: () => Effect.void },
 };
 
 /** The one attachment read plus the ready runtime, in the caller Scope. */
@@ -341,6 +380,7 @@ void test("acquisition fences exactly one lease and rejects identity or unproven
         yield* runtime.checkOwnership();
         assert.equal((yield* runtime.snapshot()).revision, 0);
         const state = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-1",
           kind: "research",
           objective: "Ready",
           expectedEvidence: ["evidence"],
@@ -368,7 +408,12 @@ void test("the caller Scope owns runtime lifetime: abandonment closes it and ano
         const escaped = yield* Effect.scoped(acquire(f));
         yield* escaped.awaitClosed();
         const stopped = yield* Effect.flip(
-          escaped.enqueue({ kind: "research", objective: "Late", expectedEvidence: ["evidence"] }),
+          escaped.enqueue({
+            taskId: "escaped-late",
+            kind: "research",
+            objective: "Late",
+            expectedEvidence: ["evidence"],
+          }),
         );
         assert.ok(stopped instanceof CanonicalRuntimeStoppedError);
         assert.equal(yield* store.observeLease(), undefined);
@@ -393,6 +438,7 @@ void test("the caller Scope owns runtime lifetime: abandonment closes it and ano
         // Independent reacquisition succeeds on the released exact lease.
         const runtime = yield* acquire(f);
         const state = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-2",
           kind: "research",
           objective: "Reacquired",
           expectedEvidence: ["evidence"],
@@ -418,12 +464,14 @@ void test("commands materialize atomically while every public projection stays a
         const [alpha, beta] = yield* Effect.all(
           [
             runtime.enqueue({
+              taskId: "queued-canonical-runtime.test-3",
               kind: "research",
               objective: "Alpha",
               expectedEvidence: ["alpha evidence"],
               selection: { count: 3 },
             }),
             runtime.enqueue({
+              taskId: "queued-canonical-runtime.test-4",
               kind: "review",
               objective: "Beta",
               subject: { kind: "revision", revision: BASE_REVISION },
@@ -458,6 +506,7 @@ void test("commands materialize atomically while every public projection stays a
         const bytes = yield* Effect.promise(() => readFile(store.path));
         const invalid = yield* Effect.flip(
           runtime.enqueue({
+            taskId: "queued-canonical-runtime.test-5",
             kind: "research",
             objective: "Bad fields",
             expectedEvidence: ["evidence"],
@@ -480,6 +529,7 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
         const { store, runtime } = yield* attached(f);
 
         const research = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-6",
           kind: "research",
           objective: "Default research",
           expectedEvidence: ["evidence"],
@@ -490,6 +540,7 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
           source: "policy",
         });
         const implementation = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-7",
           kind: "implementation",
           objective: "Implement",
           acceptance: ["accepted"],
@@ -503,9 +554,11 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
           thinking: "xhigh",
         });
         assert.equal(impl?.baseRevision, BASE_REVISION);
+        assert.deepEqual(impl?.candidate, { kind: "initial", rootCommit: BASE_REVISION });
 
         const unconfigured = yield* Effect.flip(
           runtime.enqueue({
+            taskId: "queued-canonical-runtime.test-8",
             kind: "implementation",
             objective: "Escalate without configuration",
             acceptance: ["accepted"],
@@ -515,6 +568,7 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
         assert.ok(unconfigured instanceof CanonicalRuntimeOperationError);
         yield* Effect.promise(() => writePolicy(f.policyPath, ESCALATED_POLICY));
         const escalated = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-9",
           kind: "implementation",
           objective: "Escalate",
           acceptance: ["accepted"],
@@ -527,9 +581,9 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
           source: "policy",
         });
 
-        // Consultation is one policy-owned advisor: the first configured target by
-        // default, or the exact configured target with its policy-owned thinking.
+        // Consultation uses the shared ordered fanout contract.
         const defaultAdvisor = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-10",
           kind: "consultation",
           objective: "Advise by default",
           context: "Coordinator-known context.",
@@ -540,24 +594,25 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
           source: "policy",
         });
         const selectedAdvisor = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-11",
           kind: "consultation",
-          objective: "Advise explicitly",
-          advisorModel: "fixture/advisor-2",
+          objective: "Advise broadly",
+          selection: { count: 2, distinctModels: true },
         });
-        assert.deepEqual(selectedAdvisor.tasks[4]?.attempts[0]?.selection, {
-          role: "consultation",
-          target: { model: "fixture/advisor-2", thinking: "medium" },
-          source: "policy",
-        });
+        assert.deepEqual(models(selectedAdvisor.tasks[4]?.attempts ?? []), [
+          "fixture/advisor",
+          "fixture/advisor-2",
+        ]);
         const beforeUnknown = yield* runtime.read();
-        const unknownAdvisor = yield* Effect.flip(
+        const invalidSelection = yield* Effect.flip(
           runtime.enqueue({
+            taskId: "queued-canonical-runtime.test-12",
             kind: "consultation",
-            objective: "Advise unknown",
-            advisorModel: "fixture/unknown",
+            objective: "Too many advisors",
+            selection: { count: 3, distinctModels: true },
           }),
         );
-        assert.ok(unknownAdvisor instanceof CanonicalRuntimeOperationError);
+        assert.ok(invalidSelection instanceof CanonicalRuntimeOperationError);
         assert.deepEqual(yield* runtime.read(), beforeUnknown);
 
         // The append batch is atomic: settle the first Attempt, then append N with
@@ -570,10 +625,27 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
         const lease = yield* store.observeLease();
         assert.ok(lease !== undefined);
         yield* store.transition(lease, (current) =>
+          activateAttempt(current, key, T0, {
+            placement: { kind: "shared_project", path: f.repository.projectRoot },
+            submission: "not_sent",
+          }),
+        );
+        yield* store.transition(lease, (current) =>
+          recordWorkerExecution(current, key, { sessionFile: "/sessions/retained.jsonl" }, T0),
+        );
+        yield* store.transition(lease, (current) =>
           terminalizeAttempt(current, key, reported("Continuation"), T0),
+        );
+        yield* store.transition(lease, (current) =>
+          checkpointCleanup(current, key, { state: "completed", workerClosed: true }, T0),
         );
         yield* store.transition(lease, (current) => recordDeliverySuccess(current, key, T0, T0));
         const batchBase = yield* runtime.read();
+        const invalidContinuation = yield* Effect.flip(
+          runtime.appendAttempts({ taskId: task.id, continuationOf: "missing-attempt" }),
+        );
+        assert.ok(invalidContinuation instanceof CanonicalCommandError);
+        assert.deepEqual(yield* runtime.read(), batchBase);
         const appended = yield* runtime.appendAttempts({
           taskId: task.id,
           continuationOf: attemptId,
@@ -586,13 +658,300 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
         assert.equal(attempts[1]?.continuationOf, attemptId);
         assert.equal(attempts[2]?.continuationOf, undefined);
         assert.deepEqual(models(attempts.slice(1)), ["fixture/research", "fixture/research"]);
+
+        const experiment = yield* runtime.enqueue({
+          taskId: "experiment-head",
+          kind: "experiment",
+          objective: "Try in isolation",
+          permittedEffects: ["fixture only"],
+          stopCondition: "One observation",
+          expectedEvidence: ["result"],
+        });
+        assert.equal(experiment.tasks.at(-1)?.attempts[0]?.baseRevision, BASE_REVISION);
         yield* runtime.close();
       }),
     );
   });
 });
 
+void test("serialized manual cancellation, steering, Intent revision, completion, and exact reads", async () => {
+  await withFixture(async (f) => {
+    const steered: string[] = [];
+    const commands: CanonicalCommandPorts = {
+      ...COMMANDS,
+      workers: {
+        steer: (_identity, instruction) =>
+          Effect.sync(() => steered.push(instruction)).pipe(
+            Effect.andThen(
+              instruction === "fail"
+                ? Effect.fail(
+                    new CanonicalCommandError({
+                      operation: "steer Worker",
+                      message: "submission failed",
+                    }),
+                  )
+                : Effect.void,
+            ),
+          ),
+      },
+    };
+    await runCanonical(
+      Effect.gen(function* () {
+        const { store, runtime } = yield* attached(f, { commands });
+        const queued = yield* runtime.enqueue({
+          taskId: "cancel-queued",
+          kind: "research",
+          objective: "Cancel queued",
+          expectedEvidence: ["none"],
+        });
+        const queuedId = queued.tasks[0]?.attempts[0]?.id ?? assert.fail("attempt");
+        const cancelled = yield* runtime.cancel({
+          attemptId: queuedId,
+          reason: "No longer needed.",
+        });
+        assert.equal(exactState(cancelled, queuedId).state, "finished");
+        assert.equal(exactState(cancelled, queuedId).outcome?.kind, "cancelled");
+
+        const active = yield* runtime.enqueue({
+          taskId: "cancel-active",
+          kind: "research",
+          objective: "Cancel active",
+          expectedEvidence: ["none"],
+        });
+        const activeId = active.tasks[1]?.attempts[0]?.id ?? assert.fail("attempt");
+        const activeKey = { taskId: "cancel-active", attemptId: activeId };
+        const lease = yield* store.observeLease();
+        assert.ok(lease !== undefined);
+        yield* store.transition(lease, (state) =>
+          activateAttempt(state, activeKey, T0, {
+            placement: { kind: "shared_project", path: f.repository.projectRoot },
+            submission: "not_sent",
+          }),
+        );
+        yield* runtime.read();
+        const requested = yield* runtime.cancel({ attemptId: activeId, reason: "Stop safely." });
+        assert.equal(exactState(requested, activeId).state, "active");
+        assert.equal(exactState(requested, activeId).execution?.cancellation?.state, "requested");
+
+        const steering = yield* runtime.enqueue({
+          taskId: "steer-active",
+          kind: "research",
+          objective: "Steer",
+          expectedEvidence: ["result"],
+        });
+        const steerId = steering.tasks[2]?.attempts[0]?.id ?? assert.fail("attempt");
+        const steerKey = { taskId: "steer-active", attemptId: steerId };
+        yield* store.transition(lease, (state) =>
+          activateAttempt(state, steerKey, T0, {
+            placement: { kind: "shared_project", path: f.repository.projectRoot },
+            submission: "not_sent",
+          }),
+        );
+        yield* store.transition(lease, (state) =>
+          recordWorkerExecution(state, steerKey, { sessionFile: "/sessions/steer.jsonl" }, T0),
+        );
+        yield* store.transition(lease, (state) =>
+          recordWorkerExecution(
+            state,
+            steerKey,
+            { launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" } },
+            T0,
+          ),
+        );
+        const resource = {
+          workspaceId: "workspace",
+          tabId: "tab",
+          paneId: "pane",
+          terminalId: "terminal",
+          agentName: "agent",
+          cwd: f.repository.projectRoot,
+        } as const;
+        yield* store.transition(lease, (state) =>
+          recordWorkerExecution(
+            state,
+            steerKey,
+            { launch: { phase: "resource", ...resource } },
+            T0,
+          ),
+        );
+        yield* store.transition(lease, (state) =>
+          recordWorkerExecution(state, steerKey, { launch: { phase: "ready", ...resource } }, T0),
+        );
+        yield* runtime.read();
+        const steeredState = yield* runtime.steer({
+          attemptId: steerId,
+          instruction: "Inspect the exact failure.",
+        });
+        assert.deepEqual(steered, ["Inspect the exact failure."]);
+        assert.equal(exactState(steeredState, steerId).execution?.steering?.state, "submitted");
+        assert.equal((yield* runtime.readAttempt(steerId)).attempt.id, steerId);
+        assert.ok(
+          (yield* Effect.flip(
+            runtime.steer({ attemptId: steerId, instruction: "fail" }),
+          )) instanceof CanonicalCommandError,
+        );
+        assert.equal(
+          exactState(yield* runtime.read(), steerId).execution?.steering?.state,
+          "uncertain",
+        );
+        assert.ok(
+          (yield* Effect.flip(
+            runtime.steer({ attemptId: steerId, instruction: "fail" }),
+          )) instanceof CanonicalCommandError,
+        );
+        assert.deepEqual(steered, ["Inspect the exact failure.", "fail"]);
+
+        const revised = yield* runtime.reviseIntent({
+          statement: "Revised directly.",
+          constraints: ["Keep ownership."],
+          recordedAt: T0,
+          grounding: {
+            kind: "human_input_receipt",
+            id: "receipt-revised",
+            sessionId: COORDINATOR.sessionId,
+            sessionFile: COORDINATOR.sessionFile,
+            source: "interactive",
+            text: "Revised directly.",
+            receivedAt: T0,
+          },
+        });
+        assert.equal(revised.intents.length, 2);
+        yield* runtime.close();
+      }),
+    );
+  });
+});
+
+void test("completed cleanup-only state permits explicit blocked-output release", async () => {
+  await withFixture(async (f) => {
+    await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* canonicalCreate(f);
+        const lease = yield* store.acquireLease(COORDINATOR);
+        const key = { taskId: "blocked-output", attemptId: "blocked-attempt" };
+        yield* store.transition(lease, (state) =>
+          createTask(
+            state,
+            {
+              id: key.taskId,
+              kind: "experiment",
+              objective: "Retain uncertain output.",
+              intentIndex: 0,
+              createdAt: T0,
+              permittedEffects: ["fixture only"],
+              stopCondition: "Stopped",
+              expectedEvidence: ["observation"],
+              attempts: [
+                {
+                  id: key.attemptId,
+                  state: "queued",
+                  createdAt: T0,
+                  updatedAt: T0,
+                  baseRevision: BASE_REVISION,
+                  selection: { role: "research", target: RESEARCH, source: "policy" },
+                },
+              ],
+            },
+            T0,
+          ),
+        );
+        yield* store.transition(lease, (state) =>
+          activateAttempt(state, key, T0, {
+            placement: { kind: "isolated_worktree", path: "/owned/output", branch: "owned-output" },
+            submission: "not_sent",
+          }),
+        );
+        yield* store.transition(lease, (state) =>
+          terminalizeAttempt(
+            state,
+            key,
+            {
+              kind: "unreported",
+              observedAt: T0,
+              artifacts: [],
+              reason: "Worker output is uncertain.",
+              deliveryRequestedAt: T0,
+            },
+            T0,
+          ),
+        );
+        yield* store.transition(lease, (state) => recordDeliverySuccess(state, key, T0, T0));
+        yield* store.transition(lease, (state) =>
+          checkpointCleanup(
+            state,
+            key,
+            {
+              state: "blocked",
+              expectedHead: BASE_REVISION,
+              workerClosed: true,
+              error: "Retained for inspection.",
+            },
+            T0,
+          ),
+        );
+        yield* store.releaseLease(lease);
+        const runtime = yield* acquire(f);
+        const completed = yield* runtime.complete({
+          conclusion: "Stopped with retained output.",
+          evidence: [{ label: "closure", observation: "The Worker is closed." }],
+          limitations: ["Output remains retained."],
+        });
+        assert.equal(completed.completion?.accounting.length, 1);
+        const released = yield* runtime.releaseOutput({
+          attemptId: key.attemptId,
+          reason: "Discard inspected output.",
+        });
+        const attempt = exactState(released, key.attemptId);
+        assert.equal(attempt.outputRelease?.state, "completed");
+        assert.equal(attempt.cleanup?.state, "completed");
+        assert.deepEqual(released.completion?.accounting, []);
+        yield* runtime.close();
+      }),
+    );
+  });
+});
+
+void test("completion derives accounting and rejects later delegation", async () => {
+  await withFixture(async (f) => {
+    await runCanonical(
+      Effect.gen(function* () {
+        const { runtime } = yield* attached(f);
+        const completed = yield* runtime.complete({
+          conclusion: "No delegated work was required.",
+          evidence: [{ label: "inspection", observation: "The intent was already satisfied." }],
+          limitations: [],
+        });
+        assert.equal(completed.lifecycle, "completed");
+        assert.deepEqual(completed.completion?.accounting, []);
+        assert.ok(
+          (yield* Effect.flip(
+            runtime.enqueue({
+              taskId: "late-task",
+              kind: "research",
+              objective: "Late",
+              expectedEvidence: ["none"],
+            }),
+          )) instanceof CanonicalRuntimeOperationError,
+        );
+        yield* runtime.close();
+      }),
+    );
+  });
+});
+
+function exactState(state: Workstream, attemptId: string): Attempt {
+  const attempt = state.tasks
+    .flatMap((task) => task.attempts)
+    .find((item) => item.id === attemptId);
+  return attempt ?? assert.fail(`Missing Attempt ${attemptId}`);
+}
+
 void test("canonical queue schemas remain the strict kind-owned command owner", () => {
+  const livePorts = liveCanonicalCommandPorts(
+    new GitRepository("/project", "/project/.git"),
+    new HerdrCliRuntime("herdr", {}),
+  );
+  assert.equal(livePorts.git.applyCandidate, livePorts.git.applyCandidate);
   assert.equal(
     Value.Check(CanonicalEnqueueCommandSchema, {
       kind: "research",
@@ -614,6 +973,7 @@ void test("a stale projection writes nothing until an authoritative read refresh
       Effect.gen(function* () {
         const { store, runtime } = yield* attached(f);
         const first = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-13",
           kind: "research",
           objective: "First",
           expectedEvidence: ["evidence"],
@@ -649,7 +1009,12 @@ void test("a stale projection writes nothing until an authoritative read refresh
         assert.equal((yield* runtime.snapshot()).revision, 1);
         const bytes = yield* Effect.promise(() => readFile(store.path));
         const stale = yield* Effect.flip(
-          runtime.enqueue({ kind: "research", objective: "Stale", expectedEvidence: ["evidence"] }),
+          runtime.enqueue({
+            taskId: "stale",
+            kind: "research",
+            objective: "Stale",
+            expectedEvidence: ["evidence"],
+          }),
         );
         assert.ok(stale instanceof CanonicalRuntimeStaleError);
         assert.deepEqual(yield* Effect.promise(() => readFile(store.path)), bytes);
@@ -661,6 +1026,7 @@ void test("a stale projection writes nothing until an authoritative read refresh
         assert.equal((yield* runtime.snapshot()).revision, 2);
 
         const retried = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-14",
           kind: "research",
           objective: "Retried",
           expectedEvidence: ["evidence"],
@@ -699,6 +1065,7 @@ void test("one shutdown boundary owns heartbeat, explicit close, close races, an
               runtime.close(),
               runtime
                 .enqueue({
+                  taskId: "queued-canonical-runtime.test-15",
                   kind: "research",
                   objective: `Race ${index}`,
                   expectedEvidence: ["evidence"],
@@ -719,13 +1086,19 @@ void test("one shutdown boundary owns heartbeat, explicit close, close races, an
         const runtime = yield* acquire(f);
         const fiber = yield* Effect.forkChild(
           runtime
-            .enqueue({ kind: "research", objective: "Interrupted", expectedEvidence: ["evidence"] })
+            .enqueue({
+              taskId: "interrupted",
+              kind: "research",
+              objective: "Interrupted",
+              expectedEvidence: ["evidence"],
+            })
             .pipe(Effect.exit),
         );
         yield* Fiber.interrupt(fiber);
         const interrupted = yield* runtime.read();
         assert.ok(interrupted.revision === 0 || interrupted.revision === 1);
         const next = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-16",
           kind: "research",
           objective: "After interruption",
           expectedEvidence: ["evidence"],
@@ -773,7 +1146,12 @@ void test("fatal lease loss reports one typed episode, closes once, and permits 
         assert.ok(fatal instanceof CanonicalStoreConflictError);
         yield* runtime.awaitClosed();
         const stopped = yield* Effect.flip(
-          runtime.enqueue({ kind: "research", objective: "Late", expectedEvidence: ["evidence"] }),
+          runtime.enqueue({
+            taskId: "late",
+            kind: "research",
+            objective: "Late",
+            expectedEvidence: ["evidence"],
+          }),
         );
         assert.ok(stopped instanceof CanonicalRuntimeStoppedError);
         yield* runtime.close();
@@ -897,11 +1275,13 @@ void test("one runtime control flow drives the cancellation checkpoint, cleanup,
       Effect.gen(function* () {
         const { runtime } = yield* attached(f, { driver });
         const target = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-17",
           kind: "research",
           objective: "Cancellable",
           expectedEvidence: ["evidence"],
         });
         const other = yield* runtime.enqueue({
+          taskId: "queued-canonical-runtime.test-18",
           kind: "research",
           objective: "Untouched",
           expectedEvidence: ["evidence"],

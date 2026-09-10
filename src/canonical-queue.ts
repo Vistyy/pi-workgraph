@@ -1,20 +1,13 @@
-/**
- * Canonical queue construction. TypeBox owns the externalizable command
- * shape; this module resolves settled model policy into exact Attempt
- * selections and materializes immutable Tasks/Attempts without IO or identity.
- */
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import {
   type Attempt,
   type CandidateLineage,
-  CandidateLineageSchema,
   type ModelSelection,
   ReviewSubjectSchema,
   type Task,
 } from "./domain/workstream.js";
 import {
-  configuredTarget,
   implementationTargets,
   type ModelPolicy,
   resolveSelection,
@@ -24,11 +17,13 @@ import {
 
 const NonEmptyString = Type.String({ minLength: 1 });
 const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
+const TaskIdentity = { taskId: NonEmptyString };
 const Objective = { objective: NonEmptyString };
 
 export const CanonicalEnqueueCommandSchema = Type.Union([
   Type.Object(
     {
+      ...TaskIdentity,
       ...Objective,
       kind: Type.Literal("research"),
       expectedEvidence: Type.Array(NonEmptyString, { minItems: 1 }),
@@ -38,28 +33,31 @@ export const CanonicalEnqueueCommandSchema = Type.Union([
   ),
   Type.Object(
     {
+      ...TaskIdentity,
       ...Objective,
       kind: Type.Literal("experiment"),
       permittedEffects: Type.Array(NonEmptyString, { minItems: 1 }),
       stopCondition: NonEmptyString,
       expectedEvidence: Type.Array(NonEmptyString, { minItems: 1 }),
       selection: Type.Optional(SelectionRequestSchema),
+      baseRevision: Type.Optional(Commit),
     },
     { additionalProperties: false },
   ),
   Type.Object(
     {
+      ...TaskIdentity,
       ...Objective,
       kind: Type.Literal("implementation"),
       acceptance: Type.Array(NonEmptyString, { minItems: 1 }),
       useEscalationExecutor: Type.Optional(Type.Boolean()),
       baseRevision: Type.Optional(Commit),
-      candidate: Type.Optional(CandidateLineageSchema),
     },
     { additionalProperties: false },
   ),
   Type.Object(
     {
+      ...TaskIdentity,
       ...Objective,
       kind: Type.Literal("review"),
       subject: ReviewSubjectSchema,
@@ -70,10 +68,11 @@ export const CanonicalEnqueueCommandSchema = Type.Union([
   ),
   Type.Object(
     {
+      ...TaskIdentity,
       ...Objective,
       kind: Type.Literal("consultation"),
       context: Type.Optional(Type.String({ maxLength: 20_000 })),
-      advisorModel: Type.Optional(NonEmptyString),
+      selection: Type.Optional(SelectionRequestSchema),
     },
     { additionalProperties: false },
   ),
@@ -84,67 +83,69 @@ export const CanonicalAppendCommandSchema = Type.Object(
   {
     taskId: NonEmptyString,
     continuationOf: Type.Optional(NonEmptyString),
-    selection: Type.Optional(SelectionRequestSchema),
-    advisorModel: Type.Optional(NonEmptyString),
-    useEscalationExecutor: Type.Optional(Type.Boolean()),
+    candidateOf: Type.Optional(NonEmptyString),
     baseRevision: Type.Optional(Commit),
-    candidate: Type.Optional(CandidateLineageSchema),
+    selection: Type.Optional(SelectionRequestSchema),
+    useEscalationExecutor: Type.Optional(Type.Boolean()),
   },
   { additionalProperties: false },
 );
 export type CanonicalAppendCommand = Static<typeof CanonicalAppendCommandSchema>;
 
-export interface EnqueueTaskIds {
-  readonly taskId: string;
-  readonly attemptIds: readonly string[];
+export interface ResolvedQueueFacts {
+  readonly baseRevision?: string;
+  readonly candidate?: CandidateLineage;
 }
 
 export interface EnqueuePlan {
+  readonly taskId: string;
+  readonly command: CanonicalEnqueueCommand;
   readonly attemptCount: number;
-  materialize(ids: EnqueueTaskIds, now: string, intentIndex: number): Task;
+  materialize(
+    attemptIds: readonly string[],
+    now: string,
+    intentIndex: number,
+    facts: ResolvedQueueFacts,
+  ): Task;
 }
 
 export interface AppendPlan {
   readonly attemptCount: number;
-  materialize(attemptIds: readonly string[], now: string): Attempt[];
+  materialize(attemptIds: readonly string[], now: string, facts: ResolvedQueueFacts): Attempt[];
 }
 
-/**
- * Validate a new-Task command and resolve its exact Attempt selections before
- * any identity exists. Fanout Tasks create one Attempt per resolved target.
- */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by this strict decoder.
-export function planEnqueue(value: unknown, policy: ModelPolicy): EnqueuePlan {
-  const command = decodeEnqueue(value);
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict enqueue schema decodes this external boundary value.
+export function decodeEnqueue(value: unknown): CanonicalEnqueueCommand {
+  // SAFETY: strict schema validation in decodeCommand establishes the complete enqueue shape.
+  return decodeCommand(
+    CanonicalEnqueueCommandSchema,
+    value,
+    "canonical enqueue command",
+  ) as CanonicalEnqueueCommand;
+}
+
+export function planEnqueue(command: CanonicalEnqueueCommand, policy: ModelPolicy): EnqueuePlan {
   const selections = taskSelections(command, policy);
-  // Based implementation work preserves exact supplied base/lineage facts
-  // verbatim; the queue never infers a revision or inspects Git itself.
-  const supplied: {
-    readonly baseRevision?: string | undefined;
-    readonly candidate?: CandidateLineage | undefined;
-  } = command.kind === "implementation" ? command : {};
   return {
+    taskId: command.taskId,
+    command,
     attemptCount: selections.length,
-    materialize: ({ taskId, attemptIds }, now, intentIndex) => {
+    materialize: (attemptIds, now, intentIndex, facts) => {
       if (attemptIds.length !== selections.length)
         throw new Error(
           "Canonical Task materialization requires one identity per resolved Attempt.",
         );
       const attempts = selections.map((selection, index) =>
-        queuedAttempt(exactId(attemptIds, index), selection, now, {
-          baseRevision: supplied.baseRevision,
-          candidate: supplied.candidate,
-        }),
+        queuedAttempt(exactId(attemptIds, index), selection, now, facts),
       );
-      return taskFor(command, taskId, attempts, now, intentIndex);
+      return taskFor(command, command.taskId, attempts, now, intentIndex);
     },
   };
 }
 
-/** Decode an append command; the owning Task kind is resolved by the caller. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by this strict decoder.
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict append schema decodes this external boundary value.
 export function decodeAppend(value: unknown): CanonicalAppendCommand {
-  // SAFETY: strict schema validation establishes the complete append command shape.
+  // SAFETY: strict schema validation in decodeCommand establishes the complete append shape.
   return decodeCommand(
     CanonicalAppendCommandSchema,
     value,
@@ -152,33 +153,28 @@ export function decodeAppend(value: unknown): CanonicalAppendCommand {
   ) as CanonicalAppendCommand;
 }
 
-/**
- * Validate an append command against its owning Task kind and resolve its exact
- * Attempt selections before any identity exists. The canonical domain appends
- * the whole nonempty batch after settled prior Attempts in one transition, so
- * one resolved selection becomes one queued pristine Attempt and only the first
- * Attempt carries the requested `continuationOf`.
- */
 export function planAppend(
   command: CanonicalAppendCommand,
   kind: Task["kind"],
   policy: ModelPolicy,
 ): AppendPlan {
+  if (command.continuationOf !== undefined && command.candidateOf !== undefined)
+    throw new Error("candidateOf and continuationOf cannot be combined.");
   const selections = appendSelections(command, kind, policy);
-  if (selections.length === 0)
-    throw new Error(`Canonical Task ${command.taskId} requires at least one Attempt selection.`);
   return {
     attemptCount: selections.length,
-    materialize: (attemptIds, now) => {
+    materialize: (attemptIds, now, facts) => {
       if (attemptIds.length !== selections.length)
         throw new Error("Canonical Attempt append requires one identity per resolved selection.");
-      return selections.map((selection, index) =>
-        queuedAttempt(exactId(attemptIds, index), selection, now, {
-          continuationOf: index === 0 ? command.continuationOf : undefined,
-          baseRevision: command.baseRevision,
-          candidate: command.candidate,
-        }),
-      );
+      return selections.map((selection, index) => {
+        const continuation = index === 0 ? command.continuationOf : undefined;
+        return queuedAttempt(
+          exactId(attemptIds, index),
+          selection,
+          now,
+          continuation === undefined ? facts : { ...facts, continuationOf: continuation },
+        );
+      });
     },
   };
 }
@@ -190,17 +186,11 @@ function taskSelections(
   switch (command.kind) {
     case "research":
     case "experiment":
-      return readOnlySelections("research", command.selection, policy);
+      return listSelections("research", command.selection, policy, "research");
     case "review":
-      return readOnlySelections("review", command.selection, policy);
+      return listSelections("review", command.selection, policy, "review");
     case "consultation":
-      return [
-        {
-          role: "consultation",
-          target: configuredTarget(policy, "consultation.advisor", command.advisorModel),
-          source: "policy",
-        },
-      ];
+      return listSelections("consultation.advisor", command.selection, policy, "consultation");
     case "implementation":
       return [implementationSelection(policy, command.useEscalationExecutor === true)];
   }
@@ -214,55 +204,36 @@ function appendSelections(
   switch (kind) {
     case "research":
     case "experiment":
-      rejectAppendFields(
-        command,
-        ["advisorModel", "useEscalationExecutor", "baseRevision", "candidate"],
-        kind,
-      );
-      return readOnlySelections("research", command.selection, policy);
+      rejectAppendFields(command, ["candidateOf", "useEscalationExecutor"], kind);
+      if (kind === "research") rejectAppendFields(command, ["baseRevision"], kind);
+      return listSelections("research", command.selection, policy, "research");
     case "review":
-      rejectAppendFields(
-        command,
-        ["advisorModel", "useEscalationExecutor", "baseRevision", "candidate"],
-        kind,
-      );
-      return readOnlySelections("review", command.selection, policy);
+      rejectAppendFields(command, ["candidateOf", "useEscalationExecutor", "baseRevision"], kind);
+      return listSelections("review", command.selection, policy, "review");
     case "consultation":
-      rejectAppendFields(
-        command,
-        ["selection", "useEscalationExecutor", "baseRevision", "candidate"],
-        kind,
-      );
-      return [
-        {
-          role: "consultation",
-          target: configuredTarget(policy, "consultation.advisor", command.advisorModel),
-          source: "policy",
-        },
-      ];
+      rejectAppendFields(command, ["candidateOf", "useEscalationExecutor", "baseRevision"], kind);
+      return listSelections("consultation.advisor", command.selection, policy, "consultation");
     case "implementation":
-      rejectAppendFields(command, ["selection", "advisorModel"], kind);
+      rejectAppendFields(command, ["selection"], kind);
       return [implementationSelection(policy, command.useEscalationExecutor === true)];
   }
 }
 
-function readOnlySelections(
-  role: "research" | "review",
+function listSelections(
+  policyRole: "research" | "review" | "consultation.advisor",
   request: SelectionRequest | undefined,
   policy: ModelPolicy,
+  role: "research" | "review" | "consultation",
 ): readonly ModelSelection[] {
-  return resolveSelection(role, request, policy).selected.map((target) => ({
+  return resolveSelection(policyRole, request, policy).selected.map((target) => ({
     role,
     target,
     source: "policy" as const,
   }));
 }
 
-function implementationSelection(
-  policy: ModelPolicy,
-  useEscalationExecutor: boolean,
-): ModelSelection {
-  const { guide, executor } = implementationTargets(policy, useEscalationExecutor);
+function implementationSelection(policy: ModelPolicy, escalated: boolean): ModelSelection {
+  const { guide, executor } = implementationTargets(policy, escalated);
   return { role: "implementation", guide, executor, source: "policy" };
 }
 
@@ -280,11 +251,7 @@ function queuedAttempt(
   id: string,
   selection: ModelSelection,
   now: string,
-  extra: {
-    readonly continuationOf?: string | undefined;
-    readonly baseRevision?: string | undefined;
-    readonly candidate?: CandidateLineage | undefined;
-  },
+  extra: ResolvedQueueFacts & { readonly continuationOf?: string },
 ): Attempt {
   const attempt: Attempt = {
     id,
@@ -340,17 +307,7 @@ function exactId(ids: readonly string[], index: number): string {
   return id;
 }
 
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by this strict decoder.
-function decodeEnqueue(value: unknown): CanonicalEnqueueCommand {
-  // SAFETY: strict schema validation establishes the complete enqueue command shape.
-  return decodeCommand(
-    CanonicalEnqueueCommandSchema,
-    value,
-    "canonical enqueue command",
-  ) as CanonicalEnqueueCommand;
-}
-
-// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- Queue commands are external boundary values validated by this strict decoder.
+// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- This local decoder validates before returning to a named command decoder.
 function decodeCommand(schema: TSchema, value: unknown, label: string): unknown {
   if (!Value.Check(schema, value)) {
     const issue = Value.Errors(schema, value)[0];

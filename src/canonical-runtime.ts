@@ -36,8 +36,23 @@ import {
 } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import { Value } from "typebox/value";
+import {
+  appendFacts,
+  CancelCommandSchema,
+  CanonicalCommandError,
+  type CanonicalCommandPorts,
+  type CompleteCommand,
+  CompleteCommandSchema,
+  decodeCommand,
+  enqueueFacts,
+  exactAttempt,
+  ReviseIntentCommandSchema,
+  SteerCommandSchema,
+  workerIdentity,
+} from "./canonical-commands.js";
 import type { FrontierEntry } from "./canonical-frontier.js";
-import { decodeAppend, planAppend, planEnqueue } from "./canonical-queue.js";
+import { applyMaintainedOutput, releaseMaintainedOutput } from "./canonical-output.js";
+import { decodeAppend, decodeEnqueue, planAppend, planEnqueue } from "./canonical-queue.js";
 import {
   type ReconciliationAttention,
   type ReconciliationCommit,
@@ -62,16 +77,19 @@ import {
   type CoordinatorIdentity,
   checkpointCancellation,
   checkpointCleanup,
+  completeWorkstream,
   createTask,
   findAttempt,
   findOutcome,
   findTask,
+  type Intent,
   type Outcome,
   type RepositoryIdentity,
   recordDeliveryFailure,
   recordDeliverySuccess,
   recordEffectiveModel,
   recordWorkerExecution,
+  reviseIntent,
   type Task,
   terminalizeAttempt,
   type Workstream,
@@ -114,7 +132,8 @@ export type CanonicalRuntimeError =
   | CanonicalRuntimeLeaseError
   | CanonicalRuntimeStoppedError
   | CanonicalRuntimeStaleError
-  | CanonicalRuntimeOperationError;
+  | CanonicalRuntimeOperationError
+  | CanonicalCommandError;
 
 export type CanonicalRuntimeEffect<A> = Effect.Effect<
   A,
@@ -134,6 +153,8 @@ export interface CanonicalRuntimeAcquisition {
    * inert default; tests pass one explicit inert or controlled driver.
    */
   readonly driver: ReconciliationDriver;
+  /** Narrow explicit-command host capabilities; automatic reconciliation remains driver-owned. */
+  readonly commands?: CanonicalCommandPorts;
   /** One callback for contained driver failures and blocked outcomes. */
   readonly onReconciliationAttention?: ReconciliationAttention;
   /** Test/runtime isolation seam; production uses the settled five-second heartbeat. */
@@ -304,6 +325,86 @@ export class CanonicalRuntime {
   readonly appendAttempts = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
     this.serialized(this.appendEffect(command));
 
+  readonly readAttempt = (
+    attemptId: string,
+  ): CanonicalRuntimeEffect<ReturnType<typeof exactAttempt>> =>
+    this.serialized(
+      this.fencedRead().pipe(
+        Effect.map((state) => structuredClone(exactAttempt(state, attemptId))),
+      ),
+    );
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
+  readonly reviseIntent = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+    this.serialized(
+      Effect.gen(
+        function* (this: CanonicalRuntime) {
+          const intent = yield* this.try("decode Intent revision", () =>
+            decodeCommand<Intent>(ReviseIntentCommandSchema, command, "Intent revision"),
+          );
+          const now = yield* this.now();
+          return yield* this.authoritative("revise canonical Intent", (state) =>
+            reviseIntent(state, intent, now),
+          );
+        }.bind(this),
+      ),
+    );
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
+  readonly complete = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+    this.serialized(
+      Effect.gen(
+        function* (this: CanonicalRuntime) {
+          const input = yield* this.try("decode completion", () =>
+            decodeCommand<CompleteCommand>(CompleteCommandSchema, command, "completion command"),
+          );
+          const now = yield* this.now();
+          return yield* this.authoritative("complete canonical Workstream", (state) =>
+            completeWorkstream(state, { ...input, completedAt: now }, now),
+          );
+        }.bind(this),
+      ),
+    );
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
+  readonly cancel = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+    this.serialized(
+      Effect.gen(
+        function* (this: CanonicalRuntime) {
+          const input = yield* this.try("decode cancellation", () =>
+            decodeCommand<{ attemptId: string; reason: string }>(
+              CancelCommandSchema,
+              command,
+              "cancellation command",
+            ),
+          );
+          const before = yield* Ref.get(this.committed);
+          const located = yield* this.try("resolve cancellation Attempt", () =>
+            exactAttempt(before, input.attemptId),
+          );
+          const now = yield* this.now();
+          const committed = yield* this.authoritative("request canonical cancellation", (state) =>
+            planCancellation(state, located.key, input.reason, now),
+          );
+          if (!Value.Equal(before, committed))
+            yield* this.notifyCommitted(committed, [located.key]);
+          return committed;
+        }.bind(this),
+      ),
+    );
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
+  readonly steer = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+    this.serialized(this.steerEffect(command));
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
+  readonly apply = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+    this.serialized(applyMaintainedOutput(this.outputControl(), command));
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
+  readonly releaseOutput = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+    this.serialized(releaseMaintainedOutput(this.outputControl(), command));
+
   /**
    * Defensive frontier projection for inspection. It reads only the
    * lease-lifetime frontier, never the SQLite aggregate.
@@ -428,12 +529,21 @@ export class CanonicalRuntime {
   ): Effect.Effect<Workstream, CanonicalRuntimeError, FileSystem.FileSystem> {
     return Effect.gen(
       function* (this: CanonicalRuntime) {
+        const decoded = yield* this.try("decode canonical Task enqueue", () =>
+          decodeEnqueue(command),
+        );
         const policy = yield* this.policy();
         const plan = yield* this.try("plan canonical Task enqueue", () =>
-          planEnqueue(command, policy),
+          planEnqueue(decoded, policy),
         );
+        const expected = yield* Ref.get(this.committed);
+        if (findTask(expected, plan.taskId) !== undefined)
+          return yield* new CanonicalRuntimeOperationError({
+            operation: "enqueue canonical Task",
+            message: `Task ${plan.taskId} already exists.`,
+          });
+        const facts = yield* enqueueFacts(decoded, this.acquisition.commands?.git);
         const now = yield* this.now();
-        const taskId = `task-${randomUUID()}`;
         const attemptIds = Array.from(
           { length: plan.attemptCount },
           () => `attempt-${randomUUID()}`,
@@ -441,13 +551,13 @@ export class CanonicalRuntime {
         const committed = yield* this.authoritative("enqueue canonical Task", (expected) =>
           createTask(
             expected,
-            plan.materialize({ taskId, attemptIds }, now, expected.intents.length - 1),
+            plan.materialize(attemptIds, now, expected.intents.length - 1, facts),
             now,
           ),
         );
         yield* this.notifyCommitted(
           committed,
-          attemptIds.map((attemptId) => ({ taskId, attemptId })),
+          attemptIds.map((attemptId) => ({ taskId: plan.taskId, attemptId })),
         );
         return committed;
       }.bind(this),
@@ -464,19 +574,25 @@ export class CanonicalRuntime {
           decodeAppend(command),
         );
         const policy = yield* this.policy();
-        const now = yield* this.now();
         const expected = yield* Ref.get(this.committed);
         const resolved = yield* this.try("resolve canonical append plan", () => {
           const task = findTask(expected, decoded.taskId);
           if (task === undefined) throw new Error(`Unknown Task ${decoded.taskId}.`);
           return planAppend(decoded, task.kind, policy);
         });
+        const facts = yield* appendFacts(expected, decoded, this.acquisition.commands?.git);
+        const now = yield* this.now();
         const attemptIds = Array.from(
           { length: resolved.attemptCount },
           () => `attempt-${randomUUID()}`,
         );
         const committed = yield* this.authoritative("append canonical Attempts", (current) =>
-          appendAttempts(current, decoded.taskId, resolved.materialize(attemptIds, now), now),
+          appendAttempts(
+            current,
+            decoded.taskId,
+            resolved.materialize(attemptIds, now, facts),
+            now,
+          ),
         );
         yield* this.notifyCommitted(
           committed,
@@ -485,6 +601,78 @@ export class CanonicalRuntime {
         return committed;
       }.bind(this),
     );
+  }
+
+  private outputControl() {
+    return {
+      state: Ref.get(this.committed).pipe(Effect.map((state) => structuredClone(state))),
+      commit: (operation: string, plan: (state: Workstream) => Workstream) =>
+        this.authoritative(operation, plan),
+      fence: this.store.checkLease(this.lease),
+      now: this.now(),
+      ports: this.commandPorts(),
+    };
+  }
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Called only from the schema-owning public steering boundary.
+  private steerEffect(command: unknown): CanonicalRuntimeEffect<Workstream> {
+    return Effect.gen(
+      function* (this: CanonicalRuntime) {
+        const input = yield* this.try("decode steering command", () =>
+          decodeCommand<{ attemptId: string; instruction: string }>(
+            SteerCommandSchema,
+            command,
+            "steering command",
+          ),
+        );
+        const initial = yield* Ref.get(this.committed);
+        const located = yield* this.try("resolve steering Attempt", () =>
+          exactAttempt(initial, input.attemptId),
+        );
+        const currentSteering = located.attempt.execution?.steering;
+        if (currentSteering?.state === "submitted" && currentSteering.text === input.instruction)
+          return initial;
+        if (currentSteering?.state === "uncertain")
+          return yield* new CanonicalCommandError({
+            operation: "steer Worker",
+            message: `Attempt ${input.attemptId} has an uncertain steering delivery; inspect before any resend.`,
+          });
+        const identity = yield* this.try("resolve ready Worker", () =>
+          workerIdentity(located.attempt),
+        );
+        const now = yield* this.now();
+        yield* this.authoritative("checkpoint uncertain steering", (state) =>
+          recordWorkerExecution(
+            state,
+            located.key,
+            { steering: { text: input.instruction, state: "uncertain", observedAt: now } },
+            now,
+          ),
+        );
+        yield* this.store.checkLease(this.lease);
+        yield* this.commandPorts().workers.steer(identity, input.instruction);
+        const submittedAt = yield* this.now();
+        const committed = yield* this.authoritative("checkpoint submitted steering", (state) =>
+          recordWorkerExecution(
+            state,
+            located.key,
+            { steering: { text: input.instruction, state: "submitted", observedAt: submittedAt } },
+            submittedAt,
+          ),
+        );
+        yield* this.notifyCommitted(committed, [located.key]);
+        return committed;
+      }.bind(this),
+    );
+  }
+
+  private commandPorts(): CanonicalCommandPorts {
+    if (this.acquisition.commands === undefined)
+      throw new CanonicalRuntimeOperationError({
+        operation: "canonical explicit command",
+        message: "Canonical explicit command host ports are unavailable.",
+      });
+    return this.acquisition.commands;
   }
 
   /**
@@ -678,6 +866,38 @@ export class CanonicalRuntime {
   private closeEffect(): Effect.Effect<void, CanonicalRuntimeError> {
     return this.requestClose().pipe(Effect.andThen(this.shutdown()));
   }
+}
+
+function planCancellation(
+  state: Workstream,
+  key: AttemptKey,
+  reason: string,
+  now: string,
+): Workstream {
+  const current = exactAttempt(state, key.attemptId).attempt;
+  if (current.state === "queued")
+    return terminalizeAttempt(
+      state,
+      key,
+      {
+        kind: "cancelled",
+        observedAt: now,
+        artifacts: [],
+        reason,
+        deliveryRequestedAt: now,
+      },
+      now,
+    );
+  if (current.state === "finished") {
+    if (current.outcome?.kind === "cancelled" && current.outcome.reason === reason) return state;
+    throw new Error(`Attempt ${key.attemptId} is already finished.`);
+  }
+  const existing = current.execution?.cancellation;
+  if (existing !== undefined) {
+    if (existing.reason === reason) return state;
+    throw new Error(`Attempt ${key.attemptId} has a conflicting cancellation request.`);
+  }
+  return checkpointCancellation(state, key, { state: "requested", requestedAt: now, reason }, now);
 }
 
 function acquireLease(
