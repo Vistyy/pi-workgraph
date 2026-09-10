@@ -63,7 +63,7 @@ Research and ordinary review can inspect the live repository, including uncommit
 
 ## Calm presentation
 
-`/calm` shows only conversation: your messages, assistant prose, and compact skill invocations, with a subdued separator between adjacent assistant answers. Coordinator activity stays in a bounded rail above the editor. `/calm default on` saves that preference for new coordinator sessions.
+`/calm` hides model tool executions and the Workgraph workstream/attention rows, then shows your messages, assistant prose, and compact skill invocations. Rows Pi adds through the chat lifecycle that Calm observes stay visible by default, including native Pi warnings and errors, cache/status/summary feedback, user-entered bash output, and unknown or future components. Assistant prose drops thinking and tool-call parts but keeps Pi's abort, error, and truncation notices. Pi currently inserts its streaming custom-entry row by splicing the chat directly, bypassing that lifecycle, so such a row stays in the native transcript while Calm is on. A subdued separator appears between adjacent assistant answers, and any visible native row breaks that adjacency. Coordinator activity stays in a bounded rail above the editor. `/calm default on` saves that preference for new coordinator sessions.
 
 ## Disable worker tools
 

@@ -123,6 +123,8 @@ export class FixtureAssistant extends FixtureContainer {
       else if (part.type === "thinking" && part.thinking.trim() !== "")
         this.addChild(new FixtureText(part.thinking));
     }
+    const notice = terminalNotice(message);
+    if (notice !== undefined) this.addChild(new FixtureText(notice));
   }
 
   override invalidate(): void {
@@ -165,6 +167,67 @@ export interface SkillBlockFixture {
   readonly userMessage: string | undefined;
 }
 
+export interface CustomMessageFixture {
+  readonly customType: string;
+  readonly content: string;
+}
+
+export class FixtureToolExecution extends FixtureContainer {
+  static checks = 0;
+
+  static override [Symbol.hasInstance](value: unknown): boolean {
+    FixtureToolExecution.checks += 1;
+    return isBranded(value, "tool");
+  }
+
+  renders = 0;
+  clicks = 0;
+  readonly toolName: string;
+
+  constructor(toolName = "read") {
+    super();
+    brand(this, "tool");
+    this.toolName = toolName;
+  }
+
+  override render(): string[] {
+    this.renders += 1;
+    return [`[tool] ${this.toolName}`];
+  }
+
+  override handleMouse(): undefined {
+    this.clicks += 1;
+    return undefined;
+  }
+
+  override invalidate(): void {}
+}
+
+export class FixtureCustomMessage extends FixtureContainer {
+  static checks = 0;
+
+  static override [Symbol.hasInstance](value: unknown): boolean {
+    FixtureCustomMessage.checks += 1;
+    return isBranded(value, "custom");
+  }
+
+  renders = 0;
+  readonly message: CustomMessageFixture;
+
+  constructor(message: CustomMessageFixture) {
+    super();
+    brand(this, "custom");
+    this.message = message;
+  }
+
+  override render(): string[] {
+    this.renders += 1;
+    return [`[${this.message.customType}] ${this.message.content}`];
+  }
+
+  override invalidate(): void {}
+}
+
 export class FixtureSkill extends FixtureContainer {
   static checks = 0;
 
@@ -184,6 +247,19 @@ export class FixtureSkill extends FixtureContainer {
   override render(_width: number): string[] {
     return [`[skill] ${this.skillBlock.name}`];
   }
+}
+
+/** Mirror Pi's terminal notice rules so projection visibility is observable through rendering. */
+function terminalNotice(message: AssistantMessage): string | undefined {
+  const hasToolCalls = message.content.some((part) => part.type === "toolCall");
+  if (message.stopReason === "length") return "Response was truncated before completion.";
+  if (hasToolCalls) return undefined;
+  if (message.stopReason === "aborted")
+    return message.errorMessage !== undefined && message.errorMessage !== "Request was aborted"
+      ? message.errorMessage
+      : "Operation aborted";
+  if (message.stopReason === "error") return `Error: ${message.errorMessage ?? "Unknown error"}`;
+  return undefined;
 }
 
 export class FixtureText implements Component {
@@ -206,8 +282,14 @@ export const fixtureRuntime = {
   assistant: FixtureAssistant,
   user: FixtureUser,
   skill: FixtureSkill,
+  toolExecution: FixtureToolExecution,
+  customMessage: FixtureCustomMessage,
   container: FixtureContainer,
 } as unknown as CalmChatRuntime;
+
+export function customMessage(customType: string, content = "payload"): CustomMessageFixture {
+  return { customType, content };
+}
 
 export function skillBlock(name: string, userMessage?: string): SkillBlockFixture {
   return { name, location: `/skills/${name}.md`, content: "INJECTED-SKILL-CONTENT", userMessage };
@@ -249,5 +331,11 @@ export function constructSkill(runtime: CalmChatRuntime, block: SkillBlockFixtur
 }
 
 export function classificationChecks(): number {
-  return FixtureUser.checks + FixtureSkill.checks + FixtureAssistant.checks;
+  return (
+    FixtureUser.checks +
+    FixtureSkill.checks +
+    FixtureAssistant.checks +
+    FixtureToolExecution.checks +
+    FixtureCustomMessage.checks
+  );
 }

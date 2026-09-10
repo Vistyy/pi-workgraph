@@ -11,18 +11,20 @@ import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { type AssistantMessageComponent, initTheme } from "@earendil-works/pi-coding-agent";
-import type { Container } from "@earendil-works/pi-tui";
+import { type Container, Text } from "@earendil-works/pi-tui";
 
 import { discoverCalmChat } from "../src/calm-projection.js";
 import { loadCalmChatRuntime } from "../src/pi-chat-runtime.js";
 import {
   assistantMessage,
   constructSkill,
+  customMessage,
   type FakeMouseEvent,
   projected,
   renderedLines,
   skillBlock,
   textPart,
+  toolCallPart,
 } from "./calm-fixture.js";
 import { calmHarness, command, fakeTuiRoot, shutdown, start } from "./calm-harness.js";
 
@@ -36,13 +38,67 @@ interface CalmMouseContainer extends Container {
   handleMouse(event: FakeMouseEvent): boolean | undefined;
 }
 
+interface StubUi {
+  requestRender(): void;
+}
+
+interface ToolExecutionArgs {
+  readonly path?: string;
+}
+interface ToolExecutionOptions {
+  readonly showImages?: boolean;
+  readonly imageWidthCells?: number;
+}
+interface ToolRenderers {
+  readonly renderShell?: "default" | "self";
+}
+interface CustomMessageLike {
+  readonly customType: string;
+  readonly content: string;
+}
+interface TruncationResult {
+  readonly truncated?: boolean;
+}
+
+interface ToolExecutionCtor {
+  new (
+    toolName: string,
+    toolCallId: string,
+    args: ToolExecutionArgs,
+    options: ToolExecutionOptions | undefined,
+    toolDefinition: ToolRenderers | undefined,
+    ui: StubUi,
+    cwd: string,
+  ): Container & { render(width: number): string[] };
+}
+
+interface CustomMessageCtor {
+  new (message: CustomMessageLike): Container & { render(width: number): string[] };
+}
+
+interface BashExecutionCtor {
+  new (
+    command: string,
+    ui: StubUi,
+    excludeFromContext?: boolean,
+  ): Container & {
+    render(width: number): string[];
+    setComplete(
+      exitCode: number,
+      cancelled: boolean,
+      truncationResult: TruncationResult | undefined,
+      fullOutputPath: string | undefined,
+    ): void;
+  };
+}
+
 async function writeBundleFixture(root: string, withIndex: boolean): Promise<string> {
   const chunks = join(root, "chunks");
   await mkdir(chunks, { recursive: true });
   const fixtureUrl = pathToFileURL(join(import.meta.dirname, "calm-fixture.ts")).href;
   await writeFile(
     join(chunks, "chunk-fixture.js"),
-    `export { FixtureAssistant as AssistantMessageComponent, FixtureUser as UserMessageComponent, FixtureSkill as SkillInvocationMessageComponent } from ${JSON.stringify(fixtureUrl)};\n`,
+    `export { FixtureAssistant as AssistantMessageComponent, FixtureUser as UserMessageComponent, FixtureSkill as SkillInvocationMessageComponent, FixtureToolExecution as ToolExecutionComponent, FixtureCustomMessage as CustomMessageComponent } from ${JSON.stringify(fixtureUrl)};\n`,
   );
   const cli = join(root, "cli.js");
   await writeFile(cli, "export const main = () => {};\n");
@@ -66,6 +122,8 @@ void test("loader reads the running bundle module and its distinct class identit
       assert.notEqual(runtime.assistant, publicPi.AssistantMessageComponent);
       assert.notEqual(runtime.user, publicPi.UserMessageComponent);
       assert.notEqual(runtime.skill, publicPi.SkillInvocationMessageComponent);
+      assert.notEqual(runtime.toolExecution, publicPi.ToolExecutionComponent);
+      assert.notEqual(runtime.customMessage, publicPi.CustomMessageComponent);
       assert.notEqual(runtime.container, publicTui.Container);
       assert.equal(Object.getPrototypeOf(runtime.assistant.prototype), runtime.container.prototype);
 
@@ -396,6 +454,101 @@ installedRuntimeTest(
       assert.ok(renderedLines(chat).some((line) => line.includes("answer")));
     } finally {
       projection.detach();
+    }
+  },
+);
+
+installedRuntimeTest(
+  "real 0.85.1 keeps native feedback visible and terminal notices after filtering",
+  async () => {
+    initTheme("dark", false);
+    const entrypoint = installedEntrypoint;
+    if (entrypoint === undefined) return;
+    const runtime = await loadCalmChatRuntime(entrypoint);
+    // SAFETY: This is the bundle module already validated by the runtime loader.
+    const bundle = (await import(pathToFileURL(join(dirname(entrypoint), "index.js")).href)) as {
+      readonly BashExecutionComponent: BashExecutionCtor;
+    };
+    // SAFETY: The runtime decoder validated this exact live constructor.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- Runtime types it only for identity checks.
+    const ToolExecution = runtime.toolExecution as unknown as ToolExecutionCtor;
+    // SAFETY: The runtime decoder validated this exact live constructor.
+    // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- Runtime types it only for identity checks.
+    const CustomMessage = runtime.customMessage as unknown as CustomMessageCtor;
+    const stubUi = { requestRender: () => {} };
+
+    const chat = new runtime.container();
+    const projection = projected(chat, runtime);
+    try {
+      const bash = new bundle.BashExecutionComponent("echo hi", stubUi, false);
+      bash.setComplete(0, false, undefined, undefined);
+      chat.addChild(new Text("warning: cache miss", 0, 0));
+      chat.addChild(bash);
+      chat.addChild(new Text("future-native-widget", 0, 0));
+      chat.addChild(new CustomMessage(customMessage("pi-lavish-report", "report body")));
+      chat.addChild(new CustomMessage(customMessage("pi-workgraph-workstream", "hidden")));
+      const hiddenTool = new ToolExecution(
+        "fixture-hidden-tool",
+        "call-1",
+        {},
+        undefined,
+        undefined,
+        stubUi,
+        "/tmp",
+      );
+      chat.addChild(hiddenTool);
+
+      const lines = renderedLines(chat).join("\n");
+      assert.match(lines, /warning: cache miss/);
+      assert.match(lines, /\$ echo hi/);
+      assert.match(lines, /future-native-widget/);
+      assert.match(lines, /\[pi-lavish-report\]/);
+      assert.match(lines, /report body/);
+      assert.doesNotMatch(lines, /pi-workgraph-workstream/);
+      assert.doesNotMatch(lines, /fixture-hidden-tool/);
+
+      const interrupted = new runtime.assistant();
+      chat.addChild(interrupted);
+      interrupted.updateContent(
+        { ...assistantMessage([toolCallPart("read")]), stopReason: "aborted" },
+        false,
+      );
+      assert.match(renderedLines(chat).join("\n"), /Operation aborted/);
+
+      // Hiding is Calm's own effect: native rendering restores the tool row and Pi's native rule
+      // that suppresses the aborted notice when the source carried tool calls.
+      projection.setEnabled(false);
+      const native = renderedLines(chat).join("\n");
+      assert.match(native, /fixture-hidden-tool/);
+      assert.match(native, /\[pi-workgraph-workstream\]/);
+      assert.doesNotMatch(native, /Operation aborted/);
+      projection.setEnabled(true);
+    } finally {
+      projection.detach();
+    }
+
+    const adjacency = new runtime.container();
+    const adjacencyProjection = projected(adjacency, runtime);
+    try {
+      adjacency.addChild(new runtime.assistant(assistantMessage([textPart("a")])));
+      adjacency.addChild(
+        new ToolExecution("adjacency-tool", "call-2", {}, undefined, undefined, stubUi, "/tmp"),
+      );
+      adjacency.addChild(new runtime.assistant(assistantMessage([textPart("b")])));
+      assert.deepEqual(renderedLines(adjacency), ["a", "---", "b"]);
+
+      adjacency.addChild(new CustomMessage(customMessage("pi-lavish-report", "note")));
+      adjacency.addChild(new runtime.assistant(assistantMessage([textPart("c")])));
+      assert.deepEqual(renderedLines(adjacency), [
+        "a",
+        "---",
+        "b",
+        "[pi-lavish-report]",
+        "note",
+        "c",
+      ]);
+    } finally {
+      adjacencyProjection.detach();
     }
   },
 );

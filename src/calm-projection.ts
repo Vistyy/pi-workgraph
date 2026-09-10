@@ -5,7 +5,7 @@ import type {
   UserMessageComponent,
 } from "@earendil-works/pi-coding-agent";
 import type { Component, Container, TUI } from "@earendil-works/pi-tui";
-import type { CalmChatRuntime } from "./pi-chat-runtime.js";
+import type { CalmChatRuntime, CalmComponentConstructor } from "./pi-chat-runtime.js";
 
 /**
  * Calm renders the live Pi chat through a separate projection container.
@@ -16,10 +16,13 @@ import type { CalmChatRuntime } from "./pi-chat-runtime.js";
  * projection keeps its own membership and delegates rendering and mouse dispatch back to Pi when
  * Calm is disabled.
  *
- * Known excluded boundary: a caller that mutates `chat.children` directly with `push`/`splice`
- * bypasses the lifecycle seams this adapter owns, so such a row is neither classified nor projected.
- * Pi's supported chat mutation flows use `addChild`, `removeChild`, and `clear`; the direct-splice
- * bypass remains native-only and is deliberately not scanned per frame.
+ * Classification is exclusion-based: tool executions and two Workgraph custom types are hidden;
+ * every other row observed through the wrapped lifecycle is projected unchanged.
+ *
+ * Known limitation: a row inserted directly into `chat.children` never passes a wrapped lifecycle
+ * seam, so it is neither classified nor projected and stays native-only. The inspected Pi
+ * 0.84.4/0.85.1 takes that path for its streaming custom-entry row, which it inserts with
+ * `chat.children.splice`; the adapter does not scan children per frame to recover it.
  */
 
 // SAFETY: This module is the guarded Pi chat compatibility boundary; live component instances are
@@ -63,6 +66,11 @@ class CleanupFailures {
     if (this.#details.length === 0) return undefined;
     return new Error(`${context}: ${[...new Set(this.#details)].join("; ")}`);
   }
+}
+
+/** Avoid TypeScript narrowing cross-constructor `instanceof` checks to `never`. */
+function isLiveInstance(value: unknown, ctor: CalmComponentConstructor): boolean {
+  return value instanceof ctor;
 }
 
 function describeFailure(error: unknown): string {
@@ -110,7 +118,17 @@ interface SkillEntry {
   readonly paired: boolean;
 }
 
-type ProjectionEntry = AssistantEntry | UserEntry | SkillEntry;
+interface PassThroughEntry {
+  readonly kind: "passthrough";
+  readonly source: Component;
+}
+
+type ProjectionEntry = AssistantEntry | UserEntry | SkillEntry | PassThroughEntry;
+
+const EXCLUDED_CUSTOM_TYPES: ReadonlySet<string> = new Set([
+  "pi-workgraph-workstream",
+  "pi-workgraph-attention",
+]);
 
 interface OwnedSeam {
   readonly target: object;
@@ -139,6 +157,7 @@ export interface CalmProjection {
 // after a skill-only invocation keeps the compact line.
 function visibleEntry(entry: ProjectionEntry): Component[] {
   if (entry.kind === "user") return [entry.source];
+  if (entry.kind === "passthrough") return [entry.source];
   if (entry.kind === "skill") return entry.paired ? [] : [entry.synthetic];
   return entry.visible && entry.projected !== undefined ? [entry.projected] : [];
 }
@@ -174,16 +193,31 @@ function restoreAssistantSeam(entry: AssistantEntry, warn: Diagnostic): void {
   );
 }
 
-/** Project only visible assistant prose. See `projectableProse` for the operational-notice choice. */
+/**
+ * Preserve terminal metadata while projecting only prose. Removing tool calls is essential because
+ * Pi otherwise suppresses abort/error notices in favor of the hidden tool row.
+ */
 function projectableProse(
   message: AssistantMessage,
 ): { readonly key: string; readonly message: AssistantMessage } | undefined {
   const parts = message.content.filter(isVisibleTextPart);
-  if (parts.length === 0) return undefined;
+  if (parts.length === 0 && !hasTerminalNotice(message)) return undefined;
   return {
-    key: parts.map((part) => part.text).join("\u0000"),
-    message: { ...message, content: parts, stopReason: "stop" },
+    key: [
+      parts.map((part) => part.text).join("\u0000"),
+      message.stopReason,
+      message.errorMessage ?? "",
+    ].join("\u0001"),
+    message: { ...message, content: parts },
   };
+}
+
+function hasTerminalNotice(message: AssistantMessage): boolean {
+  return (
+    message.stopReason === "aborted" ||
+    message.stopReason === "error" ||
+    message.stopReason === "length"
+  );
 }
 
 function isVisibleTextPart(part: AssistantContentPart): part is AssistantTextPart {
@@ -253,6 +287,24 @@ function readSkillMetadata(component: object): SkillMetadata {
   if (typeof userMessage !== "string")
     throw new Error("the Pi skill invocation metadata seam is malformed.");
   return { name, paired: userMessage.trim() !== "" };
+}
+
+/**
+ * Read the guarded `message.customType` of a live custom message component. Pi stores the entry on
+ * a private instance field, so a missing or malformed seam is an incompatibility rather than an
+ * empty custom type that would silently pass through.
+ */
+function readCustomType(component: object): string {
+  const descriptor = Object.getOwnPropertyDescriptor(component, "message");
+  if (descriptor === undefined || !("value" in descriptor))
+    throw new Error("the Pi custom message metadata seam is missing.");
+  const entry: unknown = descriptor.value;
+  if (typeof entry !== "object" || entry === null)
+    throw new Error("the Pi custom message metadata seam is malformed.");
+  const customType: unknown = Object.getOwnPropertyDescriptor(entry, "customType")?.value;
+  if (typeof customType !== "string")
+    throw new Error("the Pi custom message metadata seam is malformed.");
+  return customType;
 }
 
 /** Locate the live chat Container from the TUI root that Pi hands to widget factories. */
@@ -664,7 +716,12 @@ class ChatProjectionAdapter implements CalmProjection {
       };
     }
     if (component instanceof this.#runtime.assistant) return this.#createAssistantEntry(component);
-    return undefined;
+    if (isLiveInstance(component, this.#runtime.toolExecution)) return undefined;
+    if (isLiveInstance(component, this.#runtime.customMessage)) {
+      if (EXCLUDED_CUSTOM_TYPES.has(readCustomType(component))) return undefined;
+      return { kind: "passthrough", source: component };
+    }
+    return { kind: "passthrough", source: component };
   }
 
   #removeEntry(component: Component): void {

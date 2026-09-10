@@ -31,12 +31,15 @@ export type CalmAssistantConstructor = new (
 ) => AssistantMessageComponent;
 export type CalmUserConstructor = new (text: string) => UserMessageComponent;
 export type CalmSkillConstructor = new (...args: never[]) => SkillInvocationMessageComponent;
+export type CalmComponentConstructor = new (...args: never[]) => Component;
 export type CalmContainerConstructor = new () => Container;
 
 export interface CalmChatRuntime {
   readonly assistant: CalmAssistantConstructor;
   readonly user: CalmUserConstructor;
   readonly skill: CalmSkillConstructor;
+  readonly toolExecution: CalmComponentConstructor;
+  readonly customMessage: CalmComponentConstructor;
   readonly container: CalmContainerConstructor;
 }
 
@@ -44,6 +47,8 @@ const MESSAGE_EXPORTS = [
   "AssistantMessageComponent",
   "UserMessageComponent",
   "SkillInvocationMessageComponent",
+  "ToolExecutionComponent",
+  "CustomMessageComponent",
 ] as const;
 
 /**
@@ -108,8 +113,16 @@ function decodeCalmChatRuntime(module: unknown): CalmChatRuntime | undefined {
   const assistant = readProperty(module, "AssistantMessageComponent");
   const user = readProperty(module, "UserMessageComponent");
   const skill = readProperty(module, "SkillInvocationMessageComponent");
+  const toolExecution = readProperty(module, "ToolExecutionComponent");
+  const customMessage = readProperty(module, "CustomMessageComponent");
   if (!isAssistantConstructor(assistant)) return undefined;
-  if (!isComponentConstructor(user) || !isComponentConstructor(skill)) return undefined;
+  if (
+    !isComponentConstructor(user) ||
+    !isComponentConstructor(skill) ||
+    !isComponentConstructor(toolExecution) ||
+    !isComponentConstructor(customMessage)
+  )
+    return undefined;
   // Pi's assistant component extends the same private Container the live chat uses; deriving the
   // container from that prototype parent keeps discovery and the projection aligned with Pi.
   const parent: unknown = Object.getPrototypeOf(assistant.prototype);
@@ -121,6 +134,8 @@ function decodeCalmChatRuntime(module: unknown): CalmChatRuntime | undefined {
     assistant,
     user,
     skill,
+    toolExecution,
+    customMessage,
     container,
   } as unknown as CalmChatRuntime;
 }

@@ -17,9 +17,12 @@ import type { CalmChatRuntime } from "../src/pi-chat-runtime.js";
 import {
   assistantMessage,
   classificationChecks,
+  customMessage,
   FixtureAssistant,
   FixtureContainer,
+  FixtureCustomMessage,
   FixtureSkill,
+  FixtureToolExecution,
   FixtureUser,
   fixtureRuntime,
   projected,
@@ -131,37 +134,40 @@ class ThrowingInvalidateContainer extends FixtureContainer {
   }
 }
 
-void test("Calm shows conversation only and separates adjacent assistant prose", () => {
+void test("Calm hides excluded rows, keeps assistant adjacency, and renders stably", () => {
   const chat = new FixtureContainer();
   const user = new FixtureUser("hello there");
   const first = new FixtureAssistant(assistantMessage([textPart("first answer")]));
-  const hiddenTool = new CountingRow("tool-row");
+  const hiddenTool = new FixtureToolExecution("read");
   const second = new FixtureAssistant(assistantMessage([textPart("second answer")]));
-  const hiddenMessage = new CountingRow("custom-row");
+  const hiddenWorkstream = new FixtureCustomMessage(customMessage("pi-workgraph-workstream"));
+  const hiddenAttention = new FixtureCustomMessage(customMessage("pi-workgraph-attention"));
   chat.addChild(user);
   chat.addChild(first);
   chat.addChild(hiddenTool);
   chat.addChild(second);
-  chat.addChild(hiddenMessage);
+  chat.addChild(hiddenWorkstream);
+  chat.addChild(hiddenAttention);
   const projection = projected(chat);
   try {
     const lines = renderedLines(chat);
     assert.deepEqual(lines, ["hello there", "first answer", "---", "second answer"]);
     for (let frame = 0; frame < 5; frame += 1) assert.deepEqual(renderedLines(chat), lines);
     assert.equal(hiddenTool.renders, 0);
-    assert.equal(hiddenMessage.renders, 0);
+    assert.equal(hiddenWorkstream.renders, 0);
+    assert.equal(hiddenAttention.renders, 0);
   } finally {
     projection.detach();
   }
-  assert.ok(renderedLines(chat).includes("tool-row"));
-  assert.ok(renderedLines(chat).includes("custom-row"));
+  assert.ok(renderedLines(chat).includes("[tool] read"));
+  assert.ok(renderedLines(chat).includes("[pi-workgraph-workstream] payload"));
 });
 
 void test("animation frames neither classify nor render excluded native history", () => {
   const chat = new FixtureContainer();
-  const hidden: CountingRow[] = [];
+  const hidden: FixtureToolExecution[] = [];
   for (let index = 0; index < 50; index += 1) {
-    const row = new CountingRow(`hidden-${index}`);
+    const row = new FixtureToolExecution(`tool-${index}`);
     hidden.push(row);
     chat.addChild(row);
     chat.addChild(new FixtureAssistant(assistantMessage([textPart(`answer ${index}`)])));
@@ -183,15 +189,186 @@ void test("thinking-only and tool-only assistant records create neither rows nor
   const thinkingOnly = new FixtureAssistant(assistantMessage([thinkingPart("private reasoning")]));
   const toolOnly = new FixtureAssistant(assistantMessage([toolCallPart("read")]));
   const visibleSecond = new FixtureAssistant(assistantMessage([textPart("visible two")]));
+  const hiddenTool = new FixtureToolExecution("write");
   chat.addChild(visibleFirst);
   chat.addChild(thinkingOnly);
-  chat.addChild(new CountingRow("hidden"));
+  chat.addChild(hiddenTool);
   chat.addChild(visibleSecond);
   chat.addChild(toolOnly);
   const projection = projected(chat);
   try {
     assert.deepEqual(renderedLines(chat), ["visible one", "---", "visible two"]);
-    assert.doesNotMatch(renderedLines(chat).join("\n"), /private reasoning|hidden/);
+    assert.equal(hiddenTool.renders, 0);
+    assert.doesNotMatch(renderedLines(chat).join("\n"), /private reasoning|\[tool\]/);
+  } finally {
+    projection.detach();
+  }
+});
+
+void test("assistant terminal notices stay visible with no prose and keep stopReason", () => {
+  const chat = new FixtureContainer();
+  const aborted = assistantMessage([]);
+  aborted.stopReason = "aborted";
+  const errored = assistantMessage([]);
+  errored.stopReason = "error";
+  errored.errorMessage = "provider exploded";
+  const truncated = assistantMessage([]);
+  truncated.stopReason = "length";
+  chat.addChild(new FixtureAssistant(aborted));
+  chat.addChild(new FixtureAssistant(errored));
+  chat.addChild(new FixtureAssistant(truncated));
+  const projection = projected(chat);
+  try {
+    const lines = renderedLines(chat).join("\n");
+    assert.match(lines, /Operation aborted/);
+    assert.match(lines, /Error: provider exploded/);
+    assert.match(lines, /Response was truncated before completion\./);
+  } finally {
+    projection.detach();
+  }
+});
+
+void test("an interrupted turn keeps its notice after tool-call filtering", () => {
+  const chat = new FixtureContainer();
+  const interrupted = assistantMessage([toolCallPart("read"), textPart("partial answer")]);
+  interrupted.stopReason = "aborted";
+  const errored = assistantMessage([toolCallPart("write")]);
+  errored.stopReason = "error";
+  errored.errorMessage = "stream failed";
+  const hiddenTool = new FixtureToolExecution("read");
+  chat.addChild(new FixtureAssistant(interrupted));
+  chat.addChild(hiddenTool);
+  chat.addChild(new FixtureAssistant(errored));
+  const projection = projected(chat);
+  try {
+    const lines = renderedLines(chat).join("\n");
+    assert.match(lines, /partial answer/);
+    assert.match(lines, /Operation aborted/);
+    assert.match(lines, /Error: stream failed/);
+    assert.equal(hiddenTool.renders, 0);
+    assert.doesNotMatch(lines, /\[tool\]/);
+  } finally {
+    projection.detach();
+  }
+});
+
+void test("visible native rows break assistant adjacency while hidden tools do not", () => {
+  const withHiddenTool = new FixtureContainer();
+  withHiddenTool.addChild(new FixtureAssistant(assistantMessage([textPart("a")])));
+  withHiddenTool.addChild(new FixtureToolExecution("read"));
+  withHiddenTool.addChild(new FixtureAssistant(assistantMessage([textPart("b")])));
+  const hiddenProjection = projected(withHiddenTool);
+  try {
+    assert.deepEqual(renderedLines(withHiddenTool), ["a", "---", "b"]);
+  } finally {
+    hiddenProjection.detach();
+  }
+
+  const withNotice = new FixtureContainer();
+  const warning = new CountingRow("warning: cache miss");
+  withNotice.addChild(new FixtureAssistant(assistantMessage([textPart("a")])));
+  withNotice.addChild(warning);
+  withNotice.addChild(new FixtureAssistant(assistantMessage([textPart("b")])));
+  const noticeProjection = projected(withNotice);
+  try {
+    assert.deepEqual(renderedLines(withNotice), ["a", "warning: cache miss", "b"]);
+    assert.equal(warning.renders, 1);
+  } finally {
+    noticeProjection.detach();
+  }
+});
+
+void test("native, unknown, and non-Workgraph custom rows stay visible by default", () => {
+  const chat = new FixtureContainer();
+  const cache = new CountingRow("cache: read 1024 tokens");
+  const unknown = new CountingRow("future-native-widget");
+  const custom = new FixtureCustomMessage(customMessage("pi-lavish-report", "report body"));
+  const bash = new CountingRow("$ git status clean");
+  chat.addChild(new FixtureUser("hello"));
+  chat.addChild(cache);
+  chat.addChild(unknown);
+  chat.addChild(custom);
+  chat.addChild(bash);
+  chat.addChild(new FixtureAssistant(assistantMessage([textPart("answer")])));
+  const projection = projected(chat);
+  try {
+    assert.deepEqual(renderedLines(chat), [
+      "hello",
+      "cache: read 1024 tokens",
+      "future-native-widget",
+      "[pi-lavish-report] report body",
+      "$ git status clean",
+      "answer",
+    ]);
+    assert.equal(custom.renders, 1);
+    assert.equal(bash.renders, 1);
+  } finally {
+    projection.detach();
+  }
+});
+
+void test("only the two Workgraph custom types are excluded", () => {
+  const chat = new FixtureContainer();
+  const excluded = [
+    new FixtureCustomMessage(customMessage("pi-workgraph-workstream")),
+    new FixtureCustomMessage(customMessage("pi-workgraph-attention")),
+  ];
+  for (const row of excluded) chat.addChild(row);
+  chat.addChild(new FixtureCustomMessage(customMessage("pi-workgraph-other")));
+  const projection = projected(chat);
+  try {
+    assert.deepEqual(renderedLines(chat), ["[pi-workgraph-other] payload"]);
+    for (const row of excluded) assert.equal(row.renders, 0);
+  } finally {
+    projection.detach();
+  }
+});
+
+void test("a malformed custom message metadata seam fails open and detaches", () => {
+  const chat = new FixtureContainer();
+  const diagnostics: string[] = [];
+  const projection = projected(chat, fixtureRuntime, (message) => diagnostics.push(message));
+  const broken = new FixtureCustomMessage(customMessage("third-party"));
+  Reflect.deleteProperty(broken, "message");
+  chat.addChild(broken);
+  assert.equal(diagnostics.length, 1);
+  assert.match(diagnostics[0] ?? "", /custom message metadata seam is missing/);
+  assert.equal(Object.getOwnPropertyDescriptor(chat, "render"), undefined);
+  projection.detach();
+
+  const wrongType = new FixtureContainer();
+  const typeDiagnostics: string[] = [];
+  const wrongProjection = projected(wrongType, fixtureRuntime, (message) =>
+    typeDiagnostics.push(message),
+  );
+  const malformed = new FixtureCustomMessage(customMessage("third-party"));
+  Object.defineProperty(malformed, "message", { configurable: true, value: { content: "x" } });
+  wrongType.addChild(malformed);
+  assert.equal(typeDiagnostics.length, 1);
+  assert.match(typeDiagnostics[0] ?? "", /custom message metadata seam is malformed/);
+  wrongProjection.detach();
+});
+
+void test("Calm off leaves the native transcript and updates unchanged", () => {
+  const chat = new FixtureContainer();
+  const tool = new FixtureToolExecution("read");
+  const custom = new FixtureCustomMessage(customMessage("pi-workgraph-workstream"));
+  const assistant = new FixtureAssistant(
+    assistantMessage([thinkingPart("hidden reasoning"), textPart("answer")]),
+  );
+  chat.addChild(tool);
+  chat.addChild(custom);
+  chat.addChild(assistant);
+  const projection = projected(chat);
+  projection.setEnabled(false);
+  try {
+    const native = renderedLines(chat).join("\n");
+    assert.match(native, /\[tool\] read/);
+    assert.match(native, /\[pi-workgraph-workstream\] payload/);
+    assert.match(native, /hidden reasoning/);
+    assert.match(native, /answer/);
+    assistant.updateContent(assistantMessage([textPart("native update")]));
+    assert.match(renderedLines(chat).join("\n"), /native update/);
   } finally {
     projection.detach();
   }
@@ -276,7 +453,7 @@ void test("repeated toggles restore native rendering and assistant thinking", ()
     assistantMessage([thinkingPart("hidden reasoning"), textPart("answer")]),
   );
   chat.addChild(assistant);
-  chat.addChild(new CountingRow("operational-row"));
+  chat.addChild(new FixtureToolExecution("bash"));
   const projection = projected(chat);
   try {
     for (let toggle = 0; toggle < 3; toggle += 1) {
@@ -286,7 +463,7 @@ void test("repeated toggles restore native rendering and assistant thinking", ()
       const native = renderedLines(chat).join("\n");
       assert.match(native, /hidden reasoning/);
       assert.match(native, /answer/);
-      assert.match(native, /operational-row/);
+      assert.match(native, /\[tool\] bash/);
     }
     // A Calm-off/Calm-on cycle re-arms restoration for the next deferred streaming update.
     const deferred = new FixtureAssistant();
@@ -306,7 +483,7 @@ void test("detach restores native rendering, update behavior, and mouse dispatch
   const chat = new FixtureContainer();
   const user = new MouseUser("hi");
   const first = new FixtureAssistant(assistantMessage([textPart("first")]));
-  const hiddenTool = new CountingRow("tool-row");
+  const hiddenTool = new FixtureToolExecution("read");
   const second = new FixtureAssistant(assistantMessage([textPart("second")]));
   chat.addChild(user);
   chat.addChild(first);
@@ -334,7 +511,7 @@ void test("detach restores native rendering, update behavior, and mouse dispatch
     "detach must restore the native assistant update seam",
   );
   const nativeLines = chat.render(width);
-  assert.ok(nativeLines.some((line) => strip(line).includes("tool-row")));
+  assert.ok(nativeLines.some((line) => strip(line).includes("[tool] read")));
   chat.handleMouse({ y: userHeight + firstHeight, width, height: nativeLines.length });
   assert.equal(hiddenTool.clicks, 1);
 
@@ -529,7 +706,7 @@ void test("discovery validates the inspected TUI layout and returns the live cha
 
 void test("classification failure fails open, detaches, and refuses re-enabling", () => {
   const chat = new FixtureContainer();
-  const hidden = new CountingRow("native-row");
+  const hidden = new FixtureToolExecution("read");
   chat.addChild(hidden);
   const diagnostics: string[] = [];
   const projection = projected(chat, fixtureRuntime, (message) => diagnostics.push(message));
@@ -539,10 +716,10 @@ void test("classification failure fails open, detaches, and refuses re-enabling"
     chat.addChild(new FixtureSkill(skillBlock("")));
     assert.equal(diagnostics.length, 1);
     assert.match(diagnostics[0] ?? "", /skill invocation metadata seam is malformed/);
-    assert.ok(renderedLines(chat).includes("native-row"));
+    assert.ok(renderedLines(chat).includes("[tool] read"));
     // The incompatibility is terminal for this attachment: re-enabling cannot claim filtering.
     projection.setEnabled(true);
-    assert.ok(renderedLines(chat).includes("native-row"));
+    assert.ok(renderedLines(chat).includes("[tool] read"));
   } finally {
     projection.detach();
   }
@@ -614,7 +791,7 @@ void test("a failing native chat invalidation still releases every wrapper and r
 
 void test("missing or non-boolean assistant isStreaming is a hard compatibility failure", () => {
   const chat = new FixtureContainer();
-  chat.addChild(new CountingRow("native-row"));
+  chat.addChild(new FixtureToolExecution("read"));
   const diagnostics: string[] = [];
   const projection = projected(chat, fixtureRuntime, (message) => diagnostics.push(message));
   const assistant = new FixtureAssistant(assistantMessage([textPart("answer")]));
@@ -632,7 +809,7 @@ void test("missing or non-boolean assistant isStreaming is a hard compatibility 
   assert.equal(diagnostics.length, 1);
   assert.match(diagnostics[0] ?? "", /isStreaming field is malformed/);
   assert.equal(Object.getOwnPropertyDescriptor(assistant, "updateContent"), undefined);
-  assert.ok(renderedLines(chat).includes("native-row"));
+  assert.ok(renderedLines(chat).includes("[tool] read"));
   assert.ok(renderedLines(chat).includes("answer"));
   projection.detach();
 
@@ -688,10 +865,10 @@ void test("a failing native refresh disables Calm, restores chrome, and refuses 
 
 void test("direct children.splice bypass stays native-only", () => {
   const chat = new FixtureContainer();
-  const bypassed = new CountingRow("bypassed-row");
-  // A caller that mutates chat.children directly bypasses the owned lifecycle seams.
-  chat.children.push(bypassed);
   const projection = projected(chat);
+  const bypassed = new CountingRow("bypassed-row");
+  // Pi's streaming custom-entry splice similarly bypasses the lifecycle seams after attachment.
+  chat.children.push(bypassed);
   try {
     assert.deepEqual(renderedLines(chat), []);
     assert.equal(bypassed.renders, 0);
@@ -869,7 +1046,7 @@ void test("Calm on projects the chat while shutdown restores native presentation
     },
   });
   await start(pi, context);
-  const hidden = new CountingRow("native-row");
+  const hidden = new FixtureToolExecution("read");
   chat.addChild(new FixtureAssistant(assistantMessage([textPart("answer")])));
   chat.addChild(hidden);
   assert.deepEqual(renderedLines(chat), ["answer"]);
@@ -878,7 +1055,7 @@ void test("Calm on projects the chat while shutdown restores native presentation
   assert.equal(ui.widgets.get("calm"), undefined);
   assert.equal(ui.statuses.get("calm"), undefined);
   assert.equal(ui.workingVisible, true);
-  assert.ok(renderedLines(chat).includes("native-row"));
+  assert.ok(renderedLines(chat).includes("[tool] read"));
   const requests = tui.requests;
   await delay(40);
   assert.equal(tui.requests, requests, "shutdown must stop the pulse timer");
