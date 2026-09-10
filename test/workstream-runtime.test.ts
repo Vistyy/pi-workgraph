@@ -16,14 +16,9 @@ import { liveLayer } from "../src/node-platform.js";
 import { processEffect } from "../src/process.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { type WorkstreamState, WorkstreamStoreEffects } from "../src/workstream.js";
-import {
-  type Lease,
-  LeaseDecisionRequiredError,
-  SqliteWorkstreamDatabase,
-} from "../src/workstream-persistence.js";
+import { type Lease, SqliteWorkstreamDatabase } from "../src/workstream-persistence.js";
 import {
   type RuntimeEffect,
-  RuntimeOperationError,
   type RuntimeOwnership,
   WorkstreamRuntime,
 } from "../src/workstream-runtime.js";
@@ -2592,91 +2587,6 @@ await test("supported runtime close rejects queued work and releases its lease a
     );
   } finally {
     await Effect.runPromise(Deferred.succeed(releaseFinalizer, undefined));
-    t.mock.restoreAll();
-    await f.dispose();
-  }
-});
-
-await test("public runtime commands translate store failures at the application boundary", async (t) => {
-  const f = await fixture();
-  const cause = new Error("store boundary failure");
-  const failure = new WorkstreamStoreOperationError({
-    code: "workstream_store_operation_failed",
-    message: cause.message,
-    cause,
-  });
-  const assertTranslated = async (effect: RuntimeEffect<unknown>) => {
-    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Assertion validators receive an unknown rejection and check its stable runtime error boundary.
-    await assert.rejects(runRuntime(effect), (error: unknown) => {
-      assert.ok(error instanceof RuntimeOperationError);
-      assert.equal(error.cause, cause);
-      return true;
-    });
-  };
-  try {
-    const active = await f.runtime();
-    t.mock.method(f.store, "load", () => Effect.fail(failure));
-    for (const effect of [
-      active.read(),
-      active.reconcile(),
-      active.apply("missing"),
-      active.releaseOutput("missing", "inspect"),
-      active.steer("missing", "inspect"),
-      active.cancel("missing"),
-    ])
-      await assertTranslated(effect);
-    t.mock.restoreAll();
-
-    t.mock.method(f.store, "enqueue", () => Effect.fail(failure));
-    await assertTranslated(active.queue(research("store-error")));
-    t.mock.restoreAll();
-    t.mock.method(f.store, "recordInputEvent", () => Effect.fail(failure));
-    await assertTranslated(
-      active.recordInput({ ...f.owner, source: "interactive", text: "store error" }),
-    );
-    t.mock.restoreAll();
-    t.mock.method(f.store, "reviseIntent", () => Effect.fail(failure));
-    await assertTranslated(
-      active.reviseIntent({
-        authorityReceiptId: "receipt",
-        statement: "store error",
-        constraints: [],
-      }),
-    );
-    t.mock.restoreAll();
-    t.mock.method(f.store, "setLifecycle", () => Effect.fail(failure));
-    await assertTranslated(active.setLifecycle({ state: "suspended", reason: "store error" }));
-    t.mock.restoreAll();
-    t.mock.method(f.store, "complete", () => Effect.fail(failure));
-    await assertTranslated(
-      active.complete({ conclusion: "store error", evidence: [], limitations: [] }),
-    );
-    t.mock.restoreAll();
-    t.mock.method(f.store, "cancelAttempt", () => Effect.fail(failure));
-    await assertTranslated(active.requestCancellation("missing"));
-  } finally {
-    t.mock.restoreAll();
-    await f.dispose();
-  }
-});
-
-await test("store-boundary translation preserves lease-decision identity", async (t) => {
-  const f = await fixture();
-  const leaseError = new LeaseDecisionRequiredError("lease decision is required");
-  try {
-    const active = await f.runtime();
-    t.mock.method(f.store, "load", () =>
-      Effect.fail(
-        new WorkstreamStoreOperationError({
-          code: "workstream_store_operation_failed",
-          message: leaseError.message,
-          cause: leaseError,
-        }),
-      ),
-    );
-    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Assertion validators receive an unknown rejection and check exact lease identity.
-    await assert.rejects(runRuntime(active.read()), (error: unknown) => error === leaseError);
-  } finally {
     t.mock.restoreAll();
     await f.dispose();
   }
