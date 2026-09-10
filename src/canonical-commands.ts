@@ -216,7 +216,7 @@ export function appendFacts(
     }
     return yield* candidateFacts(
       workstream,
-      { ...command, candidateOf: command.candidateOf },
+      candidateRequest(command.candidateOf, command.baseRevision),
       port,
     );
   });
@@ -287,14 +287,13 @@ function retainedCandidate(
   readonly placement: WorktreePlacement;
 }> {
   const located = findAttemptLocation(workstream, attemptId);
-  const parent = located?.attempt;
-  const parentCommit = parent === undefined ? undefined : changedImplementationCommit(parent);
-  const candidate = parent?.candidate;
-  const baseCommit = parent?.baseRevision;
-  const placement = parent?.execution?.placement;
+  if (located === undefined) return Effect.fail(ineligibleCandidate(attemptId));
+  const parent = located.attempt;
+  const parentCommit = changedImplementationCommit(parent);
+  const candidate = parent.candidate;
+  const baseCommit = parent.baseRevision;
+  const placement = parent.execution?.placement;
   if (
-    located === undefined ||
-    parent === undefined ||
     parentCommit === undefined ||
     !isRetainedCandidateParent(located.task, parent, parentCommit) ||
     candidate === undefined ||

@@ -317,9 +317,7 @@ export class CanonicalRuntime {
           );
           const before = yield* Ref.get(this.committed);
           const affected = before.tasks.flatMap((task) =>
-            task.attempts
-              .filter((attempt) => attempt.state === "queued")
-              .map((attempt) => ({ taskId: task.id, attemptId: attempt.id })),
+            task.attempts.map((attempt) => ({ taskId: task.id, attemptId: attempt.id })),
           );
           const now = yield* this.now();
           const committed = yield* this.authoritative("revise canonical Intent", (state) =>

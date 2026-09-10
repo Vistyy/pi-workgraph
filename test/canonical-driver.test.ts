@@ -1322,6 +1322,96 @@ void test("retained changed output applies with exact checkpoints and releases i
   });
 });
 
+void test("completed output release replay preserves its reason and repairs cleanup without Git", async () => {
+  await withHarness(async (h) => {
+    const { base, placement } = await isolated(h);
+    await Effect.runPromise(h.git.createWorktree(ID, ATTEMPT, base));
+    await writeFile(join(placement.path, "released.txt"), "released\n");
+    await git(placement.path, "add", ".");
+    await git(placement.path, "commit", "-m", "Released");
+    const candidate = await git(placement.path, "rev-parse", "HEAD");
+    const released = await Effect.runPromise(
+      h.commands.git.releaseOutput(
+        { path: placement.path, branch: placement.branch, baseCommit: base },
+        candidate,
+      ),
+    );
+    assert.equal(released.state, "completed");
+    const reason = "Reviewed before release.";
+    const steps = [
+      ...finishedSteps(
+        placement,
+        "/sessions/released.jsonl",
+        {
+          kind: "implementation" as const,
+          status: "completed" as const,
+          outcome: "changed" as const,
+          commit: candidate,
+          changedFiles: ["released.txt"],
+          summary: "Released.",
+          evidence: [],
+          findings: [],
+        },
+        candidate,
+      ),
+      (s: Workstream) =>
+        checkpointCleanup(
+          s,
+          key(),
+          { state: "blocked", workerClosed: true, expectedHead: candidate, error: "Interrupted." },
+          T0,
+        ),
+      (s: Workstream) =>
+        checkpointOutputRelease(
+          s,
+          key(),
+          { state: "pending", expectedHead: candidate, reason },
+          T0,
+        ),
+      (s: Workstream) =>
+        checkpointOutputRelease(
+          s,
+          key(),
+          { state: "completed", expectedHead: candidate, reason },
+          T0,
+        ),
+    ];
+    let releaseCalls = 0;
+    const commands: CanonicalCommandPorts = {
+      ...h.commands,
+      git: {
+        ...h.commands.git,
+        releaseOutput: (...args) => {
+          releaseCalls += 1;
+          return h.commands.git.releaseOutput(...args);
+        },
+      },
+    };
+    await seeded(
+      h,
+      baseAttempt(ATTEMPT, { baseRevision: base }),
+      steps,
+      (runtime) =>
+        Effect.gen(function* () {
+          const before = yield* runtime.read();
+          const conflicting = yield* Effect.result(
+            runtime.releaseOutput({ attemptId: ATTEMPT, reason: "Different reason." }),
+          );
+          assert.equal(conflicting._tag, "Failure");
+          assert.deepEqual(yield* runtime.read(), before);
+          assert.equal(releaseCalls, 0);
+
+          const repaired = yield* runtime.releaseOutput({ attemptId: ATTEMPT, reason });
+          assert.equal(repaired.tasks[0]?.attempts[0]?.cleanup?.state, "completed");
+          assert.equal(repaired.tasks[0]?.attempts[0]?.outputRelease?.reason, reason);
+          assert.equal(releaseCalls, 0);
+        }),
+      undefined,
+      commands,
+    );
+  });
+});
+
 void test("retained candidate integration resolves only the clean current destination HEAD", async () => {
   await withHarness(async (h) => {
     const { base, placement } = await isolated(h);

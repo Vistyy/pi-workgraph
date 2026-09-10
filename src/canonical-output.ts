@@ -187,15 +187,16 @@ export function releaseMaintainedOutput<E, R>(
         "release output",
         `Attempt ${input.attemptId} has no exact closed isolated output.`,
       );
-    if (attempt.outputRelease?.state === "completed")
-      return yield* completeReleasedCleanup(control, state, located.key, expectedHead);
-    const reason = attempt.outputRelease?.reason ?? input.reason;
-    if (attempt.outputRelease !== undefined && reason !== input.reason)
+    const release = attempt.outputRelease;
+    const reason = release?.reason ?? input.reason;
+    if (release !== undefined && reason !== input.reason)
       return yield* failure(
         "release output",
         `Attempt ${input.attemptId} has a release checkpoint with another reason.`,
       );
-    if (attempt.outputRelease === undefined) {
+    if (release?.state === "completed")
+      return yield* completeReleasedCleanup(control, state, located.key, expectedHead);
+    if (release === undefined) {
       const now = yield* control.now;
       state = yield* control.commit("checkpoint pending output release", located.key, (current) =>
         checkpointOutputRelease(
@@ -257,13 +258,7 @@ function completeReleasedCleanup<E, R>(
   completedAt?: string,
 ): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
   return Effect.gen(function* () {
-    const cleanup = exactAttempt(state, key.attemptId).attempt.cleanup;
-    if (cleanup?.state === "completed") return state;
-    if (cleanup?.workerClosed !== true || cleanup.expectedHead !== expectedHead)
-      return yield* failure(
-        "release output",
-        `Attempt ${key.attemptId} released output does not match its closed cleanup checkpoint.`,
-      );
+    if (exactAttempt(state, key.attemptId).attempt.cleanup?.state === "completed") return state;
     const now = completedAt ?? (yield* control.now);
     return yield* control.commit("complete released output cleanup", key, (current) =>
       checkpointCleanup(
