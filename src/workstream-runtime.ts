@@ -28,7 +28,6 @@ import type {
   CandidateApplicationDestination,
   CandidateApplicationSource,
   GitFailure,
-  GitRepository,
   ValidatedCandidate,
   WorktreePlacement,
 } from "./git.js";
@@ -59,23 +58,26 @@ import type { WorkgraphRegistry } from "./registry.js";
 import type { WorkerIdentity } from "./types.js";
 import type {
   CandidateLineage,
+  HumanInputReceipt,
   StoreEffect,
   WorkAssignment,
   WorkAttempt,
   WorkResult,
   WorkstreamState,
-  WorkstreamStoreEffects,
   WorkstreamStoreError,
 } from "./workstream.js";
+import { WorkstreamStoreEffects } from "./workstream.js";
 import { LeaseDecisionRequiredError, type LeaseOwner } from "./workstream-persistence.js";
 import {
   acquireRuntimeLease,
+  liveWorkerSessionReader,
   type PiObservationError,
+  type RepositoryGateway,
   type RuntimeHostError,
   type RuntimeLeaseHandle,
   RuntimeRegistryError,
-  type RuntimeWorkerPort,
-  runtimePi,
+  type WorkerHost,
+  type WorkerSessionReader,
 } from "./workstream-runtime-services.js";
 import { WorkstreamStoreOperationError } from "./workstream-state.js";
 import { outputDisposition } from "./workstream-transitions.js";
@@ -83,6 +85,8 @@ import { outputDisposition } from "./workstream-transitions.js";
 export interface WorkstreamLaunch {
   workspaceId: string;
 }
+export type QueueAssignment = Parameters<WorkstreamStoreEffects["enqueue"]>[0];
+
 export interface QueueOptions {
   selection?: SelectionRequest;
   continuationOf?: string;
@@ -94,6 +98,14 @@ type QueueBase = {
   revision?: string;
   candidate?: CandidateLineage;
 };
+
+export interface RuntimeAuthorizationSelection {
+  readonly authority: { readonly receiptId: string; readonly intentVersion: number };
+  readonly latestObservedInput?: {
+    readonly receiptId: string;
+    readonly source: "interactive" | "rpc";
+  };
+}
 
 export interface RuntimeOwnership {
   registry?: WorkgraphRegistry;
@@ -143,32 +155,31 @@ export type RuntimeEffect<A, E = RuntimeError> = Effect.Effect<
   FileSystem.FileSystem | Path.Path
 >;
 
-export interface WorkstreamRuntimeEffects {
-  readonly submit: <A, E>(effect: RuntimeEffect<A, E>) => RuntimeEffect<A, E | RuntimeError>;
-  readonly queue: (
-    input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
-    options?: QueueOptions,
-  ) => RuntimeEffect<WorkstreamState>;
-  readonly reconcile: RuntimeEffect<WorkstreamState>;
-  readonly apply: (attemptId: string) => RuntimeEffect<WorkstreamState>;
-  readonly releaseOutput: (attemptId: string, reason: string) => RuntimeEffect<WorkstreamState>;
-  readonly steer: (attemptId: string, instruction: string) => RuntimeEffect<void>;
-  readonly cancel: (attemptId: string) => RuntimeEffect<void>;
-  readonly close: Effect.Effect<void, RuntimeRegistryError>;
-}
-
 /** Ready scoped owner for serialized work and its fenced registry lease. */
 export class WorkstreamRuntime {
+  static readonly create = (...args: Parameters<typeof WorkstreamStoreEffects.create>) =>
+    WorkstreamStoreEffects.create(...args);
+  static readonly open = (...args: Parameters<typeof WorkstreamStoreEffects.open>) =>
+    WorkstreamStoreEffects.open(...args);
+  static readonly inspect = (...args: Parameters<typeof WorkstreamStoreEffects.inspect>) =>
+    WorkstreamStoreEffects.inspect(...args);
+  static readonly inspectReattachment = (
+    ...args: Parameters<typeof WorkstreamStoreEffects.inspectForReattachment>
+  ) => WorkstreamStoreEffects.inspectForReattachment(...args);
+  static readonly migrateLegacy = (
+    ...args: Parameters<typeof WorkstreamStoreEffects.migrateLegacy>
+  ) => WorkstreamStoreEffects.migrateLegacy(...args);
+
   private readonly deliveryOwner = randomUUID();
   private readonly onState: (state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>;
   private closed = false;
   private reconciliationError: string | undefined;
-  readonly effects: WorkstreamRuntimeEffects;
-
+  readonly statePath: string;
   private constructor(
-    readonly store: WorkstreamStoreEffects,
-    readonly repository: GitRepository,
-    readonly workers: RuntimeWorkerPort,
+    private readonly store: WorkstreamStoreEffects,
+    private readonly repository: RepositoryGateway,
+    private readonly workers: WorkerHost,
+    private readonly sessions: WorkerSessionReader,
     readonly launch: WorkstreamLaunch,
     readonly onResult: (
       resultId: string,
@@ -188,28 +199,90 @@ export class WorkstreamRuntime {
     onState: ((state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>) | undefined,
   ) {
     this.onState = onState ?? (() => Effect.void);
-    this.effects = {
-      submit: <A, E>(effect: RuntimeEffect<A, E>) =>
-        this.submit(effect).pipe(Effect.mapError((error) => this.submissionError(error))),
-      queue: (input, options = {}) => this.submit(this.queueEffect(input, options)),
-      reconcile: this.submit(this.reconcileOperation()),
-      apply: (attemptId) => this.submit(this.applyEffect(attemptId)),
-      releaseOutput: (attemptId, reason) =>
-        this.submit(this.releaseOutputEffect(attemptId, reason)),
-      steer: (attemptId, instruction) => this.submit(this.steerEffect(attemptId, instruction)),
-      cancel: (attemptId) => this.submit(this.cancelEffect(attemptId)),
-      close: Effect.suspend(() => this.close(Exit.void)),
-    };
+    this.statePath = store.path;
   }
+
+  /** Check ownership through the serialized boundary without touching aggregate state. */
+  readonly checkLease = (): RuntimeEffect<void> => this.runSerialized(this.ownershipEffect());
+  readonly establishedScope = (): RuntimeEffect<{
+    state: WorkstreamState;
+    authorization: RuntimeAuthorizationSelection;
+  }> =>
+    this.read().pipe(
+      Effect.flatMap((state) =>
+        this.runtimeSync("establish workstream scope", () => {
+          const intent = required(state.intents.at(-1), "workstream intent");
+          if (intent.version === 0)
+            throw new Error(
+              "Current scope is not established. Record it explicitly with workgraph_intent before delegation.",
+            );
+          const selected = selectCurrentAuthority(state);
+          const authorization: RuntimeAuthorizationSelection =
+            selected.latestObservedInput === undefined
+              ? { authority: { receiptId: selected.receiptId, intentVersion: intent.version } }
+              : {
+                  authority: { receiptId: selected.receiptId, intentVersion: intent.version },
+                  latestObservedInput: selected.latestObservedInput,
+                };
+          return { state, authorization };
+        }),
+      ),
+    );
+  /** Read the canonical aggregate through the serialized, lease-fenced boundary. */
+  readonly read = (): RuntimeEffect<WorkstreamState> => this.commandStoreEffect(this.store.load());
+  readonly readAttempt = (attemptId: string): RuntimeEffect<WorkAttempt> =>
+    this.read().pipe(
+      Effect.flatMap((state) =>
+        this.runtimeSync("read exact attempt", () => {
+          const attempt = state.attempts.find((item) => item.id === attemptId);
+          if (attempt === undefined) throw new Error(`Unknown exact attempt ${attemptId}.`);
+          return attempt;
+        }),
+      ),
+    );
+  readonly queue = (
+    input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
+    options: QueueOptions = {},
+  ): RuntimeEffect<WorkstreamState> => this.applicationCommand(this.queueEffect(input, options));
+  readonly reconcile = (): RuntimeEffect<WorkstreamState> =>
+    this.applicationCommand(this.reconcileOperation());
+  readonly apply = (attemptId: string): RuntimeEffect<WorkstreamState> =>
+    this.applicationCommand(this.applyEffect(attemptId));
+  readonly releaseOutput = (attemptId: string, reason: string): RuntimeEffect<WorkstreamState> =>
+    this.applicationCommand(this.releaseOutputEffect(attemptId, reason));
+  readonly steer = (attemptId: string, instruction: string): RuntimeEffect<void> =>
+    this.applicationCommand(this.steerEffect(attemptId, instruction));
+  readonly cancel = (attemptId: string): RuntimeEffect<void> =>
+    this.applicationCommand(this.cancelEffect(attemptId));
+  readonly recordInput = (
+    receipt: Parameters<WorkstreamStoreEffects["recordInputEvent"]>[0],
+  ): RuntimeEffect<{ state: WorkstreamState; receipt: HumanInputReceipt }> =>
+    this.commandStoreEffect(this.store.recordInputEvent(receipt));
+  readonly reviseIntent = (
+    input: Parameters<WorkstreamStoreEffects["reviseIntent"]>[0],
+  ): RuntimeEffect<WorkstreamState> => this.commandStoreEffect(this.store.reviseIntent(input));
+  readonly setLifecycle = (
+    input: Parameters<WorkstreamStoreEffects["setLifecycle"]>[0],
+  ): RuntimeEffect<WorkstreamState> => this.commandStoreEffect(this.store.setLifecycle(input));
+  readonly complete = (
+    input: Parameters<WorkstreamStoreEffects["complete"]>[0],
+  ): RuntimeEffect<WorkstreamState> => this.commandStoreEffect(this.store.complete(input));
+  /** Record a cancellation request without performing native interruption or cleanup. */
+  readonly requestCancellation = (attemptId: string): RuntimeEffect<WorkstreamState> =>
+    this.commandStoreEffect(this.store.cancelAttempt(attemptId));
+  readonly close: Effect.Effect<void, RuntimeRegistryError> = Effect.suspend(() =>
+    this.closeScope(Exit.void),
+  );
 
   static acquire(
     store: WorkstreamStoreEffects,
-    repository: GitRepository,
-    workers: RuntimeWorkerPort,
+    repository: RepositoryGateway,
+    workers: WorkerHost,
     launch: WorkstreamLaunch,
     onResult: (resultId: string, state: WorkstreamState) => Effect.Effect<void, RuntimeHostError>,
     onError: (error: Error) => Effect.Effect<void, RuntimeHostError>,
     ownership: RuntimeOwnership = {},
+    sessions: WorkerSessionReader = liveWorkerSessionReader,
   ): RuntimeEffect<WorkstreamRuntime> {
     return Effect.gen(function* () {
       const scope = yield* Scope.make("sequential");
@@ -237,6 +310,7 @@ export class WorkstreamRuntime {
           store,
           repository,
           workers,
+          sessions,
           launch,
           onResult,
           onError,
@@ -269,7 +343,7 @@ export class WorkstreamRuntime {
     });
   }
 
-  private submit<T, E>(effect: RuntimeEffect<T, E>): RuntimeEffect<T, E | RuntimeError> {
+  private runSerialized<T, E>(effect: RuntimeEffect<T, E>): RuntimeEffect<T, E | RuntimeError> {
     return Effect.suspend(() => {
       if (this.closed)
         return Effect.fail(new RuntimeStoppedError({ message: "Workstream runtime is stopped." }));
@@ -299,7 +373,9 @@ export class WorkstreamRuntime {
     });
   }
 
-  private close(exit: Exit.Exit<unknown, RuntimeError>): Effect.Effect<void, RuntimeRegistryError> {
+  private closeScope(
+    exit: Exit.Exit<unknown, RuntimeError>,
+  ): Effect.Effect<void, RuntimeRegistryError> {
     return Scope.close(this.scope, exit).pipe(
       Effect.catchCause((cause) =>
         Effect.fail(
@@ -323,6 +399,25 @@ export class WorkstreamRuntime {
       try: run,
       catch: (cause) => new RuntimeOperationError({ operation, cause }),
     });
+  }
+
+  private commandStoreEffect<A>(effect: StoreEffect<A>): RuntimeEffect<A> {
+    return this.applicationCommand(effect);
+  }
+
+  private applicationCommand<A, E extends RuntimeError>(
+    effect: RuntimeEffect<A, E>,
+  ): RuntimeEffect<A, E | RuntimeError> {
+    return this.runSerialized(effect).pipe(
+      Effect.mapError((error) => {
+        if (!(error instanceof WorkstreamStoreOperationError)) return error;
+        if (error.cause instanceof LeaseDecisionRequiredError) return error.cause;
+        return new RuntimeOperationError({
+          operation: "application store command",
+          cause: error.cause,
+        });
+      }),
+    );
   }
 
   private storeEffect<A>(
@@ -375,7 +470,7 @@ export class WorkstreamRuntime {
       this.closed = true;
       return this.onError(fatal).pipe(
         Effect.ignore,
-        Effect.andThen(this.close(Exit.fail(fatal))),
+        Effect.andThen(this.closeScope(Exit.fail(fatal))),
         Effect.asVoid,
       );
     });
@@ -383,7 +478,7 @@ export class WorkstreamRuntime {
 
   private reconciliationLoop(): RuntimeEffect<void> {
     return Effect.sleep("1 second").pipe(
-      Effect.andThen(this.submit(this.reconcileOperation())),
+      Effect.andThen(this.runSerialized(this.reconcileOperation())),
       Effect.tap(() => Effect.sync(() => (this.reconciliationError = undefined))),
       Effect.catchCauseIf(
         (cause) => !Cause.hasInterruptsOnly(cause),
@@ -404,12 +499,6 @@ export class WorkstreamRuntime {
       Effect.repeat(Schedule.forever),
       Effect.asVoid,
     );
-  }
-
-  private submissionError<E>(error: E | RuntimeError): E | RuntimeError {
-    return error instanceof WorkstreamStoreOperationError
-      ? new RuntimeOperationError({ operation: "submitted store operation", cause: error.cause })
-      : error;
   }
 
   private queueEffect(
@@ -746,7 +835,7 @@ export class WorkstreamRuntime {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const worker = required(attempt.worker, "worker identity");
-        const pi = runtimePi;
+        const pi = this.sessions;
         const started = pi.started(worker.sessionFile, state.id, attempt.id);
         if (started && attempt.submission !== "started")
           yield* this.storeEffect((store) => store.markSubmission(attempt.id, "started"));
@@ -902,7 +991,7 @@ export class WorkstreamRuntime {
           workerCwd,
           baseRevision,
         );
-        const pi = runtimePi;
+        const pi = this.sessions;
         const sessionFile = yield* pi.createSession(sessionRequest);
         yield* this.storeEffect((store) => store.recordSessionFile(attempt.id, sessionFile));
         const models = required(attempt.models, "assignment models");
@@ -936,7 +1025,7 @@ export class WorkstreamRuntime {
         const resultId = attempt.resultId ?? `result-${attempt.id}`;
         if (!state.results.some((item) => item.id === resultId))
           yield* this.retainNewResult(state, attempt, assignment, sessionFile, resultId);
-        const effectiveModels = yield* runtimePi.models(sessionFile, generation);
+        const effectiveModels = yield* this.sessions.models(sessionFile, generation);
         yield* this.storeEffect((store) =>
           store.settleAttempt({ id: attempt.id, resultId, effectiveModels }),
         );
@@ -955,7 +1044,7 @@ export class WorkstreamRuntime {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
         const generation = { runId: state.id, nodeId: attempt.id };
-        const pi = runtimePi;
+        const pi = this.sessions;
         const read = yield* pi.readReport(sessionFile, generation);
         const base = {
           id: resultId,
@@ -1825,6 +1914,19 @@ function findAssignment(state: WorkstreamState, id: string): WorkAssignment {
     state.assignments.find((item) => item.id === id),
     `assignment ${id}`,
   );
+}
+function selectCurrentAuthority(state: WorkstreamState) {
+  const intent = required(state.intents.at(-1), "workstream intent");
+  const latestReceipt = state.inputs.at(-1);
+  const selectedReceipt = state.inputs.findLast((receipt) =>
+    intent.authorityReceiptIds.includes(receipt.id),
+  );
+  const receiptId = required(selectedReceipt?.id, "current intent authority receipt");
+  if (latestReceipt === undefined || latestReceipt.id === receiptId) return { receiptId };
+  return {
+    receiptId,
+    latestObservedInput: { receiptId: latestReceipt.id, source: latestReceipt.source },
+  };
 }
 function required<T>(value: T | undefined, label: string): T {
   if (value === undefined) throw new Error(`Missing ${label}.`);

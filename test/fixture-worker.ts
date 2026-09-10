@@ -95,7 +95,7 @@ export class Worker {
   failBeforePane = false;
   failBeforeSubmission = false;
   failAfterSubmission = false;
-  // oxlint-disable-next-line effecttsgo/async-function -- The controlled worker callback preserves the existing Promise-based RuntimeWorkerPort seam.
+  // oxlint-disable-next-line effecttsgo/async-function -- The controlled worker callback preserves the existing Promise-based WorkerHost seam.
   onWork: (request: FixtureLaunchRequest) => Promise<WorkerReport | undefined> = async () =>
     researchReport;
   onInspect: () => void = () => {};

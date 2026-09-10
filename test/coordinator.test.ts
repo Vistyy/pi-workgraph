@@ -669,7 +669,7 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
         { registry, owner: otherOwner, clock },
       ).pipe(Effect.provide(liveLayer)),
     );
-    await Effect.runPromise(competing.effects.submit(Effect.void).pipe(Effect.provide(liveLayer)));
+    await Effect.runPromise(competing.checkLease().pipe(Effect.provide(liveLayer)));
 
     const current = await createUnattachedWorkstream(f, "current-work");
     f.session.appendCustomEntry("pi-workgraph-workstream", { path: current.store.path });
@@ -782,15 +782,13 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
 
     await assert.rejects(
       Effect.runPromise(
-        competing.effects
-          .submit(
-            retainedStore.setLifecycle({ state: "active", reason: "stale owner must not mutate" }),
-          )
+        competing
+          .setLifecycle({ state: "active", reason: "stale owner must not mutate" })
           .pipe(Effect.provide(liveLayer)),
       ),
       /live lease/,
     );
-    await Effect.runPromise(competing.effects.close);
+    await Effect.runPromise(competing.close);
     competing = undefined;
     assert.deepEqual(leaseIdentity(leaseRow(retainedStore.path)), replacementLease);
 
@@ -800,7 +798,7 @@ void test("registered adoption uses authoritative snapshots and fences a stale e
     assert.deepEqual(await repositorySnapshot(), unchangedResources);
   } finally {
     if (previousEnvironment !== undefined) restoreFixtureEnvironment(previousEnvironment);
-    if (competing !== undefined) await Effect.runPromise(competing.effects.close);
+    if (competing !== undefined) await Effect.runPromise(competing.close);
     registry.close();
     // dispose awaits the registered shutdown before deleting the fixture directory.
     await f.dispose();
