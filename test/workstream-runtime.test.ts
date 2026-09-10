@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { Effect } from "effect";
+import { Deferred, Effect } from "effect";
 import { TestClock } from "effect/testing";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -16,9 +16,14 @@ import { liveLayer } from "../src/node-platform.js";
 import { processEffect } from "../src/process.js";
 import { WorkgraphRegistry } from "../src/registry.js";
 import { type WorkstreamState, WorkstreamStoreEffects } from "../src/workstream.js";
-import { type Lease, SqliteWorkstreamDatabase } from "../src/workstream-persistence.js";
+import {
+  type Lease,
+  LeaseDecisionRequiredError,
+  SqliteWorkstreamDatabase,
+} from "../src/workstream-persistence.js";
 import {
   type RuntimeEffect,
+  RuntimeOperationError,
   type RuntimeOwnership,
   WorkstreamRuntime,
 } from "../src/workstream-runtime.js";
@@ -2448,6 +2453,231 @@ await test("fatal heartbeat loss releases ownership and permits a clean reattach
     await runRuntime(reattached.read());
     await runRuntime(active.close);
   } finally {
+    await f.dispose();
+  }
+});
+
+await test("supported runtime interruption cancels queued work and awaits running interruption", async (t) => {
+  const f = await fixture();
+  const entered = Deferred.makeUnsafe<void>();
+  const interrupted = Deferred.makeUnsafe<void>();
+  const releaseInterruption = Deferred.makeUnsafe<void>();
+  let queuedRan = false;
+  let runningSettled = false;
+  try {
+    const active = await f.runtime();
+    await runRuntime(active.read());
+    t.mock.method(f.store, "load", () =>
+      Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.ensuring(
+          Effect.uninterruptible(
+            Deferred.succeed(interrupted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseInterruption)),
+            ),
+          ),
+        ),
+      ),
+    );
+    t.mock.method(f.store, "reviseIntent", () =>
+      Effect.sync(() => {
+        queuedRan = true;
+        throw new Error("queued operation ran");
+      }),
+    );
+    const runningController = new AbortController();
+    const running = Effect.runPromise(active.read().pipe(Effect.provide(liveLayer)), {
+      signal: runningController.signal,
+    });
+    void running.then(
+      () => {
+        runningSettled = true;
+      },
+      () => {
+        runningSettled = true;
+      },
+    );
+    await Effect.runPromise(Deferred.await(entered).pipe(Effect.timeout("5 seconds")));
+
+    const queuedController = new AbortController();
+    const queued = Effect.runPromise(
+      active
+        .reviseIntent({ authorityReceiptId: "queued", statement: "queued", constraints: [] })
+        .pipe(Effect.provide(liveLayer)),
+      { signal: queuedController.signal },
+    );
+    await Effect.runPromise(Effect.sleep("1 millis"));
+    queuedController.abort();
+    await assert.rejects(queued, /abort|interrupt/i);
+    assert.equal(queuedRan, false);
+
+    runningController.abort();
+    await Effect.runPromise(Deferred.await(interrupted).pipe(Effect.timeout("5 seconds")));
+    assert.equal(runningSettled, false);
+    await Effect.runPromise(Deferred.succeed(releaseInterruption, undefined));
+    await assert.rejects(running, /abort|interrupt/i);
+  } finally {
+    t.mock.restoreAll();
+    await f.dispose();
+  }
+});
+
+await test("supported runtime close rejects queued work and releases its lease after finalizers settle", async (t) => {
+  const f = await fixture();
+  const entered = Deferred.makeUnsafe<void>();
+  const finalizerEntered = Deferred.makeUnsafe<void>();
+  const releaseFinalizer = Deferred.makeUnsafe<void>();
+  let queuedRan = false;
+  let closeSettled = false;
+  try {
+    const active = await f.runtime();
+    await runRuntime(active.read());
+    t.mock.method(f.store, "load", () =>
+      Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.ensuring(
+          Effect.uninterruptible(
+            Deferred.succeed(finalizerEntered, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseFinalizer)),
+            ),
+          ),
+        ),
+      ),
+    );
+    t.mock.method(f.store, "reviseIntent", () =>
+      Effect.sync(() => {
+        queuedRan = true;
+        throw new Error("queued operation ran");
+      }),
+    );
+    const running = runRuntime(active.read());
+    void running.catch(() => undefined);
+    await Effect.runPromise(Deferred.await(entered).pipe(Effect.timeout("5 seconds")));
+    const queued = runRuntime(
+      active.reviseIntent({ authorityReceiptId: "queued", statement: "queued", constraints: [] }),
+    );
+    void queued.catch(() => undefined);
+    await Effect.runPromise(Effect.sleep("1 millis"));
+    const leaseBeforeClose = SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+      database.db.prepare("SELECT * FROM lease WHERE singleton=1").get(),
+    );
+    const close = runRuntime(active.close);
+    void close.then(
+      () => {
+        closeSettled = true;
+      },
+      () => {
+        closeSettled = true;
+      },
+    );
+    await Effect.runPromise(Deferred.await(finalizerEntered).pipe(Effect.timeout("5 seconds")));
+    assert.deepEqual(
+      SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+        database.db.prepare("SELECT * FROM lease WHERE singleton=1").get(),
+      ),
+      leaseBeforeClose,
+    );
+    assert.equal(closeSettled, false);
+    assert.equal(queuedRan, false);
+
+    await Effect.runPromise(Deferred.succeed(releaseFinalizer, undefined));
+    await close;
+    await assert.rejects(running, /stopped|interrupt/i);
+    await assert.rejects(queued, /stopped|interrupt/i);
+    assert.equal(
+      SqliteWorkstreamDatabase.use(f.store.path, (database) =>
+        database.db.prepare("SELECT 1 FROM lease WHERE singleton=1").get(),
+      ),
+      undefined,
+    );
+  } finally {
+    await Effect.runPromise(Deferred.succeed(releaseFinalizer, undefined));
+    t.mock.restoreAll();
+    await f.dispose();
+  }
+});
+
+await test("public runtime commands translate store failures at the application boundary", async (t) => {
+  const f = await fixture();
+  const cause = new Error("store boundary failure");
+  const failure = new WorkstreamStoreOperationError({
+    code: "workstream_store_operation_failed",
+    message: cause.message,
+    cause,
+  });
+  const assertTranslated = async (effect: RuntimeEffect<unknown>) => {
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Assertion validators receive an unknown rejection and check its stable runtime error boundary.
+    await assert.rejects(runRuntime(effect), (error: unknown) => {
+      assert.ok(error instanceof RuntimeOperationError);
+      assert.equal(error.cause, cause);
+      return true;
+    });
+  };
+  try {
+    const active = await f.runtime();
+    t.mock.method(f.store, "load", () => Effect.fail(failure));
+    for (const effect of [
+      active.read(),
+      active.reconcile(),
+      active.apply("missing"),
+      active.releaseOutput("missing", "inspect"),
+      active.steer("missing", "inspect"),
+      active.cancel("missing"),
+    ])
+      await assertTranslated(effect);
+    t.mock.restoreAll();
+
+    t.mock.method(f.store, "enqueue", () => Effect.fail(failure));
+    await assertTranslated(active.queue(research("store-error")));
+    t.mock.restoreAll();
+    t.mock.method(f.store, "recordInputEvent", () => Effect.fail(failure));
+    await assertTranslated(
+      active.recordInput({ ...f.owner, source: "interactive", text: "store error" }),
+    );
+    t.mock.restoreAll();
+    t.mock.method(f.store, "reviseIntent", () => Effect.fail(failure));
+    await assertTranslated(
+      active.reviseIntent({
+        authorityReceiptId: "receipt",
+        statement: "store error",
+        constraints: [],
+      }),
+    );
+    t.mock.restoreAll();
+    t.mock.method(f.store, "setLifecycle", () => Effect.fail(failure));
+    await assertTranslated(active.setLifecycle({ state: "suspended", reason: "store error" }));
+    t.mock.restoreAll();
+    t.mock.method(f.store, "complete", () => Effect.fail(failure));
+    await assertTranslated(
+      active.complete({ conclusion: "store error", evidence: [], limitations: [] }),
+    );
+    t.mock.restoreAll();
+    t.mock.method(f.store, "cancelAttempt", () => Effect.fail(failure));
+    await assertTranslated(active.requestCancellation("missing"));
+  } finally {
+    t.mock.restoreAll();
+    await f.dispose();
+  }
+});
+
+await test("store-boundary translation preserves lease-decision identity", async (t) => {
+  const f = await fixture();
+  const leaseError = new LeaseDecisionRequiredError("lease decision is required");
+  try {
+    const active = await f.runtime();
+    t.mock.method(f.store, "load", () =>
+      Effect.fail(
+        new WorkstreamStoreOperationError({
+          code: "workstream_store_operation_failed",
+          message: leaseError.message,
+          cause: leaseError,
+        }),
+      ),
+    );
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Assertion validators receive an unknown rejection and check exact lease identity.
+    await assert.rejects(runRuntime(active.read()), (error: unknown) => error === leaseError);
+  } finally {
+    t.mock.restoreAll();
     await f.dispose();
   }
 });

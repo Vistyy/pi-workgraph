@@ -177,8 +177,8 @@ export class WorkstreamRuntime {
   readonly statePath: string;
   private constructor(
     private readonly store: WorkstreamStoreEffects,
-    readonly repository: RepositoryGateway,
-    readonly workers: WorkerHost,
+    private readonly repository: RepositoryGateway,
+    private readonly workers: WorkerHost,
     private readonly sessions: WorkerSessionReader,
     readonly launch: WorkstreamLaunch,
     readonly onResult: (
@@ -243,17 +243,17 @@ export class WorkstreamRuntime {
   readonly queue = (
     input: Parameters<WorkstreamStoreEffects["enqueue"]>[0],
     options: QueueOptions = {},
-  ): RuntimeEffect<WorkstreamState> => this.runSerialized(this.queueEffect(input, options));
+  ): RuntimeEffect<WorkstreamState> => this.applicationCommand(this.queueEffect(input, options));
   readonly reconcile = (): RuntimeEffect<WorkstreamState> =>
-    this.runSerialized(this.reconcileOperation());
+    this.applicationCommand(this.reconcileOperation());
   readonly apply = (attemptId: string): RuntimeEffect<WorkstreamState> =>
-    this.runSerialized(this.applyEffect(attemptId));
+    this.applicationCommand(this.applyEffect(attemptId));
   readonly releaseOutput = (attemptId: string, reason: string): RuntimeEffect<WorkstreamState> =>
-    this.runSerialized(this.releaseOutputEffect(attemptId, reason));
+    this.applicationCommand(this.releaseOutputEffect(attemptId, reason));
   readonly steer = (attemptId: string, instruction: string): RuntimeEffect<void> =>
-    this.runSerialized(this.steerEffect(attemptId, instruction));
+    this.applicationCommand(this.steerEffect(attemptId, instruction));
   readonly cancel = (attemptId: string): RuntimeEffect<void> =>
-    this.runSerialized(this.cancelEffect(attemptId));
+    this.applicationCommand(this.cancelEffect(attemptId));
   readonly recordInput = (
     receipt: Parameters<WorkstreamStoreEffects["recordInputEvent"]>[0],
   ): RuntimeEffect<{ state: WorkstreamState; receipt: HumanInputReceipt }> =>
@@ -402,15 +402,21 @@ export class WorkstreamRuntime {
   }
 
   private commandStoreEffect<A>(effect: StoreEffect<A>): RuntimeEffect<A> {
+    return this.applicationCommand(effect);
+  }
+
+  private applicationCommand<A, E extends RuntimeError>(
+    effect: RuntimeEffect<A, E>,
+  ): RuntimeEffect<A, E | RuntimeError> {
     return this.runSerialized(effect).pipe(
-      Effect.mapError((error) =>
-        error instanceof WorkstreamStoreOperationError
-          ? new RuntimeOperationError({
-              operation: "application store command",
-              cause: error.cause,
-            })
-          : error,
-      ),
+      Effect.mapError((error) => {
+        if (!(error instanceof WorkstreamStoreOperationError)) return error;
+        if (error.cause instanceof LeaseDecisionRequiredError) return error.cause;
+        return new RuntimeOperationError({
+          operation: "application store command",
+          cause: error.cause,
+        });
+      }),
     );
   }
 
