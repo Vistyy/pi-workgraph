@@ -1177,13 +1177,27 @@ void test("one shutdown boundary owns heartbeat, explicit close, close races, an
         const beating = yield* acquire(f, COORDINATOR, { heartbeatInterval: "10 millis" });
         const lease = yield* store.observeLease();
         assert.ok(lease !== undefined);
+        const projectedRevision = (yield* beating.snapshot()).revision;
         rawUpdate(store.path, "UPDATE workstream SET revision=? WHERE singleton=1", 99);
         yield* beating.checkOwnership();
+        const inspection = yield* beating.inspectionSnapshot();
+        assert.equal(inspection.workstream.revision, projectedRevision);
         const readFailure = yield* Effect.flip(beating.read());
         assert.ok(readFailure instanceof CanonicalStoreInvalidError);
         assert.ok(Option.isSome(yield* renews(store, lease.heartbeatAt)), "expected a heartbeat");
         yield* beating.close();
         assert.equal(yield* store.observeLease(), undefined);
+        rawUpdate(
+          store.path,
+          "UPDATE workstream SET revision=? WHERE singleton=1",
+          projectedRevision,
+        );
+
+        const stale = yield* acquire(f, COORDINATOR, { heartbeatInterval: "5 seconds" });
+        yield* releaseLeaseExternally(f);
+        const staleInspection = yield* Effect.flip(stale.inspectionSnapshot());
+        assert.ok(staleInspection instanceof CanonicalStoreConflictError);
+        yield* stale.close();
       }),
     );
   });

@@ -407,10 +407,15 @@ export class CanonicalRuntime {
 
   readonly inspectionSnapshot = (): CanonicalRuntimeEffect<CanonicalRuntimeInspectionSnapshot> =>
     this.serialized(
-      Effect.all({
-        workstream: Ref.get(this.committed),
-        reconciliation: this.scheduler.inspectionSnapshot(),
-      }).pipe(Effect.map((snapshot) => structuredClone(snapshot))),
+      Effect.gen(
+        function* (this: CanonicalRuntime) {
+          yield* this.store.checkLease(this.lease);
+          return {
+            workstream: structuredClone(yield* Ref.get(this.committed)),
+            reconciliation: yield* this.scheduler.inspectionSnapshot(),
+          };
+        }.bind(this),
+      ),
     );
 
   /** Rebuild transient reconciliation state from one fenced aggregate read. */

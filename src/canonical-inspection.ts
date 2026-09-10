@@ -103,30 +103,69 @@ export class CanonicalInspectionError extends Data.TaggedError("CanonicalInspect
     | "cursor_mismatch"
     | "invalid_selector"
     | "unknown_handle"
-    | "notification_too_large";
+    | "notification_too_large"
+    | "internal_failure";
   readonly message: string;
 }> {}
 
-export interface CanonicalInspectionView {
-  readonly section: InspectSection;
+interface InspectionViewBase<Section extends InspectSection, Summary> {
+  readonly section: Section;
   readonly workstreamId: string;
   readonly revision: number;
-  readonly summary: unknown;
-  readonly content?: {
+  readonly summary: Summary;
+  readonly next?: Omit<Selector, "section"> & {
+    readonly section: Section;
+    readonly cursor: string;
+  };
+}
+
+interface TextInspectionView<Section extends InspectSection, Summary>
+  extends InspectionViewBase<Section, Summary> {
+  readonly content: {
     readonly text: string;
     readonly encoding: "utf16-code-units";
     readonly returnedChars: number;
     readonly totalChars: number;
     readonly truncated: boolean;
   };
-  readonly items?: {
-    readonly values: readonly unknown[];
+}
+
+interface ItemInspectionView<Section extends InspectSection, Summary, Item>
+  extends InspectionViewBase<Section, Summary> {
+  readonly items: {
+    readonly values: readonly Item[];
     readonly returnedItems: number;
     readonly totalItems: number;
     readonly truncated: boolean;
   };
-  readonly next?: Selector & { readonly cursor: string };
 }
+
+type TaskPreview = ReturnType<typeof taskPreview>;
+type AttemptPreview = ReturnType<typeof attemptPreview>;
+type OutcomePreview = ReturnType<typeof outcomePreview>;
+type FrontierPreview = ReturnType<typeof frontierPreview>;
+type OverviewSummary = ReturnType<typeof overviewSummary>;
+type ContextSummary = ReturnType<typeof contextSummary>;
+type CompletionSummary = ReturnType<typeof completionSummary>;
+type RecoverySummary = ReturnType<typeof recoverySummary>;
+type OverviewItem =
+  | ({ readonly record: "task" } & TaskPreview)
+  | ({ readonly record: "reconciliation" } & FrontierPreview);
+type OutcomeArtifactPreview = Outcome["artifacts"][number] & {
+  readonly reference: string;
+  readonly summary: string;
+};
+
+export type CanonicalInspectionView =
+  | ItemInspectionView<"overview", OverviewSummary, OverviewItem>
+  | TextInspectionView<"context", ContextSummary>
+  | TextInspectionView<"completion", CompletionSummary>
+  | ItemInspectionView<"task", TaskPreview, AttemptPreview>
+  | TextInspectionView<"assignment", { readonly taskId: string; readonly kind: Task["kind"] }>
+  | ItemInspectionView<"outcome", OutcomePreview, OutcomeArtifactPreview>
+  | TextInspectionView<"evidence", OutcomePreview>
+  | TextInspectionView<"recovery", RecoverySummary>
+  | TextInspectionView<"report", OutcomePreview>;
 
 interface Selection {
   readonly task?: Task;
@@ -134,12 +173,45 @@ interface Selection {
   readonly outcome?: Outcome;
 }
 
-interface SectionProjection {
-  readonly summary: unknown;
-  readonly text?: string;
-  readonly items?: readonly unknown[];
-}
+type SectionProjection =
+  | {
+      readonly section: "overview";
+      readonly summary: OverviewSummary;
+      readonly items: readonly OverviewItem[];
+    }
+  | { readonly section: "context"; readonly summary: ContextSummary; readonly text: string }
+  | { readonly section: "completion"; readonly summary: CompletionSummary; readonly text: string }
+  | {
+      readonly section: "task";
+      readonly summary: TaskPreview;
+      readonly items: readonly AttemptPreview[];
+    }
+  | {
+      readonly section: "assignment";
+      readonly summary: { readonly taskId: string; readonly kind: Task["kind"] };
+      readonly text: string;
+    }
+  | {
+      readonly section: "outcome";
+      readonly summary: OutcomePreview;
+      readonly items: readonly OutcomeArtifactPreview[];
+    }
+  | { readonly section: "evidence"; readonly summary: OutcomePreview; readonly text: string }
+  | { readonly section: "recovery"; readonly summary: RecoverySummary; readonly text: string }
+  | { readonly section: "report"; readonly summary: OutcomePreview; readonly text: string };
 
+export function inspectCanonical<Section extends InspectSection>(
+  snapshot: CanonicalRuntimeInspectionSnapshot,
+  input: CanonicalInspectionRequest & { readonly section: Section },
+): Effect.Effect<
+  Extract<CanonicalInspectionView, { readonly section: Section }>,
+  CanonicalInspectionError
+>;
+export function inspectCanonical(
+  snapshot: CanonicalRuntimeInspectionSnapshot,
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The implementation validates this external boundary with the exported request schema.
+  input: unknown,
+): Effect.Effect<CanonicalInspectionView, CanonicalInspectionError>;
 export function inspectCanonical(
   snapshot: CanonicalRuntimeInspectionSnapshot,
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The exported TypeBox schema owns this external inspection boundary.
@@ -225,52 +297,115 @@ function inspect(
   const cursor =
     request.cursor === undefined ? initialCursor(workstream, request) : readCursor(request.cursor);
   assertCursor(workstream, request, cursor);
-  const selection = resolveSection(workstream, selector);
-  const projection = projectSection(snapshot, selector.section, selection);
-  const text = projection.text ?? "";
-  const items = projection.items ?? [];
-  if (cursor.textOffset > text.length || cursor.itemOffset > items.length)
+  const projection = projectSection(
+    snapshot,
+    selector.section,
+    resolveSection(workstream, selector),
+  );
+  switch (projection.section) {
+    case "overview":
+      return pageItems(workstream, selector, cursor, projection);
+    case "task":
+      return pageItems(workstream, selector, cursor, projection);
+    case "outcome":
+      return pageItems(workstream, selector, cursor, projection);
+    case "context":
+      return pageText(workstream, selector, cursor, projection);
+    case "completion":
+      return pageText(workstream, selector, cursor, projection);
+    case "assignment":
+      return pageText(workstream, selector, cursor, projection);
+    case "evidence":
+      return pageText(workstream, selector, cursor, projection);
+    case "recovery":
+      return pageText(workstream, selector, cursor, projection);
+    case "report":
+      return pageText(workstream, selector, cursor, projection);
+  }
+}
+
+type ItemProjection = Extract<SectionProjection, { readonly items: readonly object[] }>;
+type TextProjection = Extract<SectionProjection, { readonly text: string }>;
+
+function pageItems<Projection extends ItemProjection>(
+  workstream: Workstream,
+  selector: Selector,
+  cursor: CursorPayload,
+  projection: Projection,
+): ItemInspectionView<Projection["section"], Projection["summary"], Projection["items"][number]> {
+  if (cursor.textOffset !== 0 || cursor.itemOffset > projection.items.length)
     fail("cursor_mismatch", "Cursor offsets do not match the selected content.");
-  const textValue = text.slice(cursor.textOffset, cursor.textOffset + cursor.maxChars);
-  const itemValues = items.slice(cursor.itemOffset, cursor.itemOffset + cursor.maxItems);
-  const nextTextOffset = cursor.textOffset + textValue.length;
-  const nextItemOffset = cursor.itemOffset + itemValues.length;
-  const textTruncated = nextTextOffset < text.length;
-  const itemsTruncated = nextItemOffset < items.length;
-  const view: CanonicalInspectionView = {
-    section: selector.section,
+  const values = projection.items.slice(cursor.itemOffset, cursor.itemOffset + cursor.maxItems);
+  const nextOffset = cursor.itemOffset + values.length;
+  const truncated = nextOffset < projection.items.length;
+  const view: ItemInspectionView<
+    Projection["section"],
+    Projection["summary"],
+    Projection["items"][number]
+  > = {
+    section: projection.section,
     workstreamId: workstream.id,
     revision: workstream.revision,
     summary: projection.summary,
+    items: {
+      values,
+      returnedItems: values.length,
+      totalItems: projection.items.length,
+      truncated,
+    },
   };
-  if (projection.text !== undefined)
+  if (truncated)
     Object.assign(view, {
-      content: {
-        text: textValue,
-        encoding: "utf16-code-units",
-        returnedChars: textValue.length,
-        totalChars: text.length,
-        truncated: textTruncated,
-      },
+      next: nextPage(selector, projection.section, {
+        ...cursor,
+        textOffset: 0,
+        itemOffset: nextOffset,
+      }),
     });
-  if (projection.items !== undefined)
-    Object.assign(view, {
-      items: {
-        values: itemValues,
-        returnedItems: itemValues.length,
-        totalItems: items.length,
-        truncated: itemsTruncated,
-      },
-    });
-  if (textTruncated || itemsTruncated) {
-    const next: CursorPayload = {
-      ...cursor,
-      textOffset: textTruncated ? nextTextOffset : text.length,
-      itemOffset: itemsTruncated ? nextItemOffset : items.length,
-    };
-    Object.assign(view, { next: { ...selector, cursor: writeCursor(next) } });
-  }
   return view;
+}
+
+function pageText<Projection extends TextProjection>(
+  workstream: Workstream,
+  selector: Selector,
+  cursor: CursorPayload,
+  projection: Projection,
+): TextInspectionView<Projection["section"], Projection["summary"]> {
+  if (cursor.itemOffset !== 0 || cursor.textOffset > projection.text.length)
+    fail("cursor_mismatch", "Cursor offsets do not match the selected content.");
+  const text = projection.text.slice(cursor.textOffset, cursor.textOffset + cursor.maxChars);
+  const nextOffset = cursor.textOffset + text.length;
+  const truncated = nextOffset < projection.text.length;
+  const view: TextInspectionView<Projection["section"], Projection["summary"]> = {
+    section: projection.section,
+    workstreamId: workstream.id,
+    revision: workstream.revision,
+    summary: projection.summary,
+    content: {
+      text,
+      encoding: "utf16-code-units",
+      returnedChars: text.length,
+      totalChars: projection.text.length,
+      truncated,
+    },
+  };
+  if (truncated)
+    Object.assign(view, {
+      next: nextPage(selector, projection.section, {
+        ...cursor,
+        textOffset: nextOffset,
+        itemOffset: 0,
+      }),
+    });
+  return view;
+}
+
+function nextPage<Section extends InspectSection>(
+  selector: Selector,
+  section: Section,
+  cursor: CursorPayload,
+): Omit<Selector, "section"> & { readonly section: Section; readonly cursor: string } {
+  return { ...selector, section, cursor: writeCursor(cursor) };
 }
 
 function projectSection(
@@ -282,22 +417,8 @@ function projectSection(
   switch (section) {
     case "overview":
       return {
-        summary: {
-          lifecycle: state.lifecycle,
-          purpose: compact(state.purpose),
-          intentIndex: state.intents.length - 1,
-          taskCount: state.tasks.length,
-          attemptCount: state.tasks.reduce((count, task) => count + task.attempts.length, 0),
-          outcomeCount: state.tasks.reduce(
-            (count, task) => count + task.attempts.filter((attempt) => attempt.outcome).length,
-            0,
-          ),
-          reconciliation: {
-            frontierCount: snapshot.reconciliation.length,
-            blockedCount: snapshot.reconciliation.filter((item) => item.blockedReason !== undefined)
-              .length,
-          },
-        },
+        section,
+        summary: overviewSummary(snapshot),
         items: [
           ...state.tasks.map((task) => ({ record: "task" as const, ...taskPreview(task) })),
           ...snapshot.reconciliation.map((item) => ({
@@ -308,10 +429,8 @@ function projectSection(
       };
     case "context":
       return {
-        summary: {
-          intentCount: state.intents.length,
-          currentIntentIndex: state.intents.length - 1,
-        },
+        section,
+        summary: contextSummary(state),
         text: json({
           purpose: state.purpose,
           repository: state.repository,
@@ -320,25 +439,23 @@ function projectSection(
       };
     case "completion":
       return {
-        summary: {
-          lifecycle: state.lifecycle,
-          recorded: state.completion !== undefined,
-          accountingCount: state.completion?.accounting.length ?? 0,
-        },
+        section,
+        summary: completionSummary(state),
         text: json({ lifecycle: state.lifecycle, completion: state.completion }),
       };
     case "task": {
       const task = required(selection.task);
-      return { summary: taskPreview(task), items: task.attempts.map(attemptPreview) };
+      return { section, summary: taskPreview(task), items: task.attempts.map(attemptPreview) };
     }
     case "assignment": {
       const task = required(selection.task);
       const { attempts: _attempts, ...assignment } = task;
-      return { summary: { taskId: task.id, kind: task.kind }, text: json(assignment) };
+      return { section, summary: { taskId: task.id, kind: task.kind }, text: json(assignment) };
     }
     case "outcome": {
       const outcome = required(selection.outcome);
       return {
+        section,
         summary: outcomePreview(outcome),
         items: outcome.artifacts.map((artifact) => ({
           ...artifact,
@@ -350,28 +467,27 @@ function projectSection(
     case "evidence": {
       const outcome = required(selection.outcome);
       const evidence = outcome.kind === "reported" ? outcome.report.evidence : [];
-      return { summary: outcomePreview(outcome), text: json(evidence) };
+      return { section, summary: outcomePreview(outcome), text: json(evidence) };
     }
     case "report": {
       const outcome = required(selection.outcome);
-      const report = outcome.kind === "reported" ? outcome.report : outcome;
-      return { summary: outcomePreview(outcome), text: json(report) };
+      const report =
+        outcome.kind === "reported"
+          ? outcome.report
+          : outcome.kind === "unreported"
+            ? { kind: outcome.kind, reason: outcome.reason, rawWorkerText: outcome.rawWorkerText }
+            : { kind: outcome.kind, reason: outcome.reason };
+      return { section, summary: outcomePreview(outcome), text: json(report) };
     }
     case "recovery": {
       const attempt = required(selection.attempt);
       const task = required(selection.task);
-      const frontier = snapshot.reconciliation
-        .filter((item) => item.entry.key.attemptId === attempt.id)
-        .map(frontierPreview);
+      const reconciliation = snapshot.reconciliation.filter(
+        (item) => item.entry.key.attemptId === attempt.id,
+      );
       return {
-        summary: {
-          taskId: task.id,
-          attemptId: attempt.id,
-          state: attempt.state,
-          durableBlocker: durableBlocker(attempt),
-          reconciliation: { values: frontier, totalItems: frontier.length },
-          output: outputPreview(task, attempt),
-        },
+        section,
+        summary: recoverySummary(task, attempt, reconciliation),
         text: json({
           execution: attempt.execution,
           cancellation: attempt.execution?.cancellation,
@@ -379,9 +495,7 @@ function projectSection(
           cleanup: attempt.cleanup,
           outputRelease: attempt.outputRelease,
           attentionHistory: attempt.attentionHistory,
-          reconciliation: snapshot.reconciliation.filter(
-            (item) => item.entry.key.attemptId === attempt.id,
-          ),
+          reconciliation,
         }),
       };
     }
@@ -576,7 +690,7 @@ function boundary<A>(run: () => A): Effect.Effect<A, CanonicalInspectionError> {
       cause instanceof CanonicalInspectionError
         ? cause
         : new CanonicalInspectionError({
-            code: "invalid_request",
+            code: "internal_failure",
             message: cause instanceof Error ? cause.message : "Inspection failed.",
           }),
   });
@@ -594,6 +708,57 @@ function outcomeOwner(
     for (const attempt of task.attempts)
       if (attempt.outcome?.id === outcomeId) return { task, attempt, outcome: attempt.outcome };
   return undefined;
+}
+
+function overviewSummary(snapshot: CanonicalRuntimeInspectionSnapshot) {
+  const state = snapshot.workstream;
+  return {
+    lifecycle: state.lifecycle,
+    purpose: compact(state.purpose),
+    intentIndex: state.intents.length - 1,
+    taskCount: state.tasks.length,
+    attemptCount: state.tasks.reduce((count, task) => count + task.attempts.length, 0),
+    outcomeCount: state.tasks.reduce(
+      (count, task) => count + task.attempts.filter((attempt) => attempt.outcome).length,
+      0,
+    ),
+    reconciliation: {
+      frontierCount: snapshot.reconciliation.length,
+      blockedCount: snapshot.reconciliation.filter((item) => item.blockedReason !== undefined)
+        .length,
+    },
+  };
+}
+
+function contextSummary(workstream: Workstream) {
+  return {
+    intentCount: workstream.intents.length,
+    currentIntentIndex: workstream.intents.length - 1,
+  };
+}
+
+function completionSummary(workstream: Workstream) {
+  return {
+    lifecycle: workstream.lifecycle,
+    recorded: workstream.completion !== undefined,
+    accountingCount: workstream.completion?.accounting.length ?? 0,
+  };
+}
+
+function recoverySummary(
+  task: Task,
+  attempt: Attempt,
+  reconciliation: readonly ReconciliationFrontierObservation[],
+) {
+  const values = reconciliation.map(frontierPreview);
+  return {
+    taskId: task.id,
+    attemptId: attempt.id,
+    state: attempt.state,
+    durableBlocker: durableBlocker(attempt),
+    reconciliation: { values, totalItems: values.length },
+    output: outputPreview(task, attempt),
+  };
 }
 
 function taskPreview(task: Task) {
@@ -653,8 +818,8 @@ function blockedPreview(observations: readonly ReconciliationFrontierObservation
   return {
     frontierCount: observations.length,
     blockedCount: blocked.length,
-    values: observations.slice(0, 5).map(frontierPreview),
-    truncated: observations.length > 5,
+    values: blocked.slice(0, 5).map(frontierPreview),
+    truncated: blocked.length > 5,
   };
 }
 

@@ -233,18 +233,20 @@ export class ReconciliationScheduler {
   readonly inspectionSnapshot = (): Effect.Effect<ReconciliationFrontierObservation[]> =>
     Ref.get(this.state).pipe(
       Effect.map((current) =>
-        current.entries.map((entry) => {
-          const transient = current.observations.get(identityOf(entry.key, entry.kind));
-          const deadlineMillis = Math.max(transient?.deadlineMillis ?? 0, entryDueMillis(entry));
-          const observation: ReconciliationFrontierObservation = { entry };
-          if (deadlineMillis > 0)
-            Object.assign(observation, {
-              deadlineAt: DateTime.toDate(DateTime.makeUnsafe(deadlineMillis)).toISOString(),
-            });
-          if (transient?.blockedReason !== undefined)
-            Object.assign(observation, { blockedReason: transient.blockedReason });
-          return structuredClone(observation);
-        }),
+        structuredClone(
+          current.entries.map((entry) => {
+            const transient = current.observations.get(identityOf(entry.key, entry.kind));
+            const deadlineMillis = Math.max(transient?.deadlineMillis ?? 0, entryDueMillis(entry));
+            const observation: ReconciliationFrontierObservation = { entry };
+            if (deadlineMillis > 0)
+              Object.assign(observation, {
+                deadlineAt: DateTime.toDate(DateTime.makeUnsafe(deadlineMillis)).toISOString(),
+              });
+            if (transient?.blockedReason !== undefined)
+              Object.assign(observation, { blockedReason: transient.blockedReason });
+            return observation;
+          }),
+        ),
       ),
     );
 

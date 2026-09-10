@@ -535,6 +535,13 @@ void test("a control commit is exact-key and runtime-owned, while unchanged wait
           waiting?.blockedReason,
           "queued remains unresolved without an exact identity.",
         );
+        assert.ok(waiting !== undefined);
+        Reflect.set(waiting.entry.key, "attemptId", "mutated-inspection");
+        assert.ok(
+          (yield* runtime.inspectionSnapshot()).reconciliation.some(
+            (item) => item.entry.key.attemptId === waitId,
+          ),
+        );
         holdWait = true;
         yield* runtime.reconcile();
         for (let spin = 0; spin < 20; spin += 1) yield* Effect.yieldNow;
