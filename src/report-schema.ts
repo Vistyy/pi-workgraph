@@ -19,7 +19,7 @@ const FindingFields = {
 // Retained reports were historically decoded with open nested evidence and finding objects.
 export const EvidenceSchema = Type.Object(EvidenceFields, { additionalProperties: true });
 const FindingSchema = Type.Object(FindingFields, { additionalProperties: true });
-const StrictEvidenceSchema = Type.Object(EvidenceFields, { additionalProperties: false });
+export const EvidenceInputSchema = Type.Object(EvidenceFields, { additionalProperties: false });
 const StrictFindingSchema = Type.Object(FindingFields, { additionalProperties: false });
 
 function reportContentFields(evidence: typeof EvidenceSchema, finding: typeof FindingSchema) {
@@ -32,7 +32,7 @@ function reportContentFields(evidence: typeof EvidenceSchema, finding: typeof Fi
 }
 
 const LegacyReportContentFields = reportContentFields(EvidenceSchema, FindingSchema);
-const StrictReportContentFields = reportContentFields(StrictEvidenceSchema, StrictFindingSchema);
+const StrictReportContentFields = reportContentFields(EvidenceInputSchema, StrictFindingSchema);
 
 type ReportContentFields = typeof LegacyReportContentFields;
 

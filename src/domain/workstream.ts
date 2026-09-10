@@ -1,5 +1,6 @@
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import { EvidenceInputSchema, WorkerReportInputSchema } from "../report-schema.js";
 import { ModelTargetSchema } from "./model-target.js";
 
 const CANONICAL_WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
@@ -11,84 +12,6 @@ const Timestamp = Type.String({ minLength: 1 });
 const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
 const stringLiterals = <const Values extends readonly string[]>(values: Values) =>
   Type.Unsafe<Values[number]>({ type: "string", enum: [...values] });
-
-const EvidenceSchema = Type.Object(
-  {
-    label: Type.String(),
-    observation: Type.String(),
-    class: Type.Optional(stringLiterals(["direct", "inference", "conflict", "unknown"] as const)),
-    command: Type.Optional(Type.String()),
-    artifact: Type.Optional(Type.String()),
-  },
-  { additionalProperties: false },
-);
-const FindingSchema = Type.Object(
-  {
-    severity: stringLiterals(["info", "warning", "error", "blocker"] as const),
-    title: Type.String(),
-    detail: Type.String(),
-  },
-  { additionalProperties: false },
-);
-const ReportContent = {
-  summary: Type.String(),
-  uncertainty: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
-  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
-  findings: Type.Array(FindingSchema, { maxItems: 20 }),
-};
-const ResearchReportSchema = Type.Object(
-  {
-    kind: Type.Literal("research"),
-    status: stringLiterals(["completed", "escalated", "failed"] as const),
-    ...ReportContent,
-  },
-  { additionalProperties: false },
-);
-const ReviewReportSchema = Type.Object(
-  {
-    kind: Type.Literal("review"),
-    status: stringLiterals(["completed", "escalated", "failed"] as const),
-    ...ReportContent,
-  },
-  { additionalProperties: false },
-);
-const ImplementationReportSchema = Type.Union([
-  Type.Object(
-    {
-      kind: Type.Literal("implementation"),
-      status: Type.Literal("completed"),
-      outcome: Type.Literal("changed"),
-      ...ReportContent,
-      commit: Commit,
-      changedFiles: Type.Optional(Type.Array(Type.String())),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      kind: Type.Literal("implementation"),
-      status: Type.Literal("completed"),
-      outcome: Type.Literal("no_change"),
-      ...ReportContent,
-      revision: Commit,
-      reason: NonEmptyString,
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      kind: Type.Literal("implementation"),
-      status: stringLiterals(["escalated", "failed"] as const),
-      ...ReportContent,
-    },
-    { additionalProperties: false },
-  ),
-]);
-const WorkerReportInputSchema = Type.Union([
-  ResearchReportSchema,
-  ReviewReportSchema,
-  ImplementationReportSchema,
-]);
 
 const RepositoryIdentitySchema = Type.Object(
   { projectRoot: NonEmptyString, gitCommonDir: NonEmptyString },
@@ -420,7 +343,6 @@ export const TaskSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-const StrictEvidenceSchema = EvidenceSchema;
 const CompletionAccountingSchema = Type.Union([
   Type.Object(
     { kind: Type.Literal("unresolved_task"), taskId: NonEmptyString, reason: NonEmptyString },
@@ -451,7 +373,7 @@ const CompletionAccountingSchema = Type.Union([
 const CompletionSchema = Type.Object(
   {
     conclusion: NonEmptyString,
-    evidence: Type.Array(StrictEvidenceSchema, { minItems: 1 }),
+    evidence: Type.Array(EvidenceInputSchema, { minItems: 1 }),
     limitations: Type.Array(NonEmptyString),
     accounting: Type.Array(CompletionAccountingSchema),
     completedAt: Timestamp,
@@ -544,15 +466,14 @@ export function validateWorkstream(value: Workstream): void {
     attempts.flatMap((attempt) => (attempt.outcome ? [attempt.outcome.id] : [])),
     "Outcome",
   );
-  if (
-    new Set([
-      value.id,
-      ...value.tasks.map((task) => task.id),
-      ...attempts.map((attempt) => attempt.id),
-    ]).size !==
-    1 + value.tasks.length + attempts.length
-  )
-    throw new Error("Workstream, Task, and Attempt ids must be distinct.");
+  const handles = [
+    value.id,
+    ...value.tasks.map((task) => task.id),
+    ...attempts.map((attempt) => attempt.id),
+    ...attempts.flatMap((attempt) => (attempt.outcome ? [attempt.outcome.id] : [])),
+  ];
+  if (new Set(handles).size !== handles.length)
+    throw new Error("Workstream, Task, Attempt, and Outcome ids must be globally distinct.");
   for (const task of value.tasks) {
     if (task.intentIndex >= value.intents.length)
       throw new Error(`Task ${task.id} references unknown Intent index ${task.intentIndex}.`);
@@ -680,6 +601,74 @@ function validateExecution(attempt: Attempt): void {
   )
     throw new Error(`Attempt ${attempt.id} sent submission has no exact Worker session.`);
 }
+function executionTransition(
+  attemptId: string,
+  current: WorkerExecution | undefined,
+  next: WorkerExecution,
+): WorkerExecution {
+  const merged = mergeExecution(current, next);
+  assertImmutableExecutionFields(attemptId, current, next);
+  assertSubmissionTransition(attemptId, current?.submission, next.submission);
+  if (current !== undefined && sameValue(current, merged)) return current;
+  return merged;
+}
+function mergeExecution(
+  current: WorkerExecution | undefined,
+  next: WorkerExecution,
+): WorkerExecution {
+  const merged: WorkerExecution = { ...current };
+  for (const field of ["placement", "worker", "submission", "steering", "cancellation"] as const)
+    if (next[field] !== undefined) Object.assign(merged, { [field]: next[field] });
+  return merged;
+}
+function assertImmutableExecutionFields(
+  attemptId: string,
+  current: WorkerExecution | undefined,
+  next: WorkerExecution,
+): void {
+  if (
+    current?.placement !== undefined &&
+    next.placement !== undefined &&
+    !sameValue(current.placement, next.placement)
+  )
+    throw new Error(`Attempt ${attemptId} Worker placement is immutable.`);
+  if (
+    current?.worker !== undefined &&
+    next.worker !== undefined &&
+    !sameValue(current.worker, next.worker)
+  )
+    throw new Error(`Attempt ${attemptId} Worker identity is immutable.`);
+  if (
+    current?.cancellation !== undefined &&
+    next.cancellation !== undefined &&
+    !sameValue(current.cancellation, next.cancellation)
+  )
+    throw new Error(`Attempt ${attemptId} Worker cancellation checkpoint conflicts.`);
+}
+function assertSubmissionTransition(
+  attemptId: string,
+  oldSubmission: WorkerExecution["submission"] | undefined,
+  newSubmission: WorkerExecution["submission"] | undefined,
+): void {
+  if (
+    newSubmission !== undefined &&
+    oldSubmission !== undefined &&
+    !validSubmissionTransition(oldSubmission, newSubmission)
+  )
+    throw new Error(`Attempt ${attemptId} submission transition is not monotonic.`);
+  if (newSubmission !== undefined && oldSubmission === undefined && newSubmission !== "not_sent")
+    throw new Error(`Attempt ${attemptId} submission must begin at not_sent.`);
+}
+function validSubmissionTransition(
+  oldSubmission: NonNullable<WorkerExecution["submission"]>,
+  newSubmission: NonNullable<WorkerExecution["submission"]>,
+): boolean {
+  if (oldSubmission === newSubmission) return true;
+  if (oldSubmission === "not_sent") return newSubmission === "uncertain";
+  if (oldSubmission === "uncertain")
+    return newSubmission === "submitted" || newSubmission === "started";
+  return oldSubmission === "submitted" && newSubmission === "started";
+}
 function validateSelection(task: Task, attempt: Attempt): void {
   const selection = attempt.selection;
   if (task.kind === "implementation") {
@@ -755,7 +744,6 @@ function validateApplication(task: Task, attempt: Attempt): void {
     );
   if (
     application.rootCommit !== attempt.candidate.rootCommit ||
-    application.commits[0] !== application.rootCommit ||
     application.commits.at(-1) !== application.commit
   )
     throw new Error(`Attempt ${attempt.id} application lineage is not exact.`);
@@ -776,7 +764,8 @@ function validateOutputRelease(attempt: Attempt): void {
   if (release === undefined) return;
   if (
     attempt.execution?.placement?.kind !== "isolated_worktree" ||
-    attempt.cleanup?.workerClosed !== true
+    attempt.cleanup?.state !== "completed" ||
+    attempt.cleanup.workerClosed !== true
   )
     throw new Error(`Attempt ${attempt.id} output release lacks closed isolated ownership.`);
   if (attempt.cleanup.expectedHead !== release.expectedHead)
@@ -789,12 +778,8 @@ function validateLifecycle(workstream: Workstream): void {
     throw new Error("Completed lifecycle and Completion must appear together.");
   if (workstream.completion === undefined) return;
   const expected = deriveCompletionAccounting(workstream);
-  if (
-    expected.length !== 0 ||
-    workstream.completion.accounting.length !== 0 ||
-    !sameValue(expected, workstream.completion.accounting)
-  )
-    throw new Error("Completion accounting must be the exact empty derived set.");
+  if (!sameValue(expected, workstream.completion.accounting))
+    throw new Error("Completion accounting must be the exact derived set.");
 }
 
 export function findTask(workstream: Workstream, taskId: string): Task | undefined {
@@ -890,7 +875,7 @@ export function appendAttempt(
   if (task === undefined) throw new Error(`Unknown Task ${taskId}.`);
   if (task.intentIndex !== workstream.intents.length - 1)
     throw new Error(`Task ${taskId} no longer belongs to the current Intent.`);
-  if (!task.attempts.every(isReattemptStable))
+  if (!task.attempts.every((attempt) => isReattemptStable(task, attempt)))
     throw new Error(`Task ${taskId} has an unfinished or operationally unstable prior Attempt.`);
   if (attempt.state !== "queued" || hasOperationalFacts(attempt))
     throw new Error(`Appended Attempt ${attempt.id} must be pristine and queued.`);
@@ -910,11 +895,13 @@ export function activateAttempt(
     throw new Error(`Attempt ${key.attemptId} no longer belongs to the current Intent.`);
   if (located.attempt.state !== "queued")
     throw new Error(`Attempt ${key.attemptId} is not queued.`);
+  const initialExecution =
+    execution === undefined ? undefined : executionTransition(key.attemptId, undefined, execution);
   return mutate(workstream, updatedAt, (draft) => {
     const attempt = requireAttempt(draft, key).attempt;
     attempt.state = "active";
     attempt.updatedAt = updatedAt;
-    if (execution !== undefined) attempt.execution = clone(execution);
+    if (initialExecution !== undefined) attempt.execution = clone(initialExecution);
   });
 }
 
@@ -947,11 +934,11 @@ export function recordWorkerExecution(
   const current = requireAttempt(workstream, key).attempt;
   if (current.state === "queued")
     throw new Error(`Attempt ${key.attemptId} is not active or finished.`);
-  if (current.execution !== undefined && !sameValue(current.execution, execution))
-    throw new Error(`Attempt ${key.attemptId} Worker execution identity is immutable.`);
+  const next = executionTransition(key.attemptId, current.execution, execution);
+  if (current.execution !== undefined && sameValue(current.execution, next)) return workstream;
   return mutate(workstream, updatedAt, (draft) => {
     const attempt = requireAttempt(draft, key).attempt;
-    if (attempt.execution === undefined) attempt.execution = clone(execution);
+    attempt.execution = clone(next);
     attempt.updatedAt = updatedAt;
   });
 }
@@ -964,6 +951,11 @@ export function checkpointApplication(
   const current = requireAttempt(workstream, key).attempt;
   if (current.state !== "finished")
     throw new Error(`Attempt ${key.attemptId} must be finished before application.`);
+  if (workstream.lifecycle === "completed" && current.application === undefined) {
+    assertCompletedObligation(workstream, key, "application");
+    if (application.state === "applied")
+      throw new Error(`Attempt ${key.attemptId} application must begin with a pending checkpoint.`);
+  }
   if (current.application !== undefined && !monotonicApplication(current.application, application))
     throw new Error(
       `Attempt ${key.attemptId} application transition rewrites identity or is not monotonic.`,
@@ -981,6 +973,12 @@ export function checkpointCleanup(
   updatedAt: string,
 ): Workstream {
   const current = requireAttempt(workstream, key).attempt;
+  if (current.state !== "finished")
+    throw new Error(`Attempt ${key.attemptId} must be finished before cleanup.`);
+  if (current.execution?.placement === undefined)
+    throw new Error(`Attempt ${key.attemptId} cleanup has no Worker placement.`);
+  if (workstream.lifecycle === "completed" && current.cleanup === undefined)
+    assertCompletedObligation(workstream, key, "cleanup");
   if (current.cleanup !== undefined && !monotonicCleanup(current.cleanup, cleanup))
     throw new Error(
       `Attempt ${key.attemptId} cleanup transition is not monotonic or rewrites identity.`,
@@ -998,6 +996,10 @@ export function checkpointOutputRelease(
   updatedAt: string,
 ): Workstream {
   const current = requireAttempt(workstream, key).attempt;
+  if (current.state !== "finished")
+    throw new Error(`Attempt ${key.attemptId} must be finished before output release.`);
+  if (workstream.lifecycle === "completed" && current.outputRelease === undefined)
+    assertCompletedObligation(workstream, key, "release");
   if (current.outputRelease !== undefined && !monotonicRelease(current.outputRelease, release))
     throw new Error(
       `Attempt ${key.attemptId} output release transition is not monotonic or rewrites identity.`,
@@ -1163,17 +1165,18 @@ export function outputDisposition(task: Task, attempt: Attempt): OutputDispositi
     return { kind: "retain_branch", checkout, commit };
   return { kind: "remove_checkout_and_branch", checkout };
 }
-function isReattemptStable(attempt: Attempt): boolean {
+function isReattemptStable(task: Task, attempt: Attempt): boolean {
   if (attempt.state !== "finished") return false;
   if (attempt.application?.state === "pending" || attempt.application?.state === "blocked")
     return false;
   if (attempt.outputRelease?.state === "pending" || attempt.outputRelease?.state === "blocked")
     return false;
   if (attempt.outputRelease?.state === "completed") return true;
-  return (
-    attempt.execution === undefined ||
-    (attempt.cleanup?.state === "completed" && attempt.cleanup.workerClosed)
-  );
+  if (attempt.execution === undefined) return true;
+  if (attempt.execution.placement?.kind !== "isolated_worktree") return true;
+  if (attempt.cleanup?.state !== "completed" || !attempt.cleanup.workerClosed) return false;
+  const disposition = outputDisposition(task, attempt);
+  return disposition.kind === "retain_branch" || disposition.kind === "remove_checkout_and_branch";
 }
 export function deriveCompletionAccounting(workstream: Workstream): CompletionAccounting[] {
   return workstream.tasks.flatMap((task) =>
@@ -1195,7 +1198,7 @@ function accountingForAttempt(
       },
     ];
   const accounting: CompletionAccounting[] = [];
-  if (!isReattemptStable(attempt))
+  if (!isReattemptStable(task, attempt))
     accounting.push({
       kind: "unresolved_attempt",
       taskId: task.id,
@@ -1263,12 +1266,14 @@ export function completeWorkstream(
   updatedAt: string,
 ): Workstream {
   assertActive(workstream, "complete Workstream");
+  if (
+    workstream.tasks.some((task) => task.attempts.some((attempt) => attempt.state !== "finished"))
+  )
+    throw new Error("Cannot complete Workstream while an Attempt is not terminal.");
   const accounting = deriveCompletionAccounting(workstream);
-  if (accounting.length !== 0)
-    throw new Error("Cannot complete Workstream while derived obligations remain.");
   return mutate(workstream, updatedAt, (draft) => {
     draft.lifecycle = "completed";
-    draft.completion = { ...clone(input), accounting: [] };
+    draft.completion = { ...clone(input), accounting };
   });
 }
 function outcomeFromObservation(attemptId: string, observation: TerminalObservation): Outcome {
@@ -1319,12 +1324,8 @@ function changedImplementationCommit(attempt: Attempt): string | undefined {
     : undefined;
 }
 function refreshCompletion(workstream: Workstream): void {
-  if (workstream.completion !== undefined) {
-    const accounting = deriveCompletionAccounting(workstream);
-    if (accounting.length !== 0)
-      throw new Error("Completed Workstream cannot acquire a pending obligation.");
-    workstream.completion.accounting = [];
-  }
+  if (workstream.completion !== undefined)
+    workstream.completion.accounting = deriveCompletionAccounting(workstream);
 }
 function mutate(
   workstream: Workstream,
@@ -1333,6 +1334,7 @@ function mutate(
 ): Workstream {
   const draft = clone(workstream);
   operation(draft);
+  refreshCompletion(draft);
   draft.revision += 1;
   draft.updatedAt = updatedAt;
   validateWorkstream(draft);
@@ -1345,6 +1347,33 @@ function assertActive(workstream: Workstream, operation: string): void {
 function assertObligation(workstream: Workstream): void {
   if (workstream.lifecycle === "completed" && workstream.completion === undefined)
     throw new Error("Completed Workstream has no completion record.");
+}
+function assertCompletedObligation(
+  workstream: Workstream,
+  key: AttemptKey,
+  kind: "application" | "cleanup" | "release",
+): void {
+  const located = requireAttempt(workstream, key);
+  const attempt = located.attempt;
+  if (kind === "cleanup" && attempt.execution?.placement?.kind === "isolated_worktree") return;
+  if (kind === "application") {
+    const task = located.task;
+    if (
+      task.kind === "implementation" &&
+      changedImplementationCommit(attempt) !== undefined &&
+      !outcomeResolved(workstream, task, attempt)
+    )
+      return;
+  }
+  if (
+    kind === "release" &&
+    attempt.execution?.placement?.kind === "isolated_worktree" &&
+    attempt.cleanup?.state === "completed" &&
+    attempt.cleanup.workerClosed &&
+    ["preserve_checkout", "retain_branch"].includes(outputDisposition(located.task, attempt).kind)
+  )
+    return;
+  throw new Error(`Attempt ${key.attemptId} has no existing ${kind} obligation after completion.`);
 }
 function unique(values: readonly string[], label: string): Set<string> {
   const result = new Set(values);

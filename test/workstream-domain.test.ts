@@ -35,6 +35,7 @@ import {
   WorkerExecutionSchema,
   WorkstreamSchema,
 } from "../src/domain/workstream.js";
+import { EvidenceInputSchema, WorkerReportInputSchema } from "../src/report-schema.js";
 
 const repository = { projectRoot: "/repo", gitCommonDir: "/repo/.git" };
 const coordinator = { sessionId: "session", sessionFile: "/session.json" };
@@ -138,12 +139,47 @@ function finish(
   taskId = "Task opaque",
   execution?: Parameters<typeof activateAttempt>[3],
 ) {
-  return terminalizeAttempt(
-    activateAttempt(workstream, { taskId, attemptId: id }, "t1", execution),
-    { taskId, attemptId: id },
-    observation,
-    "t2",
-  );
+  let active = activateAttempt(workstream, { taskId, attemptId: id }, "t1");
+  if (execution !== undefined) {
+    if (execution.placement !== undefined)
+      active = recordWorkerExecution(
+        active,
+        { taskId, attemptId: id },
+        { placement: execution.placement },
+        "t1a",
+      );
+    if (execution.worker !== undefined)
+      active = recordWorkerExecution(
+        active,
+        { taskId, attemptId: id },
+        { worker: execution.worker },
+        "t1b",
+      );
+    if (execution.submission !== undefined) {
+      active = recordWorkerExecution(
+        active,
+        { taskId, attemptId: id },
+        { submission: "not_sent" },
+        "t1c",
+      );
+      if (execution.submission !== "not_sent") {
+        active = recordWorkerExecution(
+          active,
+          { taskId, attemptId: id },
+          { submission: "uncertain" },
+          "t1d",
+        );
+        if (execution.submission !== "uncertain")
+          active = recordWorkerExecution(
+            active,
+            { taskId, attemptId: id },
+            { submission: execution.submission },
+            "t1e",
+          );
+      }
+    }
+  }
+  return terminalizeAttempt(active, { taskId, attemptId: id }, observation, "t2");
 }
 function deliver(workstream: ReturnType<typeof add>, id: string, taskId = "Task opaque") {
   return recordDeliverySuccess(workstream, { taskId, attemptId: id }, "t4", "t4");
@@ -158,6 +194,21 @@ void test("pure aggregate schemas are strict and identifiers are opaque", () => 
     Value.Check(TaskSchema, {
       ...researchTask("Task"),
       attempts: [{ ...attempt("A"), selectedModels: { role: "research", selected: [] } }],
+    }),
+    false,
+  );
+  assert.equal(
+    Value.Check(EvidenceInputSchema, { label: "x", observation: "y", extra: true }),
+    false,
+  );
+  assert.equal(
+    Value.Check(WorkerReportInputSchema, {
+      kind: "research",
+      status: "completed",
+      summary: "ok",
+      evidence: [],
+      findings: [],
+      extra: true,
     }),
     false,
   );
@@ -181,6 +232,25 @@ void test("pure aggregate schemas are strict and identifiers are opaque", () => 
       resource: { workspaceId: "w" },
     }),
     false,
+  );
+  assert.throws(
+    () => validateWorkstream({ ...workstream, tasks: [researchTask(workstream.id)] }),
+    /globally distinct/,
+  );
+  const outcomeCollision = finish(add(), "Attempt A", reported());
+  const collisionAttempt = outcomeCollision.tasks[0]?.attempts[0];
+  assert.ok(collisionAttempt?.outcome);
+  collisionAttempt.outcome.id = outcomeCollision.id;
+  assert.throws(() => validateWorkstream(outcomeCollision), /globally distinct/);
+  assert.equal(
+    Value.Check(ApplicationSchema, {
+      state: "pending",
+      commit: changedCommit,
+      expectedHead: baseCommit,
+      rootCommit: baseCommit,
+      commits: [commit("d"), changedCommit],
+    }),
+    true,
   );
 });
 
@@ -211,11 +281,18 @@ void test("selection is one policy-owned target, while implementation retains gu
     },
     submission: "not_sent" as const,
   };
-  workstream = recordWorkerExecution(
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  workstream = recordWorkerExecution(workstream, key, { placement: execution.placement }, "t3");
+  const stagedTask = findTask(workstream, key.taskId);
+  assert.ok(stagedTask);
+  assert.equal(findAttempt(stagedTask, key.attemptId)?.execution?.worker, undefined);
+  workstream = recordWorkerExecution(workstream, key, { worker: execution.worker }, "t3a");
+  workstream = recordWorkerExecution(workstream, key, { submission: "not_sent" }, "t3b");
+  workstream = recordWorkerExecution(workstream, key, { submission: "uncertain" }, "t3c");
+  workstream = recordWorkerExecution(workstream, key, { submission: "started" }, "t3d");
+  assert.strictEqual(
+    recordWorkerExecution(workstream, key, { submission: "started" }, "replay"),
     workstream,
-    { taskId: "Task opaque", attemptId: "Attempt A" },
-    execution,
-    "t3",
   );
   workstream = recordEffectiveModel(
     workstream,
@@ -234,12 +311,19 @@ void test("selection is one policy-owned target, while implementation retains gu
     () =>
       recordWorkerExecution(
         workstream,
-        { taskId: "Task opaque", attemptId: "Attempt A" },
-        { ...execution, worker: { ...execution.worker, paneId: "other" } },
+        key,
+        { worker: { ...execution.worker, paneId: "other" } },
         "t5",
       ),
     /immutable/,
   );
+  assert.throws(
+    () => recordWorkerExecution(workstream, key, { submission: "not_sent" }, "t5a"),
+    /monotonic/,
+  );
+  const conflictedTask = findTask(workstream, key.taskId);
+  assert.ok(conflictedTask);
+  assert.equal(findAttempt(conflictedTask, key.attemptId)?.execution?.submission, "started");
   workstream = requestCancellation(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
@@ -249,6 +333,34 @@ void test("selection is one policy-owned target, while implementation retains gu
   const updatedTask = findTask(workstream, "Task opaque");
   assert.ok(updatedTask);
   assert.equal(findAttempt(updatedTask, "Attempt A")?.execution?.cancellation?.reason, "Stop.");
+  let late = activateAttempt(add(), { taskId: "Task opaque", attemptId: "Attempt A" }, "t7");
+  late = recordWorkerExecution(
+    late,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { placement: execution.placement },
+    "t8",
+  );
+  late = requestCancellation(
+    late,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { requestedAt: "t9", reason: "Stop before worker session." },
+    "t9",
+  );
+  late = recordWorkerExecution(
+    late,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { steering: { text: "Continue.", state: "uncertain", observedAt: "t9a" } },
+    "t9a",
+  );
+  late = recordWorkerExecution(
+    late,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { worker: execution.worker },
+    "t10",
+  );
+  const lateTask = findTask(late, "Task opaque");
+  assert.ok(lateTask);
+  assert.equal(findAttempt(lateTask, "Attempt A")?.execution?.worker?.sessionFile, "/worker.json");
 });
 
 void test("grant is creation-only first grounding and revisions require a current direct receipt", () => {
@@ -367,6 +479,125 @@ void test("terminal failures and cancellation settle once operational obligation
   assert.throws(() => reviseIntent(workstream, intent, "t6"), /completed/);
 });
 
+void test("isolated failed output remains blocked through cleanup until exact release, including after completion", () => {
+  const execution = {
+    placement: { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" },
+    worker: {
+      workspaceId: "w",
+      tabId: "tab",
+      paneId: "pane",
+      terminalId: "term",
+      agentName: "agent",
+      cwd: "/repo-work",
+      sessionFile: "/worker.json",
+    },
+    submission: "started" as const,
+  };
+  let workstream = finish(
+    add(),
+    "Attempt A",
+    {
+      kind: "reported",
+      observedAt: "t2",
+      artifacts: [],
+      deliveryRequestedAt: "t3",
+      report: {
+        kind: "research",
+        status: "failed",
+        summary: "Failed.",
+        evidence: [],
+        findings: [],
+      },
+    },
+    "Task opaque",
+    execution,
+  );
+  workstream = checkpointCleanup(
+    workstream,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { state: "completed", workerClosed: true, expectedHead: changedCommit },
+    "t4",
+  );
+  const isolatedTask = findTask(workstream, "Task opaque");
+  assert.ok(isolatedTask);
+  const isolatedAttempt = findAttempt(isolatedTask, "Attempt A");
+  assert.ok(isolatedAttempt);
+  assert.equal(outputDisposition(isolatedTask, isolatedAttempt).kind, "preserve_checkout");
+  assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
+  workstream = completeWorkstream(
+    workstream,
+    {
+      conclusion: "Stopped with retained output.",
+      evidence: [{ label: "failure", observation: "retained" }],
+      limitations: [],
+      completedAt: "t5",
+    },
+    "t5",
+  );
+  assert.notDeepEqual(workstream.completion?.accounting, []);
+  workstream = deliver(workstream, "Attempt A");
+  assert.throws(
+    () => appendAttempt(workstream, "Task opaque", attempt("Later"), "t6"),
+    /completed/,
+  );
+  workstream = checkpointOutputRelease(
+    workstream,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { state: "completed", expectedHead: changedCommit, reason: "Discard failed checkout." },
+    "t6",
+  );
+  assert.deepEqual(deriveCompletionAccounting(workstream), []);
+  assert.throws(
+    () =>
+      checkpointApplication(
+        workstream,
+        { taskId: "Task opaque", attemptId: "Attempt A" },
+        {
+          state: "pending",
+          commit: changedCommit,
+          expectedHead: changedCommit,
+          rootCommit: baseCommit,
+          commits: [commit("d"), changedCommit],
+        },
+        "t6a",
+      ),
+    /no existing application obligation/,
+  );
+  assert.doesNotThrow(() =>
+    checkpointCleanup(
+      workstream,
+      { taskId: "Task opaque", attemptId: "Attempt A" },
+      { state: "completed", workerClosed: true, expectedHead: changedCommit },
+      "t7",
+    ),
+  );
+  let shared = deliver(finish(add(), "Attempt A", reported()), "Attempt A");
+  shared = completeWorkstream(
+    shared,
+    {
+      conclusion: "Shared settled.",
+      evidence: [{ label: "done", observation: "done" }],
+      limitations: [],
+      completedAt: "t5",
+    },
+    "t5",
+  );
+  assert.throws(
+    () =>
+      checkpointCleanup(
+        shared,
+        { taskId: "Task opaque", attemptId: "Attempt A" },
+        {
+          state: "completed",
+          workerClosed: true,
+          expectedHead: baseCommit,
+        },
+        "t6",
+      ),
+    /no Worker placement/,
+  );
+});
+
 void test("implementation candidate ancestry may cross Intents but application is exact and immutable", () => {
   const execution = {
     placement: { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" },
@@ -416,7 +647,7 @@ void test("implementation candidate ancestry may cross Intents but application i
       commit: changedCommit,
       expectedHead: baseCommit,
       rootCommit: baseCommit,
-      commits: [baseCommit, changedCommit],
+      commits: [commit("d"), changedCommit],
       revision: commit("c"),
     },
     "t3",
