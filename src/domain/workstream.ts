@@ -724,6 +724,8 @@ function validateDerivedCandidate(
   const parentCommit = changedImplementationCommit(parent);
   if (parentCommit !== candidate.parentCommit)
     throw new Error(`Attempt ${attempt.id} candidate parent commit is not exact.`);
+  if (!isRetainedCandidateParent(parentLocated.task, parent, parentCommit))
+    throw new Error(`Attempt ${attempt.id} candidate parent is not an eligible retained output.`);
   if (parent.candidate === undefined || parent.baseRevision === undefined)
     throw new Error(`Attempt ${attempt.id} candidate parent lineage is incomplete.`);
   if (parent.candidate.rootCommit !== candidate.rootCommit || !validCandidateBase(parent))
@@ -732,6 +734,21 @@ function validateDerivedCandidate(
     throw new Error(`Attempt ${attempt.id} correction does not continue its exact candidate.`);
   if (candidate.kind === "integration" && candidate.rootCommit !== attempt.baseRevision)
     throw new Error(`Attempt ${attempt.id} integration is not rooted at its destination base.`);
+}
+function isRetainedCandidateParent(task: Task, attempt: Attempt, commit: string): boolean {
+  const cleanup = attempt.cleanup;
+  const disposition = outputDispositionBeforeRelease(task, attempt);
+  return (
+    attempt.state === "finished" &&
+    attempt.execution?.placement?.kind === "isolated_worktree" &&
+    cleanup?.state === "completed" &&
+    cleanup.workerClosed &&
+    cleanup.expectedHead === commit &&
+    attempt.outputRelease === undefined &&
+    disposition.kind === "retain_branch" &&
+    disposition.checkout === "removed" &&
+    disposition.commit === commit
+  );
 }
 function validCandidateBase(attempt: Attempt): boolean {
   const candidate = attempt.candidate;

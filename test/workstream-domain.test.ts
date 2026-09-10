@@ -759,13 +759,7 @@ void test("implementation candidate ancestry may cross Intents but application i
   const settledParentAttempt = findAttempt(settledParentTask, "Parent Attempt");
   assert.ok(settledParentAttempt);
   assert.equal(outputDisposition(settledParentTask, settledParentAttempt).kind, "retain_branch");
-  workstream = checkpointOutputRelease(
-    workstream,
-    { taskId: "Parent Task", attemptId: "Parent Attempt" },
-    { state: "completed", expectedHead: changedCommit, reason: "Released." },
-    "t4b",
-  );
-  workstream = reviseIntent(
+  const retained = reviseIntent(
     workstream,
     { ...intent, statement: "Revise.", recordedAt: "t5" },
     "t5",
@@ -794,6 +788,26 @@ void test("implementation candidate ancestry may cross Intents but application i
     acceptance: ["It works."],
     attempts: [childAttempt],
   };
-  workstream = createTask(workstream, childTask, "t6");
+  workstream = createTask(retained, childTask, "t6");
   assert.equal(findTask(workstream, "Child Task")?.intentIndex, 1);
+
+  const released = checkpointOutputRelease(
+    retained,
+    { taskId: "Parent Task", attemptId: "Parent Attempt" },
+    { state: "completed", expectedHead: changedCommit, reason: "Released." },
+    "t6b",
+  );
+  assert.throws(
+    () =>
+      createTask(
+        released,
+        {
+          ...childTask,
+          id: "Released Child Task",
+          attempts: [{ ...childAttempt, id: "Released Child Attempt" }],
+        },
+        "t7",
+      ),
+    /eligible retained output/,
+  );
 });
