@@ -13,7 +13,18 @@
  * Attachment intentionally wakes recovery so a rebuilt frontier is inspected
  * promptly.
  */
-import { Cause, Data, Effect, Exit, type FileSystem, Option, type Path, Queue, Ref } from "effect";
+import {
+  Cause,
+  Data,
+  DateTime,
+  Effect,
+  Exit,
+  type FileSystem,
+  Option,
+  type Path,
+  Queue,
+  Ref,
+} from "effect";
 import {
   applyAffectedKeys,
   classifyWorkstream,
@@ -131,16 +142,25 @@ export type ReconciliationAttention = (detail: string) => Effect.Effect<void, ne
 
 export type ControlFactory = (key: AttemptKey) => ReconciliationControl;
 
+export interface ReconciliationFrontierObservation {
+  readonly entry: FrontierEntry;
+  readonly deadlineAt?: string;
+  readonly blockedReason?: string;
+}
+
+interface TransientEntryObservation {
+  readonly deadlineMillis?: number;
+  readonly blockedReason?: string;
+}
+
 interface SchedulerState {
   readonly entries: readonly FrontierEntry[];
-  readonly blocked: ReadonlySet<string>;
-  readonly nextAtMillis: ReadonlyMap<string, number>;
+  readonly observations: ReadonlyMap<string, TransientEntryObservation>;
 }
 
 const EMPTY_STATE: SchedulerState = {
   entries: [],
-  blocked: new Set(),
-  nextAtMillis: new Map(),
+  observations: new Map(),
 };
 
 /**
@@ -185,8 +205,7 @@ export class ReconciliationScheduler {
   readonly attach = (workstream: Workstream): Effect.Effect<void> =>
     Ref.set(this.state, {
       entries: classifyWorkstream(workstream),
-      blocked: new Set<string>(),
-      nextAtMillis: new Map<string, number>(),
+      observations: new Map(),
     }).pipe(Effect.andThen(this.signal()));
 
   /**
@@ -199,24 +218,35 @@ export class ReconciliationScheduler {
     keys: readonly AttemptKey[],
   ): Effect.Effect<void> =>
     Ref.update(this.state, (current) => {
-      const blocked = new Set(current.blocked);
-      const nextAtMillis = new Map(current.nextAtMillis);
-      for (const key of keys) {
-        for (const kind of FRONTIER_KIND_ORDER) {
-          const identity = identityOf(key, kind);
-          blocked.delete(identity);
-          nextAtMillis.delete(identity);
-        }
-      }
+      const observations = new Map(current.observations);
+      for (const key of keys)
+        for (const kind of FRONTIER_KIND_ORDER) observations.delete(identityOf(key, kind));
       return {
         entries: applyAffectedKeys(current.entries, workstream, keys),
-        blocked,
-        nextAtMillis,
+        observations,
       };
     }).pipe(Effect.andThen(this.signal()));
 
   readonly snapshot = (): Effect.Effect<FrontierEntry[]> =>
     Ref.get(this.state).pipe(Effect.map((current) => structuredClone([...current.entries])));
+
+  readonly inspectionSnapshot = (): Effect.Effect<ReconciliationFrontierObservation[]> =>
+    Ref.get(this.state).pipe(
+      Effect.map((current) =>
+        current.entries.map((entry) => {
+          const transient = current.observations.get(identityOf(entry.key, entry.kind));
+          const deadlineMillis = Math.max(transient?.deadlineMillis ?? 0, entryDueMillis(entry));
+          const observation: ReconciliationFrontierObservation = { entry };
+          if (deadlineMillis > 0)
+            Object.assign(observation, {
+              deadlineAt: DateTime.toDate(DateTime.makeUnsafe(deadlineMillis)).toISOString(),
+            });
+          if (transient?.blockedReason !== undefined)
+            Object.assign(observation, { blockedReason: transient.blockedReason });
+          return structuredClone(observation);
+        }),
+      ),
+    );
 
   /** One wake regardless of how many commits preceded it. */
   private readonly signal = (): Effect.Effect<void> => Queue.offer(this.wake, undefined);
@@ -300,17 +330,18 @@ export class ReconciliationScheduler {
     }
     return Ref.update(this.state, (current) => ({
       ...current,
-      nextAtMillis: new Map(current.nextAtMillis).set(
-        identityOf(entry.key, entry.kind),
-        now + retry,
-      ),
+      observations: new Map(current.observations).set(identityOf(entry.key, entry.kind), {
+        deadlineMillis: now + retry,
+      }),
     }));
   }
 
   private block(entry: FrontierEntry, detail: string): Effect.Effect<void> {
     return Ref.update(this.state, (current) => ({
       ...current,
-      blocked: new Set(current.blocked).add(identityOf(entry.key, entry.kind)),
+      observations: new Map(current.observations).set(identityOf(entry.key, entry.kind), {
+        blockedReason: detail,
+      }),
     })).pipe(Effect.andThen(this.attention(detail)));
   }
 
@@ -331,8 +362,9 @@ function nextCandidate(
   let best: { entry: FrontierEntry; due: number } | undefined;
   for (const entry of state.entries) {
     const identity = identityOf(entry.key, entry.kind);
-    if (state.blocked.has(identity)) continue;
-    const due = Math.max(state.nextAtMillis.get(identity) ?? 0, entryDueMillis(entry));
+    const transient = state.observations.get(identity);
+    if (transient?.blockedReason !== undefined) continue;
+    const due = Math.max(transient?.deadlineMillis ?? 0, entryDueMillis(entry));
     if (best === undefined || due < best.due) best = { entry, due };
   }
   return best === undefined

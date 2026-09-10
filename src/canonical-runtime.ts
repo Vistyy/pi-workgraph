@@ -44,6 +44,7 @@ import {
   type ReconciliationControl,
   ReconciliationControlError,
   type ReconciliationDriver,
+  type ReconciliationFrontierObservation,
   type ReconciliationMutation,
   ReconciliationScheduler,
   type ResolvedReviewInput,
@@ -124,6 +125,11 @@ export type CanonicalRuntimeEffect<A> = Effect.Effect<
   CanonicalRuntimeError,
   FileSystem.FileSystem
 >;
+
+export interface CanonicalRuntimeInspectionSnapshot {
+  readonly workstream: Workstream;
+  readonly reconciliation: readonly ReconciliationFrontierObservation[];
+}
 
 export interface CanonicalRuntimeAcquisition {
   readonly id: string;
@@ -398,6 +404,14 @@ export class CanonicalRuntime {
    */
   readonly frontierSnapshot = (): Effect.Effect<readonly FrontierEntry[]> =>
     this.scheduler.snapshot();
+
+  readonly inspectionSnapshot = (): CanonicalRuntimeEffect<CanonicalRuntimeInspectionSnapshot> =>
+    this.serialized(
+      Effect.all({
+        workstream: Ref.get(this.committed),
+        reconciliation: this.scheduler.inspectionSnapshot(),
+      }).pipe(Effect.map((snapshot) => structuredClone(snapshot))),
+    );
 
   /** Rebuild transient reconciliation state from one fenced aggregate read. */
   readonly reconcile = (): CanonicalRuntimeEffect<readonly FrontierEntry[]> =>

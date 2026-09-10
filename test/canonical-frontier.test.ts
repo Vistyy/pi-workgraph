@@ -460,11 +460,15 @@ async function withRuntime(
 void test("a control commit is exact-key and runtime-owned, while unchanged waiting is retained", async () => {
   const contexts: ReconciliationContext[] = [];
   const attention: string[] = [];
+  let holdWait = false;
   const driver = driverFrom((entry, control) =>
     Effect.gen(function* () {
       if (entry.kind !== "queued") return { kind: "waiting" } as const;
       const objective = control.context().task.objective;
-      if (objective === "Wait") return { kind: "waiting" } as const;
+      if (objective === "Wait") {
+        if (holdWait) return yield* Effect.never;
+        return { kind: "waiting" } as const;
+      }
       contexts.push(control.context());
       yield* control.checkOwnership;
       assert.equal(
@@ -525,6 +529,22 @@ void test("a control commit is exact-key and runtime-owned, while unchanged wait
           attention.some((item) => item.includes("queued remains unresolved")),
           true,
         );
+        const blocked = yield* runtime.inspectionSnapshot();
+        const waiting = blocked.reconciliation.find((item) => item.entry.key.attemptId === waitId);
+        assert.equal(
+          waiting?.blockedReason,
+          "queued remains unresolved without an exact identity.",
+        );
+        holdWait = true;
+        yield* runtime.reconcile();
+        for (let spin = 0; spin < 20; spin += 1) yield* Effect.yieldNow;
+        const cleared = yield* runtime.inspectionSnapshot();
+        assert.equal(
+          cleared.reconciliation.find((item) => item.entry.key.attemptId === waitId)?.blockedReason,
+          undefined,
+        );
+        cleared.workstream.tasks.length = 0;
+        assert.notEqual((yield* runtime.inspectionSnapshot()).workstream.tasks.length, 0);
       }),
     ),
   );
@@ -796,12 +816,18 @@ void test("TestClock polls exact workers and retries delivery through the runtim
       for (let spin = 0; spin < 100; spin += 1) yield* Effect.yieldNow;
     });
   await withFixture((f) =>
-    withRuntime(f, { driver, clock, initial: clockWorkstream }, () =>
+    withRuntime(f, { driver, clock, initial: clockWorkstream }, (runtime) =>
       Effect.gen(function* () {
         // A committed failure replaces the due entry with a one-second wait.
         yield* advance(0, 2);
         assert.deepEqual(workerCalls, [0]);
         assert.deepEqual(deliveryCalls, [0]);
+        const observed = yield* runtime.inspectionSnapshot();
+        assert.equal(observed.workstream.revision, 1);
+        assert.deepEqual(
+          observed.reconciliation.map((item) => item.deadlineAt),
+          [T1, T1],
+        );
         yield* advance(1_000, 4);
         yield* advance(1_000, 5);
         // The second failure doubles the wait to two seconds.
