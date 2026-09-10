@@ -20,6 +20,7 @@ import {
   HandoffGrantSchema,
   type Intent,
   IntentSchema,
+  LaunchCheckpointSchema,
   outputDisposition,
   recordDeliveryFailure,
   recordDeliverySuccess,
@@ -132,6 +133,50 @@ function base() {
 function add(workstream = base(), task = researchTask("Task opaque")) {
   return createTask(workstream, task, "t1");
 }
+function resourceForTest() {
+  return {
+    phase: "resource" as const,
+    workspaceId: "workspace",
+    tabId: "tab",
+    paneId: "pane",
+    terminalId: "terminal",
+    agentName: "agent",
+    cwd: "/repo-work",
+  };
+}
+function recordLaunchProgress(
+  workstream: ReturnType<typeof add>,
+  key: { taskId: string; attemptId: string },
+  execution: NonNullable<Parameters<typeof activateAttempt>[3]>,
+): ReturnType<typeof add> {
+  let active = workstream;
+  if (execution.placement !== undefined)
+    active = recordWorkerExecution(active, key, { placement: execution.placement }, "t1a");
+  if (execution.sessionFile !== undefined)
+    active = recordWorkerExecution(active, key, { sessionFile: execution.sessionFile }, "t1b");
+  if (execution.launch !== undefined) {
+    const pane = {
+      phase: "pane" as const,
+      workspaceId: execution.launch.workspaceId,
+      paneId: execution.launch.paneId,
+    };
+    active = recordWorkerExecution(active, key, { launch: pane }, "t1c");
+    if (execution.launch.phase !== "pane") {
+      const resource = { ...execution.launch, phase: "resource" as const };
+      active = recordWorkerExecution(active, key, { launch: resource }, "t1d");
+      if (execution.launch.phase === "ready")
+        active = recordWorkerExecution(active, key, { launch: execution.launch }, "t1e");
+    }
+  }
+  return active;
+}
+function isolatedPaneLaunch(key: { taskId: string; attemptId: string }): ReturnType<typeof add> {
+  return recordLaunchProgress(activateAttempt(add(), key, "t1"), key, {
+    placement: { kind: "isolated_worktree", path: "/repo-work", branch: "branch" },
+    sessionFile: "/worker.json",
+    launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" },
+  });
+}
 function finish(
   workstream: ReturnType<typeof add>,
   id: string,
@@ -139,47 +184,18 @@ function finish(
   taskId = "Task opaque",
   execution?: Parameters<typeof activateAttempt>[3],
 ) {
-  let active = activateAttempt(workstream, { taskId, attemptId: id }, "t1");
-  if (execution !== undefined) {
-    if (execution.placement !== undefined)
-      active = recordWorkerExecution(
-        active,
-        { taskId, attemptId: id },
-        { placement: execution.placement },
-        "t1a",
-      );
-    if (execution.worker !== undefined)
-      active = recordWorkerExecution(
-        active,
-        { taskId, attemptId: id },
-        { worker: execution.worker },
-        "t1b",
-      );
-    if (execution.submission !== undefined) {
-      active = recordWorkerExecution(
-        active,
-        { taskId, attemptId: id },
-        { submission: "not_sent" },
-        "t1c",
-      );
-      if (execution.submission !== "not_sent") {
-        active = recordWorkerExecution(
-          active,
-          { taskId, attemptId: id },
-          { submission: "uncertain" },
-          "t1d",
-        );
-        if (execution.submission !== "uncertain")
-          active = recordWorkerExecution(
-            active,
-            { taskId, attemptId: id },
-            { submission: execution.submission },
-            "t1e",
-          );
-      }
+  const key = { taskId, attemptId: id };
+  let active = activateAttempt(workstream, key, "t1");
+  if (execution !== undefined) active = recordLaunchProgress(active, key, execution);
+  if (execution?.submission !== undefined) {
+    active = recordWorkerExecution(active, key, { submission: "not_sent" }, "t1f");
+    if (execution.submission !== "not_sent") {
+      active = recordWorkerExecution(active, key, { submission: "uncertain" }, "t1g");
+      if (execution.submission !== "uncertain")
+        active = recordWorkerExecution(active, key, { submission: execution.submission }, "t1h");
     }
   }
-  return terminalizeAttempt(active, { taskId, attemptId: id }, observation, "t2");
+  return terminalizeAttempt(active, key, observation, "t2");
 }
 function deliver(workstream: ReturnType<typeof add>, id: string, taskId = "Task opaque") {
   return recordDeliverySuccess(workstream, { taskId, attemptId: id }, "t4", "t4");
@@ -229,7 +245,15 @@ void test("pure aggregate schemas are strict and identifiers are opaque", () => 
   assert.equal(
     Value.Check(WorkerExecutionSchema, {
       placement: { kind: "shared_project", path: "/repo" },
-      resource: { workspaceId: "w" },
+      worker: {
+        workspaceId: "w",
+        tabId: "tab",
+        paneId: "pane",
+        terminalId: "terminal",
+        agentName: "agent",
+        cwd: "/repo",
+        sessionFile: "/worker.json",
+      },
     }),
     false,
   );
@@ -254,6 +278,352 @@ void test("pure aggregate schemas are strict and identifiers are opaque", () => 
   );
 });
 
+void test("launch checkpoints enforce ordered single-stage execution mutations", () => {
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  const placement = { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" };
+  const pane = { phase: "pane" as const, workspaceId: "workspace", paneId: "pane" };
+  const resource = resourceForTest();
+  const ready = { ...resource, phase: "ready" as const };
+  assert.equal(Value.Check(LaunchCheckpointSchema, pane), true);
+
+  const initialized = activateAttempt(add(), key, "t1", {
+    placement,
+    submission: "not_sent",
+  });
+  assert.equal(initialized.tasks[0]?.attempts[0]?.execution?.submission, "not_sent");
+  assert.throws(
+    () => activateAttempt(add(), key, "t1", { placement, sessionFile: "/worker.json" }),
+    /exactly one new external-effect stage/,
+  );
+  assert.throws(
+    () =>
+      recordWorkerExecution(
+        activateAttempt(add(), key, "t1"),
+        key,
+        { placement, submission: "not_sent" },
+        "t2",
+      ),
+    /exactly one new external-effect stage/,
+  );
+
+  let workstream = recordWorkerExecution(initialized, key, { placement }, "t2");
+  assert.throws(
+    () =>
+      recordWorkerExecution(workstream, key, { sessionFile: "/worker.json", launch: pane }, "t3"),
+    /exactly one new external-effect stage/,
+  );
+  workstream = recordWorkerExecution(workstream, key, { sessionFile: "/worker.json" }, "t3");
+  assert.throws(
+    () => recordWorkerExecution(workstream, key, { launch: resource }, "t4"),
+    /skip pane/,
+  );
+  workstream = recordWorkerExecution(workstream, key, { launch: pane }, "t4");
+  workstream = recordWorkerExecution(workstream, key, { launch: resource }, "t5");
+  workstream = recordWorkerExecution(workstream, key, { launch: ready }, "t6");
+  assert.strictEqual(
+    recordWorkerExecution(workstream, key, { launch: ready }, "replay"),
+    workstream,
+  );
+  assert.throws(
+    () => recordWorkerExecution(workstream, key, { launch: { ...ready, paneId: "other" } }, "t7"),
+    /progression/,
+  );
+  assert.throws(
+    () => recordWorkerExecution(workstream, key, { sessionFile: "/other.json" }, "t8"),
+    /session file is immutable/,
+  );
+  const beforeReady = activateAttempt(add(), key, "before-ready", {
+    placement,
+    submission: "not_sent",
+  });
+  assert.throws(
+    () => recordWorkerExecution(beforeReady, key, { submission: "uncertain" }, "t9"),
+    /ready launch/,
+  );
+  workstream = recordWorkerExecution(workstream, key, { submission: "uncertain" }, "t10");
+  assert.throws(
+    () =>
+      recordWorkerExecution(
+        workstream,
+        key,
+        {
+          steering: { text: "Stop", state: "uncertain", observedAt: "t11" },
+          cancellation: { requestedAt: "t11", reason: "Stop" },
+        },
+        "t11",
+      ),
+    /exactly one new external-effect stage/,
+  );
+});
+
+void test("pane to resource launch rejects workspace or pane identity mismatch", () => {
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  const workstream = isolatedPaneLaunch(key);
+  for (const identity of [{ workspaceId: "other" }, { paneId: "other" }])
+    assert.throws(
+      () =>
+        recordWorkerExecution(
+          workstream,
+          key,
+          { launch: { ...resourceForTest(), ...identity } },
+          "t5",
+        ),
+      /launch resource does not match its pane/,
+    );
+});
+
+void test("non-pane launch rejects cwd that does not match placement", () => {
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  const workstream = isolatedPaneLaunch(key);
+  assert.throws(
+    () =>
+      recordWorkerExecution(
+        workstream,
+        key,
+        { launch: { ...resourceForTest(), cwd: "/other" } },
+        "t5",
+      ),
+    /launch cwd does not match its placement/,
+  );
+});
+
+void test("launch advancement cannot be combined with sent submission", () => {
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  const workstream = isolatedPaneLaunch(key);
+  assert.throws(
+    () =>
+      recordWorkerExecution(
+        workstream,
+        key,
+        { launch: resourceForTest(), submission: "started" },
+        "t5",
+      ),
+    /exactly one new external-effect stage/,
+  );
+});
+
+void test("partial isolated launches preserve output until exact cleanup and release", () => {
+  type Execution = NonNullable<Parameters<typeof activateAttempt>[3]>;
+  const partials: Array<{ name: string; execution: Execution }> = [
+    {
+      name: "placement",
+      execution: {
+        placement: { kind: "isolated_worktree", path: "/repo-work", branch: "branch" },
+      },
+    },
+    {
+      name: "session",
+      execution: {
+        placement: { kind: "isolated_worktree", path: "/repo-work", branch: "branch" },
+        sessionFile: "/worker.json",
+      },
+    },
+    {
+      name: "pane",
+      execution: {
+        placement: { kind: "isolated_worktree", path: "/repo-work", branch: "branch" },
+        sessionFile: "/worker.json",
+        launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" },
+      },
+    },
+    {
+      name: "resource",
+      execution: {
+        placement: { kind: "isolated_worktree", path: "/repo-work", branch: "branch" },
+        sessionFile: "/worker.json",
+        launch: resourceForTest(),
+      },
+    },
+  ];
+  for (const [index, partial] of partials.entries()) {
+    const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+    let workstream = finish(add(), key.attemptId, cancelled(), key.taskId, partial.execution);
+    workstream = deliver(workstream, key.attemptId, key.taskId);
+    let task = findTask(workstream, key.taskId);
+    assert.ok(task);
+    let attemptValue = findAttempt(task, key.attemptId);
+    assert.ok(attemptValue);
+    assert.equal(outputDisposition(task, attemptValue).kind, "preserve_checkout");
+    assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
+    assert.throws(
+      () =>
+        checkpointOutputRelease(
+          workstream,
+          key,
+          { state: "completed", expectedHead: changedCommit, reason: "Too early." },
+          `early-release-${index}`,
+        ),
+      /closed isolated ownership/,
+    );
+    workstream = checkpointCleanup(
+      workstream,
+      key,
+      { state: "completed", workerClosed: true, expectedHead: changedCommit },
+      `cleanup-${index}`,
+    );
+    task = findTask(workstream, key.taskId);
+    assert.ok(task);
+    attemptValue = findAttempt(task, key.attemptId);
+    assert.ok(attemptValue);
+    assert.equal(outputDisposition(task, attemptValue).kind, "preserve_checkout");
+    workstream = checkpointOutputRelease(
+      workstream,
+      key,
+      { state: "completed", expectedHead: changedCommit, reason: "Release partial output." },
+      `release-${index}`,
+    );
+    task = findTask(workstream, key.taskId);
+    assert.ok(task);
+    attemptValue = findAttempt(task, key.attemptId);
+    assert.ok(attemptValue);
+    assert.equal(outputDisposition(task, attemptValue).kind, "released");
+    assert.deepEqual(deriveCompletionAccounting(workstream), []);
+    workstream = completeWorkstream(
+      workstream,
+      {
+        conclusion: "Partial launch settled.",
+        evidence: [{ label: "cleanup", observation: partial.name }],
+        limitations: [],
+        completedAt: `complete-${index}`,
+      },
+      `complete-${index}`,
+    );
+    assert.deepEqual(workstream.completion?.accounting, []);
+  }
+});
+
+void test("partial changed implementation release clears accounting without candidate ancestry", () => {
+  const key = { taskId: "Parent Task", attemptId: "Parent Attempt" };
+  const parentAttempt = attempt(key.attemptId, {
+    baseRevision: baseCommit,
+    candidate: { kind: "initial", rootCommit: baseCommit },
+    selection: {
+      role: "implementation",
+      guide: { model: "provider/guide", thinking: "low" },
+      executor: { model: "provider/executor", thinking: "high" },
+      source: "policy",
+    },
+  });
+  const parentTask: Task = {
+    kind: "implementation",
+    id: key.taskId,
+    objective: "Implement.",
+    intentIndex: 0,
+    createdAt: "t0",
+    acceptance: ["It works."],
+    attempts: [parentAttempt],
+  };
+  const partialExecution = {
+    placement: { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" },
+    sessionFile: "/worker.json",
+    launch: resourceForTest(),
+  };
+  let workstream = finish(
+    createTask(base(), parentTask, "t1"),
+    key.attemptId,
+    reported("implementation"),
+    key.taskId,
+    partialExecution,
+  );
+  workstream = deliver(workstream, key.attemptId, key.taskId);
+  workstream = checkpointCleanup(
+    workstream,
+    key,
+    { state: "completed", workerClosed: true, expectedHead: changedCommit },
+    "t5",
+  );
+  const childTask = (taskId: string, attemptId: string): Task => ({
+    kind: "implementation",
+    id: taskId,
+    objective: "Continue.",
+    intentIndex: 1,
+    createdAt: "t6",
+    acceptance: ["It works."],
+    attempts: [
+      attempt(attemptId, {
+        baseRevision: changedCommit,
+        candidate: {
+          kind: "correction",
+          rootCommit: baseCommit,
+          parentAttemptId: key.attemptId,
+          parentCommit: changedCommit,
+        },
+        selection: {
+          role: "implementation",
+          guide: { model: "provider/guide", thinking: "low" },
+          executor: { model: "provider/executor", thinking: "high" },
+          source: "policy",
+        },
+      }),
+    ],
+  });
+  workstream = reviseIntent(
+    workstream,
+    { ...intent, statement: "Continue.", recordedAt: "t6" },
+    "t6",
+  );
+  assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
+  assert.throws(
+    () => createTask(workstream, childTask("Before release", "Before release attempt"), "t7"),
+    /eligible retained output/,
+  );
+  workstream = checkpointOutputRelease(
+    workstream,
+    key,
+    { state: "completed", expectedHead: changedCommit, reason: "Release partial output." },
+    "t8",
+  );
+  assert.deepEqual(deriveCompletionAccounting(workstream), []);
+  const releasedTask = findTask(workstream, key.taskId);
+  assert.ok(releasedTask);
+  const releasedAttempt = findAttempt(releasedTask, key.attemptId);
+  assert.ok(releasedAttempt);
+  assert.equal(outputDisposition(releasedTask, releasedAttempt).kind, "released");
+  assert.throws(
+    () => createTask(workstream, childTask("After release", "After release attempt"), "t9"),
+    /eligible retained output/,
+  );
+});
+
+void test("partial shared launches settle after exact closure without output release", () => {
+  type Execution = NonNullable<Parameters<typeof activateAttempt>[3]>;
+  const partials: Execution[] = [
+    { placement: { kind: "shared_project", path: "/repo" } },
+    { placement: { kind: "shared_project", path: "/repo" }, sessionFile: "/worker.json" },
+    {
+      placement: { kind: "shared_project", path: "/repo" },
+      sessionFile: "/worker.json",
+      launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" },
+    },
+    {
+      placement: { kind: "shared_project", path: "/repo" },
+      sessionFile: "/worker.json",
+      launch: { ...resourceForTest(), cwd: "/repo" },
+    },
+  ];
+  for (const [index, execution] of partials.entries()) {
+    const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+    let workstream = deliver(
+      finish(add(), key.attemptId, reported(), key.taskId, execution),
+      key.attemptId,
+    );
+    assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
+    workstream = checkpointCleanup(
+      workstream,
+      key,
+      { state: "completed", workerClosed: true },
+      `shared-cleanup-${index}`,
+    );
+    assert.deepEqual(deriveCompletionAccounting(workstream), []);
+    const task = findTask(workstream, key.taskId);
+    assert.ok(task);
+    const attemptValue = findAttempt(task, key.attemptId);
+    assert.ok(attemptValue);
+    assert.equal(attemptValue.outputRelease, undefined);
+    assert.equal(outputDisposition(task, attemptValue).kind, "not_applicable");
+  }
+});
+
 void test("selection is one policy-owned target, while implementation retains guide and executor", () => {
   let workstream = activateAttempt(add(), { taskId: "Task opaque", attemptId: "Attempt A" }, "t2");
   const task = findTask(workstream, "Task opaque");
@@ -270,14 +640,15 @@ void test("selection is one policy-owned target, while implementation retains gu
   );
   const execution = {
     placement: { kind: "shared_project" as const, path: "/repo" },
-    worker: {
+    sessionFile: "/worker.json",
+    launch: {
+      phase: "ready" as const,
       workspaceId: "workspace",
       tabId: "tab",
       paneId: "pane",
       terminalId: "terminal",
       agentName: "agent",
       cwd: "/repo",
-      sessionFile: "/worker.json",
     },
     submission: "not_sent" as const,
   };
@@ -285,11 +656,29 @@ void test("selection is one policy-owned target, while implementation retains gu
   workstream = recordWorkerExecution(workstream, key, { placement: execution.placement }, "t3");
   const stagedTask = findTask(workstream, key.taskId);
   assert.ok(stagedTask);
-  assert.equal(findAttempt(stagedTask, key.attemptId)?.execution?.worker, undefined);
-  workstream = recordWorkerExecution(workstream, key, { worker: execution.worker }, "t3a");
-  workstream = recordWorkerExecution(workstream, key, { submission: "not_sent" }, "t3b");
-  workstream = recordWorkerExecution(workstream, key, { submission: "uncertain" }, "t3c");
-  workstream = recordWorkerExecution(workstream, key, { submission: "started" }, "t3d");
+  assert.equal(findAttempt(stagedTask, key.attemptId)?.execution?.launch, undefined);
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { sessionFile: execution.sessionFile },
+    "t3a",
+  );
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" } },
+    "t3b",
+  );
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { launch: { ...execution.launch, phase: "resource" as const } },
+    "t3c",
+  );
+  workstream = recordWorkerExecution(workstream, key, { launch: execution.launch }, "t3d");
+  workstream = recordWorkerExecution(workstream, key, { submission: "not_sent" }, "t3e");
+  workstream = recordWorkerExecution(workstream, key, { submission: "uncertain" }, "t3f");
+  workstream = recordWorkerExecution(workstream, key, { submission: "started" }, "t3g");
   assert.strictEqual(
     recordWorkerExecution(workstream, key, { submission: "started" }, "replay"),
     workstream,
@@ -312,10 +701,15 @@ void test("selection is one policy-owned target, while implementation retains gu
       recordWorkerExecution(
         workstream,
         key,
-        { worker: { ...execution.worker, paneId: "other" } },
+        {
+          launch: {
+            ...execution.launch,
+            paneId: "other",
+          },
+        },
         "t5",
       ),
-    /immutable/,
+    /progression/,
   );
   const uncertainSteering = {
     steering: { text: "Continue.", state: "uncertain" as const, observedAt: "t4a" },
@@ -395,12 +789,30 @@ void test("selection is one policy-owned target, while implementation retains gu
   late = recordWorkerExecution(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
-    { worker: execution.worker },
+    { sessionFile: execution.sessionFile },
     "t10",
+  );
+  late = recordWorkerExecution(
+    late,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" } },
+    "t10a",
+  );
+  late = recordWorkerExecution(
+    late,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { launch: { ...execution.launch, phase: "resource" as const } },
+    "t10b",
+  );
+  late = recordWorkerExecution(
+    late,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { launch: execution.launch },
+    "t10c",
   );
   const lateTask = findTask(late, "Task opaque");
   assert.ok(lateTask);
-  assert.equal(findAttempt(lateTask, "Attempt A")?.execution?.worker?.sessionFile, "/worker.json");
+  assert.equal(findAttempt(lateTask, "Attempt A")?.execution?.sessionFile, "/worker.json");
 });
 
 void test("grant is creation-only first grounding and revisions require a current direct receipt", () => {
@@ -522,14 +934,15 @@ void test("terminal failures and cancellation settle once operational obligation
 void test("isolated failed output remains blocked through cleanup until exact release, including after completion", () => {
   const execution = {
     placement: { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" },
-    worker: {
+    sessionFile: "/worker.json",
+    launch: {
+      phase: "ready" as const,
       workspaceId: "w",
       tabId: "tab",
       paneId: "pane",
       terminalId: "term",
       agentName: "agent",
       cwd: "/repo-work",
-      sessionFile: "/worker.json",
     },
     submission: "started" as const,
   };
@@ -645,14 +1058,15 @@ void test("isolated failed output remains blocked through cleanup until exact re
 void test("shared Worker closure and delivery gate reattempt and accounting", () => {
   const execution = {
     placement: { kind: "shared_project" as const, path: "/repo" },
-    worker: {
+    sessionFile: "/worker.json",
+    launch: {
+      phase: "ready" as const,
       workspaceId: "w",
       tabId: "tab",
       paneId: "pane",
       terminalId: "term",
       agentName: "agent",
       cwd: "/repo",
-      sessionFile: "/worker.json",
     },
     submission: "started" as const,
   };
@@ -697,14 +1111,15 @@ void test("shared Worker closure and delivery gate reattempt and accounting", ()
 void test("implementation candidate ancestry may cross Intents but application is exact and immutable", () => {
   const execution = {
     placement: { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" },
-    worker: {
+    sessionFile: "/worker.json",
+    launch: {
+      phase: "ready" as const,
       workspaceId: "w",
       tabId: "tab",
       paneId: "pane",
       terminalId: "term",
       agentName: "agent",
       cwd: "/repo-work",
-      sessionFile: "/worker.json",
     },
     submission: "started" as const,
   };

@@ -139,18 +139,35 @@ const PlacementSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-const WorkerIdentitySchema = Type.Object(
+const PaneLaunchCheckpointSchema = Type.Object(
   {
+    phase: Type.Literal("pane"),
     workspaceId: NonEmptyString,
-    tabId: NonEmptyString,
     paneId: NonEmptyString,
-    terminalId: NonEmptyString,
-    agentName: NonEmptyString,
-    cwd: NonEmptyString,
-    sessionFile: NonEmptyString,
   },
   { additionalProperties: false },
 );
+const ResourceLaunchFields = {
+  workspaceId: NonEmptyString,
+  tabId: NonEmptyString,
+  paneId: NonEmptyString,
+  terminalId: NonEmptyString,
+  agentName: NonEmptyString,
+  cwd: NonEmptyString,
+};
+const ResourceLaunchCheckpointSchema = Type.Object(
+  { phase: Type.Literal("resource"), ...ResourceLaunchFields },
+  { additionalProperties: false },
+);
+const ReadyLaunchCheckpointSchema = Type.Object(
+  { phase: Type.Literal("ready"), ...ResourceLaunchFields },
+  { additionalProperties: false },
+);
+export const LaunchCheckpointSchema = Type.Union([
+  PaneLaunchCheckpointSchema,
+  ResourceLaunchCheckpointSchema,
+  ReadyLaunchCheckpointSchema,
+]);
 const SteeringObservationSchema = Type.Object(
   {
     text: NonEmptyString,
@@ -166,7 +183,8 @@ const CancellationObservationSchema = Type.Object(
 export const WorkerExecutionSchema = Type.Object(
   {
     placement: Type.Optional(PlacementSchema),
-    worker: Type.Optional(WorkerIdentitySchema),
+    sessionFile: Type.Optional(NonEmptyString),
+    launch: Type.Optional(LaunchCheckpointSchema),
     submission: Type.Optional(
       stringLiterals(["not_sent", "uncertain", "submitted", "started"] as const),
     ),
@@ -407,6 +425,7 @@ export type HandoffGrant = Static<typeof HandoffGrantSchema>;
 export type Intent = Static<typeof IntentSchema>;
 export type CandidateLineage = Static<typeof CandidateLineageSchema>;
 export type ModelSelection = Static<typeof SelectionSchema>;
+export type LaunchCheckpoint = Static<typeof LaunchCheckpointSchema>;
 export type WorkerExecution = Static<typeof WorkerExecutionSchema>;
 export type RetainedArtifact = Static<typeof RetainedArtifactSchema>;
 export type Delivery = Static<typeof DeliverySchema>;
@@ -586,39 +605,89 @@ function hasOperationalFacts(attempt: Attempt): boolean {
 function validateExecution(attempt: Attempt): void {
   const execution = attempt.execution;
   if (execution === undefined) return;
-  if (
-    execution.worker !== undefined &&
-    execution.placement !== undefined &&
-    execution.worker.cwd !== execution.placement.path
-  )
-    throw new Error(`Attempt ${attempt.id} Worker identity does not match its placement.`);
+  if (execution.sessionFile !== undefined && execution.placement === undefined)
+    throw new Error(`Attempt ${attempt.id} has a Worker session without placement.`);
+  if (execution.launch !== undefined) {
+    if (execution.placement === undefined || execution.sessionFile === undefined)
+      throw new Error(`Attempt ${attempt.id} launch checkpoint has no exact placement/session.`);
+    if (execution.launch.phase !== "pane" && execution.launch.cwd !== execution.placement.path)
+      throw new Error(`Attempt ${attempt.id} launch cwd does not match its placement.`);
+  }
   if (execution.submission !== undefined && execution.placement === undefined)
     throw new Error(`Attempt ${attempt.id} has submission state without placement.`);
   if (
     execution.submission !== undefined &&
     execution.submission !== "not_sent" &&
-    execution.worker?.sessionFile === undefined
+    (execution.sessionFile === undefined || execution.launch?.phase !== "ready")
   )
-    throw new Error(`Attempt ${attempt.id} sent submission has no exact Worker session.`);
+    throw new Error(`Attempt ${attempt.id} sent submission requires a ready Worker session.`);
 }
 function executionTransition(
   attemptId: string,
   current: WorkerExecution | undefined,
   next: WorkerExecution,
+  allowPlacementDeclaration = false,
 ): WorkerExecution {
   const merged = mergeExecution(current, next);
   assertImmutableExecutionFields(attemptId, current, next);
-  assertSubmissionTransition(attemptId, current?.submission, next.submission);
-  assertSteeringTransition(attemptId, current?.steering, next.steering);
   if (current !== undefined && sameValue(current, merged)) return current;
+  assertSingleExecutionAdvancement(attemptId, current, next, allowPlacementDeclaration);
+  assertLaunchTransition(attemptId, current?.launch, next.launch);
+  assertSubmissionTransition(attemptId, current?.submission, next.submission, current?.launch);
+  assertSteeringTransition(attemptId, current?.steering, next.steering);
   return merged;
+}
+function assertSingleExecutionAdvancement(
+  attemptId: string,
+  current: WorkerExecution | undefined,
+  next: WorkerExecution,
+  allowPlacementDeclaration: boolean,
+): void {
+  const fields = [
+    "placement",
+    "sessionFile",
+    "launch",
+    "submission",
+    "steering",
+    "cancellation",
+  ] as const;
+  const advanced = fields.filter(
+    (field) => next[field] !== undefined && !sameValue(current?.[field], next[field]),
+  );
+  const placementWithDeclaration =
+    advanced.length === 2 &&
+    advanced.includes("placement") &&
+    advanced.includes("submission") &&
+    next.submission === "not_sent";
+  if (advanced.length !== 1 && !(allowPlacementDeclaration && placementWithDeclaration))
+    throw new Error(
+      `Attempt ${attemptId} execution mutation must record exactly one new external-effect stage.`,
+    );
+  if (advanced.includes("sessionFile") && current?.placement === undefined)
+    throw new Error(`Attempt ${attemptId} Worker session requires a prior placement checkpoint.`);
+  if (advanced.includes("launch") && current?.sessionFile === undefined)
+    throw new Error(`Attempt ${attemptId} launch requires a prior session checkpoint.`);
+  if (
+    advanced.includes("submission") &&
+    next.submission === "not_sent" &&
+    current?.placement === undefined &&
+    !advanced.includes("placement")
+  )
+    throw new Error(`Attempt ${attemptId} submission declaration requires Worker placement.`);
 }
 function mergeExecution(
   current: WorkerExecution | undefined,
   next: WorkerExecution,
 ): WorkerExecution {
   const merged: WorkerExecution = { ...current };
-  for (const field of ["placement", "worker", "submission", "steering", "cancellation"] as const)
+  for (const field of [
+    "placement",
+    "sessionFile",
+    "launch",
+    "submission",
+    "steering",
+    "cancellation",
+  ] as const)
     if (next[field] !== undefined) Object.assign(merged, { [field]: next[field] });
   return merged;
 }
@@ -634,11 +703,11 @@ function assertImmutableExecutionFields(
   )
     throw new Error(`Attempt ${attemptId} Worker placement is immutable.`);
   if (
-    current?.worker !== undefined &&
-    next.worker !== undefined &&
-    !sameValue(current.worker, next.worker)
+    current?.sessionFile !== undefined &&
+    next.sessionFile !== undefined &&
+    current.sessionFile !== next.sessionFile
   )
-    throw new Error(`Attempt ${attemptId} Worker identity is immutable.`);
+    throw new Error(`Attempt ${attemptId} Worker session file is immutable.`);
   if (
     current?.cancellation !== undefined &&
     next.cancellation !== undefined &&
@@ -646,10 +715,41 @@ function assertImmutableExecutionFields(
   )
     throw new Error(`Attempt ${attemptId} Worker cancellation checkpoint conflicts.`);
 }
+function assertLaunchTransition(
+  attemptId: string,
+  current: WorkerExecution["launch"] | undefined,
+  next: WorkerExecution["launch"] | undefined,
+): void {
+  if (next === undefined) return;
+  if (current === undefined) {
+    if (next.phase !== "pane")
+      throw new Error(`Attempt ${attemptId} launch progression cannot skip pane.`);
+    return;
+  }
+  if (sameValue(current, next)) return;
+  if (current.phase === "pane" && next.phase === "resource") {
+    if (current.workspaceId === next.workspaceId && current.paneId === next.paneId) return;
+    throw new Error(`Attempt ${attemptId} launch resource does not match its pane.`);
+  }
+  if (current.phase === "resource" && next.phase === "ready") {
+    if (
+      current.workspaceId === next.workspaceId &&
+      current.tabId === next.tabId &&
+      current.paneId === next.paneId &&
+      current.terminalId === next.terminalId &&
+      current.agentName === next.agentName &&
+      current.cwd === next.cwd
+    )
+      return;
+    throw new Error(`Attempt ${attemptId} ready launch does not match its resource.`);
+  }
+  throw new Error(`Attempt ${attemptId} launch progression is not monotonic.`);
+}
 function assertSubmissionTransition(
   attemptId: string,
   oldSubmission: WorkerExecution["submission"] | undefined,
   newSubmission: WorkerExecution["submission"] | undefined,
+  launch: WorkerExecution["launch"] | undefined,
 ): void {
   if (
     newSubmission !== undefined &&
@@ -659,6 +759,8 @@ function assertSubmissionTransition(
     throw new Error(`Attempt ${attemptId} submission transition is not monotonic.`);
   if (newSubmission !== undefined && oldSubmission === undefined && newSubmission !== "not_sent")
     throw new Error(`Attempt ${attemptId} submission must begin at not_sent.`);
+  if (newSubmission !== undefined && newSubmission !== "not_sent" && launch?.phase !== "ready")
+    throw new Error(`Attempt ${attemptId} sent submission requires a ready launch.`);
 }
 function validSubmissionTransition(
   oldSubmission: NonNullable<WorkerExecution["submission"]>,
@@ -741,6 +843,7 @@ function isRetainedCandidateParent(task: Task, attempt: Attempt, commit: string)
   return (
     attempt.state === "finished" &&
     attempt.execution?.placement?.kind === "isolated_worktree" &&
+    attempt.execution.launch?.phase === "ready" &&
     cleanup?.state === "completed" &&
     cleanup.workerClosed &&
     cleanup.expectedHead === commit &&
@@ -762,8 +865,14 @@ function validCandidateBase(attempt: Attempt): boolean {
 function validateApplication(task: Task, attempt: Attempt): void {
   const application = attempt.application;
   if (application === undefined) return;
-  if (task.kind !== "implementation" || attempt.execution?.placement?.kind !== "isolated_worktree")
-    throw new Error(`Attempt ${attempt.id} application is outside isolated implementation work.`);
+  if (
+    task.kind !== "implementation" ||
+    attempt.execution?.placement?.kind !== "isolated_worktree" ||
+    attempt.execution.launch?.phase !== "ready"
+  )
+    throw new Error(
+      `Attempt ${attempt.id} application is outside a ready isolated implementation.`,
+    );
   const candidateCommit = changedImplementationCommit(attempt);
   if (
     candidateCommit === undefined ||
@@ -933,7 +1042,9 @@ export function activateAttempt(
   if (located.attempt.state !== "queued")
     throw new Error(`Attempt ${key.attemptId} is not queued.`);
   const initialExecution =
-    execution === undefined ? undefined : executionTransition(key.attemptId, undefined, execution);
+    execution === undefined
+      ? undefined
+      : executionTransition(key.attemptId, undefined, execution, true);
   return mutate(workstream, updatedAt, (draft) => {
     const attempt = requireAttempt(draft, key).attempt;
     attempt.state = "active";
@@ -1197,6 +1308,8 @@ function outputReleaseEligible(task: Task, attempt: Attempt): boolean {
 }
 function outputDispositionBeforeRelease(task: Task, attempt: Attempt): OutputDisposition {
   if (attempt.execution?.placement?.kind !== "isolated_worktree") return { kind: "not_applicable" };
+  if (attempt.execution.launch?.phase !== "ready")
+    return { kind: "preserve_checkout", reason: "Worker launch is only partially checkpointed." };
   if (attempt.cleanup?.state === "blocked")
     return { kind: "preserve_checkout", reason: attempt.cleanup.error ?? "Cleanup is blocked." };
   const outcome = attempt.outcome;
