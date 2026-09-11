@@ -17,28 +17,15 @@ Discuss consequential choices with the user before implementation. Explain the r
 
 Use signatures, examples, diagrams, or prose according to what makes the boundary concrete. Do not manufacture ceremony for a local change beneath stable contracts, but do not call a cross-boundary change “local” merely because it was split into small assignments.
 
-## Hand off decided work
+## Delegate decided work
 
-Use Workgraph proportionately:
+Use Workgraph when bounded delegation is likely to improve evidence, implementation focus, or elapsed time enough to repay assignment, supervision, review, and integration. Handle straightforward local work directly; do not create tasks merely to follow a workflow.
 
-- Handle small, straightforward changes directly when assigning, supervising, reviewing, and integrating a worker would cost more than doing the work.
-- Delegate substantial, ambitious, uncertain, or naturally separable work when bounded workers can improve evidence, implementation focus, or elapsed time.
-- Do not create tasks merely to follow a workflow. Delegation must earn its coordination cost.
+Delegate implementation only after the relevant design boundaries above are settled. Carry those decisions into a complete objective and observable acceptance conditions, with enough source context to preserve them. Leave local algorithms and helper structure to the worker unless they are part of the settled design.
 
-Delegate implementation only after the consequential design is settled. Give the implementer the intended result and flow, responsibility boundaries, preserved and removed behavior, affected consumers, failure semantics, constraints, and observable acceptance conditions. Include enough source context to preserve settled priorities without making the worker rediscover the architecture. Leave algorithms, helper structure, and other local mechanics to the worker unless they are part of the agreed design.
+Make each assignment an independently judgeable slice. It need not cover the complete end-to-end flow, but it must own a coherent result whose acceptance does not depend on reconstructing intent from other assignments. A foundation slice is appropriate when its contract is settled, it can be verified independently, and its consumer is clear. Avoid both omnibus assignments and fragments whose coordination cost exceeds their isolation value.
 
-Make every assignment independently judgeable. An implementation assignment need not cover the complete end-to-end product flow, but it must own a coherent result whose acceptance can be decided without reconstructing intent from other assignments. Prefer a meaningful vertical slice when possible. A foundation slice is appropriate when its contract is settled, its behavior can be verified independently, and its later consumer is clear. Avoid both omnibus assignments spanning several responsibility boundaries and tiny fragments that create more handoff and integration work than they remove.
-
-Choose sequencing from actual dependencies rather than a serial or parallel default. Run contract-settled assignments concurrently when that reduces elapsed time without likely ownership or file conflicts, duplicated work, or disproportionate integration cost. Sequence coupled work and consumers of unfinished candidates. Parallel foundations followed by deliberate integration is often useful, but it is a heuristic rather than a mandatory phase model.
-
-Match the worker mode to the contribution:
-
-- Ask research for decision-changing observations and explicit unknowns.
-- Ask review for discrepancies and supporting evidence about one consequential concern, not a general approval.
-- Use consultation when a fresh advisor's non-authoritative judgment would materially improve a decision.
-- Use an independent Handoff only for a self-contained narrowed request. Include prior discussion only when it materially aids interpretation, and coordinate by the returned launch identity rather than expecting a result channel.
-
-Worker count and model diversity are separate choices. Use configured defaults ordinarily. Select distinct research or review models only when different model priors on the same question or concern are specifically useful.
+Split and sequence work along actual responsibility and dependency boundaries. Run independent slices concurrently when the elapsed-time gain outweighs likely conflicts, duplication, and integration cost; sequence dependent or overlapping work. Choose worker count from useful independent assignments, and model diversity separately only when different priors are valuable.
 
 ## Demand evidence, minimize testing machinery
 
