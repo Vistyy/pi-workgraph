@@ -42,8 +42,8 @@ export const FRONTIER_KIND_ORDER = [
   "placement_recovery",
   "worker_poll",
   "cancellation",
-  "cleanup",
   "delivery",
+  "cleanup",
 ] as const;
 
 export type FrontierEntry = Readonly<
@@ -220,6 +220,9 @@ function classifyFinished(
   if (isOperationallyStable(task, attempt)) return [];
   const key = attemptKey(task, attempt);
   const entries: FrontierEntry[] = [];
+  const outcome = attempt.outcome;
+  if (lifecycle !== "suspended" && outcome !== undefined && outcome.delivery.state === "pending")
+    entries.push(deliveryEntry(key, outcome));
   const execution = attempt.execution;
   // Blocked cleanup and manual application/output release are never scheduled;
   // only a pending or not-yet-recorded cleanup is retry-safe.
@@ -232,9 +235,6 @@ function classifyFinished(
     if (worker !== undefined) entry.worker = worker;
     entries.push(entry);
   }
-  const outcome = attempt.outcome;
-  if (lifecycle !== "suspended" && outcome !== undefined && outcome.delivery.state === "pending")
-    entries.push(deliveryEntry(key, outcome));
   return entries;
 }
 

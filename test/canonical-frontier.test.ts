@@ -1010,6 +1010,51 @@ void test("Intent revision removes every superseded queued key before a blocked 
   );
 });
 
+/** Two terminal Attempts whose delivery and cleanup obligations begin immediately runnable. */
+function deliveryCleanupWorkstream(f: Fixture): Workstream {
+  let ws = freshWorkstream(f);
+  for (const id of ["delivery-succeeds", "delivery-fails"]) {
+    const key = KEY(id, `${id}-a`);
+    ws = createTask(ws, taskFor(id, 0), T0);
+    ws = activate(ws, key, SHARED);
+    ws = terminalizeAttempt(ws, key, reported(), T1);
+  }
+  return { ...ws, revision: 0 };
+}
+
+void test("immediate delivery precedes independent cleanup without delaying cleanup for a retry", async () => {
+  const complete = await Effect.runPromise(Deferred.make<void>());
+  const dispatches: string[] = [];
+  const driver = driverFrom((entry, control) =>
+    Effect.gen(function* () {
+      dispatches.push(`${entry.kind}:${entry.key.attemptId}`);
+      if (entry.kind === "delivery") {
+        const mutation =
+          entry.key.taskId === "delivery-succeeds"
+            ? ({ kind: "record_delivery_success" } as const)
+            : ({ kind: "record_delivery_failure", detail: "controlled failure" } as const);
+        assert.equal((yield* control.commit(mutation)).kind, "committed");
+      }
+      if (dispatches.length === 4) yield* Deferred.succeed(complete, undefined);
+      return { kind: "blocked", detail: `Observed ${entry.kind}.` } as const;
+    }),
+  );
+
+  await withFixture((f) =>
+    withRuntime(f, { driver, initial: deliveryCleanupWorkstream }, () =>
+      Effect.gen(function* () {
+        expectSome(yield* Deferred.await(complete).pipe(Effect.timeoutOption("3 seconds")));
+        assert.deepEqual(dispatches, [
+          "delivery:delivery-succeeds-a",
+          "cleanup:delivery-succeeds-a",
+          "delivery:delivery-fails-a",
+          "cleanup:delivery-fails-a",
+        ]);
+      }),
+    ),
+  );
+});
+
 /** One active ready Worker identity plus one finished Attempt with a pending delivery. */
 function clockWorkstream(f: Fixture): Workstream {
   const intent = { statement: "Time it.", constraints: [], grounding: receipt(), recordedAt: T0 };
