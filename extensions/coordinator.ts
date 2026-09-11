@@ -327,7 +327,7 @@ export default function workstreamCoordinator(
     name: "workgraph_handoff",
     label: "Workgraph Handoff",
     description:
-      "Launch one independent child coordinator with a narrowed request. includeContext=false starts clean; true includes only the discussion before this call as non-authoritative context. The request cannot broaden the current Intent. Returns only exact confirmed running identity and has no result channel or retry lifecycle.",
+      "Launch one independent child coordinator with a narrowed request. includeContext=false starts clean; true includes only the discussion before this call as non-authoritative context. The request cannot broaden the current Intent. Returns exact native identity only when Herdr reports working or idle. Every current launch failure is uncertain: retain the child session and known native resources; do not clean up or retry. There is no result channel or retry lifecycle.",
     promptSnippet: "Launch an independent focused child coordinator",
     parameters: HandoffSchema,
     execute(id, params, signal, _update, ctx) {

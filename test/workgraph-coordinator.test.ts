@@ -414,6 +414,49 @@ else console.log(JSON.stringify({result:{}}));
   }
 });
 
+void test("registered handoff rejects exact blocked identity without resubmission or cleanup", async () => {
+  const native = await mkdtemp(join(tmpdir(), "workstream-handoff-blocked-"));
+  const command = join(native, "herdr.mjs");
+  const logFile = join(native, "calls.jsonl");
+  const stateFile = join(native, "state.json");
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+const args=process.argv.slice(2); appendFileSync(${JSON.stringify(logFile)},JSON.stringify(args)+"\\n");
+if(args[0]==="workspace"&&args[1]==="create") { writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify({cwd:args[args.indexOf("--cwd")+1]})); console.log(JSON.stringify({result:{workspace:{workspace_id:"blocked-workspace"},tab:{tab_id:"blocked-tab"},root_pane:{pane_id:"blocked-pane"}}})); }
+else if(args[0]==="agent"&&args[1]==="start") { const state={...JSON.parse(readFileSync(${JSON.stringify(stateFile)},"utf8")),name:args[2],session:args[args.indexOf("--session")+1]}; writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(state)); console.log(JSON.stringify({result:{agent:{workspace_id:"blocked-workspace",tab_id:"blocked-tab",pane_id:"blocked-pane",terminal_id:"blocked-terminal",agent_status:"working",name:state.name,cwd:state.cwd}}})); }
+else if(args[0]==="agent"&&args[1]==="get") { const state=JSON.parse(readFileSync(${JSON.stringify(stateFile)},"utf8")); console.log(JSON.stringify({result:{agent:{workspace_id:"blocked-workspace",tab_id:"blocked-tab",pane_id:"blocked-pane",terminal_id:"blocked-terminal",agent_status:"blocked",name:state.name,cwd:state.cwd,agent_session:{value:state.session}}}})); }
+else console.log(JSON.stringify({result:{}}));
+`,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "parent" });
+  const f = await fixture({}, [(pi) => workstreamCoordinator(pi, { workers: () => runtime })]);
+  try {
+    await f.input("Parent request");
+    await f.call("workgraph_intent", { statement: "Parent request" });
+    await assert.rejects(
+      f.call("workgraph_handoff", { request: "Launch the blocked child" }),
+      /blocked.*not launch-ready working or idle.*blocked-workspace.*blocked-tab.*blocked-pane|blocked-workspace.*blocked-tab.*blocked-pane.*blocked.*not launch-ready working or idle/s,
+    );
+    const calls = (await readFile(logFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(calls.filter((args) => args[0] === "workspace" && args[1] === "create").length, 1);
+    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "start").length, 1);
+    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "get").length, 1);
+    assert.equal(
+      calls.some((args) => args[0] === "tab" && args[1] === "close"),
+      false,
+    );
+  } finally {
+    await f.dispose();
+    await rm(native, { recursive: true, force: true });
+  }
+});
+
 void test("uncertain one-shot handoff reports exact handles and never duplicates launch", async () => {
   const native = await mkdtemp(join(tmpdir(), "workstream-handoff-uncertain-"));
   const command = join(native, "herdr.mjs");

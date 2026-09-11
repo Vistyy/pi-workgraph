@@ -487,6 +487,11 @@ export class HerdrCliRuntime {
           yield* protocolTry(["agent", "get"], () =>
             assertIdentity({ ...identity, sessionFile: expectedSessionFile }, current),
           );
+          if (current.status !== "working" && current.status !== "idle")
+            return yield* new WorkerLaunchReadinessError(
+              resource,
+              `Exact native Pi identity is ${current.status}, not launch-ready working or idle.`,
+            );
           return identity;
         }
         if (current.status === "blocked")
