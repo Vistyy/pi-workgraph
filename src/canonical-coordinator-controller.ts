@@ -37,6 +37,8 @@ import type { CanonicalHumanInputReceipt } from "./coordinator-notepad.js";
 import {
   type CoordinatorIdentity,
   createWorkstream,
+  type HandoffCheckpoint,
+  type HandoffGrant,
   HerdrDeadObservationSchema,
   type Intent,
   type RepositoryIdentity,
@@ -44,7 +46,14 @@ import {
   WorkstreamSchema,
 } from "./domain/workstream.js";
 import { GitRepository, inspectRepository } from "./git.js";
-import { HerdrCliRuntime } from "./herdr.js";
+import {
+  deterministicChildSessionId,
+  handoffChildWorkstreamId,
+  prepareHandoffSession,
+  priorDiscussion,
+} from "./handoff-session.js";
+import { type CoordinatorLaunchResource, HerdrCliRuntime } from "./herdr.js";
+import { herdrCoordinatorNames } from "./herdr-naming.js";
 
 export const CANONICAL_POINTER_ENTRY = "pi-workgraph-canonical-workstream";
 const CANONICAL_MESSAGE = "pi-workgraph-workstream";
@@ -302,6 +311,247 @@ export class CanonicalCoordinatorController {
           return yield* projectCanonicalAction(yield* next.runtime.inspectionSnapshot(), {
             action: "workgraph_intent",
           });
+        }.bind(this),
+      ),
+    );
+  }
+
+  handoff(
+    ctx: ExtensionContext,
+    toolCallId: string,
+    request: { request: string; forkContext: boolean; targetRepository: string | undefined },
+  ): Effect.Effect<object, unknown, Requirements> {
+    return this.serialize(
+      Effect.gen(
+        function* (this: CanonicalCoordinatorController) {
+          const active = yield* requireActive(this.active);
+          const target = yield* inspectRepository(
+            request.targetRepository ?? active.repository.projectRoot,
+          );
+          const targetRepository = { projectRoot: target.root, gitCommonDir: target.commonDir };
+          let state = yield* active.runtime.read();
+          let checkpoint = resolveHandoff(state, toolCallId, request, targetRepository);
+          if (checkpoint === undefined) {
+            if (state.lifecycle !== "active")
+              return yield* Effect.fail(
+                new Error(
+                  "Only an active, unsuspended parent Workstream can issue a Handoff Grant.",
+                ),
+              );
+            const intentIndex = state.intents.length - 1;
+            const intent = state.intents[intentIndex];
+            if (intent === undefined)
+              return yield* Effect.fail(new Error("Parent Workstream has no current Intent."));
+            const parentReceipt =
+              intent.grounding.kind === "handoff_grant"
+                ? intent.grounding.parentReceipt
+                : intent.grounding;
+            const issuedAt = yield* nowIso;
+            const id = `grant-${randomUUID()}`;
+            const grant: HandoffGrant = {
+              kind: "handoff_grant",
+              id,
+              parentReceipt: structuredClone(parentReceipt),
+              parentWorkstreamId: state.id,
+              parentRepository: structuredClone(state.repository),
+              parentIntentIndex: intentIndex,
+              parentIntentStatement: intent.statement,
+              parentIntentConstraints: [...intent.constraints],
+              narrowedRequest: request.request,
+              targetRepository,
+              issuedAt,
+            };
+            checkpoint = {
+              phase: "prepared",
+              id,
+              toolCallId,
+              request: request.request,
+              forkContext: request.forkContext,
+              grant,
+              childSessionId: deterministicChildSessionId(id),
+            };
+            state = yield* active.runtime.issueHandoff(checkpoint);
+          }
+          return yield* this.advanceHandoff(active, ctx, checkpoint);
+        }.bind(this),
+      ),
+    );
+  }
+
+  // biome-ignore-start lint/complexity/noExcessiveCognitiveComplexity: ordered checkpoints keep each remote effect and recovery classification explicit.
+  private advanceHandoff(
+    active: Active,
+    ctx: ExtensionContext,
+    initial: HandoffCheckpoint,
+  ): Effect.Effect<object, unknown, Requirements> {
+    return Effect.gen(
+      function* (this: CanonicalCoordinatorController) {
+        let checkpoint = initial;
+        const workers = this.options.workers?.() ?? new HerdrCliRuntime();
+        if (checkpoint.phase === "prepared") {
+          const parentDiscussion = priorDiscussion(ctx.sessionManager, checkpoint.toolCallId);
+          const prepared = yield* prepareHandoffSession(
+            checkpoint.grant.targetRepository.projectRoot,
+            checkpoint.childSessionId,
+            checkpoint.grant,
+            checkpoint.forkContext ? parentDiscussion : [],
+          );
+          checkpoint = {
+            ...checkpoint,
+            phase: "session_ready",
+            childSessionFile: prepared.sessionFile,
+          };
+          yield* active.runtime.checkpointHandoff(checkpoint);
+        }
+        if (checkpoint.phase === "session_ready") {
+          const names = herdrCoordinatorNames({
+            cwd: checkpoint.grant.targetRepository.projectRoot,
+            sessionFile: checkpoint.childSessionFile,
+          });
+          checkpoint = {
+            ...checkpoint,
+            phase: "workspace_submitting",
+            workspaceLabel: names.label,
+            agentName: names.agentName,
+          };
+          yield* active.runtime.checkpointHandoff(checkpoint);
+        }
+        if (checkpoint.phase === "workspace_submitting") {
+          const launchRequest = {
+            cwd: checkpoint.grant.targetRepository.projectRoot,
+            sessionFile: checkpoint.childSessionFile,
+          };
+          const observed = yield* workers.probeCoordinatorLaunch(launchRequest);
+          if (observed.state === "ambiguous") return yield* Effect.fail(new Error(observed.detail));
+          if (observed.state === "launched") {
+            const workspace = workspaceCheckpoint(checkpoint, observed.identity);
+            yield* active.runtime.checkpointHandoff(workspace);
+            const submitting = { ...workspace, phase: "start_submitting" as const };
+            yield* active.runtime.checkpointHandoff(submitting);
+            checkpoint = launchedCheckpoint(submitting, observed.identity, yield* nowIso);
+            yield* active.runtime.checkpointHandoff(checkpoint);
+          } else {
+            let resource: CoordinatorLaunchResource;
+            if (observed.state === "workspace") {
+              resource = observed.resource;
+              checkpoint = { ...checkpoint, phase: "workspace_ready", ...resourceFields(resource) };
+              yield* active.runtime.checkpointHandoff(checkpoint);
+            } else {
+              yield* active.runtime.checkOwnership();
+              const submitting = checkpoint;
+              checkpoint = yield* Effect.uninterruptibleMask((restore) =>
+                restore(workers.createCoordinatorWorkspace(launchRequest)).pipe(
+                  Effect.flatMap((created) => {
+                    const ready: Extract<HandoffCheckpoint, { phase: "workspace_ready" }> = {
+                      ...submitting,
+                      phase: "workspace_ready",
+                      ...resourceFields(created),
+                    };
+                    return active.runtime.checkpointHandoff(ready).pipe(Effect.as(ready));
+                  }),
+                ),
+              );
+            }
+          }
+        }
+        if (checkpoint.phase === "workspace_ready") {
+          checkpoint = { ...checkpoint, phase: "start_submitting" };
+          yield* active.runtime.checkpointHandoff(checkpoint);
+          yield* active.runtime.checkOwnership();
+          const submitting = checkpoint;
+          checkpoint = yield* Effect.uninterruptibleMask((restore) =>
+            restore(workers.startCoordinatorAgent(resourceFrom(submitting))).pipe(
+              Effect.flatMap((identity) =>
+                Effect.flatMap(nowIso, (launchedAt) => {
+                  const launched = launchedCheckpoint(submitting, identity, launchedAt);
+                  return active.runtime.checkpointHandoff(launched).pipe(Effect.as(launched));
+                }),
+              ),
+            ),
+          );
+        } else if (checkpoint.phase === "start_submitting") {
+          const observed = yield* workers.probeCoordinatorLaunch({
+            cwd: checkpoint.grant.targetRepository.projectRoot,
+            sessionFile: checkpoint.childSessionFile,
+          });
+          if (observed.state !== "launched")
+            return yield* Effect.fail(
+              new Error(
+                observed.state === "ambiguous"
+                  ? observed.detail
+                  : "Handoff agent start is uncertain and exact child identity is not observable; no resubmission was attempted.",
+              ),
+            );
+          checkpoint = launchedCheckpoint(checkpoint, observed.identity, yield* nowIso);
+          yield* active.runtime.checkpointHandoff(checkpoint);
+        }
+        if (checkpoint.phase !== "launched")
+          return yield* Effect.fail(new Error("Handoff launch did not reach an exact identity."));
+        return {
+          grantId: checkpoint.id,
+          childSessionId: checkpoint.childSessionId,
+          childSessionFile: checkpoint.childSessionFile,
+          workspaceId: checkpoint.workspaceId,
+          tabId: checkpoint.tabId,
+          paneId: checkpoint.paneId,
+          terminalId: checkpoint.terminalId,
+          agentName: checkpoint.agentName,
+          cwd: checkpoint.grant.targetRepository.projectRoot,
+          resultChannel: "none",
+        };
+      }.bind(this),
+    );
+  }
+
+  // biome-ignore-end lint/complexity/noExcessiveCognitiveComplexity: ordered checkpoint boundary ends here.
+  bootstrapHandoff(
+    ctx: ExtensionContext,
+    grant: HandoffGrant,
+  ): Effect.Effect<void, unknown, Requirements> {
+    return this.serialize(
+      Effect.gen(
+        function* (this: CanonicalCoordinatorController) {
+          if (this.active !== undefined) {
+            const state = yield* this.active.runtime.read();
+            verifyGrantBootstrap(state, grant);
+            return;
+          }
+          if (this.pointerBlocked)
+            return yield* Effect.fail(
+              new Error("Handoff Grant conflicts with a retained Workstream pointer."),
+            );
+          yield* this.proveRepository(grant.targetRepository);
+          const owner = this.owner(ctx);
+          const id = handoffChildWorkstreamId(grant.id);
+          const path = yield* CanonicalWorkstreamStore.pathFor(grant.targetRepository, id);
+          const now = yield* nowIso;
+          const initial = createWorkstream({
+            id,
+            purpose: grant.narrowedRequest,
+            repository: grant.targetRepository,
+            coordinator: owner,
+            intent: {
+              statement: grant.narrowedRequest,
+              constraints: [...grant.parentIntentConstraints],
+              grounding: structuredClone(grant),
+              recordedAt: now,
+            },
+            createdAt: now,
+          });
+          const pointer: CanonicalWorkstreamPointer = {
+            version: 1,
+            phase: "prepared",
+            path,
+            workstreamId: id,
+            repository: structuredClone(grant.targetRepository),
+            operation: { kind: "create", initial },
+          };
+          yield* this.persistPointer(pointer);
+          const discovered = yield* Effect.scoped(CanonicalWorkstreamStore.resumeCreate(initial));
+          const next = yield* this.acquire(ctx, discovered, { kind: "attach" }, owner);
+          this.active = next;
+          yield* this.persistPointer(attachedPointer(pointer));
+          this.publish(ctx, yield* next.runtime.snapshot());
         }.bind(this),
       ),
     );
@@ -674,6 +924,105 @@ function transferMatches(
     sameOwner(transfer.to, operation.expectedOwner) &&
     Value.Equal(transfer.deathObservation, operation.deathObservation)
   );
+}
+
+function resolveHandoff(
+  state: Workstream,
+  toolCallId: string,
+  request: { request: string; forkContext: boolean; targetRepository: string | undefined },
+  targetRepository: RepositoryIdentity,
+): HandoffCheckpoint | undefined {
+  const exactCall = (state.handoffs ?? []).findLast((handoff) => handoff.toolCallId === toolCallId);
+  if (exactCall !== undefined) {
+    requireMatchingHandoff(exactCall, request, targetRepository);
+    return exactCall;
+  }
+  const unresolved = (state.handoffs ?? []).findLast((handoff) => handoff.phase !== "launched");
+  if (unresolved === undefined) return undefined;
+  requireMatchingHandoff(unresolved, request, targetRepository);
+  return unresolved;
+}
+
+function requireMatchingHandoff(
+  handoff: HandoffCheckpoint,
+  request: { request: string; forkContext: boolean; targetRepository: string | undefined },
+  targetRepository: RepositoryIdentity,
+): void {
+  if (
+    handoff.request !== request.request ||
+    handoff.forkContext !== request.forkContext ||
+    !Value.Equal(handoff.grant.targetRepository, targetRepository)
+  )
+    throw new Error(
+      `Unresolved Handoff ${handoff.id} has different request, context, or target repository parameters.`,
+    );
+}
+
+function resourceFields(
+  resource: Pick<CoordinatorLaunchResource, "workspaceId" | "tabId" | "paneId">,
+) {
+  return {
+    workspaceId: resource.workspaceId,
+    tabId: resource.tabId,
+    paneId: resource.paneId,
+  };
+}
+
+function resourceFrom(
+  checkpoint: Extract<HandoffCheckpoint, { phase: "workspace_ready" | "start_submitting" }>,
+): CoordinatorLaunchResource {
+  return {
+    ...resourceFields(checkpoint),
+    agentName: checkpoint.agentName,
+    sessionFile: checkpoint.childSessionFile,
+    cwd: checkpoint.grant.targetRepository.projectRoot,
+  };
+}
+
+function workspaceCheckpoint(
+  checkpoint: Extract<HandoffCheckpoint, { phase: "workspace_submitting" }>,
+  identity: import("./types.js").WorkerIdentity,
+): Extract<HandoffCheckpoint, { phase: "workspace_ready" }> {
+  return {
+    ...checkpoint,
+    phase: "workspace_ready",
+    workspaceId: identity.workspaceId,
+    tabId: identity.tabId,
+    paneId: identity.paneId,
+  };
+}
+
+function launchedCheckpoint(
+  checkpoint: Extract<HandoffCheckpoint, { phase: "start_submitting" }>,
+  identity: import("./types.js").WorkerIdentity,
+  launchedAt: string,
+): Extract<HandoffCheckpoint, { phase: "launched" }> {
+  if (
+    checkpoint.workspaceId !== identity.workspaceId ||
+    checkpoint.tabId !== identity.tabId ||
+    checkpoint.paneId !== identity.paneId ||
+    checkpoint.agentName !== identity.agentName ||
+    checkpoint.childSessionFile !== identity.sessionFile ||
+    checkpoint.grant.targetRepository.projectRoot !== identity.cwd
+  )
+    throw new Error("Observed Herdr launch identity conflicts with the prepared Handoff.");
+  return {
+    ...checkpoint,
+    phase: "launched",
+    terminalId: identity.terminalId,
+    launchedAt,
+  };
+}
+
+function verifyGrantBootstrap(state: Workstream, grant: HandoffGrant): void {
+  const first = state.intents[0];
+  if (
+    first === undefined ||
+    first.statement !== grant.narrowedRequest ||
+    !Value.Equal(first.constraints, grant.parentIntentConstraints) ||
+    !Value.Equal(first.grounding, grant)
+  )
+    throw new Error("Attached child Workstream first Intent does not match its Handoff Grant.");
 }
 
 function publicMessage(cause: unknown): string {

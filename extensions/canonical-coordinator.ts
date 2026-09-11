@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/any-unknown-in-error-context -- Pi callbacks are the sole Promise facade over canonical Effects whose independently typed failures converge at this host boundary. */
+/* oxlint-disable effecttsgo/any-unknown-in-error-context, effecttsgo/global-error-in-effect-failure -- Pi callbacks are the sole Promise facade over canonical Effects whose independently typed failures converge at this host boundary. */
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The in-scope factory reads one immutable packaged instruction asset before registering its lifecycle hooks.
 import { readFileSync } from "node:fs";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -21,6 +21,12 @@ import {
   type CanonicalHumanInputReceipt,
   installCoordinatorSessionState,
 } from "../src/coordinator-notepad.js";
+import { type HandoffGrant, HandoffGrantSchema } from "../src/domain/workstream.js";
+import {
+  HANDOFF_GRANT_ENTRY,
+  HANDOFF_KICKOFF_ENTRY,
+  handoffChildWorkstreamId,
+} from "../src/handoff-session.js";
 import {
   loadModelPolicyEffect,
   MODEL_LIST_ROLES,
@@ -155,6 +161,14 @@ const ControlSchema = Type.Union(
   ],
   { type: "object" },
 );
+const HandoffSchema = Type.Object(
+  {
+    request: NonEmpty,
+    forkContext: Type.Optional(Type.Boolean({ default: false })),
+    targetRepository: Type.Optional(NonEmpty),
+  },
+  { additionalProperties: false },
+);
 const CompleteSchema = Type.Object(
   {
     conclusion: NonEmpty,
@@ -240,7 +254,21 @@ export default function canonicalCoordinator(
   };
 
   pi.on("session_start", (_event, ctx) =>
-    run(controller.restore(ctx, () => pointer(ctx))).catch((error) => {
+    run(
+      Effect.gen(function* () {
+        const grant = decodeSessionGrant(ctx);
+        if (grant !== undefined && hasPredecessorPointer(ctx))
+          return yield* Effect.fail(
+            new Error("Handoff Grant cannot coexist with a predecessor Workgraph pointer."),
+          );
+        const retained = pointer(ctx);
+        if (grant !== undefined && retained !== undefined) validateChildPointer(retained, grant);
+        yield* controller.restore(ctx, () => retained);
+        if (grant === undefined) return;
+        yield* controller.bootstrapHandoff(ctx, grant);
+        triggerHandoffKickoff(pi, ctx, grant);
+      }),
+    ).catch((error) => {
       ctx.ui.notify(
         `Canonical Workstream reattachment skipped: ${publicMessage(error)}`,
         "warning",
@@ -297,6 +325,22 @@ export default function canonicalCoordinator(
         ),
         signal,
       );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_handoff",
+    label: "Workgraph Handoff",
+    description:
+      "Launch an independent child coordinator with a narrowed request. forkContext=false starts clean; use true only when prior discussion materially aids interpretation. The request must narrow, never broaden, the current Intent. Returns immediate launch identity only and has no result channel.",
+    promptSnippet: "Launch an independent focused child coordinator",
+    parameters: HandoffSchema,
+    execute(id, params, signal, _update, ctx) {
+      const request = {
+        request: params.request,
+        forkContext: params.forkContext ?? false,
+        targetRepository: params.targetRepository,
+      };
+      return run(Effect.map(controller.handoff(ctx, id, request), toolResult), signal);
     },
   });
   pi.registerTool({
@@ -564,6 +608,72 @@ function reviewSubject(subject: Static<typeof PublicReviewSubjectSchema>) {
     case "revision":
       return subject;
   }
+}
+
+function decodeSessionGrant(ctx: ExtensionContext): HandoffGrant | undefined {
+  const entries = ctx.sessionManager
+    .getBranch()
+    .filter((entry) => entry.type === "custom" && entry.customType === HANDOFF_GRANT_ENTRY);
+  if (entries.length === 0) return undefined;
+  if (entries.length !== 1)
+    throw new Error("Child session must contain exactly one Handoff Grant.");
+  const entry = entries[0];
+  if (entry?.type !== "custom" || !Value.Check(HandoffGrantSchema, entry.data))
+    throw new Error("Child session contains a malformed Handoff Grant.");
+  return Value.Decode(HandoffGrantSchema, entry.data);
+}
+
+function validateChildPointer(pointer: CanonicalPointerRestoration, grant: HandoffGrant): void {
+  if (
+    pointer === "malformed" ||
+    pointer === undefined ||
+    pointer.workstreamId !== handoffChildWorkstreamId(grant.id) ||
+    !Value.Equal(pointer.repository, grant.targetRepository)
+  )
+    throw new Error("Retained canonical pointer conflicts with the child Handoff Grant.");
+}
+
+function hasPredecessorPointer(ctx: ExtensionContext): boolean {
+  return ctx.sessionManager
+    .getBranch()
+    .some((entry) => entry.type === "custom" && entry.customType === "pi-workgraph-workstream");
+}
+
+function triggerHandoffKickoff(pi: ExtensionAPI, ctx: ExtensionContext, grant: HandoffGrant): void {
+  const branch = ctx.sessionManager.getBranch();
+  const kickoffIndex = branch.findIndex(
+    (entry) => entry.type === "custom_message" && entry.customType === HANDOFF_KICKOFF_ENTRY,
+  );
+  if (kickoffIndex >= 0) {
+    const answered = branch
+      .slice(kickoffIndex + 1)
+      .some(
+        (entry) =>
+          entry.type === "message" &&
+          entry.message.role === "assistant" &&
+          entry.message.provider !== "workgraph",
+      );
+    if (!answered)
+      ctx.ui.notify(
+        "The retained Workgraph handoff kickoff has no observed child response; it was not duplicated.",
+        "warning",
+      );
+    return;
+  }
+  pi.sendMessage(
+    {
+      customType: HANDOFF_KICKOFF_ENTRY,
+      content: [
+        "[WORKGRAPH HANDOFF KICKOFF]",
+        grant.narrowedRequest,
+        "",
+        "Inherited parent constraints:",
+        ...grant.parentIntentConstraints.map((constraint) => `- ${constraint}`),
+      ].join("\n"),
+      display: true,
+    },
+    { triggerTurn: true, deliverAs: "followUp" },
+  );
 }
 
 function publicMessage(cause: unknown): string {

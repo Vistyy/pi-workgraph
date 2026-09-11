@@ -293,10 +293,8 @@ await test("coordinator forks into a new unfocused workspace with isolated Pi id
   const command = join(parent, "fake-herdr-fork.mjs");
   const cwd = join(parent, "child-repo");
   const sessionFile = join(parent, "child.jsonl");
-  const coordinatorAgentName = herdrCoordinatorNames({
-    cwd,
-    sessionFile,
-  }).agentName;
+  const coordinatorNames = herdrCoordinatorNames({ cwd, sessionFile });
+  const coordinatorAgentName = coordinatorNames.agentName;
   await writeFile(
     command,
     `#!/usr/bin/env node
@@ -305,7 +303,11 @@ const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
 const agentName = ${JSON.stringify(coordinatorAgentName)};
 const agent = (native) => ({workspace_id:"child-workspace",tab_id:"child-workspace:tab-1",pane_id:"child-workspace:pane-1",terminal_id:"child-terminal",agent_status:"idle",name:agentName,cwd:${JSON.stringify(cwd)},...(native ? {agent_session:{value:${JSON.stringify(sessionFile)}}} : {})});
-if (args[0] === "workspace" && args[1] === "create") console.log(JSON.stringify({result:{workspace:{workspace_id:"child-workspace"},tab:{tab_id:"child-workspace:tab-1"},root_pane:{pane_id:"child-workspace:pane-1"}}}));
+if (args[0] === "workspace" && args[1] === "list") console.log(JSON.stringify({result:{workspaces:[{workspace_id:"child-workspace",label:${JSON.stringify(coordinatorNames.label)},cwd:${JSON.stringify(cwd)}}]}}));
+else if (args[0] === "tab" && args[1] === "list") console.log(JSON.stringify({result:{tabs:[{tab_id:"child-workspace:tab-1"}]}}));
+else if (args[0] === "pane" && args[1] === "list") console.log(JSON.stringify({result:{panes:[{workspace_id:"child-workspace",tab_id:"child-workspace:tab-1",pane_id:"child-workspace:pane-1",terminal_id:"child-terminal",cwd:${JSON.stringify(cwd)}}]}}));
+else if (args[0] === "api" && args[1] === "snapshot") console.log(JSON.stringify({result:{snapshot:{agents:[agent(true)]}}}));
+else if (args[0] === "workspace" && args[1] === "create") console.log(JSON.stringify({result:{workspace:{workspace_id:"child-workspace"},tab:{tab_id:"child-workspace:tab-1"},root_pane:{pane_id:"child-workspace:pane-1"}}}));
 else if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:agent(false)}}));
 else if (args[0] === "agent" && args[1] === "get") console.log(JSON.stringify({result:{agent:agent(true)}}));
 else console.log(JSON.stringify({result:{accepted:true}}));
@@ -336,6 +338,8 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       cwd,
     });
     assert.notEqual(identity.workspaceId, "parent-workspace");
+    const probe = await runEffect(runtime.probeCoordinatorLaunch({ cwd, sessionFile }));
+    assert.deepEqual(probe, { state: "launched", identity });
     // SAFETY: Each fixture process writes only JSON-encoded string argument arrays to this private log.
     const calls = (await readFile(log, "utf8"))
       .trim()

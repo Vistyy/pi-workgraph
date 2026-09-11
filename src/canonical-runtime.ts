@@ -80,13 +80,16 @@ import {
   type CoordinatorIdentity,
   checkpointCancellation,
   checkpointCleanup,
+  checkpointHandoff,
   completeWorkstream,
   createTask,
   findAttempt,
   findOutcome,
   findTask,
+  type HandoffCheckpoint,
   type HerdrDeadObservation,
   type Intent,
+  issueHandoff,
   type Outcome,
   type RepositoryIdentity,
   recordDeliveryFailure,
@@ -432,6 +435,34 @@ export class CanonicalRuntime {
           );
           yield* this.notifyCommitted(committed, affected);
           return committed;
+        }.bind(this),
+      ),
+    );
+
+  readonly issueHandoff = (
+    prepared: Extract<HandoffCheckpoint, { phase: "prepared" }>,
+  ): CanonicalRuntimeEffect<Workstream> =>
+    this.serialized(
+      Effect.gen(
+        function* (this: CanonicalRuntime) {
+          const now = yield* this.now();
+          return yield* this.authoritative("issue canonical Handoff Grant", (state) =>
+            issueHandoff(state, prepared, now),
+          );
+        }.bind(this),
+      ),
+    );
+
+  readonly checkpointHandoff = (
+    checkpoint: HandoffCheckpoint,
+  ): CanonicalRuntimeEffect<Workstream> =>
+    this.serialized(
+      Effect.gen(
+        function* (this: CanonicalRuntime) {
+          const now = yield* this.now();
+          return yield* this.authoritative("checkpoint canonical Handoff launch", (state) =>
+            checkpointHandoff(state, checkpoint, now),
+          );
         }.bind(this),
       ),
     );

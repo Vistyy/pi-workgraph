@@ -4,11 +4,14 @@ import {
   decodeAgentResponse,
   decodeCoordinatorAgentResponse,
   decodeCoordinatorSnapshotResponse,
+  decodePaneListResponse,
   decodePaneResponse,
   decodeProcessInfoResponse,
   decodeSnapshotResponse,
   decodeSuccessResponse,
+  decodeTabListResponse,
   decodeWorkspaceCreateResponse,
+  decodeWorkspaceListResponse,
 } from "./herdr-decoder.js";
 import {
   assertCoordinatorPlacement,
@@ -149,6 +152,12 @@ export type WorkerLaunchInspection =
       detail: string;
     };
 
+export type CoordinatorLaunchProbe =
+  | { readonly state: "absent" }
+  | { readonly state: "workspace"; readonly resource: CoordinatorLaunchResource }
+  | { readonly state: "launched"; readonly identity: WorkerIdentity }
+  | { readonly state: "ambiguous"; readonly detail: string };
+
 export interface CoordinatorObservationRequest {
   paneId: string;
   sessionFile: string;
@@ -198,38 +207,27 @@ export class HerdrCliRuntime {
     });
   }
 
-  readonly launchCoordinator = (
+  readonly createCoordinatorWorkspace = (
     request: CoordinatorLaunchRequest,
-  ): Effect.Effect<WorkerIdentity, CoordinatorLaunchError | HerdrProtocolError> => {
-    return Effect.gen(
+  ): Effect.Effect<CoordinatorLaunchResource, CoordinatorLaunchError | HerdrProtocolError> =>
+    Effect.gen(
       function* (this: HerdrCliRuntime) {
         yield* this.requireAvailable("coordinator");
         const { agentName, label } = herdrCoordinatorNames(request);
-        const created = yield* this.transport
-          .call(
-            [
-              "workspace",
-              "create",
-              "--cwd",
-              request.cwd,
-              "--label",
-              label,
-              "--no-focus",
-              ...envArgs(this.coordinatorEnvironment),
-            ],
-            decodeWorkspaceCreateResponse,
-          )
-          .pipe(
-            Effect.mapError(
-              (cause) =>
-                new CoordinatorLaunchError(
-                  undefined,
-                  `Coordinator workspace creation is uncertain for session ${request.sessionFile} at ${request.cwd} with exact label ${JSON.stringify(label)}: ${cause.message} Inspect that label before retrying; no tab fallback or cleanup was attempted.`,
-                  cause,
-                ),
-            ),
-          );
-        const resource: CoordinatorLaunchResource = {
+        const created = yield* this.transport.call(
+          [
+            "workspace",
+            "create",
+            "--cwd",
+            request.cwd,
+            "--label",
+            label,
+            "--no-focus",
+            ...envArgs(this.coordinatorEnvironment),
+          ],
+          decodeWorkspaceCreateResponse,
+        );
+        return {
           workspaceId: created.workspaceId,
           tabId: created.tabId,
           paneId: created.paneId,
@@ -237,51 +235,151 @@ export class HerdrCliRuntime {
           sessionFile: request.sessionFile,
           cwd: request.cwd,
         };
-        let retainedResource = resource;
-        const launched = Effect.gen(
-          function* (this: HerdrCliRuntime) {
-            const started = yield* this.transport
-              .call(
-                [
-                  "agent",
-                  "start",
-                  agentName,
-                  "--kind",
-                  "pi",
-                  "--pane",
-                  resource.paneId,
-                  "--",
-                  "--session",
-                  request.sessionFile,
-                ],
-                decodeAgentResponse,
-                45_000,
-              )
-              .pipe(
-                Effect.flatMap((agent) => protocolTry(["agent", "start"], () => parseAgent(agent))),
-              );
-            yield* protocolTry(["agent", "start"], () =>
-              assertCoordinatorPlacement(resource, started),
-            );
-            const startedResource = resourceOf(started);
-            retainedResource = { ...resource, terminalId: startedResource.terminalId };
-            return yield* this.awaitNativeIdentity(startedResource, request.sessionFile);
-          }.bind(this),
+      }.bind(this),
+    ).pipe(
+      Effect.mapError((cause) =>
+        cause instanceof CoordinatorLaunchError
+          ? cause
+          : new CoordinatorLaunchError(
+              undefined,
+              `Coordinator workspace creation is uncertain for session ${request.sessionFile} at ${request.cwd}: ${cause.message} Inspect the deterministic label before retrying; no cleanup was attempted.`,
+              cause,
+            ),
+      ),
+    );
+
+  readonly startCoordinatorAgent = (
+    resource: CoordinatorLaunchResource,
+  ): Effect.Effect<WorkerIdentity, CoordinatorLaunchError | HerdrProtocolError> => {
+    let retained = resource;
+    return Effect.gen(
+      function* (this: HerdrCliRuntime) {
+        const started = yield* this.transport
+          .call(
+            [
+              "agent",
+              "start",
+              resource.agentName,
+              "--kind",
+              "pi",
+              "--pane",
+              resource.paneId,
+              "--",
+              "--session",
+              resource.sessionFile,
+            ],
+            decodeAgentResponse,
+            45_000,
+          )
+          .pipe(
+            Effect.flatMap((agent) => protocolTry(["agent", "start"], () => parseAgent(agent))),
+          );
+        yield* protocolTry(["agent", "start"], () => assertCoordinatorPlacement(resource, started));
+        const native = resourceOf(started);
+        retained = { ...resource, terminalId: native.terminalId };
+        return yield* this.awaitNativeIdentity(native, resource.sessionFile);
+      }.bind(this),
+    ).pipe(
+      Effect.mapError((cause) =>
+        cause instanceof CoordinatorLaunchError
+          ? cause
+          : new CoordinatorLaunchError(
+              retained,
+              `Coordinator launch is uncertain in workspace ${resource.workspaceId}, tab ${resource.tabId}, pane ${resource.paneId}, agent ${resource.agentName}, session ${resource.sessionFile}, cwd ${resource.cwd}: ${cause.message} Inspect these exact handles before retrying; the workspace was retained.`,
+              cause,
+            ),
+      ),
+    );
+  };
+
+  readonly launchCoordinator = (
+    request: CoordinatorLaunchRequest,
+  ): Effect.Effect<WorkerIdentity, CoordinatorLaunchError | HerdrProtocolError> =>
+    Effect.flatMap(this.createCoordinatorWorkspace(request), this.startCoordinatorAgent);
+
+  // biome-ignore-start lint/complexity/noExcessiveCognitiveComplexity: Exact probing keeps all identity evidence in one fail-closed boundary.
+  readonly probeCoordinatorLaunch = (
+    request: CoordinatorLaunchRequest,
+  ): Effect.Effect<CoordinatorLaunchProbe, HerdrProtocolError> => {
+    return Effect.gen(
+      function* (this: HerdrCliRuntime) {
+        yield* this.requireAvailable("coordinator");
+        const names = herdrCoordinatorNames(request);
+        const workspaces = yield* this.transport.call(
+          ["workspace", "list"],
+          decodeWorkspaceListResponse,
         );
-        return yield* launched.pipe(
-          Effect.mapError(
-            (cause) =>
-              new CoordinatorLaunchError(
-                retainedResource,
-                `Coordinator launch is uncertain in workspace ${resource.workspaceId}, tab ${resource.tabId}, pane ${resource.paneId}, agent ${agentName}, session ${request.sessionFile}, cwd ${request.cwd}: ${cause.message} Inspect these exact handles before retrying; the workspace was retained.`,
-                cause,
-              ),
-          ),
+        const matches = workspaces.filter(
+          (workspace) => workspace.label === names.label && workspace.cwd === request.cwd,
         );
+        if (matches.length === 0) return { state: "absent" as const };
+        if (matches.length !== 1)
+          return {
+            state: "ambiguous" as const,
+            detail: `Found ${matches.length} Herdr workspaces with the deterministic handoff label.`,
+          };
+        const workspace = matches[0];
+        if (workspace === undefined) return { state: "absent" as const };
+        const tabs = yield* this.transport.call(
+          ["tab", "list", "--workspace", workspace.workspaceId],
+          decodeTabListResponse,
+        );
+        const panes = yield* this.transport.call(
+          ["pane", "list", "--workspace", workspace.workspaceId],
+          decodePaneListResponse,
+        );
+        const matchingPanes = panes.filter(
+          (pane) =>
+            pane.workspaceId === workspace.workspaceId &&
+            pane.cwd === request.cwd &&
+            tabs.includes(pane.tabId),
+        );
+        if (tabs.length !== 1 || matchingPanes.length !== 1)
+          return {
+            state: "ambiguous" as const,
+            detail: "Deterministic handoff workspace does not contain one exact tab and pane.",
+          };
+        const pane = matchingPanes[0];
+        if (pane === undefined)
+          return { state: "ambiguous" as const, detail: "Deterministic handoff pane is missing." };
+        const resource: CoordinatorLaunchResource = {
+          workspaceId: workspace.workspaceId,
+          tabId: pane.tabId,
+          paneId: pane.paneId,
+          agentName: names.agentName,
+          sessionFile: request.sessionFile,
+          cwd: request.cwd,
+        };
+        const agents = yield* this.transport.call(["api", "snapshot"], decodeSnapshotResponse);
+        const candidates = agents.filter(
+          (agent) =>
+            agent.workspace_id === resource.workspaceId &&
+            agent.tab_id === resource.tabId &&
+            agent.pane_id === resource.paneId,
+        );
+        if (candidates.length === 0) return { state: "workspace" as const, resource };
+        if (candidates.length !== 1)
+          return {
+            state: "ambiguous" as const,
+            detail: "Deterministic handoff workspace has multiple native agents.",
+          };
+        const current = parseAgent(decodeAgent(candidates[0]));
+        if (
+          current.name !== resource.agentName ||
+          current.cwd !== resource.cwd ||
+          current.sessionFile !== resource.sessionFile
+        )
+          return {
+            state: "ambiguous" as const,
+            detail:
+              "Native agent does not match the exact child session, cwd, and deterministic name.",
+          };
+        return { state: "launched" as const, identity: identityOf(resourceOf(current), current) };
       }.bind(this),
     );
   };
 
+  // biome-ignore-end lint/complexity/noExcessiveCognitiveComplexity: Exact probing boundary ends here.
   readonly coordinatorLiveness = (
     sessionFile: string,
   ): Effect.Effect<"alive" | "dead" | "unknown", HerdrProtocolError> => {

@@ -11,6 +11,7 @@ import {
   checkpointApplication,
   checkpointCancellation,
   checkpointCleanup,
+  checkpointHandoff,
   checkpointOutputRelease,
   completeWorkstream,
   createTask,
@@ -21,6 +22,7 @@ import {
   HandoffGrantSchema,
   type Intent,
   IntentSchema,
+  issueHandoff,
   LaunchCheckpointSchema,
   outputDisposition,
   recordDeliveryFailure,
@@ -1017,6 +1019,102 @@ void test("grant is creation-only first grounding and revisions require a curren
       }),
     /only valid for the first/,
   );
+});
+
+void test("Handoff issuance retains direct and nested root receipt authority and rejects inactive parents", () => {
+  const prepared = {
+    phase: "prepared" as const,
+    id: "grant-direct",
+    toolCallId: "call-direct",
+    request: "Narrow child request",
+    forkContext: false,
+    childSessionId: "11111111-1111-5111-a111-111111111111",
+    grant: {
+      kind: "handoff_grant" as const,
+      id: "grant-direct",
+      parentReceipt: receipt,
+      parentWorkstreamId: "Workstream opaque",
+      parentRepository: repository,
+      parentIntentIndex: 0,
+      parentIntentStatement: intent.statement,
+      parentIntentConstraints: intent.constraints,
+      narrowedRequest: "Narrow child request",
+      targetRepository: repository,
+      issuedAt: "t1",
+    },
+  };
+  const parent = issueHandoff(base(), prepared, "t1");
+  assert.deepEqual(parent.handoffs?.[0]?.grant.parentReceipt, receipt);
+  const sessionReady = checkpointHandoff(
+    parent,
+    { ...prepared, phase: "session_ready", childSessionFile: "/child.jsonl" },
+    "t2",
+  );
+  assert.equal(sessionReady.handoffs?.[0]?.phase, "session_ready");
+  assert.throws(
+    () =>
+      checkpointHandoff(
+        parent,
+        {
+          ...prepared,
+          phase: "workspace_submitting",
+          childSessionFile: "/child.jsonl",
+          workspaceLabel: "label",
+          agentName: "agent",
+        },
+        "t2",
+      ),
+    /skipped/,
+  );
+
+  const childGrant = { ...prepared.grant, id: "parent-grant", parentWorkstreamId: "upstream" };
+  const child = createWorkstream({
+    id: "nested-parent",
+    purpose: "Nested",
+    repository,
+    coordinator,
+    intent: { ...intent, grounding: childGrant },
+    createdAt: "t0",
+  });
+  const nestedPrepared = {
+    ...prepared,
+    id: "grant-nested",
+    grant: {
+      ...prepared.grant,
+      id: "grant-nested",
+      parentWorkstreamId: child.id,
+      parentIntentStatement: child.intents[0]?.statement ?? "",
+      parentIntentConstraints: child.intents[0]?.constraints ?? [],
+    },
+  };
+  assert.deepEqual(
+    issueHandoff(child, nestedPrepared, "t2").handoffs?.[0]?.grant.parentReceipt,
+    receipt,
+  );
+  assert.throws(
+    () =>
+      issueHandoff(
+        suspendWorkstream(
+          base(),
+          { reason: "hold", suspendedAt: "2026-01-01T00:00:00.000Z" },
+          "t1",
+        ),
+        prepared,
+        "t2",
+      ),
+    /active/,
+  );
+  const completed = completeWorkstream(
+    base(),
+    {
+      conclusion: "done",
+      evidence: [{ label: "state", observation: "done" }],
+      limitations: [],
+      completedAt: "t1",
+    },
+    "t1",
+  );
+  assert.throws(() => issueHandoff(completed, prepared, "t2"), /active/);
 });
 
 void test("coordinator transfer history preserves direct receipt ownership intervals", () => {
