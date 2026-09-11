@@ -179,6 +179,9 @@ void test("implementation worker tools expose object-root schemas", async () => 
       // SAFETY: Registered tool parameters are TypeBox JSON Schema objects.
       assert.equal((tool.parameters as { readonly type?: unknown }).type, "object");
     }
+    const inspected = await f.call("workgraph_plan", { action: "get" });
+    const details = decodeTestValue(planToolDetailsSchema, inspected.details);
+    assert.deepEqual(Object.keys(details), ["action", "plan", "planStatus", "attempt"]);
   } finally {
     await f.dispose();
   }

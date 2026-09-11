@@ -2,6 +2,7 @@
 import { Data, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import { isWorkerIdentityData, type WorkerContextIdentity } from "./worker-context.js";
 
 // One concise, worker-owned plan survives the guide/executor handoff. Status is
 // navigation, never verification evidence or authority to expand the assignment.
@@ -118,10 +119,6 @@ export const WorkerPlanToolSchema = Type.Union(
   ],
   { type: "object" },
 );
-const WorkerAttemptIdentitySchema = Type.Object({
-  runId: Type.String(),
-  nodeId: Type.String(),
-});
 const WorkerPlanEntrySchema = Type.Object(
   {
     runId: Type.String(),
@@ -135,21 +132,23 @@ const WorkerPlanEntrySchema = Type.Object(
 export type WorkerPlan = Static<typeof WorkerPlanSchema>;
 export type WorkerPlanToolInput = Static<typeof WorkerPlanToolSchema>;
 export type PlanRestoreKind = "absent" | "valid" | "malformed";
-export interface WorkerAttemptIdentity {
-  readonly runId: string;
-  readonly nodeId: string;
-}
+export type WorkerAttemptIdentity = WorkerContextIdentity;
 export interface WorkerPlanEntry {
   readonly type: string;
   readonly customType?: string;
   readonly data?: unknown;
 }
-export interface PersistedPlanResult {
-  readonly action: string;
-  readonly plan: WorkerPlan;
-  readonly planStatus: "valid";
-  readonly attempt: WorkerAttemptIdentity;
-  readonly change?: { readonly removed: { readonly id: string; readonly reason: string } };
+type PlanChange = { readonly removed: { readonly id: string; readonly reason: string } };
+
+export interface WorkerPlanToolResult {
+  readonly content: Array<{ readonly type: "text"; readonly text: string }>;
+  readonly details: {
+    readonly action: string;
+    readonly plan: WorkerPlan | undefined;
+    readonly planStatus: PlanRestoreKind;
+    readonly attempt: WorkerAttemptIdentity;
+    readonly change?: PlanChange | undefined;
+  };
 }
 
 export class WorkerContractError extends Data.TaggedError("WorkerContractError")<{
@@ -317,7 +316,10 @@ export class WorkerPlanState {
         : undefined;
   }
 
-  execute(input: WorkerPlanToolInput, phase: "guide" | "executor") {
+  execute(
+    input: WorkerPlanToolInput,
+    phase: "guide" | "executor",
+  ): Effect.Effect<WorkerPlanToolResult, WorkerContractError> {
     if (input.action === "get") return Effect.succeed(this.result("get", phase));
     if (input.action === "update") return this.guideUpdate(input.plan, phase);
     return this.targetedEdit(input);
@@ -355,24 +357,14 @@ export class WorkerPlanState {
     );
   }
 
-  private result(
-    action: string,
-    phase: "guide" | "executor",
-    change?: PersistedPlanResult["change"],
-  ) {
+  private result(action: string, phase: "guide" | "executor"): WorkerPlanToolResult {
     return {
-      content: [
-        {
-          type: "text" as const,
-          text: action === "get" ? this.text(phase) : `Updated ${this.text(phase)}`,
-        },
-      ],
+      content: [{ type: "text", text: this.text(phase) }],
       details: {
         action,
         plan: this.plan === undefined ? undefined : structuredClone(this.plan),
         planStatus: this.status,
         attempt: this.identity,
-        change: change === undefined ? undefined : structuredClone(change),
       },
     };
   }
@@ -381,7 +373,7 @@ export class WorkerPlanState {
     next: WorkerPlan,
     action: string,
     allocatedThrough = this.nextStepNumber,
-    change?: PersistedPlanResult["change"],
+    change?: PlanChange,
   ) {
     this.append("pi-workgraph-worker-plan", {
       ...this.identity,
@@ -491,10 +483,8 @@ export class WorkerPlanState {
     return { kind: "malformed", nextStepNumber: 1 };
   }
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict attempt-identity schema decodes this Pi session boundary.
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Shared strict identity decoding owns this Pi session boundary.
   private isCurrentAttemptData(data: unknown): boolean {
-    if (!Value.Check(WorkerAttemptIdentitySchema, data)) return false;
-    const identity = Value.Decode(WorkerAttemptIdentitySchema, data);
-    return identity.runId === this.identity.runId && identity.nodeId === this.identity.nodeId;
+    return isWorkerIdentityData(data, this.identity);
   }
 }
