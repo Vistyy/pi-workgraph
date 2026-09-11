@@ -4,14 +4,11 @@ import {
   decodeAgentResponse,
   decodeCoordinatorAgentResponse,
   decodeCoordinatorSnapshotResponse,
-  decodePaneListResponse,
   decodePaneResponse,
   decodeProcessInfoResponse,
   decodeSnapshotResponse,
   decodeSuccessResponse,
-  decodeTabListResponse,
   decodeWorkspaceCreateResponse,
-  decodeWorkspaceListResponse,
   type HerdrAgentStatus,
 } from "./herdr-decoder.js";
 import {
@@ -124,12 +121,6 @@ export type WorkerLaunchInspection =
       evidence: WorkerLaunchInspectionEvidence;
       detail: string;
     };
-
-export type CoordinatorLaunchProbe =
-  | { readonly state: "absent" }
-  | { readonly state: "workspace"; readonly resource: CoordinatorLaunchResource }
-  | { readonly state: "launched"; readonly identity: WorkerIdentity }
-  | { readonly state: "ambiguous"; readonly detail: string };
 
 export interface CoordinatorObservationRequest {
   paneId: string;
@@ -257,7 +248,14 @@ export class HerdrCliRuntime {
         yield* protocolTry(["agent", "start"], () => assertCoordinatorPlacement(resource, started));
         const native = resourceOf(started);
         retained = { ...resource, terminalId: native.terminalId };
-        return yield* this.awaitNativeIdentity(native, resource.sessionFile);
+        const identity = yield* this.awaitNativeIdentity(native, resource.sessionFile);
+        const confirmation = yield* this.observe(identity);
+        if (confirmation.status !== "working")
+          return yield* new CoordinatorLaunchError(
+            retained,
+            `Coordinator launch did not confirm a running Pi agent; exact status is ${confirmation.status}.`,
+          );
+        return identity;
       }.bind(this),
     ).pipe(
       Effect.mapError((cause) =>
@@ -277,87 +275,6 @@ export class HerdrCliRuntime {
   ): Effect.Effect<WorkerIdentity, CoordinatorLaunchError | HerdrProtocolError> =>
     Effect.flatMap(this.createCoordinatorWorkspace(request), this.startCoordinatorAgent);
 
-  // biome-ignore-start lint/complexity/noExcessiveCognitiveComplexity: Exact probing keeps all identity evidence in one fail-closed boundary.
-  readonly probeCoordinatorLaunch = (
-    request: CoordinatorLaunchRequest,
-  ): Effect.Effect<CoordinatorLaunchProbe, HerdrProtocolError> => {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        yield* this.requireAvailable("coordinator");
-        const names = herdrCoordinatorNames(request);
-        const workspaces = yield* this.transport.call(
-          ["workspace", "list"],
-          decodeWorkspaceListResponse,
-        );
-        const matches = workspaces.filter((workspace) => workspace.label === names.label);
-        if (matches.length === 0) return { state: "absent" as const };
-        if (matches.length !== 1)
-          return {
-            state: "ambiguous" as const,
-            detail: `Found ${matches.length} Herdr workspaces with the deterministic handoff label.`,
-          };
-        const workspace = matches[0];
-        if (workspace === undefined) return { state: "absent" as const };
-        const tabs = yield* this.transport.call(
-          ["tab", "list", "--workspace", workspace.workspaceId],
-          decodeTabListResponse,
-        );
-        const panes = yield* this.transport.call(
-          ["pane", "list", "--workspace", workspace.workspaceId],
-          decodePaneListResponse,
-        );
-        const matchingPanes = panes.filter(
-          (pane) =>
-            pane.workspaceId === workspace.workspaceId &&
-            pane.cwd === request.cwd &&
-            tabs.includes(pane.tabId),
-        );
-        if (tabs.length !== 1 || matchingPanes.length !== 1)
-          return {
-            state: "ambiguous" as const,
-            detail: "Deterministic handoff workspace does not contain one exact tab and pane.",
-          };
-        const pane = matchingPanes[0];
-        if (pane === undefined)
-          return { state: "ambiguous" as const, detail: "Deterministic handoff pane is missing." };
-        const resource: CoordinatorLaunchResource = {
-          workspaceId: workspace.workspaceId,
-          tabId: pane.tabId,
-          paneId: pane.paneId,
-          agentName: names.agentName,
-          sessionFile: request.sessionFile,
-          cwd: request.cwd,
-        };
-        const agents = yield* this.transport.call(["api", "snapshot"], decodeSnapshotResponse);
-        const candidates = agents.filter(
-          (agent) =>
-            agent.workspace_id === resource.workspaceId &&
-            agent.tab_id === resource.tabId &&
-            agent.pane_id === resource.paneId,
-        );
-        if (candidates.length === 0) return { state: "workspace" as const, resource };
-        if (candidates.length !== 1)
-          return {
-            state: "ambiguous" as const,
-            detail: "Deterministic handoff workspace has multiple native agents.",
-          };
-        const current = parseAgent(decodeAgent(candidates[0]));
-        if (
-          current.name !== resource.agentName ||
-          current.cwd !== resource.cwd ||
-          current.sessionFile !== resource.sessionFile
-        )
-          return {
-            state: "ambiguous" as const,
-            detail:
-              "Native agent does not match the exact child session, cwd, and deterministic name.",
-          };
-        return { state: "launched" as const, identity: identityOf(resourceOf(current), current) };
-      }.bind(this),
-    );
-  };
-
-  // biome-ignore-end lint/complexity/noExcessiveCognitiveComplexity: Exact probing boundary ends here.
   readonly coordinatorLiveness = (
     sessionFile: string,
   ): Effect.Effect<"alive" | "dead" | "unknown", HerdrProtocolError> => {

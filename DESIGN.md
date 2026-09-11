@@ -71,6 +71,14 @@ Preserve genuine authority, input and model provenance, exact resource ownership
 Represent uncertainty explicitly, especially when an operation may have taken effect despite an interrupted response.
 Recovery should inspect authoritative state before retrying and should retain conflicting or blocked work when safe automatic settlement is not justified.
 
+### Keep Handoff one-shot
+
+A Handoff is a nonpersisted capability, not parent Workstream state. `workgraph_handoff(request, includeContext?)` reads the current Workstream and Intent only to derive one exact narrowed grant and its fixed repository. It creates no parent Task, checkpoint, reconciliation work, cancellation relation, completion gate, result channel, or retry obligation.
+
+Each invocation creates one fresh parentless Pi session using Pi's default model configuration. The child session retains the exact grant needed to bootstrap its independent grant-grounded Workstream and one kickoff through the normal coordinator startup path. Optional context contains only the discussion before the persisted invoking tool call, excludes Workgraph-owned entries, and is explicitly non-authoritative.
+
+The capability submits one Herdr coordinator launch and waits within that call for exact running identity across the session file, repository cwd, workspace, tab, pane, terminal, agent name, and native Pi identity. Success returns only that identity. Failure retains the child session and reports known resource evidence without storing a retryable parent lifecycle or automatically resubmitting; uncertain resources are preserved.
+
 ### Separate worker, output, and coordination lifetime
 
 A stopped worker closes independently of whether its report is successful, malformed, or failed and independently of whether its owned output remains useful.

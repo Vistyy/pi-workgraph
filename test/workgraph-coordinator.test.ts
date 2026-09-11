@@ -19,7 +19,7 @@ import { WORKSTREAM_POINTER_ENTRY } from "../src/coordination/controller.js";
 import type { HandoffGrant } from "../src/domain/workstream.js";
 import { createWorkstream } from "../src/domain/workstream.js";
 import {
-  deterministicChildSessionId,
+  HANDOFF_CONTEXT_ENTRY,
   HANDOFF_KICKOFF_CLAIM_ENTRY,
   HANDOFF_KICKOFF_ENTRY,
   prepareHandoffSession,
@@ -120,11 +120,7 @@ async function fixture(
   const prepared =
     grant === undefined
       ? undefined
-      : await Effect.runPromise(
-          prepareHandoffSession(root, deterministicChildSessionId(grant.id), grant, []).pipe(
-            Effect.provide(liveLayer),
-          ),
-        );
+      : await Effect.runPromise(prepareHandoffSession(root, grant, []));
   const session = prepared === undefined ? undefined : SessionManager.open(prepared.sessionFile);
   const pi = await extensionFixture(
     "coordinator",
@@ -162,6 +158,21 @@ void test("package and staged factory register only the workstream coordinator a
       assert.ok(f.runner.getToolDefinition(name) !== undefined, `missing ${name}`);
     assert.equal(f.runner.getToolDefinition("workgraph_fork"), undefined);
     assert.equal(f.runner.getToolDefinition("workgraph_reload"), undefined);
+    const handoff = f.runner.getToolDefinition("workgraph_handoff");
+    assert.ok(handoff !== undefined);
+    assert.equal(Value.Check(handoff.parameters, { request: "Narrow request" }), true);
+    assert.equal(
+      Value.Check(handoff.parameters, { request: "Narrow request", includeContext: true }),
+      true,
+    );
+    assert.equal(
+      Value.Check(handoff.parameters, { request: "Narrow request", forkContext: true }),
+      false,
+    );
+    assert.equal(
+      Value.Check(handoff.parameters, { request: "Narrow request", targetRepository: "/tmp" }),
+      false,
+    );
   } finally {
     await f.dispose();
   }
@@ -182,7 +193,7 @@ void test("child session bootstrap creates the grant-grounded first Intent and t
 
     const identity = {
       grantId: f.grant.id,
-      childSessionId: deterministicChildSessionId(f.grant.id),
+      childSessionId: f.session.getSessionId(),
     };
     const claim = f.session
       .getBranch()
@@ -288,7 +299,7 @@ void test("kickoff host failure leaves a durable uncertain claim and never resen
   }
 });
 
-void test("handoff tool checkpoints one successful independent launch and exact replay mutates no remote", async () => {
+void test("registered handoff launches fresh context/no-context sessions without parent mutation", async () => {
   const native = await mkdtemp(join(tmpdir(), "workstream-handoff-herdr-"));
   const command = join(native, "herdr.mjs");
   const stateFile = join(native, "state.json");
@@ -297,11 +308,9 @@ void test("handoff tool checkpoints one successful independent launch and exact 
     command,
     `#!/usr/bin/env node
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
-const args = process.argv.slice(2);
-appendFileSync(${JSON.stringify(logFile)}, JSON.stringify(args) + "\\n");
+const args = process.argv.slice(2); appendFileSync(${JSON.stringify(logFile)}, JSON.stringify(args) + "\\n");
 const read = () => existsSync(${JSON.stringify(stateFile)}) ? JSON.parse(readFileSync(${JSON.stringify(stateFile)}, "utf8")) : undefined;
-if (args[0] === "workspace" && args[1] === "list") console.log(JSON.stringify({result:{workspaces:[]}}));
-else if (args[0] === "workspace" && args[1] === "create") { const cwd=args[args.indexOf("--cwd")+1]; writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify({cwd})); console.log(JSON.stringify({result:{workspace:{workspace_id:"handoff-workspace"},tab:{tab_id:"handoff-tab"},root_pane:{pane_id:"handoff-pane"}}})); }
+if (args[0] === "workspace" && args[1] === "create") { const cwd=args[args.indexOf("--cwd")+1]; writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify({cwd})); console.log(JSON.stringify({result:{workspace:{workspace_id:"handoff-workspace"},tab:{tab_id:"handoff-tab"},root_pane:{pane_id:"handoff-pane"}}})); }
 else if (args[0] === "agent" && args[1] === "start") { const prior=read(); const session=args[args.indexOf("--session")+1]; writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify({...prior,name:args[2],session})); console.log(JSON.stringify({result:{agent:{workspace_id:"handoff-workspace",tab_id:"handoff-tab",pane_id:"handoff-pane",terminal_id:"handoff-terminal",agent_status:"working",name:args[2],cwd:prior.cwd}}})); }
 else if (args[0] === "agent" && args[1] === "get") { const value=read(); console.log(JSON.stringify({result:{agent:{workspace_id:"handoff-workspace",tab_id:"handoff-tab",pane_id:"handoff-pane",terminal_id:"handoff-terminal",agent_status:"working",name:value.name,cwd:value.cwd,agent_session:{value:value.session}}}})); }
 else console.log(JSON.stringify({result:{}}));
@@ -310,120 +319,139 @@ else console.log(JSON.stringify({result:{}}));
   await chmod(command, 0o755);
   const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "parent" });
   const f = await fixture({}, [(pi) => workstreamCoordinator(pi, { workers: () => runtime })]);
+  const childSessions: string[] = [];
   try {
     await f.input("Coordinate the parent request");
     await f.call("workgraph_intent", {
       statement: "Coordinate the parent request",
       constraints: ["Keep scope narrow"],
     });
-    const first = await f.call("workgraph_handoff", { request: "Perform the focused child part" });
-    assert.equal((first.details as { resultChannel?: string }).resultChannel, "none");
-    const beforeReplay = await readFile(logFile, "utf8");
-    const replay = await f.call("workgraph_handoff", { request: "Perform the focused child part" });
+    const before = await f.call("workgraph_inspect", { section: "overview" });
+    const clean = await f.callWithId("clean-call", "workgraph_handoff", {
+      request: "Perform the clean child part",
+    });
+    const cleanIdentity = clean.details as { sessionFile: string; cwd: string };
+    childSessions.push(cleanIdentity.sessionFile);
+    assert.equal(cleanIdentity.cwd, f.root);
     assert.equal(
-      (replay.details as { childSessionFile?: string }).childSessionFile,
-      (first.details as { childSessionFile?: string }).childSessionFile,
+      SessionManager.open(cleanIdentity.sessionFile)
+        .getBranch()
+        .some(
+          (entry) => entry.type === "custom_message" && entry.customType === HANDOFF_CONTEXT_ENTRY,
+        ),
+      false,
     );
-    assert.equal(await readFile(logFile, "utf8"), beforeReplay);
-    const pointerEntry = f.session
-      .getBranch()
-      .findLast(
-        (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
-      );
-    assert.ok(pointerEntry?.type === "custom");
-    const attachment = await Effect.runPromise(
-      Effect.scoped(WorkstreamStore.discover((pointerEntry.data as { path: string }).path)).pipe(
-        Effect.provide(liveLayer),
-      ),
+
+    appendHandoffInvocation(f.session, "Perform the contextual child part", "context-call");
+    const contextual = await f.callWithId("context-call", "workgraph_handoff", {
+      request: "Perform the contextual child part",
+      includeContext: true,
+    });
+    const contextIdentity = contextual.details as { sessionFile: string };
+    childSessions.push(contextIdentity.sessionFile);
+    assert.notEqual(contextIdentity.sessionFile, cleanIdentity.sessionFile);
+    assert.equal(
+      SessionManager.open(contextIdentity.sessionFile)
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom_message" && entry.customType === HANDOFF_CONTEXT_ENTRY,
+        ).length,
+      1,
     );
-    assert.equal(attachment.state.handoffs?.[0]?.phase, "launched");
-    await rm((first.details as { childSessionFile: string }).childSessionFile, { force: true });
+    const after = await f.call("workgraph_inspect", { section: "overview" });
+    assert.equal(
+      (after.details as { revision: number }).revision,
+      (before.details as { revision: number }).revision,
+    );
+    const calls = (await readFile(logFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(calls.filter((args) => args[0] === "workspace" && args[1] === "create").length, 2);
+    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "start").length, 2);
+  } finally {
+    for (const sessionFile of childSessions) await rm(sessionFile, { force: true });
+    await f.dispose();
+    await rm(native, { recursive: true, force: true });
+  }
+});
+
+void test("uncertain one-shot handoff reports exact handles and never duplicates launch", async () => {
+  const native = await mkdtemp(join(tmpdir(), "workstream-handoff-uncertain-"));
+  const command = join(native, "herdr.mjs");
+  const logFile = join(native, "calls.jsonl");
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { appendFileSync } from "node:fs";
+const args=process.argv.slice(2); appendFileSync(${JSON.stringify(logFile)},JSON.stringify(args)+"\\n");
+if(args[0]==="workspace"&&args[1]==="create") console.log(JSON.stringify({result:{workspace:{workspace_id:"uncertain-workspace"},tab:{tab_id:"uncertain-tab"},root_pane:{pane_id:"uncertain-pane"}}}));
+else if(args[0]==="agent"&&args[1]==="start") process.exit(1);
+else console.log(JSON.stringify({result:{}}));
+`,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "parent" });
+  const f = await fixture({}, [(pi) => workstreamCoordinator(pi, { workers: () => runtime })]);
+  try {
+    await f.input("Parent request");
+    await f.call("workgraph_intent", { statement: "Parent request" });
+    const before = await f.call("workgraph_inspect", { section: "overview" });
+    await assert.rejects(
+      f.callWithId("uncertain-call", "workgraph_handoff", { request: "One uncertain launch" }),
+      /uncertain-workspace.*uncertain-tab.*uncertain-pane|uncertain-pane.*uncertain-workspace/s,
+    );
+    const calls = (await readFile(logFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(calls.filter((args) => args[0] === "workspace" && args[1] === "create").length, 1);
+    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "start").length, 1);
+    const after = await f.call("workgraph_inspect", { section: "overview" });
+    assert.equal(
+      (after.details as { revision: number }).revision,
+      (before.details as { revision: number }).revision,
+    );
   } finally {
     await f.dispose();
     await rm(native, { recursive: true, force: true });
   }
 });
 
-void test("handoff recovery probes exact workspace and child agent after interrupted remote responses", async () => {
-  for (const failure of ["workspace", "start"] as const) {
-    const native = await mkdtemp(join(tmpdir(), `workstream-handoff-${failure}-`));
-    const command = join(native, "herdr.mjs");
-    const stateFile = join(native, "state.json");
-    const failedFile = join(native, "failed");
-    const logFile = join(native, "calls.jsonl");
-    await writeFile(
-      command,
-      `#!/usr/bin/env node
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+void test("registered handoff rejects a mismatched native Pi identity without resubmission", async () => {
+  const native = await mkdtemp(join(tmpdir(), "workstream-handoff-mismatch-"));
+  const command = join(native, "herdr.mjs");
+  const logFile = join(native, "calls.jsonl");
+  const stateFile = join(native, "state.json");
+  await writeFile(
+    command,
+    `#!/usr/bin/env node
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 const args=process.argv.slice(2); appendFileSync(${JSON.stringify(logFile)},JSON.stringify(args)+"\\n");
-const load=()=>existsSync(${JSON.stringify(stateFile)})?JSON.parse(readFileSync(${JSON.stringify(stateFile)},"utf8")):undefined;
-const save=(v)=>writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(v));
-const current=load();
-const agent=(v,native)=>({workspace_id:"w",tab_id:"t",pane_id:"p",terminal_id:"terminal",agent_status:"working",name:v.name,cwd:v.cwd,...(native?{agent_session:{value:v.session}}:{})});
-if(args[0]==="workspace"&&args[1]==="list") console.log(JSON.stringify({result:{workspaces:current?[{workspace_id:"w",label:current.label}]:[]}}));
-else if(args[0]==="tab"&&args[1]==="list") console.log(JSON.stringify({result:{tabs:[{tab_id:"t"}]}}));
-else if(args[0]==="pane"&&args[1]==="list") console.log(JSON.stringify({result:{panes:[{workspace_id:"w",tab_id:"t",pane_id:"p",terminal_id:"terminal",cwd:current.cwd}]}}));
-else if(args[0]==="api"&&args[1]==="snapshot") console.log(JSON.stringify({result:{snapshot:{agents:current?.session?[agent(current,true)]:[]}}}));
-else if(args[0]==="workspace"&&args[1]==="create") { const value={cwd:args[args.indexOf("--cwd")+1],label:args[args.indexOf("--label")+1]}; save(value); if(${JSON.stringify(failure)}==="workspace"&&!existsSync(${JSON.stringify(failedFile)})){writeFileSync(${JSON.stringify(failedFile)},"");process.exit(1)} console.log(JSON.stringify({result:{workspace:{workspace_id:"w"},tab:{tab_id:"t"},root_pane:{pane_id:"p"}}})); }
-else if(args[0]==="agent"&&args[1]==="start") { const value={...current,name:args[2],session:args[args.indexOf("--session")+1]}; save(value); if(${JSON.stringify(failure)}==="start"&&!existsSync(${JSON.stringify(failedFile)})){writeFileSync(${JSON.stringify(failedFile)},"");process.exit(1)} console.log(JSON.stringify({result:{agent:agent(value,false)}})); }
-else if(args[0]==="agent"&&args[1]==="get") console.log(JSON.stringify({result:{agent:agent(load(),true)}}));
+if(args[0]==="workspace"&&args[1]==="create") { writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify({cwd:args[args.indexOf("--cwd")+1]})); console.log(JSON.stringify({result:{workspace:{workspace_id:"mismatch-workspace"},tab:{tab_id:"mismatch-tab"},root_pane:{pane_id:"mismatch-pane"}}})); }
+else if(args[0]==="agent"&&args[1]==="start") { const state={...JSON.parse(readFileSync(${JSON.stringify(stateFile)},"utf8")),name:args[2]}; writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(state)); console.log(JSON.stringify({result:{agent:{workspace_id:"mismatch-workspace",tab_id:"mismatch-tab",pane_id:"mismatch-pane",terminal_id:"mismatch-terminal",agent_status:"working",name:state.name,cwd:state.cwd}}})); }
+else if(args[0]==="agent"&&args[1]==="get") { const state=JSON.parse(readFileSync(${JSON.stringify(stateFile)},"utf8")); console.log(JSON.stringify({result:{agent:{workspace_id:"mismatch-workspace",tab_id:"mismatch-tab",pane_id:"mismatch-pane",terminal_id:"mismatch-terminal",agent_status:"working",name:state.name,cwd:state.cwd,agent_session:{value:"/foreign-session.jsonl"}}}})); }
 else console.log(JSON.stringify({result:{}}));
 `,
+  );
+  await chmod(command, 0o755);
+  const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "parent" });
+  const f = await fixture({}, [(pi) => workstreamCoordinator(pi, { workers: () => runtime })]);
+  try {
+    await f.input("Parent request");
+    await f.call("workgraph_intent", { statement: "Parent request" });
+    await assert.rejects(
+      f.call("workgraph_handoff", { request: "Reject foreign identity" }),
+      /resource identity changed|native Pi session changed|uncertain/,
     );
-    await chmod(command, 0o755);
-    const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "parent" });
-    const f = await fixture({}, [(pi) => workstreamCoordinator(pi, { workers: () => runtime })]);
-    try {
-      await f.input("Parent request");
-      await f.call("workgraph_intent", { statement: "Parent request" });
-      appendHandoffInvocation(f.session, `Recover ${failure}`, "original-call");
-      await assert.rejects(
-        f.callWithId("original-call", "workgraph_handoff", { request: `Recover ${failure}` }),
-      );
-      const beforeMismatch = await readFile(logFile, "utf8");
-      await assert.rejects(
-        f.callWithId("different-call", "workgraph_handoff", {
-          request: `Different ${failure}`,
-        }),
-        /different request/,
-      );
-      assert.equal(await readFile(logFile, "utf8"), beforeMismatch);
-      const recovered = await f.callWithId("recovery-call", "workgraph_handoff", {
-        request: `Recover ${failure}`,
-      });
-      const calls = (await readFile(logFile, "utf8"))
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line) as string[]);
-      assert.equal(
-        calls.filter((args) => args[0] === "workspace" && args[1] === "create").length,
-        1,
-      );
-      assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "start").length, 1);
-      const pointer = f.session
-        .getBranch()
-        .findLast(
-          (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
-        );
-      assert.ok(pointer?.type === "custom");
-      const attachment = await Effect.runPromise(
-        Effect.scoped(WorkstreamStore.discover((pointer.data as { path: string }).path)).pipe(
-          Effect.provide(liveLayer),
-        ),
-      );
-      assert.equal(attachment.state.handoffs?.length, 1);
-      assert.equal(attachment.state.handoffs?.[0]?.toolCallId, "original-call");
-      assert.equal(
-        attachment.state.handoffs?.[0]?.childSessionId,
-        (recovered.details as { childSessionId: string }).childSessionId,
-      );
-      await rm((recovered.details as { childSessionFile: string }).childSessionFile, {
-        force: true,
-      });
-    } finally {
-      await f.dispose();
-      await rm(native, { recursive: true, force: true });
-    }
+    const calls = (await readFile(logFile, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "start").length, 1);
+  } finally {
+    await f.dispose();
+    await rm(native, { recursive: true, force: true });
   }
 });
 

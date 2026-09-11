@@ -70,60 +70,6 @@ export const HandoffGrantSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const HandoffPreparedFields = {
-  id: NonEmptyString,
-  toolCallId: NonEmptyString,
-  request: NonEmptyString,
-  forkContext: Type.Boolean(),
-  grant: HandoffGrantSchema,
-  childSessionId: NonEmptyString,
-};
-const HandoffSessionFields = {
-  ...HandoffPreparedFields,
-  childSessionFile: NonEmptyString,
-};
-const HandoffWorkspaceDeclarationFields = {
-  ...HandoffSessionFields,
-  workspaceLabel: NonEmptyString,
-  agentName: NonEmptyString,
-};
-const HandoffWorkspaceFields = {
-  ...HandoffWorkspaceDeclarationFields,
-  workspaceId: NonEmptyString,
-  tabId: NonEmptyString,
-  paneId: NonEmptyString,
-};
-const HandoffCheckpointSchema = Type.Union([
-  Type.Object(
-    { phase: Type.Literal("prepared"), ...HandoffPreparedFields },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    { phase: Type.Literal("session_ready"), ...HandoffSessionFields },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    { phase: Type.Literal("workspace_submitting"), ...HandoffWorkspaceDeclarationFields },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    { phase: Type.Literal("workspace_ready"), ...HandoffWorkspaceFields },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    { phase: Type.Literal("start_submitting"), ...HandoffWorkspaceFields },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      phase: Type.Literal("launched"),
-      ...HandoffWorkspaceFields,
-      terminalId: NonEmptyString,
-      launchedAt: Timestamp,
-    },
-    { additionalProperties: false },
-  ),
-]);
 const IntentGroundingSchema = Type.Union([HumanInputReceiptSchema, HandoffGrantSchema]);
 export const IntentSchema = Type.Object(
   {
@@ -518,7 +464,6 @@ export const WorkstreamSchema = Type.Object(
     suspension: Type.Optional(SuspensionSchema),
     intents: Type.Array(IntentSchema, { minItems: 1 }),
     tasks: Type.Array(TaskSchema),
-    handoffs: Type.Optional(Type.Array(HandoffCheckpointSchema)),
     completion: Type.Optional(CompletionSchema),
     createdAt: Timestamp,
     updatedAt: Timestamp,
@@ -532,7 +477,6 @@ export type HerdrDeadObservation = Static<typeof HerdrDeadObservationSchema>;
 type CoordinatorTransfer = Static<typeof CoordinatorTransferSchema>;
 export type HumanInputReceiptData = Static<typeof HumanInputReceiptDataSchema>;
 export type HandoffGrant = Static<typeof HandoffGrantSchema>;
-export type HandoffCheckpoint = Static<typeof HandoffCheckpointSchema>;
 export type Intent = Static<typeof IntentSchema>;
 export type CandidateLineage = Static<typeof CandidateLineageSchema>;
 export type ModelSelection = Static<typeof SelectionSchema>;
@@ -602,11 +546,6 @@ export function validateWorkstreamInvariants(value: Workstream): void {
     value.tasks.map((task) => task.id),
     "Task",
   );
-  unique(
-    (value.handoffs ?? []).map((handoff) => handoff.id),
-    "Handoff",
-  );
-  for (const handoff of value.handoffs ?? []) validateHandoff(value, handoff);
   const attempts = value.tasks.flatMap((task) => task.attempts);
   unique(
     attempts.map((attempt) => attempt.id),
@@ -711,28 +650,6 @@ function validateGrounding(workstream: Workstream): void {
     }
   }
 }
-function validateHandoff(workstream: Workstream, handoff: HandoffCheckpoint): void {
-  if (!sameValue(handoff.grant.parentRepository, workstream.repository))
-    throw new Error(`Handoff ${handoff.id} parent repository does not match its Workstream.`);
-  if (handoff.grant.parentWorkstreamId !== workstream.id)
-    throw new Error(`Handoff ${handoff.id} grant names another parent Workstream.`);
-  if (handoff.grant.id !== handoff.id || handoff.grant.narrowedRequest !== handoff.request)
-    throw new Error(`Handoff ${handoff.id} grant does not match its prepared request.`);
-  if (handoff.grant.parentIntentIndex >= workstream.intents.length)
-    throw new Error(`Handoff ${handoff.id} references an unknown parent Intent.`);
-  const intent = workstream.intents[handoff.grant.parentIntentIndex];
-  if (
-    intent === undefined ||
-    intent.statement !== handoff.grant.parentIntentStatement ||
-    !sameValue(intent.constraints, handoff.grant.parentIntentConstraints)
-  )
-    throw new Error(`Handoff ${handoff.id} does not retain its exact parent Intent.`);
-  const rootReceipt =
-    intent.grounding.kind === "handoff_grant" ? intent.grounding.parentReceipt : intent.grounding;
-  if (!sameValue(rootReceipt, handoff.grant.parentReceipt))
-    throw new Error(`Handoff ${handoff.id} does not retain the root Human Input Receipt.`);
-}
-
 function validateTask(workstream: Workstream, task: Task): void {
   if (task.kind === "review") validateReviewSubject(workstream, task);
   for (const [index, attempt] of task.attempts.entries()) {
@@ -1241,9 +1158,6 @@ function validateLifecycle(workstream: Workstream): void {
 }
 
 function validateCompletedLifecycle(workstream: Workstream): void {
-  for (const handoff of workstream.handoffs ?? [])
-    if (handoff.phase !== "launched")
-      throw new Error(`Completed Workstream contains unlaunched Handoff ${handoff.id}.`);
   // A completed Workstream cannot retain any unfinished Attempt; this mirrors
   // `completeWorkstream` at the persisted read boundary without widening the
   // existing completion accounting rules.
@@ -1318,73 +1232,6 @@ export function createWorkstream(input: {
   validateWorkstream(workstream);
   return workstream;
 }
-export function issueHandoff(
-  workstream: Workstream,
-  handoff: Extract<HandoffCheckpoint, { phase: "prepared" }>,
-  updatedAt: string,
-): Workstream {
-  assertActive(workstream, "issue Handoff Grant");
-  if ((workstream.handoffs ?? []).some((existing) => existing.id === handoff.id))
-    throw new Error(`Handoff ${handoff.id} already exists.`);
-  return mutate(workstream, updatedAt, (draft) => {
-    if (draft.handoffs === undefined) draft.handoffs = [];
-    draft.handoffs.push(clone(handoff));
-  });
-}
-
-export function checkpointHandoff(
-  workstream: Workstream,
-  checkpoint: HandoffCheckpoint,
-  updatedAt: string,
-): Workstream {
-  const handoffs = workstream.handoffs ?? [];
-  const index = handoffs.findIndex((handoff) => handoff.id === checkpoint.id);
-  const current = handoffs[index];
-  if (current === undefined) throw new Error(`Unknown Handoff ${checkpoint.id}.`);
-  if (!sameValue(handoffIdentity(current), handoffIdentity(checkpoint)))
-    throw new Error(`Handoff ${checkpoint.id} checkpoint conflicts with its prepared identity.`);
-  const currentRank = handoffPhaseRank(current.phase);
-  const nextRank = handoffPhaseRank(checkpoint.phase);
-  if (nextRank < currentRank)
-    throw new Error(`Handoff ${checkpoint.id} checkpoint cannot move backward.`);
-  if (nextRank === currentRank) {
-    if (!sameValue(current, checkpoint))
-      throw new Error(
-        `Handoff ${checkpoint.id} checkpoint conflicts at phase ${checkpoint.phase}.`,
-      );
-    return workstream;
-  }
-  assertActive(workstream, "progress Handoff");
-  if (nextRank !== currentRank + 1)
-    throw new Error(`Handoff ${checkpoint.id} checkpoint skipped a required phase.`);
-  return mutate(workstream, updatedAt, (draft) => {
-    if (draft.handoffs === undefined) throw new Error(`Unknown Handoff ${checkpoint.id}.`);
-    draft.handoffs[index] = clone(checkpoint);
-  });
-}
-
-function handoffIdentity(handoff: HandoffCheckpoint) {
-  return {
-    id: handoff.id,
-    toolCallId: handoff.toolCallId,
-    request: handoff.request,
-    forkContext: handoff.forkContext,
-    grant: handoff.grant,
-    childSessionId: handoff.childSessionId,
-  };
-}
-
-function handoffPhaseRank(phase: HandoffCheckpoint["phase"]): number {
-  return [
-    "prepared",
-    "session_ready",
-    "workspace_submitting",
-    "workspace_ready",
-    "start_submitting",
-    "launched",
-  ].indexOf(phase);
-}
-
 export function suspendWorkstream(
   workstream: Workstream,
   suspension: Suspension,
@@ -1942,9 +1789,6 @@ export function completeWorkstream(
     workstream.tasks.some((task) => task.attempts.some((attempt) => attempt.state !== "finished"))
   )
     throw new Error("Cannot complete Workstream while an Attempt is not terminal.");
-  const unlaunched = (workstream.handoffs ?? []).find((handoff) => handoff.phase !== "launched");
-  if (unlaunched !== undefined)
-    throw new Error(`Cannot complete Workstream while Handoff ${unlaunched.id} is not launched.`);
   const accounting = deriveCompletionAccounting(workstream);
   return mutate(workstream, updatedAt, (draft) => {
     draft.lifecycle = "completed";

@@ -27,16 +27,13 @@ import {
   type CoordinatorIdentity,
   checkpointCancellation,
   checkpointCleanup,
-  checkpointHandoff,
   completeWorkstream,
   createTask,
   findAttempt,
   findOutcome,
   findTask,
-  type HandoffCheckpoint,
   type HerdrDeadObservation,
   type Intent,
-  issueHandoff,
   type Outcome,
   type RepositoryIdentity,
   recordDeliveryFailure,
@@ -434,34 +431,6 @@ export class WorkstreamRuntime {
           );
           yield* this.notifyCommitted(committed, affected);
           return committed;
-        }.bind(this),
-      ),
-    );
-
-  readonly issueHandoff = (
-    prepared: Extract<HandoffCheckpoint, { phase: "prepared" }>,
-  ): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          const now = yield* this.now();
-          return yield* this.authoritative("issue workstream Handoff Grant", (state) =>
-            issueHandoff(state, prepared, now),
-          );
-        }.bind(this),
-      ),
-    );
-
-  readonly checkpointHandoff = (
-    checkpoint: HandoffCheckpoint,
-  ): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          const now = yield* this.now();
-          return yield* this.authoritative("checkpoint workstream Handoff launch", (state) =>
-            checkpointHandoff(state, checkpoint, now),
-          );
         }.bind(this),
       ),
     );

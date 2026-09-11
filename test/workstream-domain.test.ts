@@ -12,7 +12,6 @@ import {
   checkpointApplication,
   checkpointCancellation,
   checkpointCleanup,
-  checkpointHandoff,
   checkpointOutputRelease,
   completeWorkstream,
   createTask,
@@ -24,7 +23,6 @@ import {
   type Intent,
   IntentSchema,
   isOperationallyStable,
-  issueHandoff,
   LaunchCheckpointSchema,
   outputDisposition,
   recordDeliveryFailure,
@@ -1198,159 +1196,6 @@ void test("grant is creation-only first grounding and revisions require a curren
       }),
     /only valid for the first/,
   );
-});
-
-void test("Handoff issuance retains direct and nested root receipt authority and rejects inactive parents", () => {
-  const prepared = {
-    phase: "prepared" as const,
-    id: "grant-direct",
-    toolCallId: "call-direct",
-    request: "Narrow child request",
-    forkContext: false,
-    childSessionId: "11111111-1111-5111-a111-111111111111",
-    grant: {
-      kind: "handoff_grant" as const,
-      id: "grant-direct",
-      parentReceipt: receipt,
-      parentWorkstreamId: "Workstream opaque",
-      parentRepository: repository,
-      parentIntentIndex: 0,
-      parentIntentStatement: intent.statement,
-      parentIntentConstraints: intent.constraints,
-      narrowedRequest: "Narrow child request",
-      targetRepository: repository,
-      issuedAt: "2026-01-01T00:00:01.000Z",
-    },
-  };
-  const parent = issueHandoff(base(), prepared, "2026-01-01T00:00:01.000Z");
-  assert.deepEqual(parent.handoffs?.[0]?.grant.parentReceipt, receipt);
-  const sessionReady = checkpointHandoff(
-    parent,
-    { ...prepared, phase: "session_ready", childSessionFile: "/child.jsonl" },
-    "2026-01-01T00:00:02.000Z",
-  );
-  assert.equal(sessionReady.handoffs?.[0]?.phase, "session_ready");
-  const suspendedParent = suspendWorkstream(
-    sessionReady,
-    { reason: "Hold.", suspendedAt: "2026-01-01T00:00:03.000Z" },
-    "2026-01-01T00:00:03.000Z",
-  );
-  assert.strictEqual(
-    checkpointHandoff(
-      suspendedParent,
-      { ...prepared, phase: "session_ready", childSessionFile: "/child.jsonl" },
-      "2026-01-01T00:00:04.000Z",
-    ),
-    suspendedParent,
-  );
-  assert.throws(
-    () =>
-      checkpointHandoff(
-        suspendedParent,
-        {
-          ...prepared,
-          phase: "workspace_submitting",
-          childSessionFile: "/child.jsonl",
-          workspaceLabel: "label",
-          agentName: "agent",
-        },
-        "2026-01-01T00:00:04.000Z",
-      ),
-    /active/,
-  );
-  assert.throws(
-    () =>
-      completeWorkstream(
-        parent,
-        {
-          conclusion: "Not launched.",
-          evidence: [{ label: "handoff", observation: "prepared" }],
-          limitations: [],
-          completedAt: "2026-01-01T00:00:04.000Z",
-        },
-        "2026-01-01T00:00:04.000Z",
-      ),
-    /not launched/,
-  );
-  const completedWithoutHandoff = completeWorkstream(
-    base(),
-    {
-      conclusion: "Done.",
-      evidence: [{ label: "state", observation: "done" }],
-      limitations: [],
-      completedAt: "2026-01-01T00:00:04.000Z",
-    },
-    "2026-01-01T00:00:04.000Z",
-  );
-  assert.throws(
-    () => validateWorkstream({ ...completedWithoutHandoff, handoffs: [prepared] }),
-    /unlaunched Handoff/,
-  );
-  assert.throws(
-    () =>
-      checkpointHandoff(
-        parent,
-        {
-          ...prepared,
-          phase: "workspace_submitting",
-          childSessionFile: "/child.jsonl",
-          workspaceLabel: "label",
-          agentName: "agent",
-        },
-        "2026-01-01T00:00:02.000Z",
-      ),
-    /skipped/,
-  );
-
-  const childGrant = { ...prepared.grant, id: "parent-grant", parentWorkstreamId: "upstream" };
-  const child = createWorkstream({
-    id: "nested-parent",
-    purpose: "Nested",
-    repository,
-    coordinator,
-    intent: { ...intent, grounding: childGrant },
-    createdAt: "2026-01-01T00:00:00.000Z",
-  });
-  const nestedPrepared = {
-    ...prepared,
-    id: "grant-nested",
-    grant: {
-      ...prepared.grant,
-      id: "grant-nested",
-      parentWorkstreamId: child.id,
-      parentIntentStatement: child.intents[0]?.statement ?? "",
-      parentIntentConstraints: child.intents[0]?.constraints ?? [],
-    },
-  };
-  assert.deepEqual(
-    issueHandoff(child, nestedPrepared, "2026-01-01T00:00:02.000Z").handoffs?.[0]?.grant
-      .parentReceipt,
-    receipt,
-  );
-  assert.throws(
-    () =>
-      issueHandoff(
-        suspendWorkstream(
-          base(),
-          { reason: "hold", suspendedAt: "2026-01-01T00:00:00.000Z" },
-          "2026-01-01T00:00:01.000Z",
-        ),
-        prepared,
-        "2026-01-01T00:00:02.000Z",
-      ),
-    /active/,
-  );
-  const completed = completeWorkstream(
-    base(),
-    {
-      conclusion: "done",
-      evidence: [{ label: "state", observation: "done" }],
-      limitations: [],
-      completedAt: "2026-01-01T00:00:01.000Z",
-    },
-    "2026-01-01T00:00:01.000Z",
-  );
-  assert.throws(() => issueHandoff(completed, prepared, "2026-01-01T00:00:02.000Z"), /active/);
 });
 
 void test("coordinator transfer history preserves direct receipt ownership intervals", () => {

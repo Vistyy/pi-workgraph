@@ -75,16 +75,6 @@ const CoordinatorSnapshotResponseSchema = Type.Object({
     }),
   }),
 });
-const WorkspaceListResponseSchema = Type.Object({
-  result: Type.Object({
-    workspaces: Type.Array(
-      Type.Object({
-        workspace_id: Type.String({ minLength: 1 }),
-        label: Type.String({ minLength: 1 }),
-      }),
-    ),
-  }),
-});
 const WorkspaceCreateResponseSchema = Type.Object({
   result: Type.Object({
     workspace: Type.Object({ workspace_id: Type.String({ minLength: 1 }) }),
@@ -94,14 +84,6 @@ const WorkspaceCreateResponseSchema = Type.Object({
 });
 const TabCreateResponseSchema = Type.Object({
   result: Type.Object({ root_pane: Type.Object({ pane_id: Type.String({ minLength: 1 }) }) }),
-});
-const TabListResponseSchema = Type.Object({
-  result: Type.Object({
-    tabs: Type.Array(Type.Object({ tab_id: Type.String({ minLength: 1 }) })),
-  }),
-});
-const PaneListResponseSchema = Type.Object({
-  result: Type.Object({ panes: Type.Array(PaneSchema) }),
 });
 const PaneResponseSchema = Type.Union([
   Type.Object({ result: PaneSchema }),
@@ -129,11 +111,6 @@ type DecodedError = Static<typeof ErrorResponseSchema>["error"];
 export type HerdrAgentStatus = Static<typeof AgentStatusSchema>;
 export type HerdrAgent = DecodedAgent;
 export type HerdrCoordinatorAgent = DecodedCoordinatorAgent;
-
-export interface DecodedWorkspaceSummary {
-  readonly workspaceId: string;
-  readonly label: string;
-}
 
 export interface DecodedWorkspaceCreation {
   readonly workspaceId: string;
@@ -199,16 +176,6 @@ export function decodeSnapshotResponse(value: unknown): readonly DecodedSnapshot
   return Value.Decode(SnapshotResponseSchema, value).result.snapshot.agents;
 }
 
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This named decoder validates exact workspace-label probing.
-export function decodeWorkspaceListResponse(value: unknown): readonly DecodedWorkspaceSummary[] {
-  if (!Value.Check(WorkspaceListResponseSchema, value))
-    throw new Error("Herdr workspace list omitted exact label or workspace identity.");
-  return Value.Decode(WorkspaceListResponseSchema, value).result.workspaces.map((workspace) => ({
-    workspaceId: workspace.workspace_id,
-    label: workspace.label,
-  }));
-}
-
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This named decoder validates the complete Herdr workspace response.
 export function decodeWorkspaceCreateResponse(value: unknown): DecodedWorkspaceCreation {
   if (!Value.Check(WorkspaceCreateResponseSchema, value))
@@ -226,26 +193,6 @@ export function decodeTabCreateResponse(value: unknown): string {
   if (!Value.Check(TabCreateResponseSchema, value))
     throw new Error("Herdr tab response omitted the created root pane.");
   return Value.Decode(TabCreateResponseSchema, value).result.root_pane.pane_id;
-}
-
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This named decoder validates exact workspace tab probing.
-export function decodeTabListResponse(value: unknown): readonly string[] {
-  if (!Value.Check(TabListResponseSchema, value))
-    throw new Error("Herdr tab list omitted exact tab identities.");
-  return Value.Decode(TabListResponseSchema, value).result.tabs.map((tab) => tab.tab_id);
-}
-
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This named decoder validates exact workspace pane probing.
-export function decodePaneListResponse(value: unknown): readonly DecodedPaneObservation[] {
-  if (!Value.Check(PaneListResponseSchema, value))
-    throw new Error("Herdr pane list omitted exact pane identities.");
-  return Value.Decode(PaneListResponseSchema, value).result.panes.map((pane) => ({
-    workspaceId: pane.workspace_id,
-    tabId: pane.tab_id,
-    paneId: pane.pane_id,
-    terminalId: pane.terminal_id,
-    cwd: pane.cwd,
-  }));
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This named decoder validates the complete Herdr pane response.

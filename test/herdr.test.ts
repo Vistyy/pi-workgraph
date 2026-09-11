@@ -300,7 +300,7 @@ import { appendFileSync } from "node:fs";
 const args = process.argv.slice(2);
 appendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");
 const agentName = ${JSON.stringify(coordinatorAgentName)};
-const agent = (native) => ({workspace_id:"child-workspace",tab_id:"child-workspace:tab-1",pane_id:"child-workspace:pane-1",terminal_id:"child-terminal",agent_status:"idle",name:agentName,cwd:${JSON.stringify(cwd)},...(native ? {agent_session:{value:${JSON.stringify(sessionFile)}}} : {})});
+const agent = (native) => ({workspace_id:"child-workspace",tab_id:"child-workspace:tab-1",pane_id:"child-workspace:pane-1",terminal_id:"child-terminal",agent_status:"working",name:agentName,cwd:${JSON.stringify(cwd)},...(native ? {agent_session:{value:${JSON.stringify(sessionFile)}}} : {})});
 if (args[0] === "workspace" && args[1] === "list") console.log(JSON.stringify({result:{workspaces:[{workspace_id:"child-workspace",label:${JSON.stringify(coordinatorNames.label)}}]}}));
 else if (args[0] === "tab" && args[1] === "list") console.log(JSON.stringify({result:{tabs:[{tab_id:"child-workspace:tab-1"}]}}));
 else if (args[0] === "pane" && args[1] === "list") console.log(JSON.stringify({result:{panes:[{workspace_id:"child-workspace",tab_id:"child-workspace:tab-1",pane_id:"child-workspace:pane-1",terminal_id:"child-terminal",cwd:${JSON.stringify(cwd)}}]}}));
@@ -336,8 +336,6 @@ else console.log(JSON.stringify({result:{accepted:true}}));
       cwd,
     });
     assert.notEqual(identity.workspaceId, "parent-workspace");
-    const probe = await runEffect(runtime.probeCoordinatorLaunch({ cwd, sessionFile }));
-    assert.deepEqual(probe, { state: "launched", identity });
     // SAFETY: Each fixture process writes only JSON-encoded string argument arrays to this private log.
     const calls = (await readFile(log, "utf8"))
       .trim()

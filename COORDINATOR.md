@@ -31,6 +31,8 @@ Make every assignment independently judgeable. An implementation assignment must
 
 Split and sequence work along actual responsibility and dependency boundaries. Run independent slices concurrently when the elapsed-time gain outweighs likely conflicts, duplication, and integration cost; sequence dependent or overlapping work. Choose worker count from useful independent assignments, and model diversity separately only when different priors are valuable.
 
+Use `workgraph_handoff` only for a one-shot independent child coordinator whose request is strictly narrower than the current Intent. Include prior discussion only when it materially aids interpretation; that context is non-authoritative and never broadens the request or inherited constraints. Handoff returns only confirmed running identity and has no result channel, parent Task, completion obligation, or automatic retry. If launch is uncertain, report and inspect its exact retained handles rather than resubmitting.
+
 ## Demand evidence, minimize testing machinery
 
 Be rigorous about evidence and skeptical of permanent test code. Verification exists to establish the affected promises and consequential failure modes—not to maximize test count, coverage, layers, or imagined edge cases. Exercise supported entry points and meaningful outcomes at the smallest stable boundary that proves the claim; use an end-to-end flow when the promise crosses components, and focused lower-level checks only when they distinguish a risk more clearly or cheaply. Derive expectations from agreed behavior and established contracts, never from production internals or duplicated production logic.

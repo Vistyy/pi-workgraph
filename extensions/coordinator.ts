@@ -21,7 +21,6 @@ import { installCoordinatorSessionState } from "../src/coordinator-notepad.js";
 import { EvidenceSchema } from "../src/domain/report.js";
 import type { HandoffGrant, HumanInputReceiptData } from "../src/domain/workstream.js";
 import {
-  deterministicChildSessionId,
   HANDOFF_KICKOFF_CLAIM_ENTRY,
   HANDOFF_KICKOFF_ENTRY,
   handoffChildWorkstreamId,
@@ -168,8 +167,7 @@ const ControlSchema = Type.Union(
 const HandoffSchema = Type.Object(
   {
     request: NonEmpty,
-    forkContext: Type.Optional(Type.Boolean({ default: false })),
-    targetRepository: Type.Optional(NonEmpty),
+    includeContext: Type.Optional(Type.Boolean({ default: false })),
   },
   { additionalProperties: false },
 );
@@ -263,7 +261,7 @@ export default function workstreamCoordinator(
         const grant = sealedHandoffGrant(ctx.sessionManager);
         const restoration = pointer(ctx);
         if (grant !== undefined && restoration !== undefined)
-          validateChildPointer(restoration, grant);
+          validateChildPointer(restoration, grant, ctx.sessionManager.getSessionId());
         yield* controller.restore(ctx, () => restoration);
         if (grant === undefined) return;
         yield* controller.bootstrapHandoff(ctx, grant);
@@ -329,14 +327,13 @@ export default function workstreamCoordinator(
     name: "workgraph_handoff",
     label: "Workgraph Handoff",
     description:
-      "Launch an independent child coordinator with a narrowed request. forkContext=false starts clean; use true only when prior discussion materially aids interpretation. The request must narrow, never broaden, the current Intent. Returns immediate launch identity only and has no result channel.",
+      "Launch one independent child coordinator with a narrowed request. includeContext=false starts clean; true includes only the discussion before this call as non-authoritative context. The request cannot broaden the current Intent. Returns only exact confirmed running identity and has no result channel or retry lifecycle.",
     promptSnippet: "Launch an independent focused child coordinator",
     parameters: HandoffSchema,
     execute(id, params, signal, _update, ctx) {
       const request = {
         request: params.request,
-        forkContext: params.forkContext ?? false,
-        targetRepository: params.targetRepository,
+        includeContext: params.includeContext ?? false,
       };
       return run(Effect.map(controller.handoff(ctx, id, request), toolResult), signal);
     },
@@ -608,11 +605,15 @@ function reviewSubject(subject: Static<typeof PublicReviewSubjectSchema>) {
   }
 }
 
-function validateChildPointer(pointer: WorkstreamPointerRestoration, grant: HandoffGrant): void {
+function validateChildPointer(
+  pointer: WorkstreamPointerRestoration,
+  grant: HandoffGrant,
+  childSessionId: string,
+): void {
   if (
     pointer === "malformed" ||
     pointer === undefined ||
-    pointer.workstreamId !== handoffChildWorkstreamId(grant.id) ||
+    pointer.workstreamId !== handoffChildWorkstreamId(childSessionId) ||
     !Value.Equal(pointer.repository, grant.targetRepository)
   )
     throw new Error("Retained workstream pointer conflicts with the child Handoff Grant.");
@@ -628,7 +629,7 @@ function triggerHandoffKickoff(
       const branch = ctx.sessionManager.getBranch();
       const identity = {
         grantId: grant.id,
-        childSessionId: deterministicChildSessionId(grant.id),
+        childSessionId: ctx.sessionManager.getSessionId(),
       };
       const retained = retainedKickoff(branch, identity);
       if (retained === "claim") {
