@@ -88,10 +88,10 @@ function liveWorkerPort(workers: HerdrCliRuntime, workspaceId: string): Workstre
         Effect.map((observation) => observation.status),
         Effect.mapError((error) => hostFailure("inspect Herdr worker", error)),
       ),
-    interrupt: (identity) =>
-      workers.interrupt(identity).pipe(
-        Effect.map((observation) => observation.status),
-        Effect.mapError((error) => hostFailure("interrupt Herdr worker", error)),
+    terminate: (identity) =>
+      workers.terminate(identity).pipe(
+        Effect.map((result) => ({ state: result.state, detail: result.detail })),
+        Effect.mapError((error) => hostFailure("terminate Herdr worker", error)),
       ),
     steer: (identity, instruction) =>
       workers

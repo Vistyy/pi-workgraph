@@ -228,7 +228,7 @@ function finish(
         "2026-01-01T00:00:01.008Z",
       );
   }
-  // An active cancelled settlement is gated on the full interrupt protocol plus
+  // An active cancelled settlement is gated on verified termination plus
   // durably proven Worker closure, so the fixture satisfies it before settling.
   if (observation.kind === "cancelled") {
     const requested = {
@@ -248,10 +248,9 @@ function finish(
       key,
       {
         ...requested,
-        state: "submitted_or_observed",
+        state: "terminated",
         dispatchAt: "2026-01-01T00:00:01.010Z",
-        observedAt: "2026-01-01T00:00:01.011Z",
-        evidence: "done",
+        terminatedAt: "2026-01-01T00:00:01.011Z",
       },
       "2026-01-01T00:00:01.011Z",
     );
@@ -2031,7 +2030,7 @@ void test("activation declares durable placement before any external effect", ()
   assert.throws(() => validateWorkstream(progressed), /not-sent submission checkpoint/);
 });
 
-void test("cancellation is one monotonic interrupt protocol with exact evidence", () => {
+void test("cancellation is one monotonic termination protocol with exact absence", () => {
   const key = { taskId: "Task opaque", attemptId: "Attempt A" };
   const placement = { kind: "shared_project" as const, path: "/repo" };
   const active = activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", declare(placement));
@@ -2045,11 +2044,10 @@ void test("cancellation is one monotonic interrupt protocol with exact evidence"
     state: "uncertain" as const,
     dispatchAt: "2026-01-01T00:00:03.000Z",
   };
-  const observed = {
+  const terminated = {
     ...uncertain,
-    state: "submitted_or_observed" as const,
-    observedAt: "2026-01-01T00:00:04.000Z",
-    evidence: "done" as const,
+    state: "terminated" as const,
+    terminatedAt: "2026-01-01T00:00:04.000Z",
   };
 
   let workstream = checkpointCancellation(active, key, requested, "2026-01-01T00:00:02.000Z");
@@ -2061,7 +2059,7 @@ void test("cancellation is one monotonic interrupt protocol with exact evidence"
   );
   // No skip and no backward move.
   assert.throws(
-    () => checkpointCancellation(workstream, key, observed, "2026-01-01T00:00:02.003Z"),
+    () => checkpointCancellation(workstream, key, terminated, "2026-01-01T00:00:02.003Z"),
     /not monotonic/,
   );
   // A different request identity cannot overwrite the durable request.
@@ -2092,11 +2090,11 @@ void test("cancellation is one monotonic interrupt protocol with exact evidence"
       ),
     /not monotonic/,
   );
-  workstream = checkpointCancellation(workstream, key, observed, "2026-01-01T00:00:04.000Z");
+  workstream = checkpointCancellation(workstream, key, terminated, "2026-01-01T00:00:04.000Z");
   const terminal = workstream.tasks[0]?.attempts[0]?.execution?.cancellation;
-  assert.deepEqual(terminal, observed);
+  assert.deepEqual(terminal, terminated);
   assert.strictEqual(
-    checkpointCancellation(workstream, key, observed, "2026-01-01T00:00:04.002Z"),
+    checkpointCancellation(workstream, key, terminated, "2026-01-01T00:00:04.002Z"),
     workstream,
   );
   // A terminal checkpoint cannot be rewritten or moved backward.
@@ -2105,12 +2103,12 @@ void test("cancellation is one monotonic interrupt protocol with exact evidence"
     /not monotonic/,
   );
 
-  // An active cancelled settlement needs both observed cancellation and durable
+  // An active cancelled settlement needs both verified termination and durable
   // closure; while active, cleanup may only be the cancellation path's start.
   const pending = { state: "pending" as const, workerClosed: true };
   assert.throws(
     () => terminalizeAttempt(active, key, cancelled(), "2026-01-01T00:00:05.000Z"),
-    /submitted-or-observed/,
+    /terminated cancellation/,
   );
   assert.throws(
     () => terminalizeAttempt(workstream, key, cancelled(), "2026-01-01T00:00:05.000Z"),
@@ -2118,7 +2116,7 @@ void test("cancellation is one monotonic interrupt protocol with exact evidence"
   );
   assert.throws(
     () => checkpointCleanup(active, key, pending, "2026-01-01T00:00:05.000Z"),
-    /observed cancellation/,
+    /terminated cancellation/,
   );
   assert.throws(
     () =>
@@ -2163,11 +2161,10 @@ void test("persisted read validation mirrors cancellation settlement and complet
     state: "uncertain" as const,
     dispatchAt: "2026-01-01T00:00:03.000Z",
   };
-  const observed = {
+  const terminated = {
     ...uncertain,
-    state: "submitted_or_observed" as const,
-    observedAt: "2026-01-01T00:00:04.000Z",
-    evidence: "done" as const,
+    state: "terminated" as const,
+    terminatedAt: "2026-01-01T00:00:04.000Z",
   };
   let active = checkpointCancellation(
     activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", declare(placement)),
@@ -2176,7 +2173,7 @@ void test("persisted read validation mirrors cancellation settlement and complet
     "2026-01-01T00:00:02.000Z",
   );
   active = checkpointCancellation(active, key, uncertain, "2026-01-01T00:00:03.000Z");
-  active = checkpointCancellation(active, key, observed, "2026-01-01T00:00:04.000Z");
+  active = checkpointCancellation(active, key, terminated, "2026-01-01T00:00:04.000Z");
 
   // A pending active cancellation cleanup and a pristine queued cancellation
   // settlement are both valid persisted states.
@@ -2204,7 +2201,7 @@ void test("persisted read validation mirrors cancellation settlement and complet
   blockedAttempt.cleanup = { state: "blocked", workerClosed: false, error: "Cleanup blocked." };
   assert.throws(() => validateWorkstream(blockedCleanup), /active cleanup may only be pending/);
 
-  // A finished cancelled Worker settlement keeps its exact interruption proof and
+  // A finished cancelled Worker settlement keeps its exact termination proof and
   // durable Worker closure on read.
   const settled = terminalizeAttempt(pendingCleanup, key, cancelled(), "2026-01-01T00:00:06.000Z");
   assert.doesNotThrow(() => validateWorkstream(settled));
@@ -2212,7 +2209,7 @@ void test("persisted read validation mirrors cancellation settlement and complet
   const uncancelledAttempt = withoutCancellation.tasks[0]?.attempts[0];
   assert.ok(uncancelledAttempt?.execution);
   Reflect.deleteProperty(uncancelledAttempt.execution, "cancellation");
-  assert.throws(() => validateWorkstream(withoutCancellation), /submitted-or-observed/);
+  assert.throws(() => validateWorkstream(withoutCancellation), /terminated cancellation/);
   const reopenedWorker = structuredClone(settled);
   const reopenedAttempt = reopenedWorker.tasks[0]?.attempts[0];
   assert.ok(reopenedAttempt?.cleanup);

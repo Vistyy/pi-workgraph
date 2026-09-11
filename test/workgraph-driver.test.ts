@@ -109,10 +109,11 @@ interface Harness {
     inspectLaunch: "live" | "absent" | "unknown";
     inspectLaunchCount: number;
     presence: HerdrAgentStatus | "absent";
+    terminationState: "completed" | "blocked";
+    terminations: number;
     cleanupState: "pending" | "completed" | "blocked";
     cleanupCount: number;
     presenceChecks: number;
-    interrupts: number;
     launches: number;
   };
   readonly sessionControl: SessionControlState;
@@ -166,10 +167,11 @@ async function makeHarness(): Promise<Harness> {
     inspectLaunch: "live",
     inspectLaunchCount: 0,
     presence: "idle",
+    terminationState: "completed",
+    terminations: 0,
     cleanupState: "completed",
     cleanupCount: 0,
     presenceChecks: 0,
-    interrupts: 0,
     launches: 0,
   };
   const sessionControl: SessionControlState = {
@@ -273,10 +275,10 @@ async function makeHarness(): Promise<Harness> {
         worker.presenceChecks += 1;
         return worker.presence;
       }),
-    interrupt: () =>
+    terminate: () =>
       Effect.sync(() => {
-        worker.interrupts += 1;
-        return worker.presence === "absent" ? ("absent" as const) : ("working" as const);
+        worker.terminations += 1;
+        return { state: worker.terminationState, detail: "controlled termination" };
       }),
     steer: () => Effect.void,
     cleanup: () =>
@@ -532,7 +534,7 @@ async function seeded(
   h.gitControl.headReadCount = 0;
   h.gitControl.cleanupCount = 0;
   h.worker.launches = 0;
-  h.worker.interrupts = 0;
+  h.worker.terminations = 0;
   h.worker.inspectLaunchCount = 0;
   h.worker.cleanupCount = 0;
   h.worker.presenceChecks = 0;
@@ -855,8 +857,7 @@ void test("settlement validates Git facts and terminalizes an unreported mismatc
 function cancelledSteps(
   placement: Placement,
   sessionFile: string,
-  target: "uncertain" | "submitted_or_observed",
-  evidence: "interrupt_submitted" | "idle" | "done" | "absent" = "idle",
+  target: "uncertain" | "terminated",
 ): Step[] {
   const requested = { state: "requested" as const, requestedAt: T0, reason: "Stop." };
   const uncertain = { ...requested, state: "uncertain" as const, dispatchAt: T0 };
@@ -866,19 +867,14 @@ function cancelledSteps(
     (s) => checkpointCancellation(s, key(), requested, T0),
     (s) => checkpointCancellation(s, key(), uncertain, T0),
   ];
-  if (target === "submitted_or_observed")
+  if (target === "terminated")
     steps.push((s) =>
-      checkpointCancellation(
-        s,
-        key(),
-        { ...uncertain, state: "submitted_or_observed", observedAt: T0, evidence },
-        T0,
-      ),
+      checkpointCancellation(s, key(), { ...uncertain, state: "terminated", terminatedAt: T0 }, T0),
     );
   return steps;
 }
 
-void test("uncertain cancellation recovery interrupts only after exact observation", async () => {
+void test("uncertain cancellation recovery terminates only the retained exact Worker", async () => {
   await withHarness(async (h) => {
     const placement = sharedPlacement(h);
     const sessionFile = await seedSessionRecord(h);
@@ -893,16 +889,16 @@ void test("uncertain cancellation recovery interrupts only after exact observati
             until(runtime, (item) => item?.state === "finished"),
           );
           assert.equal(attempt.outcome?.kind, "cancelled");
-          assert.equal(attempt.execution?.cancellation?.state, "submitted_or_observed");
+          assert.equal(attempt.execution?.cancellation?.state, "terminated");
           assert.equal(attempt.cleanup?.workerClosed, true);
-          assert.equal(h.worker.interrupts, 1);
+          assert.equal(h.worker.terminations, 1);
         }),
     );
   });
 });
 
-void test("idle and done cancellation observations advance without a new interrupt", async () => {
-  for (const presence of ["idle", "done"] as const) {
+void test("cancellation definitively terminates every present Worker status", async () => {
+  for (const presence of ["working", "idle", "done"] as const) {
     await withHarness(async (h) => {
       const placement = sharedPlacement(h);
       const sessionFile = await seedSessionRecord(h);
@@ -917,13 +913,8 @@ void test("idle and done cancellation observations advance without a new interru
               until(runtime, (item) => item?.state === "finished"),
             );
             assert.equal(attempt.outcome?.kind, "cancelled");
-            assert.equal(
-              attempt.execution?.cancellation?.state === "submitted_or_observed"
-                ? attempt.execution.cancellation.evidence
-                : undefined,
-              presence,
-            );
-            assert.equal(h.worker.interrupts, 0);
+            assert.equal(attempt.execution?.cancellation?.state, "terminated");
+            assert.equal(h.worker.terminations, 1);
           }),
       );
     });
@@ -955,7 +946,7 @@ void test("cancellation blocks on a recorded launch gap or an ambiguous scan", a
           assert.equal(attempt?.outcome, undefined);
           assert.equal(attempt?.execution?.cancellation?.state, "uncertain");
           assert.equal(h.worker.launches, 0);
-          assert.equal(h.worker.interrupts, 0);
+          assert.equal(h.worker.terminations, 0);
         }),
     );
   });
@@ -1015,7 +1006,7 @@ void test("partial cancellation dispositions observe unknown, live, and proven-a
         assert.equal(attempt?.state, "active");
         assert.equal(attempt?.execution?.cancellation?.state, "uncertain");
         assert.notEqual(attempt?.cleanup?.workerClosed, true);
-        assert.equal(h.worker.interrupts, 0);
+        assert.equal(h.worker.terminations, 0);
       }),
     );
 
@@ -1030,7 +1021,7 @@ void test("partial cancellation dispositions observe unknown, live, and proven-a
         assert.equal(attempt.outcome?.kind, "cancelled");
         assert.equal(attempt.execution?.launch?.phase, "ready");
         assert.equal(attempt.cleanup?.workerClosed, true);
-        assert.equal(h.worker.interrupts, 1);
+        assert.equal(h.worker.terminations, 1);
       }),
     );
 
@@ -1042,12 +1033,7 @@ void test("partial cancellation dispositions observe unknown, live, and proven-a
           until(runtime, (item) => item?.cleanup?.state === "blocked"),
         );
         assert.equal(attempt.outcome?.kind, "cancelled");
-        assert.equal(
-          attempt.execution?.cancellation?.state === "submitted_or_observed"
-            ? attempt.execution.cancellation.evidence
-            : undefined,
-          "absent",
-        );
+        assert.equal(attempt.execution?.cancellation?.state, "terminated");
         assert.equal(attempt.cleanup?.workerClosed, true);
         assert.match(attempt.cleanup?.expectedHead ?? "", /^[0-9a-f]{40,64}$/);
         assert.equal(existsSync(placement.path), true);
@@ -1090,7 +1076,7 @@ void test("cancellation and cleanup without a launch prove absence from the sess
           assert.equal(attempt.outcome?.kind, "cancelled");
           assert.equal(attempt.cleanup?.workerClosed, true);
           assert.equal(h.worker.launches, 0);
-          assert.equal(h.worker.interrupts, 0);
+          assert.equal(h.worker.terminations, 0);
         }),
     );
   });
@@ -1134,27 +1120,30 @@ void test("cancelled settlement blocks until exact worker closure and then termi
     const placement = sharedPlacement(h);
     const sessionFile = await seedSessionRecord(h);
     const state = baseAttempt(ATTEMPT);
-    const steps = cancelledSteps(placement, sessionFile, "submitted_or_observed", "idle");
+    const steps = cancelledSteps(placement, sessionFile, "uncertain");
 
-    h.worker.cleanupState = "blocked";
+    h.worker.terminationState = "blocked";
     await seeded(h, state, steps, (runtime) =>
       Effect.gen(function* () {
-        yield* Effect.promise(() => waitFor(() => h.worker.cleanupCount > 0, "cleanup attempt"));
+        yield* Effect.promise(() =>
+          waitFor(() => h.worker.terminations > 0, "termination attempt"),
+        );
         yield* Effect.promise(() => waitFor(() => h.attention.length > 0, "closure block"));
         const attempt = yield* Effect.promise(() => currentAttempt(runtime));
         assert.equal(attempt?.state, "active");
+        assert.equal(attempt?.execution?.cancellation?.state, "blocked");
         assert.notEqual(attempt?.cleanup?.workerClosed, true);
-      }),
-    );
 
-    h.worker.cleanupState = "completed";
-    await seeded(h, state, steps, (runtime) =>
-      Effect.gen(function* () {
-        const attempt = yield* Effect.promise(() =>
+        // Recovery observes only: it must not retry the uncertain destructive close.
+        h.worker.terminationState = "completed";
+        h.worker.presence = "absent";
+        yield* runtime.reconcile();
+        const finished = yield* Effect.promise(() =>
           until(runtime, (item) => item?.state === "finished"),
         );
-        assert.equal(attempt.outcome?.kind, "cancelled");
-        assert.equal(attempt.cleanup?.workerClosed, true);
+        assert.equal(finished.outcome?.kind, "cancelled");
+        assert.equal(finished.cleanup?.workerClosed, true);
+        assert.equal(h.worker.terminations, 1);
       }),
     );
   });

@@ -469,9 +469,60 @@ await test("cleanup rejects mismatched cwd, verifies exact tab absence and toler
   }
 });
 
-await test("Herdr launch submits one non-waiting prompt and cleanup preserves a working tab", async () => {
+await test("uncertain Herdr close inspects exact absence once and never blindly retries", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-uncertain-close-"));
+  const command = join(parent, "fake-herdr-uncertain-close.mjs");
+  const mode = join(parent, "mode");
+  const closed = join(parent, "closed");
+  const log = join(parent, "commands.jsonl");
+  const cwd = join(parent, "worktree");
+  const identity: WorkerIdentity = {
+    workspaceId: "workspace-1",
+    tabId: "workspace-1:tab-1",
+    paneId: "workspace-1:pane-1",
+    terminalId: "terminal-1",
+    agentName: "wg-terminate",
+    sessionFile: join(parent, "worker.jsonl"),
+    cwd,
+  };
+  const agent = {
+    workspace_id: identity.workspaceId,
+    tab_id: identity.tabId,
+    pane_id: identity.paneId,
+    terminal_id: identity.terminalId,
+    agent_status: "working",
+    name: identity.agentName,
+    cwd,
+    agent_session: { value: identity.sessionFile },
+  };
+  await writeFile(
+    command,
+    `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";\nconst args=process.argv.slice(2);\nconst mode=readFileSync(${JSON.stringify(mode)},"utf8");\nconst closed=${JSON.stringify(closed)};\nappendFileSync(${JSON.stringify(log)},JSON.stringify(args)+"\\n");\nif(args[0]==="tab"&&args[1]==="close"){if(mode==="absent")writeFileSync(closed,"yes");console.error(JSON.stringify({error:{code:"transport_lost",message:"uncertain"}}));process.exit(1)}\nif(args[0]==="agent"&&args[1]==="get"&&existsSync(closed)){console.error(JSON.stringify({error:{code:"pane_not_found",message:"gone"}}));process.exit(1)}\nif(args[0]==="tab"&&args[1]==="get"&&existsSync(closed)){console.error(JSON.stringify({error:{code:"tab_not_found",message:"gone"}}));process.exit(1)}\nif(args[0]==="agent"&&args[1]==="get")console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));\nelse console.log(JSON.stringify({result:{tab:{tab_id:${JSON.stringify(identity.tabId)}}}}));\n`,
+  );
+  await chmod(command, 0o755);
+  try {
+    const runtime = new HerdrCliRuntime(command, {
+      HERDR_ENV: "1",
+      HERDR_WORKSPACE_ID: identity.workspaceId,
+    });
+    await writeFile(mode, "absent");
+    assert.equal((await runEffect(runtime.terminate(identity))).state, "completed");
+    await rm(closed);
+    await writeFile(mode, "present");
+    const blocked = await runEffect(runtime.terminate(identity));
+    assert.equal(blocked.state, "blocked");
+    assert.match(blocked.detail, /uncertain.*remains working/i);
+    const calls = await commandLog(log);
+    assert.equal(calls.filter((args) => args[0] === "tab" && args[1] === "close").length, 2);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+await test("Herdr launch submits one non-waiting prompt and termination closes a working tab", async () => {
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-"));
   const log = join(parent, "commands.jsonl");
+  const closed = join(parent, "closed");
   const command = join(parent, "fake-herdr.mjs");
   const cwd = join(parent, "worktree");
   const sessionFile = join(parent, "worker.jsonl");
@@ -496,7 +547,7 @@ await test("Herdr launch submits one non-waiting prompt and cleanup preserves a 
   };
   await writeFile(
     command,
-    `#!/usr/bin/env node\nimport { appendFileSync } from "node:fs";\nconst args = process.argv.slice(2);\nappendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");\nif (args[0] === "tab") console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-1"}}}));\nelse if (args[0] === "api") console.log(JSON.stringify({result:{snapshot:{agents:[${JSON.stringify(agent)}]}}}));\nelse if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));\nelse if (args[0] === "agent" && args[1] === "get") console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));\nelse console.log(JSON.stringify({result:{accepted:true}}));\n`,
+    `#!/usr/bin/env node\nimport { appendFileSync, existsSync, writeFileSync } from "node:fs";\nconst args = process.argv.slice(2);\nconst closed = ${JSON.stringify(closed)};\nappendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");\nif (args[0] === "tab" && args[1] === "close") { writeFileSync(closed, args[2]); console.log(JSON.stringify({result:{accepted:true}})); }\nelse if (args[0] === "tab" && args[1] === "get" && existsSync(closed)) { console.error(JSON.stringify({error:{code:"tab_not_found",message:"gone"}})); process.exit(1); }\nelse if (args[0] === "tab") console.log(JSON.stringify({result:{root_pane:{pane_id:"workspace-1:pane-1"}}}));\nelse if (args[0] === "api") console.log(JSON.stringify({result:{snapshot:{agents:[${JSON.stringify(agent)}]}}}));\nelse if (args[0] === "agent" && args[1] === "start") console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));\nelse if (args[0] === "agent" && args[1] === "get" && existsSync(closed)) { console.error(JSON.stringify({error:{code:"pane_not_found",message:"gone"}})); process.exit(1); }\nelse if (args[0] === "agent" && args[1] === "get") console.log(JSON.stringify({result:{agent:${JSON.stringify(agent)}}}));\nelse console.log(JSON.stringify({result:{accepted:true}}));\n`,
   );
   await chmod(command, 0o755);
   try {
@@ -533,9 +584,10 @@ await test("Herdr launch submits one non-waiting prompt and cleanup preserves a 
     );
     assert.deepEqual(recovered?.identity, observation.identity);
     assert.equal(recovered?.status, "working");
-    await runEffect(runtime.interrupt(observation.identity));
     const pendingCleanup = await runEffect(runtime.cleanup(observation.identity));
     assert.equal(pendingCleanup.state, "pending");
+    const termination = await runEffect(runtime.terminate(observation.identity));
+    assert.equal(termination.state, "completed");
     // SAFETY: Each fixture process writes only JSON-encoded string argument arrays to this private log.
     const calls = (await readFile(log, "utf8"))
       .trim()
@@ -543,8 +595,9 @@ await test("Herdr launch submits one non-waiting prompt and cleanup preserves a 
       .map((line) => JSON.parse(line) as string[]);
     const prompts = calls.filter((args) => args[0] === "agent" && args[1] === "prompt");
     assert.deepEqual(prompts, [["agent", "prompt", agentName, "Continue now."]]);
+    assert.equal(calls.filter((args) => args[0] === "tab" && args[1] === "close").length, 1);
     assert.equal(
-      calls.some((args) => args[0] === "tab" && args[1] === "close"),
+      calls.some((args) => args[0] === "agent" && args[1] === "send-keys"),
       false,
     );
   } finally {

@@ -271,12 +271,22 @@ const CancellationCheckpointSchema = Type.Union([
   ),
   Type.Object(
     {
-      state: Type.Literal("submitted_or_observed"),
+      state: Type.Literal("blocked"),
       requestedAt: Timestamp,
       reason: NonEmptyString,
       dispatchAt: Timestamp,
-      observedAt: Timestamp,
-      evidence: stringLiterals(["interrupt_submitted", "idle", "done", "absent"] as const),
+      blockedAt: Timestamp,
+      error: NonEmptyString,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      state: Type.Literal("terminated"),
+      requestedAt: Timestamp,
+      reason: NonEmptyString,
+      dispatchAt: Timestamp,
+      terminatedAt: Timestamp,
     },
     { additionalProperties: false },
   ),
@@ -1180,20 +1190,20 @@ function validateCleanupShape(attempt: Attempt, cleanup: NonNullable<Attempt["cl
   if (cleanup.state === "completed" && !cleanup.workerClosed)
     throw new Error(`Attempt ${attempt.id} completed cleanup has no closed Worker.`);
 }
-/** The active cleanup path exists only for an observed cancellation, and only its start. */
+/** The active cleanup path exists only after verified Worker termination, and only its start. */
 function validateActiveCleanup(attempt: Attempt, cleanup: NonNullable<Attempt["cleanup"]>): void {
-  if (attempt.execution?.cancellation?.state !== "submitted_or_observed")
+  if (attempt.execution?.cancellation?.state !== "terminated")
     throw new Error(
-      `Attempt ${attempt.id} active cleanup requires an observed cancellation checkpoint.`,
+      `Attempt ${attempt.id} active cleanup requires a terminated cancellation checkpoint.`,
     );
   if (cleanup.state !== "pending")
     throw new Error(`Attempt ${attempt.id} active cleanup may only be pending.`);
 }
-/** A cancelled Worker settlement keeps its exact interruption proof and durable closure. */
+/** A cancelled Worker settlement keeps its exact termination proof and durable closure. */
 function validateCancelledWorkerSettlement(attempt: Attempt, cleanup: Attempt["cleanup"]): void {
-  if (attempt.execution?.cancellation?.state !== "submitted_or_observed")
+  if (attempt.execution?.cancellation?.state !== "terminated")
     throw new Error(
-      `Attempt ${attempt.id} cancelled Worker settlement requires a submitted-or-observed cancellation checkpoint.`,
+      `Attempt ${attempt.id} cancelled Worker settlement requires a terminated cancellation checkpoint.`,
     );
   if (cleanup?.workerClosed !== true)
     throw new Error(
@@ -1571,9 +1581,9 @@ export function checkpointCleanup(
     // Only the cancellation path may checkpoint cleanup while the Attempt is
     // still active, and only its pending start. Active normal-work cleanup and
     // active completed/blocked placement cleanup are forbidden.
-    if (current.execution?.cancellation?.state !== "submitted_or_observed")
+    if (current.execution?.cancellation?.state !== "terminated")
       throw new Error(
-        `Attempt ${key.attemptId} active cleanup requires an observed cancellation checkpoint.`,
+        `Attempt ${key.attemptId} active cleanup requires a terminated cancellation checkpoint.`,
       );
     if (cleanup.state !== "pending")
       throw new Error(`Attempt ${key.attemptId} active cleanup may only begin pending.`);
@@ -1657,7 +1667,7 @@ function monotonicRelease(old: Attempt["outputRelease"], next: Attempt["outputRe
   if (next.state === "blocked") return next.error !== undefined;
   return next.state === "completed" && next.error === undefined;
 }
-/** Own the one monotonic durable interrupt protocol for an active Attempt. */
+/** Own the one monotonic durable termination protocol for an active Attempt. */
 export function checkpointCancellation(
   workstream: Workstream,
   key: AttemptKey,
@@ -1687,7 +1697,12 @@ function validCancellationTransition(
   if (current.requestedAt !== next.requestedAt || current.reason !== next.reason) return false;
   if (current.state === "requested") return next.state === "uncertain";
   if (current.state === "uncertain")
-    return next.state === "submitted_or_observed" && current.dispatchAt === next.dispatchAt;
+    return (
+      (next.state === "blocked" || next.state === "terminated") &&
+      current.dispatchAt === next.dispatchAt
+    );
+  if (current.state === "blocked")
+    return next.state === "terminated" && current.dispatchAt === next.dispatchAt;
   return false;
 }
 export function terminalizeAttempt(
@@ -1706,12 +1721,11 @@ export function terminalizeAttempt(
   if (current.state !== "active" && current.state !== "queued")
     throw new Error(`Attempt ${key.attemptId} cannot be terminalized from ${current.state}.`);
   if (observation.kind === "cancelled" && current.state === "active") {
-    // Durable cancelled settlement is gated on the exact cancellation evidence:
-    // a submitted-or-observed interruption whose cleanup already proved Worker
-    // closure. A queued pristine Attempt needs no Worker facts.
-    if (current.execution?.cancellation?.state !== "submitted_or_observed")
+    // Durable cancelled settlement is gated on verified exact Worker absence
+    // and a durable closure checkpoint. A queued pristine Attempt needs no Worker facts.
+    if (current.execution?.cancellation?.state !== "terminated")
       throw new Error(
-        `Attempt ${key.attemptId} active cancelled settlement requires a submitted-or-observed cancellation checkpoint.`,
+        `Attempt ${key.attemptId} active cancelled settlement requires a terminated cancellation checkpoint.`,
       );
     if (current.cleanup?.workerClosed !== true)
       throw new Error(

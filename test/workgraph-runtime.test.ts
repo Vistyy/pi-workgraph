@@ -1217,6 +1217,7 @@ void test("serialized manual cancellation, steering, Intent revision, completion
         yield* runtime.read();
         const requested = yield* runtime.cancel({ attemptId: activeId, reason: "Stop safely." });
         assert.equal(exactState(requested, activeId).state, "active");
+        assert.equal(exactState(requested, activeId).outcome, undefined);
         assert.equal(exactState(requested, activeId).execution?.cancellation?.state, "requested");
 
         const steering = yield* runtime.enqueue({
@@ -1917,11 +1918,10 @@ void test("one runtime control flow drives the cancellation checkpoint, cleanup,
     const SHARED = { kind: "shared_project" as const, path: "/repo" };
     const requested = { state: "requested" as const, requestedAt: T0, reason: "Stop." };
     const uncertain = { ...requested, state: "uncertain" as const, dispatchAt: T0 };
-    const observed = {
+    const terminated = {
       ...uncertain,
-      state: "submitted_or_observed" as const,
-      observedAt: T0,
-      evidence: "done" as const,
+      state: "terminated" as const,
+      terminatedAt: T0,
     };
     const cancelled: TerminalObservation = {
       kind: "cancelled",
@@ -1942,7 +1942,7 @@ void test("one runtime control flow drives the cancellation checkpoint, cleanup,
       if (cancellation.state === "requested")
         return { kind: "checkpoint_cancellation", checkpoint: uncertain };
       if (cancellation.state === "uncertain")
-        return { kind: "checkpoint_cancellation", checkpoint: observed };
+        return { kind: "checkpoint_cancellation", checkpoint: terminated };
       if (attempt.cleanup === undefined)
         return { kind: "checkpoint_cleanup", checkpoint: { state: "pending", workerClosed: true } };
       return { kind: "terminalize", observation: cancelled };
@@ -2022,7 +2022,7 @@ void test("one runtime control flow drives the cancellation checkpoint, cleanup,
         const attempt = projection.tasks[0]?.attempts[0];
         assert.equal(attempt?.state, "finished");
         assert.equal(attempt?.outcome?.kind, "cancelled");
-        assert.equal(attempt?.execution?.cancellation?.state, "submitted_or_observed");
+        assert.equal(attempt?.execution?.cancellation?.state, "terminated");
         assert.equal(attempt?.cleanup?.state, "completed");
         assert.equal(attempt?.cleanup?.workerClosed, true);
 
