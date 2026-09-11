@@ -110,8 +110,9 @@ export async function extensionFixture(
   parent: string,
   actions: Partial<ExtensionActions> = {},
   extensionFactories: InlineExtension[] = [],
+  sessionOverride?: SessionManager,
 ) {
-  const session = persistentSession(root, join(parent, "sessions"));
+  const session = sessionOverride ?? persistentSession(root, join(parent, "sessions"));
   await mkdir(join(parent, "agent", "workgraph"), { recursive: true });
   await writeFile(
     join(parent, "agent", "workgraph", "models.json"),
@@ -198,6 +199,22 @@ export async function extensionFixture(
       getSystemPrompt: () => "Fixture",
     },
   );
+  // oxlint-disable-next-line effecttsgo/async-function -- Raw fixture input is decoded against the exact registered tool schema before execution.
+  async function callWithId(
+    toolCallId: string,
+    toolName: string,
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Value.Check and Value.Decode below parse this raw fixture input against the selected registered tool schema.
+    params: unknown,
+    signal?: AbortSignal,
+  ) {
+    const tool = runner.getToolDefinition(toolName);
+    assert.ok(tool !== undefined, `Missing registered tool ${toolName}`);
+    assert.ok(Value.Check(tool.parameters, params), `Invalid fixture input to ${toolName}`);
+    // SAFETY: Pi's registered definition erases its concrete schema generic, but Value.Check above validates this value against the exact runtime schema.
+    const decoded = Value.Decode(tool.parameters, params);
+    return tool.execute(toolCallId, decoded, signal, undefined, runner.createContext());
+  }
+
   return {
     runner,
     session,
@@ -211,13 +228,9 @@ export async function extensionFixture(
     },
     // oxlint-disable-next-line anti-slop/no-unknown-parameters, effecttsgo/async-function -- Raw input intentionally enters through Pi's registered tool boundary and is decoded against that exact registration schema before execute performs authority validation.
     async call(toolName: string, params: unknown, signal?: AbortSignal) {
-      const tool = runner.getToolDefinition(toolName);
-      assert.ok(tool !== undefined, `Missing registered tool ${toolName}`);
-      assert.ok(Value.Check(tool.parameters, params), `Invalid fixture input to ${toolName}`);
-      // SAFETY: Pi's registered definition erases its concrete schema generic, but Value.Check above validates this value against the exact runtime schema.
-      const decoded = Value.Decode(tool.parameters, params);
-      return tool.execute("fixture", decoded, signal, undefined, runner.createContext());
+      return callWithId("fixture", toolName, params, signal);
     },
+    callWithId,
     // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
     async close() {
       await runner.emit({ type: "session_shutdown", reason: "quit" });

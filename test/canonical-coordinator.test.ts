@@ -7,9 +7,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import type {
-  ExtensionActions,
-  InlineExtension,
+import {
+  type ExtensionActions,
+  type InlineExtension,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
@@ -17,12 +17,45 @@ import { Value } from "typebox/value";
 import canonicalCoordinator from "../extensions/canonical-coordinator.js";
 import { CANONICAL_POINTER_ENTRY } from "../src/canonical-coordinator-controller.js";
 import { CanonicalWorkstreamStore } from "../src/canonical-workstream-store.js";
+import type { HandoffGrant } from "../src/domain/workstream.js";
 import { createWorkstream } from "../src/domain/workstream.js";
-import { HANDOFF_GRANT_ENTRY, HANDOFF_KICKOFF_ENTRY } from "../src/handoff-session.js";
+import {
+  deterministicChildSessionId,
+  HANDOFF_KICKOFF_CLAIM_ENTRY,
+  HANDOFF_KICKOFF_ENTRY,
+  prepareHandoffSession,
+} from "../src/handoff-session.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { liveLayer } from "../src/node-platform.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "./decoders.js";
 import { extensionFixture, git, usage } from "./helpers.js";
+
+function childGrant(
+  repository: { projectRoot: string; gitCommonDir: string },
+  id = "grant-bootstrap",
+): HandoffGrant {
+  return {
+    kind: "handoff_grant",
+    id,
+    parentReceipt: {
+      kind: "human_input_receipt",
+      id: "root-receipt",
+      sessionId: "parent-session",
+      sessionFile: "/parent.jsonl",
+      source: "interactive",
+      text: "Parent request",
+      receivedAt: "2026-01-01T00:00:00.000Z",
+    },
+    parentWorkstreamId: "parent-workstream",
+    parentRepository: repository,
+    parentIntentIndex: 0,
+    parentIntentStatement: "Parent request",
+    parentIntentConstraints: ["Inherited constraint"],
+    narrowedRequest: "Focused child request",
+    targetRepository: repository,
+    issuedAt: "2026-01-01T00:00:01.000Z",
+  };
+}
 
 const TARGET_TOOLS = [
   "workgraph_models",
@@ -40,13 +73,17 @@ const TARGET_TOOLS = [
   "workgraph_notepad",
 ] as const;
 
-function appendHandoffInvocation(session: SessionManager, request: string): void {
+function appendHandoffInvocation(
+  session: SessionManager,
+  request: string,
+  toolCallId = "fixture",
+): void {
   session.appendMessage({
     role: "assistant",
     content: [
       {
         type: "toolCall",
-        id: "fixture",
+        id: toolCallId,
         name: "workgraph_handoff",
         arguments: { request },
       },
@@ -63,6 +100,7 @@ function appendHandoffInvocation(session: SessionManager, request: string): void
 async function fixture(
   actions: Partial<ExtensionActions> = {},
   extensionFactories: InlineExtension[] = [canonicalCoordinator],
+  childGrant?: (repository: { projectRoot: string; gitCommonDir: string }) => HandoffGrant,
 ) {
   const parent = await mkdtemp(join(tmpdir(), "canonical-coordinator-"));
   const root = join(parent, "repo");
@@ -77,11 +115,31 @@ async function fixture(
     PI_WORKGRAPH_MODE: null,
     PI_CODING_AGENT_DIR: join(parent, "agent"),
   });
-  const pi = await extensionFixture("coordinator", root, parent, actions, extensionFactories);
+  const commonDir = await git(root, "rev-parse", "--path-format=absolute", "--git-common-dir");
+  const grant = childGrant?.({ projectRoot: root, gitCommonDir: commonDir });
+  const prepared =
+    grant === undefined
+      ? undefined
+      : await Effect.runPromise(
+          prepareHandoffSession(root, deterministicChildSessionId(grant.id), grant, []).pipe(
+            Effect.provide(liveLayer),
+          ),
+        );
+  const session = prepared === undefined ? undefined : SessionManager.open(prepared.sessionFile);
+  const pi = await extensionFixture(
+    "coordinator",
+    root,
+    parent,
+    actions,
+    extensionFactories,
+    session,
+  );
   return {
     ...pi,
     root,
     parent,
+    grant,
+    childSessionFile: prepared?.sessionFile,
     async dispose() {
       await pi.close();
       restoreFixtureEnvironment(previous);
@@ -102,32 +160,9 @@ void test("staged factory registers only canonical tools in coordinator scope", 
 });
 
 void test("child session bootstrap creates the grant-grounded first Intent and triggers kickoff once", async () => {
-  const f = await fixture();
+  const f = await fixture({}, [canonicalCoordinator], childGrant);
   try {
-    const commonDir = await git(f.root, "rev-parse", "--path-format=absolute", "--git-common-dir");
-    const repository = { projectRoot: f.root, gitCommonDir: commonDir };
-    const grant = {
-      kind: "handoff_grant" as const,
-      id: "grant-bootstrap",
-      parentReceipt: {
-        kind: "human_input_receipt" as const,
-        id: "root-receipt",
-        sessionId: "parent-session",
-        sessionFile: "/parent.jsonl",
-        source: "interactive" as const,
-        text: "Parent request",
-        receivedAt: "2026-01-01T00:00:00.000Z",
-      },
-      parentWorkstreamId: "parent-workstream",
-      parentRepository: repository,
-      parentIntentIndex: 0,
-      parentIntentStatement: "Parent request",
-      parentIntentConstraints: ["Inherited constraint"],
-      narrowedRequest: "Focused child request",
-      targetRepository: repository,
-      issuedAt: "2026-01-01T00:00:01.000Z",
-    };
-    f.session.appendCustomEntry(HANDOFF_GRANT_ENTRY, grant);
+    assert.ok(f.grant !== undefined);
     await f.runner.emit({ type: "session_start", reason: "new" });
     const inspection = await f.call("workgraph_inspect", { section: "context" });
     assert.match(JSON.stringify(inspection.details), /Focused child request/);
@@ -137,13 +172,107 @@ void test("child session bootstrap creates the grant-grounded first Intent and t
       1,
     );
 
-    f.session.appendCustomMessageEntry(HANDOFF_KICKOFF_ENTRY, "retained kickoff", true);
+    const identity = {
+      grantId: f.grant.id,
+      childSessionId: deterministicChildSessionId(f.grant.id),
+    };
+    const claim = f.session
+      .getBranch()
+      .find((entry) => entry.type === "custom" && entry.customType === HANDOFF_KICKOFF_CLAIM_ENTRY);
+    assert.ok(claim?.type === "custom");
+    assert.deepEqual(claim.data, identity);
+    f.session.appendCustomMessageEntry(HANDOFF_KICKOFF_ENTRY, "retained kickoff", true, identity);
     await f.runner.emit({ type: "session_start", reason: "reload" });
     assert.equal(
       f.messages.filter((message) => message.customType === HANDOFF_KICKOFF_ENTRY).length,
       1,
     );
     assert.ok(f.notifications.some((item) => /not duplicated/.test(item.message)));
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("conflicting first grounding disables an attached child Workstream", async () => {
+  const f = await fixture({}, [canonicalCoordinator], (repository) =>
+    childGrant(repository, "grant-conflicting-grounding"),
+  );
+  try {
+    await f.runner.emit({ type: "session_start", reason: "new" });
+    const pointer = f.session
+      .getBranch()
+      .findLast((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
+    assert.ok(pointer?.type === "custom");
+    const path = (pointer.data as { path: string }).path;
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+
+    const database = new DatabaseSync(path);
+    const row = database.prepare("SELECT state_json FROM workstream WHERE singleton=1").get() as {
+      state_json: string;
+    };
+    const state = JSON.parse(row.state_json) as { intents: Array<{ statement: string }> };
+    const first = state.intents[0];
+    assert.ok(first !== undefined);
+    first.statement = "Conflicting first grounding";
+    database
+      .prepare("UPDATE workstream SET state_json=? WHERE singleton=1")
+      .run(JSON.stringify(state));
+    database.close();
+
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    await assert.rejects(
+      f.call("workgraph_inspect", { section: "overview" }),
+      /No canonical Workstream is attached/,
+    );
+    const readback = new DatabaseSync(path, { readOnly: true });
+    assert.equal(readback.prepare("SELECT token FROM lease WHERE singleton=1").get(), undefined);
+    readback.close();
+    assert.ok(f.notifications.some((item) => /first Intent does not match/.test(item.message)));
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("kickoff host failure leaves a durable uncertain claim and never resends", async () => {
+  const f = await fixture(
+    {
+      sendMessage() {
+        throw new Error("native send failed");
+      },
+    },
+    [canonicalCoordinator],
+    (repository) => childGrant(repository, "grant-kickoff-host-failure"),
+  );
+  try {
+    assert.ok(f.grant !== undefined);
+    await f.runner.emit({ type: "session_start", reason: "new" });
+    const claims = f.session
+      .getBranch()
+      .filter(
+        (entry) => entry.type === "custom" && entry.customType === HANDOFF_KICKOFF_CLAIM_ENTRY,
+      );
+    assert.equal(claims.length, 1);
+    assert.ok(
+      f.notifications.some((item) =>
+        /Handoff child session start failed: native send failed/.test(item.message),
+      ),
+    );
+    await assert.rejects(
+      f.call("workgraph_inspect", { section: "overview" }),
+      /No canonical Workstream is attached/,
+    );
+
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    assert.equal(
+      f.session
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === HANDOFF_KICKOFF_CLAIM_ENTRY,
+        ).length,
+      1,
+    );
+    assert.ok(f.notifications.some((item) => /submission is uncertain/.test(item.message)));
+    await f.call("workgraph_inspect", { section: "overview" });
   } finally {
     await f.dispose();
   }
@@ -177,7 +306,6 @@ else console.log(JSON.stringify({result:{}}));
       statement: "Coordinate the parent request",
       constraints: ["Keep scope narrow"],
     });
-    appendHandoffInvocation(f.session, "Perform the focused child part");
     const first = await f.call("workgraph_handoff", { request: "Perform the focused child part" });
     assert.equal((first.details as { resultChannel?: string }).resultChannel, "none");
     const beforeReplay = await readFile(logFile, "utf8");
@@ -220,7 +348,7 @@ const load=()=>existsSync(${JSON.stringify(stateFile)})?JSON.parse(readFileSync(
 const save=(v)=>writeFileSync(${JSON.stringify(stateFile)},JSON.stringify(v));
 const current=load();
 const agent=(v,native)=>({workspace_id:"w",tab_id:"t",pane_id:"p",terminal_id:"terminal",agent_status:"working",name:v.name,cwd:v.cwd,...(native?{agent_session:{value:v.session}}:{})});
-if(args[0]==="workspace"&&args[1]==="list") console.log(JSON.stringify({result:{workspaces:current?[{workspace_id:"w",label:current.label,cwd:current.cwd}]:[]}}));
+if(args[0]==="workspace"&&args[1]==="list") console.log(JSON.stringify({result:{workspaces:current?[{workspace_id:"w",label:current.label}]:[]}}));
 else if(args[0]==="tab"&&args[1]==="list") console.log(JSON.stringify({result:{tabs:[{tab_id:"t"}]}}));
 else if(args[0]==="pane"&&args[1]==="list") console.log(JSON.stringify({result:{panes:[{workspace_id:"w",tab_id:"t",pane_id:"p",terminal_id:"terminal",cwd:current.cwd}]}}));
 else if(args[0]==="api"&&args[1]==="snapshot") console.log(JSON.stringify({result:{snapshot:{agents:current?.session?[agent(current,true)]:[]}}}));
@@ -236,15 +364,21 @@ else console.log(JSON.stringify({result:{}}));
     try {
       await f.input("Parent request");
       await f.call("workgraph_intent", { statement: "Parent request" });
-      appendHandoffInvocation(f.session, `Recover ${failure}`);
-      await assert.rejects(f.call("workgraph_handoff", { request: `Recover ${failure}` }));
+      appendHandoffInvocation(f.session, `Recover ${failure}`, "original-call");
+      await assert.rejects(
+        f.callWithId("original-call", "workgraph_handoff", { request: `Recover ${failure}` }),
+      );
       const beforeMismatch = await readFile(logFile, "utf8");
       await assert.rejects(
-        f.call("workgraph_handoff", { request: `Different ${failure}` }),
+        f.callWithId("different-call", "workgraph_handoff", {
+          request: `Different ${failure}`,
+        }),
         /different request/,
       );
       assert.equal(await readFile(logFile, "utf8"), beforeMismatch);
-      const recovered = await f.call("workgraph_handoff", { request: `Recover ${failure}` });
+      const recovered = await f.callWithId("recovery-call", "workgraph_handoff", {
+        request: `Recover ${failure}`,
+      });
       const calls = (await readFile(logFile, "utf8"))
         .trim()
         .split("\n")
@@ -254,6 +388,23 @@ else console.log(JSON.stringify({result:{}}));
         1,
       );
       assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "start").length, 1);
+      const pointer = f.session
+        .getBranch()
+        .findLast(
+          (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
+        );
+      assert.ok(pointer?.type === "custom");
+      const attachment = await Effect.runPromise(
+        Effect.scoped(
+          CanonicalWorkstreamStore.discover((pointer.data as { path: string }).path),
+        ).pipe(Effect.provide(liveLayer)),
+      );
+      assert.equal(attachment.state.handoffs?.length, 1);
+      assert.equal(attachment.state.handoffs?.[0]?.toolCallId, "original-call");
+      assert.equal(
+        attachment.state.handoffs?.[0]?.childSessionId,
+        (recovered.details as { childSessionId: string }).childSessionId,
+      );
       await rm((recovered.details as { childSessionFile: string }).childSessionFile, {
         force: true,
       });

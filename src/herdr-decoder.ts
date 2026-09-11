@@ -81,7 +81,6 @@ const WorkspaceListResponseSchema = Type.Object({
       Type.Object({
         workspace_id: Type.String({ minLength: 1 }),
         label: Type.String({ minLength: 1 }),
-        cwd: Type.String({ minLength: 1 }),
       }),
     ),
   }),
@@ -134,7 +133,6 @@ export type HerdrCoordinatorAgent = DecodedCoordinatorAgent;
 export interface DecodedWorkspaceSummary {
   readonly workspaceId: string;
   readonly label: string;
-  readonly cwd: string;
 }
 
 export interface DecodedWorkspaceCreation {
@@ -204,11 +202,10 @@ export function decodeSnapshotResponse(value: unknown): readonly DecodedSnapshot
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This named decoder validates exact workspace-label probing.
 export function decodeWorkspaceListResponse(value: unknown): readonly DecodedWorkspaceSummary[] {
   if (!Value.Check(WorkspaceListResponseSchema, value))
-    throw new Error("Herdr workspace list omitted exact label, cwd, or workspace identity.");
+    throw new Error("Herdr workspace list omitted exact label or workspace identity.");
   return Value.Decode(WorkspaceListResponseSchema, value).result.workspaces.map((workspace) => ({
     workspaceId: workspace.workspace_id,
     label: workspace.label,
-    cwd: workspace.cwd,
   }));
 }
 

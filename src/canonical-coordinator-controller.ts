@@ -389,12 +389,14 @@ export class CanonicalCoordinatorController {
         let checkpoint = initial;
         const workers = this.options.workers?.() ?? new HerdrCliRuntime();
         if (checkpoint.phase === "prepared") {
-          const parentDiscussion = priorDiscussion(ctx.sessionManager, checkpoint.toolCallId);
+          const discussion = checkpoint.forkContext
+            ? priorDiscussion(ctx.sessionManager, checkpoint.toolCallId)
+            : [];
           const prepared = yield* prepareHandoffSession(
             checkpoint.grant.targetRepository.projectRoot,
             checkpoint.childSessionId,
             checkpoint.grant,
-            checkpoint.forkContext ? parentDiscussion : [],
+            discussion,
           );
           checkpoint = {
             ...checkpoint,

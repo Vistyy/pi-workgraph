@@ -309,9 +309,7 @@ export class HerdrCliRuntime {
           ["workspace", "list"],
           decodeWorkspaceListResponse,
         );
-        const matches = workspaces.filter(
-          (workspace) => workspace.label === names.label && workspace.cwd === request.cwd,
-        );
+        const matches = workspaces.filter((workspace) => workspace.label === names.label);
         if (matches.length === 0) return { state: "absent" as const };
         if (matches.length !== 1)
           return {

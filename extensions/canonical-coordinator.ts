@@ -2,8 +2,8 @@
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The in-scope factory reads one immutable packaged instruction asset before registering its lifecycle hooks.
 import { readFileSync } from "node:fs";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Effect } from "effect";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Data, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { installCalmMode, isCoordinatorScope } from "../src/calm.js";
@@ -21,11 +21,13 @@ import {
   type CanonicalHumanInputReceipt,
   installCoordinatorSessionState,
 } from "../src/coordinator-notepad.js";
-import { type HandoffGrant, HandoffGrantSchema } from "../src/domain/workstream.js";
+import type { HandoffGrant } from "../src/domain/workstream.js";
 import {
-  HANDOFF_GRANT_ENTRY,
+  deterministicChildSessionId,
+  HANDOFF_KICKOFF_CLAIM_ENTRY,
   HANDOFF_KICKOFF_ENTRY,
   handoffChildWorkstreamId,
+  sealedHandoffGrant,
 } from "../src/handoff-session.js";
 import {
   loadModelPolicyEffect,
@@ -35,6 +37,11 @@ import {
 } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import { EvidenceInputSchema } from "../src/report-schema.js";
+
+class HandoffKickoffError extends Data.TaggedError("HandoffKickoffError")<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
 
 const NonEmpty = Type.String({ minLength: 1 });
 const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
@@ -256,7 +263,7 @@ export default function canonicalCoordinator(
   pi.on("session_start", (_event, ctx) =>
     run(
       Effect.gen(function* () {
-        const grant = decodeSessionGrant(ctx);
+        const grant = sealedHandoffGrant(ctx.sessionManager);
         if (grant !== undefined && hasPredecessorPointer(ctx))
           return yield* Effect.fail(
             new Error("Handoff Grant cannot coexist with a predecessor Workgraph pointer."),
@@ -266,8 +273,8 @@ export default function canonicalCoordinator(
         yield* controller.restore(ctx, () => retained);
         if (grant === undefined) return;
         yield* controller.bootstrapHandoff(ctx, grant);
-        triggerHandoffKickoff(pi, ctx, grant);
-      }),
+        yield* triggerHandoffKickoff(pi, ctx, grant);
+      }).pipe(Effect.onError(() => controller.close(ctx).pipe(Effect.ignore))),
     ).catch((error) => {
       ctx.ui.notify(
         `Canonical Workstream reattachment skipped: ${publicMessage(error)}`,
@@ -610,19 +617,6 @@ function reviewSubject(subject: Static<typeof PublicReviewSubjectSchema>) {
   }
 }
 
-function decodeSessionGrant(ctx: ExtensionContext): HandoffGrant | undefined {
-  const entries = ctx.sessionManager
-    .getBranch()
-    .filter((entry) => entry.type === "custom" && entry.customType === HANDOFF_GRANT_ENTRY);
-  if (entries.length === 0) return undefined;
-  if (entries.length !== 1)
-    throw new Error("Child session must contain exactly one Handoff Grant.");
-  const entry = entries[0];
-  if (entry?.type !== "custom" || !Value.Check(HandoffGrantSchema, entry.data))
-    throw new Error("Child session contains a malformed Handoff Grant.");
-  return Value.Decode(HandoffGrantSchema, entry.data);
-}
-
 function validateChildPointer(pointer: CanonicalPointerRestoration, grant: HandoffGrant): void {
   if (
     pointer === "malformed" ||
@@ -639,41 +633,99 @@ function hasPredecessorPointer(ctx: ExtensionContext): boolean {
     .some((entry) => entry.type === "custom" && entry.customType === "pi-workgraph-workstream");
 }
 
-function triggerHandoffKickoff(pi: ExtensionAPI, ctx: ExtensionContext, grant: HandoffGrant): void {
-  const branch = ctx.sessionManager.getBranch();
-  const kickoffIndex = branch.findIndex(
-    (entry) => entry.type === "custom_message" && entry.customType === HANDOFF_KICKOFF_ENTRY,
-  );
-  if (kickoffIndex >= 0) {
-    const answered = branch
-      .slice(kickoffIndex + 1)
-      .some(
-        (entry) =>
-          entry.type === "message" &&
-          entry.message.role === "assistant" &&
-          entry.message.provider !== "workgraph",
+function triggerHandoffKickoff(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  grant: HandoffGrant,
+): Effect.Effect<void, HandoffKickoffError> {
+  return Effect.try({
+    try: () => {
+      const branch = ctx.sessionManager.getBranch();
+      const identity = {
+        grantId: grant.id,
+        childSessionId: deterministicChildSessionId(grant.id),
+      };
+      const retained = retainedKickoff(branch, identity);
+      if (retained === "claim") {
+        ctx.ui.notify(
+          "The retained Workgraph handoff kickoff claim has no exact submitted message; submission is uncertain and was not duplicated.",
+          "warning",
+        );
+        return;
+      }
+      if (retained !== undefined) {
+        if (!hasAssistantAfter(branch, retained))
+          ctx.ui.notify(
+            "The retained Workgraph handoff kickoff has no observed child response; it was not duplicated.",
+            "warning",
+          );
+        return;
+      }
+      pi.appendEntry(HANDOFF_KICKOFF_CLAIM_ENTRY, identity);
+      pi.sendMessage(
+        {
+          customType: HANDOFF_KICKOFF_ENTRY,
+          content: [
+            "[WORKGRAPH HANDOFF KICKOFF]",
+            grant.narrowedRequest,
+            "",
+            "Inherited parent constraints:",
+            ...grant.parentIntentConstraints.map((constraint) => `- ${constraint}`),
+          ].join("\n"),
+          display: true,
+          details: identity,
+        },
+        { triggerTurn: true, deliverAs: "followUp" },
       );
-    if (!answered)
-      ctx.ui.notify(
-        "The retained Workgraph handoff kickoff has no observed child response; it was not duplicated.",
-        "warning",
-      );
-    return;
-  }
-  pi.sendMessage(
-    {
-      customType: HANDOFF_KICKOFF_ENTRY,
-      content: [
-        "[WORKGRAPH HANDOFF KICKOFF]",
-        grant.narrowedRequest,
-        "",
-        "Inherited parent constraints:",
-        ...grant.parentIntentConstraints.map((constraint) => `- ${constraint}`),
-      ].join("\n"),
-      display: true,
     },
-    { triggerTurn: true, deliverAs: "followUp" },
+    catch: (cause) =>
+      new HandoffKickoffError({
+        message: `Handoff child session start failed: ${publicMessage(cause)}`,
+        cause,
+      }),
+  });
+}
+
+type KickoffIdentity = { readonly grantId: string; readonly childSessionId: string };
+
+function retainedKickoff(
+  branch: readonly SessionEntry[],
+  identity: KickoffIdentity,
+): Extract<SessionEntry, { type: "custom_message" }> | "claim" | undefined {
+  const claims = branch.filter(
+    (entry): entry is Extract<SessionEntry, { type: "custom" }> =>
+      entry.type === "custom" && entry.customType === HANDOFF_KICKOFF_CLAIM_ENTRY,
   );
+  const messages = branch.filter(
+    (entry): entry is Extract<SessionEntry, { type: "custom_message" }> =>
+      entry.type === "custom_message" && entry.customType === HANDOFF_KICKOFF_ENTRY,
+  );
+  if (claims.length > 1 || messages.length > 1)
+    throw new Error("Child session contains multiple handoff kickoff claims or messages.");
+  const claim = claims[0];
+  if (claim !== undefined && !Value.Equal(claim.data, identity))
+    throw new Error("Child session contains a conflicting handoff kickoff claim.");
+  const message = messages[0];
+  if (message !== undefined && !Value.Equal(message.details, identity))
+    throw new Error("Child session contains a malformed handoff kickoff message.");
+  if (message !== undefined && claim === undefined)
+    throw new Error("Child session handoff kickoff message has no pre-effect claim.");
+  if (message !== undefined) return message;
+  return claim === undefined ? undefined : "claim";
+}
+
+function hasAssistantAfter(
+  branch: readonly SessionEntry[],
+  kickoff: Extract<SessionEntry, { type: "custom_message" }>,
+): boolean {
+  return branch
+    .slice(branch.indexOf(kickoff) + 1)
+    .some(
+      (entry) =>
+        entry.type === "message" &&
+        entry.message.role === "assistant" &&
+        entry.message.provider !== "workgraph",
+    );
 }
 
 function publicMessage(cause: unknown): string {

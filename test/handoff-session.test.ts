@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The native SessionManager fixture owns removal of its exact default-directory child session file.
-import { rm } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
@@ -43,7 +43,7 @@ void test("handoff discussion forks before the invoking call and excludes Workgr
   const parent = SessionManager.inMemory();
   parent.appendMessage({ role: "user", content: "Useful prior discussion", timestamp: 1 });
   parent.appendCustomMessageEntry("pi-workgraph-attention", "owned", false);
-  parent.appendMessage({
+  const kept = parent.appendMessage({
     role: "assistant",
     content: [{ type: "text", text: "Useful answer" }],
     api: "test",
@@ -53,6 +53,7 @@ void test("handoff discussion forks before the invoking call and excludes Workgr
     stopReason: "stop",
     timestamp: 2,
   });
+  parent.appendCompaction("Compacted discussion", kept, 10);
   parent.appendMessage({
     role: "assistant",
     content: [
@@ -71,9 +72,58 @@ void test("handoff discussion forks before the invoking call and excludes Workgr
     timestamp: 3,
   });
   const discussion = priorDiscussion(parent, "handoff-call");
-  assert.match(JSON.stringify(discussion), /Useful prior discussion/);
+  assert.match(JSON.stringify(discussion), /Compacted discussion/);
   assert.match(JSON.stringify(discussion), /Useful answer/);
+  assert.doesNotMatch(JSON.stringify(discussion), /Useful prior discussion/);
   assert.doesNotMatch(JSON.stringify(discussion), /owned|workgraph_handoff|handoff-call/);
+});
+
+void test("complete child preparation prefixes resume append-only while truncated JSONL blocks", async () => {
+  const discussion = [
+    { role: "user" as const, content: "Non-authoritative context", timestamp: 1 },
+  ];
+  for (const retainedRecords of [1, 2, 3]) {
+    const currentGrant = { ...grant, id: `${grant.id}-${retainedRecords}` };
+    const childSessionId = deterministicChildSessionId(currentGrant.id);
+    const exact = await Effect.runPromise(
+      prepareHandoffSession(repository.projectRoot, childSessionId, currentGrant, discussion).pipe(
+        Effect.provide(liveLayer),
+      ),
+    );
+    try {
+      const lines = (await readFile(exact.sessionFile, "utf8")).trimEnd().split("\n");
+      const prefix = `${lines.slice(0, retainedRecords + 1).join("\n")}\n`;
+      await writeFile(exact.sessionFile, prefix);
+      const resumed = await Effect.runPromise(
+        prepareHandoffSession(
+          repository.projectRoot,
+          childSessionId,
+          currentGrant,
+          discussion,
+        ).pipe(Effect.provide(liveLayer)),
+      );
+      assert.equal(resumed.sessionFile, exact.sessionFile);
+      assert.equal(
+        (await readFile(exact.sessionFile, "utf8")).split("\n").length,
+        lines.length + 1,
+      );
+
+      await writeFile(exact.sessionFile, prefix.trimEnd());
+      await assert.rejects(
+        Effect.runPromise(
+          prepareHandoffSession(
+            repository.projectRoot,
+            childSessionId,
+            currentGrant,
+            discussion,
+          ).pipe(Effect.provide(liveLayer)),
+        ),
+        /malformed, truncated, or conflicts/,
+      );
+    } finally {
+      await rm(exact.sessionFile, { force: true });
+    }
+  }
 });
 
 void test("deterministic child session has no parent pointer, replays exactly, and seals optional context", async () => {

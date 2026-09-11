@@ -1,16 +1,19 @@
 import { createHash } from "node:crypto";
 import {
+  buildContextEntries,
   type SessionContext,
   type SessionEntry,
   SessionManager,
   sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { Data, Effect, FileSystem } from "effect";
-import type { HandoffGrant } from "./domain/workstream.js";
+import { Value } from "typebox/value";
+import { type HandoffGrant, HandoffGrantSchema } from "./domain/workstream.js";
 
 export const HANDOFF_GRANT_ENTRY = "pi-workgraph-handoff-grant";
 export const HANDOFF_CONTEXT_ENTRY = "pi-workgraph-handoff-context";
 export const HANDOFF_SEAL_ENTRY = "pi-workgraph-handoff-seal";
+export const HANDOFF_KICKOFF_CLAIM_ENTRY = "pi-workgraph-handoff-kickoff-claim";
 export const HANDOFF_KICKOFF_ENTRY = "pi-workgraph-handoff-kickoff";
 const HANDOFF_MARKER_PROVIDER = "workgraph";
 const HANDOFF_MARKER_TEXT = "Workgraph handoff session prepared.";
@@ -40,8 +43,61 @@ export function deterministicChildSessionId(grantId: string): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-5${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
+export function sealedHandoffGrant(
+  session: Pick<SessionManager, "getBranch" | "getSessionId">,
+): HandoffGrant | undefined {
+  const branch = session.getBranch();
+  const preparationPresent = branch.some(
+    (entry) =>
+      isPreparationMarker(entry) ||
+      (entry.type === "custom" &&
+        (entry.customType === HANDOFF_GRANT_ENTRY || entry.customType === HANDOFF_SEAL_ENTRY)) ||
+      (entry.type === "custom_message" && entry.customType === HANDOFF_CONTEXT_ENTRY),
+  );
+  if (!preparationPresent) return undefined;
+  if (branch.filter(isPreparationMarker).length !== 1 || !isPreparationMarker(branch[0]))
+    throw invalidSealedSession();
+  const grantEntry = branch[1];
+  if (
+    grantEntry?.type !== "custom" ||
+    grantEntry.customType !== HANDOFF_GRANT_ENTRY ||
+    !Value.Check(HandoffGrantSchema, grantEntry.data)
+  )
+    throw invalidSealedSession();
+  const grant = Value.Decode(HandoffGrantSchema, grantEntry.data);
+  const context = branch[2];
+  const contextIncluded = context?.type === "custom_message";
+  if (
+    contextIncluded &&
+    (context.customType !== HANDOFF_CONTEXT_ENTRY ||
+      JSON.stringify(context.details) !== JSON.stringify({ grantId: grant.id }))
+  )
+    throw invalidSealedSession();
+  const seal = branch[contextIncluded ? 3 : 2];
+  if (
+    seal?.type !== "custom" ||
+    seal.customType !== HANDOFF_SEAL_ENTRY ||
+    JSON.stringify(seal.data) !==
+      JSON.stringify({
+        grantId: grant.id,
+        childSessionId: deterministicChildSessionId(grant.id),
+        contextIncluded,
+      }) ||
+    session.getSessionId() !== deterministicChildSessionId(grant.id)
+  )
+    throw invalidSealedSession();
+  const preparationEntries = branch.filter(
+    (entry) =>
+      (entry.type === "custom" &&
+        (entry.customType === HANDOFF_GRANT_ENTRY || entry.customType === HANDOFF_SEAL_ENTRY)) ||
+      (entry.type === "custom_message" && entry.customType === HANDOFF_CONTEXT_ENTRY),
+  );
+  if (preparationEntries.length !== (contextIncluded ? 3 : 2)) throw invalidSealedSession();
+  return grant;
+}
+
 export function priorDiscussion(
-  parent: Pick<SessionManager, "getBranch">,
+  parent: Pick<SessionManager, "getBranch" | "getEntries">,
   toolCallId: string,
 ): readonly SessionContext["messages"][number][] {
   const invoking = parent
@@ -56,7 +112,7 @@ export function priorDiscussion(
     throw new HandoffSessionError({
       message: "The invoking assistant entry for this exact handoff tool call was not persisted.",
     });
-  const entries = invoking.parentId === null ? [] : parent.getBranch(invoking.parentId);
+  const entries = buildContextEntries(parent.getEntries(), invoking.parentId);
   return entries.filter(retainDiscussionEntry).flatMap(sessionEntryToContextMessages);
 }
 
@@ -206,6 +262,7 @@ function classifyContextTail(
   discussion: readonly SessionContext["messages"][number][],
 ): "exact" | "prefix" | "conflict" {
   const context = branch[2];
+  if (context === undefined) return "prefix";
   if (
     context?.type !== "custom_message" ||
     context.customType !== HANDOFF_CONTEXT_ENTRY ||
@@ -312,6 +369,12 @@ function retainDiscussionEntry(entry: SessionEntry): boolean {
       (part) => part.type === "toolCall" && part.name.startsWith("workgraph_"),
     );
   return !(entry.message.role === "toolResult" && entry.message.toolName.startsWith("workgraph_"));
+}
+
+function invalidSealedSession(): HandoffSessionError {
+  return new HandoffSessionError({
+    message: "Child session does not contain one exact sealed Handoff Grant.",
+  });
 }
 
 function sessionTry<A>(run: () => A): Effect.Effect<A, HandoffSessionError> {
