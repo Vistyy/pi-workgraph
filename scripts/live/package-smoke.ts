@@ -60,12 +60,8 @@ async function smokePackage(): Promise<void> {
     "--eval",
     `for (const url of ${JSON.stringify(modules)}) { const loaded = await import(url); if (typeof loaded.default !== "function") throw new Error(\`Missing extension factory: \${url}\`); }`,
   ]);
-  const response: unknown = JSON.parse(
-    await command(consumer, join(consumer, "node_modules/.bin/pi-workgraph"), ["--help"]),
-  );
-  assert.partialDeepStrictEqual(response, { ok: true, command: "help" });
   process.stdout.write(
-    `${JSON.stringify({ status: "passed", boundary: "pack/install/import/cli", totalMs: Date.now() - started })}\n`,
+    `${JSON.stringify({ status: "passed", boundary: "pack/install/import/extensions", totalMs: Date.now() - started })}\n`,
   );
 }
 
@@ -74,7 +70,7 @@ try {
 } catch (cause) {
   const failure: unknown = controller.signal.aborted ? controller.signal.reason : cause;
   process.stderr.write(
-    `verify:package failed at the pack/install/import/CLI boundary. Installation may require registry access for uncached peers and dependencies. ${failure instanceof Error ? failure.message : String(failure)}\n`,
+    `verify:package failed at the pack/install/import/extensions boundary. Installation may require registry access for uncached peers and dependencies. ${failure instanceof Error ? failure.message : String(failure)}\n`,
   );
   process.exitCode = 1;
 } finally {

@@ -4,22 +4,18 @@ import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Native fixture paths identify real temporary repositories.
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import {
   type ExtensionActions,
-  type ExtensionCommandContext,
   type InlineExtension,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
 import canonicalCoordinator from "../extensions/canonical-coordinator.js";
-import {
-  CANONICAL_POINTER_ENTRY,
-  type CanonicalWorkstreamPointer,
-} from "../src/canonical-coordinator-controller.js";
+import { CANONICAL_POINTER_ENTRY } from "../src/canonical-coordinator-controller.js";
 import { CanonicalWorkstreamStore } from "../src/canonical-workstream-store.js";
 import type { HandoffGrant } from "../src/domain/workstream.js";
 import { createWorkstream } from "../src/domain/workstream.js";
@@ -31,9 +27,6 @@ import {
 } from "../src/handoff-session.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { liveLayer } from "../src/node-platform.js";
-import { PREDECESSOR_POINTER_ENTRY } from "../src/temporary-canonical-cutover.js";
-import { V7_MIGRATION_BREADCRUMB_ENTRY } from "../src/temporary-v7-migration.js";
-import type { WorkstreamState } from "../src/workstream-state.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "./decoders.js";
 import { extensionFixture, git, usage } from "./helpers.js";
 
@@ -104,84 +97,6 @@ function appendHandoffInvocation(
   });
 }
 
-async function installLegacyCutover(f: Awaited<ReturnType<typeof fixture>>): Promise<string> {
-  const ctx = f.runner.createContext();
-  const sessionFile = ctx.sessionManager.getSessionFile();
-  assert.ok(sessionFile !== undefined);
-  const repository = {
-    projectRoot: f.root,
-    gitCommonDir: await git(f.root, "rev-parse", "--path-format=absolute", "--git-common-dir"),
-  };
-  const id = "migration";
-  const path = join(
-    repository.gitCommonDir,
-    "pi-workgraph",
-    "workstreams",
-    id,
-    "workstream.sqlite",
-  );
-  for (const directory of [
-    join(repository.gitCommonDir, "pi-workgraph"),
-    join(repository.gitCommonDir, "pi-workgraph", "workstreams"),
-    dirname(path),
-  ]) {
-    await mkdir(directory, { recursive: true, mode: 0o700 });
-    await chmod(directory, 0o700);
-  }
-  const owner = { sessionId: ctx.sessionManager.getSessionId(), sessionFile };
-  const receipt = {
-    id: "cutover-receipt",
-    ...owner,
-    source: "interactive" as const,
-    text: "Retained cutover Workstream",
-    receivedAt: "2024-01-01T00:00:00.000Z",
-  };
-  const state: WorkstreamState = {
-    format: "pi-workgraph-workstream",
-    version: 7,
-    revision: 1,
-    id,
-    purpose: receipt.text,
-    projectRoot: repository.projectRoot,
-    gitCommonDir: repository.gitCommonDir,
-    statePath: path,
-    coordinator: owner,
-    lifecycle: { state: "active", changedAt: receipt.receivedAt, reason: "Active." },
-    inputs: [receipt],
-    intents: [
-      {
-        version: 0,
-        statement: receipt.text,
-        constraints: [],
-        authorityReceiptIds: [],
-        recordedAt: receipt.receivedAt,
-      },
-      {
-        version: 1,
-        statement: receipt.text,
-        constraints: ["Preserve exact cutover state."],
-        authorityReceiptIds: [receipt.id],
-        recordedAt: receipt.receivedAt,
-      },
-    ],
-    assignments: [],
-    attempts: [],
-    results: [],
-    deliveries: [],
-    createdAt: receipt.receivedAt,
-    updatedAt: receipt.receivedAt,
-  };
-  using database = new DatabaseSync(path);
-  database.exec(`
-    CREATE TABLE workstream_state(singleton INTEGER PRIMARY KEY, state_json TEXT NOT NULL, revision INTEGER NOT NULL);
-    CREATE TABLE lease(singleton INTEGER PRIMARY KEY, token TEXT NOT NULL, owner_session_id TEXT NOT NULL, owner_session_file TEXT NOT NULL, acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, expires_at TEXT NOT NULL);
-  `);
-  database.prepare("INSERT INTO workstream_state VALUES(1,?,?)").run(JSON.stringify(state), 1);
-  await chmod(path, 0o600);
-  f.session.appendCustomEntry(PREDECESSOR_POINTER_ENTRY, { path });
-  return path;
-}
-
 async function fixture(
   actions: Partial<ExtensionActions> = {},
   extensionFactories: InlineExtension[] = [canonicalCoordinator],
@@ -233,7 +148,7 @@ async function fixture(
   };
 }
 
-void test("package and staged factory register canonical coordinator, worker, and only the human reload command", async () => {
+void test("package and staged factory register only the canonical coordinator and worker", async () => {
   const packaged = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as {
     pi: { extensions: string[] };
   };
@@ -247,418 +162,6 @@ void test("package and staged factory register canonical coordinator, worker, an
       assert.ok(f.runner.getToolDefinition(name) !== undefined, `missing ${name}`);
     assert.equal(f.runner.getToolDefinition("workgraph_fork"), undefined);
     assert.equal(f.runner.getToolDefinition("workgraph_reload"), undefined);
-    assert.ok(f.runner.getCommand("workgraph-reload") !== undefined);
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("temporary cutover migrates before restore, attaches once, and committed replay does not append", async () => {
-  const f = await fixture();
-  try {
-    const path = await installLegacyCutover(f);
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    await f.call("workgraph_inspect", { section: "overview" });
-    const branch = f.session.getBranch();
-    assert.deepEqual(
-      branch
-        .filter(
-          (entry) => entry.type === "custom" && entry.customType === V7_MIGRATION_BREADCRUMB_ENTRY,
-        )
-        .map((entry) =>
-          entry.type === "custom" ? (entry.data as { phase: string }).phase : "invalid",
-        ),
-      ["prepared", "committed"],
-    );
-    assert.equal(
-      branch.filter(
-        (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
-      ).length,
-      1,
-    );
-    assert.ok(
-      f.notifications.some((item) =>
-        /migration committed; canonical Workstream attached/.test(item.message),
-      ),
-    );
-    await f.call("workgraph_adopt", { statePath: path });
-    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
-    const beforeReplay = f.session.getBranch().length;
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    assert.equal(f.session.getBranch().length, beforeReplay);
-    assert.equal(
-      f.session
-        .getBranch()
-        .filter((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY)
-        .length,
-      3,
-    );
-    await f.call("workgraph_inspect", { section: "overview" });
-    const database = new DatabaseSync(path, { readOnly: true });
-    assert.ok(database.prepare("SELECT token FROM lease").get() !== undefined);
-    database.close();
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("cutover append mutate-then-throw fails closed and next reload recovers without duplication", async () => {
-  for (const interruptedType of [V7_MIGRATION_BREADCRUMB_ENTRY, CANONICAL_POINTER_ENTRY]) {
-    let session: SessionManager | undefined;
-    let interrupt = true;
-    const f = await fixture({
-      appendEntry(type, data) {
-        session?.appendCustomEntry(type, data);
-        if (type === interruptedType && interrupt) {
-          interrupt = false;
-          throw new Error("interrupted after append");
-        }
-      },
-    });
-    session = f.session;
-    try {
-      await installLegacyCutover(f);
-      await f.runner.emit({ type: "session_start", reason: "reload" });
-      await assert.rejects(
-        f.call("workgraph_inspect", { section: "overview" }),
-        /No canonical Workstream is attached/,
-      );
-      await f.runner.emit({ type: "session_start", reason: "reload" });
-      await f.call("workgraph_inspect", { section: "overview" });
-      assert.equal(
-        f.session
-          .getBranch()
-          .filter(
-            (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
-          ).length,
-        1,
-      );
-      assert.equal(
-        f.session
-          .getBranch()
-          .filter(
-            (entry) =>
-              entry.type === "custom" && entry.customType === V7_MIGRATION_BREADCRUMB_ENTRY,
-          ).length,
-        2,
-      );
-    } finally {
-      await f.dispose();
-    }
-  }
-});
-
-void test("migration record conflicts prevent canonical restore", async () => {
-  const f = await fixture();
-  try {
-    const path = await installLegacyCutover(f);
-    f.session.appendCustomEntry(PREDECESSOR_POINTER_ENTRY, { path });
-    const before = await readFile(path);
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    await assert.rejects(
-      f.call("workgraph_inspect", { section: "overview" }),
-      /No canonical Workstream is attached/,
-    );
-    assert.deepEqual(await readFile(path), before);
-    const startupDiagnostic = f.notifications.find((item) =>
-      /exactly one retained predecessor pointer/.test(item.message),
-    );
-    assert.ok(startupDiagnostic !== undefined);
-    await f.input("Do not create a conflicting canonical Workstream");
-    await assert.rejects(
-      f.call("workgraph_intent", { statement: "Do not create a conflicting canonical Workstream" }),
-      /startup remains blocked.*exactly one retained predecessor pointer/,
-    );
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("cutover rejects malformed and target-conflicting canonical histories", async () => {
-  type AttachedPointer = Extract<CanonicalWorkstreamPointer, { phase: "attached" }>;
-  type CorruptPointer = CanonicalWorkstreamPointer | { readonly version: 1 };
-  type Owner = { readonly sessionId: string; readonly sessionFile: string };
-  const cases: readonly {
-    readonly label: string;
-    readonly append: (attached: AttachedPointer, owner: Owner) => CorruptPointer;
-    readonly diagnostic: RegExp;
-  }[] = [
-    {
-      label: "malformed",
-      append: () => ({ version: 1 }),
-      diagnostic: /pointer history is malformed/,
-    },
-    {
-      label: "conflicting target",
-      append: (attached: AttachedPointer) => ({
-        ...structuredClone(attached),
-        path: `${attached.path}-conflict`,
-      }),
-      diagnostic: /pointer history contains conflicting targets/,
-    },
-  ] as const;
-  for (const scenario of cases) {
-    const f = await fixture();
-    try {
-      await installLegacyCutover(f);
-      await f.runner.emit({ type: "session_start", reason: "reload" });
-      await f.runner.emit({ type: "session_shutdown", reason: "reload" });
-      const attached = f.session
-        .getBranch()
-        .findLast(
-          (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
-        );
-      assert.ok(attached?.type === "custom");
-      const context = f.runner.createContext();
-      const sessionFile = context.sessionManager.getSessionFile();
-      assert.ok(sessionFile !== undefined);
-      f.session.appendCustomEntry(
-        CANONICAL_POINTER_ENTRY,
-        scenario.append(attached.data as AttachedPointer, {
-          sessionId: context.sessionManager.getSessionId(),
-          sessionFile,
-        }),
-      );
-
-      await f.runner.emit({ type: "session_start", reason: "reload" });
-      await assert.rejects(
-        f.call("workgraph_inspect", { section: "overview" }),
-        /No canonical Workstream is attached/,
-      );
-      const diagnostic = f.notifications.find((item) => scenario.diagnostic.test(item.message));
-      assert.ok(diagnostic !== undefined, `${scenario.label}: ${JSON.stringify(f.notifications)}`);
-      await f.input(`Do not create after ${scenario.label}`);
-      await assert.rejects(
-        f.call("workgraph_intent", { statement: `Do not create after ${scenario.label}` }),
-        scenario.diagnostic,
-      );
-    } finally {
-      await f.dispose();
-    }
-  }
-});
-
-void test("cutover requires the migration attachment to be the first canonical pointer", async () => {
-  let session: SessionManager | undefined;
-  const f = await fixture({
-    appendEntry(type, data) {
-      if (type !== CANONICAL_POINTER_ENTRY) {
-        session?.appendCustomEntry(type, data);
-        return;
-      }
-      assert.ok(session !== undefined);
-      const sessionFile = session.getSessionFile();
-      assert.ok(sessionFile !== undefined);
-      session.appendCustomEntry(type, {
-        ...(data as Extract<CanonicalWorkstreamPointer, { phase: "attached" }>),
-        phase: "prepared",
-        operation: {
-          kind: "recover",
-          expectedOwner: { sessionId: session.getSessionId(), sessionFile },
-        },
-      });
-    },
-  });
-  session = f.session;
-  try {
-    await installLegacyCutover(f);
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    await assert.rejects(
-      f.call("workgraph_inspect", { section: "overview" }),
-      /No canonical Workstream is attached/,
-    );
-    assert.ok(
-      f.notifications.some((item) => /must begin with migration attachment/.test(item.message)),
-    );
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("cutover replays trailing prepared and accepts repeated prepared checkpoints", async () => {
-  for (const repeatedThenAttached of [false, true]) {
-    const f = await fixture();
-    try {
-      await installLegacyCutover(f);
-      await f.runner.emit({ type: "session_start", reason: "reload" });
-      await f.runner.emit({ type: "session_shutdown", reason: "reload" });
-      const attachedEntry = f.session
-        .getBranch()
-        .findLast(
-          (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
-        );
-      assert.ok(attachedEntry?.type === "custom");
-      const attached = attachedEntry.data as Extract<
-        CanonicalWorkstreamPointer,
-        { phase: "attached" }
-      >;
-      const context = f.runner.createContext();
-      const sessionFile = context.sessionManager.getSessionFile();
-      assert.ok(sessionFile !== undefined);
-      const prepared: CanonicalWorkstreamPointer = {
-        ...structuredClone(attached),
-        phase: "prepared",
-        operation: {
-          kind: "recover",
-          expectedOwner: { sessionId: context.sessionManager.getSessionId(), sessionFile },
-        },
-      };
-      f.session.appendCustomEntry(CANONICAL_POINTER_ENTRY, structuredClone(prepared));
-      if (repeatedThenAttached) {
-        f.session.appendCustomEntry(CANONICAL_POINTER_ENTRY, structuredClone(prepared));
-        f.session.appendCustomEntry(CANONICAL_POINTER_ENTRY, structuredClone(attached));
-      }
-
-      const before = f.session
-        .getBranch()
-        .filter(
-          (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
-        ).length;
-      await f.runner.emit({ type: "session_start", reason: "reload" });
-      await f.call("workgraph_inspect", { section: "overview" });
-      const pointers = f.session
-        .getBranch()
-        .filter((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
-      assert.equal(pointers.length, repeatedThenAttached ? before : before + 1);
-      const current = pointers.at(-1);
-      assert.equal(
-        current?.type === "custom" ? (current.data as CanonicalWorkstreamPointer).phase : undefined,
-        "attached",
-      );
-    } finally {
-      await f.dispose();
-    }
-  }
-});
-
-void test("controlled reload requires idle and observes lease absence before reload", async () => {
-  const f = await fixture();
-  try {
-    const path = await installLegacyCutover(f);
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    const command = f.runner.getCommand("workgraph-reload");
-    assert.ok(command !== undefined);
-    let reloads = 0;
-    const makeContext = (idle: boolean): ExtensionCommandContext => ({
-      ...f.runner.createContext(),
-      isIdle: () => idle,
-      waitForIdle: async () => {},
-      getSystemPromptOptions: () => ({ cwd: f.root }),
-      newSession: async () => ({ cancelled: true }),
-      fork: async () => ({ cancelled: true }),
-      navigateTree: async () => ({ cancelled: true }),
-      switchSession: async () => ({ cancelled: true }),
-      reload: async () => {
-        const database = new DatabaseSync(path, { readOnly: true });
-        assert.equal(database.prepare("SELECT token FROM lease").get(), undefined);
-        database.close();
-        reloads += 1;
-      },
-    });
-    await command.handler("", makeContext(false));
-    assert.equal(reloads, 0);
-    const leased = new DatabaseSync(path, { readOnly: true });
-    assert.ok(leased.prepare("SELECT token FROM lease").get() !== undefined);
-    leased.close();
-    await command.handler("", makeContext(true));
-    assert.equal(reloads, 1, JSON.stringify(f.notifications));
-
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    const originalObserveLease = Object.getOwnPropertyDescriptor(
-      CanonicalWorkstreamStore.prototype,
-      "observeLease",
-    );
-    assert.ok(originalObserveLease !== undefined);
-    Object.defineProperty(CanonicalWorkstreamStore.prototype, "observeLease", {
-      configurable: true,
-      value: () =>
-        Effect.succeed({
-          token: "remaining",
-          owner: { sessionId: "foreign", sessionFile: "/foreign.jsonl" },
-          acquiredAt: "2024-01-01T00:00:00.000Z",
-          heartbeatAt: "2024-01-01T00:00:00.000Z",
-          expiresAt: "2024-01-01T00:01:00.000Z",
-        }),
-    });
-    try {
-      await command.handler("", makeContext(true));
-      assert.equal(reloads, 1);
-      assert.ok(f.notifications.some((item) => /lease remains present/.test(item.message)));
-    } finally {
-      Object.defineProperty(
-        CanonicalWorkstreamStore.prototype,
-        "observeLease",
-        originalObserveLease,
-      );
-    }
-
-    const pointerCount = f.session
-      .getBranch()
-      .filter(
-        (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
-      ).length;
-    const workstreamDirectories = (await readdir(dirname(dirname(path)))).toSorted();
-    await f.input("Must not create competing state after lease proof failure");
-    await assert.rejects(
-      f.call("workgraph_intent", {
-        statement: "Must not create competing state after lease proof failure",
-      }),
-      /startup remains blocked.*lease remains present/,
-    );
-    assert.equal(
-      f.session
-        .getBranch()
-        .filter((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY)
-        .length,
-      pointerCount,
-    );
-    assert.deepEqual((await readdir(dirname(dirname(path)))).toSorted(), workstreamDirectories);
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("rejected resource reload keeps retained establishment blocked", async () => {
-  const f = await fixture();
-  try {
-    const path = await installLegacyCutover(f);
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    const command = f.runner.getCommand("workgraph-reload");
-    assert.ok(command !== undefined);
-    const context: ExtensionCommandContext = {
-      ...f.runner.createContext(),
-      isIdle: () => true,
-      waitForIdle: async () => {},
-      getSystemPromptOptions: () => ({ cwd: f.root }),
-      newSession: async () => ({ cancelled: true }),
-      fork: async () => ({ cancelled: true }),
-      navigateTree: async () => ({ cancelled: true }),
-      switchSession: async () => ({ cancelled: true }),
-      reload: async () => {
-        throw new Error("resource reload rejected");
-      },
-    };
-
-    await command.handler("", context);
-    const database = new DatabaseSync(path, { readOnly: true });
-    assert.equal(database.prepare("SELECT token FROM lease").get(), undefined);
-    database.close();
-    assert.ok(f.notifications.some((item) => /resource reload rejected/.test(item.message)));
-
-    await f.input("Must not create competing state after rejected reload");
-    await assert.rejects(
-      f.call("workgraph_intent", {
-        statement: "Must not create competing state after rejected reload",
-      }),
-      /startup remains blocked.*resource reload rejected/,
-    );
-    assert.equal(
-      f.session
-        .getBranch()
-        .filter((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY)
-        .length,
-      1,
-    );
   } finally {
     await f.dispose();
   }
@@ -1151,7 +654,7 @@ void test("genuine Pi input creates one receipt-grounded private canonical Works
     await f.input("Build the canonical target", "interactive");
     await f.call("workgraph_intent", {
       statement: "Build the canonical target",
-      constraints: ["Keep the predecessor loaded"],
+      constraints: ["Keep the current state loaded"],
     });
     const branch = f.session.getBranch();
     const receipts = branch.filter(

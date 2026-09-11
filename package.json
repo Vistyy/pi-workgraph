@@ -8,9 +8,6 @@
     "node": ">=24"
   },
   "license": "MIT",
-  "bin": {
-    "pi-workgraph": "./bin/pi-workgraph.mjs"
-  },
   "keywords": [
     "pi-package",
     "pi",
@@ -18,7 +15,6 @@
     "worktree"
   ],
   "files": [
-    "bin",
     "extensions",
     "src",
     "COORDINATOR.md",

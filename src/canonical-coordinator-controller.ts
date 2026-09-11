@@ -173,36 +173,34 @@ export class CanonicalCoordinatorController {
   }
 
   restore(ctx: ExtensionContext, retained: () => CanonicalPointerRestoration) {
-    return this.serialize(
-      Effect.gen(
-        function* (this: CanonicalCoordinatorController) {
-          yield* this.closeOwned(ctx);
-          const restoration = retained();
-          this.pointerBlocked = restoration !== undefined;
-          if (restoration === undefined) {
-            this.startupFailure = undefined;
-            return;
-          }
-          if (restoration === "malformed")
-            return yield* Effect.fail(new Error("Canonical Workstream pointer is malformed."));
-          const pointer = restoration;
-          const owner = this.owner(ctx);
-          const { discovered, ownership } = yield* this.prepareRestoration(pointer, owner);
-          const next = yield* this.acquire(ctx, discovered, ownership, owner);
-          this.active = next;
-          if (pointer.phase === "prepared") yield* this.persistPointer(attachedPointer(pointer));
-          else this.pointerBlocked = false;
-          this.publish(ctx, yield* next.runtime.snapshot());
+    const restoration = Effect.gen(
+      function* (this: CanonicalCoordinatorController) {
+        yield* this.closeOwned(ctx);
+        const pointer = retained();
+        this.pointerBlocked = pointer !== undefined;
+        if (pointer === undefined) {
           this.startupFailure = undefined;
-        }.bind(this),
+          return;
+        }
+        if (pointer === "malformed")
+          return yield* Effect.fail(new Error("Canonical Workstream pointer is malformed."));
+        const owner = this.owner(ctx);
+        const { discovered, ownership } = yield* this.prepareRestoration(pointer, owner);
+        const next = yield* this.acquire(ctx, discovered, ownership, owner);
+        this.active = next;
+        if (pointer.phase === "prepared") yield* this.persistPointer(attachedPointer(pointer));
+        else this.pointerBlocked = false;
+        this.publish(ctx, yield* next.runtime.snapshot());
+        this.startupFailure = undefined;
+      }.bind(this),
+    ).pipe(
+      Effect.tapError((cause) =>
+        Effect.sync(() => {
+          this.startupFailure = publicMessage(cause);
+        }),
       ),
     );
-  }
-
-  /** TEMPORARY: retain the actionable cutover bootstrap failure as an establishment gate. */
-  temporaryBlockEstablishment(diagnostic: string): void {
-    this.pointerBlocked = true;
-    this.startupFailure = diagnostic;
+    return this.serialize(restoration);
   }
 
   private prepareRestoration(
@@ -666,55 +664,6 @@ export class CanonicalCoordinatorController {
           return yield* projectCanonicalAction(
             yield* active.runtime.inspectionSnapshot(),
             projection,
-          );
-        }.bind(this),
-      ),
-    );
-  }
-
-  /**
-   * TEMPORARY cutover seam: close and join only the exact pointed owned runtime,
-   * then positively reopen the same canonical store and prove its lease absent.
-   * Remove with the temporary /workgraph-reload cutover mechanism.
-   */
-  temporaryCloseForReload(
-    ctx: ExtensionContext,
-    pointer: Extract<CanonicalWorkstreamPointer, { phase: "attached" }>,
-  ): Effect.Effect<void, unknown, Requirements> {
-    return this.serialize(
-      Effect.gen(
-        function* (this: CanonicalCoordinatorController) {
-          const active = yield* requireActive(this.active);
-          const owner = this.owner(ctx);
-          if (
-            active.path !== pointer.path ||
-            active.id !== pointer.workstreamId ||
-            !Value.Equal(active.repository, pointer.repository) ||
-            !sameOwner(active.owner, owner)
-          )
-            return yield* Effect.fail(
-              new Error("Controlled reload pointer does not identify the exact owned runtime."),
-            );
-          this.temporaryBlockEstablishment(
-            "Controlled reload started but fresh attachment has not completed.",
-          );
-          yield* this.closeOwned(ctx);
-          yield* Effect.scoped(
-            Effect.gen(
-              function* (this: CanonicalCoordinatorController) {
-                const reopened = yield* CanonicalWorkstreamStore.discover(pointer.path);
-                if (!pointerMatches(pointer, reopened.state))
-                  return yield* Effect.fail(
-                    new Error("Controlled reload pointer no longer matches the canonical store."),
-                  );
-                yield* requireExactOwner(reopened.state.coordinator, owner);
-                yield* this.proveRepository(reopened.state.repository);
-                if ((yield* reopened.store.observeLease()) !== undefined)
-                  return yield* Effect.fail(
-                    new Error("Controlled reload canonical lease remains present after close."),
-                  );
-              }.bind(this),
-            ),
           );
         }.bind(this),
       ),

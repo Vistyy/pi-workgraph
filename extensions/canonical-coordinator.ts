@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/any-unknown-in-error-context, effecttsgo/async-function, effecttsgo/global-error-in-effect-failure -- Pi callbacks are the sole Promise facade over canonical Effects whose independently typed failures converge at this host boundary. */
+/* oxlint-disable effecttsgo/any-unknown-in-error-context -- Pi callbacks are the sole Promise facade over canonical Effects whose independently typed failures converge at this host boundary. */
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The in-scope factory reads one immutable packaged instruction asset before registering its lifecycle hooks.
 import { readFileSync } from "node:fs";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -37,12 +37,6 @@ import {
 } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import { EvidenceInputSchema } from "../src/report-schema.js";
-import {
-  PREDECESSOR_POINTER_ENTRY,
-  temporaryCutoverBootstrap,
-  temporaryReloadPointer,
-} from "../src/temporary-canonical-cutover.js";
-import { V7_MIGRATION_BREADCRUMB_ENTRY } from "../src/temporary-v7-migration.js";
 
 class HandoffKickoffError extends Data.TaggedError("HandoffKickoffError")<{
   readonly message: string;
@@ -270,26 +264,19 @@ export default function canonicalCoordinator(
     run(
       Effect.gen(function* () {
         const grant = sealedHandoffGrant(ctx.sessionManager);
-        if (grant !== undefined && hasPredecessorPointer(ctx))
-          return yield* Effect.fail(
-            new Error("Handoff Grant cannot coexist with a predecessor Workgraph pointer."),
-          );
-        const bootstrap = yield* Effect.scoped(
-          temporaryCutoverBootstrap(pi, ctx, controller, () => pointer(ctx)),
-        );
-        if (grant !== undefined && bootstrap.restoration !== undefined)
-          validateChildPointer(bootstrap.restoration, grant);
-        yield* controller.restore(ctx, () => bootstrap.restoration);
-        if (bootstrap.cutover)
-          ctx.ui.notify("Workgraph v7 migration committed; canonical Workstream attached.", "info");
+        const restoration = pointer(ctx);
+        if (grant !== undefined && restoration !== undefined)
+          validateChildPointer(restoration, grant);
+        yield* controller.restore(ctx, () => restoration);
         if (grant === undefined) return;
         yield* controller.bootstrapHandoff(ctx, grant);
         yield* triggerHandoffKickoff(pi, ctx, grant);
       }).pipe(Effect.onError(() => controller.close(ctx).pipe(Effect.ignore))),
     ).catch((error) => {
-      const diagnostic = publicMessage(error);
-      if (hasRetainedCutoverState(ctx)) controller.temporaryBlockEstablishment(diagnostic);
-      ctx.ui.notify(`Canonical Workstream reattachment skipped: ${diagnostic}`, "warning");
+      ctx.ui.notify(
+        `Canonical Workstream reattachment skipped: ${publicMessage(error)}`,
+        "warning",
+      );
     }),
   );
   pi.on("session_shutdown", (_event, ctx) => run(controller.close(ctx)));
@@ -299,26 +286,6 @@ export default function canonicalCoordinator(
       : `${event.systemPrompt}\n\n${guidance}`,
   }));
 
-  // TEMPORARY: remove this human-invoked command with the v7 cutover bootstrap.
-  pi.registerCommand("workgraph-reload", {
-    description: "Safely close the cutover Workgraph runtime and reload Pi resources",
-    handler: async (_args, ctx) => {
-      if (!ctx.isIdle()) {
-        ctx.ui.notify("Workgraph reload aborted: Pi is not idle.", "warning");
-        return;
-      }
-      try {
-        const retained = await run(temporaryReloadPointer(ctx, controller));
-        await run(controller.temporaryCloseForReload(ctx, retained));
-        await ctx.reload();
-        return;
-      } catch (error) {
-        const diagnostic = publicMessage(error);
-        controller.temporaryBlockEstablishment(diagnostic);
-        ctx.ui.notify(`Workgraph reload aborted: ${diagnostic}`, "warning");
-      }
-    },
-  });
   pi.registerTool({
     name: "workgraph_models",
     label: "Workgraph Models",
@@ -655,24 +622,6 @@ function validateChildPointer(pointer: CanonicalPointerRestoration, grant: Hando
     !Value.Equal(pointer.repository, grant.targetRepository)
   )
     throw new Error("Retained canonical pointer conflicts with the child Handoff Grant.");
-}
-
-function hasPredecessorPointer(ctx: ExtensionContext): boolean {
-  return ctx.sessionManager
-    .getBranch()
-    .some((entry) => entry.type === "custom" && entry.customType === PREDECESSOR_POINTER_ENTRY);
-}
-
-function hasRetainedCutoverState(ctx: ExtensionContext): boolean {
-  return ctx.sessionManager
-    .getBranch()
-    .some(
-      (entry) =>
-        entry.type === "custom" &&
-        (entry.customType === PREDECESSOR_POINTER_ENTRY ||
-          entry.customType === V7_MIGRATION_BREADCRUMB_ENTRY ||
-          entry.customType === CANONICAL_POINTER_ENTRY),
-    );
 }
 
 function triggerHandoffKickoff(

@@ -437,10 +437,3 @@ export function activeWorkerCount(state: {
     (attempt) => attempt.state === "running" || attempt.state === "starting",
   ).length;
 }
-
-export function updateCalmWorkers(
-  calm: CalmMode,
-  state: Parameters<typeof activeWorkerCount>[0],
-): void {
-  calm.setActiveWorkers(activeWorkerCount(state));
-}

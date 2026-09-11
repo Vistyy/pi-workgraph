@@ -1,11 +1,8 @@
 import assert from "node:assert/strict";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
-import { readFileSync } from "node:fs";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Test setup writes an isolated user policy fixture before loading the real extension boundary.
 import { mkdir, writeFile } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { join, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 import type { ExtensionActions } from "@earendil-works/pi-coding-agent";
 import {
   DefaultResourceLoader,
@@ -16,20 +13,9 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { Clock, Effect } from "effect";
-import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import type { ModelPolicy } from "../src/model-policy.js";
 import { processEffect } from "../src/process.js";
-import type { WorkerReport } from "../src/types.js";
-import { WorkstreamStateSchema } from "../src/workstream.js";
-import { isNativeSqliteFile } from "../src/workstream-persistence.js";
-import { parsePersistedObject } from "../src/workstream-validation.js";
-
-const ResultDetailsSchema = Type.Object({
-  workstream: Type.Optional(WorkstreamStateSchema),
-  statePath: Type.Optional(Type.String()),
-});
-const PersistedSqliteRowSchema = Type.Object({ state_json: Type.String() });
 
 export const fixturePolicy: ModelPolicy = {
   version: 6,
@@ -59,16 +45,6 @@ export const usage = {
   totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
-export function researchReport(summary = "Evidence found."): WorkerReport {
-  return {
-    kind: "research",
-    status: "completed",
-    summary,
-    evidence: [],
-    findings: [],
-  };
-}
-
 // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 export async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await Effect.runPromise(
@@ -123,7 +99,15 @@ export async function extensionFixture(
     cwd: root,
     agentDir: join(parent, "agent"),
     additionalExtensionPaths:
-      extensionFactories.length === 0 ? [resolve(`extensions/${name}.ts`)] : [],
+      extensionFactories.length === 0
+        ? [
+            resolve(
+              name === "coordinator"
+                ? "extensions/canonical-coordinator.ts"
+                : "extensions/worker.ts",
+            ),
+          ]
+        : [],
     extensionFactories,
     noExtensions: extensionFactories.length > 0,
     noSkills: true,
@@ -237,35 +221,4 @@ export async function extensionFixture(
       assert.deepEqual(errors, []);
     },
   };
-}
-
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Pi tool result details are external input and are decoded immediately against their domain schema.
-export function resultState(details: unknown) {
-  assert.ok(Value.Check(ResultDetailsSchema, details), "Invalid Pi tool result details");
-  const record = Value.Decode(ResultDetailsSchema, details);
-  const persisted: unknown =
-    record.statePath === undefined ? undefined : readPersistedState(record.statePath);
-  const state = record.workstream ?? persisted;
-  assert.ok(Value.Check(WorkstreamStateSchema, state));
-  return Value.Decode(WorkstreamStateSchema, state);
-}
-
-function readPersistedState(path: string): Static<typeof WorkstreamStateSchema> {
-  let value: ReturnType<typeof parsePersistedObject>;
-  if (!isNativeSqliteFile(path)) value = parsePersistedObject(readFileSync(path, "utf8"));
-  else {
-    const database = new DatabaseSync(path, { readOnly: true });
-    try {
-      const row = database
-        .prepare("SELECT state_json FROM workstream_state WHERE singleton=1")
-        .get();
-      if (!Value.Check(PersistedSqliteRowSchema, row))
-        throw new Error("Missing persisted SQLite aggregate.");
-      value = parsePersistedObject(Value.Decode(PersistedSqliteRowSchema, row).state_json);
-    } finally {
-      database.close();
-    }
-  }
-  assert.ok(Value.Check(WorkstreamStateSchema, value), "Invalid persisted workstream state");
-  return Value.Decode(WorkstreamStateSchema, value);
 }

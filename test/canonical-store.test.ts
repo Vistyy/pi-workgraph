@@ -38,12 +38,6 @@ import {
   type Workstream,
 } from "../src/domain/workstream.js";
 import { liveLayer } from "../src/node-platform.js";
-import { SqliteWorkstreamDatabase } from "../src/workstream-persistence.js";
-import {
-  pathForWorkstream,
-  WORKSTREAM_FORMAT,
-  WORKSTREAM_STATE_VERSION,
-} from "../src/workstream-state.js";
 
 const ID = "canonical";
 const COORDINATOR: CoordinatorIdentity = {
@@ -712,7 +706,7 @@ void test("coordinator adoption atomically transfers ownership and installs one 
   }
 });
 
-void test("canonical create and open reject unsafe, foreign, partial, malformed, and predecessor storage", async () => {
+void test("canonical create and open reject unsafe, foreign, partial, and malformed storage", async () => {
   const fixture = await canonicalFixture();
   try {
     await runCanonical(createCanonical(fixture));
@@ -805,46 +799,6 @@ void test("canonical create and open reject unsafe, foreign, partial, malformed,
       runCanonical(openCanonical(fixture, "partialcolumn")),
       CanonicalStoreIncompleteError,
     );
-
-    const predecessorPath = storagePath(fixture, "predecessor");
-    await mkdir(storageDirectory(fixture, "predecessor"), {
-      recursive: true,
-      mode: 0o700,
-    });
-    SqliteWorkstreamDatabase.create(predecessorPath, {
-      format: WORKSTREAM_FORMAT,
-      version: WORKSTREAM_STATE_VERSION,
-      revision: 0,
-      id: "predecessor",
-      purpose: "Predecessor aggregate.",
-      projectRoot: fixture.projectRoot,
-      gitCommonDir: fixture.gitCommonDir,
-      statePath: pathForWorkstream(fixture.gitCommonDir, "predecessor"),
-      coordinator: COORDINATOR,
-      lifecycle: { state: "active", changedAt: T0, reason: "Predecessor created." },
-      inputs: [],
-      intents: [
-        {
-          version: 0,
-          statement: "Predecessor intent.",
-          constraints: [],
-          authorityReceiptIds: [],
-          recordedAt: T0,
-        },
-      ],
-      assignments: [],
-      results: [],
-      attempts: [],
-      deliveries: [],
-      createdAt: T0,
-      updatedAt: T0,
-    });
-    const predecessorBytes = await readFile(predecessorPath);
-    await assert.rejects(
-      runCanonical(openCanonical(fixture, "predecessor")),
-      CanonicalStoreUnsupportedError,
-    );
-    assert.deepEqual(await readFile(predecessorPath), predecessorBytes);
   } finally {
     await rm(fixture.parent, { recursive: true, force: true });
   }
