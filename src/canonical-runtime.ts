@@ -503,7 +503,7 @@ export class CanonicalRuntime {
           const committed = yield* this.authoritative("request canonical cancellation", (state) =>
             planCancellation(state, located.key, input.reason, now),
           );
-          if (!Value.Equal(before, committed))
+          if (before.revision !== committed.revision)
             yield* this.notifyCommitted(committed, [located.key]);
           return committed;
         }.bind(this),
@@ -614,7 +614,7 @@ export class CanonicalRuntime {
           "apply canonical reconciliation mutation",
           (expected) => applyReconciliationMutation(expected, key, mutation, now),
         );
-        if (Value.Equal(committed, before)) return { kind: "no_change" } as const;
+        if (committed.revision === before.revision) return { kind: "no_change" } as const;
         yield* this.notifyCommitted(committed, [key]);
         return {
           kind: "committed",
@@ -636,9 +636,7 @@ export class CanonicalRuntime {
   private fencedRead(): Effect.Effect<Workstream, CanonicalStoreError, FileSystem.FileSystem> {
     return Effect.gen(
       function* (this: CanonicalRuntime) {
-        // An unchanged fenced transition re-proves the held lease and returns the
-        // committed aggregate without writing.
-        const current = yield* this.store.transition(this.lease, (state) => state);
+        const current = yield* this.store.readFenced(this.lease);
         yield* Ref.set(this.committed, current);
         return current;
       }.bind(this),
@@ -809,23 +807,31 @@ export class CanonicalRuntime {
   ): Effect.Effect<Workstream, CanonicalRuntimeError, FileSystem.FileSystem> {
     return Effect.gen(
       function* (this: CanonicalRuntime) {
-        const expected = yield* Ref.get(this.committed);
-        const planned = yield* this.try(operation, () => plan(expected));
+        const expectedRevision = (yield* Ref.get(this.committed)).revision;
         let failure: CanonicalRuntimeError | undefined;
         const committed = yield* this.store.transition(this.lease, (current) => {
           if (this.closed) {
             failure = stoppedError();
             return current;
           }
-          if (!Value.Equal(current, expected)) {
+          if (current.revision !== expectedRevision) {
             failure = staleError(operation);
             return current;
           }
-          return planned;
+          try {
+            return plan(current);
+          } catch (cause) {
+            failure = new CanonicalRuntimeOperationError({
+              operation,
+              message: errorMessage(cause),
+              cause,
+            });
+            return current;
+          }
         });
         if (failure !== undefined) return yield* failure;
         yield* Ref.set(this.committed, committed);
-        if (!Value.Equal(committed, expected) && this.acquisition.onCommitted !== undefined)
+        if (committed.revision !== expectedRevision && this.acquisition.onCommitted !== undefined)
           yield* this.acquisition.onCommitted(structuredClone(committed)).pipe(Effect.ignoreCause);
         return structuredClone(committed);
       }.bind(this),
@@ -1130,7 +1136,7 @@ function adoptDifferentCoordinator(
       );
     const locallyQuiesced = local !== undefined;
     const current = yield* store.read();
-    if (!Value.Equal(current, initial))
+    if (current.revision !== initial.revision)
       return yield* new CanonicalRuntimeIdentityError({
         message: `Canonical state changed before coordinator adoption at ${path}.`,
       });

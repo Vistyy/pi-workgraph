@@ -325,15 +325,17 @@ void test("suspension is an exact lifecycle fact with active-only creation and r
     "finished",
   );
   assert.throws(
-    () => suspendWorkstream(active, { reason: " ", suspendedAt }, suspendedAt),
+    () => validateWorkstream(suspendWorkstream(active, { reason: " ", suspendedAt }, suspendedAt)),
     /reason/,
   );
   assert.throws(
     () =>
-      suspendWorkstream(
-        active,
-        { reason: "Wait.", suspendedAt: "2026-01-02T03:04:05Z" },
-        suspendedAt,
+      validateWorkstream(
+        suspendWorkstream(
+          active,
+          { reason: "Wait.", suspendedAt: "2026-01-02T03:04:05Z" },
+          suspendedAt,
+        ),
       ),
     /suspendedAt|canonical UTC instant/,
   );
@@ -538,11 +540,13 @@ void test("non-pane launch rejects cwd that does not match placement", () => {
   const workstream = isolatedPaneLaunch(key);
   assert.throws(
     () =>
-      recordWorkerExecution(
-        workstream,
-        key,
-        { launch: { ...resourceForTest(), cwd: "/other" } },
-        "t5",
+      validateWorkstream(
+        recordWorkerExecution(
+          workstream,
+          key,
+          { launch: { ...resourceForTest(), cwd: "/other" } },
+          "t5",
+        ),
       ),
     /launch cwd does not match its placement/,
   );
@@ -608,11 +612,13 @@ void test("partial isolated launches preserve output until exact cleanup and rel
     assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
     assert.throws(
       () =>
-        checkpointOutputRelease(
-          workstream,
-          key,
-          { state: "completed", expectedHead: changedCommit, reason: "Too early." },
-          `early-release-${index}`,
+        validateWorkstream(
+          checkpointOutputRelease(
+            workstream,
+            key,
+            { state: "completed", expectedHead: changedCommit, reason: "Too early." },
+            `early-release-${index}`,
+          ),
         ),
       /closed isolated ownership/,
     );
@@ -1239,7 +1245,7 @@ void test("report kind follows Task kind and first terminal replay uses structur
   };
   // SAFETY: This intentionally crosses the report/Task boundary to verify aggregate rejection.
   assert.throws(
-    () => finish(add(), "Attempt A", malformedReport as TerminalObservation),
+    () => validateWorkstream(finish(add(), "Attempt A", malformedReport as TerminalObservation)),
     /Report kind/,
   );
   const workstream = finish(add(), "Attempt A", reported());
@@ -1355,11 +1361,13 @@ void test("appendAttempts is one atomic nonempty batch that preserves order and 
   );
   assert.throws(
     () =>
-      appendAttempts(
-        stable,
-        "Task opaque",
-        [attempt("Attempt B", { continuationOf: "Attempt A" })],
-        "t5",
+      validateWorkstream(
+        appendAttempts(
+          stable,
+          "Task opaque",
+          [attempt("Attempt B", { continuationOf: "Attempt A" })],
+          "t5",
+        ),
       ),
     /retained closed Worker session/,
   );

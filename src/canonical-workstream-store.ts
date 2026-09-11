@@ -15,6 +15,7 @@ import {
   HerdrDeadObservationSchema,
   type RepositoryIdentity,
   validateWorkstream,
+  validateWorkstreamInvariants,
   type Workstream,
   WorkstreamSchema,
 } from "./domain/workstream.js";
@@ -457,6 +458,19 @@ export class CanonicalWorkstreamStore {
     return hostEffect("read the canonical Workstream", () => this.readAggregate());
   }
 
+  /** Atomically read the authoritative aggregate and prove the exact live lease. */
+  readFenced(lease: CanonicalLease): Effect.Effect<Workstream, CanonicalStoreError> {
+    return validateLeaseInput(lease).pipe(
+      Effect.andThen(
+        this.transaction((now) => {
+          const current = this.readAggregate();
+          this.assertHeldLease(lease, now());
+          return current;
+        }),
+      ),
+    );
+  }
+
   observeLease(): Effect.Effect<CanonicalLease | undefined, CanonicalStoreError> {
     return hostEffect("observe the canonical Workstream lease", () => this.readLeaseRow());
   }
@@ -638,9 +652,9 @@ export class CanonicalWorkstreamStore {
   }
 
   /**
-   * Persist one settled domain transition. The store never supplies a timestamp
-   * or edits the returned aggregate: exact no-op is untouched; a changed result
-   * must already be valid at exactly current revision + 1.
+   * Persist one settled domain transition. The callback receives the validated
+   * authoritative aggregate; returning that same object is the only no-op.
+   * A changed result must be valid at exactly current revision + 1.
    */
   transition(
     lease: CanonicalLease,
@@ -651,8 +665,8 @@ export class CanonicalWorkstreamStore {
         this.atomic((nowMillis, resample) => {
           const current = this.readAggregate();
           this.assertHeldLease(lease, nowMillis);
-          const next = apply(structuredClone(current));
-          if (Value.Equal(next, current)) return current;
+          const next = apply(current);
+          if (next === current) return structuredClone(current);
           validateTransition(current, next);
           // The callback may consume arbitrary time, so the final lease
           // predicate uses a sample taken only after it returned.
@@ -886,9 +900,10 @@ function parseWorkstream(text: string): Workstream {
       `Canonical Workstream is malformed at ${location === undefined || location === "" ? "/" : location}.`,
     );
   }
-  const state = Value.Decode(WorkstreamSchema, value);
+  // SAFETY: WorkstreamSchema is transform-free and the value passed its complete structural check.
+  const state = value as Workstream;
   try {
-    validateWorkstream(state);
+    validateWorkstreamInvariants(state);
   } catch (cause) {
     throw new CanonicalStoreInvalidError(
       `Canonical Workstream violates domain invariants: ${errorMessage(cause)}`,

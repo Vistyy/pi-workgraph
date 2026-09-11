@@ -594,6 +594,11 @@ export function validateWorkstream(value: Workstream): void {
       `Invalid canonical Workstream at ${issue?.instancePath === undefined || issue.instancePath === "" ? "/" : issue.instancePath}: ${issue?.message ?? "schema mismatch"}.`,
     );
   }
+  validateWorkstreamInvariants(value);
+}
+
+/** Validate domain relationships after the caller has checked WorkstreamSchema. */
+export function validateWorkstreamInvariants(value: Workstream): void {
   validateCoordinatorTransfers(value);
   validateGrounding(value);
   unique(
@@ -2005,7 +2010,6 @@ function mutate(
   refreshCompletion(draft);
   draft.revision += 1;
   draft.updatedAt = updatedAt;
-  validateWorkstream(draft);
   return draft;
 }
 function assertActive(workstream: Workstream, operation: string): void {

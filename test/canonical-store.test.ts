@@ -399,6 +399,14 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
     );
     assert.ok(observed !== undefined, "Expected a persisted observed lease.");
     assert.equal(observed.owner.sessionId, COORDINATOR.sessionId);
+    const fenced = await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* openCanonical(fixture);
+        return yield* store.readFenced(observed);
+      }),
+      clock,
+    );
+    assert.equal(fenced.revision, 0);
 
     await assert.rejects(
       runCanonical(
@@ -435,6 +443,16 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
         Effect.gen(function* () {
           const store = yield* openCanonical(fixture);
           return yield* store.transition({ ...observed, token: "forged" }, (current) => current);
+        }),
+        clock,
+      ),
+      /fenced lease/,
+    );
+    await assert.rejects(
+      runCanonical(
+        Effect.gen(function* () {
+          const store = yield* openCanonical(fixture);
+          return yield* store.readFenced({ ...observed, token: "forged" });
         }),
         clock,
       ),
@@ -827,9 +845,28 @@ void test("canonical transition stays no-op exact, rejects invalid results, and 
         const store = yield* openCanonical(fixture);
         const lease = yield* store.observeLease();
         assert.ok(lease !== undefined, "Expected the recovered lease.");
-        const noop = yield* store.transition(lease, (current) => current);
+        let callbackInput: Workstream | undefined;
+        const noop = yield* store.transition(lease, (current) => {
+          callbackInput = current;
+          return current;
+        });
         assert.equal(noop.revision, before.revision);
+        assert.notStrictEqual(noop, callbackInput);
+        assert.notStrictEqual(noop.tasks, callbackInput?.tasks);
       }),
+    );
+    assert.deepEqual(await readFile(path), bytes);
+
+    await assert.rejects(
+      runCanonical(
+        Effect.gen(function* () {
+          const store = yield* openCanonical(fixture);
+          const lease = yield* store.observeLease();
+          assert.ok(lease !== undefined, "Expected the recovered lease.");
+          return yield* store.transition(lease, (current) => ({ ...current }));
+        }),
+      ),
+      /must return revision/,
     );
     assert.deepEqual(await readFile(path), bytes);
 
