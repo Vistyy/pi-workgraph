@@ -16,7 +16,11 @@ import {
 import { GitRepository, inspectRepository } from "../git.js";
 import { handoffChildWorkstreamId } from "../handoff-session.js";
 import { HerdrCliRuntime } from "../herdr.js";
-import { WorkstreamStore, type WorkstreamStoreAttachment } from "../storage/workstream-store.js";
+import {
+  type WorkstreamPresentation,
+  WorkstreamStore,
+  type WorkstreamStoreAttachment,
+} from "../storage/workstream-store.js";
 import { launchOneShotHandoff } from "./handoff.js";
 import {
   liveWorkstreamCommandPorts,
@@ -92,7 +96,7 @@ export class WorkstreamCoordinatorController {
   constructor(
     private readonly pi: ExtensionAPI,
     private readonly options: WorkstreamCoordinatorControllerOptions,
-    private readonly publish: (ctx: ExtensionContext, state?: Workstream) => void,
+    private readonly publish: (ctx: ExtensionContext, state?: WorkstreamPresentation) => void,
   ) {}
 
   owner(ctx: ExtensionContext): CoordinatorIdentity {
@@ -123,7 +127,7 @@ export class WorkstreamCoordinatorController {
         const next = yield* this.acquire(ctx, discovered, owner);
         yield* this.activate(next);
         this.pointerBlocked = false;
-        this.publish(ctx, yield* next.runtime.snapshot());
+        this.publish(ctx, yield* next.runtime.presentation());
         this.startupFailure = undefined;
       }.bind(this),
     ).pipe(
@@ -181,7 +185,7 @@ export class WorkstreamCoordinatorController {
             };
             yield* active.runtime.reviseIntent(intent);
             const snapshot = yield* active.runtime.inspectionSnapshot();
-            this.publish(ctx, snapshot.workstream);
+            this.publish(ctx, yield* active.runtime.presentation());
             return yield* projectWorkstreamAction(snapshot, { action: "workgraph_intent" });
           }
           if (this.pointerBlocked)
@@ -217,8 +221,7 @@ export class WorkstreamCoordinatorController {
           const next = yield* this.acquire(ctx, discovered, this.owner(ctx));
           yield* this.activate(next);
           this.pointerBlocked = false;
-          const state = yield* next.runtime.snapshot();
-          this.publish(ctx, state);
+          this.publish(ctx, yield* next.runtime.presentation());
           return yield* projectWorkstreamAction(yield* next.runtime.inspectionSnapshot(), {
             action: "workgraph_intent",
           });
@@ -236,7 +239,7 @@ export class WorkstreamCoordinatorController {
       Effect.gen(
         function* (this: WorkstreamCoordinatorController) {
           const active = yield* requireActive(this.active);
-          const parent = yield* active.runtime.read();
+          const parent = yield* active.runtime.handoffParent();
           const workers = this.options.workers?.() ?? new HerdrCliRuntime();
           return yield* launchOneShotHandoff(
             {
@@ -299,7 +302,7 @@ export class WorkstreamCoordinatorController {
           const next = yield* this.acquire(ctx, discovered, owner);
           yield* this.activate(next);
           this.pointerBlocked = false;
-          this.publish(ctx, yield* next.runtime.snapshot());
+          this.publish(ctx, yield* next.runtime.presentation());
         }.bind(this),
       ),
     );
@@ -444,7 +447,8 @@ export class WorkstreamCoordinatorController {
             owns: () => PROCESS_RUNTIMES.get(attachment.store.path)?.token === token,
             driver,
             commands: liveWorkstreamCommandPorts(git, workers),
-            onCommitted: (state) => Effect.sync(() => this.publish(ctx, state)).pipe(Effect.ignore),
+            onPresentationChanged: (state) =>
+              Effect.sync(() => this.publish(ctx, state)).pipe(Effect.ignore),
             onReconciliationAttention: (detail) => this.attention(ctx, detail),
             onFatal: (error) => this.attention(ctx, publicMessage(error)),
             ...(this.options.policyPath === undefined

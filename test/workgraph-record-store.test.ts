@@ -9,9 +9,18 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Effect } from "effect";
 import type { WorkstreamCommandPorts } from "../src/coordination/commands.js";
+import {
+  makeWorkstreamReconciliationDriver,
+  type WorkstreamReconciliationPorts,
+} from "../src/coordination/driver.js";
 import type { ReconciliationDriver } from "../src/coordination/reconciliation.js";
 import { WorkstreamRuntime } from "../src/coordination/runtime.js";
-import { createWorkstream, type Intent, type Task } from "../src/domain/workstream.js";
+import {
+  createWorkstream,
+  deriveCompletionAccounting,
+  type Intent,
+  type Task,
+} from "../src/domain/workstream.js";
 import { liveLayer } from "../src/node-platform.js";
 import {
   WorkstreamStore,
@@ -444,6 +453,316 @@ void test("registered apply and release settle once through direct fences", asyn
     await rm(f.root, { recursive: true, force: true });
   }
 });
+
+void test("keyed review Outcome reads reject malformed and mismatched persisted records", async () => {
+  const f = await fixture();
+  const task = finishedTask("review-source", "delivered");
+  try {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const attachment = yield* WorkstreamStore.create(f.initial);
+          yield* attachment.store.mutateRecords(f.initial.coordinator, 0, {
+            kind: "create_task",
+            task,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          });
+          const outcomeId = task.attempts[0]?.outcome?.id;
+          assert.ok(outcomeId !== undefined);
+          const database = new DatabaseSync(attachment.store.path);
+          database
+            .prepare(
+              "UPDATE outcomes SET outcome_json=json_set(outcome_json,'$.extra','invalid') WHERE outcome_id=?",
+            )
+            .run(outcomeId);
+          database.close();
+          const result = yield* Effect.result(attachment.store.readOutcome(outcomeId));
+          assert.equal(result._tag, "Failure");
+          if (result._tag === "Failure")
+            assert.equal(result.failure._tag, "WorkstreamStoreInvalidError");
+        }),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+void test("real driver cancellation refreshes committed context and terminates exactly once", async () => {
+  const f = await fixture();
+  const task = activeCancellationTask(f.root);
+  let terminateCalls = 0;
+  const activeCounts: number[] = [];
+  const ports = reconciliationPorts(f.root, {
+    terminate: () =>
+      Effect.sync(() => {
+        terminateCalls += 1;
+        return { state: "completed" as const, detail: "terminated" };
+      }),
+  });
+  try {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const attachment = yield* WorkstreamStore.create(f.initial);
+          yield* attachment.store.mutateRecords(f.initial.coordinator, 0, {
+            kind: "create_task",
+            task,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          });
+        }),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    await Effect.runPromise(
+      Effect.timeoutOrElse(
+        Effect.acquireUseRelease(
+          WorkstreamRuntime.acquire({
+            id: f.initial.id,
+            repository: f.initial.repository,
+            coordinator: f.initial.coordinator,
+            driver: makeWorkstreamReconciliationDriver(ports),
+            onPresentationChanged: (presentation) =>
+              Effect.sync(() => activeCounts.push(presentation.activeAttemptCount)),
+          }),
+          (runtime) =>
+            Effect.gen(function* () {
+              while (true) {
+                const state = yield* runtime.snapshot();
+                const attempt = state.tasks[0]?.attempts[0];
+                if (attempt?.state === "finished") {
+                  assert.equal(attempt.execution?.cancellation?.state, "terminated");
+                  assert.equal(
+                    (yield* runtime.frontierSnapshot()).some(
+                      (entry) => entry.kind === "cancellation",
+                    ),
+                    false,
+                  );
+                  break;
+                }
+                yield* Effect.sleep("10 millis");
+              }
+            }),
+          (runtime) => runtime.close().pipe(Effect.orDie),
+        ),
+        { duration: "2 seconds", orElse: () => Effect.die(new Error("cancellation stalled")) },
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    assert.equal(terminateCalls, 1);
+    assert.equal(activeCounts.includes(1), true);
+    assert.equal(activeCounts.at(-1), 0);
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+void test("delivery after completion replaces outcome accounting and remains attachable", async () => {
+  const f = await fixture();
+  const task = finishedTask("pending-source", "pending");
+  const waiting: ReconciliationDriver = { reconcile: () => Effect.succeed({ kind: "waiting" }) };
+  try {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const attachment = yield* WorkstreamStore.create(f.initial);
+          yield* attachment.store.mutateRecords(f.initial.coordinator, 0, {
+            kind: "create_task",
+            task,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          });
+        }),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    await Effect.runPromise(
+      Effect.acquireUseRelease(
+        WorkstreamRuntime.acquire({
+          id: f.initial.id,
+          repository: f.initial.repository,
+          coordinator: f.initial.coordinator,
+          driver: waiting,
+        }),
+        (runtime) =>
+          Effect.gen(function* () {
+            const completed = yield* runtime.complete({
+              conclusion: "Complete while delivery remains pending.",
+              evidence: [{ label: "fixture", observation: "Outcome retained." }],
+              limitations: [],
+            });
+            assert.equal(completed.lifecycle, "completed");
+            assert.equal(completed.completion?.accounting[0]?.kind, "unresolved_attempt");
+            assert.equal(
+              completed.completion?.accounting.some((item) => item.kind === "undelivered_outcome"),
+              true,
+            );
+          }),
+        (runtime) => runtime.close().pipe(Effect.orDie),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    const ports = reconciliationPorts(f.root);
+    await Effect.runPromise(
+      Effect.timeoutOrElse(
+        Effect.acquireUseRelease(
+          WorkstreamRuntime.acquire({
+            id: f.initial.id,
+            repository: f.initial.repository,
+            coordinator: f.initial.coordinator,
+            driver: makeWorkstreamReconciliationDriver(ports),
+          }),
+          (runtime) =>
+            Effect.gen(function* () {
+              while (true) {
+                const state = yield* runtime.snapshot();
+                if (state.tasks[0]?.attempts[0]?.outcome?.delivery.state === "delivered") {
+                  assert.deepEqual(state.completion?.accounting, deriveCompletionAccounting(state));
+                  break;
+                }
+                yield* Effect.sleep("10 millis");
+              }
+            }),
+          (runtime) => runtime.close().pipe(Effect.orDie),
+        ),
+        { duration: "2 seconds", orElse: () => Effect.die(new Error("delivery stalled")) },
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    const attached = await Effect.runPromise(
+      Effect.scoped(WorkstreamStore.open(f.initial.id, f.initial.repository)).pipe(
+        Effect.provide(liveLayer),
+      ),
+    );
+    assert.deepEqual(
+      attached.state.completion?.accounting,
+      deriveCompletionAccounting(attached.state),
+    );
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+function finishedTask(id: string, delivery: "pending" | "delivered"): Task {
+  const at = "2026-01-01T00:00:01.000Z";
+  return {
+    kind: "research",
+    id,
+    objective: "Produce an Outcome",
+    intentIndex: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    expectedEvidence: ["result"],
+    attempts: [
+      {
+        id: `${id}-attempt`,
+        state: "finished",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: at,
+        selection: {
+          role: "research",
+          target: { model: "provider/research", thinking: "low" },
+          source: "policy",
+        },
+        outcome: {
+          id: `${id}-attempt:outcome`,
+          kind: "cancelled",
+          observedAt: at,
+          artifacts: [],
+          reason: "Fixture terminal Outcome",
+          delivery:
+            delivery === "pending"
+              ? { state: "pending", requestedAt: at, attemptCount: 0, failureHistory: [] }
+              : {
+                  state: "delivered",
+                  requestedAt: at,
+                  attemptCount: 1,
+                  failureHistory: [],
+                  deliveredAt: at,
+                },
+        },
+      },
+    ],
+  };
+}
+
+function activeCancellationTask(root: string): Task {
+  return {
+    kind: "research",
+    id: "cancel-task",
+    objective: "Cancel the Worker",
+    intentIndex: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    expectedEvidence: ["termination"],
+    attempts: [
+      {
+        id: "cancel-attempt",
+        state: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+        selection: {
+          role: "research",
+          target: { model: "provider/research", thinking: "low" },
+          source: "policy",
+        },
+        execution: {
+          placement: { kind: "shared_project", path: root },
+          sessionFile: "/sessions/cancel.jsonl",
+          submission: "started",
+          launch: {
+            phase: "ready",
+            workspaceId: "workspace",
+            tabId: "tab",
+            paneId: "pane",
+            terminalId: "terminal",
+            agentName: "agent",
+            cwd: root,
+          },
+          cancellation: {
+            state: "requested",
+            requestedAt: "2026-01-01T00:00:01.000Z",
+            reason: "Stop exactly once",
+          },
+        },
+      },
+    ],
+  };
+}
+
+function reconciliationPorts(
+  root: string,
+  overrides: Partial<WorkstreamReconciliationPorts["workers"]> = {},
+): WorkstreamReconciliationPorts {
+  const unused = () => Effect.die(new Error("unused reconciliation port"));
+  return {
+    git: {
+      projectRoot: root,
+      gitCommonDir: join(root, ".git"),
+      derivePlacement: () => undefined,
+      ensureWorktree: unused,
+      currentHead: unused,
+      validateNoChange: unused,
+      validateCommit: unused,
+      cleanupWorktree: unused,
+    },
+    workers: {
+      workspaceId: "workspace",
+      launch: unused,
+      inspectLaunch: unused,
+      inspect: () => Effect.succeed("absent"),
+      terminate: () => Effect.succeed({ state: "completed", detail: "terminated" }),
+      steer: unused,
+      cleanup: () => Effect.succeed({ state: "completed", detail: "cleaned" }),
+      ...overrides,
+    },
+    sessions: {
+      sessionDirectory: () => Effect.succeed("/sessions"),
+      inspectDirectory: () => Effect.succeed({ state: "none" }),
+      create: unused,
+      readReport: () => ({ invalid: false, unreadable: false }),
+      readText: () => undefined,
+      observeFailure: () => undefined,
+      models: () => [],
+      started: () => true,
+      settled: () => true,
+    },
+    delivery: { deliver: () => Effect.void },
+    host: {},
+  };
+}
 
 void test("unsupported historical store is rejected byte-for-byte without migration", async () => {
   const f = await fixture();

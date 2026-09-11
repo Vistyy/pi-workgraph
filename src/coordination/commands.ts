@@ -8,7 +8,7 @@ import {
   type CandidateLineage,
   changedImplementationCommit,
   findAttemptLocation,
-  findTask,
+  type findTask,
   IntentSchema,
   isRetainedCandidateParent,
   ReviewSubjectSchema,
@@ -245,7 +245,7 @@ export function exactAttemptEffect(
 }
 
 export function enqueueFacts(
-  workstream: Workstream,
+  workstream: Pick<Workstream, "tasks">,
   command: WorkstreamEnqueueCommand,
   git: WorkstreamCommandGitPort | undefined,
 ): CommandEffect<ResolvedQueueFacts> {
@@ -278,13 +278,13 @@ export function enqueueFacts(
 }
 
 export function appendFacts(
-  workstream: Workstream,
+  workstream: Pick<Workstream, "tasks">,
   command: WorkstreamAppendCommand,
   git: WorkstreamCommandGitPort | undefined,
 ): CommandEffect<ResolvedQueueFacts> {
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: kind-owned preflight stays explicit so incompatible fields cannot share Git behavior.
   return Effect.gen(function* () {
-    const task = findTask(workstream, command.taskId);
+    const task = workstream.tasks.find((item) => item.id === command.taskId);
     if (task === undefined)
       return yield* commandFailure("append Attempt", `Unknown Task ${command.taskId}.`);
     if (command.continuationOf !== undefined) {
@@ -312,7 +312,7 @@ export function appendFacts(
 }
 
 function candidateFacts(
-  workstream: Workstream,
+  workstream: Pick<Workstream, "tasks">,
   command: { readonly candidateOf: string; readonly baseRevision?: string },
   commandGit: WorkstreamCommandGitPort,
 ): CommandEffect<ResolvedQueueFacts> {
@@ -367,7 +367,7 @@ function candidateRequest(
 }
 
 function retainedCandidate(
-  workstream: Workstream,
+  workstream: Pick<Workstream, "tasks">,
   attemptId: string,
 ): CommandEffect<{
   readonly parent: Attempt;
@@ -375,7 +375,9 @@ function retainedCandidate(
   readonly rootCommit: string;
   readonly placement: WorktreePlacement;
 }> {
-  const located = findAttemptLocation(workstream, attemptId);
+  const located = workstream.tasks
+    .map((task) => ({ task, attempt: task.attempts.find((attempt) => attempt.id === attemptId) }))
+    .find((item): item is { task: Task; attempt: Attempt } => item.attempt !== undefined);
   if (located === undefined) return Effect.fail(ineligibleCandidate(attemptId));
   const parent = located.attempt;
   const parentCommit = changedImplementationCommit(parent);

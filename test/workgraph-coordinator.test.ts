@@ -16,7 +16,7 @@ import { Effect } from "effect";
 import { Value } from "typebox/value";
 import workstreamCoordinator from "../extensions/coordinator.js";
 import { WORKSTREAM_POINTER_ENTRY } from "../src/coordination/controller.js";
-import type { HandoffGrant } from "../src/domain/workstream.js";
+import type { HandoffGrant, Task } from "../src/domain/workstream.js";
 import { createWorkstream } from "../src/domain/workstream.js";
 import {
   HANDOFF_CONTEXT_ENTRY,
@@ -607,6 +607,122 @@ void test("workstream tool schemas expose release_output and every runtime facad
       assert.ok(result instanceof Promise, `${name} must return a Promise`);
       await assert.rejects(result, /No Workstream is attached/);
     }
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("registered review rejects corrupt keyed Outcome records before assignment", async () => {
+  const f = await fixture();
+  try {
+    await f.input("Review only valid Outcomes");
+    await f.call("workgraph_intent", { statement: "Review only valid Outcomes" });
+    const pointer = f.session
+      .getBranch()
+      .findLast(
+        (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
+      );
+    assert.ok(pointer?.type === "custom");
+    const path = (pointer.data as { path: string }).path;
+    const at = "2026-01-01T00:00:01.000Z";
+    const task: Task = {
+      kind: "research",
+      id: "corrupt-source",
+      objective: "Supply review source",
+      intentIndex: 0,
+      createdAt: at,
+      expectedEvidence: ["source"],
+      attempts: [
+        {
+          id: "corrupt-attempt",
+          state: "finished",
+          createdAt: at,
+          updatedAt: at,
+          selection: {
+            role: "research",
+            target: { model: "fixture/research", thinking: "high" },
+            source: "policy",
+          },
+          outcome: {
+            id: "corrupt-attempt:outcome",
+            kind: "cancelled",
+            observedAt: at,
+            artifacts: [],
+            reason: "Fixture",
+            delivery: {
+              state: "delivered",
+              requestedAt: at,
+              attemptCount: 1,
+              failureHistory: [],
+              deliveredAt: at,
+            },
+          },
+        },
+      ],
+    };
+    const database = new DatabaseSync(path);
+    const attempt = task.attempts[0];
+    const outcome = attempt?.outcome;
+    assert.ok(attempt !== undefined && outcome !== undefined);
+    const { attempts: _attempts, ...contract } = task;
+    const { outcome: _outcome, ...operational } = attempt;
+    const { delivery, ...immutableOutcome } = outcome;
+    database
+      .prepare("INSERT INTO tasks(task_id,intent_index,kind,contract_json) VALUES(?,?,?,?)")
+      .run(task.id, task.intentIndex, task.kind, JSON.stringify(contract));
+    database
+      .prepare("INSERT INTO attempts(attempt_id,task_id,sequence,operational_json) VALUES(?,?,0,?)")
+      .run(attempt.id, task.id, JSON.stringify(operational));
+    database
+      .prepare("INSERT INTO outcomes(outcome_id,attempt_id,outcome_json) VALUES(?,?,?)")
+      .run(outcome.id, attempt.id, JSON.stringify({ ...immutableOutcome, extra: "invalid" }));
+    database
+      .prepare("INSERT INTO deliveries(outcome_id,delivery_json) VALUES(?,?)")
+      .run(outcome.id, JSON.stringify(delivery));
+    database.prepare("UPDATE metadata SET revision=revision+1,updated_at=?").run(at);
+    database.close();
+    await assert.rejects(
+      f.call("workgraph_review", {
+        id: "must-not-create",
+        objective: "Reject corrupt source",
+        concern: "strict decoding",
+        subject: { kind: "result", resultId: "corrupt-attempt:outcome" },
+      }),
+      /malformed/,
+    );
+    const inspect = new DatabaseSync(path, { readOnly: true });
+    const taskCount = inspect
+      .prepare("SELECT count(*) AS count FROM tasks WHERE task_id='must-not-create'")
+      .get() as { count: number };
+    assert.equal(taskCount.count, 0);
+    inspect.close();
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("suspend and resume refresh the coordinator status projection", async () => {
+  const f = await fixture();
+  const statuses: string[] = [];
+  const ui = f.runner.getUIContext();
+  f.runner.setUIContext(
+    {
+      ...ui,
+      setStatus(key, text) {
+        if (key === "workgraph" && text !== undefined) statuses.push(text);
+        ui.setStatus(key, text);
+      },
+    },
+    "rpc",
+  );
+  try {
+    await f.input("Refresh lifecycle presentation");
+    await f.call("workgraph_intent", { statement: "Refresh lifecycle presentation" });
+    assert.equal(statuses.at(-1), "WG active - 0 active");
+    await f.call("workgraph_control", { action: "suspend", reason: "Pause dispatch" });
+    assert.equal(statuses.at(-1), "WG suspended - 0 active");
+    await f.call("workgraph_control", { action: "resume", reason: "Continue dispatch" });
+    assert.equal(statuses.at(-1), "WG active - 0 active");
   } finally {
     await f.dispose();
   }

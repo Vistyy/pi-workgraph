@@ -1,4 +1,4 @@
-/* oxlint-disable anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/no-widen-then-assert, anti-slop/require-safety-comment-for-type-assertion -- node:sqlite exposes untyped host rows; this boundary assembles them once and validates the complete strict Workstream schema before returning domain data. */
+/* oxlint-disable anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/no-widen-then-assert, anti-slop/require-safety-comment-for-type-assertion -- node:sqlite exposes untyped host rows; each query decodes its strict record projection, while explicit inspection validates the complete Workstream. */
 import { Clock, Data, Effect, FileSystem, Path, type Scope } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import { Value } from "typebox/value";
@@ -16,6 +16,7 @@ import type {
 import {
   AttemptSchema,
   IntentSchema,
+  OutcomeSchema,
   TaskSchema,
   validateWorkstream,
   validateWorkstreamInvariants,
@@ -161,6 +162,34 @@ export interface ActionableRecords {
   readonly lifecycle: Workstream["lifecycle"];
   readonly currentIntentIndex: number;
   readonly records: readonly Readonly<{ task: Task; attempt: Attempt }>[];
+}
+
+export interface WorkstreamPresentation {
+  readonly lifecycle: Workstream["lifecycle"];
+  readonly activeAttemptCount: number;
+}
+
+export interface PlanningRecords {
+  readonly revision: number;
+  readonly id: string;
+  readonly purpose: string;
+  readonly repository: RepositoryIdentity;
+  readonly coordinator: CoordinatorIdentity;
+  readonly lifecycle: Workstream["lifecycle"];
+  readonly suspension?: Suspension;
+  readonly completion?: Completion;
+  readonly currentIntentIndex: number;
+  readonly currentIntent: Intent;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface HandoffParentRecords {
+  readonly id: string;
+  readonly repository: RepositoryIdentity;
+  readonly lifecycle: Workstream["lifecycle"];
+  readonly currentIntentIndex: number;
+  readonly currentIntent: Intent;
 }
 /** Private record store. Full assembly is reserved for inspection and pure-domain validation. */
 export class WorkstreamStore {
@@ -396,8 +425,58 @@ export class WorkstreamStore {
     });
   }
 
-  /** Minimal current-Intent projection for queue planning; it contains no Task scan. */
-  readPlanningState(): Effect.Effect<Workstream, WorkstreamStoreError> {
+  /** Minimal status projection for coordinator presentation; it contains no Task assembly. */
+  readPresentation(): Effect.Effect<WorkstreamPresentation, WorkstreamStoreError> {
+    return hostEffect("read Workstream presentation", () => {
+      const row = requiredRow(
+        this.database.readRow(
+          `SELECT lifecycle,
+                  (SELECT count(*) FROM attempts WHERE json_extract(operational_json,'$.state')='active') AS active_attempt_count
+           FROM metadata WHERE singleton=1`,
+        ),
+        "metadata",
+      );
+      const lifecycle = stringField(row, "lifecycle") as Workstream["lifecycle"];
+      if (lifecycle !== "active" && lifecycle !== "suspended" && lifecycle !== "completed")
+        throw new WorkstreamStoreInvalidError("lifecycle is malformed.");
+      return { lifecycle, activeAttemptCount: numberField(row, "active_attempt_count") };
+    });
+  }
+
+  /** Minimal parent facts for one-shot Handoff; it contains no Task scan. */
+  readHandoffParent(): Effect.Effect<HandoffParentRecords, WorkstreamStoreError> {
+    return hostEffect("read Handoff parent records", () => {
+      const row = requiredRow(
+        this.database.readRow(
+          `SELECT m.id,m.project_root,m.git_common_dir,m.lifecycle,
+                  (SELECT max(intent_index) FROM intents) AS current_intent,
+                  (SELECT intent_json FROM intents ORDER BY intent_index DESC LIMIT 1) AS intent_json
+           FROM metadata m WHERE singleton=1`,
+        ),
+        "metadata",
+      );
+      const lifecycle = stringField(row, "lifecycle") as Workstream["lifecycle"];
+      const currentIntent = parseJson(stringField(row, "intent_json"));
+      if (
+        (lifecycle !== "active" && lifecycle !== "suspended" && lifecycle !== "completed") ||
+        !Value.Check(IntentSchema, currentIntent)
+      )
+        throw new WorkstreamStoreInvalidError("Handoff parent records are malformed.");
+      return {
+        id: stringField(row, "id"),
+        repository: {
+          projectRoot: stringField(row, "project_root"),
+          gitCommonDir: stringField(row, "git_common_dir"),
+        },
+        lifecycle,
+        currentIntentIndex: numberField(row, "current_intent"),
+        currentIntent: structuredClone(currentIntent as Intent),
+      };
+    });
+  }
+
+  /** Current-Intent metadata used by queue planning; it contains no Task scan. */
+  readPlanningRecords(): Effect.Effect<PlanningRecords, WorkstreamStoreError> {
     return hostEffect("read Workstream planning metadata", () => {
       const row = requiredRow(
         this.database.readRow(
@@ -412,8 +491,6 @@ export class WorkstreamStore {
       if (!Value.Check(IntentSchema, intent))
         throw new WorkstreamStoreInvalidError("Current Intent record is malformed.");
       return {
-        format: "pi-workgraph-workstream",
-        schemaVersion: 3,
         revision: numberField(row, "revision"),
         id: stringField(row, "id"),
         purpose: stringField(row, "purpose"),
@@ -427,10 +504,8 @@ export class WorkstreamStore {
         },
         lifecycle: stringField(row, "lifecycle") as Workstream["lifecycle"],
         ...nullableJson(row, "suspension_json", "suspension"),
-        intents: Array.from({ length: currentIntentIndex + 1 }, () =>
-          structuredClone(intent as Intent),
-        ),
-        tasks: [],
+        currentIntentIndex,
+        currentIntent: structuredClone(intent as Intent),
         ...nullableJson(row, "completion_json", "completion"),
         createdAt: stringField(row, "created_at"),
         updatedAt: stringField(row, "updated_at"),
@@ -442,7 +517,27 @@ export class WorkstreamStore {
   readCompletionState(): Effect.Effect<Workstream, WorkstreamStoreError> {
     return Effect.gen(
       function* (this: WorkstreamStore) {
-        const state = yield* this.readPlanningState();
+        const planning = yield* this.readPlanningRecords();
+        const state: Workstream = {
+          format: "pi-workgraph-workstream",
+          schemaVersion: 3,
+          revision: planning.revision,
+          id: planning.id,
+          purpose: planning.purpose,
+          repository: structuredClone(planning.repository),
+          coordinator: structuredClone(planning.coordinator),
+          lifecycle: planning.lifecycle,
+          intents: Array.from({ length: planning.currentIntentIndex + 1 }, () =>
+            structuredClone(planning.currentIntent),
+          ),
+          tasks: [],
+          createdAt: planning.createdAt,
+          updatedAt: planning.updatedAt,
+        };
+        if (planning.suspension !== undefined)
+          Object.assign(state, { suspension: structuredClone(planning.suspension) });
+        if (planning.completion !== undefined)
+          Object.assign(state, { completion: structuredClone(planning.completion) });
         const taskIds = yield* hostEffect("read completion-related Task keys", () =>
           this.database
             .readRows(
@@ -600,6 +695,10 @@ export class WorkstreamStore {
         ...(parseJson(stringField(row, "outcome_json")) as Record<string, unknown>),
         delivery: parseJson(stringField(row, "delivery_json")),
       };
+      if (!Value.Check(OutcomeSchema, value) || value.id !== outcomeId)
+        throw new WorkstreamStoreInvalidError(
+          `Outcome ${outcomeId} record is malformed or mismatched.`,
+        );
       return structuredClone(value as NonNullable<Attempt["outcome"]>);
     });
   }

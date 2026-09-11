@@ -302,7 +302,7 @@ const OutcomeBase = {
   artifacts: Type.Array(RetainedArtifactSchema),
   delivery: DeliverySchema,
 };
-const OutcomeSchema = Type.Union([
+export const OutcomeSchema = Type.Union([
   Type.Object(
     { ...OutcomeBase, kind: Type.Literal("reported"), report: WorkerReportSchema },
     { additionalProperties: false },

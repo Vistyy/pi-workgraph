@@ -21,13 +21,10 @@ import { Value } from "typebox/value";
 import {
   type AttemptKey,
   activateAttempt,
-  appendAttempts,
   type CoordinatorIdentity,
   checkpointCancellation,
   checkpointCleanup,
   completeWorkstream,
-  createTask,
-  findTask,
   type Intent,
   type RepositoryIdentity,
   recordDeliveryFailure,
@@ -41,6 +38,8 @@ import {
 import { loadModelPolicyEffect, type ModelPolicy, type ModelPolicyError } from "../model-policy.js";
 import {
   type AttemptRecords,
+  type PlanningRecords,
+  type WorkstreamPresentation,
   type WorkstreamRecordMutation,
   WorkstreamStore,
   type WorkstreamStoreError,
@@ -133,17 +132,20 @@ export interface WorkstreamRuntimeAcquisition {
   readonly driver: ReconciliationDriver;
   readonly commands?: WorkstreamCommandPorts;
   readonly onReconciliationAttention?: ReconciliationAttention;
-  readonly onCommitted?: (state: Workstream) => Effect.Effect<void, never>;
+  readonly onPresentationChanged?: (state: WorkstreamPresentation) => Effect.Effect<void, never>;
   readonly onFatal?: (error: WorkstreamRuntimeError) => Effect.Effect<void, never>;
 }
 
 const STOPPED_MESSAGE = "Workstream runtime is closed and accepts no further commands.";
 
 type RecordPlan =
-  | Readonly<{ kind: "task"; taskId: string; current: Workstream }>
-  | Readonly<{ kind: "attempts"; taskId: string; current: Workstream }>
   | Readonly<{ kind: "attempt"; key: AttemptKey }>
   | Readonly<{ kind: "lifecycle"; current: Workstream }>;
+
+type QueuePlanningContext = {
+  readonly planning: PlanningRecords;
+  readonly tasks: Task[];
+};
 type WritableWorkstream = { -readonly [Key in keyof Workstream]: Workstream[Key] };
 type MutableAttemptMutation = {
   -readonly [Key in keyof Extract<WorkstreamRecordMutation, { kind: "update_attempt" }>]: Extract<
@@ -273,6 +275,13 @@ export class WorkstreamRuntime {
   /** Assemble a current inspection view from authoritative records. */
   readonly snapshot = (): WorkstreamRuntimeEffect<Workstream> => this.serialized(this.store.read());
 
+  /** Read only the status facts consumed by coordinator presentation. */
+  readonly presentation = (): WorkstreamRuntimeEffect<WorkstreamPresentation> =>
+    this.serialized(this.store.readPresentation());
+
+  /** Read only the parent facts needed to derive a one-shot Handoff Grant. */
+  readonly handoffParent = () => this.serialized(this.store.readHandoffParent());
+
   /** Process-local ownership is the exact active runtime instance. */
   readonly checkOwnership = (): WorkstreamRuntimeEffect<void> => this.serialized(this.fence());
 
@@ -321,6 +330,7 @@ export class WorkstreamRuntime {
                 updatedAt: now,
               });
               yield* this.scheduler.attach();
+              yield* this.publishPresentation();
             }.bind(this),
           ),
         ),
@@ -345,6 +355,7 @@ export class WorkstreamRuntime {
                 updatedAt: now,
               });
               yield* this.scheduler.attach();
+              yield* this.publishPresentation();
             }.bind(this),
           ),
         ),
@@ -476,13 +487,23 @@ export class WorkstreamRuntime {
     key: AttemptKey,
   ): Effect.Effect<ReconciliationControl, ReconciliationControlError, FileSystem.FileSystem> {
     return this.serialized(this.contextFor(key)).pipe(
-      Effect.map((context) => ({
-        context: () => context,
-        checkOwnership: this.fence().pipe(
-          Effect.mapError((error) => controlError(errorMessage(error), error)),
-        ),
-        commit: (mutation: ReconciliationMutation) => this.controlCommit(key, mutation),
-      })),
+      Effect.map((initialContext) => {
+        let context = initialContext;
+        return {
+          context: () => context,
+          checkOwnership: this.fence().pipe(
+            Effect.mapError((error) => controlError(errorMessage(error), error)),
+          ),
+          commit: (mutation: ReconciliationMutation) =>
+            this.controlCommit(key, mutation).pipe(
+              Effect.tap((result) =>
+                Effect.sync(() => {
+                  if (result.kind === "committed") context = result.receipt.context;
+                }),
+              ),
+            ),
+        };
+      }),
       Effect.mapError((error) => controlError(errorMessage(error), error)),
     );
   }
@@ -602,28 +623,30 @@ export class WorkstreamRuntime {
         const plan = yield* this.try("plan workstream Task enqueue", () =>
           planEnqueue(decoded, policy),
         );
-        const expected = yield* this.enqueueState(decoded);
+        const context = yield* this.enqueueState(decoded);
         if (yield* this.store.taskExists(plan.taskId))
           return yield* new WorkstreamRuntimeOperationError({
             operation: "enqueue workstream Task",
             message: `Task ${plan.taskId} already exists.`,
           });
-        const facts = yield* enqueueFacts(expected, decoded, this.acquisition.commands?.git);
+        const facts = yield* enqueueFacts(context, decoded, this.acquisition.commands?.git);
         const now = yield* this.now();
         const attemptIds = Array.from(
           { length: plan.attemptCount },
           () => `attempt-${randomUUID()}`,
         );
-        const committed = yield* this.authoritative(
-          "enqueue workstream Task",
-          (expected) =>
-            createTask(
-              expected,
-              plan.materialize(attemptIds, now, expected.intents.length - 1, facts),
-              now,
-            ),
-          { kind: "task", taskId: plan.taskId, current: expected },
+        const task = yield* this.try("enqueue workstream Task", () =>
+          plan.materialize(attemptIds, now, context.planning.currentIntentIndex, facts),
         );
+        const revision = yield* this.store.mutateRecords(
+          this.acquisition.coordinator,
+          context.planning.revision,
+          { kind: "create_task", task, updatedAt: now },
+        );
+        if (revision !== context.planning.revision + 1)
+          return yield* staleError("enqueue workstream Task");
+        yield* this.publishPresentation();
+        const committed = yield* this.keyedState(attemptIds[0] ?? "");
         yield* this.notifyCommitted(
           committed,
           attemptIds.map((attemptId) => ({ taskId: plan.taskId, attemptId })),
@@ -643,29 +666,30 @@ export class WorkstreamRuntime {
           decodeAppend(command),
         );
         const policy = yield* this.policy();
-        const expected = yield* this.appendState(decoded);
+        const context = yield* this.appendState(decoded);
         const resolved = yield* this.try("resolve workstream append plan", () => {
-          const task = findTask(expected, decoded.taskId);
+          const task = context.tasks.find((item) => item.id === decoded.taskId);
           if (task === undefined) throw new Error(`Unknown Task ${decoded.taskId}.`);
           return planAppend(decoded, task, policy);
         });
-        const facts = yield* appendFacts(expected, decoded, this.acquisition.commands?.git);
+        const facts = yield* appendFacts(context, decoded, this.acquisition.commands?.git);
         const now = yield* this.now();
         const attemptIds = Array.from(
           { length: resolved.attemptCount },
           () => `attempt-${randomUUID()}`,
         );
-        const committed = yield* this.authoritative(
-          "append workstream Attempts",
-          (current) =>
-            appendAttempts(
-              current,
-              decoded.taskId,
-              resolved.materialize(attemptIds, now, facts),
-              now,
-            ),
-          { kind: "attempts", taskId: decoded.taskId, current: expected },
+        const attempts = yield* this.try("append workstream Attempts", () =>
+          resolved.materialize(attemptIds, now, facts),
         );
+        const revision = yield* this.store.mutateRecords(
+          this.acquisition.coordinator,
+          context.planning.revision,
+          { kind: "append_attempts", taskId: decoded.taskId, attempts, updatedAt: now },
+        );
+        if (revision !== context.planning.revision + 1)
+          return yield* staleError("append workstream Attempts");
+        yield* this.publishPresentation();
+        const committed = yield* this.keyedState(attemptIds[0] ?? "");
         yield* this.notifyCommitted(
           committed,
           attemptIds.map((attemptId) => ({ taskId: decoded.taskId, attemptId })),
@@ -675,40 +699,46 @@ export class WorkstreamRuntime {
     );
   }
 
-  private enqueueState(command: WorkstreamEnqueueCommand): WorkstreamRuntimeEffect<Workstream> {
+  private enqueueState(
+    command: WorkstreamEnqueueCommand,
+  ): WorkstreamRuntimeEffect<QueuePlanningContext> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const state = yield* this.store.readPlanningState();
+        const planning = yield* this.store.readPlanningRecords();
+        const tasks: Task[] = [];
         const candidate = candidateAttempt(command);
         if (candidate !== undefined) {
           const parent = yield* this.store.readAttempt(undefined, candidate);
-          state.tasks.push(parent.task);
+          tasks.push(parent.task);
         }
         for (const id of reviewOutcomes(command)) {
           const records = yield* this.store.readAttemptForOutcome(id);
-          const existing = state.tasks.find((task) => task.id === records.task.id);
-          if (existing === undefined) state.tasks.push(records.task);
+          yield* this.store.readOutcome(id);
+          const existing = tasks.find((task) => task.id === records.task.id);
+          if (existing === undefined) tasks.push(records.task);
           else if (!existing.attempts.some((attempt) => attempt.id === records.attempt.id))
             existing.attempts.push(records.attempt);
         }
-        return state;
+        return { planning, tasks };
       }.bind(this),
     );
   }
 
-  private appendState(command: WorkstreamAppendCommand): WorkstreamRuntimeEffect<Workstream> {
+  private appendState(
+    command: WorkstreamAppendCommand,
+  ): WorkstreamRuntimeEffect<QueuePlanningContext> {
     return Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const state = yield* this.store.readPlanningState();
-        state.tasks.push(yield* this.store.readTask(command.taskId));
+        const planning = yield* this.store.readPlanningRecords();
+        const tasks = [yield* this.store.readTask(command.taskId)];
         if (command.candidateOf !== undefined) {
           const parent = yield* this.store.readAttempt(undefined, command.candidateOf);
-          const existing = state.tasks.find((task) => task.id === parent.task.id);
-          if (existing === undefined) state.tasks.push(parent.task);
+          const existing = tasks.find((task) => task.id === parent.task.id);
+          if (existing === undefined) tasks.push(parent.task);
           else if (!existing.attempts.some((attempt) => attempt.id === parent.attempt.id))
             existing.attempts.push(parent.attempt);
         }
-        return state;
+        return { planning, tasks };
       }.bind(this),
     );
   }
@@ -843,11 +873,17 @@ export class WorkstreamRuntime {
           mutation,
         );
         if (revision !== next.revision) return yield* staleError(operation);
-        if (records.kind !== "attempt" && this.acquisition.onCommitted !== undefined)
-          yield* this.acquisition.onCommitted(structuredClone(next)).pipe(Effect.ignoreCause);
+        yield* this.publishPresentation();
         return structuredClone(next);
       }.bind(this),
     );
+  }
+
+  private publishPresentation(): Effect.Effect<void, never, FileSystem.FileSystem> {
+    const publish = this.acquisition.onPresentationChanged;
+    return publish === undefined
+      ? Effect.void
+      : this.store.readPresentation().pipe(Effect.flatMap(publish), Effect.ignoreCause);
   }
 
   private policy(): Effect.Effect<
@@ -987,28 +1023,12 @@ function partialWorkstream(records: AttemptRecords, coordinator: CoordinatorIden
   return value;
 }
 
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: each closed record-plan variant maps to one explicit store operation.
 function recordMutation(
   current: Workstream,
   next: Workstream,
   plan: RecordPlan,
 ): WorkstreamRecordMutation {
   switch (plan.kind) {
-    case "task": {
-      const task = findTask(next, plan.taskId);
-      if (task === undefined || findTask(current, plan.taskId) !== undefined)
-        throw new Error("Task mutation did not create the expected record.");
-      return { kind: "create_task", task, updatedAt: next.updatedAt };
-    }
-    case "attempts": {
-      const prior = findTask(current, plan.taskId);
-      const task = findTask(next, plan.taskId);
-      if (prior === undefined || task === undefined)
-        throw new Error(`Unknown Task ${plan.taskId}.`);
-      const attempts = task.attempts.slice(prior.attempts.length);
-      if (attempts.length === 0) throw new Error("Attempt mutation did not append records.");
-      return { kind: "append_attempts", taskId: plan.taskId, attempts, updatedAt: next.updatedAt };
-    }
     case "attempt": {
       const mutation: MutableAttemptMutation = {
         kind: "update_attempt",
@@ -1017,17 +1037,22 @@ function recordMutation(
         updatedAt: next.updatedAt,
       };
       if (next.completion !== undefined) {
+        const outcomeIds = new Set(
+          [
+            exactAttempt(current, plan.key.attemptId).attempt.outcome?.id,
+            exactAttempt(next, plan.key.attemptId).attempt.outcome?.id,
+          ].filter((id): id is string => id !== undefined),
+        );
         mutation.completion =
           current.completion === undefined
             ? next.completion
             : {
                 ...next.completion,
                 accounting: [
-                  ...current.completion.accounting.filter(
-                    (item) =>
-                      !("taskId" in item) ||
-                      item.taskId !== plan.key.taskId ||
-                      item.attemptId !== plan.key.attemptId,
+                  ...current.completion.accounting.filter((item) =>
+                    "taskId" in item
+                      ? item.taskId !== plan.key.taskId || item.attemptId !== plan.key.attemptId
+                      : !outcomeIds.has(item.outcomeId),
                   ),
                   ...next.completion.accounting,
                 ],

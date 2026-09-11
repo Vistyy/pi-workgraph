@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Clock, Data, DateTime, Effect } from "effect";
-import type { HandoffGrant, Workstream } from "../domain/workstream.js";
+import type { HandoffGrant } from "../domain/workstream.js";
 import { HandoffSessionError, prepareHandoffSession, priorDiscussion } from "../handoff-session.js";
 import type { HerdrCliRuntime } from "../herdr.js";
 import type { WorkerIdentity } from "../herdr-identity.js";
+import type { HandoffParentRecords } from "../storage/workstream-store.js";
 
 export class HandoffGrantError extends Data.TaggedError("HandoffGrantError")<{
   readonly message: string;
@@ -15,7 +16,7 @@ export interface OneShotHandoffRequest {
   readonly includeContext: boolean;
   readonly toolCallId: string;
   readonly parentSession: Pick<SessionManager, "getBranch" | "getEntries">;
-  readonly parent: Workstream;
+  readonly parent: HandoffParentRecords;
 }
 
 /**
@@ -59,7 +60,7 @@ export function launchOneShotHandoff(
 }
 
 function deriveGrant(
-  parent: Workstream,
+  parent: HandoffParentRecords,
   narrowedRequest: string,
 ): Effect.Effect<HandoffGrant, HandoffGrantError> {
   return Effect.gen(function* () {
@@ -67,10 +68,8 @@ function deriveGrant(
       return yield* new HandoffGrantError({
         message: "Only an active, unsuspended Workstream can issue a Handoff Grant.",
       });
-    const parentIntentIndex = parent.intents.length - 1;
-    const intent = parent.intents[parentIntentIndex];
-    if (intent === undefined)
-      return yield* new HandoffGrantError({ message: "Parent Workstream has no current Intent." });
+    const parentIntentIndex = parent.currentIntentIndex;
+    const intent = parent.currentIntent;
     const parentReceipt =
       intent.grounding.kind === "handoff_grant" ? intent.grounding.parentReceipt : intent.grounding;
     const issuedAt = DateTime.formatIso(DateTime.makeUnsafe(yield* Clock.currentTimeMillis));

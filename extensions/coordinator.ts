@@ -189,7 +189,7 @@ export default function workstreamCoordinator(
   const calm = installCalmMode(pi);
   const publish = (
     ctx: ExtensionContext,
-    state?: { lifecycle: string; tasks: readonly { attempts: readonly { state: string }[] }[] },
+    state?: { lifecycle: string; activeAttemptCount: number },
   ) => {
     try {
       if (state === undefined) {
@@ -197,13 +197,8 @@ export default function workstreamCoordinator(
         calm.setActiveWorkers(0);
         return;
       }
-      const active = state.tasks.reduce(
-        (count, task) =>
-          count + task.attempts.filter((attempt) => attempt.state === "active").length,
-        0,
-      );
-      ctx.ui.setStatus("workgraph", `WG ${state.lifecycle} - ${active} active`);
-      calm.setActiveWorkers(active);
+      ctx.ui.setStatus("workgraph", `WG ${state.lifecycle} - ${state.activeAttemptCount} active`);
+      calm.setActiveWorkers(state.activeAttemptCount);
     } catch {
       // Presentation is best-effort and cannot alter committed Workstream records.
     }

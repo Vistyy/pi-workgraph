@@ -210,7 +210,7 @@ function reconcile(
   });
 }
 
-/** Reject an aggregate whose repository identity is not the owned Git identity. */
+/** Reject keyed context whose repository identity is not the owned Git identity. */
 function repositoryMismatch(
   ports: WorkstreamReconciliationPorts,
   context: ReconciliationContext,
