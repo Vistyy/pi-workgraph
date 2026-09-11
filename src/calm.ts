@@ -429,11 +429,3 @@ export function installCalmMode(
     },
   };
 }
-
-export function activeWorkerCount(state: {
-  readonly attempts: readonly { readonly state: string }[];
-}): number {
-  return state.attempts.filter(
-    (attempt) => attempt.state === "running" || attempt.state === "starting",
-  ).length;
-}

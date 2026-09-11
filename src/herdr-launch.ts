@@ -1,10 +1,11 @@
 import { Clock, Data, DateTime, Effect } from "effect";
-import type { HerdrObservation } from "./herdr.js";
+import type { Thinking } from "./domain/model-target.js";
 import {
   decodeAgentResponse,
   decodeSuccessResponse,
   decodeTabCreateResponse,
 } from "./herdr-decoder.js";
+import type { CoordinatorLaunchResource, HerdrObservation } from "./herdr-identity.js";
 import { assertWorkerLaunchPlacement, parseAgent, resourceOf } from "./herdr-identity.js";
 import { herdrWorkerName, herdrWorkerTabLabel, type WorkerRole } from "./herdr-naming.js";
 import {
@@ -12,9 +13,9 @@ import {
   type HerdrProtocolError,
   protocolTry,
 } from "./herdr-protocol.js";
-import type { ThinkingLevel, WorkerIdentity, WorkerResourceIdentity } from "./types.js";
+import type { WorkerIdentity, WorkerResourceIdentity } from "./types.js";
 
-export interface WorkerLaunchBaseRequest {
+interface WorkerLaunchBaseRequest {
   workspaceId: string;
   runId: string;
   nodeId: string;
@@ -27,11 +28,11 @@ export interface WorkerLaunchBaseRequest {
   sessionFile: string;
   prompt?: string;
   model?: string;
-  thinking?: ThinkingLevel;
+  thinking?: Thinking;
   env: Record<string, string>;
 }
 
-export interface WorkerPaneLocator {
+interface WorkerPaneLocator {
   readonly workspaceId: string;
   readonly paneId: string;
 }
@@ -76,16 +77,6 @@ export class WorkerLaunchError<Cause = unknown> extends Data.TaggedError("Worker
 export interface CoordinatorLaunchRequest {
   cwd: string;
   sessionFile: string;
-}
-
-export interface CoordinatorLaunchResource {
-  workspaceId: string;
-  tabId: string;
-  paneId: string;
-  agentName: string;
-  terminalId?: string;
-  sessionFile: string;
-  cwd: string;
 }
 
 export class CoordinatorLaunchError extends Data.TaggedError("CoordinatorLaunchError")<{

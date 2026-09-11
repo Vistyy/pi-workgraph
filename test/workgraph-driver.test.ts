@@ -9,25 +9,27 @@ import { join } from "node:path";
 import test from "node:test";
 import type { FileSystem, Path } from "effect";
 import { Effect, type Scope } from "effect";
-import { CanonicalCommandError, type CanonicalCommandPorts } from "../src/canonical-commands.js";
 import {
-  type CanonicalGitPort,
-  type CanonicalReconciliationPorts,
-  type CanonicalSessionPort,
-  makeCanonicalReconciliationDriver,
-} from "../src/canonical-driver.js";
+  WorkstreamCommandError,
+  type WorkstreamCommandPorts,
+} from "../src/coordination/commands.js";
 import {
-  liveCanonicalCommandPorts,
+  makeWorkstreamReconciliationDriver,
+  type WorkstreamGitPort,
+  type WorkstreamReconciliationPorts,
+  type WorkstreamSessionPort,
+} from "../src/coordination/driver.js";
+import {
   liveGitPort,
-  makeLiveCanonicalReconciliationDriver,
-} from "../src/canonical-host.js";
+  liveWorkstreamCommandPorts,
+  makeLiveWorkstreamReconciliationDriver,
+} from "../src/coordination/host.js";
 import {
   type ReconciliationContext,
   type ReconciliationDriver,
   ReconciliationDriverError,
-} from "../src/canonical-reconciliation.js";
-import { CanonicalRuntime, type CanonicalRuntimeError } from "../src/canonical-runtime.js";
-import { CanonicalWorkstreamStore } from "../src/canonical-workstream-store.js";
+} from "../src/coordination/reconciliation.js";
+import { WorkstreamRuntime, type WorkstreamRuntimeError } from "../src/coordination/runtime.js";
 import {
   type Attempt,
   type AttemptKey,
@@ -49,11 +51,13 @@ import {
 } from "../src/domain/workstream.js";
 import { type GitRepository, openRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
+import type { HerdrAgentStatus } from "../src/herdr-decoder.js";
 import type { ModelPolicy } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import type { NativeFailureCategory, WorkerSessionResolution } from "../src/pi-process.js";
 import type { WorkerReport } from "../src/report-schema.js";
-import type { WorkerIdentity, WorkerObservationStatus } from "../src/types.js";
+import { WorkstreamStore } from "../src/storage/workstream-store.js";
+import type { WorkerIdentity } from "../src/types.js";
 import { git } from "./helpers.js";
 
 const ID = "driver";
@@ -82,7 +86,7 @@ interface SessionRecord {
   report?: WorkerReport;
   text?: string;
   failure?: NativeFailureCategory;
-  models?: { model: string; thinking?: string; source?: "selection" | "message" }[];
+  models?: { model: string; thinking?: string; source: "selection" | "message" }[];
   started?: boolean;
   settled?: boolean;
 }
@@ -99,12 +103,12 @@ interface Harness {
   readonly repository: RepositoryIdentity;
   readonly git: GitRepository;
   readonly policyPath: string;
-  readonly commands: ReturnType<typeof liveCanonicalCommandPorts>;
+  readonly commands: ReturnType<typeof liveWorkstreamCommandPorts>;
   readonly sessions: Map<string, SessionRecord>;
   readonly worker: {
     inspectLaunch: "live" | "absent" | "unknown";
     inspectLaunchCount: number;
-    presence: WorkerObservationStatus | "absent";
+    presence: HerdrAgentStatus | "absent";
     cleanupState: "pending" | "completed" | "blocked";
     cleanupCount: number;
     presenceChecks: number;
@@ -122,7 +126,7 @@ interface Harness {
   readonly deliveryControl: { failures: number; calls: ReconciliationContext[] };
   /** Driver block details surfaced through the runtime attention boundary. */
   readonly attention: string[];
-  readonly ports: CanonicalReconciliationPorts;
+  readonly ports: WorkstreamReconciliationPorts;
 }
 
 function liveIdentity(sessionFile: string, cwd: string): WorkerIdentity {
@@ -186,7 +190,7 @@ async function makeHarness(): Promise<Harness> {
   const attention: string[] = [];
 
   const realGit = liveGitPort(gitRepository);
-  const gitPort: CanonicalGitPort = {
+  const gitPort: WorkstreamGitPort = {
     ...realGit,
     ensureWorktree: (runId, nodeId, placement) =>
       Effect.gen(function* () {
@@ -209,7 +213,7 @@ async function makeHarness(): Promise<Harness> {
       }),
   };
 
-  const workerPort: CanonicalReconciliationPorts["workers"] = {
+  const workerPort: WorkstreamReconciliationPorts["workers"] = {
     workspaceId: "ws-test",
     launch: (request) =>
       Effect.gen(function* () {
@@ -282,7 +286,7 @@ async function makeHarness(): Promise<Harness> {
       }),
   };
 
-  const sessionPort: CanonicalSessionPort = {
+  const sessionPort: WorkstreamSessionPort = {
     sessionDirectory: (runId) =>
       Effect.succeed(join(repository.gitCommonDir, "pi-workgraph", "worker-sessions", runId)),
     inspectDirectory: (sessionDir, generation) =>
@@ -344,7 +348,7 @@ async function makeHarness(): Promise<Harness> {
     repository,
     git: gitRepository,
     policyPath,
-    commands: liveCanonicalCommandPorts(gitRepository, new HerdrCliRuntime("herdr", {})),
+    commands: liveWorkstreamCommandPorts(gitRepository, new HerdrCliRuntime("herdr", {})),
     sessions,
     worker,
     sessionControl,
@@ -361,7 +365,7 @@ function runScoped<A, E>(
   return Effect.runPromise(Effect.scoped(program).pipe(Effect.provide(liveLayer)));
 }
 
-/** One disposable repository plus canonical store, removed after the flow. */
+/** One disposable repository plus workstream store, removed after the flow. */
 async function withHarness(body: (h: Harness) => Promise<void>): Promise<void> {
   const h = await makeHarness();
   try {
@@ -517,12 +521,13 @@ async function seeded(
   attempt: Attempt,
   steps: Step[],
   body: (
-    runtime: CanonicalRuntime,
-  ) => Effect.Effect<void, CanonicalRuntimeError, FileSystem.FileSystem | Path.Path | Scope.Scope>,
+    runtime: WorkstreamRuntime,
+  ) => Effect.Effect<void, WorkstreamRuntimeError, FileSystem.FileSystem | Path.Path | Scope.Scope>,
   driverOverride?: ReconciliationDriver,
-  commandOverride: CanonicalCommandPorts = h.commands,
+  commandOverride: WorkstreamCommandPorts = h.commands,
 ): Promise<void> {
-  const driver: ReconciliationDriver = driverOverride ?? makeCanonicalReconciliationDriver(h.ports);
+  const driver: ReconciliationDriver =
+    driverOverride ?? makeWorkstreamReconciliationDriver(h.ports);
   h.gitControl.ensureCount = 0;
   h.gitControl.headReadCount = 0;
   h.gitControl.cleanupCount = 0;
@@ -535,7 +540,7 @@ async function seeded(
   h.sessionControl.inspectCount = 0;
   h.sessionControl.startedChecks = 0;
   h.attention.length = 0;
-  // Reset only the canonical store; session fixtures under worker-sessions survive.
+  // Reset only the workstream store; session fixtures under worker-sessions survive.
   await rm(join(h.repository.gitCommonDir, "pi-workgraph", "workstreams"), {
     recursive: true,
     force: true,
@@ -543,13 +548,13 @@ async function seeded(
   return runScoped(
     Effect.gen(function* () {
       const state = emptyWorkstream(h.repository);
-      yield* CanonicalWorkstreamStore.create(state);
-      const attachment = yield* CanonicalWorkstreamStore.open(ID, h.repository);
+      yield* WorkstreamStore.create(state);
+      const attachment = yield* WorkstreamStore.open(ID, h.repository);
       const lease = yield* attachment.store.acquireLease(COORDINATOR);
       const all: Step[] = [(s) => createTask(s, implementationTask(attempt), T0), ...steps];
       for (const step of all) yield* attachment.store.transition(lease, step);
       yield* attachment.store.releaseLease(lease);
-      const runtime = yield* CanonicalRuntime.acquire({
+      const runtime = yield* WorkstreamRuntime.acquire({
         id: ID,
         repository: h.repository,
         coordinator: COORDINATOR,
@@ -571,7 +576,7 @@ async function seeded(
 
 /** Bounded polling with an iteration cap, not wall-clock time. */
 async function until(
-  runtime: CanonicalRuntime,
+  runtime: WorkstreamRuntime,
   predicate: (attempt: Attempt | undefined) => boolean,
   maxPolls = 800,
 ): Promise<Attempt> {
@@ -596,7 +601,7 @@ async function waitFor(predicate: () => boolean, describe: string, maxPolls = 80
   throw new Error(`Timed out waiting for ${describe}`);
 }
 
-const currentAttempt = (runtime: CanonicalRuntime) =>
+const currentAttempt = (runtime: WorkstreamRuntime) =>
   Effect.runPromise(runtime.snapshot()).then((state) => state.tasks[0]?.attempts[0]);
 
 async function branchHead(h: Harness, branch: string): Promise<string | undefined> {
@@ -1257,7 +1262,7 @@ void test("retained changed output applies with exact checkpoints and releases i
       candidate,
     );
     let releaseCalls = 0;
-    const commands: CanonicalCommandPorts = {
+    const commands: WorkstreamCommandPorts = {
       ...h.commands,
       git: {
         ...h.commands.git,
@@ -1381,7 +1386,7 @@ void test("completed output release replay preserves its reason and repairs clea
         ),
     ];
     let releaseCalls = 0;
-    const commands: CanonicalCommandPorts = {
+    const commands: WorkstreamCommandPorts = {
       ...h.commands,
       git: {
         ...h.commands.git,
@@ -1483,7 +1488,8 @@ void test("retained candidate integration resolves only the clean current destin
           }),
         );
         assert.equal(invalid._tag, "Failure");
-        if (invalid._tag === "Failure") assert.ok(invalid.failure instanceof CanonicalCommandError);
+        if (invalid._tag === "Failure")
+          assert.ok(invalid.failure instanceof WorkstreamCommandError);
         assert.deepEqual(yield* runtime.read(), beforeInvalid);
         const integrated = yield* runtime.enqueue({
           taskId: "task-2",
@@ -1559,7 +1565,7 @@ void test("pending application recovery blocks an incompatible destination witho
       Effect.gen(function* () {
         const result = yield* Effect.result(runtime.apply({ attemptId: ATTEMPT }));
         assert.equal(result._tag, "Failure");
-        if (result._tag === "Failure") assert.ok(result.failure instanceof CanonicalCommandError);
+        if (result._tag === "Failure") assert.ok(result.failure instanceof WorkstreamCommandError);
         const attempt = (yield* runtime.readAttempt(ATTEMPT)).attempt;
         assert.equal(attempt.application?.state, "blocked");
         assert.equal(yield* h.commands.git.head, destination);
@@ -1597,7 +1603,7 @@ void test("same-owner pending delivery retries under backoff and delivers exact 
 void test("the production factory composes live Git with injected Worker/session/delivery ports", async () => {
   await withHarness(async (h) => {
     const { base, placement } = await isolated(h);
-    const driver = makeLiveCanonicalReconciliationDriver({
+    const driver = makeLiveWorkstreamReconciliationDriver({
       repository: h.repository,
       workspaceId: "ws-test",
       git: h.git,

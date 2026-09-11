@@ -42,7 +42,7 @@ import {
   WorkstreamSchema,
 } from "../src/domain/workstream.js";
 import { EvidenceSchema, WorkerReportSchema } from "../src/report-schema.js";
-import { canonicalSessionMode, canonicalWorkerAssignment } from "../src/worker-context.js";
+import { workerAssignment, workerSessionMode } from "../src/worker-context.js";
 
 const repository = { projectRoot: "/repo", gitCommonDir: "/repo/.git" };
 const coordinator = { sessionId: "session", sessionFile: "/session.json" };
@@ -53,7 +53,7 @@ const receipt = {
   sessionFile: "/session.json",
   source: "interactive" as const,
   text: "Investigate the change.",
-  receivedAt: "2026-01-01T00:00:00Z",
+  receivedAt: "2026-01-01T00:00:00.000Z",
 };
 const intent: Intent = {
   statement: "Investigate the change.",
@@ -69,8 +69,8 @@ function attempt(id: string, extra: Partial<Attempt> = {}): Attempt {
   return {
     id,
     state: "queued",
-    createdAt: "t0",
-    updatedAt: "t0",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    updatedAt: "2026-01-01T00:00:00.000Z",
     selection: {
       role: "research",
       target: { model: "provider/research", thinking: "low" },
@@ -85,7 +85,7 @@ function researchTask(id: string, attempts = [attempt("Attempt A")]): Task {
     id,
     objective: "Find evidence.",
     intentIndex: 0,
-    createdAt: "t0",
+    createdAt: "2026-01-01T00:00:00.000Z",
     expectedEvidence: ["A result"],
     attempts,
   };
@@ -96,14 +96,15 @@ function reported(
   if (kind === "implementation")
     return {
       kind: "reported",
-      observedAt: "t2",
+      observedAt: "2026-01-01T00:00:02.000Z",
       artifacts: [],
-      deliveryRequestedAt: "t3",
+      deliveryRequestedAt: "2026-01-01T00:00:03.000Z",
       report: {
         kind,
         status: "completed",
         outcome: "changed",
         commit: changedCommit,
+        changedFiles: ["change.txt"],
         summary: "Changed.",
         evidence: [],
         findings: [],
@@ -111,18 +112,18 @@ function reported(
     };
   return {
     kind: "reported",
-    observedAt: "t2",
+    observedAt: "2026-01-01T00:00:02.000Z",
     artifacts: [],
-    deliveryRequestedAt: "t3",
+    deliveryRequestedAt: "2026-01-01T00:00:03.000Z",
     report: { kind, status: "completed", summary: "Reported.", evidence: [], findings: [] },
   };
 }
 function cancelled(): TerminalObservation {
   return {
     kind: "cancelled",
-    observedAt: "t2",
+    observedAt: "2026-01-01T00:00:02.000Z",
     artifacts: [],
-    deliveryRequestedAt: "t3",
+    deliveryRequestedAt: "2026-01-01T00:00:03.000Z",
     reason: "Stopped.",
   };
 }
@@ -133,11 +134,11 @@ function base() {
     repository,
     coordinator,
     intent,
-    createdAt: "t0",
+    createdAt: "2026-01-01T00:00:00.000Z",
   });
 }
 function add(workstream = base(), task = researchTask("Task opaque")) {
-  return createTask(workstream, task, "t1");
+  return createTask(workstream, task, "2026-01-01T00:00:01.000Z");
 }
 function resourceForTest() {
   return {
@@ -150,7 +151,7 @@ function resourceForTest() {
     cwd: "/repo-work",
   };
 }
-/** The one durable placement declaration activating a canonical Attempt. */
+/** The one durable placement declaration activating a workstream Attempt. */
 function declare(
   placement: NonNullable<NonNullable<Attempt["execution"]>["placement"]>,
 ): NonNullable<Parameters<typeof activateAttempt>[3]> {
@@ -163,29 +164,43 @@ function recordLaunchProgress(
 ): ReturnType<typeof add> {
   let active = workstream;
   if (execution.sessionFile !== undefined)
-    active = recordWorkerExecution(active, key, { sessionFile: execution.sessionFile }, "t1b");
+    active = recordWorkerExecution(
+      active,
+      key,
+      { sessionFile: execution.sessionFile },
+      "2026-01-01T00:00:01.002Z",
+    );
   if (execution.launch !== undefined) {
     const pane = {
       phase: "pane" as const,
       workspaceId: execution.launch.workspaceId,
       paneId: execution.launch.paneId,
     };
-    active = recordWorkerExecution(active, key, { launch: pane }, "t1c");
+    active = recordWorkerExecution(active, key, { launch: pane }, "2026-01-01T00:00:01.003Z");
     if (execution.launch.phase !== "pane") {
       const resource = { ...execution.launch, phase: "resource" as const };
-      active = recordWorkerExecution(active, key, { launch: resource }, "t1d");
+      active = recordWorkerExecution(active, key, { launch: resource }, "2026-01-01T00:00:01.004Z");
       if (execution.launch.phase === "ready")
-        active = recordWorkerExecution(active, key, { launch: execution.launch }, "t1e");
+        active = recordWorkerExecution(
+          active,
+          key,
+          { launch: execution.launch },
+          "2026-01-01T00:00:01.005Z",
+        );
     }
   }
   return active;
 }
 function isolatedPaneLaunch(key: { taskId: string; attemptId: string }): ReturnType<typeof add> {
   const placement = { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" };
-  return recordLaunchProgress(activateAttempt(add(), key, "t1", declare(placement)), key, {
-    sessionFile: "/worker.json",
-    launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" },
-  });
+  return recordLaunchProgress(
+    activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", declare(placement)),
+    key,
+    {
+      sessionFile: "/worker.json",
+      launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" },
+    },
+  );
 }
 function finish(
   workstream: ReturnType<typeof add>,
@@ -196,27 +211,37 @@ function finish(
 ) {
   const key = { taskId, attemptId: id };
   const placement = execution?.placement ?? { kind: "shared_project" as const, path: "/repo" };
-  let active = activateAttempt(workstream, key, "t1", declare(placement));
+  let active = activateAttempt(workstream, key, "2026-01-01T00:00:01.000Z", declare(placement));
   if (execution !== undefined) active = recordLaunchProgress(active, key, execution);
   if (execution?.submission !== undefined && execution.submission !== "not_sent") {
-    active = recordWorkerExecution(active, key, { submission: "uncertain" }, "t1g");
+    active = recordWorkerExecution(
+      active,
+      key,
+      { submission: "uncertain" },
+      "2026-01-01T00:00:01.007Z",
+    );
     if (execution.submission !== "uncertain")
-      active = recordWorkerExecution(active, key, { submission: execution.submission }, "t1h");
+      active = recordWorkerExecution(
+        active,
+        key,
+        { submission: execution.submission },
+        "2026-01-01T00:00:01.008Z",
+      );
   }
   // An active cancelled settlement is gated on the full interrupt protocol plus
   // durably proven Worker closure, so the fixture satisfies it before settling.
   if (observation.kind === "cancelled") {
     const requested = {
       state: "requested" as const,
-      requestedAt: "t1i",
+      requestedAt: "2026-01-01T00:00:01.009Z",
       reason: observation.reason,
     };
-    active = checkpointCancellation(active, key, requested, "t1i");
+    active = checkpointCancellation(active, key, requested, "2026-01-01T00:00:01.009Z");
     active = checkpointCancellation(
       active,
       key,
-      { ...requested, state: "uncertain", dispatchAt: "t1j" },
-      "t1j",
+      { ...requested, state: "uncertain", dispatchAt: "2026-01-01T00:00:01.010Z" },
+      "2026-01-01T00:00:01.010Z",
     );
     active = checkpointCancellation(
       active,
@@ -224,23 +249,38 @@ function finish(
       {
         ...requested,
         state: "submitted_or_observed",
-        dispatchAt: "t1j",
-        observedAt: "t1k",
+        dispatchAt: "2026-01-01T00:00:01.010Z",
+        observedAt: "2026-01-01T00:00:01.011Z",
         evidence: "done",
       },
-      "t1k",
+      "2026-01-01T00:00:01.011Z",
     );
-    active = checkpointCleanup(active, key, { state: "pending", workerClosed: true }, "t1l");
+    active = checkpointCleanup(
+      active,
+      key,
+      { state: "pending", workerClosed: true },
+      "2026-01-01T00:00:01.012Z",
+    );
   }
-  active = terminalizeAttempt(active, key, observation, "t2");
+  active = terminalizeAttempt(active, key, observation, "2026-01-01T00:00:02.000Z");
   // A default shared placement has no isolated output, so its only remaining
   // operational obligation is exact Worker closure.
   return execution === undefined
-    ? checkpointCleanup(active, key, { state: "completed", workerClosed: true }, "t2a")
+    ? checkpointCleanup(
+        active,
+        key,
+        { state: "completed", workerClosed: true },
+        "2026-01-01T00:00:02.001Z",
+      )
     : active;
 }
 function deliver(workstream: ReturnType<typeof add>, id: string, taskId = "Task opaque") {
-  return recordDeliverySuccess(workstream, { taskId, attemptId: id }, "t4", "t4");
+  return recordDeliverySuccess(
+    workstream,
+    { taskId, attemptId: id },
+    "2026-01-01T00:00:04.000Z",
+    "2026-01-01T00:00:04.000Z",
+  );
 }
 
 void test("consultation is a presentation role over the research session contract", () => {
@@ -249,10 +289,10 @@ void test("consultation is a presentation role over the research session contrac
     id: "consultation-task",
     objective: "Advise on ownership.",
     intentIndex: 0,
-    createdAt: "t0",
+    createdAt: "2026-01-01T00:00:00.000Z",
     context: "Known context.",
   };
-  const assignment = canonicalWorkerAssignment({
+  const assignment = workerAssignment({
     task,
     intent,
     intentIndex: 0,
@@ -261,7 +301,7 @@ void test("consultation is a presentation role over the research session contrac
     runId: "workstream",
     attemptId: "attempt",
   });
-  assert.equal(canonicalSessionMode(task), "research");
+  assert.equal(workerSessionMode(task), "research");
   assert.equal(assignment.mode, "research");
   assert.equal(assignment.role, "consultation");
   const { PI_WORKGRAPH_MODE: mode, PI_WORKGRAPH_POLICY_ROLE: policyRole } = assignment.environment;
@@ -333,11 +373,11 @@ void test("suspension is an exact lifecycle fact with active-only creation and r
       validateWorkstream(
         suspendWorkstream(
           active,
-          { reason: "Wait.", suspendedAt: "2026-01-02T03:04:05Z" },
+          { reason: "Wait.", suspendedAt: "2026-02-30T03:04:05.000Z" },
           suspendedAt,
         ),
       ),
-    /suspendedAt|canonical UTC instant/,
+    /suspendedAt|workstream UTC instant/,
   );
   assert.throws(
     () => validateWorkstream({ ...structuredClone(active), lifecycle: "suspended" }),
@@ -367,6 +407,27 @@ void test("pure aggregate schemas are strict and identifiers are opaque", () => 
   assert.equal(Value.Check(WorkstreamSchema, workstream), true);
   assert.equal(Value.Check(AttemptSchema, { ...attempt("UPPER / arbitrary") }), true);
   assert.equal(Value.Check(WorkstreamSchema, { ...workstream, id: "" }), false);
+  assert.equal(
+    Value.Check(WorkstreamSchema, {
+      ...workstream,
+      updatedAt: "2026-02-30T00:00:00.000Z",
+    }),
+    false,
+  );
+  assert.equal(
+    Value.Check(IntentSchema, {
+      ...intent,
+      recordedAt: "2026-01-01T00:00:00Z",
+    }),
+    false,
+  );
+  assert.equal(
+    Value.Check(AttemptSchema, {
+      ...attempt("A"),
+      createdAt: "not-an-instant",
+    }),
+    false,
+  );
   assert.equal(
     Value.Check(TaskSchema, {
       ...researchTask("Task"),
@@ -444,13 +505,17 @@ void test("launch checkpoints enforce ordered single-stage execution mutations",
   const ready = { ...resource, phase: "ready" as const };
   assert.equal(Value.Check(LaunchCheckpointSchema, pane), true);
 
-  const initialized = activateAttempt(add(), key, "t1", {
+  const initialized = activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", {
     placement,
     submission: "not_sent",
   });
   assert.equal(initialized.tasks[0]?.attempts[0]?.execution?.submission, "not_sent");
   assert.throws(
-    () => activateAttempt(add(), key, "t1", { placement, sessionFile: "/worker.json" }),
+    () =>
+      activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", {
+        placement,
+        sessionFile: "/worker.json",
+      }),
     /activation requires only exact placement/,
   );
   assert.throws(
@@ -458,38 +523,75 @@ void test("launch checkpoints enforce ordered single-stage execution mutations",
     // recorded exactly one at a time.
     () =>
       recordWorkerExecution(
-        activateAttempt(add(), key, "t1", declare(placement)),
+        activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", declare(placement)),
         key,
         { sessionFile: "/worker.json", launch: pane },
-        "t2",
+        "2026-01-01T00:00:02.000Z",
       ),
     /exactly one new external-effect stage/,
   );
 
-  let workstream = recordWorkerExecution(initialized, key, { placement }, "t2");
+  let workstream = recordWorkerExecution(
+    initialized,
+    key,
+    { placement },
+    "2026-01-01T00:00:02.000Z",
+  );
   assert.throws(
     () =>
-      recordWorkerExecution(workstream, key, { sessionFile: "/worker.json", launch: pane }, "t3"),
+      recordWorkerExecution(
+        workstream,
+        key,
+        { sessionFile: "/worker.json", launch: pane },
+        "2026-01-01T00:00:03.000Z",
+      ),
     /exactly one new external-effect stage/,
   );
-  workstream = recordWorkerExecution(workstream, key, { sessionFile: "/worker.json" }, "t3");
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { sessionFile: "/worker.json" },
+    "2026-01-01T00:00:03.000Z",
+  );
   assert.throws(
-    () => recordWorkerExecution(workstream, key, { launch: resource }, "t4"),
+    () => recordWorkerExecution(workstream, key, { launch: resource }, "2026-01-01T00:00:04.000Z"),
     /skip pane/,
   );
-  workstream = recordWorkerExecution(workstream, key, { launch: pane }, "t4");
-  workstream = recordWorkerExecution(workstream, key, { launch: resource }, "t5");
-  workstream = recordWorkerExecution(workstream, key, { launch: ready }, "t6");
+  workstream = recordWorkerExecution(workstream, key, { launch: pane }, "2026-01-01T00:00:04.000Z");
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { launch: resource },
+    "2026-01-01T00:00:05.000Z",
+  );
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { launch: ready },
+    "2026-01-01T00:00:06.000Z",
+  );
   assert.strictEqual(
-    recordWorkerExecution(workstream, key, { launch: ready }, "replay"),
+    recordWorkerExecution(workstream, key, { launch: ready }, "2026-01-01T00:00:30.000Z"),
     workstream,
   );
   assert.throws(
-    () => recordWorkerExecution(workstream, key, { launch: { ...ready, paneId: "other" } }, "t7"),
+    () =>
+      recordWorkerExecution(
+        workstream,
+        key,
+        { launch: { ...ready, paneId: "other" } },
+        "2026-01-01T00:00:07.000Z",
+      ),
     /progression/,
   );
   assert.throws(
-    () => recordWorkerExecution(workstream, key, { sessionFile: "/other.json" }, "t8"),
+    () =>
+      recordWorkerExecution(
+        workstream,
+        key,
+        { sessionFile: "/other.json" },
+        "2026-01-01T00:00:08.000Z",
+      ),
     /session file is immutable/,
   );
   const beforeReady = activateAttempt(add(), key, "before-ready", {
@@ -497,10 +599,21 @@ void test("launch checkpoints enforce ordered single-stage execution mutations",
     submission: "not_sent",
   });
   assert.throws(
-    () => recordWorkerExecution(beforeReady, key, { submission: "uncertain" }, "t9"),
+    () =>
+      recordWorkerExecution(
+        beforeReady,
+        key,
+        { submission: "uncertain" },
+        "2026-01-01T00:00:09.000Z",
+      ),
     /ready launch/,
   );
-  workstream = recordWorkerExecution(workstream, key, { submission: "uncertain" }, "t10");
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { submission: "uncertain" },
+    "2026-01-01T00:00:10.000Z",
+  );
   assert.throws(
     () =>
       recordWorkerExecution(
@@ -508,9 +621,9 @@ void test("launch checkpoints enforce ordered single-stage execution mutations",
         key,
         {
           launch: { phase: "pane", workspaceId: "workspace", paneId: "late" },
-          steering: { text: "Stop", state: "uncertain", observedAt: "t11" },
+          steering: { text: "Stop", state: "uncertain", observedAt: "2026-01-01T00:00:11.000Z" },
         },
-        "t11",
+        "2026-01-01T00:00:11.000Z",
       ),
     /exactly one new external-effect stage/,
   );
@@ -526,7 +639,7 @@ void test("pane to resource launch rejects workspace or pane identity mismatch",
           workstream,
           key,
           { launch: { ...resourceForTest(), ...identity } },
-          "t5",
+          "2026-01-01T00:00:05.000Z",
         ),
       /launch resource does not match its pane/,
     );
@@ -542,7 +655,7 @@ void test("non-pane launch rejects cwd that does not match placement", () => {
           workstream,
           key,
           { launch: { ...resourceForTest(), cwd: "/other" } },
-          "t5",
+          "2026-01-01T00:00:05.000Z",
         ),
       ),
     /launch cwd does not match its placement/,
@@ -558,7 +671,7 @@ void test("launch advancement cannot be combined with sent submission", () => {
         workstream,
         key,
         { launch: resourceForTest(), submission: "started" },
-        "t5",
+        "2026-01-01T00:00:05.000Z",
       ),
     /exactly one new external-effect stage/,
   );
@@ -614,7 +727,7 @@ void test("partial isolated launches preserve output until exact cleanup and rel
             workstream,
             key,
             { state: "completed", expectedHead: changedCommit, reason: "Too early." },
-            `early-release-${index}`,
+            `2026-01-01T00:00:20.00${index}Z`,
           ),
         ),
       /closed isolated ownership/,
@@ -673,7 +786,7 @@ void test("partial changed implementation release clears accounting without cand
     id: key.taskId,
     objective: "Implement.",
     intentIndex: 0,
-    createdAt: "t0",
+    createdAt: "2026-01-01T00:00:00.000Z",
     acceptance: ["It works."],
     attempts: [parentAttempt],
   };
@@ -683,7 +796,7 @@ void test("partial changed implementation release clears accounting without cand
     launch: resourceForTest(),
   };
   let workstream = finish(
-    createTask(base(), parentTask, "t1"),
+    createTask(base(), parentTask, "2026-01-01T00:00:01.000Z"),
     key.attemptId,
     reported("implementation"),
     key.taskId,
@@ -694,14 +807,14 @@ void test("partial changed implementation release clears accounting without cand
     workstream,
     key,
     { state: "completed", workerClosed: true, expectedHead: changedCommit },
-    "t5",
+    "2026-01-01T00:00:05.000Z",
   );
   const childTask = (taskId: string, attemptId: string): Task => ({
     kind: "implementation",
     id: taskId,
     objective: "Continue.",
     intentIndex: 1,
-    createdAt: "t6",
+    createdAt: "2026-01-01T00:00:06.000Z",
     acceptance: ["It works."],
     attempts: [
       attempt(attemptId, {
@@ -723,19 +836,24 @@ void test("partial changed implementation release clears accounting without cand
   });
   workstream = reviseIntent(
     workstream,
-    { ...intent, statement: "Continue.", recordedAt: "t6" },
-    "t6",
+    { ...intent, statement: "Continue.", recordedAt: "2026-01-01T00:00:06.000Z" },
+    "2026-01-01T00:00:06.000Z",
   );
   assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
   assert.throws(
-    () => createTask(workstream, childTask("Before release", "Before release attempt"), "t7"),
+    () =>
+      createTask(
+        workstream,
+        childTask("Before release", "Before release attempt"),
+        "2026-01-01T00:00:07.000Z",
+      ),
     /eligible retained output/,
   );
   workstream = checkpointOutputRelease(
     workstream,
     key,
     { state: "completed", expectedHead: changedCommit, reason: "Release partial output." },
-    "t8",
+    "2026-01-01T00:00:08.000Z",
   );
   assert.deepEqual(deriveCompletionAccounting(workstream), []);
   const releasedTask = findTask(workstream, key.taskId);
@@ -744,7 +862,12 @@ void test("partial changed implementation release clears accounting without cand
   assert.ok(releasedAttempt);
   assert.equal(outputDisposition(releasedTask, releasedAttempt).kind, "released");
   assert.throws(
-    () => createTask(workstream, childTask("After release", "After release attempt"), "t9"),
+    () =>
+      createTask(
+        workstream,
+        childTask("After release", "After release attempt"),
+        "2026-01-01T00:00:09.000Z",
+      ),
     /eligible retained output/,
   );
 });
@@ -793,7 +916,7 @@ void test("selection is one policy-owned target, while implementation retains gu
   let workstream = activateAttempt(
     add(),
     key,
-    "t2",
+    "2026-01-01T00:00:02.000Z",
     declare({ kind: "shared_project", path: "/repo" }),
   );
   const task = findTask(workstream, "Task opaque");
@@ -822,7 +945,12 @@ void test("selection is one policy-owned target, while implementation retains gu
     },
     submission: "not_sent" as const,
   };
-  workstream = recordWorkerExecution(workstream, key, { placement: execution.placement }, "t3");
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { placement: execution.placement },
+    "2026-01-01T00:00:03.000Z",
+  );
   const stagedTask = findTask(workstream, key.taskId);
   assert.ok(stagedTask);
   assert.equal(findAttempt(stagedTask, key.attemptId)?.execution?.launch, undefined);
@@ -830,39 +958,59 @@ void test("selection is one policy-owned target, while implementation retains gu
     workstream,
     key,
     { sessionFile: execution.sessionFile },
-    "t3a",
+    "2026-01-01T00:00:03.001Z",
   );
   workstream = recordWorkerExecution(
     workstream,
     key,
     { launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" } },
-    "t3b",
+    "2026-01-01T00:00:13.000Z",
   );
   workstream = recordWorkerExecution(
     workstream,
     key,
     { launch: { ...execution.launch, phase: "resource" as const } },
-    "t3c",
+    "2026-01-01T00:00:03.003Z",
   );
-  workstream = recordWorkerExecution(workstream, key, { launch: execution.launch }, "t3d");
-  workstream = recordWorkerExecution(workstream, key, { submission: "not_sent" }, "t3e");
-  workstream = recordWorkerExecution(workstream, key, { submission: "uncertain" }, "t3f");
-  workstream = recordWorkerExecution(workstream, key, { submission: "started" }, "t3g");
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { launch: execution.launch },
+    "2026-01-01T00:00:03.004Z",
+  );
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { submission: "not_sent" },
+    "2026-01-01T00:00:03.005Z",
+  );
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { submission: "uncertain" },
+    "2026-01-01T00:00:03.006Z",
+  );
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    { submission: "started" },
+    "2026-01-01T00:00:03.007Z",
+  );
   assert.strictEqual(
-    recordWorkerExecution(workstream, key, { submission: "started" }, "replay"),
+    recordWorkerExecution(workstream, key, { submission: "started" }, "2026-01-01T00:00:30.000Z"),
     workstream,
   );
   workstream = recordEffectiveModel(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { model: "provider/research", thinking: "low", source: "message" },
-    "t4",
+    "2026-01-01T00:00:04.000Z",
   );
   const duplicate = recordEffectiveModel(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { model: "provider/research", thinking: "low", source: "message" },
-    "t5",
+    "2026-01-01T00:00:05.000Z",
   );
   assert.strictEqual(duplicate, workstream);
   assert.throws(
@@ -876,16 +1024,25 @@ void test("selection is one policy-owned target, while implementation retains gu
             paneId: "other",
           },
         },
-        "t5",
+        "2026-01-01T00:00:05.000Z",
       ),
     /progression/,
   );
   const uncertainSteering = {
-    steering: { text: "Continue.", state: "uncertain" as const, observedAt: "t4a" },
+    steering: {
+      text: "Continue.",
+      state: "uncertain" as const,
+      observedAt: "2026-01-01T00:00:04.001Z",
+    },
   };
-  workstream = recordWorkerExecution(workstream, key, uncertainSteering, "t4a");
+  workstream = recordWorkerExecution(
+    workstream,
+    key,
+    uncertainSteering,
+    "2026-01-01T00:00:04.001Z",
+  );
   assert.strictEqual(
-    recordWorkerExecution(workstream, key, uncertainSteering, "replay"),
+    recordWorkerExecution(workstream, key, uncertainSteering, "2026-01-01T00:00:30.000Z"),
     workstream,
   );
   assert.throws(
@@ -893,35 +1050,47 @@ void test("selection is one policy-owned target, while implementation retains gu
       recordWorkerExecution(
         workstream,
         key,
-        { steering: { text: "Stop.", state: "uncertain", observedAt: "t4b" } },
-        "t4b",
+        { steering: { text: "Stop.", state: "uncertain", observedAt: "2026-01-01T00:00:04.002Z" } },
+        "2026-01-01T00:00:04.002Z",
       ),
     /cannot be overwritten/,
   );
   workstream = recordWorkerExecution(
     workstream,
     key,
-    { steering: { text: "Continue.", state: "submitted", observedAt: "t4c" } },
-    "t4c",
+    { steering: { text: "Continue.", state: "submitted", observedAt: "2026-01-01T00:00:04.003Z" } },
+    "2026-01-01T00:00:04.003Z",
   );
   assert.throws(
     () =>
       recordWorkerExecution(
         workstream,
         key,
-        { steering: { text: "Continue.", state: "uncertain", observedAt: "t4d" } },
-        "t4d",
+        {
+          steering: {
+            text: "Continue.",
+            state: "uncertain",
+            observedAt: "2026-01-01T00:00:04.004Z",
+          },
+        },
+        "2026-01-01T00:00:04.004Z",
       ),
     /progression is not exact/,
   );
   workstream = recordWorkerExecution(
     workstream,
     key,
-    { steering: { text: "Stop.", state: "uncertain", observedAt: "t4e" } },
-    "t4e",
+    { steering: { text: "Stop.", state: "uncertain", observedAt: "2026-01-01T00:00:04.005Z" } },
+    "2026-01-01T00:00:04.005Z",
   );
   assert.throws(
-    () => recordWorkerExecution(workstream, key, { submission: "not_sent" }, "t5a"),
+    () =>
+      recordWorkerExecution(
+        workstream,
+        key,
+        { submission: "not_sent" },
+        "2026-01-01T00:00:05.001Z",
+      ),
     /monotonic/,
   );
   const conflictedTask = findTask(workstream, key.taskId);
@@ -930,8 +1099,8 @@ void test("selection is one policy-owned target, while implementation retains gu
   workstream = checkpointCancellation(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
-    { state: "requested", requestedAt: "t6", reason: "Stop." },
-    "t6",
+    { state: "requested", requestedAt: "2026-01-01T00:00:06.000Z", reason: "Stop." },
+    "2026-01-01T00:00:06.000Z",
   );
   const updatedTask = findTask(workstream, "Task opaque");
   assert.ok(updatedTask);
@@ -939,50 +1108,54 @@ void test("selection is one policy-owned target, while implementation retains gu
   let late = activateAttempt(
     add(),
     { taskId: "Task opaque", attemptId: "Attempt A" },
-    "t7",
+    "2026-01-01T00:00:07.000Z",
     declare({ kind: "shared_project", path: "/repo" }),
   );
   late = recordWorkerExecution(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { placement: execution.placement },
-    "t8",
+    "2026-01-01T00:00:08.000Z",
   );
   late = checkpointCancellation(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
-    { state: "requested", requestedAt: "t9", reason: "Stop before worker session." },
-    "t9",
+    {
+      state: "requested",
+      requestedAt: "2026-01-01T00:00:09.000Z",
+      reason: "Stop before worker session.",
+    },
+    "2026-01-01T00:00:09.000Z",
   );
   late = recordWorkerExecution(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
-    { steering: { text: "Continue.", state: "uncertain", observedAt: "t9a" } },
-    "t9a",
+    { steering: { text: "Continue.", state: "uncertain", observedAt: "2026-01-01T00:00:09.001Z" } },
+    "2026-01-01T00:00:09.001Z",
   );
   late = recordWorkerExecution(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { sessionFile: execution.sessionFile },
-    "t10",
+    "2026-01-01T00:00:10.000Z",
   );
   late = recordWorkerExecution(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { launch: { phase: "pane", workspaceId: "workspace", paneId: "pane" } },
-    "t10a",
+    "2026-01-01T00:00:10.001Z",
   );
   late = recordWorkerExecution(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { launch: { ...execution.launch, phase: "resource" as const } },
-    "t10b",
+    "2026-01-01T00:00:10.002Z",
   );
   late = recordWorkerExecution(
     late,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { launch: execution.launch },
-    "t10c",
+    "2026-01-01T00:00:10.003Z",
   );
   const lateTask = findTask(late, "Task opaque");
   assert.ok(lateTask);
@@ -1001,7 +1174,7 @@ void test("grant is creation-only first grounding and revisions require a curren
     parentIntentConstraints: intent.constraints,
     narrowedRequest: "Continue.",
     targetRepository: repository,
-    issuedAt: "t0",
+    issuedAt: "2026-01-01T00:00:00.000Z",
   };
   const child = createWorkstream({
     id: "Child opaque",
@@ -1009,10 +1182,13 @@ void test("grant is creation-only first grounding and revisions require a curren
     repository,
     coordinator,
     intent: { ...intent, grounding: grant },
-    createdAt: "t0",
+    createdAt: "2026-01-01T00:00:00.000Z",
   });
   assert.equal(child.intents[0]?.grounding.kind, "handoff_grant");
-  assert.throws(() => reviseIntent(child, { ...intent, grounding: grant }, "t1"), /direct receipt/);
+  assert.throws(
+    () => reviseIntent(child, { ...intent, grounding: grant }, "2026-01-01T00:00:01.000Z"),
+    /direct receipt/,
+  );
   assert.equal(Value.Check(IntentSchema, { ...intent, grounding: grant }), true);
   assert.equal(Value.Check(HandoffGrantSchema, { ...grant, id: "" }), false);
   assert.throws(
@@ -1044,17 +1220,73 @@ void test("Handoff issuance retains direct and nested root receipt authority and
       parentIntentConstraints: intent.constraints,
       narrowedRequest: "Narrow child request",
       targetRepository: repository,
-      issuedAt: "t1",
+      issuedAt: "2026-01-01T00:00:01.000Z",
     },
   };
-  const parent = issueHandoff(base(), prepared, "t1");
+  const parent = issueHandoff(base(), prepared, "2026-01-01T00:00:01.000Z");
   assert.deepEqual(parent.handoffs?.[0]?.grant.parentReceipt, receipt);
   const sessionReady = checkpointHandoff(
     parent,
     { ...prepared, phase: "session_ready", childSessionFile: "/child.jsonl" },
-    "t2",
+    "2026-01-01T00:00:02.000Z",
   );
   assert.equal(sessionReady.handoffs?.[0]?.phase, "session_ready");
+  const suspendedParent = suspendWorkstream(
+    sessionReady,
+    { reason: "Hold.", suspendedAt: "2026-01-01T00:00:03.000Z" },
+    "2026-01-01T00:00:03.000Z",
+  );
+  assert.strictEqual(
+    checkpointHandoff(
+      suspendedParent,
+      { ...prepared, phase: "session_ready", childSessionFile: "/child.jsonl" },
+      "2026-01-01T00:00:04.000Z",
+    ),
+    suspendedParent,
+  );
+  assert.throws(
+    () =>
+      checkpointHandoff(
+        suspendedParent,
+        {
+          ...prepared,
+          phase: "workspace_submitting",
+          childSessionFile: "/child.jsonl",
+          workspaceLabel: "label",
+          agentName: "agent",
+        },
+        "2026-01-01T00:00:04.000Z",
+      ),
+    /active/,
+  );
+  assert.throws(
+    () =>
+      completeWorkstream(
+        parent,
+        {
+          conclusion: "Not launched.",
+          evidence: [{ label: "handoff", observation: "prepared" }],
+          limitations: [],
+          completedAt: "2026-01-01T00:00:04.000Z",
+        },
+        "2026-01-01T00:00:04.000Z",
+      ),
+    /not launched/,
+  );
+  const completedWithoutHandoff = completeWorkstream(
+    base(),
+    {
+      conclusion: "Done.",
+      evidence: [{ label: "state", observation: "done" }],
+      limitations: [],
+      completedAt: "2026-01-01T00:00:04.000Z",
+    },
+    "2026-01-01T00:00:04.000Z",
+  );
+  assert.throws(
+    () => validateWorkstream({ ...completedWithoutHandoff, handoffs: [prepared] }),
+    /unlaunched Handoff/,
+  );
   assert.throws(
     () =>
       checkpointHandoff(
@@ -1066,7 +1298,7 @@ void test("Handoff issuance retains direct and nested root receipt authority and
           workspaceLabel: "label",
           agentName: "agent",
         },
-        "t2",
+        "2026-01-01T00:00:02.000Z",
       ),
     /skipped/,
   );
@@ -1078,7 +1310,7 @@ void test("Handoff issuance retains direct and nested root receipt authority and
     repository,
     coordinator,
     intent: { ...intent, grounding: childGrant },
-    createdAt: "t0",
+    createdAt: "2026-01-01T00:00:00.000Z",
   });
   const nestedPrepared = {
     ...prepared,
@@ -1092,7 +1324,8 @@ void test("Handoff issuance retains direct and nested root receipt authority and
     },
   };
   assert.deepEqual(
-    issueHandoff(child, nestedPrepared, "t2").handoffs?.[0]?.grant.parentReceipt,
+    issueHandoff(child, nestedPrepared, "2026-01-01T00:00:02.000Z").handoffs?.[0]?.grant
+      .parentReceipt,
     receipt,
   );
   assert.throws(
@@ -1101,10 +1334,10 @@ void test("Handoff issuance retains direct and nested root receipt authority and
         suspendWorkstream(
           base(),
           { reason: "hold", suspendedAt: "2026-01-01T00:00:00.000Z" },
-          "t1",
+          "2026-01-01T00:00:01.000Z",
         ),
         prepared,
-        "t2",
+        "2026-01-01T00:00:02.000Z",
       ),
     /active/,
   );
@@ -1114,11 +1347,11 @@ void test("Handoff issuance retains direct and nested root receipt authority and
       conclusion: "done",
       evidence: [{ label: "state", observation: "done" }],
       limitations: [],
-      completedAt: "t1",
+      completedAt: "2026-01-01T00:00:01.000Z",
     },
-    "t1",
+    "2026-01-01T00:00:01.000Z",
   );
-  assert.throws(() => issueHandoff(completed, prepared, "t2"), /active/);
+  assert.throws(() => issueHandoff(completed, prepared, "2026-01-01T00:00:02.000Z"), /active/);
 });
 
 void test("coordinator transfer history preserves direct receipt ownership intervals", () => {
@@ -1154,11 +1387,11 @@ void test("coordinator transfer history preserves direct receipt ownership inter
         sessionFile: successor.sessionFile,
         source: "interactive",
         text: "Successor intent.",
-        receivedAt: "t2",
+        receivedAt: "2026-01-01T00:00:02.000Z",
       },
-      recordedAt: "t2",
+      recordedAt: "2026-01-01T00:00:02.000Z",
     },
-    "t2",
+    "2026-01-01T00:00:02.000Z",
   );
   validateWorkstream(revised);
 
@@ -1192,11 +1425,11 @@ void test("coordinator transfer history preserves direct receipt ownership inter
         sessionFile: third.sessionFile,
         source: "interactive",
         text: "Third coordinator intent.",
-        receivedAt: "t3",
+        receivedAt: "2026-01-01T00:00:03.000Z",
       },
-      recordedAt: "t3",
+      recordedAt: "2026-01-01T00:00:03.000Z",
     },
-    "t3",
+    "2026-01-01T00:00:03.000Z",
   );
   validateWorkstream(afterEqualBoundary);
   const originalGrounding = afterEqualBoundary.intents[0]?.grounding;
@@ -1213,7 +1446,12 @@ void test("coordinator transfer history preserves direct receipt ownership inter
   };
   assert.throws(() => validateWorkstream(rewritten), /Intent 0 direct receipt/);
   assert.throws(
-    () => reviseIntent(adopted, { ...intent, recordedAt: "t2" }, "t2"),
+    () =>
+      reviseIntent(
+        adopted,
+        { ...intent, recordedAt: "2026-01-01T00:00:02.000Z" },
+        "2026-01-01T00:00:02.000Z",
+      ),
     /current coordinator/,
   );
 
@@ -1226,11 +1464,11 @@ void test("coordinator transfer history preserves direct receipt ownership inter
     /must change coordinator identity|death observation|transfer history/,
   );
 
-  const noncanonical = structuredClone(adopted);
-  const transfer = noncanonical.coordinatorTransfers[0];
+  const nonworkstream = structuredClone(adopted);
+  const transfer = nonworkstream.coordinatorTransfers[0];
   assert.ok(transfer !== undefined);
   transfer.committedAt = "2024-01-02T01:00:00.000+01:00";
-  assert.throws(() => validateWorkstream(noncanonical), /Invalid canonical Workstream/);
+  assert.throws(() => validateWorkstream(nonworkstream), /Invalid Workstream/);
 });
 
 void test("report kind follows Task kind and first terminal replay uses structural equality", () => {
@@ -1248,9 +1486,9 @@ void test("report kind follows Task kind and first terminal replay uses structur
   const workstream = finish(add(), "Attempt A", reported());
   const reordered = {
     kind: "reported" as const,
-    observedAt: "t2",
+    observedAt: "2026-01-01T00:00:02.000Z",
     artifacts: [],
-    deliveryRequestedAt: "t3",
+    deliveryRequestedAt: "2026-01-01T00:00:03.000Z",
     report: {
       findings: [],
       evidence: [],
@@ -1275,9 +1513,9 @@ void test("terminal failures and cancellation settle once operational obligation
   );
   workstream = finish(workstream, "Failed", {
     kind: "reported",
-    observedAt: "t2",
+    observedAt: "2026-01-01T00:00:02.000Z",
     artifacts: [],
-    deliveryRequestedAt: "t3",
+    deliveryRequestedAt: "2026-01-01T00:00:03.000Z",
     report: {
       kind: "research",
       status: "failed",
@@ -1289,14 +1527,14 @@ void test("terminal failures and cancellation settle once operational obligation
   workstream = recordDeliveryFailure(
     workstream,
     { taskId: "Task opaque", attemptId: "Failed" },
-    { at: "t3", detail: "Retry delivery." },
-    "t3",
+    { at: "2026-01-01T00:00:03.000Z", detail: "Retry delivery." },
+    "2026-01-01T00:00:03.000Z",
   );
   workstream = deliver(workstream, "Failed");
   workstream = deliver(finish(workstream, "Cancelled", cancelled()), "Cancelled");
   assert.deepEqual(deriveCompletionAccounting(workstream), []);
   let fanout = deliver(finish(add(), "Attempt A", reported()), "Attempt A");
-  fanout = appendAttempts(fanout, "Task opaque", [attempt("Sibling")], "t5");
+  fanout = appendAttempts(fanout, "Task opaque", [attempt("Sibling")], "2026-01-01T00:00:05.000Z");
   assert.equal(findTask(fanout, "Task opaque")?.attempts.length, 2);
   workstream = completeWorkstream(
     workstream,
@@ -1304,13 +1542,16 @@ void test("terminal failures and cancellation settle once operational obligation
       conclusion: "Settled.",
       evidence: [{ label: "check", observation: "done" }],
       limitations: [],
-      completedAt: "t5",
+      completedAt: "2026-01-01T00:00:05.000Z",
     },
-    "t5",
+    "2026-01-01T00:00:05.000Z",
   );
   assert.deepEqual(workstream.completion?.accounting, []);
-  assert.throws(() => createTask(workstream, researchTask("New"), "t6"), /completed/);
-  assert.throws(() => reviseIntent(workstream, intent, "t6"), /completed/);
+  assert.throws(
+    () => createTask(workstream, researchTask("New"), "2026-01-01T00:00:06.000Z"),
+    /completed/,
+  );
+  assert.throws(() => reviseIntent(workstream, intent, "2026-01-01T00:00:06.000Z"), /completed/);
 });
 
 void test("appendAttempts is one atomic nonempty batch that preserves order and validates the result", () => {
@@ -1319,7 +1560,7 @@ void test("appendAttempts is one atomic nonempty batch that preserves order and 
     stable,
     "Task opaque",
     [attempt("Attempt B"), attempt("Attempt C"), attempt("Attempt D")],
-    "t5",
+    "2026-01-01T00:00:05.000Z",
   );
   assert.deepEqual(
     findTask(batch, "Task opaque")?.attempts.map((item) => item.id),
@@ -1328,10 +1569,18 @@ void test("appendAttempts is one atomic nonempty batch that preserves order and 
   assert.equal(batch.revision, stable.revision + 1);
   validateWorkstream(batch);
 
-  assert.throws(() => appendAttempts(stable, "Task opaque", [], "t5"), /at least one new Attempt/);
+  assert.throws(
+    () => appendAttempts(stable, "Task opaque", [], "2026-01-01T00:00:05.000Z"),
+    /at least one new Attempt/,
+  );
   assert.throws(
     () =>
-      appendAttempts(stable, "Task opaque", [{ ...attempt("Attempt B"), state: "active" }], "t5"),
+      appendAttempts(
+        stable,
+        "Task opaque",
+        [{ ...attempt("Attempt B"), state: "active" }],
+        "2026-01-01T00:00:05.000Z",
+      ),
     /pristine and queued/,
   );
   assert.throws(
@@ -1348,12 +1597,12 @@ void test("appendAttempts is one atomic nonempty batch that preserves order and 
             },
           }),
         ],
-        "t5",
+        "2026-01-01T00:00:05.000Z",
       ),
     /does not match Task kind/,
   );
   assert.throws(
-    () => appendAttempts(stable, "Unknown", [attempt("Attempt B")], "t5"),
+    () => appendAttempts(stable, "Unknown", [attempt("Attempt B")], "2026-01-01T00:00:05.000Z"),
     /Unknown Task/,
   );
   assert.throws(
@@ -1363,7 +1612,7 @@ void test("appendAttempts is one atomic nonempty batch that preserves order and 
           stable,
           "Task opaque",
           [attempt("Attempt B", { continuationOf: "Attempt A" })],
-          "t5",
+          "2026-01-01T00:00:05.000Z",
         ),
       ),
     /retained closed Worker session/,
@@ -1373,7 +1622,12 @@ void test("appendAttempts is one atomic nonempty batch that preserves order and 
   const unstable = finish(add(), "Attempt A", reported());
   assert.throws(
     () =>
-      appendAttempts(unstable, "Task opaque", [attempt("Attempt B"), attempt("Attempt C")], "t5"),
+      appendAttempts(
+        unstable,
+        "Task opaque",
+        [attempt("Attempt B"), attempt("Attempt C")],
+        "2026-01-01T00:00:05.000Z",
+      ),
     /operationally unstable/,
   );
   assert.equal(findTask(unstable, "Task opaque")?.attempts.length, 1);
@@ -1399,9 +1653,9 @@ void test("isolated failed output remains blocked through cleanup until exact re
     "Attempt A",
     {
       kind: "reported",
-      observedAt: "t2",
+      observedAt: "2026-01-01T00:00:02.000Z",
       artifacts: [],
-      deliveryRequestedAt: "t3",
+      deliveryRequestedAt: "2026-01-01T00:00:03.000Z",
       report: {
         kind: "research",
         status: "failed",
@@ -1422,7 +1676,7 @@ void test("isolated failed output remains blocked through cleanup until exact re
       expectedHead: changedCommit,
       error: "Checkout cleanup interrupted.",
     },
-    "t4",
+    "2026-01-01T00:00:04.000Z",
   );
   const isolatedTask = findTask(workstream, "Task opaque");
   assert.ok(isolatedTask);
@@ -1436,28 +1690,28 @@ void test("isolated failed output remains blocked through cleanup until exact re
       conclusion: "Stopped with retained output.",
       evidence: [{ label: "failure", observation: "retained" }],
       limitations: [],
-      completedAt: "t5",
+      completedAt: "2026-01-01T00:00:05.000Z",
     },
-    "t5",
+    "2026-01-01T00:00:05.000Z",
   );
   assert.notDeepEqual(workstream.completion?.accounting, []);
   workstream = deliver(workstream, "Attempt A");
   assert.throws(
-    () => appendAttempts(workstream, "Task opaque", [attempt("Later")], "t6"),
+    () => appendAttempts(workstream, "Task opaque", [attempt("Later")], "2026-01-01T00:00:06.000Z"),
     /completed/,
   );
   workstream = checkpointOutputRelease(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { state: "completed", expectedHead: changedCommit, reason: "Discard failed checkout." },
-    "t6",
+    "2026-01-01T00:00:06.000Z",
   );
   assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
   workstream = checkpointCleanup(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { state: "completed", workerClosed: true, expectedHead: changedCommit },
-    "t6a",
+    "2026-01-01T00:00:06.001Z",
   );
   assert.deepEqual(deriveCompletionAccounting(workstream), []);
   assert.throws(
@@ -1472,7 +1726,7 @@ void test("isolated failed output remains blocked through cleanup until exact re
           rootCommit: baseCommit,
           commits: [commit("d"), changedCommit],
         },
-        "t7",
+        "2026-01-01T00:00:07.000Z",
       ),
     /no existing application obligation/,
   );
@@ -1483,9 +1737,9 @@ void test("isolated failed output remains blocked through cleanup until exact re
       conclusion: "Shared settled.",
       evidence: [{ label: "done", observation: "done" }],
       limitations: [],
-      completedAt: "t5",
+      completedAt: "2026-01-01T00:00:05.000Z",
     },
-    "t5",
+    "2026-01-01T00:00:05.000Z",
   );
   // A shared placement is settled by exact Worker closure; once cleanup is
   // completed it cannot be replayed with different identity.
@@ -1499,7 +1753,7 @@ void test("isolated failed output remains blocked through cleanup until exact re
           workerClosed: true,
           expectedHead: baseCommit,
         },
-        "t6",
+        "2026-01-01T00:00:06.000Z",
       ),
     /not monotonic/,
   );
@@ -1528,7 +1782,7 @@ void test("an exact completed release and cleanup is operationally stable", () =
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { state: "completed", workerClosed: true, expectedHead: changedCommit },
-    "t4",
+    "2026-01-01T00:00:04.000Z",
   );
   const released = structuredClone(workstream);
   const releasedTask = released.tasks[0];
@@ -1563,7 +1817,7 @@ void test("shared Worker closure and delivery gate reattempt and accounting", ()
   let workstream = finish(add(), "Attempt A", reported(), "Task opaque", execution);
   assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
   assert.throws(
-    () => appendAttempts(workstream, "Task opaque", [attempt("Later")], "t3"),
+    () => appendAttempts(workstream, "Task opaque", [attempt("Later")], "2026-01-01T00:00:03.000Z"),
     /operationally unstable/,
   );
   workstream = deliver(workstream, "Attempt A");
@@ -1572,11 +1826,17 @@ void test("shared Worker closure and delivery gate reattempt and accounting", ()
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { state: "blocked", workerClosed: true, error: "Worker cleanup blocked." },
-    "t5",
+    "2026-01-01T00:00:05.000Z",
   );
   assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
   assert.throws(
-    () => appendAttempts(workstream, "Task opaque", [attempt("Still blocked")], "t6"),
+    () =>
+      appendAttempts(
+        workstream,
+        "Task opaque",
+        [attempt("Still blocked")],
+        "2026-01-01T00:00:06.000Z",
+      ),
     /operationally unstable/,
   );
   workstream = completeWorkstream(
@@ -1585,15 +1845,15 @@ void test("shared Worker closure and delivery gate reattempt and accounting", ()
       conclusion: "Shared worker is closed only after recovery.",
       evidence: [{ label: "cleanup", observation: "blocked" }],
       limitations: [],
-      completedAt: "t7",
+      completedAt: "2026-01-01T00:00:07.000Z",
     },
-    "t7",
+    "2026-01-01T00:00:07.000Z",
   );
   workstream = checkpointCleanup(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
     { state: "completed", workerClosed: true },
-    "t8",
+    "2026-01-01T00:00:08.000Z",
   );
   assert.deepEqual(deriveCompletionAccounting(workstream), []);
 });
@@ -1628,11 +1888,11 @@ void test("implementation candidate ancestry may cross Intents but application i
     id: "Parent Task",
     objective: "Implement.",
     intentIndex: 0,
-    createdAt: "t0",
+    createdAt: "2026-01-01T00:00:00.000Z",
     acceptance: ["It works."],
     attempts: [parentAttempt],
   };
-  let workstream = createTask(base(), parentTask, "t1");
+  let workstream = createTask(base(), parentTask, "2026-01-01T00:00:01.000Z");
   workstream = finish(
     workstream,
     "Parent Attempt",
@@ -1651,13 +1911,13 @@ void test("implementation candidate ancestry may cross Intents but application i
       commits: [commit("d"), changedCommit],
       revision: commit("c"),
     },
-    "t3",
+    "2026-01-01T00:00:03.000Z",
   );
   workstream = checkpointCleanup(
     workstream,
     { taskId: "Parent Task", attemptId: "Parent Attempt" },
     { state: "completed", workerClosed: true, expectedHead: changedCommit },
-    "t4",
+    "2026-01-01T00:00:04.000Z",
   );
   const settledParentTask = findTask(workstream, "Parent Task");
   assert.ok(settledParentTask);
@@ -1666,8 +1926,8 @@ void test("implementation candidate ancestry may cross Intents but application i
   assert.equal(outputDisposition(settledParentTask, settledParentAttempt).kind, "retain_branch");
   const retained = reviseIntent(
     workstream,
-    { ...intent, statement: "Revise.", recordedAt: "t5" },
-    "t5",
+    { ...intent, statement: "Revise.", recordedAt: "2026-01-01T00:00:05.000Z" },
+    "2026-01-01T00:00:05.000Z",
   );
   const childAttempt = attempt("Child Attempt", {
     baseRevision: changedCommit,
@@ -1689,18 +1949,18 @@ void test("implementation candidate ancestry may cross Intents but application i
     id: "Child Task",
     objective: "Correct.",
     intentIndex: 1,
-    createdAt: "t5",
+    createdAt: "2026-01-01T00:00:05.000Z",
     acceptance: ["It works."],
     attempts: [childAttempt],
   };
-  workstream = createTask(retained, childTask, "t6");
+  workstream = createTask(retained, childTask, "2026-01-01T00:00:06.000Z");
   assert.equal(findTask(workstream, "Child Task")?.intentIndex, 1);
 
   const released = checkpointOutputRelease(
     retained,
     { taskId: "Parent Task", attemptId: "Parent Attempt" },
     { state: "completed", expectedHead: changedCommit, reason: "Released." },
-    "t6b",
+    "2026-01-01T00:00:06.002Z",
   );
   assert.throws(
     () =>
@@ -1711,7 +1971,7 @@ void test("implementation candidate ancestry may cross Intents but application i
           id: "Released Child Task",
           attempts: [{ ...childAttempt, id: "Released Child Attempt" }],
         },
-        "t7",
+        "2026-01-01T00:00:07.000Z",
       ),
     /eligible retained output/,
   );
@@ -1722,7 +1982,7 @@ void test("activation declares durable placement before any external effect", ()
   const placement = { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" };
 
   // The declaration is placement plus the initial not-sent submission checkpoint.
-  const declared = activateAttempt(add(), key, "t1", declare(placement));
+  const declared = activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", declare(placement));
   assert.deepEqual(declared.tasks[0]?.attempts[0]?.execution, {
     placement,
     submission: "not_sent",
@@ -1730,16 +1990,20 @@ void test("activation declares durable placement before any external effect", ()
 
   // A missing placement or a pre-progressed submission can never begin activation.
   assert.throws(
-    () => activateAttempt(add(), key, "t1", { submission: "not_sent" }),
-    /exact placement and not-sent submission/,
-  );
-  assert.throws(
-    () => activateAttempt(add(), key, "t1", { placement, submission: "uncertain" }),
+    () => activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", { submission: "not_sent" }),
     /exact placement and not-sent submission/,
   );
   assert.throws(
     () =>
-      activateAttempt(add(), key, "t1", {
+      activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", {
+        placement,
+        submission: "uncertain",
+      }),
+    /exact placement and not-sent submission/,
+  );
+  assert.throws(
+    () =>
+      activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", {
         placement,
         submission: "not_sent",
         sessionFile: "/worker.json",
@@ -1755,7 +2019,12 @@ void test("activation declares durable placement before any external effect", ()
   Reflect.deleteProperty(undeclaredAttempt, "execution");
   assert.throws(() => validateWorkstream(undeclared), /exact placement declaration/);
 
-  const progressed = recordWorkerExecution(declared, key, { sessionFile: "/worker.json" }, "t2");
+  const progressed = recordWorkerExecution(
+    declared,
+    key,
+    { sessionFile: "/worker.json" },
+    "2026-01-01T00:00:02.000Z",
+  );
   const progressedActive = progressed.tasks[0]?.attempts[0]?.execution;
   assert.ok(progressedActive);
   Reflect.deleteProperty(progressedActive, "submission");
@@ -1765,74 +2034,118 @@ void test("activation declares durable placement before any external effect", ()
 void test("cancellation is one monotonic interrupt protocol with exact evidence", () => {
   const key = { taskId: "Task opaque", attemptId: "Attempt A" };
   const placement = { kind: "shared_project" as const, path: "/repo" };
-  const active = activateAttempt(add(), key, "t1", declare(placement));
-  const requested = { state: "requested" as const, requestedAt: "t2", reason: "Stop." };
-  const uncertain = { ...requested, state: "uncertain" as const, dispatchAt: "t3" };
+  const active = activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", declare(placement));
+  const requested = {
+    state: "requested" as const,
+    requestedAt: "2026-01-01T00:00:02.000Z",
+    reason: "Stop.",
+  };
+  const uncertain = {
+    ...requested,
+    state: "uncertain" as const,
+    dispatchAt: "2026-01-01T00:00:03.000Z",
+  };
   const observed = {
     ...uncertain,
     state: "submitted_or_observed" as const,
-    observedAt: "t4",
+    observedAt: "2026-01-01T00:00:04.000Z",
     evidence: "done" as const,
   };
 
-  let workstream = checkpointCancellation(active, key, requested, "t2");
+  let workstream = checkpointCancellation(active, key, requested, "2026-01-01T00:00:02.000Z");
   assert.equal(workstream.tasks[0]?.attempts[0]?.execution?.cancellation?.state, "requested");
   // Exact replay is a structural no-op; the request identity and reason persist.
-  assert.strictEqual(checkpointCancellation(workstream, key, requested, "t2b"), workstream);
+  assert.strictEqual(
+    checkpointCancellation(workstream, key, requested, "2026-01-01T00:00:02.002Z"),
+    workstream,
+  );
   // No skip and no backward move.
-  assert.throws(() => checkpointCancellation(workstream, key, observed, "t2c"), /not monotonic/);
+  assert.throws(
+    () => checkpointCancellation(workstream, key, observed, "2026-01-01T00:00:02.003Z"),
+    /not monotonic/,
+  );
   // A different request identity cannot overwrite the durable request.
   assert.throws(
     () =>
       checkpointCancellation(
         workstream,
         key,
-        { state: "uncertain", requestedAt: "t9", reason: "Other.", dispatchAt: "t3" },
-        "t2e",
+        {
+          state: "uncertain",
+          requestedAt: "2026-01-01T00:00:09.000Z",
+          reason: "Other.",
+          dispatchAt: "2026-01-01T00:00:03.000Z",
+        },
+        "2026-01-01T00:00:02.005Z",
       ),
     /not monotonic/,
   );
-  workstream = checkpointCancellation(workstream, key, uncertain, "t3");
+  workstream = checkpointCancellation(workstream, key, uncertain, "2026-01-01T00:00:03.000Z");
   assert.equal(workstream.tasks[0]?.attempts[0]?.execution?.cancellation?.state, "uncertain");
   assert.throws(
-    () => checkpointCancellation(workstream, key, { ...uncertain, dispatchAt: "t9" }, "t3b"),
+    () =>
+      checkpointCancellation(
+        workstream,
+        key,
+        { ...uncertain, dispatchAt: "2026-01-01T00:00:09.000Z" },
+        "2026-01-01T00:00:13.000Z",
+      ),
     /not monotonic/,
   );
-  workstream = checkpointCancellation(workstream, key, observed, "t4");
+  workstream = checkpointCancellation(workstream, key, observed, "2026-01-01T00:00:04.000Z");
   const terminal = workstream.tasks[0]?.attempts[0]?.execution?.cancellation;
   assert.deepEqual(terminal, observed);
-  assert.strictEqual(checkpointCancellation(workstream, key, observed, "t4b"), workstream);
+  assert.strictEqual(
+    checkpointCancellation(workstream, key, observed, "2026-01-01T00:00:04.002Z"),
+    workstream,
+  );
   // A terminal checkpoint cannot be rewritten or moved backward.
-  assert.throws(() => checkpointCancellation(workstream, key, uncertain, "t5"), /not monotonic/);
+  assert.throws(
+    () => checkpointCancellation(workstream, key, uncertain, "2026-01-01T00:00:05.000Z"),
+    /not monotonic/,
+  );
 
   // An active cancelled settlement needs both observed cancellation and durable
   // closure; while active, cleanup may only be the cancellation path's start.
   const pending = { state: "pending" as const, workerClosed: true };
-  assert.throws(() => terminalizeAttempt(active, key, cancelled(), "t5"), /submitted-or-observed/);
   assert.throws(
-    () => terminalizeAttempt(workstream, key, cancelled(), "t5"),
+    () => terminalizeAttempt(active, key, cancelled(), "2026-01-01T00:00:05.000Z"),
+    /submitted-or-observed/,
+  );
+  assert.throws(
+    () => terminalizeAttempt(workstream, key, cancelled(), "2026-01-01T00:00:05.000Z"),
     /durable Worker closure/,
   );
-  assert.throws(() => checkpointCleanup(active, key, pending, "t5"), /observed cancellation/);
   assert.throws(
-    () => checkpointCleanup(workstream, key, { state: "completed", workerClosed: true }, "t5"),
+    () => checkpointCleanup(active, key, pending, "2026-01-01T00:00:05.000Z"),
+    /observed cancellation/,
+  );
+  assert.throws(
+    () =>
+      checkpointCleanup(
+        workstream,
+        key,
+        { state: "completed", workerClosed: true },
+        "2026-01-01T00:00:05.000Z",
+      ),
     /only begin pending/,
   );
   // The fully proven path settles cancelled, then ordinary cleanup resumes.
-  const closed = checkpointCleanup(workstream, key, pending, "t6");
-  const settled = terminalizeAttempt(closed, key, cancelled(), "t7");
+  const closed = checkpointCleanup(workstream, key, pending, "2026-01-01T00:00:06.000Z");
+  const settled = terminalizeAttempt(closed, key, cancelled(), "2026-01-01T00:00:07.000Z");
   assert.equal(settled.tasks[0]?.attempts[0]?.state, "finished");
   assert.equal(settled.tasks[0]?.attempts[0]?.outcome?.kind, "cancelled");
   const completed = checkpointCleanup(
     settled,
     key,
     { state: "completed", workerClosed: true, expectedHead: changedCommit },
-    "t8",
+    "2026-01-01T00:00:08.000Z",
   );
   assert.equal(completed.tasks[0]?.attempts[0]?.cleanup?.state, "completed");
   // A queued pristine Attempt settles cancelled without any Worker facts.
   assert.equal(
-    terminalizeAttempt(add(), key, cancelled(), "t9").tasks[0]?.attempts[0]?.state,
+    terminalizeAttempt(add(), key, cancelled(), "2026-01-01T00:00:09.000Z").tasks[0]?.attempts[0]
+      ?.state,
     "finished",
   );
 });
@@ -1840,22 +2153,30 @@ void test("cancellation is one monotonic interrupt protocol with exact evidence"
 void test("persisted read validation mirrors cancellation settlement and completion lifecycle", () => {
   const key = { taskId: "Task opaque", attemptId: "Attempt A" };
   const placement = { kind: "shared_project" as const, path: "/repo" };
-  const requested = { state: "requested" as const, requestedAt: "t2", reason: "Stop." };
-  const uncertain = { ...requested, state: "uncertain" as const, dispatchAt: "t3" };
+  const requested = {
+    state: "requested" as const,
+    requestedAt: "2026-01-01T00:00:02.000Z",
+    reason: "Stop.",
+  };
+  const uncertain = {
+    ...requested,
+    state: "uncertain" as const,
+    dispatchAt: "2026-01-01T00:00:03.000Z",
+  };
   const observed = {
     ...uncertain,
     state: "submitted_or_observed" as const,
-    observedAt: "t4",
+    observedAt: "2026-01-01T00:00:04.000Z",
     evidence: "done" as const,
   };
   let active = checkpointCancellation(
-    activateAttempt(add(), key, "t1", declare(placement)),
+    activateAttempt(add(), key, "2026-01-01T00:00:01.000Z", declare(placement)),
     key,
     requested,
-    "t2",
+    "2026-01-01T00:00:02.000Z",
   );
-  active = checkpointCancellation(active, key, uncertain, "t3");
-  active = checkpointCancellation(active, key, observed, "t4");
+  active = checkpointCancellation(active, key, uncertain, "2026-01-01T00:00:03.000Z");
+  active = checkpointCancellation(active, key, observed, "2026-01-01T00:00:04.000Z");
 
   // A pending active cancellation cleanup and a pristine queued cancellation
   // settlement are both valid persisted states.
@@ -1863,10 +2184,12 @@ void test("persisted read validation mirrors cancellation settlement and complet
     active,
     key,
     { state: "pending", workerClosed: true },
-    "t5",
+    "2026-01-01T00:00:05.000Z",
   );
   assert.doesNotThrow(() => validateWorkstream(pendingCleanup));
-  assert.doesNotThrow(() => validateWorkstream(terminalizeAttempt(add(), key, cancelled(), "t5")));
+  assert.doesNotThrow(() =>
+    validateWorkstream(terminalizeAttempt(add(), key, cancelled(), "2026-01-01T00:00:05.000Z")),
+  );
 
   // Active completed or blocked cleanup is rejected on read exactly as the
   // transition boundary rejects it.
@@ -1883,7 +2206,7 @@ void test("persisted read validation mirrors cancellation settlement and complet
 
   // A finished cancelled Worker settlement keeps its exact interruption proof and
   // durable Worker closure on read.
-  const settled = terminalizeAttempt(pendingCleanup, key, cancelled(), "t6");
+  const settled = terminalizeAttempt(pendingCleanup, key, cancelled(), "2026-01-01T00:00:06.000Z");
   assert.doesNotThrow(() => validateWorkstream(settled));
   const withoutCancellation = structuredClone(settled);
   const uncancelledAttempt = withoutCancellation.tasks[0]?.attempts[0];
@@ -1903,9 +2226,9 @@ void test("persisted read validation mirrors cancellation settlement and complet
       conclusion: "Complete.",
       evidence: [{ label: "completion", observation: "The Workstream completed." }],
       limitations: [],
-      completedAt: "t6",
+      completedAt: "2026-01-01T00:00:06.000Z",
     },
-    "t6",
+    "2026-01-01T00:00:06.000Z",
   );
   const stillWorking = structuredClone(complete);
   const task = stillWorking.tasks[0];
@@ -1930,12 +2253,27 @@ void test("delivery attempt counts are exact against failure history", () => {
   assert.ok(corruptedDelivery);
   corruptedDelivery.attemptCount = 1;
   assert.throws(() => validateWorkstream(corrupted), /attempt count is not exact/);
-  let failed = recordDeliveryFailure(pending, key, { at: "t3", detail: "Retry." }, "t3");
-  failed = recordDeliveryFailure(failed, key, { at: "t4", detail: "Retry again." }, "t4");
+  let failed = recordDeliveryFailure(
+    pending,
+    key,
+    { at: "2026-01-01T00:00:03.000Z", detail: "Retry." },
+    "2026-01-01T00:00:03.000Z",
+  );
+  failed = recordDeliveryFailure(
+    failed,
+    key,
+    { at: "2026-01-01T00:00:04.000Z", detail: "Retry again." },
+    "2026-01-01T00:00:04.000Z",
+  );
   const failedDelivery = failed.tasks[0]?.attempts[0]?.outcome?.delivery;
   assert.equal(failedDelivery?.attemptCount, 2);
   assert.equal(failedDelivery?.failureHistory.length, 2);
-  const accepted = recordDeliverySuccess(failed, key, "t5", "t5");
+  const accepted = recordDeliverySuccess(
+    failed,
+    key,
+    "2026-01-01T00:00:05.000Z",
+    "2026-01-01T00:00:05.000Z",
+  );
   const acceptedDelivery = accepted.tasks[0]?.attempts[0]?.outcome?.delivery;
   assert.equal(acceptedDelivery?.attemptCount, 3);
   assert.equal(acceptedDelivery?.failureHistory.length, 2);

@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/any-unknown-in-error-context, effecttsgo/global-error-in-effect-failure, typescript/no-this-alias, anti-slop/no-conditional-empty-object-spread, anti-slop/no-runtime-typeof -- The controller composes independently typed canonical/host failures at the single Pi Promise boundary; messages are bounded before presentation, optional properties retain exact external schemas, and the delivery closure must retain its controller owner. */
+/* oxlint-disable effecttsgo/any-unknown-in-error-context, effecttsgo/global-error-in-effect-failure, typescript/no-this-alias, anti-slop/no-conditional-empty-object-spread, anti-slop/no-runtime-typeof -- The controller composes independently typed workstream/host failures at the single Pi Promise boundary; messages are bounded before presentation, optional properties retain exact external schemas, and the delivery closure must retain its controller owner. */
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -14,26 +14,7 @@ import {
 } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import {
-  type CanonicalHostOptions,
-  liveCanonicalCommandPorts,
-  makeLiveCanonicalReconciliationDriver,
-} from "./canonical-host.js";
-import {
-  type CanonicalActionProjection,
-  type CanonicalInspectionRequest,
-  type CanonicalInspectionView,
-  canonicalOutcomeNotification,
-  inspectCanonical,
-  projectCanonicalAction,
-} from "./canonical-inspection.js";
-import { ReconciliationDriverError } from "./canonical-reconciliation.js";
-import { CanonicalRuntime, type CanonicalRuntimeOwnership } from "./canonical-runtime.js";
-import {
-  type CanonicalStoreAttachment,
-  CanonicalWorkstreamStore,
-} from "./canonical-workstream-store.js";
-import type { HumanInputReceiptData } from "./domain/workstream.js";
+import type { HumanInputReceiptData } from "../domain/workstream.js";
 import {
   type CoordinatorIdentity,
   createWorkstream,
@@ -44,19 +25,36 @@ import {
   type RepositoryIdentity,
   type Workstream,
   WorkstreamSchema,
-} from "./domain/workstream.js";
-import { GitRepository, inspectRepository } from "./git.js";
+} from "../domain/workstream.js";
+import { GitRepository, inspectRepository } from "../git.js";
 import {
   deterministicChildSessionId,
   handoffChildWorkstreamId,
   prepareHandoffSession,
   priorDiscussion,
-} from "./handoff-session.js";
-import { type CoordinatorLaunchResource, HerdrCliRuntime } from "./herdr.js";
-import { herdrCoordinatorNames } from "./herdr-naming.js";
+} from "../handoff-session.js";
+import { HerdrCliRuntime } from "../herdr.js";
+import type { CoordinatorLaunchResource } from "../herdr-identity.js";
+import { herdrCoordinatorNames } from "../herdr-naming.js";
+import { WorkstreamStore, type WorkstreamStoreAttachment } from "../storage/workstream-store.js";
+import {
+  liveWorkstreamCommandPorts,
+  makeLiveWorkstreamReconciliationDriver,
+  type WorkstreamHostOptions,
+} from "./host.js";
+import {
+  inspectWorkstream,
+  projectWorkstreamAction,
+  type WorkstreamActionProjection,
+  type WorkstreamInspectionRequest,
+  type WorkstreamInspectionView,
+  workstreamOutcomeNotification,
+} from "./inspection.js";
+import { ReconciliationDriverError } from "./reconciliation.js";
+import { WorkstreamRuntime, type WorkstreamRuntimeOwnership } from "./runtime.js";
 
-export const CANONICAL_POINTER_ENTRY = "pi-workgraph-canonical-workstream";
-const CANONICAL_MESSAGE = "pi-workgraph-workstream";
+export const WORKSTREAM_POINTER_ENTRY = "pi-workgraph-workstream-pointer";
+const WORKSTREAM_MESSAGE = "pi-workgraph-workstream";
 const ATTENTION_MESSAGE = "pi-workgraph-attention";
 
 class CoordinatorHostError extends Data.TaggedError("CoordinatorHostError")<{
@@ -78,7 +76,7 @@ const PointerBase = {
   workstreamId: NonBlank,
   repository: PointerRepositorySchema,
 };
-export const CanonicalWorkstreamPointerSchema = Type.Union([
+export const WorkstreamPointerSchema = Type.Union([
   Type.Object(
     {
       ...PointerBase,
@@ -129,19 +127,19 @@ export const CanonicalWorkstreamPointerSchema = Type.Union([
     { additionalProperties: false },
   ),
 ]);
-export type CanonicalWorkstreamPointer = Static<typeof CanonicalWorkstreamPointerSchema>;
-export type CanonicalPointerRestoration = CanonicalWorkstreamPointer | "malformed" | undefined;
+export type WorkstreamPointer = Static<typeof WorkstreamPointerSchema>;
+export type WorkstreamPointerRestoration = WorkstreamPointer | "malformed" | undefined;
 
-export interface CanonicalCoordinatorControllerOptions {
+export interface WorkstreamCoordinatorControllerOptions {
   readonly workers?: () => HerdrCliRuntime;
   readonly workspaceId?: string;
   readonly policyPath?: string;
-  readonly hostOverrides?: CanonicalHostOptions["overrides"];
+  readonly hostOverrides?: WorkstreamHostOptions["overrides"];
 }
 
 type Requirements = FileSystem.FileSystem | Path.Path;
 type Active = {
-  readonly runtime: CanonicalRuntime;
+  readonly runtime: WorkstreamRuntime;
   readonly scope: Scope.Closeable;
   readonly path: string;
   readonly id: string;
@@ -149,7 +147,7 @@ type Active = {
   readonly owner: CoordinatorIdentity;
 };
 
-export class CanonicalCoordinatorController {
+export class WorkstreamCoordinatorController {
   private active: Active | undefined;
   private pointerBlocked = false;
   private startupFailure: string | undefined;
@@ -157,7 +155,7 @@ export class CanonicalCoordinatorController {
 
   constructor(
     private readonly pi: ExtensionAPI,
-    private readonly options: CanonicalCoordinatorControllerOptions,
+    private readonly options: WorkstreamCoordinatorControllerOptions,
     private readonly publish: (ctx: ExtensionContext, state?: Workstream) => void,
   ) {}
 
@@ -172,9 +170,9 @@ export class CanonicalCoordinatorController {
     return this.semaphore.withPermit(effect);
   }
 
-  restore(ctx: ExtensionContext, retained: () => CanonicalPointerRestoration) {
+  restore(ctx: ExtensionContext, retained: () => WorkstreamPointerRestoration) {
     const restoration = Effect.gen(
-      function* (this: CanonicalCoordinatorController) {
+      function* (this: WorkstreamCoordinatorController) {
         yield* this.closeOwned(ctx);
         const pointer = retained();
         this.pointerBlocked = pointer !== undefined;
@@ -183,7 +181,7 @@ export class CanonicalCoordinatorController {
           return;
         }
         if (pointer === "malformed")
-          return yield* Effect.fail(new Error("Canonical Workstream pointer is malformed."));
+          return yield* Effect.fail(new Error("Workstream pointer is malformed."));
         const owner = this.owner(ctx);
         const { discovered, ownership } = yield* this.prepareRestoration(pointer, owner);
         const next = yield* this.acquire(ctx, discovered, ownership, owner);
@@ -204,15 +202,15 @@ export class CanonicalCoordinatorController {
   }
 
   private prepareRestoration(
-    pointer: CanonicalWorkstreamPointer,
+    pointer: WorkstreamPointer,
     owner: CoordinatorIdentity,
   ): Effect.Effect<
-    { discovered: CanonicalStoreAttachment; ownership: CanonicalRuntimeOwnership },
+    { discovered: WorkstreamStoreAttachment; ownership: WorkstreamRuntimeOwnership },
     unknown,
     Requirements
   > {
     return Effect.gen(
-      function* (this: CanonicalCoordinatorController) {
+      function* (this: WorkstreamCoordinatorController) {
         if (pointer.phase === "prepared" && pointer.operation.kind === "create") {
           if (
             !pointerMatches(pointer, pointer.operation.initial) ||
@@ -221,14 +219,14 @@ export class CanonicalCoordinatorController {
             return yield* Effect.fail(new Error("Prepared creation identity changed."));
           yield* this.proveRepository(pointer.operation.initial.repository);
           const discovered = yield* Effect.scoped(
-            CanonicalWorkstreamStore.resumeCreate(pointer.operation.initial),
+            WorkstreamStore.resumeCreate(pointer.operation.initial),
           );
           return { discovered, ownership: { kind: "recover" } as const };
         }
         const discovered = yield* this.discover(pointer.path);
         if (!pointerMatches(pointer, discovered.state))
           return yield* Effect.fail(
-            new Error("Canonical pointer identity does not match its aggregate."),
+            new Error("Workstream pointer identity does not match its aggregate."),
           );
         yield* this.proveRepository(discovered.state.repository);
         if (pointer.phase === "attached") {
@@ -254,10 +252,10 @@ export class CanonicalCoordinatorController {
     ctx: ExtensionContext,
     receipt: HumanInputReceiptData,
     request: { statement: string; constraints: readonly string[]; targetRepository?: string },
-  ): Effect.Effect<CanonicalActionProjection, unknown, Requirements> {
+  ): Effect.Effect<WorkstreamActionProjection, unknown, Requirements> {
     return this.serialize(
       Effect.gen(
-        function* (this: CanonicalCoordinatorController) {
+        function* (this: WorkstreamCoordinatorController) {
           if (this.active !== undefined) {
             const active = this.active;
             if (request.targetRepository !== undefined) {
@@ -275,7 +273,7 @@ export class CanonicalCoordinatorController {
               recordedAt: yield* nowIso,
             };
             yield* active.runtime.reviseIntent(intent);
-            return yield* projectCanonicalAction(yield* active.runtime.inspectionSnapshot(), {
+            return yield* projectWorkstreamAction(yield* active.runtime.inspectionSnapshot(), {
               action: "workgraph_intent",
             });
           }
@@ -284,7 +282,7 @@ export class CanonicalCoordinatorController {
           const inspected = yield* inspectRepository(request.targetRepository ?? ctx.cwd);
           const repository = { projectRoot: inspected.root, gitCommonDir: inspected.commonDir };
           const id = `ws-${randomUUID()}`;
-          const path = yield* CanonicalWorkstreamStore.pathFor(repository, id);
+          const path = yield* WorkstreamStore.pathFor(repository, id);
           const now = yield* nowIso;
           const intent: Intent = {
             statement: request.statement,
@@ -300,7 +298,7 @@ export class CanonicalCoordinatorController {
             intent,
             createdAt: now,
           });
-          const pointer: CanonicalWorkstreamPointer = {
+          const pointer: WorkstreamPointer = {
             version: 1,
             phase: "prepared",
             path,
@@ -309,13 +307,13 @@ export class CanonicalCoordinatorController {
             operation: { kind: "create", initial: structuredClone(initial) },
           };
           yield* this.persistPointer(pointer);
-          const discovered = yield* Effect.scoped(CanonicalWorkstreamStore.resumeCreate(initial));
+          const discovered = yield* Effect.scoped(WorkstreamStore.resumeCreate(initial));
           const next = yield* this.acquire(ctx, discovered, { kind: "attach" }, this.owner(ctx));
           this.active = next;
           yield* this.persistPointer(attachedPointer(pointer));
           const state = yield* next.runtime.snapshot();
           this.publish(ctx, state);
-          return yield* projectCanonicalAction(yield* next.runtime.inspectionSnapshot(), {
+          return yield* projectWorkstreamAction(yield* next.runtime.inspectionSnapshot(), {
             action: "workgraph_intent",
           });
         }.bind(this),
@@ -330,7 +328,7 @@ export class CanonicalCoordinatorController {
   ): Effect.Effect<object, unknown, Requirements> {
     return this.serialize(
       Effect.gen(
-        function* (this: CanonicalCoordinatorController) {
+        function* (this: WorkstreamCoordinatorController) {
           const active = yield* requireActive(this.active);
           const target = yield* inspectRepository(
             request.targetRepository ?? active.repository.projectRoot,
@@ -379,6 +377,10 @@ export class CanonicalCoordinatorController {
             };
             state = yield* active.runtime.issueHandoff(checkpoint);
           }
+          if (state.lifecycle !== "active" && checkpoint.phase !== "launched")
+            return yield* Effect.fail(
+              new Error("Only an active, unsuspended parent Workstream can progress a Handoff."),
+            );
           return yield* this.advanceHandoff(active, ctx, checkpoint);
         }.bind(this),
       ),
@@ -392,7 +394,7 @@ export class CanonicalCoordinatorController {
     initial: HandoffCheckpoint,
   ): Effect.Effect<object, unknown, Requirements> {
     return Effect.gen(
-      function* (this: CanonicalCoordinatorController) {
+      function* (this: WorkstreamCoordinatorController) {
         let checkpoint = initial;
         const workers = this.options.workers?.() ?? new HerdrCliRuntime();
         if (checkpoint.phase === "prepared") {
@@ -519,7 +521,7 @@ export class CanonicalCoordinatorController {
   ): Effect.Effect<void, unknown, Requirements> {
     return this.serialize(
       Effect.gen(
-        function* (this: CanonicalCoordinatorController) {
+        function* (this: WorkstreamCoordinatorController) {
           if (this.active !== undefined) {
             const state = yield* this.active.runtime.read();
             verifyGrantBootstrap(state, grant);
@@ -532,7 +534,7 @@ export class CanonicalCoordinatorController {
           yield* this.proveRepository(grant.targetRepository);
           const owner = this.owner(ctx);
           const id = handoffChildWorkstreamId(grant.id);
-          const path = yield* CanonicalWorkstreamStore.pathFor(grant.targetRepository, id);
+          const path = yield* WorkstreamStore.pathFor(grant.targetRepository, id);
           const now = yield* nowIso;
           const initial = createWorkstream({
             id,
@@ -547,7 +549,7 @@ export class CanonicalCoordinatorController {
             },
             createdAt: now,
           });
-          const pointer: CanonicalWorkstreamPointer = {
+          const pointer: WorkstreamPointer = {
             version: 1,
             phase: "prepared",
             path,
@@ -556,7 +558,7 @@ export class CanonicalCoordinatorController {
             operation: { kind: "create", initial },
           };
           yield* this.persistPointer(pointer);
-          const discovered = yield* Effect.scoped(CanonicalWorkstreamStore.resumeCreate(initial));
+          const discovered = yield* Effect.scoped(WorkstreamStore.resumeCreate(initial));
           const next = yield* this.acquire(ctx, discovered, { kind: "attach" }, owner);
           this.active = next;
           yield* this.persistPointer(attachedPointer(pointer));
@@ -569,16 +571,16 @@ export class CanonicalCoordinatorController {
   adopt(
     ctx: ExtensionContext,
     statePath: string,
-  ): Effect.Effect<CanonicalActionProjection, unknown, Requirements> {
+  ): Effect.Effect<WorkstreamActionProjection, unknown, Requirements> {
     return this.serialize(
       Effect.gen(
-        function* (this: CanonicalCoordinatorController) {
+        function* (this: WorkstreamCoordinatorController) {
           const discovered = yield* this.discover(statePath);
           yield* this.proveRepository(discovered.state.repository);
           const owner = this.owner(ctx);
           const prior = discovered.state.coordinator;
-          let ownership: CanonicalRuntimeOwnership;
-          let pointer: CanonicalWorkstreamPointer;
+          let ownership: WorkstreamRuntimeOwnership;
+          let pointer: WorkstreamPointer;
           if (sameOwner(prior, owner)) {
             ownership = { kind: "recover" };
             pointer = {
@@ -624,7 +626,7 @@ export class CanonicalCoordinatorController {
           yield* this.persistPointer(attachedPointer(pointer));
           const state = yield* next.runtime.snapshot();
           this.publish(ctx, state);
-          return yield* projectCanonicalAction(yield* next.runtime.inspectionSnapshot(), {
+          return yield* projectWorkstreamAction(yield* next.runtime.inspectionSnapshot(), {
             action: "workgraph_adopt",
           });
         }.bind(this),
@@ -633,21 +635,21 @@ export class CanonicalCoordinatorController {
   }
 
   inspect(
-    request: CanonicalInspectionRequest,
-  ): Effect.Effect<CanonicalInspectionView, unknown, Requirements> {
+    request: WorkstreamInspectionRequest,
+  ): Effect.Effect<WorkstreamInspectionView, unknown, Requirements> {
     return this.serialize(
       Effect.gen(
-        function* (this: CanonicalCoordinatorController) {
+        function* (this: WorkstreamCoordinatorController) {
           const active = yield* requireActive(this.active);
           const snapshot = yield* active.runtime.inspectionSnapshot();
-          return yield* inspectCanonical(snapshot, request);
+          return yield* inspectWorkstream(snapshot, request);
         }.bind(this),
       ),
     );
   }
 
   action(
-    operation: (runtime: CanonicalRuntime) => Effect.Effect<Workstream, unknown, Requirements>,
+    operation: (runtime: WorkstreamRuntime) => Effect.Effect<Workstream, unknown, Requirements>,
     projection: {
       action: string;
       message?: string;
@@ -655,13 +657,13 @@ export class CanonicalCoordinatorController {
       attemptId?: string;
       outcomeId?: string;
     },
-  ): Effect.Effect<CanonicalActionProjection, unknown, Requirements> {
+  ): Effect.Effect<WorkstreamActionProjection, unknown, Requirements> {
     return this.serialize(
       Effect.gen(
-        function* (this: CanonicalCoordinatorController) {
+        function* (this: WorkstreamCoordinatorController) {
           const active = yield* requireActive(this.active);
           yield* operation(active.runtime);
-          return yield* projectCanonicalAction(
+          return yield* projectWorkstreamAction(
             yield* active.runtime.inspectionSnapshot(),
             projection,
           );
@@ -674,8 +676,8 @@ export class CanonicalCoordinatorController {
     return this.serialize(this.closeOwned(ctx));
   }
 
-  private discover(path: string): Effect.Effect<CanonicalStoreAttachment, unknown, Requirements> {
-    return Effect.scoped(CanonicalWorkstreamStore.discover(path));
+  private discover(path: string): Effect.Effect<WorkstreamStoreAttachment, unknown, Requirements> {
+    return Effect.scoped(WorkstreamStore.discover(path));
   }
 
   private proveRepository(repository: RepositoryIdentity): Effect.Effect<void, unknown> {
@@ -686,30 +688,30 @@ export class CanonicalCoordinatorController {
         inspected.commonDir !== repository.gitCommonDir
       )
         return yield* Effect.fail(
-          new Error("Canonical aggregate repository identity does not match Git."),
+          new Error("Workstream aggregate repository identity does not match Git."),
         );
     });
   }
 
   private acquire(
     ctx: ExtensionContext,
-    attachment: CanonicalStoreAttachment,
-    ownership: CanonicalRuntimeOwnership,
+    attachment: WorkstreamStoreAttachment,
+    ownership: WorkstreamRuntimeOwnership,
     owner: CoordinatorIdentity,
   ): Effect.Effect<Active, unknown, Requirements> {
     return Effect.gen(
-      function* (this: CanonicalCoordinatorController) {
+      function* (this: WorkstreamCoordinatorController) {
         const scope = yield* Scope.make("sequential");
         const workers = this.options.workers?.() ?? new HerdrCliRuntime();
         const git = new GitRepository(
           attachment.state.repository.projectRoot,
           attachment.state.repository.gitCommonDir,
         );
-        let runtime: CanonicalRuntime | undefined;
+        let runtime: WorkstreamRuntime | undefined;
         const controller = this;
         const { HERDR_WORKSPACE_ID: hostWorkspaceId, PI_CODING_AGENT_DIR: hostAgentDir } =
           process.env;
-        const driver = makeLiveCanonicalReconciliationDriver({
+        const driver = makeLiveWorkstreamReconciliationDriver({
           repository: attachment.state.repository,
           workspaceId: this.options.workspaceId ?? hostWorkspaceId ?? "",
           git,
@@ -719,7 +721,7 @@ export class CanonicalCoordinatorController {
               Effect.gen(function* () {
                 const ready = yield* deliveryTry(() => {
                   if (runtime === undefined)
-                    throw new Error("Canonical runtime delivery is not ready.");
+                    throw new Error("Workstream runtime delivery is not ready.");
                   return runtime;
                 });
                 const snapshotEffect = yield* deliveryTry(() => ready.inspectionSnapshot());
@@ -743,7 +745,7 @@ export class CanonicalCoordinatorController {
                   return value;
                 });
                 const notificationEffect = yield* deliveryTry(() =>
-                  canonicalOutcomeNotification(snapshot, outcomeId),
+                  workstreamOutcomeNotification(snapshot, outcomeId),
                 );
                 const content = yield* notificationEffect.pipe(
                   Effect.mapError(
@@ -752,7 +754,7 @@ export class CanonicalCoordinatorController {
                 );
                 yield* deliveryTry(() =>
                   controller.pi.sendMessage(
-                    { customType: CANONICAL_MESSAGE, content, display: true },
+                    { customType: WORKSTREAM_MESSAGE, content, display: true },
                     { triggerTurn: true, deliverAs: "followUp" },
                   ),
                 );
@@ -764,13 +766,13 @@ export class CanonicalCoordinatorController {
             : { overrides: this.options.hostOverrides }),
         });
         const acquired = yield* Effect.exit(
-          CanonicalRuntime.acquire({
+          WorkstreamRuntime.acquire({
             id: attachment.state.id,
             repository: attachment.state.repository,
             coordinator: owner,
             ownership,
             driver,
-            commands: liveCanonicalCommandPorts(git, workers),
+            commands: liveWorkstreamCommandPorts(git, workers),
             onCommitted: (state) => Effect.sync(() => this.publish(ctx, state)).pipe(Effect.ignore),
             onReconciliationAttention: (detail) => this.attention(ctx, detail),
             onFatal: (error) => this.attention(ctx, publicMessage(error)),
@@ -799,13 +801,13 @@ export class CanonicalCoordinatorController {
   private attention(ctx: ExtensionContext, detail: string): Effect.Effect<void> {
     const bounded = publicMessage(detail);
     return Effect.gen(
-      function* (this: CanonicalCoordinatorController) {
+      function* (this: WorkstreamCoordinatorController) {
         yield* hostTry(() => ctx.ui.notify(`Workgraph: ${bounded}`, "warning")).pipe(Effect.ignore);
         yield* hostTry(() =>
           this.pi.sendMessage(
             {
               customType: ATTENTION_MESSAGE,
-              content: `Workgraph requires attention: ${bounded}. Inspect retained canonical state; this message grants no authority.`,
+              content: `Workgraph requires attention: ${bounded}. Inspect retained workstream state; this message grants no authority.`,
               display: true,
             },
             { triggerTurn: true, deliverAs: "followUp" },
@@ -817,7 +819,7 @@ export class CanonicalCoordinatorController {
 
   private closeOwned(ctx: ExtensionContext): Effect.Effect<void, unknown, Requirements> {
     return Effect.gen(
-      function* (this: CanonicalCoordinatorController) {
+      function* (this: WorkstreamCoordinatorController) {
         const active = this.active;
         if (active === undefined) return;
         this.active = undefined;
@@ -829,12 +831,10 @@ export class CanonicalCoordinatorController {
     );
   }
 
-  private persistPointer(
-    pointer: CanonicalWorkstreamPointer,
-  ): Effect.Effect<void, CoordinatorHostError> {
+  private persistPointer(pointer: WorkstreamPointer): Effect.Effect<void, CoordinatorHostError> {
     if (pointer.phase === "prepared") this.pointerBlocked = true;
     return Effect.map(
-      hostTry(() => this.pi.appendEntry(CANONICAL_POINTER_ENTRY, structuredClone(pointer))),
+      hostTry(() => this.pi.appendEntry(WORKSTREAM_POINTER_ENTRY, structuredClone(pointer))),
       () => {
         if (pointer.phase === "attached") this.pointerBlocked = false;
       },
@@ -849,14 +849,14 @@ const nowIso = Clock.clockWith((clock) =>
 function blockedEstablishmentError(diagnostic: string | undefined): Error {
   return new Error(
     diagnostic === undefined
-      ? "A retained canonical pointer must be recovered or explicitly adopted."
-      : `Canonical startup remains blocked by retained state: ${diagnostic}`,
+      ? "A retained workstream pointer must be recovered or explicitly adopted."
+      : `Workstream startup remains blocked by retained state: ${diagnostic}`,
   );
 }
 
 function requireActive(active: Active | undefined): Effect.Effect<Active, Error> {
   return active === undefined
-    ? Effect.fail(new Error("No canonical Workstream is attached."))
+    ? Effect.fail(new Error("No Workstream is attached."))
     : Effect.succeed(active);
 }
 
@@ -867,18 +867,18 @@ function requireExactOwner(
   return sameOwner(actual, expected)
     ? Effect.void
     : Effect.fail(
-        new Error("Canonical pointer belongs to a different coordinator; use explicit adoption."),
+        new Error("Workstream pointer belongs to a different coordinator; use explicit adoption."),
       );
 }
 
 function preparedAdoptionOwnership(
   state: Workstream,
   operation: Extract<
-    Extract<CanonicalWorkstreamPointer, { phase: "prepared" }>["operation"],
+    Extract<WorkstreamPointer, { phase: "prepared" }>["operation"],
     { kind: "adopt" }
   >,
   owner: CoordinatorIdentity,
-): Effect.Effect<CanonicalRuntimeOwnership, Error> {
+): Effect.Effect<WorkstreamRuntimeOwnership, Error> {
   if (!sameOwner(operation.expectedOwner, owner))
     return Effect.fail(new Error("Prepared adoption successor changed."));
   if (sameOwner(state.coordinator, operation.expectedPriorOwner))
@@ -908,7 +908,7 @@ function sameOwner(left: CoordinatorIdentity, right: CoordinatorIdentity): boole
   return left.sessionId === right.sessionId && left.sessionFile === right.sessionFile;
 }
 
-function pointerMatches(pointer: CanonicalWorkstreamPointer, state: Workstream): boolean {
+function pointerMatches(pointer: WorkstreamPointer, state: Workstream): boolean {
   return (
     pointer.workstreamId === state.id &&
     Value.Equal(pointer.repository, state.repository) &&
@@ -916,7 +916,7 @@ function pointerMatches(pointer: CanonicalWorkstreamPointer, state: Workstream):
   );
 }
 
-function attachedPointer(pointer: CanonicalWorkstreamPointer): CanonicalWorkstreamPointer {
+function attachedPointer(pointer: WorkstreamPointer): WorkstreamPointer {
   return {
     version: pointer.version,
     phase: "attached",
@@ -929,7 +929,7 @@ function attachedPointer(pointer: CanonicalWorkstreamPointer): CanonicalWorkstre
 function transferMatches(
   state: Workstream,
   operation: Extract<
-    Extract<CanonicalWorkstreamPointer, { phase: "prepared" }>["operation"],
+    Extract<WorkstreamPointer, { phase: "prepared" }>["operation"],
     { kind: "adopt" }
   >,
 ): boolean {
@@ -998,7 +998,7 @@ function resourceFrom(
 
 function workspaceCheckpoint(
   checkpoint: Extract<HandoffCheckpoint, { phase: "workspace_submitting" }>,
-  identity: import("./types.js").WorkerIdentity,
+  identity: import("../types.js").WorkerIdentity,
 ): Extract<HandoffCheckpoint, { phase: "workspace_ready" }> {
   return {
     ...checkpoint,
@@ -1011,7 +1011,7 @@ function workspaceCheckpoint(
 
 function launchedCheckpoint(
   checkpoint: Extract<HandoffCheckpoint, { phase: "start_submitting" }>,
-  identity: import("./types.js").WorkerIdentity,
+  identity: import("../types.js").WorkerIdentity,
   launchedAt: string,
 ): Extract<HandoffCheckpoint, { phase: "launched" }> {
   if (

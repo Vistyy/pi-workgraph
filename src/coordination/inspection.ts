@@ -2,8 +2,6 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { Data, Effect } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
-import type { ReconciliationFrontierObservation } from "./canonical-reconciliation.js";
-import type { CanonicalRuntimeInspectionSnapshot } from "./canonical-runtime.js";
 import {
   type Attempt,
   findAttemptLocation,
@@ -12,7 +10,9 @@ import {
   outputDisposition,
   type Task,
   type Workstream,
-} from "./domain/workstream.js";
+} from "../domain/workstream.js";
+import type { ReconciliationFrontierObservation } from "./reconciliation.js";
+import type { WorkstreamRuntimeInspectionSnapshot } from "./runtime.js";
 
 const DEFAULT_INSPECTION_CHARS = 3_000;
 const MAX_INSPECTION_CHARS = 8_000;
@@ -33,7 +33,7 @@ const SectionSchema = Type.Union([
   Type.Literal("recovery"),
   Type.Literal("report"),
 ]);
-export const CanonicalInspectionRequestSchema = Type.Object(
+export const WorkstreamInspectionRequestSchema = Type.Object(
   {
     section: SectionSchema,
     taskId: Type.Optional(NonEmptyString),
@@ -45,9 +45,9 @@ export const CanonicalInspectionRequestSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export type CanonicalInspectionRequest = Static<typeof CanonicalInspectionRequestSchema>;
+export type WorkstreamInspectionRequest = Static<typeof WorkstreamInspectionRequestSchema>;
 
-const CanonicalActionProjectionRequestSchema = Type.Object(
+const WorkstreamActionProjectionRequestSchema = Type.Object(
   {
     action: NonEmptyString,
     message: Type.Optional(Type.String()),
@@ -57,12 +57,10 @@ const CanonicalActionProjectionRequestSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export type CanonicalActionProjectionRequest = Static<
-  typeof CanonicalActionProjectionRequestSchema
->;
+type WorkstreamActionProjectionRequest = Static<typeof WorkstreamActionProjectionRequestSchema>;
 
-type InspectSection = CanonicalInspectionRequest["section"];
-type Selector = Pick<CanonicalInspectionRequest, "section" | "taskId" | "attemptId" | "outcomeId">;
+type InspectSection = WorkstreamInspectionRequest["section"];
+type Selector = Pick<WorkstreamInspectionRequest, "section" | "taskId" | "attemptId" | "outcomeId">;
 interface CursorPayload {
   readonly version: 1;
   readonly workstreamId: string;
@@ -96,7 +94,7 @@ const CursorPayloadSchema = Type.Object(
   { additionalProperties: false },
 );
 
-export class CanonicalInspectionError extends Data.TaggedError("CanonicalInspectionError")<{
+export class WorkstreamInspectionError extends Data.TaggedError("WorkstreamInspectionError")<{
   readonly code:
     | "invalid_request"
     | "invalid_cursor"
@@ -156,7 +154,7 @@ type OutcomeArtifactPreview = Outcome["artifacts"][number] & {
   readonly summary: string;
 };
 
-export type CanonicalInspectionView =
+export type WorkstreamInspectionView =
   | ItemInspectionView<"overview", OverviewSummary, OverviewItem>
   | TextInspectionView<"context", ContextSummary>
   | TextInspectionView<"completion", CompletionSummary>
@@ -200,23 +198,23 @@ type SectionProjection =
   | { readonly section: "recovery"; readonly summary: RecoverySummary; readonly text: string }
   | { readonly section: "report"; readonly summary: OutcomePreview; readonly text: string };
 
-export function inspectCanonical<Section extends InspectSection>(
-  snapshot: CanonicalRuntimeInspectionSnapshot,
-  input: CanonicalInspectionRequest & { readonly section: Section },
+export function inspectWorkstream<Section extends InspectSection>(
+  snapshot: WorkstreamRuntimeInspectionSnapshot,
+  input: WorkstreamInspectionRequest & { readonly section: Section },
 ): Effect.Effect<
-  Extract<CanonicalInspectionView, { readonly section: Section }>,
-  CanonicalInspectionError
+  Extract<WorkstreamInspectionView, { readonly section: Section }>,
+  WorkstreamInspectionError
 >;
-export function inspectCanonical(
-  snapshot: CanonicalRuntimeInspectionSnapshot,
+export function inspectWorkstream(
+  snapshot: WorkstreamRuntimeInspectionSnapshot,
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The implementation validates this external boundary with the exported request schema.
   input: unknown,
-): Effect.Effect<CanonicalInspectionView, CanonicalInspectionError>;
-export function inspectCanonical(
-  snapshot: CanonicalRuntimeInspectionSnapshot,
+): Effect.Effect<WorkstreamInspectionView, WorkstreamInspectionError>;
+export function inspectWorkstream(
+  snapshot: WorkstreamRuntimeInspectionSnapshot,
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The exported TypeBox schema owns this external inspection boundary.
   input: unknown,
-): Effect.Effect<CanonicalInspectionView, CanonicalInspectionError> {
+): Effect.Effect<WorkstreamInspectionView, WorkstreamInspectionError> {
   return boundary(() => inspect(snapshot, decodeRequest(input)));
 }
 
@@ -227,7 +225,7 @@ interface ActionWorkstreamProjection {
   readonly suspension?: NonNullable<Workstream["suspension"]>;
 }
 
-export interface CanonicalActionProjection {
+export interface WorkstreamActionProjection {
   readonly workstream: ActionWorkstreamProjection;
   readonly action: { readonly name: string; readonly message: string | undefined };
   readonly affected: {
@@ -238,14 +236,14 @@ export interface CanonicalActionProjection {
   readonly blocked: ReturnType<typeof blockedPreview>;
 }
 
-export function projectCanonicalAction(
-  snapshot: CanonicalRuntimeInspectionSnapshot,
+export function projectWorkstreamAction(
+  snapshot: WorkstreamRuntimeInspectionSnapshot,
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The exported TypeBox schema owns this external action projection boundary.
   input: unknown,
-): Effect.Effect<CanonicalActionProjection, CanonicalInspectionError> {
+): Effect.Effect<WorkstreamActionProjection, WorkstreamInspectionError> {
   return boundary(() => {
-    const request = decode<CanonicalActionProjectionRequest>(
-      CanonicalActionProjectionRequestSchema,
+    const request = decode<WorkstreamActionProjectionRequest>(
+      WorkstreamActionProjectionRequestSchema,
       input,
       "action projection",
     );
@@ -277,10 +275,10 @@ function actionWorkstreamProjection(workstream: Workstream): ActionWorkstreamPro
     : { ...base, suspension: structuredClone(workstream.suspension) };
 }
 
-export function canonicalOutcomeNotification(
-  snapshot: CanonicalRuntimeInspectionSnapshot,
+export function workstreamOutcomeNotification(
+  snapshot: WorkstreamRuntimeInspectionSnapshot,
   outcomeId: string,
-): Effect.Effect<string, CanonicalInspectionError> {
+): Effect.Effect<string, WorkstreamInspectionError> {
   return boundary(() => {
     const owner = outcomeOwner(snapshot.workstream, outcomeId);
     if (owner === undefined) fail("unknown_handle", `Unknown Outcome ${compact(outcomeId)}.`);
@@ -299,9 +297,9 @@ export function canonicalOutcomeNotification(
 }
 
 function inspect(
-  snapshot: CanonicalRuntimeInspectionSnapshot,
-  request: CanonicalInspectionRequest,
-): CanonicalInspectionView {
+  snapshot: WorkstreamRuntimeInspectionSnapshot,
+  request: WorkstreamInspectionRequest,
+): WorkstreamInspectionView {
   const workstream = snapshot.workstream;
   const selector = selectorOf(request);
   const cursor =
@@ -419,7 +417,7 @@ function nextPage<Section extends InspectSection>(
 }
 
 function projectSection(
-  snapshot: CanonicalRuntimeInspectionSnapshot,
+  snapshot: WorkstreamRuntimeInspectionSnapshot,
   section: InspectSection,
   selection: Selection,
 ): SectionProjection {
@@ -506,7 +504,6 @@ function projectSection(
           application: attempt.application,
           cleanup: attempt.cleanup,
           outputRelease: attempt.outputRelease,
-          attentionHistory: attempt.attentionHistory,
           reconciliation,
         }),
       };
@@ -557,7 +554,7 @@ function assertOnlySelector(
 
 function resolveActionSelection(
   workstream: Workstream,
-  request: CanonicalActionProjectionRequest,
+  request: WorkstreamActionProjectionRequest,
 ): Selection {
   const task = request.taskId === undefined ? undefined : exactTask(workstream, request.taskId);
   const attemptLocation =
@@ -608,7 +605,10 @@ function exactOutcomeOwner(workstream: Workstream, outcomeId: string) {
   return owner;
 }
 
-function initialCursor(workstream: Workstream, request: CanonicalInspectionRequest): CursorPayload {
+function initialCursor(
+  workstream: Workstream,
+  request: WorkstreamInspectionRequest,
+): CursorPayload {
   return {
     version: 1,
     workstreamId: workstream.id,
@@ -623,7 +623,7 @@ function initialCursor(workstream: Workstream, request: CanonicalInspectionReque
 
 function assertCursor(
   workstream: Workstream,
-  request: CanonicalInspectionRequest,
+  request: WorkstreamInspectionRequest,
   cursor: CursorPayload,
 ): void {
   if (
@@ -636,7 +636,7 @@ function assertCursor(
     fail("cursor_mismatch", "Cursor does not match the selected Workstream revision or request.");
 }
 
-function selectorOf(request: CanonicalInspectionRequest): Selector {
+function selectorOf(request: WorkstreamInspectionRequest): Selector {
   const selector: Selector = { section: request.section };
   if (request.taskId !== undefined) Object.assign(selector, { taskId: request.taskId });
   if (request.attemptId !== undefined) Object.assign(selector, { attemptId: request.attemptId });
@@ -670,10 +670,10 @@ function digest(encoded: string): string {
   return createHmac("sha256", cursorIntegrityKey).update(encoded).digest("base64url");
 }
 
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- The canonical inspection request schema parses this boundary value.
-function decodeRequest(input: unknown): CanonicalInspectionRequest {
-  return decode<CanonicalInspectionRequest>(
-    CanonicalInspectionRequestSchema,
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- The workstream inspection request schema parses this boundary value.
+function decodeRequest(input: unknown): WorkstreamInspectionRequest {
+  return decode<WorkstreamInspectionRequest>(
+    WorkstreamInspectionRequestSchema,
     input,
     "inspection request",
   );
@@ -696,21 +696,21 @@ function decode<Value>(
   return input as Value;
 }
 
-function boundary<A>(run: () => A): Effect.Effect<A, CanonicalInspectionError> {
+function boundary<A>(run: () => A): Effect.Effect<A, WorkstreamInspectionError> {
   return Effect.try({
     try: run,
     catch: (cause) =>
-      cause instanceof CanonicalInspectionError
+      cause instanceof WorkstreamInspectionError
         ? cause
-        : new CanonicalInspectionError({
+        : new WorkstreamInspectionError({
             code: "internal_failure",
             message: cause instanceof Error ? cause.message : "Inspection failed.",
           }),
   });
 }
 
-function fail(code: CanonicalInspectionError["code"], message: string): never {
-  throw new CanonicalInspectionError({ code, message });
+function fail(code: WorkstreamInspectionError["code"], message: string): never {
+  throw new WorkstreamInspectionError({ code, message });
 }
 
 function outcomeOwner(
@@ -723,7 +723,7 @@ function outcomeOwner(
   return undefined;
 }
 
-function overviewSummary(snapshot: CanonicalRuntimeInspectionSnapshot) {
+function overviewSummary(snapshot: WorkstreamRuntimeInspectionSnapshot) {
   const state = snapshot.workstream;
   return {
     lifecycle: state.lifecycle,
@@ -848,10 +848,7 @@ function outputPreview(task: Task, attempt: Attempt) {
 
 function durableBlocker(attempt: Attempt): string | undefined {
   const detail =
-    attempt.outputRelease?.error ??
-    attempt.application?.error ??
-    attempt.cleanup?.error ??
-    attempt.attentionHistory?.at(-1)?.detail;
+    attempt.outputRelease?.error ?? attempt.application?.error ?? attempt.cleanup?.error;
   return detail === undefined ? undefined : compact(detail, 320);
 }
 

@@ -12,11 +12,14 @@ import {
   decodeTabListResponse,
   decodeWorkspaceCreateResponse,
   decodeWorkspaceListResponse,
+  type HerdrAgentStatus,
 } from "./herdr-decoder.js";
 import {
   assertCoordinatorPlacement,
   assertIdentity,
   assertResource,
+  type CoordinatorLaunchResource,
+  type HerdrObservation,
   identityOf,
   type ParsedAgent,
   parseAgent,
@@ -26,7 +29,6 @@ import {
 import {
   CoordinatorLaunchError,
   type CoordinatorLaunchRequest,
-  type CoordinatorLaunchResource,
   HerdrWorkerLauncher,
   type WorkerLaunchEffectRequest,
   type WorkerLaunchError,
@@ -46,39 +48,13 @@ import {
   protocolTry,
 } from "./herdr-protocol.js";
 
-export { WorkerLaunchPlacementError } from "./herdr-identity.js";
-export {
-  CoordinatorLaunchError,
-  type CoordinatorLaunchRequest,
-  type CoordinatorLaunchResource,
-  type WorkerLaunchEffectRequest,
-  WorkerLaunchError,
-  WorkerLaunchReadinessError,
-} from "./herdr-launch.js";
-export type { WorkerNamingContext, WorkerRole } from "./herdr-naming.js";
-export {
-  herdrCoordinatorNames,
-  herdrWorkerName,
-  herdrWorkerTabLabel,
-} from "./herdr-naming.js";
-export { HERDR_PROTOCOL_OUTPUT_LIMIT, HerdrProtocolError } from "./herdr-protocol.js";
-
 import type {
   CoordinatorRuntimeIdentity,
   WorkerIdentity,
-  WorkerObservationStatus,
   WorkerResourceIdentity,
 } from "./types.js";
 
-export type HerdrAgentStatus = WorkerObservationStatus;
-
-export interface HerdrObservation {
-  identity: WorkerIdentity;
-  status: HerdrAgentStatus;
-  observedAt: string;
-}
-
-export interface HerdrAbsentObservation {
+interface HerdrAbsentObservation {
   identity: WorkerIdentity;
   status: "absent";
   observedAt: string;
@@ -115,15 +91,15 @@ export interface WorkerPaneObservation {
   cwd: string;
 }
 
-export interface WorkerProcessObservation {
+interface WorkerProcessObservation {
   shellPid: number;
   foregroundProcessGroupId: number;
   foregroundProcesses: readonly WorkerForegroundProcess[];
 }
 
-export type WorkerForegroundProcess = string | { readonly name?: string; readonly pid?: number };
+type WorkerForegroundProcess = string | { readonly name?: string; readonly pid?: number };
 
-export type WorkerLaunchAgentEvidence =
+type WorkerLaunchAgentEvidence =
   | { state: "present"; identity: WorkerIdentity; status: HerdrAgentStatus }
   | { state: "absent"; detail: string }
   | { state: "unknown"; detail: string };

@@ -1,6 +1,3 @@
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
-export type WorkerObservationStatus = "idle" | "working" | "blocked" | "done" | "unknown";
-
 export interface CoordinatorRuntimeIdentity {
   workspaceId: string;
   tabId: string;

@@ -20,14 +20,6 @@ import { TestClock } from "effect/testing";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
-  CanonicalStoreConflictError,
-  CanonicalStoreHostError,
-  CanonicalStoreIncompleteError,
-  CanonicalStoreInvalidError,
-  CanonicalStoreUnsupportedError,
-  CanonicalWorkstreamStore,
-} from "../src/canonical-workstream-store.js";
-import {
   type CoordinatorIdentity,
   completeWorkstream,
   createWorkstream,
@@ -38,8 +30,16 @@ import {
   type Workstream,
 } from "../src/domain/workstream.js";
 import { liveLayer } from "../src/node-platform.js";
+import {
+  WorkstreamStore,
+  WorkstreamStoreConflictError,
+  WorkstreamStoreHostError,
+  WorkstreamStoreIncompleteError,
+  WorkstreamStoreInvalidError,
+  WorkstreamStoreUnsupportedError,
+} from "../src/storage/workstream-store.js";
 
-const ID = "canonical";
+const ID = "workstream";
 const COORDINATOR: CoordinatorIdentity = {
   sessionId: "coordinator-a",
   sessionFile: "/sessions/coordinator-a.jsonl",
@@ -52,7 +52,7 @@ const T0 = "2024-01-01T00:00:00.000Z";
 const START_MILLIS = 1_700_000_000_000;
 const DEAD_OBSERVED_AT = "2023-11-14T22:13:20.000Z";
 
-function runCanonical<A, E>(
+function runWorkstream<A, E>(
   program: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path | Scope.Scope>,
   clock?: Clock.Clock,
 ): Promise<A> {
@@ -61,14 +61,16 @@ function runCanonical<A, E>(
   return Effect.runPromise(Effect.scoped(withClock).pipe(Effect.provide(liveLayer)));
 }
 
-interface CanonicalFixture {
+interface WorkstreamFixture {
   readonly parent: string;
   readonly projectRoot: string;
   readonly gitCommonDir: string;
   readonly repository: RepositoryIdentity;
 }
 
-async function canonicalFixture(parentName = "pi-workgraph-canonical-"): Promise<CanonicalFixture> {
+async function workstreamFixture(
+  parentName = "pi-workgraph-workstream-",
+): Promise<WorkstreamFixture> {
   const parent = await mkdtemp(join(tmpdir(), parentName));
   const projectRoot = join(parent, "project");
   const gitCommonDir = join(projectRoot, ".git");
@@ -78,16 +80,16 @@ async function canonicalFixture(parentName = "pi-workgraph-canonical-"): Promise
   return { parent, projectRoot, gitCommonDir, repository: { projectRoot, gitCommonDir } };
 }
 
-function storageDirectory(fixture: CanonicalFixture, id = ID): string {
+function storageDirectory(fixture: WorkstreamFixture, id = ID): string {
   return join(fixture.gitCommonDir, "pi-workgraph", "workstreams", id);
 }
 
-function storagePath(fixture: CanonicalFixture, id = ID): string {
+function storagePath(fixture: WorkstreamFixture, id = ID): string {
   return join(storageDirectory(fixture, id), "workstream.sqlite");
 }
 
-function canonicalPath(fixture: CanonicalFixture, id = ID): Promise<string> {
-  return runCanonical(CanonicalWorkstreamStore.pathFor(fixture.repository, id));
+function workstreamPath(fixture: WorkstreamFixture, id = ID): Promise<string> {
+  return runWorkstream(WorkstreamStore.pathFor(fixture.repository, id));
 }
 
 function receipt(id: string, text: string): Intent["grounding"] {
@@ -124,19 +126,19 @@ function intent(statement: string, receiptId = "receipt-1"): Intent {
   };
 }
 
-function initialWorkstream(fixture: CanonicalFixture, id = ID): Workstream {
+function initialWorkstream(fixture: WorkstreamFixture, id = ID): Workstream {
   return createWorkstream({
     id,
-    purpose: "Persist the canonical aggregate.",
+    purpose: "Persist the workstream aggregate.",
     repository: fixture.repository,
     coordinator: COORDINATOR,
-    intent: intent("Persist the canonical aggregate."),
+    intent: intent("Persist the workstream aggregate."),
     createdAt: T0,
   });
 }
 
-function createCanonical(fixture: CanonicalFixture, id = ID) {
-  return CanonicalWorkstreamStore.create(initialWorkstream(fixture, id)).pipe(
+function createFixtureStore(fixture: WorkstreamFixture, id = ID) {
+  return WorkstreamStore.create(initialWorkstream(fixture, id)).pipe(
     Effect.map((attachment) => attachment.store),
   );
 }
@@ -156,8 +158,8 @@ function steppingClock(startMillis: number, stepMillis: number): Clock.Clock {
   };
 }
 
-function openCanonical(fixture: CanonicalFixture, id = ID) {
-  return CanonicalWorkstreamStore.open(id, fixture.repository).pipe(
+function openWorkstream(fixture: WorkstreamFixture, id = ID) {
+  return WorkstreamStore.open(id, fixture.repository).pipe(
     Effect.map((attachment) => attachment.store),
   );
 }
@@ -183,14 +185,14 @@ const RawAggregateRowSchema = Type.Object(
 function rawStateText(path: string): string {
   return rawDatabase(path, (database) => {
     const row = database.prepare("SELECT state_json FROM workstream WHERE singleton = 1").get();
-    assert.ok(Value.Check(RawAggregateRowSchema, row), "Missing canonical aggregate row.");
+    assert.ok(Value.Check(RawAggregateRowSchema, row), "Missing workstream aggregate row.");
     return Value.Decode(RawAggregateRowSchema, row).state_json;
   });
 }
 
 /** Create a private SQLite file containing exactly the given partial schema. */
-async function rawCanonicalSchema(
-  fixture: CanonicalFixture,
+async function rawWorkstreamSchema(
+  fixture: WorkstreamFixture,
   id: string,
   schema: string,
 ): Promise<void> {
@@ -206,13 +208,13 @@ async function assertPrivateModes(path: string): Promise<void> {
     assert.equal((await lstat(directory)).mode & 0o777, 0o700, directory);
 }
 
-void test("canonical store persists a grounded workstream and attaches a completed aggregate", async () => {
-  const fixture = await canonicalFixture();
-  const path = await canonicalPath(fixture);
+void test("workstream store persists a grounded workstream and attaches a completed aggregate", async () => {
+  const fixture = await workstreamFixture();
+  const path = await workstreamPath(fixture);
   try {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* createCanonical(fixture);
+        const store = yield* createFixtureStore(fixture);
         const created = yield* store.read();
         assert.equal(created.id, ID);
         assert.equal(created.revision, 0);
@@ -240,25 +242,25 @@ void test("canonical store persists a grounded workstream and attaches a complet
     await assertPrivateModes(path);
     assert.equal(storagePath(fixture), path);
 
-    const reopened = await runCanonical(
+    const reopened = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         return yield* store.read();
       }),
     );
     assert.equal(reopened.revision, 1);
     assert.equal(reopened.intents.length, 2);
 
-    const completed = await runCanonical(
+    const completed = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         const lease = yield* store.acquireLease(COORDINATOR);
         const next = yield* store.transition(lease, (current) =>
           completeWorkstream(
             current,
             {
-              conclusion: "The canonical aggregate is complete.",
-              evidence: [{ label: "aggregate", observation: "The canonical row persisted." }],
+              conclusion: "The workstream aggregate is complete.",
+              evidence: [{ label: "aggregate", observation: "The workstream row persisted." }],
               limitations: [],
               completedAt: "2024-07-01T00:00:00.000Z",
             },
@@ -272,9 +274,9 @@ void test("canonical store persists a grounded workstream and attaches a complet
     assert.equal(completed.lifecycle, "completed");
     assert.equal(completed.revision, 2);
 
-    const attached = await runCanonical(
+    const attached = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         const lease = yield* store.acquireLease(COORDINATOR);
         yield* store.releaseLease(lease);
         return yield* store.read();
@@ -288,12 +290,12 @@ void test("canonical store persists a grounded workstream and attaches a complet
 });
 
 void test("prepared creation resumes only absent or exact empty residue and reuses only an equal aggregate", async () => {
-  const fixture = await canonicalFixture();
+  const fixture = await workstreamFixture();
   try {
     const absent = initialWorkstream(fixture, "resume-absent");
-    const resumed = await runCanonical(CanonicalWorkstreamStore.resumeCreate(absent));
+    const resumed = await runWorkstream(WorkstreamStore.resumeCreate(absent));
     assert.deepEqual(resumed.state, absent);
-    const reused = await runCanonical(CanonicalWorkstreamStore.resumeCreate(absent));
+    const reused = await runWorkstream(WorkstreamStore.resumeCreate(absent));
     assert.deepEqual(reused.state, absent);
 
     for (const [id, residue] of [
@@ -310,10 +312,7 @@ void test("prepared creation resumes only absent or exact empty residue and reus
       else rawDatabase(path, () => undefined);
       await chmod(path, 0o600);
       const initial = initialWorkstream(fixture, id);
-      assert.deepEqual(
-        (await runCanonical(CanonicalWorkstreamStore.resumeCreate(initial))).state,
-        initial,
-      );
+      assert.deepEqual((await runWorkstream(WorkstreamStore.resumeCreate(initial))).state, initial);
     }
 
     const partialId = "resume-partial";
@@ -325,8 +324,8 @@ void test("prepared creation resumes only absent or exact empty residue and reus
     await chmod(partialPath, 0o600);
     const before = await readFile(partialPath);
     await assert.rejects(
-      runCanonical(CanonicalWorkstreamStore.resumeCreate(initialWorkstream(fixture, partialId))),
-      CanonicalStoreIncompleteError,
+      runWorkstream(WorkstreamStore.resumeCreate(initialWorkstream(fixture, partialId))),
+      WorkstreamStoreIncompleteError,
     );
     assert.deepEqual(await readFile(partialPath), before);
 
@@ -339,11 +338,11 @@ void test("prepared creation resumes only absent or exact empty residue and reus
       createdAt: T0,
     });
     await assert.rejects(
-      runCanonical(CanonicalWorkstreamStore.resumeCreate(mismatch)),
-      CanonicalStoreConflictError,
+      runWorkstream(WorkstreamStore.resumeCreate(mismatch)),
+      WorkstreamStoreConflictError,
     );
     assert.deepEqual(
-      (await runCanonical(CanonicalWorkstreamStore.open(absent.id, fixture.repository))).state,
+      (await runWorkstream(WorkstreamStore.open(absent.id, fixture.repository))).state,
       absent,
     );
   } finally {
@@ -351,13 +350,13 @@ void test("prepared creation resumes only absent or exact empty residue and reus
   }
 });
 
-void test("canonical discovery derives identity from the aggregate and never accepts a relocated store", async () => {
-  const fixture = await canonicalFixture();
+void test("workstream discovery derives identity from the aggregate and never accepts a relocated store", async () => {
+  const fixture = await workstreamFixture();
   try {
-    await runCanonical(createCanonical(fixture));
-    const path = await canonicalPath(fixture);
+    await runWorkstream(createFixtureStore(fixture));
+    const path = await workstreamPath(fixture);
     const before = await readFile(path);
-    const attachment = await runCanonical(CanonicalWorkstreamStore.discover(path));
+    const attachment = await runWorkstream(WorkstreamStore.discover(path));
     assert.equal(attachment.state.id, ID);
     assert.deepEqual(attachment.state.repository, fixture.repository);
     assert.deepEqual(await readFile(path), before);
@@ -369,39 +368,39 @@ void test("canonical discovery derives identity from the aggregate and never acc
     await copyFile(path, relocated);
     await chmod(relocated, 0o600);
     await assert.rejects(
-      runCanonical(CanonicalWorkstreamStore.discover(relocated)),
-      CanonicalStoreInvalidError,
+      runWorkstream(WorkstreamStore.discover(relocated)),
+      WorkstreamStoreInvalidError,
     );
   } finally {
     await rm(fixture.parent, { recursive: true, force: true });
   }
 });
 
-void test("canonical lease observation, fencing, and expired takeover stay exact-observed", async () => {
-  const fixture = await canonicalFixture();
+void test("workstream lease observation, fencing, and expired takeover stay exact-observed", async () => {
+  const fixture = await workstreamFixture();
   const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
   await Effect.runPromise(clock.setTime(START_MILLIS));
   try {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* createCanonical(fixture);
+        const store = yield* createFixtureStore(fixture);
         yield* store.acquireLease(COORDINATOR);
       }),
       clock,
     );
 
-    const observed = await runCanonical(
+    const observed = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         return yield* store.observeLease();
       }),
       clock,
     );
     assert.ok(observed !== undefined, "Expected a persisted observed lease.");
     assert.equal(observed.owner.sessionId, COORDINATOR.sessionId);
-    const fenced = await runCanonical(
+    const fenced = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         return yield* store.readFenced(observed);
       }),
       clock,
@@ -409,9 +408,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
     assert.equal(fenced.revision, 0);
 
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.acquireLease(OWNER_B);
         }),
         clock,
@@ -419,9 +418,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
       /exact observed lease/,
     );
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.acquireLease(OWNER_B, { ...observed, token: "forged" });
         }),
         clock,
@@ -429,9 +428,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
       /exact observed lease/,
     );
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.acquireLease(OWNER_B, observed);
         }),
         clock,
@@ -439,9 +438,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
       /has not expired/,
     );
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.transition({ ...observed, token: "forged" }, (current) => current);
         }),
         clock,
@@ -449,9 +448,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
       /fenced lease/,
     );
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.readFenced({ ...observed, token: "forged" });
         }),
         clock,
@@ -459,20 +458,20 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
       /fenced lease/,
     );
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.acquireLease({ sessionId: "", sessionFile: "" });
         }),
         clock,
       ),
-      CanonicalStoreInvalidError,
+      WorkstreamStoreInvalidError,
     );
 
     await Effect.runPromise(clock.setTime(START_MILLIS + 30_001));
-    const taken = await runCanonical(
+    const taken = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         return yield* store.acquireLease(OWNER_B, observed);
       }),
       clock,
@@ -481,9 +480,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
     assert.equal(taken.owner.sessionId, OWNER_B.sessionId);
 
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.renewLease(observed);
         }),
         clock,
@@ -491,9 +490,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
       /fenced lease/,
     );
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.releaseLease(observed);
         }),
         clock,
@@ -501,9 +500,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
       /fenced lease/,
     );
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.transition(
             { ...taken, expiresAt: "not-a-time" },
             (current) => current,
@@ -515,9 +514,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
     );
 
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.transition(taken, (current) =>
             reviseIntent(current, intent("Late revision.", "receipt-late"), T0),
           );
@@ -531,9 +530,9 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
 
     rawUpdate(storagePath(fixture), "UPDATE lease SET expires_at=? WHERE singleton=1", "later");
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.observeLease();
         }),
         clock,
@@ -546,13 +545,13 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
 });
 
 void test("coordinator adoption atomically transfers ownership and installs one fresh lease", async () => {
-  const fixture = await canonicalFixture();
+  const fixture = await workstreamFixture();
   const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
   await Effect.runPromise(clock.setTime(START_MILLIS));
   try {
-    const observed = await runCanonical(
+    const observed = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* createCanonical(fixture);
+        const store = yield* createFixtureStore(fixture);
         return yield* store.acquireLease(COORDINATOR);
       }),
       clock,
@@ -563,9 +562,9 @@ void test("coordinator adoption atomically transfers ownership and installs one 
       source: "invented-placement-proof",
     });
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.adoptCoordinator({
             repository: fixture.repository,
             workstreamId: ID,
@@ -582,9 +581,9 @@ void test("coordinator adoption atomically transfers ownership and installs one 
       /Herdr API dead snapshot/,
     );
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.adoptCoordinator({
             repository: fixture.repository,
             workstreamId: ID,
@@ -601,9 +600,9 @@ void test("coordinator adoption atomically transfers ownership and installs one 
     );
     assert.deepEqual(await readFile(storagePath(fixture)), beforeBytes);
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.adoptCoordinator({
             repository: fixture.repository,
             workstreamId: ID,
@@ -620,9 +619,9 @@ void test("coordinator adoption atomically transfers ownership and installs one 
     );
     assert.deepEqual(await readFile(storagePath(fixture)), beforeBytes);
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.adoptCoordinator({
             repository: fixture.repository,
             workstreamId: ID,
@@ -646,9 +645,9 @@ void test("coordinator adoption atomically transfers ownership and installs one 
       ),
     );
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.adoptCoordinator({
             repository: fixture.repository,
             workstreamId: ID,
@@ -661,11 +660,11 @@ void test("coordinator adoption atomically transfers ownership and installs one 
         }),
         clock,
       ),
-      /canonical transaction/,
+      /workstream transaction/,
     );
-    const rolledBack = await runCanonical(
+    const rolledBack = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         return { state: yield* store.read(), lease: yield* store.observeLease() };
       }),
       clock,
@@ -674,9 +673,9 @@ void test("coordinator adoption atomically transfers ownership and installs one 
     assert.deepEqual(rolledBack.lease, observed);
     rawDatabase(storagePath(fixture), (database) => database.exec("DROP TRIGGER reject_adoption"));
 
-    const adopted = await runCanonical(
+    const adopted = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         return yield* store.adoptCoordinator({
           repository: fixture.repository,
           workstreamId: ID,
@@ -697,9 +696,9 @@ void test("coordinator adoption atomically transfers ownership and installs one 
     assert.notEqual(adopted.lease.token, observed.token);
 
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           return yield* store.transition(adopted.lease, (current) => ({
             ...current,
             revision: current.revision + 1,
@@ -710,9 +709,9 @@ void test("coordinator adoption atomically transfers ownership and installs one 
       ),
       /immutable coordinatorTransfers/,
     );
-    const replay = await runCanonical(
+    const replay = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         return { state: yield* store.read(), lease: yield* store.observeLease() };
       }),
       clock,
@@ -724,26 +723,26 @@ void test("coordinator adoption atomically transfers ownership and installs one 
   }
 });
 
-void test("canonical create and open reject unsafe, foreign, partial, and malformed storage", async () => {
-  const fixture = await canonicalFixture();
+void test("workstream create and open reject unsafe, foreign, partial, and malformed storage", async () => {
+  const fixture = await workstreamFixture();
   try {
-    await runCanonical(createCanonical(fixture));
+    await runWorkstream(createFixtureStore(fixture));
     const path = storagePath(fixture);
     const validBytes = await readFile(path);
 
-    await assert.rejects(runCanonical(openCanonical(fixture, "escape/child")), /path segment/);
-    await assert.rejects(runCanonical(createCanonical(fixture)), CanonicalStoreConflictError);
+    await assert.rejects(runWorkstream(openWorkstream(fixture, "escape/child")), /path segment/);
+    await assert.rejects(runWorkstream(createFixtureStore(fixture)), WorkstreamStoreConflictError);
     assert.deepEqual(await readFile(path), validBytes);
 
     const foreignPath = storagePath(fixture, "foreign");
     await mkdir(storageDirectory(fixture, "foreign"), { recursive: true, mode: 0o700 });
     await copyFile(path, foreignPath);
     await chmod(foreignPath, 0o600);
-    await assert.rejects(runCanonical(openCanonical(fixture, "foreign")), /foreign/);
+    await assert.rejects(runWorkstream(openWorkstream(fixture, "foreign")), /foreign/);
     assert.deepEqual(await readFile(foreignPath), validBytes);
 
     await chmod(path, 0o644);
-    await assert.rejects(runCanonical(openCanonical(fixture)), /not private/);
+    await assert.rejects(runWorkstream(openWorkstream(fixture)), /not private/);
     assert.deepEqual(await readFile(path), validBytes);
     await chmod(path, 0o600);
 
@@ -752,97 +751,97 @@ void test("canonical create and open reject unsafe, foreign, partial, and malfor
       recursive: true,
       mode: 0o755,
     });
-    await assert.rejects(runCanonical(createCanonical(fixture, "unsafe")), /unsafe/);
+    await assert.rejects(runWorkstream(createFixtureStore(fixture, "unsafe")), /unsafe/);
 
-    const symlinkFixture = await canonicalFixture("pi-workgraph-symlink-");
+    const symlinkFixture = await workstreamFixture("pi-workgraph-symlink-");
     try {
       await symlink(symlinkFixture.parent, join(symlinkFixture.gitCommonDir, "pi-workgraph"));
-      await assert.rejects(runCanonical(createCanonical(symlinkFixture)), /symbolic link/);
+      await assert.rejects(runWorkstream(createFixtureStore(symlinkFixture)), /symbolic link/);
     } finally {
       await rm(symlinkFixture.parent, { recursive: true, force: true });
     }
 
     rawUpdate(path, "UPDATE store_header SET version=? WHERE singleton=1", 1);
-    await assert.rejects(runCanonical(openCanonical(fixture)), CanonicalStoreUnsupportedError);
+    await assert.rejects(runWorkstream(openWorkstream(fixture)), WorkstreamStoreUnsupportedError);
     rawUpdate(path, "UPDATE store_header SET version=? WHERE singleton=1", 2);
 
     rawUpdate(path, "UPDATE workstream SET revision=? WHERE singleton=1", 5);
-    await assert.rejects(runCanonical(openCanonical(fixture)), /diverges/);
+    await assert.rejects(runWorkstream(openWorkstream(fixture)), /diverges/);
     rawUpdate(path, "UPDATE workstream SET revision=? WHERE singleton=1", 0);
 
     const malformedState = rawStateText(path).replace(`"id": "${ID}"`, `"id": 5`);
     assert.notEqual(malformedState, rawStateText(path), "Expected to corrupt the aggregate id.");
     rawUpdate(path, "UPDATE workstream SET state_json=? WHERE singleton=1", malformedState);
-    await assert.rejects(runCanonical(openCanonical(fixture)), /malformed/);
+    await assert.rejects(runWorkstream(openWorkstream(fixture)), /malformed/);
     rawUpdate(path, "UPDATE workstream SET state_json=? WHERE singleton=1", "{");
-    await assert.rejects(runCanonical(openCanonical(fixture)), /not valid JSON/);
+    await assert.rejects(runWorkstream(openWorkstream(fixture)), /not valid JSON/);
 
     const malformedPath = storagePath(fixture, "notsqlite");
     await mkdir(storageDirectory(fixture, "notsqlite"), { recursive: true, mode: 0o700 });
     await writeFile(malformedPath, "not a database", { mode: 0o600 });
-    await assert.rejects(runCanonical(openCanonical(fixture, "notsqlite")), /supported SQLite/);
+    await assert.rejects(runWorkstream(openWorkstream(fixture, "notsqlite")), /supported SQLite/);
     assert.equal(await readFile(malformedPath, "utf8"), "not a database");
 
     const emptyPath = storagePath(fixture, "empty");
     await mkdir(storageDirectory(fixture, "empty"), { recursive: true, mode: 0o700 });
     await writeFile(emptyPath, "", { mode: 0o600 });
     await assert.rejects(
-      runCanonical(openCanonical(fixture, "empty")),
-      CanonicalStoreIncompleteError,
+      runWorkstream(openWorkstream(fixture, "empty")),
+      WorkstreamStoreIncompleteError,
     );
     await assert.rejects(
-      runCanonical(createCanonical(fixture, "empty")),
-      CanonicalStoreIncompleteError,
+      runWorkstream(createFixtureStore(fixture, "empty")),
+      WorkstreamStoreIncompleteError,
     );
 
     const headerOnly =
       "CREATE TABLE store_header (singleton INTEGER PRIMARY KEY, format TEXT NOT NULL, version INTEGER NOT NULL);" +
       "CREATE TABLE workstream (singleton INTEGER PRIMARY KEY, state_json TEXT NOT NULL, revision INTEGER NOT NULL);";
-    await rawCanonicalSchema(fixture, "partial", headerOnly);
+    await rawWorkstreamSchema(fixture, "partial", headerOnly);
     await assert.rejects(
-      runCanonical(openCanonical(fixture, "partial")),
-      CanonicalStoreIncompleteError,
+      runWorkstream(openWorkstream(fixture, "partial")),
+      WorkstreamStoreIncompleteError,
     );
     await assert.rejects(
-      runCanonical(createCanonical(fixture, "partial")),
-      CanonicalStoreIncompleteError,
+      runWorkstream(createFixtureStore(fixture, "partial")),
+      WorkstreamStoreIncompleteError,
     );
 
-    await rawCanonicalSchema(
+    await rawWorkstreamSchema(
       fixture,
       "partialcolumn",
       `${headerOnly}CREATE TABLE lease (singleton INTEGER PRIMARY KEY, token TEXT NOT NULL);`,
     );
     await assert.rejects(
-      runCanonical(openCanonical(fixture, "partialcolumn")),
-      CanonicalStoreIncompleteError,
+      runWorkstream(openWorkstream(fixture, "partialcolumn")),
+      WorkstreamStoreIncompleteError,
     );
   } finally {
     await rm(fixture.parent, { recursive: true, force: true });
   }
 });
 
-void test("canonical transition stays no-op exact, rejects invalid results, and rolls back", async () => {
-  const fixture = await canonicalFixture();
+void test("workstream transition stays no-op exact, rejects invalid results, and rolls back", async () => {
+  const fixture = await workstreamFixture();
   const path = storagePath(fixture);
   try {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* createCanonical(fixture);
+        const store = yield* createFixtureStore(fixture);
         yield* store.acquireLease(COORDINATOR);
       }),
     );
     const bytes = await readFile(path);
-    const before = await runCanonical(
+    const before = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         return yield* store.read();
       }),
     );
 
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         const lease = yield* store.observeLease();
         assert.ok(lease !== undefined, "Expected the recovered lease.");
         let callbackInput: Workstream | undefined;
@@ -859,9 +858,9 @@ void test("canonical transition stays no-op exact, rejects invalid results, and 
     assert.deepEqual(await readFile(path), bytes);
 
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const store = yield* openCanonical(fixture);
+          const store = yield* openWorkstream(fixture);
           const lease = yield* store.observeLease();
           assert.ok(lease !== undefined, "Expected the recovered lease.");
           return yield* store.transition(lease, (current) => ({ ...current }));
@@ -899,9 +898,9 @@ void test("canonical transition stays no-op exact, rejects invalid results, and 
     ];
     for (const [mutate, expected] of cases) {
       await assert.rejects(
-        runCanonical(
+        runWorkstream(
           Effect.gen(function* () {
-            const opened = yield* openCanonical(fixture);
+            const opened = yield* openWorkstream(fixture);
             const held = yield* opened.observeLease();
             assert.ok(held !== undefined, "Expected the recovered lease.");
             return yield* opened.transition(held, mutate);
@@ -912,9 +911,9 @@ void test("canonical transition stays no-op exact, rejects invalid results, and 
     }
 
     await assert.rejects(
-      runCanonical(
+      runWorkstream(
         Effect.gen(function* () {
-          const opened = yield* openCanonical(fixture);
+          const opened = yield* openWorkstream(fixture);
           const held = yield* opened.observeLease();
           assert.ok(held !== undefined, "Expected the recovered lease.");
           return yield* opened.transition(held, () => {
@@ -922,12 +921,12 @@ void test("canonical transition stays no-op exact, rejects invalid results, and 
           });
         }),
       ),
-      CanonicalStoreHostError,
+      WorkstreamStoreHostError,
     );
 
-    const after = await runCanonical(
+    const after = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* openCanonical(fixture);
+        const store = yield* openWorkstream(fixture);
         return yield* store.read();
       }),
     );

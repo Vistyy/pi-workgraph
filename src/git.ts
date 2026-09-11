@@ -39,7 +39,7 @@ export interface CandidateApplicationDestination {
   expectedHead: string;
 }
 
-export type CandidateApplicationAction =
+type CandidateApplicationAction =
   | { kind: "already-integrated"; revision: string }
   | { kind: "fast-forward"; target: string };
 
@@ -103,11 +103,7 @@ export class GitParseError extends Data.TaggedError("GitParseError")<{
   readonly output: string;
 }> {}
 
-export type GitFailure =
-  | GitOperationError
-  | GitFileSystemError
-  | GitParseError
-  | ProcessExecutionError;
+type GitFailure = GitOperationError | GitFileSystemError | GitParseError | ProcessExecutionError;
 export type GitEffect<A> = Effect.Effect<A, GitFailure>;
 
 export class GitRepository {

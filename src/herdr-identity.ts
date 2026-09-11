@@ -1,7 +1,5 @@
 import { Data } from "effect";
-import type { HerdrAgentStatus } from "./herdr.js";
-import type { HerdrAgent, HerdrCoordinatorAgent } from "./herdr-decoder.js";
-import type { CoordinatorLaunchResource } from "./herdr-launch.js";
+import type { HerdrAgent, HerdrAgentStatus, HerdrCoordinatorAgent } from "./herdr-decoder.js";
 import type {
   CoordinatorRuntimeIdentity,
   WorkerIdentity,
@@ -24,6 +22,22 @@ export interface WorkerLaunchPlacement {
   readonly paneId: string;
   readonly agentName: string;
   readonly cwd: string;
+}
+
+export interface CoordinatorLaunchResource {
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+  agentName: string;
+  terminalId?: string;
+  sessionFile: string;
+  cwd: string;
+}
+
+export interface HerdrObservation {
+  identity: WorkerIdentity;
+  status: HerdrAgentStatus;
+  observedAt: string;
 }
 
 export class WorkerLaunchPlacementError extends Data.TaggedError("WorkerLaunchPlacementError")<{

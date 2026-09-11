@@ -10,16 +10,7 @@
  * inventing a checkpoint or blindly retrying.
  */
 import { Clock, DateTime, Effect, type FileSystem, type Path } from "effect";
-import type { FrontierEntry } from "./canonical-frontier.js";
-import {
-  type ReconciliationContext,
-  type ReconciliationControl,
-  ReconciliationControlError,
-  type ReconciliationDriver,
-  type ReconciliationDriverError,
-  type ReconciliationMutation,
-  type ReconciliationOutcome,
-} from "./canonical-reconciliation.js";
+import type { Thinking } from "../domain/model-target.js";
 import {
   type Attempt,
   type CancellationCheckpoint,
@@ -29,26 +20,37 @@ import {
   type TaskContract,
   type TerminalObservation,
   type WorkerExecution,
-} from "./domain/workstream.js";
-import type { WorktreePlacement } from "./git.js";
-import type { WorkerLaunchInspection, WorkerLaunchInspectionRequest } from "./herdr.js";
-import type { WorkerLaunchEffectRequest } from "./herdr-launch.js";
-import type { NativeFailureCategory, WorkerSessionResolution } from "./pi-process.js";
-import type { WorkerReport, WorkerSessionMode } from "./report-schema.js";
-import type { ThinkingLevel, WorkerIdentity, WorkerObservationStatus } from "./types.js";
+} from "../domain/workstream.js";
+import type { WorktreePlacement } from "../git.js";
+import type { WorkerLaunchInspection, WorkerLaunchInspectionRequest } from "../herdr.js";
+import type { HerdrAgentStatus } from "../herdr-decoder.js";
+import type { WorkerLaunchEffectRequest } from "../herdr-launch.js";
+import type { NativeFailureCategory, WorkerSessionResolution } from "../pi-process.js";
+import type { WorkerReport, WorkerSessionMode } from "../report-schema.js";
+import type { WorkerIdentity } from "../types.js";
 import {
-  type CanonicalAssignmentInput,
-  type CanonicalWorkerAssignment,
-  canonicalSessionMode,
-  canonicalWorkerAssignment,
-} from "./worker-context.js";
+  type AssignmentInput,
+  type WorkerAssignment,
+  workerAssignment,
+  workerSessionMode,
+} from "../worker-context.js";
+import type { FrontierEntry } from "./frontier.js";
+import {
+  type ReconciliationContext,
+  type ReconciliationControl,
+  ReconciliationControlError,
+  type ReconciliationDriver,
+  type ReconciliationDriverError,
+  type ReconciliationMutation,
+  type ReconciliationOutcome,
+} from "./reconciliation.js";
 
-type WorkerPresence = WorkerObservationStatus | "absent";
+type WorkerPresence = HerdrAgentStatus | "absent";
 type Stage = ReconciliationDriverError | ReconciliationControlError;
 type Requirements = FileSystem.FileSystem | Path.Path;
 
 /** Narrow Git ownership port: one derivation, exact ensure, exact cleanup. */
-export interface CanonicalGitPort {
+export interface WorkstreamGitPort {
   readonly projectRoot: string;
   readonly gitCommonDir: string;
   readonly derivePlacement: (
@@ -79,7 +81,7 @@ export interface CanonicalGitPort {
 }
 
 /** Narrow Herdr worker port over the existing progressive launch contract. */
-export interface CanonicalWorkerPort {
+export interface WorkstreamWorkerPort {
   readonly workspaceId: string;
   readonly launch: (
     request: WorkerLaunchEffectRequest<Stage, Requirements>,
@@ -106,7 +108,7 @@ export interface CanonicalWorkerPort {
 }
 
 /** One immutable worker-session creation request. */
-export interface WorkerSessionRequest {
+interface WorkerSessionRequest {
   runId: string;
   nodeId: string;
   targetCwd: string;
@@ -117,7 +119,7 @@ export interface WorkerSessionRequest {
 }
 
 /** Narrow Pi/session port: exact pre-creation inspection plus retained evidence. */
-export interface CanonicalSessionPort {
+export interface WorkstreamSessionPort {
   readonly sessionDirectory: (runId: string) => Effect.Effect<string, never, Path.Path>;
   readonly inspectDirectory: (
     sessionDir: string,
@@ -146,22 +148,22 @@ export interface CanonicalSessionPort {
   readonly models: (
     sessionFile: string,
     generation: { runId: string; nodeId: string },
-  ) => readonly { model: string; thinking?: string; source?: "selection" | "message" }[];
+  ) => readonly { model: string; thinking?: string; source: "selection" | "message" }[];
   readonly started: (sessionFile: string, runId: string, nodeId: string) => boolean;
   readonly settled: (sessionFile: string, runId: string, nodeId: string) => boolean;
 }
 
-export interface CanonicalDeliveryPort {
+export interface WorkstreamDeliveryPort {
   readonly deliver: (
     context: ReconciliationContext,
   ) => Effect.Effect<void, ReconciliationDriverError, Requirements>;
 }
 
-export interface CanonicalReconciliationPorts {
-  readonly git: CanonicalGitPort;
-  readonly workers: CanonicalWorkerPort;
-  readonly sessions: CanonicalSessionPort;
-  readonly delivery: CanonicalDeliveryPort;
+export interface WorkstreamReconciliationPorts {
+  readonly git: WorkstreamGitPort;
+  readonly workers: WorkstreamWorkerPort;
+  readonly sessions: WorkstreamSessionPort;
+  readonly delivery: WorkstreamDeliveryPort;
   /** Host-only configuration, injected so the pure driver reads no process global. */
   readonly host: { readonly codingAgentDir?: string };
 }
@@ -169,8 +171,8 @@ export interface CanonicalReconciliationPorts {
 const CONTINUATION_INSTRUCTION = "Continue the assigned Workgraph objective now.";
 const WAITING: ReconciliationOutcome = { kind: "waiting" };
 
-export function makeCanonicalReconciliationDriver(
-  ports: CanonicalReconciliationPorts,
+export function makeWorkstreamReconciliationDriver(
+  ports: WorkstreamReconciliationPorts,
 ): ReconciliationDriver {
   return {
     reconcile: (entry, control) => reconcile(ports, entry, control),
@@ -178,7 +180,7 @@ export function makeCanonicalReconciliationDriver(
 }
 
 function reconcile(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   entry: FrontierEntry,
   control: ReconciliationControl,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -207,7 +209,7 @@ function reconcile(
 
 /** Reject an aggregate whose repository identity is not the owned Git identity. */
 function repositoryMismatch(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   context: ReconciliationContext,
 ): string | undefined {
   if (context.repository.projectRoot !== ports.git.projectRoot)
@@ -230,7 +232,7 @@ function isolationMismatch(
 
 /** Declaration-first activation: only the exact placement is committed here. */
 function activate(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
   return Effect.gen(function* () {
@@ -245,7 +247,7 @@ function activate(
 }
 
 function placementFor(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   context: ReconciliationContext,
 ): Placement | undefined {
   if (!requiresIsolation(context.task))
@@ -268,7 +270,7 @@ function persistedBase(context: ReconciliationContext): string | undefined {
 }
 
 function recoverPlacement(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
   return Effect.gen(function* () {
@@ -296,7 +298,7 @@ function recoverPlacement(
 
 /** Returns a blocker detail, or `undefined` when the exact worktree is ensured. */
 function ensureIsolatedWorktree(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   placement: Extract<Placement, { kind: "isolated_worktree" }>,
 ): Effect.Effect<string | undefined, Stage, Requirements> {
@@ -344,10 +346,10 @@ type SessionResolution =
   | { readonly kind: "blocked"; readonly detail: string };
 
 function ensureWorkerSession(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   cwd: string,
-  assignment: CanonicalWorkerAssignment,
+  assignment: WorkerAssignment,
 ): Effect.Effect<SessionResolution, Stage, Requirements> {
   return Effect.gen(function* () {
     const context = control.context();
@@ -406,12 +408,12 @@ function ensureWorkerSession(
 }
 
 function launchOrAdvance(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   cwd: string,
   sessionFile: string,
   firstLaunchAuthorized: boolean,
-  assignment: CanonicalWorkerAssignment,
+  assignment: WorkerAssignment,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
   return Effect.gen(function* () {
     const context = control.context();
@@ -429,12 +431,12 @@ function launchOrAdvance(
 }
 
 function launchFresh(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   context: ReconciliationContext,
   cwd: string,
   sessionFile: string,
-  assignment: CanonicalWorkerAssignment,
+  assignment: WorkerAssignment,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
   return Effect.gen(function* () {
     const selection = guideModel(context);
@@ -497,7 +499,7 @@ function launchFresh(
  * launch checkpoint is monotonic and cannot be rewritten to a new identity.
  */
 function advancePartialLaunch(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   launch: NonNullable<WorkerExecution["launch"]>,
   cwd: string,
@@ -514,7 +516,7 @@ function advancePartialLaunch(
 }
 
 function pollWorker(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   entry: Extract<FrontierEntry, { kind: "worker_poll" }>,
   control: ReconciliationControl,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -539,7 +541,7 @@ function pollWorker(
 
 /** Resolves `not_sent`/`uncertain` submission; `undefined` means polling may proceed. */
 function resolveSubmission(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "worker_poll" }>,
   sessionFile: string,
@@ -565,7 +567,7 @@ function resolveSubmission(
 }
 
 function observeWorker(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "worker_poll" }>,
   sessionFile: string,
@@ -594,7 +596,7 @@ function observeWorker(
 }
 
 function submitObjective(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "worker_poll" }>,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -625,7 +627,7 @@ function submissionInstruction(): string {
 
 /** Read the exact current-generation evidence and atomically terminalize. */
 function retainSettled(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   sessionFile: string,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -644,7 +646,7 @@ function retainSettled(
 }
 
 function terminalObservation(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   context: ReconciliationContext,
   sessionFile: string,
   generation: { runId: string; nodeId: string },
@@ -652,7 +654,7 @@ function terminalObservation(
 ): Effect.Effect<TerminalObservation, Stage, Requirements> {
   return Effect.gen(function* () {
     const read = ports.sessions.readReport(sessionFile, generation);
-    if (read.report !== undefined && read.report.kind === canonicalSessionMode(context.task))
+    if (read.report !== undefined && read.report.kind === workerSessionMode(context.task))
       return yield* typedReportObservation(
         ports,
         context,
@@ -666,7 +668,7 @@ function terminalObservation(
 }
 
 function typedReportObservation(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   context: ReconciliationContext,
   sessionFile: string,
   generation: { runId: string; nodeId: string },
@@ -688,7 +690,7 @@ function typedReportObservation(
 }
 
 function untypedObservation(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   sessionFile: string,
   generation: { runId: string; nodeId: string },
   read: { report?: WorkerReport; invalid: boolean; unreadable: boolean; error?: string },
@@ -712,7 +714,7 @@ function untypedObservation(
 
 /** Returns a blocker reason when the report's Git facts do not hold. */
 function validateReportFacts(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   context: ReconciliationContext,
   report: WorkerReport,
 ): Effect.Effect<string | undefined, Stage, Requirements> {
@@ -723,7 +725,7 @@ function validateReportFacts(
 }
 
 function validateImplementationFacts(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   context: ReconciliationContext,
   report: Extract<WorkerReport, { kind: "implementation"; status: "completed" }>,
 ): Effect.Effect<string | undefined, Stage, Requirements> {
@@ -745,7 +747,7 @@ function validateImplementationFacts(
 }
 
 function validateChangedCandidate(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   target: WorktreePlacement,
   report: Extract<
     WorkerReport,
@@ -777,7 +779,7 @@ function unreported(
 }
 
 function reconcileCancellation(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   entry: Extract<FrontierEntry, { kind: "cancellation" }>,
   control: ReconciliationControl,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -793,7 +795,7 @@ function reconcileCancellation(
 }
 
 function beginCancellation(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "cancellation" }>,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -809,7 +811,7 @@ function beginCancellation(
 }
 
 function resumeInterrupt(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "cancellation" }>,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -835,7 +837,7 @@ function resumeInterrupt(
  * unknown blocks.
  */
 function dispatchInterrupt(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "cancellation" }>,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -869,7 +871,7 @@ type RetainedLaunchObservation =
   | { readonly kind: "blocked"; readonly detail: string };
 
 function inspectRetainedLaunch(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   input: RetainedLaunchInput,
 ): Effect.Effect<RetainedLaunchObservation, Stage, Requirements> {
@@ -902,7 +904,7 @@ function inspectRetainedLaunch(
  * ambiguous because tab creation may already have succeeded.
  */
 function proveNoPriorLaunch(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
 ): Effect.Effect<RetainedLaunchObservation, Stage, Requirements> {
   return Effect.gen(function* () {
@@ -951,7 +953,7 @@ function advanceLaunchCheckpoint(
 }
 
 function interruptObserved(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   worker: WorkerIdentity,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -992,7 +994,7 @@ function observedCancellation(
 }
 
 function closeCancelled(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "cancellation" }>,
   checkpoint: Extract<CancellationCheckpoint, { state: "submitted_or_observed" }>,
@@ -1018,7 +1020,7 @@ function closeCancelled(
 }
 
 function ensureCancellationClosure(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "cancellation" }>,
   checkpoint: Extract<CancellationCheckpoint, { state: "submitted_or_observed" }>,
@@ -1063,7 +1065,7 @@ function retainedLaunchInput(
 }
 
 function ensureClosure(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   input: ClosureInput,
 ): Effect.Effect<Closure, Stage, Requirements> {
@@ -1079,7 +1081,7 @@ function ensureClosure(
 }
 
 function closeIdentity(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   worker: WorkerIdentity,
 ): Effect.Effect<Closure, Stage, Requirements> {
@@ -1094,7 +1096,7 @@ function closeIdentity(
 }
 
 function reconcileCleanup(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   entry: Extract<FrontierEntry, { kind: "cleanup" }>,
   control: ReconciliationControl,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -1118,7 +1120,7 @@ function explicitRelease(attempt: Attempt): boolean {
 }
 
 function ensureWorkerClosed(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   entry: Extract<FrontierEntry, { kind: "cleanup" }>,
   placement: Placement,
   control: ReconciliationControl,
@@ -1136,7 +1138,7 @@ function ensureWorkerClosed(
 }
 
 function applyCleanupDisposition(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   placement: Placement,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -1175,7 +1177,7 @@ function requiresIsolatedCleanup(disposition: OutputDisposition, placement: Plac
 }
 
 function performIsolatedCleanup(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   context: ReconciliationContext,
   disposition: OutputDisposition,
@@ -1203,7 +1205,7 @@ type ExpectedHeadObservation =
 
 /** Fence the exact observed isolated HEAD before any Git cleanup or preserve decision. */
 function checkpointExpectedHead(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   placement: Placement,
 ): Effect.Effect<ExpectedHeadObservation, Stage, Requirements> {
@@ -1264,7 +1266,7 @@ function commitCleanup(
 }
 
 function deliverOutcome(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   entry: Extract<FrontierEntry, { kind: "delivery" }>,
   control: ReconciliationControl,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
@@ -1356,7 +1358,7 @@ function launchInspectionRequest(
 
 interface SelectedGuideModel {
   readonly model: string;
-  readonly thinking?: ThinkingLevel;
+  readonly thinking?: Thinking;
 }
 
 function guideModel(context: ReconciliationContext): SelectedGuideModel {
@@ -1366,13 +1368,13 @@ function guideModel(context: ReconciliationContext): SelectedGuideModel {
   return { model: selection.target.model, thinking: selection.target.thinking };
 }
 
-/** Map one exact immutable context into the single concrete canonical assignment. */
+/** Map one exact immutable context into the single concrete workstream assignment. */
 function assignmentFor(
-  ports: CanonicalReconciliationPorts,
+  ports: WorkstreamReconciliationPorts,
   context: ReconciliationContext,
   cwd: string,
-): CanonicalWorkerAssignment {
-  const assignment: CanonicalAssignmentInput = {
+): WorkerAssignment {
+  const assignment: AssignmentInput = {
     task: context.task,
     intent: context.intent.value,
     intentIndex: context.intent.index,
@@ -1395,7 +1397,7 @@ function assignmentFor(
     assignment.codingAgentDir = ports.host.codingAgentDir;
   if (context.attempt.continuationOf !== undefined)
     assignment.continuationOf = context.attempt.continuationOf;
-  return canonicalWorkerAssignment(assignment);
+  return workerAssignment(assignment);
 }
 
 function absentDetail(failure: NativeFailureCategory | undefined): string {

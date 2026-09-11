@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Canonical storage identity requires no-follow entry inspection (symlink kind, permission bits, and file size); Effect's FileSystem service follows links and exposes no lstat.
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Workstream storage identity requires no-follow entry inspection (symlink kind, permission bits, and file size); Effect's FileSystem service follows links and exposes no lstat.
 import { lstatSync } from "node:fs";
-// node:sqlite is the canonical private aggregate-and-lease transaction guarantee; it has no Effect service equivalent.
+// node:sqlite is the workstream private aggregate-and-lease transaction guarantee; it has no Effect service equivalent.
 import { DatabaseSync } from "node:sqlite";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -20,8 +20,8 @@ export interface StorageEntry {
 
 type NodeSqliteRow = Exclude<ReturnType<ReturnType<DatabaseSync["prepare"]>["get"]>, undefined>;
 
-/** The narrow synchronous SQLite handle owned by one canonical store instance. */
-export interface CanonicalDatabase {
+/** The narrow synchronous SQLite handle owned by one workstream store instance. */
+export interface WorkstreamDatabase {
   exec(statement: string): void;
   tableNames(): string[];
   columnNames(table: string): string[];
@@ -57,10 +57,10 @@ export function inspectStorageEntry(path: string): StorageEntry {
 }
 
 /**
- * Open and configure one canonical handle. Durability and isolation pragmas are
+ * Open and configure one workstream handle. Durability and isolation pragmas are
  * applied here so every caller of this adapter gets the same guarantees.
  */
-export function openCanonicalDatabase(path: string, readOnly = false): CanonicalDatabase {
+export function openWorkstreamDatabase(path: string, readOnly = false): WorkstreamDatabase {
   const database = new DatabaseSync(path, { readOnly });
   database.exec("PRAGMA busy_timeout = 5000;");
   if (!readOnly)

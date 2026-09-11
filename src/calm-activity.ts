@@ -5,8 +5,8 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 // unknown and applies a fail-closed structural guard before reading the one allowlisted property.
 // oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof
 
-export type CalmActivityPhase = "thinking" | "responding";
-export type CalmToolActivity = {
+type CalmActivityPhase = "thinking" | "responding";
+type CalmToolActivity = {
   readonly toolCallId: string;
   readonly toolName: string;
   readonly pathHint?: string;

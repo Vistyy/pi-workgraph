@@ -1,20 +1,16 @@
-import { DateTime, Option } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { EvidenceSchema, WorkerReportSchema } from "../report-schema.js";
 import { ModelTargetSchema } from "./model-target.js";
+import { CommitSchema, InstantSchema, NonEmptyStringSchema } from "./values.js";
 
-const CANONICAL_WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
-const CANONICAL_WORKSTREAM_SCHEMA = "coordination-domain" as const;
-const CANONICAL_WORKSTREAM_SCHEMA_VERSION = 2 as const;
+const WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
+const WORKSTREAM_SCHEMA_VERSION = 3 as const;
 
-const NonEmptyString = Type.String({ minLength: 1 });
-const Timestamp = Type.String({ minLength: 1 });
-const TransferTimestamp = Type.String({
-  format: "date-time",
-  pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
-});
-const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
+const NonEmptyString = NonEmptyStringSchema;
+const Timestamp = InstantSchema;
+const TransferTimestamp = InstantSchema;
+const Commit = CommitSchema;
 const stringLiterals = <const Values extends readonly string[]>(values: Values) =>
   Type.Unsafe<Values[number]>({ type: "string", enum: [...values] });
 
@@ -204,7 +200,7 @@ const EffectiveModelSchema = Type.Object(
   {
     model: NonEmptyString,
     thinking: Type.Optional(NonEmptyString),
-    source: Type.Optional(stringLiterals(["selection", "message"] as const)),
+    source: stringLiterals(["selection", "message"] as const),
   },
   { additionalProperties: false },
 );
@@ -329,10 +325,6 @@ const OutputReleaseSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const AttentionSchema = Type.Object(
-  { detail: NonEmptyString, at: Timestamp },
-  { additionalProperties: false },
-);
 const RetainedArtifactSchema = Type.Object(
   {
     id: NonEmptyString,
@@ -409,7 +401,6 @@ export const AttemptSchema = Type.Object(
     application: Type.Optional(ApplicationSchema),
     cleanup: Type.Optional(CleanupSchema),
     outputRelease: Type.Optional(OutputReleaseSchema),
-    attentionHistory: Type.Optional(Type.Array(AttentionSchema)),
     outcome: Type.Optional(OutcomeSchema),
   },
   { additionalProperties: false },
@@ -468,10 +459,6 @@ export const TaskSchema = Type.Union([
 ]);
 const CompletionAccountingSchema = Type.Union([
   Type.Object(
-    { kind: Type.Literal("unresolved_task"), taskId: NonEmptyString, reason: NonEmptyString },
-    { additionalProperties: false },
-  ),
-  Type.Object(
     {
       kind: Type.Literal("unresolved_attempt"),
       taskId: NonEmptyString,
@@ -509,9 +496,8 @@ const SuspensionSchema = Type.Object(
 );
 export const WorkstreamSchema = Type.Object(
   {
-    format: Type.Literal(CANONICAL_WORKSTREAM_FORMAT),
-    schema: Type.Literal(CANONICAL_WORKSTREAM_SCHEMA),
-    schemaVersion: Type.Literal(CANONICAL_WORKSTREAM_SCHEMA_VERSION),
+    format: Type.Literal(WORKSTREAM_FORMAT),
+    schemaVersion: Type.Literal(WORKSTREAM_SCHEMA_VERSION),
     revision: Type.Integer({ minimum: 0 }),
     id: NonEmptyString,
     purpose: NonEmptyString,
@@ -533,8 +519,7 @@ export const WorkstreamSchema = Type.Object(
 export type RepositoryIdentity = Static<typeof RepositoryIdentitySchema>;
 export type CoordinatorIdentity = Static<typeof CoordinatorIdentitySchema>;
 export type HerdrDeadObservation = Static<typeof HerdrDeadObservationSchema>;
-export type CoordinatorTransfer = Static<typeof CoordinatorTransferSchema>;
-export type HumanInputReceipt = Static<typeof HumanInputReceiptSchema>;
+type CoordinatorTransfer = Static<typeof CoordinatorTransferSchema>;
 export type HumanInputReceiptData = Static<typeof HumanInputReceiptDataSchema>;
 export type HandoffGrant = Static<typeof HandoffGrantSchema>;
 export type HandoffCheckpoint = Static<typeof HandoffCheckpointSchema>;
@@ -593,7 +578,7 @@ export function validateWorkstream(value: Workstream): void {
   if (!Value.Check(WorkstreamSchema, value)) {
     const issue = Value.Errors(WorkstreamSchema, value)[0];
     throw new Error(
-      `Invalid canonical Workstream at ${issue?.instancePath === undefined || issue.instancePath === "" ? "/" : issue.instancePath}: ${issue?.message ?? "schema mismatch"}.`,
+      `Invalid Workstream at ${issue?.instancePath === undefined || issue.instancePath === "" ? "/" : issue.instancePath}: ${issue?.message ?? "schema mismatch"}.`,
     );
   }
   validateWorkstreamInvariants(value);
@@ -875,7 +860,6 @@ function hasOperationalFacts(attempt: Attempt): boolean {
     attempt.application !== undefined ||
     attempt.cleanup !== undefined ||
     attempt.outputRelease !== undefined ||
-    attempt.attentionHistory !== undefined ||
     attempt.outcome !== undefined
   );
 }
@@ -1239,19 +1223,24 @@ function validateLifecycle(workstream: Workstream): void {
   validateSuspension(workstream);
   if ((workstream.lifecycle === "completed") !== (workstream.completion !== undefined))
     throw new Error("Completed lifecycle and Completion must appear together.");
-  if (workstream.lifecycle === "completed") {
-    // A completed Workstream cannot retain any unfinished Attempt; this mirrors
-    // `completeWorkstream` at the persisted read boundary without widening the
-    // existing completion accounting rules.
-    for (const task of workstream.tasks)
-      for (const attempt of task.attempts)
-        if (attempt.state !== "finished")
-          throw new Error(`Completed Workstream contains unfinished Attempt ${attempt.id}.`);
-  }
+  if (workstream.lifecycle === "completed") validateCompletedLifecycle(workstream);
   if (workstream.completion === undefined) return;
   const expected = deriveCompletionAccounting(workstream);
   if (!sameValue(expected, workstream.completion.accounting))
     throw new Error("Completion accounting must be the exact derived set.");
+}
+
+function validateCompletedLifecycle(workstream: Workstream): void {
+  for (const handoff of workstream.handoffs ?? [])
+    if (handoff.phase !== "launched")
+      throw new Error(`Completed Workstream contains unlaunched Handoff ${handoff.id}.`);
+  // A completed Workstream cannot retain any unfinished Attempt; this mirrors
+  // `completeWorkstream` at the persisted read boundary without widening the
+  // existing completion accounting rules.
+  for (const task of workstream.tasks)
+    for (const attempt of task.attempts)
+      if (attempt.state !== "finished")
+        throw new Error(`Completed Workstream contains unfinished Attempt ${attempt.id}.`);
 }
 
 function validateSuspension(workstream: Workstream): void {
@@ -1259,12 +1248,6 @@ function validateSuspension(workstream: Workstream): void {
     throw new Error("Suspended lifecycle and current Suspension must appear together.");
   if (workstream.suspension === undefined) return;
   if (!workstream.suspension.reason.trim()) throw new Error("Suspension reason is required.");
-  const suspendedAt = DateTime.make(workstream.suspension.suspendedAt);
-  if (
-    Option.isNone(suspendedAt) ||
-    DateTime.toDate(suspendedAt.value).toISOString() !== workstream.suspension.suspendedAt
-  )
-    throw new Error("Suspension timestamp must be a canonical UTC instant.");
 }
 
 export function findTask(workstream: Workstream, taskId: string): Task | undefined {
@@ -1308,9 +1291,8 @@ export function createWorkstream(input: {
   createdAt: string;
 }): Workstream {
   const workstream: Workstream = {
-    format: CANONICAL_WORKSTREAM_FORMAT,
-    schema: CANONICAL_WORKSTREAM_SCHEMA,
-    schemaVersion: CANONICAL_WORKSTREAM_SCHEMA_VERSION,
+    format: WORKSTREAM_FORMAT,
+    schemaVersion: WORKSTREAM_SCHEMA_VERSION,
     revision: 0,
     id: input.id,
     purpose: input.purpose,
@@ -1362,6 +1344,7 @@ export function checkpointHandoff(
       );
     return workstream;
   }
+  assertActive(workstream, "progress Handoff");
   if (nextRank !== currentRank + 1)
     throw new Error(`Handoff ${checkpoint.id} checkpoint skipped a required phase.`);
   return mutate(workstream, updatedAt, (draft) => {
@@ -1945,6 +1928,9 @@ export function completeWorkstream(
     workstream.tasks.some((task) => task.attempts.some((attempt) => attempt.state !== "finished"))
   )
     throw new Error("Cannot complete Workstream while an Attempt is not terminal.");
+  const unlaunched = (workstream.handoffs ?? []).find((handoff) => handoff.phase !== "launched");
+  if (unlaunched !== undefined)
+    throw new Error(`Cannot complete Workstream while Handoff ${unlaunched.id} is not launched.`);
   const accounting = deriveCompletionAccounting(workstream);
   return mutate(workstream, updatedAt, (draft) => {
     draft.lifecycle = "completed";

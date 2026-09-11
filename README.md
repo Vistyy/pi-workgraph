@@ -60,6 +60,7 @@ Describe the outcome you want and any important constraints. Workgraph fixes one
 
 Research and ordinary review can inspect the live repository, including uncommitted files. Implementation and authorized disposable experiments use isolated worktrees; these are ownership boundaries, not security sandboxes. Results remain unapplied until the coordinator has inspected them and deliberately integrates the selected output.
 
+Workgraph stores each operational Workstream in a private SQLite database below the repository's Git common directory. Delegated Pi session history is retained separately under `pi-workgraph/worker-sessions/<workstreamId>/`; operational Workstream cleanup does not imply deleting or relocating that session history.
 
 ## Calm presentation
 

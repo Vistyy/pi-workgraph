@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Value } from "typebox/value";
-import { reportSchemaForMode, type WorkerMode } from "../src/report-schema.js";
+import { reportSchemaForMode, type WorkerMode, WorkerReportSchema } from "../src/report-schema.js";
 
 const reportContent = {
   summary: "Bounded result",
@@ -22,6 +22,33 @@ function reportForMode(mode: WorkerMode) {
     ...reportContent,
   };
 }
+
+void test("changed implementation input excludes host-owned Git metadata and persistence requires it", () => {
+  const input = {
+    kind: "implementation",
+    status: "completed",
+    outcome: "changed",
+    ...reportContent,
+  } as const;
+  const inputSchema = reportSchemaForMode("implementation");
+  assert.equal(Value.Check(inputSchema, input), true);
+  assert.equal(Value.Check(inputSchema, { ...input, commit: "a".repeat(40) }), false);
+  assert.equal(Value.Check(inputSchema, { ...input, changedFiles: ["change.ts"] }), false);
+
+  assert.equal(Value.Check(WorkerReportSchema, input), false);
+  assert.equal(
+    Value.Check(WorkerReportSchema, {
+      ...input,
+      commit: "a".repeat(40),
+      changedFiles: ["change.ts"],
+    }),
+    true,
+  );
+  assert.equal(
+    Value.Check(WorkerReportSchema, { ...input, commit: "invalid", changedFiles: [] }),
+    false,
+  );
+});
 
 void test("live report schemas reject undeclared top-level and nested sensitive fields in every mode", () => {
   for (const mode of ["research", "review", "implementation"] as const) {

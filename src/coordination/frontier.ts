@@ -16,13 +16,13 @@ import {
   type Task,
   type WorkerExecution,
   type Workstream,
-} from "./domain/workstream.js";
+} from "../domain/workstream.js";
 
 /**
  * Exact ready Worker identity a driver may poll. Polling needs the Pi session
  * file as well as the Herdr resource fields, so partial identity never polls.
  */
-export interface ReadyWorkerIdentity {
+interface ReadyWorkerIdentity {
   readonly workspaceId: string;
   readonly tabId: string;
   readonly paneId: string;
@@ -111,7 +111,7 @@ export function deliveryDueAt(delivery: Delivery | undefined): string | undefine
   return DateTime.toDate(DateTime.makeUnsafe(due)).toISOString();
 }
 
-/** Preserve aggregate order and canonical per-Attempt kind order. */
+/** Preserve aggregate order and workstream per-Attempt kind order. */
 export function classifyWorkstream(workstream: Workstream): FrontierEntry[] {
   const entries: FrontierEntry[] = [];
   for (const task of workstream.tasks)

@@ -26,13 +26,11 @@ import type { Component, Container } from "@earendil-works/pi-tui";
 // SAFETY: The running Pi module is external input; exports and constructor shapes are validated here.
 // oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-runtime-typeof, anti-slop/no-reflect-get, anti-slop/no-chained-type-assertions, effecttsgo/async-function
 
-export type CalmAssistantConstructor = new (
-  message?: AssistantMessage,
-) => AssistantMessageComponent;
-export type CalmUserConstructor = new (text: string) => UserMessageComponent;
-export type CalmSkillConstructor = new (...args: never[]) => SkillInvocationMessageComponent;
+type CalmAssistantConstructor = new (message?: AssistantMessage) => AssistantMessageComponent;
+type CalmUserConstructor = new (text: string) => UserMessageComponent;
+type CalmSkillConstructor = new (...args: never[]) => SkillInvocationMessageComponent;
 export type CalmComponentConstructor = new (...args: never[]) => Component;
-export type CalmContainerConstructor = new () => Container;
+type CalmContainerConstructor = new () => Container;
 
 export interface CalmChatRuntime {
   readonly assistant: CalmAssistantConstructor;

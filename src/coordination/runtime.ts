@@ -1,4 +1,4 @@
-/** Lease-scoped canonical command and reconciliation owner. */
+/** Lease-scoped workstream command and reconciliation owner. */
 import { randomUUID } from "node:crypto";
 import {
   Cause,
@@ -20,59 +20,6 @@ import {
 } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import { Value } from "typebox/value";
-import {
-  appendFacts,
-  CancelCommandSchema,
-  CanonicalCommandError,
-  type CanonicalCommandPorts,
-  type CompleteCommand,
-  CompleteCommandSchema,
-  decodeCommand,
-  enqueueFacts,
-  exactAttempt,
-  type ResumeCommand,
-  ResumeCommandSchema,
-  ReviseIntentCommandSchema,
-  SteerCommandSchema,
-  type SuspendCommand,
-  SuspendCommandSchema,
-  workerIdentity,
-} from "./canonical-commands.js";
-import type { FrontierEntry } from "./canonical-frontier.js";
-import { applyMaintainedOutput, releaseMaintainedOutput } from "./canonical-output.js";
-import { decodeAppend, decodeEnqueue, planAppend, planEnqueue } from "./canonical-queue.js";
-import {
-  type ReconciliationAttention,
-  type ReconciliationCommit,
-  type ReconciliationContext,
-  type ReconciliationControl,
-  ReconciliationControlError,
-  type ReconciliationDriver,
-  type ReconciliationFrontierObservation,
-  type ReconciliationMutation,
-  ReconciliationScheduler,
-  type ResolvedReviewInput,
-} from "./canonical-reconciliation.js";
-import {
-  CANONICAL_RUNTIME_GENERATION_PROTOCOL,
-  closeRuntimeGeneration,
-  compatibleRuntimeGeneration,
-  publishRuntimeGeneration,
-  type RuntimeGenerationEntry,
-  type RuntimeGenerationHandle,
-  type RuntimeGenerationQuiescence,
-  type RuntimeGenerationRegistryError,
-  recordRuntimeGenerationQuiescence,
-  reserveRuntimeGenerationPath,
-  runtimeGeneration,
-  unregisterRuntimeGeneration,
-} from "./canonical-runtime-generation.js";
-import {
-  type CanonicalCoordinatorAdoption,
-  type CanonicalLease,
-  type CanonicalStoreError,
-  CanonicalWorkstreamStore,
-} from "./canonical-workstream-store.js";
 import {
   type AttemptKey,
   activateAttempt,
@@ -102,16 +49,69 @@ import {
   type Task,
   terminalizeAttempt,
   type Workstream,
-} from "./domain/workstream.js";
-import { loadModelPolicyEffect, type ModelPolicy, type ModelPolicyError } from "./model-policy.js";
+} from "../domain/workstream.js";
+import { loadModelPolicyEffect, type ModelPolicy, type ModelPolicyError } from "../model-policy.js";
+import {
+  type WorkstreamCoordinatorAdoption,
+  type WorkstreamLease,
+  WorkstreamStore,
+  type WorkstreamStoreError,
+} from "../storage/workstream-store.js";
+import {
+  appendFacts,
+  CancelCommandSchema,
+  type CompleteCommand,
+  CompleteCommandSchema,
+  decodeCommand,
+  enqueueFacts,
+  exactAttempt,
+  type ResumeCommand,
+  ResumeCommandSchema,
+  ReviseIntentCommandSchema,
+  SteerCommandSchema,
+  type SuspendCommand,
+  SuspendCommandSchema,
+  WorkstreamCommandError,
+  type WorkstreamCommandPorts,
+  workerIdentity,
+} from "./commands.js";
+import type { FrontierEntry } from "./frontier.js";
+import { applyMaintainedOutput, releaseMaintainedOutput } from "./output.js";
+import { decodeAppend, decodeEnqueue, planAppend, planEnqueue } from "./queue.js";
+import {
+  type ReconciliationAttention,
+  type ReconciliationCommit,
+  type ReconciliationContext,
+  type ReconciliationControl,
+  ReconciliationControlError,
+  type ReconciliationDriver,
+  type ReconciliationFrontierObservation,
+  type ReconciliationMutation,
+  ReconciliationScheduler,
+  type ResolvedReviewInput,
+} from "./reconciliation.js";
+import {
+  closeRuntimeGeneration,
+  compatibleRuntimeGeneration,
+  publishRuntimeGeneration,
+  type RuntimeGenerationEntry,
+  type RuntimeGenerationHandle,
+  type RuntimeGenerationQuiescence,
+  type RuntimeGenerationRegistryError,
+  recordRuntimeGenerationQuiescence,
+  reserveRuntimeGenerationPath,
+  runtimeGeneration,
+  unregisterRuntimeGeneration,
+  WORKSTREAM_RUNTIME_GENERATION_PROTOCOL,
+} from "./runtime-generation.js";
 
-export class CanonicalRuntimeIdentityError extends Data.TaggedError(
-  "CanonicalRuntimeIdentityError",
+export class WorkstreamRuntimeIdentityError extends Data.TaggedError(
+  "WorkstreamRuntimeIdentityError",
 )<{
   readonly message: string;
 }> {}
 
-export class CanonicalRuntimeLeaseError extends Data.TaggedError("CanonicalRuntimeLeaseError")<{
+export class WorkstreamRuntimeLeaseError extends Data.TaggedError("WorkstreamRuntimeLeaseError")<{
   readonly code:
     | "lease_already_held"
     | "generation_proof_missing"
@@ -121,112 +121,114 @@ export class CanonicalRuntimeLeaseError extends Data.TaggedError("CanonicalRunti
   readonly message: string;
 }> {}
 
-export class CanonicalRuntimeStoppedError extends Data.TaggedError("CanonicalRuntimeStoppedError")<{
+export class WorkstreamRuntimeStoppedError extends Data.TaggedError(
+  "WorkstreamRuntimeStoppedError",
+)<{
   readonly message: string;
 }> {}
 
-export class CanonicalRuntimeOperationError extends Data.TaggedError(
-  "CanonicalRuntimeOperationError",
+export class WorkstreamRuntimeOperationError extends Data.TaggedError(
+  "WorkstreamRuntimeOperationError",
 )<{
   readonly operation: string;
   readonly message: string;
   readonly cause?: unknown;
 }> {}
 
-export class CanonicalRuntimeStaleError extends Data.TaggedError("CanonicalRuntimeStaleError")<{
+export class WorkstreamRuntimeStaleError extends Data.TaggedError("WorkstreamRuntimeStaleError")<{
   readonly operation: string;
   readonly message: string;
 }> {}
 
-export type CanonicalRuntimeError =
-  | CanonicalStoreError
+export type WorkstreamRuntimeError =
+  | WorkstreamStoreError
   | ModelPolicyError
   | PlatformError
-  | CanonicalRuntimeIdentityError
-  | CanonicalRuntimeLeaseError
-  | CanonicalRuntimeStoppedError
-  | CanonicalRuntimeStaleError
-  | CanonicalRuntimeOperationError
+  | WorkstreamRuntimeIdentityError
+  | WorkstreamRuntimeLeaseError
+  | WorkstreamRuntimeStoppedError
+  | WorkstreamRuntimeStaleError
+  | WorkstreamRuntimeOperationError
   | RuntimeGenerationRegistryError
-  | CanonicalCommandError;
+  | WorkstreamCommandError;
 
-export type CanonicalRuntimeEffect<A> = Effect.Effect<
+export type WorkstreamRuntimeEffect<A> = Effect.Effect<
   A,
-  CanonicalRuntimeError,
+  WorkstreamRuntimeError,
   FileSystem.FileSystem
 >;
 
-export interface CanonicalRuntimeInspectionSnapshot {
+export interface WorkstreamRuntimeInspectionSnapshot {
   readonly workstream: Workstream;
   readonly reconciliation: readonly ReconciliationFrontierObservation[];
 }
 
-export type CanonicalRuntimeOwnership =
+export type WorkstreamRuntimeOwnership =
   | { readonly kind: "attach" }
   | { readonly kind: "recover" }
   | { readonly kind: "adopt"; readonly deathObservation: HerdrDeadObservation };
 
-export interface CanonicalRuntimeAcquisition {
+export interface WorkstreamRuntimeAcquisition {
   readonly id: string;
   readonly repository: RepositoryIdentity;
   readonly coordinator: CoordinatorIdentity;
-  readonly ownership: CanonicalRuntimeOwnership;
+  readonly ownership: WorkstreamRuntimeOwnership;
   readonly policyPath?: string;
   readonly driver: ReconciliationDriver;
-  readonly commands?: CanonicalCommandPorts;
+  readonly commands?: WorkstreamCommandPorts;
   readonly onReconciliationAttention?: ReconciliationAttention;
   readonly heartbeatInterval?: Duration.Input;
   readonly onCommitted?: (state: Workstream) => Effect.Effect<void, never>;
-  readonly onFatal?: (error: CanonicalRuntimeError) => Effect.Effect<void, never>;
+  readonly onFatal?: (error: WorkstreamRuntimeError) => Effect.Effect<void, never>;
 }
 
 const DEFAULT_HEARTBEAT_INTERVAL: Duration.Input = "5 seconds";
-const STOPPED_MESSAGE = "Canonical runtime is closed and accepts no further commands.";
+const STOPPED_MESSAGE = "Workstream runtime is closed and accepts no further commands.";
 
-/** Ready scoped owner for serialized canonical coordinator commands. */
-export class CanonicalRuntime {
+/** Ready scoped owner for serialized workstream coordinator commands. */
+export class WorkstreamRuntime {
   private closed = false;
   private generationEntry?: RuntimeGenerationEntry;
 
   private constructor(
     private readonly resourceScope: Scope.Scope,
-    private readonly store: CanonicalWorkstreamStore,
-    private readonly lease: CanonicalLease,
+    private readonly store: WorkstreamStore,
+    private readonly lease: WorkstreamLease,
     private readonly semaphore: Semaphore.Semaphore,
     private readonly fibers: FiberSet.FiberSet<unknown, never>,
     private readonly scheduler: ReconciliationScheduler,
     private readonly committed: Ref.Ref<Workstream>,
-    private readonly closeRequest: Deferred.Deferred<CanonicalRuntimeError | undefined>,
+    private readonly closeRequest: Deferred.Deferred<WorkstreamRuntimeError | undefined>,
     private readonly shutdownClaimed: Ref.Ref<boolean>,
-    private readonly completion: Deferred.Deferred<void, CanonicalRuntimeError>,
+    private readonly completion: Deferred.Deferred<void, WorkstreamRuntimeError>,
     private readonly generationQuiescence: Deferred.Deferred<RuntimeGenerationQuiescence>,
-    private readonly releaseFailure: Ref.Ref<CanonicalStoreError | undefined>,
-    private readonly acquisition: CanonicalRuntimeAcquisition,
+    private readonly releaseFailure: Ref.Ref<WorkstreamStoreError | undefined>,
+    private readonly acquisition: WorkstreamRuntimeAcquisition,
   ) {}
 
   /**
-   * Eagerly acquire a caller-Scope-owned canonical runtime. Escaping an
+   * Eagerly acquire a caller-Scope-owned workstream runtime. Escaping an
    * `Effect.scoped` acquisition returns an already-closed handle.
    */
   static acquire(
-    acquisition: CanonicalRuntimeAcquisition,
+    acquisition: WorkstreamRuntimeAcquisition,
   ): Effect.Effect<
-    CanonicalRuntime,
-    CanonicalRuntimeError,
+    WorkstreamRuntime,
+    WorkstreamRuntimeError,
     FileSystem.FileSystem | Path.Path | Scope.Scope
   > {
     return Effect.acquireRelease(
-      CanonicalRuntime.initialize(acquisition),
+      WorkstreamRuntime.initialize(acquisition),
       (runtime) => runtime.ownerFinalizer(),
       { interruptible: true },
     );
   }
 
   private static initialize(
-    acquisition: CanonicalRuntimeAcquisition,
+    acquisition: WorkstreamRuntimeAcquisition,
   ): Effect.Effect<
-    CanonicalRuntime,
-    CanonicalRuntimeError,
+    WorkstreamRuntime,
+    WorkstreamRuntimeError,
     FileSystem.FileSystem | Path.Path | Scope.Scope
   > {
     return Effect.gen(function* () {
@@ -237,11 +239,11 @@ export class CanonicalRuntime {
       const resourceScope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
         Scope.close(scope, Exit.void),
       );
-      const path = yield* CanonicalWorkstreamStore.pathFor(acquisition.repository, acquisition.id);
+      const path = yield* WorkstreamStore.pathFor(acquisition.repository, acquisition.id);
       const runtime = yield* Effect.scoped(
         reserveRuntimeGenerationPath(path).pipe(
           Effect.andThen(
-            CanonicalRuntime.build(resourceScope, acquisition, path).pipe(
+            WorkstreamRuntime.build(resourceScope, acquisition, path).pipe(
               Scope.provide(resourceScope),
               Effect.onError((cause) => Scope.close(resourceScope, Exit.failCause(cause))),
             ),
@@ -257,20 +259,17 @@ export class CanonicalRuntime {
 
   private static build(
     resourceScope: Scope.Scope,
-    acquisition: CanonicalRuntimeAcquisition,
+    acquisition: WorkstreamRuntimeAcquisition,
     path: string,
   ): Effect.Effect<
-    CanonicalRuntime,
-    CanonicalRuntimeError,
+    WorkstreamRuntime,
+    WorkstreamRuntimeError,
     FileSystem.FileSystem | Path.Path | Scope.Scope
   > {
     return Effect.gen(function* () {
-      const attachment = yield* CanonicalWorkstreamStore.open(
-        acquisition.id,
-        acquisition.repository,
-      );
+      const attachment = yield* WorkstreamStore.open(acquisition.id, acquisition.repository);
       const { store } = attachment;
-      const releaseFailure = yield* Ref.make<CanonicalStoreError | undefined>(undefined);
+      const releaseFailure = yield* Ref.make<WorkstreamStoreError | undefined>(undefined);
       const owned = yield* Effect.acquireRelease(
         prepareOwnership(store, attachment.state, acquisition, path),
         ({ lease }) =>
@@ -295,11 +294,11 @@ export class CanonicalRuntime {
       // One defensive snapshot of the committed aggregate, seeded from the
       // attachment read and replaced only by successful transitions.
       const committed = yield* Ref.make(structuredClone(state));
-      const closeRequest = yield* Deferred.make<CanonicalRuntimeError | undefined>();
+      const closeRequest = yield* Deferred.make<WorkstreamRuntimeError | undefined>();
       const shutdownClaimed = yield* Ref.make(false);
-      const completion = yield* Deferred.make<void, CanonicalRuntimeError>();
+      const completion = yield* Deferred.make<void, WorkstreamRuntimeError>();
       const generationQuiescence = yield* Deferred.make<RuntimeGenerationQuiescence>();
-      const runtime = new CanonicalRuntime(
+      const runtime = new WorkstreamRuntime(
         resourceScope,
         store,
         lease,
@@ -319,7 +318,7 @@ export class CanonicalRuntime {
         close: () => Effect.runPromise(runtime.closeForGeneration()),
       };
       const entry: RuntimeGenerationEntry = {
-        protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+        protocolVersion: WORKSTREAM_RUNTIME_GENERATION_PROTOCOL,
         path,
         workstreamId: acquisition.id,
         coordinator: structuredClone(acquisition.coordinator),
@@ -340,7 +339,7 @@ export class CanonicalRuntime {
   }
 
   /** Fenced read through the serialized boundary; also re-proves ownership. */
-  readonly read = (): CanonicalRuntimeEffect<Workstream> =>
+  readonly read = (): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(this.fencedRead().pipe(Effect.map((state) => structuredClone(state))));
 
   /** Lease-local projection; SQLite remains authoritative. */
@@ -348,24 +347,24 @@ export class CanonicalRuntime {
     Ref.get(this.committed).pipe(Effect.map((state) => structuredClone(state)));
 
   /** Prove the held lease from the lease row alone, never full task history. */
-  readonly checkOwnership = (): CanonicalRuntimeEffect<void> =>
+  readonly checkOwnership = (): WorkstreamRuntimeEffect<void> =>
     this.serialized(this.store.checkLease(this.lease));
 
   /** Enqueue one immutable Task with its resolved initial Attempt(s). */
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the canonical TypeBox schema.
-  readonly enqueue = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the workstream TypeBox schema.
+  readonly enqueue = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(this.enqueueEffect(command));
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the canonical TypeBox schema.
-  readonly appendAttempts = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the workstream TypeBox schema.
+  readonly appendAttempts = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(this.appendEffect(command));
 
   readonly readAttempt = (
     attemptId: string,
-  ): CanonicalRuntimeEffect<ReturnType<typeof exactAttempt>> =>
+  ): WorkstreamRuntimeEffect<ReturnType<typeof exactAttempt>> =>
     this.serialized(
       Effect.gen(
-        function* (this: CanonicalRuntime) {
+        function* (this: WorkstreamRuntime) {
           const state = yield* this.fencedRead();
           const located = yield* this.try("resolve Attempt", () => exactAttempt(state, attemptId));
           return structuredClone(located);
@@ -373,18 +372,18 @@ export class CanonicalRuntime {
       ),
     );
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
-  readonly suspend = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
+  readonly suspend = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.scheduler.withDispatchBarrier(
       Effect.uninterruptible(
         this.serialized(
           Effect.gen(
-            function* (this: CanonicalRuntime) {
+            function* (this: WorkstreamRuntime) {
               const input = yield* this.try("decode suspension", () =>
                 decodeCommand<SuspendCommand>(SuspendCommandSchema, command, "suspension command"),
               );
               const now = yield* this.now();
-              const committed = yield* this.authoritative("suspend canonical Workstream", (state) =>
+              const committed = yield* this.authoritative("suspend Workstream", (state) =>
                 suspendWorkstream(state, { reason: input.reason, suspendedAt: now }, now),
               );
               yield* this.scheduler.attach(committed);
@@ -395,18 +394,18 @@ export class CanonicalRuntime {
       ),
     );
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
-  readonly resume = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
+  readonly resume = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.scheduler.withDispatchBarrier(
       Effect.uninterruptible(
         this.serialized(
           Effect.gen(
-            function* (this: CanonicalRuntime) {
+            function* (this: WorkstreamRuntime) {
               yield* this.try("decode resumption", () =>
                 decodeCommand<ResumeCommand>(ResumeCommandSchema, command, "resumption command"),
               );
               const now = yield* this.now();
-              const committed = yield* this.authoritative("resume canonical Workstream", (state) =>
+              const committed = yield* this.authoritative("resume Workstream", (state) =>
                 resumeWorkstream(state, now),
               );
               yield* this.scheduler.attach(committed);
@@ -417,11 +416,11 @@ export class CanonicalRuntime {
       ),
     );
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
-  readonly reviseIntent = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
+  readonly reviseIntent = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(
       Effect.gen(
-        function* (this: CanonicalRuntime) {
+        function* (this: WorkstreamRuntime) {
           const intent = yield* this.try("decode Intent revision", () =>
             decodeCommand<Intent>(ReviseIntentCommandSchema, command, "Intent revision"),
           );
@@ -430,7 +429,7 @@ export class CanonicalRuntime {
             task.attempts.map((attempt) => ({ taskId: task.id, attemptId: attempt.id })),
           );
           const now = yield* this.now();
-          const committed = yield* this.authoritative("revise canonical Intent", (state) =>
+          const committed = yield* this.authoritative("revise workstream Intent", (state) =>
             reviseIntent(state, intent, now),
           );
           yield* this.notifyCommitted(committed, affected);
@@ -441,12 +440,12 @@ export class CanonicalRuntime {
 
   readonly issueHandoff = (
     prepared: Extract<HandoffCheckpoint, { phase: "prepared" }>,
-  ): CanonicalRuntimeEffect<Workstream> =>
+  ): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(
       Effect.gen(
-        function* (this: CanonicalRuntime) {
+        function* (this: WorkstreamRuntime) {
           const now = yield* this.now();
-          return yield* this.authoritative("issue canonical Handoff Grant", (state) =>
+          return yield* this.authoritative("issue workstream Handoff Grant", (state) =>
             issueHandoff(state, prepared, now),
           );
         }.bind(this),
@@ -455,39 +454,39 @@ export class CanonicalRuntime {
 
   readonly checkpointHandoff = (
     checkpoint: HandoffCheckpoint,
-  ): CanonicalRuntimeEffect<Workstream> =>
+  ): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(
       Effect.gen(
-        function* (this: CanonicalRuntime) {
+        function* (this: WorkstreamRuntime) {
           const now = yield* this.now();
-          return yield* this.authoritative("checkpoint canonical Handoff launch", (state) =>
+          return yield* this.authoritative("checkpoint workstream Handoff launch", (state) =>
             checkpointHandoff(state, checkpoint, now),
           );
         }.bind(this),
       ),
     );
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
-  readonly complete = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
+  readonly complete = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(
       Effect.gen(
-        function* (this: CanonicalRuntime) {
+        function* (this: WorkstreamRuntime) {
           const input = yield* this.try("decode completion", () =>
             decodeCommand<CompleteCommand>(CompleteCommandSchema, command, "completion command"),
           );
           const now = yield* this.now();
-          return yield* this.authoritative("complete canonical Workstream", (state) =>
+          return yield* this.authoritative("complete Workstream", (state) =>
             completeWorkstream(state, { ...input, completedAt: now }, now),
           );
         }.bind(this),
       ),
     );
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
-  readonly cancel = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
+  readonly cancel = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(
       Effect.gen(
-        function* (this: CanonicalRuntime) {
+        function* (this: WorkstreamRuntime) {
           const input = yield* this.try("decode cancellation", () =>
             decodeCommand<{ attemptId: string; reason: string }>(
               CancelCommandSchema,
@@ -500,7 +499,7 @@ export class CanonicalRuntime {
             exactAttempt(before, input.attemptId),
           );
           const now = yield* this.now();
-          const committed = yield* this.authoritative("request canonical cancellation", (state) =>
+          const committed = yield* this.authoritative("request workstream cancellation", (state) =>
             planCancellation(state, located.key, input.reason, now),
           );
           if (before.revision !== committed.revision)
@@ -510,20 +509,20 @@ export class CanonicalRuntime {
       ),
     );
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
-  readonly steer = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
+  readonly steer = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(this.steerEffect(command));
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
-  readonly apply = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
+  readonly apply = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(
       Effect.flatMap(this.commandPorts(), (ports) =>
         applyMaintainedOutput(this.outputControl(ports), command),
       ),
     );
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
-  readonly releaseOutput = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
+  readonly releaseOutput = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(
       Effect.flatMap(this.commandPorts(), (ports) =>
         releaseMaintainedOutput(this.outputControl(ports), command),
@@ -537,10 +536,10 @@ export class CanonicalRuntime {
   readonly frontierSnapshot = (): Effect.Effect<readonly FrontierEntry[]> =>
     this.scheduler.snapshot();
 
-  readonly inspectionSnapshot = (): CanonicalRuntimeEffect<CanonicalRuntimeInspectionSnapshot> =>
+  readonly inspectionSnapshot = (): WorkstreamRuntimeEffect<WorkstreamRuntimeInspectionSnapshot> =>
     this.serialized(
       Effect.gen(
-        function* (this: CanonicalRuntime) {
+        function* (this: WorkstreamRuntime) {
           yield* this.store.checkLease(this.lease);
           return {
             workstream: structuredClone(yield* Ref.get(this.committed)),
@@ -551,10 +550,10 @@ export class CanonicalRuntime {
     );
 
   /** Rebuild transient reconciliation state from one fenced aggregate read. */
-  readonly reconcile = (): CanonicalRuntimeEffect<readonly FrontierEntry[]> =>
+  readonly reconcile = (): WorkstreamRuntimeEffect<readonly FrontierEntry[]> =>
     this.serialized(
       Effect.gen(
-        function* (this: CanonicalRuntime) {
+        function* (this: WorkstreamRuntime) {
           const state = yield* this.fencedRead();
           yield* this.scheduler.attach(state);
           return yield* this.scheduler.snapshot();
@@ -607,11 +606,11 @@ export class CanonicalRuntime {
     mutation: ReconciliationMutation,
   ): Effect.Effect<ReconciliationCommit, ReconciliationControlError, FileSystem.FileSystem> {
     const effect = Effect.gen(
-      function* (this: CanonicalRuntime) {
+      function* (this: WorkstreamRuntime) {
         const before = yield* Ref.get(this.committed);
         const now = yield* this.now();
         const committed = yield* this.authoritative(
-          "apply canonical reconciliation mutation",
+          "apply workstream reconciliation mutation",
           (expected) => applyReconciliationMutation(expected, key, mutation, now),
         );
         if (committed.revision === before.revision) return { kind: "no_change" } as const;
@@ -628,14 +627,14 @@ export class CanonicalRuntime {
   }
 
   /** The single idempotent close boundary for explicit shutdown. */
-  readonly close = (): Effect.Effect<void, CanonicalRuntimeError> => this.closeEffect();
+  readonly close = (): Effect.Effect<void, WorkstreamRuntimeError> => this.closeEffect();
 
-  readonly awaitClosed = (): Effect.Effect<void, CanonicalRuntimeError> =>
+  readonly awaitClosed = (): Effect.Effect<void, WorkstreamRuntimeError> =>
     Deferred.await(this.completion);
 
-  private fencedRead(): Effect.Effect<Workstream, CanonicalStoreError, FileSystem.FileSystem> {
+  private fencedRead(): Effect.Effect<Workstream, WorkstreamStoreError, FileSystem.FileSystem> {
     return Effect.gen(
-      function* (this: CanonicalRuntime) {
+      function* (this: WorkstreamRuntime) {
         const current = yield* this.store.readFenced(this.lease);
         yield* Ref.set(this.committed, current);
         return current;
@@ -644,22 +643,22 @@ export class CanonicalRuntime {
   }
 
   private enqueueEffect(
-    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the canonical TypeBox schema.
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the workstream TypeBox schema.
     command: unknown,
-  ): Effect.Effect<Workstream, CanonicalRuntimeError, FileSystem.FileSystem> {
+  ): Effect.Effect<Workstream, WorkstreamRuntimeError, FileSystem.FileSystem> {
     return Effect.gen(
-      function* (this: CanonicalRuntime) {
-        const decoded = yield* this.try("decode canonical Task enqueue", () =>
+      function* (this: WorkstreamRuntime) {
+        const decoded = yield* this.try("decode workstream Task enqueue", () =>
           decodeEnqueue(command),
         );
         const policy = yield* this.policy();
-        const plan = yield* this.try("plan canonical Task enqueue", () =>
+        const plan = yield* this.try("plan workstream Task enqueue", () =>
           planEnqueue(decoded, policy),
         );
         const expected = yield* Ref.get(this.committed);
         if (findTask(expected, plan.taskId) !== undefined)
-          return yield* new CanonicalRuntimeOperationError({
-            operation: "enqueue canonical Task",
+          return yield* new WorkstreamRuntimeOperationError({
+            operation: "enqueue workstream Task",
             message: `Task ${plan.taskId} already exists.`,
           });
         const facts = yield* enqueueFacts(expected, decoded, this.acquisition.commands?.git);
@@ -668,7 +667,7 @@ export class CanonicalRuntime {
           { length: plan.attemptCount },
           () => `attempt-${randomUUID()}`,
         );
-        const committed = yield* this.authoritative("enqueue canonical Task", (expected) =>
+        const committed = yield* this.authoritative("enqueue workstream Task", (expected) =>
           createTask(
             expected,
             plan.materialize(attemptIds, now, expected.intents.length - 1, facts),
@@ -685,17 +684,17 @@ export class CanonicalRuntime {
   }
 
   private appendEffect(
-    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the canonical TypeBox schema.
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the workstream TypeBox schema.
     command: unknown,
-  ): Effect.Effect<Workstream, CanonicalRuntimeError, FileSystem.FileSystem> {
+  ): Effect.Effect<Workstream, WorkstreamRuntimeError, FileSystem.FileSystem> {
     return Effect.gen(
-      function* (this: CanonicalRuntime) {
-        const decoded = yield* this.try("decode canonical append command", () =>
+      function* (this: WorkstreamRuntime) {
+        const decoded = yield* this.try("decode workstream append command", () =>
           decodeAppend(command),
         );
         const policy = yield* this.policy();
         const expected = yield* Ref.get(this.committed);
-        const resolved = yield* this.try("resolve canonical append plan", () => {
+        const resolved = yield* this.try("resolve workstream append plan", () => {
           const task = findTask(expected, decoded.taskId);
           if (task === undefined) throw new Error(`Unknown Task ${decoded.taskId}.`);
           return planAppend(decoded, task, policy);
@@ -706,7 +705,7 @@ export class CanonicalRuntime {
           { length: resolved.attemptCount },
           () => `attempt-${randomUUID()}`,
         );
-        const committed = yield* this.authoritative("append canonical Attempts", (current) =>
+        const committed = yield* this.authoritative("append workstream Attempts", (current) =>
           appendAttempts(
             current,
             decoded.taskId,
@@ -723,7 +722,7 @@ export class CanonicalRuntime {
     );
   }
 
-  private outputControl(ports: CanonicalCommandPorts) {
+  private outputControl(ports: WorkstreamCommandPorts) {
     return {
       state: Ref.get(this.committed).pipe(Effect.map((state) => structuredClone(state))),
       commit: (operation: string, key: AttemptKey, plan: (state: Workstream) => Workstream) =>
@@ -737,9 +736,9 @@ export class CanonicalRuntime {
   }
 
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Called only from the schema-owning public steering boundary.
-  private steerEffect(command: unknown): CanonicalRuntimeEffect<Workstream> {
+  private steerEffect(command: unknown): WorkstreamRuntimeEffect<Workstream> {
     return Effect.gen(
-      function* (this: CanonicalRuntime) {
+      function* (this: WorkstreamRuntime) {
         const input = yield* this.try("decode steering command", () =>
           decodeCommand<{ attemptId: string; instruction: string }>(
             SteerCommandSchema,
@@ -756,7 +755,7 @@ export class CanonicalRuntime {
         if (currentSteering?.state === "submitted" && currentSteering.text === input.instruction)
           return initial;
         if (currentSteering?.state === "uncertain")
-          return yield* new CanonicalCommandError({
+          return yield* new WorkstreamCommandError({
             operation: "steer Worker",
             message: `Attempt ${input.attemptId} has an uncertain steering delivery; inspect before any resend.`,
           });
@@ -789,12 +788,12 @@ export class CanonicalRuntime {
     );
   }
 
-  private commandPorts(): Effect.Effect<CanonicalCommandPorts, CanonicalRuntimeOperationError> {
+  private commandPorts(): Effect.Effect<WorkstreamCommandPorts, WorkstreamRuntimeOperationError> {
     return this.acquisition.commands === undefined
       ? Effect.fail(
-          new CanonicalRuntimeOperationError({
-            operation: "canonical explicit command",
-            message: "Canonical explicit command host ports are unavailable.",
+          new WorkstreamRuntimeOperationError({
+            operation: "workstream explicit command",
+            message: "Workstream explicit command host ports are unavailable.",
           }),
         )
       : Effect.succeed(this.acquisition.commands);
@@ -804,11 +803,11 @@ export class CanonicalRuntime {
   private authoritative(
     operation: string,
     plan: (expected: Workstream) => Workstream,
-  ): Effect.Effect<Workstream, CanonicalRuntimeError, FileSystem.FileSystem> {
+  ): Effect.Effect<Workstream, WorkstreamRuntimeError, FileSystem.FileSystem> {
     return Effect.gen(
-      function* (this: CanonicalRuntime) {
+      function* (this: WorkstreamRuntime) {
         const expectedRevision = (yield* Ref.get(this.committed)).revision;
-        let failure: CanonicalRuntimeError | undefined;
+        let failure: WorkstreamRuntimeError | undefined;
         const committed = yield* this.store.transition(this.lease, (current) => {
           if (this.closed) {
             failure = stoppedError();
@@ -821,7 +820,7 @@ export class CanonicalRuntime {
           try {
             return plan(current);
           } catch (cause) {
-            failure = new CanonicalRuntimeOperationError({
+            failure = new WorkstreamRuntimeOperationError({
               operation,
               message: errorMessage(cause),
               cause,
@@ -860,11 +859,11 @@ export class CanonicalRuntime {
   private try<A>(
     operation: string,
     run: () => A,
-  ): Effect.Effect<A, CanonicalRuntimeOperationError> {
+  ): Effect.Effect<A, WorkstreamRuntimeOperationError> {
     return Effect.try({
       try: run,
       catch: (cause) =>
-        new CanonicalRuntimeOperationError({
+        new WorkstreamRuntimeOperationError({
           operation,
           message: errorMessage(cause),
           cause,
@@ -873,17 +872,17 @@ export class CanonicalRuntime {
   }
 
   /** Serialize a command in the owned FiberSet so close interrupts and joins it. */
-  private serialized<A>(effect: CanonicalRuntimeEffect<A>): CanonicalRuntimeEffect<A> {
+  private serialized<A>(effect: WorkstreamRuntimeEffect<A>): WorkstreamRuntimeEffect<A> {
     return Effect.suspend(
-      function (this: CanonicalRuntime) {
+      function (this: WorkstreamRuntime) {
         if (this.closed) return Effect.fail(stoppedError());
         const run = Effect.gen(
-          function* (this: CanonicalRuntime) {
+          function* (this: WorkstreamRuntime) {
             const fiber = yield* FiberSet.run(
               this.fibers,
               Effect.exit(
                 this.semaphore.withPermit(
-                  Effect.suspend<A, CanonicalRuntimeError, FileSystem.FileSystem>(() =>
+                  Effect.suspend<A, WorkstreamRuntimeError, FileSystem.FileSystem>(() =>
                     this.closed ? Effect.fail(stoppedError()) : effect,
                   ),
                 ),
@@ -903,7 +902,7 @@ export class CanonicalRuntime {
   private heartbeatLoop(): Effect.Effect<void, never, FileSystem.FileSystem> {
     const interval = this.acquisition.heartbeatInterval ?? DEFAULT_HEARTBEAT_INTERVAL;
     return Effect.gen(
-      function* (this: CanonicalRuntime) {
+      function* (this: WorkstreamRuntime) {
         while (!this.closed) {
           yield* Effect.sleep(interval);
           if (this.closed) return;
@@ -919,9 +918,9 @@ export class CanonicalRuntime {
     );
   }
 
-  private renewLease(): CanonicalRuntimeEffect<void> {
+  private renewLease(): WorkstreamRuntimeEffect<void> {
     return Effect.gen(
-      function* (this: CanonicalRuntime) {
+      function* (this: WorkstreamRuntime) {
         yield* Effect.suspend(() => (this.closed ? Effect.fail(stoppedError()) : Effect.void));
         yield* this.store.renewLease(this.lease).pipe(Effect.asVoid);
       }.bind(this),
@@ -935,17 +934,17 @@ export class CanonicalRuntime {
     return Deferred.await(this.closeRequest).pipe(Effect.andThen(this.shutdown()), Effect.ignore);
   }
 
-  private requestClose(fatal?: CanonicalRuntimeError): Effect.Effect<void> {
+  private requestClose(fatal?: WorkstreamRuntimeError): Effect.Effect<void> {
     return Effect.sync(() => {
       this.closed = true;
     }).pipe(Effect.andThen(Deferred.succeed(this.closeRequest, fatal)), Effect.asVoid);
   }
 
   /** One uninterruptible claim closes resources and settles shared completion. */
-  private shutdown(): Effect.Effect<void, CanonicalRuntimeError> {
-    const close: Effect.Effect<CanonicalRuntimeError | undefined> = Effect.uninterruptible(
+  private shutdown(): Effect.Effect<void, WorkstreamRuntimeError> {
+    const close: Effect.Effect<WorkstreamRuntimeError | undefined> = Effect.uninterruptible(
       Effect.gen(
-        function* (this: CanonicalRuntime) {
+        function* (this: WorkstreamRuntime) {
           const owned = yield* Ref.getAndSet(this.shutdownClaimed, true);
           if (owned) return undefined;
           const fatal = yield* Deferred.await(this.closeRequest);
@@ -974,14 +973,14 @@ export class CanonicalRuntime {
     );
   }
 
-  private report(error: CanonicalRuntimeError): Effect.Effect<void> {
+  private report(error: WorkstreamRuntimeError): Effect.Effect<void> {
     const report = this.acquisition.onFatal;
     return report === undefined ? Effect.void : report(error).pipe(Effect.ignoreCause);
   }
 
   private ownerFinalizer(): Effect.Effect<void> {
     return Effect.gen(
-      function* (this: CanonicalRuntime) {
+      function* (this: WorkstreamRuntime) {
         const entry = this.generationEntry;
         if (entry === undefined) return;
         yield* this.recordPublishedQuiescence(entry);
@@ -992,7 +991,7 @@ export class CanonicalRuntime {
 
   private recordPublishedQuiescence(entry: RuntimeGenerationEntry): Effect.Effect<void> {
     return Effect.gen(
-      function* (this: CanonicalRuntime) {
+      function* (this: WorkstreamRuntime) {
         yield* this.requestClose();
         yield* Effect.exit(this.shutdown());
         const result = yield* Deferred.await(this.generationQuiescence);
@@ -1001,7 +1000,7 @@ export class CanonicalRuntime {
     );
   }
 
-  private closeEffect(): Effect.Effect<void, CanonicalRuntimeError> {
+  private closeEffect(): Effect.Effect<void, WorkstreamRuntimeError> {
     return this.requestClose().pipe(Effect.andThen(this.shutdown()));
   }
 
@@ -1046,13 +1045,13 @@ function planCancellation(
 }
 
 function prepareOwnership(
-  store: CanonicalWorkstreamStore,
+  store: WorkstreamStore,
   initial: Workstream,
-  acquisition: CanonicalRuntimeAcquisition,
+  acquisition: WorkstreamRuntimeAcquisition,
   path: string,
 ): Effect.Effect<
-  { readonly state: Workstream; readonly lease: CanonicalLease },
-  CanonicalRuntimeError,
+  { readonly state: Workstream; readonly lease: WorkstreamLease },
+  WorkstreamRuntimeError,
   FileSystem.FileSystem
 > {
   return Effect.gen(function* () {
@@ -1060,7 +1059,7 @@ function prepareOwnership(
     if (sameCoordinator(initial.coordinator, acquisition.coordinator))
       return yield* prepareCurrentCoordinator(store, initial, acquisition, path, observed);
     if (acquisition.ownership.kind !== "adopt")
-      return yield* new CanonicalRuntimeIdentityError({
+      return yield* new WorkstreamRuntimeIdentityError({
         message: `Workstream ${acquisition.id} is coordinated by ${initial.coordinator.sessionId}; different-session attachment requires explicit adoption.`,
       });
     return yield* adoptDifferentCoordinator(
@@ -1075,14 +1074,14 @@ function prepareOwnership(
 }
 
 function prepareCurrentCoordinator(
-  store: CanonicalWorkstreamStore,
+  store: WorkstreamStore,
   initial: Workstream,
-  acquisition: CanonicalRuntimeAcquisition,
+  acquisition: WorkstreamRuntimeAcquisition,
   path: string,
-  observed: CanonicalLease | undefined,
+  observed: WorkstreamLease | undefined,
 ): Effect.Effect<
-  { readonly state: Workstream; readonly lease: CanonicalLease },
-  CanonicalRuntimeError,
+  { readonly state: Workstream; readonly lease: WorkstreamLease },
+  WorkstreamRuntimeError,
   FileSystem.FileSystem
 > {
   if (observed === undefined) {
@@ -1114,15 +1113,15 @@ function prepareCurrentCoordinator(
 }
 
 function adoptDifferentCoordinator(
-  store: CanonicalWorkstreamStore,
+  store: WorkstreamStore,
   initial: Workstream,
-  acquisition: CanonicalRuntimeAcquisition,
+  acquisition: WorkstreamRuntimeAcquisition,
   path: string,
-  observed: CanonicalLease | undefined,
+  observed: WorkstreamLease | undefined,
   deathObservation: HerdrDeadObservation,
 ): Effect.Effect<
-  { readonly state: Workstream; readonly lease: CanonicalLease },
-  CanonicalRuntimeError,
+  { readonly state: Workstream; readonly lease: WorkstreamLease },
+  WorkstreamRuntimeError,
   FileSystem.FileSystem
 > {
   return Effect.gen(function* () {
@@ -1137,12 +1136,12 @@ function adoptDifferentCoordinator(
     const locallyQuiesced = local !== undefined;
     const current = yield* store.read();
     if (current.revision !== initial.revision)
-      return yield* new CanonicalRuntimeIdentityError({
-        message: `Canonical state changed before coordinator adoption at ${path}.`,
+      return yield* new WorkstreamRuntimeIdentityError({
+        message: `Workstream state changed before coordinator adoption at ${path}.`,
       });
     const currentLease = yield* store.observeLease();
     yield* validateAdoptionReobservation(path, observed, currentLease, locallyQuiesced);
-    const adoption: CanonicalCoordinatorAdoption = {
+    const adoption: WorkstreamCoordinatorAdoption = {
       repository: acquisition.repository,
       workstreamId: acquisition.id,
       expectedRevision: initial.revision,
@@ -1158,10 +1157,10 @@ function adoptDifferentCoordinator(
 
 function validateAdoptionReobservation(
   path: string,
-  before: CanonicalLease | undefined,
-  after: CanonicalLease | undefined,
+  before: WorkstreamLease | undefined,
+  after: WorkstreamLease | undefined,
   locallyQuiesced: boolean,
-): Effect.Effect<void, CanonicalRuntimeLeaseError> {
+): Effect.Effect<void, WorkstreamRuntimeLeaseError> {
   if (before === undefined && after === undefined) return Effect.void;
   if (before !== undefined && after !== undefined && sameExactLease(before, after))
     return Effect.void;
@@ -1176,10 +1175,10 @@ function validateAdoptionReobservation(
 
 function quiesceExactGeneration(
   entry: RuntimeGenerationEntry,
-  acquisition: CanonicalRuntimeAcquisition,
+  acquisition: WorkstreamRuntimeAcquisition,
   path: string,
-  observed: CanonicalLease | undefined,
-): Effect.Effect<void, CanonicalRuntimeLeaseError> {
+  observed: WorkstreamLease | undefined,
+): Effect.Effect<void, WorkstreamRuntimeLeaseError> {
   return Effect.gen(function* () {
     const compatible =
       observed === undefined
@@ -1224,13 +1223,13 @@ function quiesceExactGeneration(
 }
 
 function recoverGeneration(
-  store: CanonicalWorkstreamStore,
-  acquisition: CanonicalRuntimeAcquisition,
+  store: WorkstreamStore,
+  acquisition: WorkstreamRuntimeAcquisition,
   path: string,
-  observed: CanonicalLease,
+  observed: WorkstreamLease,
 ): Effect.Effect<
-  { readonly state: Workstream; readonly lease: CanonicalLease },
-  CanonicalRuntimeError,
+  { readonly state: Workstream; readonly lease: WorkstreamLease },
+  WorkstreamRuntimeError,
   FileSystem.FileSystem
 > {
   return Effect.gen(function* () {
@@ -1264,21 +1263,21 @@ function recoverGeneration(
 }
 
 function leaseError(
-  code: CanonicalRuntimeLeaseError["code"],
+  code: WorkstreamRuntimeLeaseError["code"],
   path: string,
-  observed: CanonicalLease | undefined,
+  observed: WorkstreamLease | undefined,
   proof: string,
-): Effect.Effect<never, CanonicalRuntimeLeaseError> {
+): Effect.Effect<never, WorkstreamRuntimeLeaseError> {
   const row =
     observed === undefined
       ? "observed lease absence"
       : `observed owner ${observed.owner.sessionId}, token ${observed.token}, expiry ${observed.expiresAt}`;
   return Effect.fail(
-    new CanonicalRuntimeLeaseError({ code, message: `${path}: ${row}; ${proof}.` }),
+    new WorkstreamRuntimeLeaseError({ code, message: `${path}: ${row}; ${proof}.` }),
   );
 }
 
-function sameExactLease(left: CanonicalLease, right: CanonicalLease): boolean {
+function sameExactLease(left: WorkstreamLease, right: WorkstreamLease): boolean {
   return Value.Equal(left, right);
 }
 
@@ -1287,7 +1286,7 @@ type WritableContext = {
   -readonly [Key in keyof ReconciliationContext]: ReconciliationContext[Key];
 };
 
-/** Resolve only the canonical content named by a validated review subject. */
+/** Resolve only the workstream content named by a validated review subject. */
 function resolveReviewInput(
   workstream: Workstream,
   subject: Extract<Task, { kind: "review" }>["subject"],
@@ -1360,51 +1359,51 @@ function sameCoordinator(left: CoordinatorIdentity, right: CoordinatorIdentity):
   return left.sessionId === right.sessionId && left.sessionFile === right.sessionFile;
 }
 
-function stoppedError(): CanonicalRuntimeStoppedError {
-  return new CanonicalRuntimeStoppedError({ message: STOPPED_MESSAGE });
+function stoppedError(): WorkstreamRuntimeStoppedError {
+  return new WorkstreamRuntimeStoppedError({ message: STOPPED_MESSAGE });
 }
 
-function staleError(operation: string): CanonicalRuntimeStaleError {
-  return new CanonicalRuntimeStaleError({
+function staleError(operation: string): WorkstreamRuntimeStaleError {
+  return new WorkstreamRuntimeStaleError({
     operation,
     message: `${operation} planned from a projection that no longer matches the authoritative aggregate; run an authoritative read or manual reconcile before retrying.`,
   });
 }
 
-function releaseFailureError(cause: CanonicalStoreError): CanonicalRuntimeOperationError {
-  return new CanonicalRuntimeOperationError({
-    operation: "release canonical runtime lease",
+function releaseFailureError(cause: WorkstreamStoreError): WorkstreamRuntimeOperationError {
+  return new WorkstreamRuntimeOperationError({
+    operation: "release workstream runtime lease",
     message: "Runtime resources are quiescent but exact lease release failed.",
     cause,
   });
 }
 
-function closeFailure(cause: Cause.Cause<unknown>): CanonicalRuntimeOperationError {
-  return new CanonicalRuntimeOperationError({
-    operation: "close canonical runtime",
-    message: "Failed to close the canonical runtime.",
+function closeFailure(cause: Cause.Cause<unknown>): WorkstreamRuntimeOperationError {
+  return new WorkstreamRuntimeOperationError({
+    operation: "close workstream runtime",
+    message: "Failed to close the workstream runtime.",
     cause: Cause.squash(cause),
   });
 }
 
 /** Combine a fatal lease episode with a close failure into one typed report. */
 function combineFatalClose(
-  fatal: CanonicalRuntimeError,
-  closeError: CanonicalRuntimeOperationError,
-): CanonicalRuntimeError {
-  return new CanonicalRuntimeOperationError({
-    operation: "close canonical runtime after fatal lease loss",
-    message: "Canonical runtime lease loss and close failure.",
+  fatal: WorkstreamRuntimeError,
+  closeError: WorkstreamRuntimeOperationError,
+): WorkstreamRuntimeError {
+  return new WorkstreamRuntimeOperationError({
+    operation: "close workstream runtime after fatal lease loss",
+    message: "Workstream runtime lease loss and close failure.",
     cause: new AggregateError([fatal, closeError]),
   });
 }
 
-function fatalCause(cause: Cause.Cause<CanonicalRuntimeError>): CanonicalRuntimeError {
+function fatalCause(cause: Cause.Cause<WorkstreamRuntimeError>): WorkstreamRuntimeError {
   const failure = Cause.findErrorOption(cause);
   if (Option.isSome(failure)) return failure.value;
   const defect = Cause.squash(cause);
-  return new CanonicalRuntimeOperationError({
-    operation: "renew canonical Workstream lease",
+  return new WorkstreamRuntimeOperationError({
+    operation: "renew Workstream lease",
     message: errorMessage(defect),
     cause: defect,
   });

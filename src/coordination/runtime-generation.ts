@@ -1,9 +1,9 @@
 import { Data, Effect, type Scope } from "effect";
-import type { CanonicalLease } from "./canonical-workstream-store.js";
-import type { CoordinatorIdentity } from "./domain/workstream.js";
+import type { CoordinatorIdentity } from "../domain/workstream.js";
+import type { WorkstreamLease } from "../storage/workstream-store.js";
 
-export const CANONICAL_RUNTIME_GENERATION_PROTOCOL = 1 as const;
-const REGISTRY_SYMBOL = Symbol.for("pi-workgraph.canonical-runtime-generations.v1");
+export const WORKSTREAM_RUNTIME_GENERATION_PROTOCOL = 2 as const;
+const REGISTRY_SYMBOL = Symbol.for("pi-workgraph.runtime-generations.v2");
 
 export interface RuntimeGenerationQuiescence {
   readonly quiescent: boolean;
@@ -15,18 +15,18 @@ export interface RuntimeGenerationHandle {
 }
 
 export interface RuntimeGenerationEntry {
-  readonly protocolVersion: typeof CANONICAL_RUNTIME_GENERATION_PROTOCOL;
+  readonly protocolVersion: typeof WORKSTREAM_RUNTIME_GENERATION_PROTOCOL;
   readonly path: string;
   readonly workstreamId: string;
   readonly coordinator: CoordinatorIdentity;
-  readonly lease: CanonicalLease;
+  readonly lease: WorkstreamLease;
   readonly handle: RuntimeGenerationHandle;
   status: "active" | "closing" | "quiescent" | "failed";
   closeResult?: Promise<RuntimeGenerationQuiescence>;
 }
 
 interface RuntimeGenerationRegistry {
-  readonly protocolVersion: typeof CANONICAL_RUNTIME_GENERATION_PROTOCOL;
+  readonly protocolVersion: typeof WORKSTREAM_RUNTIME_GENERATION_PROTOCOL;
   readonly entries: Map<string, RuntimeGenerationEntry>;
   readonly tails: Map<string, Promise<void>>;
 }
@@ -48,17 +48,17 @@ function registry(): RuntimeGenerationRegistry {
   const existing = host[REGISTRY_SYMBOL];
   if (existing !== undefined) {
     if (
-      existing.protocolVersion !== CANONICAL_RUNTIME_GENERATION_PROTOCOL ||
+      existing.protocolVersion !== WORKSTREAM_RUNTIME_GENERATION_PROTOCOL ||
       !(existing.entries instanceof Map) ||
       !(existing.tails instanceof Map)
     )
       throw new RuntimeGenerationRegistryError({
-        message: `Incompatible process-global canonical runtime generation protocol; expected version ${CANONICAL_RUNTIME_GENERATION_PROTOCOL}.`,
+        message: `Incompatible process-global workstream runtime generation protocol; expected version ${WORKSTREAM_RUNTIME_GENERATION_PROTOCOL}.`,
       });
     return existing;
   }
   const created: RuntimeGenerationRegistry = {
-    protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+    protocolVersion: WORKSTREAM_RUNTIME_GENERATION_PROTOCOL,
     entries: new Map(),
     tails: new Map(),
   };
@@ -66,7 +66,7 @@ function registry(): RuntimeGenerationRegistry {
   return created;
 }
 
-/** Reserve all attachment and replacement decisions for one exact canonical path. */
+/** Reserve all attachment and replacement decisions for one exact workstream path. */
 export function reserveRuntimeGenerationPath(
   path: string,
 ): Effect.Effect<void, RuntimeGenerationRegistryError, Scope.Scope> {
@@ -75,7 +75,7 @@ export function reserveRuntimeGenerationPath(
       try: () => enqueueReservation(path),
       catch: (cause) =>
         new RuntimeGenerationRegistryError({
-          message: `Failed to serialize canonical runtime attachment for ${path}: ${String(cause)}`,
+          message: `Failed to serialize workstream runtime attachment for ${path}: ${String(cause)}`,
         }),
     }),
     (reservation) => Effect.sync(reservation.release),
@@ -154,11 +154,11 @@ export function compatibleRuntimeGeneration(
     readonly path: string;
     readonly workstreamId: string;
     readonly coordinator: CoordinatorIdentity;
-    readonly lease?: CanonicalLease;
+    readonly lease?: WorkstreamLease;
   },
 ): boolean {
   if (
-    entry.protocolVersion !== CANONICAL_RUNTIME_GENERATION_PROTOCOL ||
+    entry.protocolVersion !== WORKSTREAM_RUNTIME_GENERATION_PROTOCOL ||
     entry.path !== input.path ||
     entry.workstreamId !== input.workstreamId ||
     entry.coordinator.sessionId !== input.coordinator.sessionId ||
@@ -174,7 +174,7 @@ export function compatibleRuntimeGeneration(
   );
 }
 
-/** Deterministic isolation for tests that own all canonical runtimes in this process. */
+/** Deterministic isolation for tests that own all workstream runtimes in this process. */
 export function resetRuntimeGenerationRegistryForTest(): void {
   const state = registry();
   state.entries.clear();

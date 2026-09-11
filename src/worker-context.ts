@@ -1,7 +1,7 @@
 import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import type { ResolvedReviewInput } from "./canonical-reconciliation.js";
+import type { ResolvedReviewInput } from "./coordination/reconciliation.js";
 import type { CandidateLineage, Intent, TaskContract } from "./domain/workstream.js";
 import type { WorkerSessionMode } from "./report-schema.js";
 
@@ -194,8 +194,8 @@ function belongsToIdentity(
   return data.runId === identity.runId && data.nodeId === identity.nodeId;
 }
 
-/** One concrete canonical worker assignment; every launch fact is built once here. */
-export interface CanonicalWorkerAssignment {
+/** One concrete workstream worker assignment; every launch fact is built once here. */
+export interface WorkerAssignment {
   readonly mode: WorkerSessionMode;
   readonly role: "consultation" | "implement" | "research" | "review";
   readonly objective: string;
@@ -203,7 +203,7 @@ export interface CanonicalWorkerAssignment {
   readonly environment: Record<string, string>;
 }
 
-export interface CanonicalAssignmentInput {
+export interface AssignmentInput {
   task: TaskContract;
   intent: Intent;
   intentIndex: number;
@@ -220,22 +220,20 @@ export interface CanonicalAssignmentInput {
   continuationOf?: string;
 }
 
-export function canonicalWorkerAssignment(
-  input: CanonicalAssignmentInput,
-): CanonicalWorkerAssignment {
+export function workerAssignment(input: AssignmentInput): WorkerAssignment {
   const capability = capabilityForKind(input.task.kind);
   const experiment = input.task.kind === "experiment";
   return {
     mode: workerMode(capability),
     role: workerRole(capability),
-    objective: canonicalObjective(input),
-    prompt: canonicalPrompt(input),
-    environment: canonicalEnvironment(input, capability, experiment),
+    objective: assignmentObjective(input),
+    prompt: assignmentPrompt(input),
+    environment: assignmentEnvironment(input, capability, experiment),
   };
 }
 
-/** Session mode for one canonical Task; the kind-to-fact policy lives only here. */
-export function canonicalSessionMode(task: TaskContract): WorkerSessionMode {
+/** Session mode for one workstream Task; the kind-to-fact policy lives only here. */
+export function workerSessionMode(task: TaskContract): WorkerSessionMode {
   return workerMode(capabilityForKind(task.kind));
 }
 
@@ -254,7 +252,7 @@ function workerMode(capability: WorkerCapability): WorkerSessionMode {
   return "research";
 }
 
-function workerRole(capability: WorkerCapability): CanonicalWorkerAssignment["role"] {
+function workerRole(capability: WorkerCapability): WorkerAssignment["role"] {
   if (capability === "implement") return "implement";
   if (capability === "review") return "review";
   if (capability === "consultation") return "consultation";
@@ -276,7 +274,7 @@ const EXPERIMENT_NOTES = [
   "Experimental changes are not maintained product changes and must not be applied to the destination.",
 ];
 
-function canonicalObjective(input: CanonicalAssignmentInput): string {
+function assignmentObjective(input: AssignmentInput): string {
   const { task, intent, baseRevision } = input;
   const lines = [
     `Assignment: ${task.objective}`,
@@ -314,7 +312,7 @@ function canonicalObjective(input: CanonicalAssignmentInput): string {
   return lines.join("\n");
 }
 
-function canonicalPrompt(input: CanonicalAssignmentInput): string {
+function assignmentPrompt(input: AssignmentInput): string {
   const { task } = input;
   const lines = [
     `Workgraph assignment for Task ${task.id}.`,
@@ -336,8 +334,8 @@ function canonicalPrompt(input: CanonicalAssignmentInput): string {
   return lines.join("\n");
 }
 
-function canonicalEnvironment(
-  input: CanonicalAssignmentInput,
+function assignmentEnvironment(
+  input: AssignmentInput,
   capability: WorkerCapability,
   experiment: boolean,
 ): Record<string, string> {
@@ -380,7 +378,7 @@ function appendCandidateLines(lines: string[], candidate: CandidateLineage | und
 }
 
 function reviewSubjectFor(
-  input: CanonicalAssignmentInput,
+  input: AssignmentInput,
 ): ResolvedReviewInput | Extract<TaskContract, { kind: "review" }>["subject"] | undefined {
   if (input.reviewSubject !== undefined) return input.reviewSubject;
   return input.task.kind === "review" ? input.task.subject : undefined;

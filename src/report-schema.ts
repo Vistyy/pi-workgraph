@@ -1,6 +1,7 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
+import { CommitSchema } from "./domain/values.js";
 
 export const EvidenceSchema = Type.Object(
   {
@@ -40,50 +41,76 @@ function readOnlyReportSchema<const Kind extends "research" | "review">(kind: Ki
 
 const ResearchReportSchema = readOnlyReportSchema("research");
 const ReviewReportSchema = readOnlyReportSchema("review");
-const ImplementationReportSchema = Type.Union(
+const ImplementationNoChangeReportSchema = Type.Object(
+  {
+    kind: Type.Literal("implementation"),
+    status: Type.Literal("completed"),
+    outcome: Type.Literal("no_change"),
+    ...ReportContentFields,
+    revision: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
+    reason: Type.String({ minLength: 1 }),
+  },
+  { additionalProperties: false },
+);
+const ImplementationIncompleteReportSchema = Type.Object(
+  {
+    kind: Type.Literal("implementation"),
+    status: StringEnum(["escalated", "failed"] as const),
+    ...ReportContentFields,
+  },
+  { additionalProperties: false },
+);
+const ImplementationChangedInputSchema = Type.Object(
+  {
+    kind: Type.Literal("implementation"),
+    status: Type.Literal("completed"),
+    outcome: Type.Literal("changed"),
+    ...ReportContentFields,
+  },
+  { additionalProperties: false },
+);
+const ImplementationChangedReportSchema = Type.Object(
+  {
+    kind: Type.Literal("implementation"),
+    status: Type.Literal("completed"),
+    outcome: Type.Literal("changed"),
+    ...ReportContentFields,
+    commit: CommitSchema,
+    changedFiles: Type.Array(Type.String()),
+  },
+  { additionalProperties: false },
+);
+const ImplementationReportInputSchema = Type.Union(
   [
-    Type.Object(
-      {
-        kind: Type.Literal("implementation"),
-        status: Type.Literal("completed"),
-        outcome: Type.Literal("changed"),
-        ...ReportContentFields,
-        commit: Type.Optional(Type.String()),
-        changedFiles: Type.Optional(Type.Array(Type.String())),
-      },
-      { additionalProperties: false },
-    ),
-    Type.Object(
-      {
-        kind: Type.Literal("implementation"),
-        status: Type.Literal("completed"),
-        outcome: Type.Literal("no_change"),
-        ...ReportContentFields,
-        revision: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
-        reason: Type.String({ minLength: 1 }),
-      },
-      { additionalProperties: false },
-    ),
-    Type.Object(
-      {
-        kind: Type.Literal("implementation"),
-        status: StringEnum(["escalated", "failed"] as const),
-        ...ReportContentFields,
-      },
-      { additionalProperties: false },
-    ),
+    ImplementationChangedInputSchema,
+    ImplementationNoChangeReportSchema,
+    ImplementationIncompleteReportSchema,
   ],
   { type: "object" },
 );
+const ImplementationReportSchema = Type.Union(
+  [
+    ImplementationChangedReportSchema,
+    ImplementationNoChangeReportSchema,
+    ImplementationIncompleteReportSchema,
+  ],
+  { type: "object" },
+);
+const WorkerReportInputSchema = Type.Union([
+  ResearchReportSchema,
+  ReviewReportSchema,
+  ImplementationReportInputSchema,
+]);
 export const WorkerReportSchema = Type.Union([
   ResearchReportSchema,
   ReviewReportSchema,
   ImplementationReportSchema,
 ]);
 
+export type WorkerReportInput = Static<typeof WorkerReportInputSchema>;
 export type WorkerReport = Static<typeof WorkerReportSchema>;
-export type ImplementationReport = Static<typeof ImplementationReportSchema>;
-export type WorkerMode = WorkerReport["kind"];
+export type ImplementationReportInput = Static<typeof ImplementationReportInputSchema>;
+export type WorkerMode = WorkerReportInput["kind"];
 export type WorkerSessionMode = WorkerMode;
 
 export function reportSchemaForMode(mode: WorkerSessionMode) {
@@ -93,8 +120,12 @@ export function reportSchemaForMode(mode: WorkerSessionMode) {
     case "review":
       return ReviewReportSchema;
     case "implementation":
-      return ImplementationReportSchema;
+      return ImplementationReportInputSchema;
   }
+}
+
+export function isWorkerReportInput(value: unknown): value is WorkerReportInput {
+  return Value.Check(WorkerReportInputSchema, value);
 }
 
 export function isWorkerReport(value: unknown): value is WorkerReport {

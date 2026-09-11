@@ -6,7 +6,6 @@ import { initTheme } from "@earendil-works/pi-coding-agent";
 import { type Component, visibleWidth } from "@earendil-works/pi-tui";
 
 import {
-  activeWorkerCount,
   calmActivityLines,
   createCalmActivityTracker,
   isCalmActivityActive,
@@ -1061,19 +1060,13 @@ void test("Calm on projects the chat while shutdown restores native presentation
   assert.equal(tui.requests, requests, "shutdown must stop the pulse timer");
 });
 
-void test("coordinator scope and worker accounting remain unchanged", () => {
+void test("coordinator scope and activity state remain unchanged", () => {
   assert.equal(isCoordinatorScope({}), true);
   assert.equal(isCoordinatorScope({ PI_WORKGRAPH_MODE: "" }), true);
   assert.equal(isCoordinatorScope({ PI_WORKGRAPH_MODE: "implementation" }), false);
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 0 }), false);
   assert.equal(isCalmActivityActive({ coordinatorActive: true, activeWorkers: 0 }), true);
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 2 }), true);
-  assert.equal(
-    activeWorkerCount({
-      attempts: [{ state: "queued" }, { state: "starting" }, { state: "running" }],
-    }),
-    2,
-  );
 });
 
 void test("activity tracker bounds history, live labels, width, and secrets", () => {

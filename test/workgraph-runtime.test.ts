@@ -21,30 +21,30 @@ import {
 } from "effect";
 import { TestClock } from "effect/testing";
 import { Value } from "typebox/value";
-import { CanonicalCommandError, type CanonicalCommandPorts } from "../src/canonical-commands.js";
 import {
-  CanonicalAppendCommandSchema,
-  CanonicalEnqueueCommandSchema,
-  planAppend,
-} from "../src/canonical-queue.js";
+  WorkstreamAppendCommandSchema,
+  WorkstreamCommandError,
+  type WorkstreamCommandPorts,
+  WorkstreamEnqueueCommandSchema,
+} from "../src/coordination/commands.js";
+import { planAppend } from "../src/coordination/queue.js";
 import type {
   ReconciliationCommit,
   ReconciliationDriver,
   ReconciliationMutation,
   ReconciliationOutcome,
-} from "../src/canonical-reconciliation.js";
+} from "../src/coordination/reconciliation.js";
 import {
-  CanonicalRuntime,
-  type CanonicalRuntimeAcquisition,
-  type CanonicalRuntimeError,
-  CanonicalRuntimeIdentityError,
-  CanonicalRuntimeLeaseError,
-  CanonicalRuntimeOperationError,
-  CanonicalRuntimeStaleError,
-  CanonicalRuntimeStoppedError,
-} from "../src/canonical-runtime.js";
+  WorkstreamRuntime,
+  type WorkstreamRuntimeAcquisition,
+  type WorkstreamRuntimeError,
+  WorkstreamRuntimeIdentityError,
+  WorkstreamRuntimeLeaseError,
+  WorkstreamRuntimeOperationError,
+  WorkstreamRuntimeStaleError,
+  WorkstreamRuntimeStoppedError,
+} from "../src/coordination/runtime.js";
 import {
-  CANONICAL_RUNTIME_GENERATION_PROTOCOL,
   closeRuntimeGeneration,
   publishRuntimeGeneration,
   type RuntimeGenerationEntry,
@@ -52,14 +52,8 @@ import {
   resetRuntimeGenerationRegistryForTest,
   runtimeGeneration,
   unregisterRuntimeGeneration,
-} from "../src/canonical-runtime-generation.js";
-import {
-  type CanonicalLease,
-  CanonicalStoreConflictError,
-  type CanonicalStoreError,
-  CanonicalStoreInvalidError,
-  CanonicalWorkstreamStore,
-} from "../src/canonical-workstream-store.js";
+  WORKSTREAM_RUNTIME_GENERATION_PROTOCOL,
+} from "../src/coordination/runtime-generation.js";
 import {
   type Attempt,
   activateAttempt,
@@ -79,6 +73,13 @@ import {
 } from "../src/domain/workstream.js";
 import type { ModelPolicy } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
+import {
+  type WorkstreamLease,
+  WorkstreamStore,
+  WorkstreamStoreConflictError,
+  type WorkstreamStoreError,
+  WorkstreamStoreInvalidError,
+} from "../src/storage/workstream-store.js";
 
 const ID = "runtime";
 const COORDINATOR: CoordinatorIdentity = {
@@ -145,7 +146,7 @@ function writePolicy(path: string, policy: ModelPolicy): Promise<void> {
 }
 
 /** Run one program under a real caller Scope, optionally with a virtual Clock. */
-function runCanonical<A, E>(
+function runWorkstream<A, E>(
   program: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path | Scope.Scope>,
   clock?: Clock.Clock,
 ): Promise<A> {
@@ -173,7 +174,7 @@ function generationLease(token: string, owner = COORDINATOR) {
 }
 
 function initialWorkstream(f: Fixture, coordinator = COORDINATOR): Workstream {
-  const statement = "Own the canonical runtime.";
+  const statement = "Own the workstream runtime.";
   const first: Intent = {
     statement,
     constraints: [],
@@ -198,28 +199,26 @@ function initialWorkstream(f: Fixture, coordinator = COORDINATOR): Workstream {
   });
 }
 
-function canonicalCreate(f: Fixture, coordinator = COORDINATOR) {
-  return CanonicalWorkstreamStore.create(initialWorkstream(f, coordinator)).pipe(
+function workstreamCreate(f: Fixture, coordinator = COORDINATOR) {
+  return WorkstreamStore.create(initialWorkstream(f, coordinator)).pipe(
     Effect.map((attachment) => attachment.store),
   );
 }
 
 function openStore(f: Fixture) {
-  return CanonicalWorkstreamStore.open(ID, f.repository).pipe(
-    Effect.map((attachment) => attachment.store),
-  );
+  return WorkstreamStore.open(ID, f.repository).pipe(Effect.map((attachment) => attachment.store));
 }
 
 function acquire(
   f: Fixture,
   coordinator: CoordinatorIdentity = COORDINATOR,
-  extra: Partial<CanonicalRuntimeAcquisition> = {},
+  extra: Partial<WorkstreamRuntimeAcquisition> = {},
 ): Effect.Effect<
-  CanonicalRuntime,
-  CanonicalRuntimeError,
+  WorkstreamRuntime,
+  WorkstreamRuntimeError,
   FileSystem.FileSystem | Path.Path | Scope.Scope
 > {
-  return CanonicalRuntime.acquire({
+  return WorkstreamRuntime.acquire({
     id: ID,
     repository: f.repository,
     coordinator,
@@ -240,7 +239,7 @@ const INERT_DRIVER: ReconciliationDriver = {
   reconcile: (): Effect.Effect<ReconciliationOutcome> => Effect.succeed({ kind: "waiting" }),
 };
 
-const COMMANDS: CanonicalCommandPorts = {
+const COMMANDS: WorkstreamCommandPorts = {
   git: {
     resolveRevision: (revision) => Effect.succeed(revision === "HEAD" ? BASE_REVISION : revision),
     head: Effect.succeed(BASE_REVISION),
@@ -272,17 +271,17 @@ const COMMANDS: CanonicalCommandPorts = {
 };
 
 /** The one attachment read plus the ready runtime, in the caller Scope. */
-function attached(f: Fixture, extra: Partial<CanonicalRuntimeAcquisition> = {}) {
+function attached(f: Fixture, extra: Partial<WorkstreamRuntimeAcquisition> = {}) {
   return Effect.gen(function* () {
-    const store = yield* canonicalCreate(f);
+    const store = yield* workstreamCreate(f);
     const runtime = yield* acquire(f, COORDINATOR, extra);
     return { store, runtime };
   });
 }
 
 function settleSharedAttempt(
-  store: CanonicalWorkstreamStore,
-  lease: CanonicalLease,
+  store: WorkstreamStore,
+  lease: WorkstreamLease,
   key: { readonly taskId: string; readonly attemptId: string },
   projectRoot: string,
   sessionFile: string,
@@ -332,9 +331,9 @@ function waitFor(condition: () => boolean): Effect.Effect<Option.Option<void>> {
 
 /** Poll the lease row until its heartbeat advances past `previous`. */
 function renews(
-  store: CanonicalWorkstreamStore,
+  store: WorkstreamStore,
   previous: string,
-): Effect.Effect<Option.Option<void>, CanonicalStoreError, FileSystem.FileSystem> {
+): Effect.Effect<Option.Option<void>, WorkstreamStoreError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     while (true) {
       const lease = yield* store.observeLease();
@@ -365,7 +364,7 @@ function models(attempts: readonly Attempt[]): string[] {
 /** Release the exact held lease from an independent, already-closed probe handle. */
 function releaseLeaseExternally(
   f: Fixture,
-): Effect.Effect<void, CanonicalStoreError, FileSystem.FileSystem | Path.Path> {
+): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem | Path.Path> {
   return Effect.scoped(
     Effect.gen(function* () {
       const probe = yield* openStore(f);
@@ -389,14 +388,14 @@ function handleCount(path: string): number {
 }
 
 void test("runtime generation registry exposes one stable protocol and deterministic isolation", () => {
-  assert.equal(CANONICAL_RUNTIME_GENERATION_PROTOCOL, 1);
+  assert.equal(WORKSTREAM_RUNTIME_GENERATION_PROTOCOL, 2);
   resetRuntimeGenerationRegistryForTest();
 });
 
 void test("generation close is shared and stale unregister cannot remove a successor", async () => {
   let closes = 0;
   const first: RuntimeGenerationEntry = {
-    protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+    protocolVersion: WORKSTREAM_RUNTIME_GENERATION_PROTOCOL,
     path: "/registry/stale",
     workstreamId: ID,
     coordinator: COORDINATOR,
@@ -418,7 +417,7 @@ void test("generation close is shared and stale unregister cannot remove a succe
   assert.equal(first.status, "quiescent");
 
   const successor: RuntimeGenerationEntry = {
-    protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+    protocolVersion: WORKSTREAM_RUNTIME_GENERATION_PROTOCOL,
     path: first.path,
     workstreamId: first.workstreamId,
     coordinator: first.coordinator,
@@ -433,10 +432,10 @@ void test("generation close is shared and stale unregister cannot remove a succe
 
 void test("an interrupted queued reservation cannot wedge later runtime acquisition", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
-        const path = yield* CanonicalWorkstreamStore.pathFor(f.repository, ID);
+        const store = yield* workstreamCreate(f);
+        const path = yield* WorkstreamStore.pathFor(f.repository, ID);
         const reserved = yield* Deferred.make<void>();
         const release = yield* Deferred.make<void>();
         const holder = yield* Effect.forkScoped(
@@ -468,9 +467,9 @@ void test("acquisition fences exactly one lease and rejects identity or unproven
   await withFixture(async (f) => {
     const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
     await Effect.runPromise(clock.setTime(START_MILLIS));
-    const observed = await runCanonical(
+    const observed = await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
+        const store = yield* workstreamCreate(f);
         yield* store.acquireLease(COORDINATOR);
         const lease = yield* store.observeLease();
         assert.ok(lease !== undefined);
@@ -479,10 +478,10 @@ void test("acquisition fences exactly one lease and rejects identity or unproven
       clock,
     );
 
-    const identity = await runCanonical(Effect.flip(acquire(f, OTHER)), clock);
-    assert.ok(identity instanceof CanonicalRuntimeIdentityError);
+    const identity = await runWorkstream(Effect.flip(acquire(f, OTHER)), clock);
+    assert.ok(identity instanceof WorkstreamRuntimeIdentityError);
     // A same-session row from another process context cannot be recovered from expiry.
-    const live = await runCanonical(
+    const live = await runWorkstream(
       Effect.gen(function* () {
         const store = yield* openStore(f);
         const failure = yield* Effect.flip(
@@ -492,19 +491,19 @@ void test("acquisition fences exactly one lease and rejects identity or unproven
       }),
       clock,
     );
-    assert.ok(live.failure instanceof CanonicalRuntimeLeaseError);
+    assert.ok(live.failure instanceof WorkstreamRuntimeLeaseError);
     assert.equal(live.failure.code, "generation_proof_missing");
     assert.deepEqual(live.lease, observed);
 
     await Effect.runPromise(clock.setTime(START_MILLIS + 30_001));
-    const expiredWithoutProof = await runCanonical(
+    const expiredWithoutProof = await runWorkstream(
       Effect.flip(acquire(f, COORDINATOR, { ownership: { kind: "recover" } })),
       clock,
     );
-    assert.ok(expiredWithoutProof instanceof CanonicalRuntimeLeaseError);
+    assert.ok(expiredWithoutProof instanceof WorkstreamRuntimeLeaseError);
     assert.equal(expiredWithoutProof.code, "generation_proof_missing");
     // Failed acquisitions left the exact observed lease and aggregate untouched.
-    const untouched = await runCanonical(
+    const untouched = await runWorkstream(
       Effect.gen(function* () {
         const store = yield* openStore(f);
         assert.deepEqual(yield* store.observeLease(), observed);
@@ -514,7 +513,7 @@ void test("acquisition fences exactly one lease and rejects identity or unproven
     );
     assert.equal(untouched.revision, 0);
 
-    const taken = await runCanonical(
+    const taken = await runWorkstream(
       Effect.gen(function* () {
         const store = yield* openStore(f);
         yield* store.releaseLease(observed);
@@ -522,7 +521,7 @@ void test("acquisition fences exactly one lease and rejects identity or unproven
         yield* runtime.checkOwnership();
         assert.equal((yield* runtime.snapshot()).revision, 0);
         const state = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-1",
+          taskId: "queued-workstream-runtime.test-1",
           kind: "research",
           objective: "Ready",
           expectedEvidence: ["evidence"],
@@ -551,10 +550,10 @@ void test("absent-lease mismatch and uncertain generation fail before runtime ef
           return { kind: "waiting" } as const;
         }),
     };
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
-        const path = yield* CanonicalWorkstreamStore.pathFor(f.repository, ID);
+        const store = yield* workstreamCreate(f);
+        const path = yield* WorkstreamStore.pathFor(f.repository, ID);
         const handle = {
           close: async () => {
             closeEffects += 1;
@@ -562,7 +561,7 @@ void test("absent-lease mismatch and uncertain generation fail before runtime ef
           },
         };
         publishRuntimeGeneration({
-          protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+          protocolVersion: WORKSTREAM_RUNTIME_GENERATION_PROTOCOL,
           path,
           workstreamId: ID,
           coordinator: OTHER,
@@ -572,13 +571,13 @@ void test("absent-lease mismatch and uncertain generation fail before runtime ef
           closeResult: Promise.resolve({ quiescent: true }),
         });
         const mismatch = yield* Effect.flip(acquire(f, COORDINATOR, { driver }));
-        assert.ok(mismatch instanceof CanonicalRuntimeLeaseError);
+        assert.ok(mismatch instanceof WorkstreamRuntimeLeaseError);
         assert.equal(mismatch.code, "generation_proof_mismatch");
         assert.equal(yield* store.observeLease(), undefined);
         assert.equal(driverEffects, 0);
 
         publishRuntimeGeneration({
-          protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+          protocolVersion: WORKSTREAM_RUNTIME_GENERATION_PROTOCOL,
           path,
           workstreamId: ID,
           coordinator: COORDINATOR,
@@ -587,14 +586,14 @@ void test("absent-lease mismatch and uncertain generation fail before runtime ef
           status: "failed",
         });
         const uncertain = yield* Effect.flip(acquire(f, COORDINATOR, { driver }));
-        assert.ok(uncertain instanceof CanonicalRuntimeLeaseError);
+        assert.ok(uncertain instanceof WorkstreamRuntimeLeaseError);
         assert.equal(uncertain.code, "generation_not_quiescent");
         assert.equal(yield* store.observeLease(), undefined);
         assert.equal(driverEffects, 0);
 
         const held = yield* store.acquireLease(COORDINATOR);
         publishRuntimeGeneration({
-          protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+          protocolVersion: WORKSTREAM_RUNTIME_GENERATION_PROTOCOL,
           path,
           workstreamId: ID,
           coordinator: COORDINATOR,
@@ -606,7 +605,7 @@ void test("absent-lease mismatch and uncertain generation fail before runtime ef
         const changed = yield* Effect.flip(
           acquire(f, COORDINATOR, { ownership: { kind: "recover" }, driver }),
         );
-        assert.ok(changed instanceof CanonicalRuntimeLeaseError);
+        assert.ok(changed instanceof WorkstreamRuntimeLeaseError);
         assert.equal(changed.code, "generation_proof_mismatch");
         assert.deepEqual(yield* store.observeLease(), held);
         assert.equal(driverEffects, 0);
@@ -619,9 +618,9 @@ void test("absent-lease mismatch and uncertain generation fail before runtime ef
 
 void test("controlled same-process reload quiesces the old runtime before fresh attachment", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
+        const store = yield* workstreamCreate(f);
         const first = yield* acquire(f);
         const queued = yield* first.enqueue({
           taskId: "reload-task",
@@ -644,9 +643,9 @@ void test("controlled same-process reload quiesces the old runtime before fresh 
         assert.equal((yield* second.read()).revision, queued.revision);
         assert.equal((yield* second.read()).tasks[0]?.id, "reload-task");
         assert.deepEqual((yield* second.read()).coordinatorTransfers, []);
-        assert.ok((yield* Effect.flip(first.read())) instanceof CanonicalRuntimeStoppedError);
+        assert.ok((yield* Effect.flip(first.read())) instanceof WorkstreamRuntimeStoppedError);
         assert.ok(
-          (yield* Effect.flip(store.renewLease(oldLease))) instanceof CanonicalStoreConflictError,
+          (yield* Effect.flip(store.renewLease(oldLease))) instanceof WorkstreamStoreConflictError,
         );
         yield* second.close();
       }),
@@ -658,9 +657,9 @@ void test("quiescent recovery re-observes a failed release and uses only expired
   await withFixture(async (f) => {
     const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
     await Effect.runPromise(clock.setTime(START_MILLIS));
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        yield* canonicalCreate(f);
+        yield* workstreamCreate(f);
         const first = yield* acquire(f);
         const store = yield* openStore(f);
         const observed = yield* store.observeLease();
@@ -681,9 +680,9 @@ void test("quiescent recovery re-observes a failed release and uses only expired
         const blocked = yield* Effect.flip(
           acquire(f, COORDINATOR, { ownership: { kind: "recover" } }),
         );
-        assert.ok(blocked instanceof CanonicalStoreConflictError);
+        assert.ok(blocked instanceof WorkstreamStoreConflictError);
         assert.deepEqual(yield* store.observeLease(), observed);
-        assert.ok((yield* Effect.flip(first.read())) instanceof CanonicalRuntimeStoppedError);
+        assert.ok((yield* Effect.flip(first.read())) instanceof WorkstreamRuntimeStoppedError);
 
         const cleanup = new DatabaseSync(path);
         cleanup.exec("DROP TRIGGER reject_release");
@@ -704,9 +703,9 @@ void test("quiescent recovery re-observes a failed release and uses only expired
 
 void test("concurrent ordinary attachment selects exactly one runtime", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        yield* canonicalCreate(f);
+        yield* workstreamCreate(f);
         const exits = yield* Effect.all([Effect.exit(acquire(f)), Effect.exit(acquire(f))], {
           concurrency: "unbounded",
         });
@@ -739,9 +738,9 @@ void test("lease absence still waits for an owned operation to join before repla
           ),
         ),
     };
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
+        const store = yield* workstreamCreate(f);
         const first = yield* acquire(f, COORDINATOR, { driver: blocking });
         yield* first.enqueue({
           taskId: "joining-task",
@@ -757,7 +756,7 @@ void test("lease absence still waits for an owned operation to join before repla
         assert.equal(yield* store.observeLease(), undefined);
         const second = yield* acquire(f, COORDINATOR, { driver: INERT_DRIVER });
         assert.equal(joined, true);
-        assert.ok((yield* Effect.flip(first.read())) instanceof CanonicalRuntimeStoppedError);
+        assert.ok((yield* Effect.flip(first.read())) instanceof WorkstreamRuntimeStoppedError);
         yield* second.close();
       }),
     );
@@ -768,9 +767,9 @@ void test("different-session adoption commits ownership before startup and repla
   await withFixture(async (f) => {
     const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
     await Effect.runPromise(clock.setTime(START_MILLIS));
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
+        const store = yield* workstreamCreate(f);
         const prior = yield* store.acquireLease(COORDINATOR);
         yield* TestClock.adjust("31 seconds");
         const runtime = yield* acquire(f, OTHER, {
@@ -781,7 +780,7 @@ void test("different-session adoption commits ownership before startup and repla
         assert.equal(state.coordinatorTransfers.length, 1);
         assert.equal(state.coordinatorTransfers[0]?.committedRevision, 1);
         assert.ok(
-          (yield* Effect.flip(store.renewLease(prior))) instanceof CanonicalStoreConflictError,
+          (yield* Effect.flip(store.renewLease(prior))) instanceof WorkstreamStoreConflictError,
         );
         yield* runtime.close();
 
@@ -800,11 +799,11 @@ void test("local quiescence survives transient adoption failure and permits retr
   await withFixture(async (f) => {
     const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
     await Effect.runPromise(clock.setTime(START_MILLIS));
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
+        const store = yield* workstreamCreate(f);
         const prior = yield* acquire(f);
-        const path = yield* CanonicalWorkstreamStore.pathFor(f.repository, ID);
+        const path = yield* WorkstreamStore.pathFor(f.repository, ID);
         const blocker = new DatabaseSync(path);
         blocker.exec(
           "CREATE TRIGGER reject_adoption_retry BEFORE UPDATE ON workstream BEGIN SELECT RAISE(FAIL, 'transient adoption failure'); END",
@@ -816,8 +815,8 @@ void test("local quiescence survives transient adoption failure and permits retr
             ownership: { kind: "adopt", deathObservation: deadObservation() },
           }),
         );
-        assert.equal(failed._tag, "CanonicalStoreHostError");
-        assert.ok((yield* Effect.flip(prior.read())) instanceof CanonicalRuntimeStoppedError);
+        assert.equal(failed._tag, "WorkstreamStoreHostError");
+        assert.ok((yield* Effect.flip(prior.read())) instanceof WorkstreamRuntimeStoppedError);
         assert.equal(yield* store.observeLease(), undefined);
         const unchanged = yield* store.read();
         assert.equal(unchanged.revision, 0);
@@ -841,9 +840,9 @@ void test("local quiescence survives transient adoption failure and permits retr
 
 void test("the caller Scope owns runtime lifetime: abandonment closes it and another runtime reacquires", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
+        const store = yield* workstreamCreate(f);
         // The acquisition Scope escapes immediately, so the runtime is already
         // closed: fibers joined, lease released, SQLite handle closed.
         const escaped = yield* Effect.scoped(acquire(f));
@@ -856,7 +855,7 @@ void test("the caller Scope owns runtime lifetime: abandonment closes it and ano
             expectedEvidence: ["evidence"],
           }),
         );
-        assert.ok(stopped instanceof CanonicalRuntimeStoppedError);
+        assert.ok(stopped instanceof WorkstreamRuntimeStoppedError);
         assert.equal(yield* store.observeLease(), undefined);
         assert.equal((yield* store.read()).revision, 0);
 
@@ -879,7 +878,7 @@ void test("the caller Scope owns runtime lifetime: abandonment closes it and ano
         // Independent reacquisition succeeds on the released exact lease.
         const runtime = yield* acquire(f);
         const state = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-2",
+          taskId: "queued-workstream-runtime.test-2",
           kind: "research",
           objective: "Reacquired",
           expectedEvidence: ["evidence"],
@@ -894,7 +893,7 @@ void test("the caller Scope owns runtime lifetime: abandonment closes it and ano
 
 void test("commands materialize atomically while every public projection stays a defensive clone", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
         const { store, runtime } = yield* attached(f);
 
@@ -905,14 +904,14 @@ void test("commands materialize atomically while every public projection stays a
         const [alpha, beta] = yield* Effect.all(
           [
             runtime.enqueue({
-              taskId: "queued-canonical-runtime.test-3",
+              taskId: "queued-workstream-runtime.test-3",
               kind: "research",
               objective: "Alpha",
               expectedEvidence: ["alpha evidence"],
               selection: { count: 3 },
             }),
             runtime.enqueue({
-              taskId: "queued-canonical-runtime.test-4",
+              taskId: "queued-workstream-runtime.test-4",
               kind: "review",
               objective: "Beta",
               subject: { kind: "revision", revision: BASE_REVISION },
@@ -947,14 +946,14 @@ void test("commands materialize atomically while every public projection stays a
         const bytes = yield* Effect.promise(() => readFile(store.path));
         const invalid = yield* Effect.flip(
           runtime.enqueue({
-            taskId: "queued-canonical-runtime.test-5",
+            taskId: "queued-workstream-runtime.test-5",
             kind: "research",
             objective: "Bad fields",
             expectedEvidence: ["evidence"],
             acceptance: ["not a research field"],
           }),
         );
-        assert.ok(invalid instanceof CanonicalRuntimeOperationError);
+        assert.ok(invalid instanceof WorkstreamRuntimeOperationError);
         assert.deepEqual(yield* Effect.promise(() => readFile(store.path)), bytes);
         assert.equal((yield* runtime.read()).revision, 2);
         yield* runtime.close();
@@ -965,12 +964,12 @@ void test("commands materialize atomically while every public projection stays a
 
 void test("queue planning resolves policy-owned selections, atomic fanout, and configured consultation", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
         const { store, runtime } = yield* attached(f);
 
         const research = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-6",
+          taskId: "queued-workstream-runtime.test-6",
           kind: "research",
           objective: "Default research",
           expectedEvidence: ["evidence"],
@@ -981,7 +980,7 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
           source: "policy",
         });
         const implementation = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-7",
+          taskId: "queued-workstream-runtime.test-7",
           kind: "implementation",
           objective: "Implement",
           acceptance: ["accepted"],
@@ -999,17 +998,17 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
 
         const unconfigured = yield* Effect.flip(
           runtime.enqueue({
-            taskId: "queued-canonical-runtime.test-8",
+            taskId: "queued-workstream-runtime.test-8",
             kind: "implementation",
             objective: "Escalate without configuration",
             acceptance: ["accepted"],
             useEscalationExecutor: true,
           }),
         );
-        assert.ok(unconfigured instanceof CanonicalRuntimeOperationError);
+        assert.ok(unconfigured instanceof WorkstreamRuntimeOperationError);
         yield* Effect.promise(() => writePolicy(f.policyPath, ESCALATED_POLICY));
         const escalated = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-9",
+          taskId: "queued-workstream-runtime.test-9",
           kind: "implementation",
           objective: "Escalate",
           acceptance: ["accepted"],
@@ -1023,7 +1022,7 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
         });
 
         const defaultAdvisor = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-10",
+          taskId: "queued-workstream-runtime.test-10",
           kind: "consultation",
           objective: "Advise by default",
           context: "Coordinator-known context.",
@@ -1034,7 +1033,7 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
           source: "policy",
         });
         const selectedAdvisor = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-11",
+          taskId: "queued-workstream-runtime.test-11",
           kind: "consultation",
           objective: "Advise exactly",
           advisor: "fixture/advisor-2",
@@ -1079,7 +1078,7 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
         const removedAdvisor = yield* Effect.flip(
           runtime.appendAttempts({ taskId: consultationTask.id }),
         );
-        assert.ok(removedAdvisor instanceof CanonicalRuntimeOperationError);
+        assert.ok(removedAdvisor instanceof WorkstreamRuntimeOperationError);
         assert.deepEqual(yield* runtime.read(), beforeRemovedAdvisor);
         yield* Effect.promise(() => writePolicy(f.policyPath, ESCALATED_POLICY));
         const beforeIncompatibleAppend = yield* runtime.read();
@@ -1089,26 +1088,26 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
             selection: { count: 2, distinctModels: true },
           }),
         );
-        assert.ok(incompatibleAppend instanceof CanonicalRuntimeOperationError);
+        assert.ok(incompatibleAppend instanceof WorkstreamRuntimeOperationError);
         assert.deepEqual(yield* runtime.read(), beforeIncompatibleAppend);
 
         const beforeUnknown = yield* runtime.read();
         for (const command of [
           {
-            taskId: "queued-canonical-runtime.test-12",
+            taskId: "queued-workstream-runtime.test-12",
             kind: "consultation",
             objective: "Unknown advisor",
             advisor: "fixture/unknown",
           },
           {
-            taskId: "queued-canonical-runtime.test-13",
+            taskId: "queued-workstream-runtime.test-13",
             kind: "consultation",
             objective: "Fanout is forbidden",
             selection: { count: 2, distinctModels: true },
           },
         ]) {
           const invalidSelection = yield* Effect.flip(runtime.enqueue(command));
-          assert.ok(invalidSelection instanceof CanonicalRuntimeOperationError);
+          assert.ok(invalidSelection instanceof WorkstreamRuntimeOperationError);
           assert.deepEqual(yield* runtime.read(), beforeUnknown);
         }
 
@@ -1131,7 +1130,7 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
         const invalidContinuation = yield* Effect.flip(
           runtime.appendAttempts({ taskId: task.id, continuationOf: "missing-attempt" }),
         );
-        assert.ok(invalidContinuation instanceof CanonicalCommandError);
+        assert.ok(invalidContinuation instanceof WorkstreamCommandError);
         assert.deepEqual(yield* runtime.read(), batchBase);
         const appended = yield* runtime.appendAttempts({
           taskId: task.id,
@@ -1164,7 +1163,7 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
 void test("serialized manual cancellation, steering, Intent revision, completion, and exact reads", async () => {
   await withFixture(async (f) => {
     const steered: string[] = [];
-    const commands: CanonicalCommandPorts = {
+    const commands: WorkstreamCommandPorts = {
       ...COMMANDS,
       workers: {
         steer: (_identity, instruction) =>
@@ -1172,7 +1171,7 @@ void test("serialized manual cancellation, steering, Intent revision, completion
             Effect.andThen(
               instruction === "fail"
                 ? Effect.fail(
-                    new CanonicalCommandError({
+                    new WorkstreamCommandError({
                       operation: "steer Worker",
                       message: "submission failed",
                     }),
@@ -1182,7 +1181,7 @@ void test("serialized manual cancellation, steering, Intent revision, completion
           ),
       },
     };
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
         const { store, runtime } = yield* attached(f, { commands });
         const queued = yield* runtime.enqueue({
@@ -1274,12 +1273,12 @@ void test("serialized manual cancellation, steering, Intent revision, completion
         assert.equal((yield* runtime.readAttempt(steerId)).attempt.id, steerId);
         assert.ok(
           (yield* Effect.flip(runtime.readAttempt("unknown-attempt"))) instanceof
-            CanonicalRuntimeOperationError,
+            WorkstreamRuntimeOperationError,
         );
         assert.ok(
           (yield* Effect.flip(
             runtime.steer({ attemptId: steerId, instruction: "fail" }),
-          )) instanceof CanonicalCommandError,
+          )) instanceof WorkstreamCommandError,
         );
         assert.equal(
           exactState(yield* runtime.read(), steerId).execution?.steering?.state,
@@ -1288,7 +1287,7 @@ void test("serialized manual cancellation, steering, Intent revision, completion
         assert.ok(
           (yield* Effect.flip(
             runtime.steer({ attemptId: steerId, instruction: "fail" }),
-          )) instanceof CanonicalCommandError,
+          )) instanceof WorkstreamCommandError,
         );
         assert.deepEqual(steered, ["Inspect the exact failure.", "fail"]);
 
@@ -1315,9 +1314,9 @@ void test("serialized manual cancellation, steering, Intent revision, completion
 
 void test("completed output release re-entry finishes a matching pending cleanup", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
+        const store = yield* workstreamCreate(f);
         const lease = yield* store.acquireLease(COORDINATOR);
         const key = { taskId: "blocked-output", attemptId: "blocked-attempt" };
         yield* store.transition(lease, (state) =>
@@ -1426,7 +1425,7 @@ void test("completed output release re-entry finishes a matching pending cleanup
 
 void test("completion derives accounting and rejects later delegation", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
         const { runtime } = yield* attached(f);
         const completed = yield* runtime.complete({
@@ -1444,10 +1443,10 @@ void test("completion derives accounting and rejects later delegation", async ()
               objective: "Late",
               expectedEvidence: ["none"],
             }),
-          )) instanceof CanonicalRuntimeOperationError,
+          )) instanceof WorkstreamRuntimeOperationError,
         );
         yield* runtime.close();
-        const noPorts = yield* CanonicalRuntime.acquire({
+        const noPorts = yield* WorkstreamRuntime.acquire({
           id: ID,
           repository: f.repository,
           coordinator: COORDINATOR,
@@ -1457,8 +1456,8 @@ void test("completion derives accounting and rejects later delegation", async ()
         });
         const apply = noPorts.apply({ attemptId: "unknown" });
         const release = noPorts.releaseOutput({ attemptId: "unknown", reason: "Inspect." });
-        assert.ok((yield* Effect.flip(apply)) instanceof CanonicalRuntimeOperationError);
-        assert.ok((yield* Effect.flip(release)) instanceof CanonicalRuntimeOperationError);
+        assert.ok((yield* Effect.flip(apply)) instanceof WorkstreamRuntimeOperationError);
+        assert.ok((yield* Effect.flip(release)) instanceof WorkstreamRuntimeOperationError);
         yield* noPorts.close();
       }),
     );
@@ -1472,9 +1471,9 @@ function exactState(state: Workstream, attemptId: string): Attempt {
   return attempt ?? assert.fail(`Missing Attempt ${attemptId}`);
 }
 
-void test("canonical queue schemas remain the strict kind-owned command owner", () => {
+void test("command schemas remain the strict kind-owned queue input owner", () => {
   assert.equal(
-    Value.Check(CanonicalEnqueueCommandSchema, {
+    Value.Check(WorkstreamEnqueueCommandSchema, {
       kind: "research",
       objective: "Research",
       expectedEvidence: ["evidence"],
@@ -1483,11 +1482,11 @@ void test("canonical queue schemas remain the strict kind-owned command owner", 
     false,
   );
   assert.equal(
-    Value.Check(CanonicalAppendCommandSchema, { taskId: "task", selection: { model: "any" } }),
+    Value.Check(WorkstreamAppendCommandSchema, { taskId: "task", selection: { model: "any" } }),
     false,
   );
   assert.equal(
-    Value.Check(CanonicalEnqueueCommandSchema, {
+    Value.Check(WorkstreamEnqueueCommandSchema, {
       taskId: "consultation-fanout",
       kind: "consultation",
       objective: "Consult",
@@ -1562,16 +1561,16 @@ void test("canonical queue schemas remain the strict kind-owned command owner", 
       candidateOf: "candidate",
     },
   ])
-    assert.equal(Value.Check(CanonicalEnqueueCommandSchema, command), false);
+    assert.equal(Value.Check(WorkstreamEnqueueCommandSchema, command), false);
 });
 
 void test("a stale projection writes nothing until an authoritative read refreshes it", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
         const { store, runtime } = yield* attached(f);
         const first = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-13",
+          taskId: "queued-workstream-runtime.test-13",
           kind: "research",
           objective: "First",
           expectedEvidence: ["evidence"],
@@ -1614,7 +1613,7 @@ void test("a stale projection writes nothing until an authoritative read refresh
             expectedEvidence: ["evidence"],
           }),
         );
-        assert.ok(stale instanceof CanonicalRuntimeStaleError);
+        assert.ok(stale instanceof WorkstreamRuntimeStaleError);
         assert.deepEqual(yield* Effect.promise(() => readFile(store.path)), bytes);
         // The failed command left the projection untouched; only a read refreshes.
         assert.equal((yield* runtime.snapshot()).revision, 1);
@@ -1624,7 +1623,7 @@ void test("a stale projection writes nothing until an authoritative read refresh
         assert.equal((yield* runtime.snapshot()).revision, 2);
 
         const retried = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-14",
+          taskId: "queued-workstream-runtime.test-14",
           kind: "research",
           objective: "Retried",
           expectedEvidence: ["evidence"],
@@ -1640,9 +1639,9 @@ void test("a stale projection writes nothing until an authoritative read refresh
 
 void test("one shutdown boundary owns heartbeat, explicit close, close races, and interruption", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
+        const store = yield* workstreamCreate(f);
 
         // Explicit close is idempotent and no heartbeat survives it to re-create
         // the released lease.
@@ -1663,7 +1662,7 @@ void test("one shutdown boundary owns heartbeat, explicit close, close races, an
               runtime.close(),
               runtime
                 .enqueue({
-                  taskId: "queued-canonical-runtime.test-15",
+                  taskId: "queued-workstream-runtime.test-15",
                   kind: "research",
                   objective: `Race ${index}`,
                   expectedEvidence: ["evidence"],
@@ -1696,7 +1695,7 @@ void test("one shutdown boundary owns heartbeat, explicit close, close races, an
         const interrupted = yield* runtime.read();
         assert.ok(interrupted.revision === 0 || interrupted.revision === 1);
         const next = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-16",
+          taskId: "queued-workstream-runtime.test-16",
           kind: "research",
           objective: "After interruption",
           expectedEvidence: ["evidence"],
@@ -1717,7 +1716,7 @@ void test("one shutdown boundary owns heartbeat, explicit close, close races, an
         const inspection = yield* beating.inspectionSnapshot();
         assert.equal(inspection.workstream.revision, projectedRevision);
         const readFailure = yield* Effect.flip(beating.read());
-        assert.ok(readFailure instanceof CanonicalStoreInvalidError);
+        assert.ok(readFailure instanceof WorkstreamStoreInvalidError);
         assert.ok(Option.isSome(yield* renews(store, lease.heartbeatAt)), "expected a heartbeat");
         yield* beating.close();
         assert.equal(yield* store.observeLease(), undefined);
@@ -1730,7 +1729,7 @@ void test("one shutdown boundary owns heartbeat, explicit close, close races, an
         const stale = yield* acquire(f, COORDINATOR, { heartbeatInterval: "5 seconds" });
         yield* releaseLeaseExternally(f);
         const staleInspection = yield* Effect.flip(stale.inspectionSnapshot());
-        assert.ok(staleInspection instanceof CanonicalStoreConflictError);
+        assert.ok(staleInspection instanceof WorkstreamStoreConflictError);
         yield* stale.close();
       }),
     );
@@ -1741,11 +1740,11 @@ void test("lease heartbeat continues while a serialized command waits on its hos
   await withFixture(async (f) => {
     const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
     await Effect.runPromise(clock.setTime(START_MILLIS));
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
         const steeringStarted = yield* Deferred.make<void>();
         const releaseSteering = yield* Deferred.make<void>();
-        const commands: CanonicalCommandPorts = {
+        const commands: WorkstreamCommandPorts = {
           ...COMMANDS,
           workers: {
             steer: () =>
@@ -1825,10 +1824,10 @@ void test("lease heartbeat continues while a serialized command waits on its hos
 
 void test("fatal lease loss reports one typed episode, closes once, and permits reacquisition", async () => {
   await withFixture(async (f) => {
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
-        const store = yield* canonicalCreate(f);
-        let fatal: CanonicalRuntimeError | undefined;
+        const store = yield* workstreamCreate(f);
+        let fatal: WorkstreamRuntimeError | undefined;
         let fatalCalls = 0;
         const runtime = yield* acquire(f, COORDINATOR, {
           heartbeatInterval: "10 millis",
@@ -1841,7 +1840,7 @@ void test("fatal lease loss reports one typed episode, closes once, and permits 
         yield* releaseLeaseExternally(f);
         assert.ok(Option.isSome(yield* waitFor(() => fatal !== undefined)));
         assert.equal(fatalCalls, 1);
-        assert.ok(fatal instanceof CanonicalStoreConflictError);
+        assert.ok(fatal instanceof WorkstreamStoreConflictError);
         yield* runtime.awaitClosed();
         const stopped = yield* Effect.flip(
           runtime.enqueue({
@@ -1851,13 +1850,13 @@ void test("fatal lease loss reports one typed episode, closes once, and permits 
             expectedEvidence: ["evidence"],
           }),
         );
-        assert.ok(stopped instanceof CanonicalRuntimeStoppedError);
+        assert.ok(stopped instanceof WorkstreamRuntimeStoppedError);
         yield* runtime.close();
         yield* runtime.close();
 
         // Removing the lease table fails both renewal (the fatal episode) and the
         // lease-release finalizer, combined into one typed report.
-        let combined: CanonicalRuntimeError | undefined;
+        let combined: WorkstreamRuntimeError | undefined;
         let combinedCalls = 0;
         const failing = yield* acquire(f, COORDINATOR, {
           heartbeatInterval: "10 millis",
@@ -1870,12 +1869,12 @@ void test("fatal lease loss reports one typed episode, closes once, and permits 
         rawUpdate(store.path, "DROP TABLE lease");
         assert.ok(Option.isSome(yield* waitFor(() => combined !== undefined)));
         assert.equal(combinedCalls, 1);
-        assert.ok(combined instanceof CanonicalRuntimeOperationError);
+        assert.ok(combined instanceof WorkstreamRuntimeOperationError);
         assert.ok(combined.cause instanceof AggregateError);
         assert.ok(
-          (yield* Effect.flip(failing.awaitClosed())) instanceof CanonicalRuntimeOperationError,
+          (yield* Effect.flip(failing.awaitClosed())) instanceof WorkstreamRuntimeOperationError,
         );
-        assert.ok((yield* Effect.flip(failing.close())) instanceof CanonicalRuntimeOperationError);
+        assert.ok((yield* Effect.flip(failing.close())) instanceof WorkstreamRuntimeOperationError);
       }),
     );
   });
@@ -1892,9 +1891,9 @@ void test("a fatal close releases the runtime's own SQLite file descriptor", {
   skip: FD_SKIP,
 }, async () => {
   await withFixture(async (f) => {
-    const path = await runCanonical(canonicalCreate(f).pipe(Effect.map((store) => store.path)));
-    let fatal: CanonicalRuntimeError | undefined;
-    await runCanonical(
+    const path = await runWorkstream(workstreamCreate(f).pipe(Effect.map((store) => store.path)));
+    let fatal: WorkstreamRuntimeError | undefined;
+    await runWorkstream(
       Effect.gen(function* () {
         const runtime = yield* acquire(f, COORDINATOR, {
           heartbeatInterval: "10 millis",
@@ -1969,17 +1968,17 @@ void test("one runtime control flow drives the cancellation checkpoint, cleanup,
         }),
     };
 
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
         const { runtime } = yield* attached(f, { driver });
         const target = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-17",
+          taskId: "queued-workstream-runtime.test-17",
           kind: "research",
           objective: "Cancellable",
           expectedEvidence: ["evidence"],
         });
         const other = yield* runtime.enqueue({
-          taskId: "queued-canonical-runtime.test-18",
+          taskId: "queued-workstream-runtime.test-18",
           kind: "research",
           objective: "Untouched",
           expectedEvidence: ["evidence"],

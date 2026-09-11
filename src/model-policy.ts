@@ -8,12 +8,9 @@ import { Value } from "typebox/value";
 import { type ModelTarget, ModelTargetSchema } from "./domain/model-target.js";
 import { runNodePlatformPromise } from "./node-platform.js";
 
-export type { ModelTarget, Thinking } from "./domain/model-target.js";
-export { ThinkingSchema } from "./domain/model-target.js";
-
 export const MODEL_LIST_ROLES = ["research", "review", "consultation.advisor"] as const;
 export type ListModelRole = (typeof MODEL_LIST_ROLES)[number];
-export type ModelTargetList = [ModelTarget, ...ModelTarget[]];
+type ModelTargetList = [ModelTarget, ...ModelTarget[]];
 
 const ModelTargetListSchema = Type.Array(ModelTargetSchema, { minItems: 1 });
 const ModelPolicySchema = Type.Object(

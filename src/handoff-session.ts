@@ -23,7 +23,7 @@ export class HandoffSessionError extends Data.TaggedError("HandoffSessionError")
   readonly cause?: unknown;
 }> {}
 
-export type HandoffSessionResolution =
+type HandoffSessionResolution =
   | { readonly state: "none" }
   | { readonly state: "exact"; readonly sessionFile: string }
   | { readonly state: "prefix"; readonly sessionFile: string }

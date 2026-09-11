@@ -8,18 +8,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Data, Deferred, Effect } from "effect";
+import { HerdrCliRuntime } from "../src/herdr.js";
+import { WorkerLaunchPlacementError } from "../src/herdr-identity.js";
+import { CoordinatorLaunchError, WorkerLaunchError } from "../src/herdr-launch.js";
 import {
-  CoordinatorLaunchError,
-  HERDR_PROTOCOL_OUTPUT_LIMIT,
-  HerdrCliRuntime,
-  HerdrProtocolError,
   herdrCoordinatorNames,
   herdrWorkerName,
   herdrWorkerTabLabel,
-  WorkerLaunchError,
-  WorkerLaunchPlacementError,
   type WorkerRole,
-} from "../src/herdr.js";
+} from "../src/herdr-naming.js";
+import { HERDR_PROTOCOL_OUTPUT_LIMIT, HerdrProtocolError } from "../src/herdr-protocol.js";
 import type { WorkerIdentity, WorkerResourceIdentity } from "../src/types.js";
 
 const runEffect = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);

@@ -1,14 +1,8 @@
-import { Clock, Data, DateTime, Effect, FileSystem, Option, Path, type Scope } from "effect";
+import { Clock, Data, DateTime, Effect, FileSystem, Path, type Scope } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import {
-  type CanonicalDatabase,
-  inspectStorageEntry,
-  newLeaseToken,
-  openCanonicalDatabase,
-  type StorageEntry,
-} from "./canonical-sqlite-host.js";
+import { InstantSchema, instantMillis as parseInstantMillis } from "../domain/values.js";
 import {
   type CoordinatorIdentity,
   type HerdrDeadObservation,
@@ -18,7 +12,14 @@ import {
   validateWorkstreamInvariants,
   type Workstream,
   WorkstreamSchema,
-} from "./domain/workstream.js";
+} from "../domain/workstream.js";
+import {
+  inspectStorageEntry,
+  newLeaseToken,
+  openWorkstreamDatabase,
+  type StorageEntry,
+  type WorkstreamDatabase,
+} from "./sqlite-host.js";
 
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
@@ -31,8 +32,8 @@ const STORAGE_DIRECTORY = "pi-workgraph";
 const WORKSTREAM_DIRECTORY = "workstreams";
 const columnList = (value: string) => value.split(" ");
 
-/** Complete canonical schema contract: each table must exist with these columns. */
-const CANONICAL_SCHEMA = {
+/** Complete workstream schema contract: each table must exist with these columns. */
+const WORKSTREAM_SCHEMA = {
   store_header: columnList("format version"),
   workstream: columnList("state_json revision"),
   lease: columnList(
@@ -74,7 +75,7 @@ const LeaseOwnerSchema = Type.Object(
   { sessionId: Type.String({ minLength: 1 }), sessionFile: Type.String({ minLength: 1 }) },
   { additionalProperties: false },
 );
-const IsoInstantSchema = Type.String({ format: "date-time" });
+const IsoInstantSchema = InstantSchema;
 const LeaseRowSchema = Type.Object(
   {
     token: Type.String({ minLength: 1 }),
@@ -90,7 +91,7 @@ type HeaderRow = Static<typeof HeaderRowSchema>;
 type AggregateRow = Static<typeof AggregateRowSchema>;
 type LeaseRow = Static<typeof LeaseRowSchema>;
 
-export interface CanonicalLease {
+export interface WorkstreamLease {
   readonly token: string;
   readonly owner: CoordinatorIdentity;
   readonly acquiredAt: string;
@@ -98,74 +99,74 @@ export interface CanonicalLease {
   readonly expiresAt: string;
 }
 
-export type CanonicalObservedLease =
+type WorkstreamObservedLease =
   | { readonly kind: "absent" }
-  | { readonly kind: "present"; readonly lease: CanonicalLease };
+  | { readonly kind: "present"; readonly lease: WorkstreamLease };
 
-export interface CanonicalCoordinatorAdoption {
+export interface WorkstreamCoordinatorAdoption {
   readonly repository: RepositoryIdentity;
   readonly workstreamId: string;
   readonly expectedRevision: number;
   readonly priorCoordinator: CoordinatorIdentity;
   readonly coordinator: CoordinatorIdentity;
-  readonly observedLease: CanonicalObservedLease;
+  readonly observedLease: WorkstreamObservedLease;
   readonly deathObservation: HerdrDeadObservation;
 }
 
-export interface CanonicalCoordinatorAdoptionResult {
+export interface WorkstreamCoordinatorAdoptionResult {
   readonly state: Workstream;
-  readonly lease: CanonicalLease;
+  readonly lease: WorkstreamLease;
 }
 
-export class CanonicalStoreInvalidError extends Data.TaggedError("CanonicalStoreInvalidError")<{
-  readonly code: "canonical_store_invalid";
+export class WorkstreamStoreInvalidError extends Data.TaggedError("WorkstreamStoreInvalidError")<{
+  readonly code: "workstream_store_invalid";
   readonly message: string;
 }> {
   constructor(message: string) {
-    super({ code: "canonical_store_invalid", message });
+    super({ code: "workstream_store_invalid", message });
   }
 }
 
-export class CanonicalStoreIncompleteError extends Data.TaggedError(
-  "CanonicalStoreIncompleteError",
+export class WorkstreamStoreIncompleteError extends Data.TaggedError(
+  "WorkstreamStoreIncompleteError",
 )<{
-  readonly code: "canonical_store_incomplete";
+  readonly code: "workstream_store_incomplete";
   readonly message: string;
 }> {
   constructor(message: string) {
-    super({ code: "canonical_store_incomplete", message });
+    super({ code: "workstream_store_incomplete", message });
   }
 }
 
-export class CanonicalStoreUnsupportedError extends Data.TaggedError(
-  "CanonicalStoreUnsupportedError",
+export class WorkstreamStoreUnsupportedError extends Data.TaggedError(
+  "WorkstreamStoreUnsupportedError",
 )<{
-  readonly code: "canonical_store_unsupported";
+  readonly code: "workstream_store_unsupported";
   readonly message: string;
 }> {
   constructor(message: string) {
-    super({ code: "canonical_store_unsupported", message });
+    super({ code: "workstream_store_unsupported", message });
   }
 }
 
-export class CanonicalStoreConflictError extends Data.TaggedError("CanonicalStoreConflictError")<{
-  readonly code: "canonical_store_conflict";
+export class WorkstreamStoreConflictError extends Data.TaggedError("WorkstreamStoreConflictError")<{
+  readonly code: "workstream_store_conflict";
   readonly message: string;
 }> {
   constructor(message: string) {
-    super({ code: "canonical_store_conflict", message });
+    super({ code: "workstream_store_conflict", message });
   }
 }
 
-export class CanonicalStoreHostError extends Data.TaggedError("CanonicalStoreHostError")<{
-  readonly code: "canonical_store_host_failed";
+export class WorkstreamStoreHostError extends Data.TaggedError("WorkstreamStoreHostError")<{
+  readonly code: "workstream_store_host_failed";
   readonly operation: string;
   readonly message: string;
   readonly cause: unknown;
 }> {
   constructor(operation: string, cause: unknown) {
     super({
-      code: "canonical_store_host_failed",
+      code: "workstream_store_host_failed",
       operation,
       message: `Failed to ${operation}.`,
       cause,
@@ -173,43 +174,43 @@ export class CanonicalStoreHostError extends Data.TaggedError("CanonicalStoreHos
   }
 }
 
-export type CanonicalStoreError =
-  | CanonicalStoreInvalidError
-  | CanonicalStoreIncompleteError
-  | CanonicalStoreUnsupportedError
-  | CanonicalStoreConflictError
-  | CanonicalStoreHostError;
+export type WorkstreamStoreError =
+  | WorkstreamStoreInvalidError
+  | WorkstreamStoreIncompleteError
+  | WorkstreamStoreUnsupportedError
+  | WorkstreamStoreConflictError
+  | WorkstreamStoreHostError;
 
 /**
  * One scoped store plus its validated attachment read, so callers never
  * re-read what open/create already established.
  */
-export interface CanonicalStoreAttachment {
-  readonly store: CanonicalWorkstreamStore;
+export interface WorkstreamStoreAttachment {
+  readonly store: WorkstreamStore;
   readonly state: Workstream;
 }
 
 /**
- * Unwired canonical persistence for one settled domain Workstream and its lease.
+ * Unwired workstream persistence for one settled domain Workstream and its lease.
  * Effect owns scope, time, filesystem/path work, interruption, and transaction
- * sequencing; canonical-sqlite-host owns only guarantees unavailable there.
+ * sequencing; workstream-sqlite-host owns only guarantees unavailable there.
  */
-export class CanonicalWorkstreamStore {
+export class WorkstreamStore {
   private constructor(
     readonly path: string,
     readonly id: string,
     readonly repository: RepositoryIdentity,
-    private readonly database: CanonicalDatabase,
+    private readonly database: WorkstreamDatabase,
   ) {}
 
   static pathFor(
     repository: RepositoryIdentity,
     id: string,
-  ): Effect.Effect<string, CanonicalStoreInvalidError, Path.Path> {
+  ): Effect.Effect<string, WorkstreamStoreInvalidError, Path.Path> {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
       yield* validateIdentity(paths, repository, id);
-      return canonicalPath(paths, repository.gitCommonDir, id);
+      return workstreamPath(paths, repository.gitCommonDir, id);
     });
   }
 
@@ -217,33 +218,28 @@ export class CanonicalWorkstreamStore {
   static create(
     initial: Workstream,
   ): Effect.Effect<
-    CanonicalStoreAttachment,
-    CanonicalStoreError,
+    WorkstreamStoreAttachment,
+    WorkstreamStoreError,
     Scope.Scope | FileSystem.FileSystem | Path.Path
   > {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
       const fileSystem = yield* FileSystem.FileSystem;
       yield* validateInitial(paths, initial);
-      const path = canonicalPath(paths, initial.repository.gitCommonDir, initial.id);
+      const path = workstreamPath(paths, initial.repository.gitCommonDir, initial.id);
       yield* assertGroundedCommonDirectory(initial.repository.gitCommonDir);
       yield* claimStorageDirectories(paths, fileSystem, path);
       const existing = yield* inspect(path);
       if (existing.exists)
-        return yield* CanonicalWorkstreamStore.classifyExisting(
-          fileSystem,
-          path,
-          initial,
-          existing,
-        );
+        return yield* WorkstreamStore.classifyExisting(fileSystem, path, initial, existing);
 
       const store = yield* Effect.acquireUseRelease(
         createPrivateDatabaseFile(fileSystem, path),
-        () => CanonicalWorkstreamStore.initialize(path, initial),
+        () => WorkstreamStore.initialize(path, initial),
         (_, exit) =>
           exit._tag === "Success"
             ? Effect.void
-            : platform("remove the incomplete canonical database", fileSystem.remove(path)).pipe(
+            : platform("remove the incomplete workstream database", fileSystem.remove(path)).pipe(
                 Effect.ignore,
               ),
       );
@@ -257,35 +253,35 @@ export class CanonicalWorkstreamStore {
   static resumeCreate(
     initial: Workstream,
   ): Effect.Effect<
-    CanonicalStoreAttachment,
-    CanonicalStoreError,
+    WorkstreamStoreAttachment,
+    WorkstreamStoreError,
     Scope.Scope | FileSystem.FileSystem | Path.Path
   > {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
       const fileSystem = yield* FileSystem.FileSystem;
       yield* validateInitial(paths, initial);
-      const path = canonicalPath(paths, initial.repository.gitCommonDir, initial.id);
+      const path = workstreamPath(paths, initial.repository.gitCommonDir, initial.id);
       yield* assertGroundedCommonDirectory(initial.repository.gitCommonDir);
       yield* claimStorageDirectories(paths, fileSystem, path);
       const existing = yield* inspect(path);
       if (!existing.exists) {
         yield* createPrivateDatabaseFile(fileSystem, path);
-        const store = yield* CanonicalWorkstreamStore.initialize(path, initial);
+        const store = yield* WorkstreamStore.initialize(path, initial);
         return { store, state: structuredClone(initial) };
       }
       if (existing.symbolicLink || !existing.regularFile || existing.mode !== FILE_MODE)
         return yield* invalid(
-          `Canonical database residue is not an exact private ordinary file: ${path}.`,
+          `Workstream database residue is not an exact private ordinary file: ${path}.`,
         );
       if (existing.size === 0) {
-        const store = yield* CanonicalWorkstreamStore.initialize(path, initial);
+        const store = yield* WorkstreamStore.initialize(path, initial);
         return { store, state: structuredClone(initial) };
       }
       yield* classifyFileHeader(fileSystem, path);
       const database = yield* acquireDatabase(path);
       if (database.tableNames().length === 0) {
-        const store = new CanonicalWorkstreamStore(
+        const store = new WorkstreamStore(
           path,
           initial.id,
           structuredClone(initial.repository),
@@ -294,7 +290,7 @@ export class CanonicalWorkstreamStore {
         yield* store.initializeEmpty(initial);
         return { store, state: structuredClone(initial) };
       }
-      const store = new CanonicalWorkstreamStore(
+      const store = new WorkstreamStore(
         path,
         initial.id,
         structuredClone(initial.repository),
@@ -302,8 +298,8 @@ export class CanonicalWorkstreamStore {
       );
       const state = yield* store.read();
       if (!Value.Equal(state, initial))
-        return yield* new CanonicalStoreConflictError(
-          `Canonical database does not equal its prepared creation declaration: ${path}.`,
+        return yield* new WorkstreamStoreConflictError(
+          `Workstream database does not equal its prepared creation declaration: ${path}.`,
         );
       return { store, state };
     });
@@ -313,51 +309,51 @@ export class CanonicalWorkstreamStore {
     id: string,
     repository: RepositoryIdentity,
   ): Effect.Effect<
-    CanonicalStoreAttachment,
-    CanonicalStoreError,
+    WorkstreamStoreAttachment,
+    WorkstreamStoreError,
     Scope.Scope | FileSystem.FileSystem | Path.Path
   > {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
       const fileSystem = yield* FileSystem.FileSystem;
       yield* validateIdentity(paths, repository, id);
-      const path = canonicalPath(paths, repository.gitCommonDir, id);
+      const path = workstreamPath(paths, repository.gitCommonDir, id);
       yield* assertGroundedCommonDirectory(repository.gitCommonDir);
       yield* assertPrivateStorage(paths, path);
       yield* classifyFileHeader(fileSystem, path);
       const database = yield* acquireDatabase(path);
-      const store = new CanonicalWorkstreamStore(path, id, structuredClone(repository), database);
+      const store = new WorkstreamStore(path, id, structuredClone(repository), database);
       return { store, state: yield* store.read() };
     });
   }
 
-  /** Discover one exact canonical attachment from an explicit untrusted path without writing. */
+  /** Discover one exact workstream attachment from an explicit untrusted path without writing. */
   static discover(
     statePath: string,
   ): Effect.Effect<
-    CanonicalStoreAttachment,
-    CanonicalStoreError,
+    WorkstreamStoreAttachment,
+    WorkstreamStoreError,
     Scope.Scope | FileSystem.FileSystem | Path.Path
   > {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
       const fileSystem = yield* FileSystem.FileSystem;
       if (!paths.isAbsolute(statePath) || paths.resolve(statePath) !== statePath)
-        return yield* invalid("Canonical statePath must be absolute and normalized.");
+        return yield* invalid("Workstream statePath must be absolute and normalized.");
       yield* assertPrivateStorage(paths, statePath);
       yield* classifyFileHeader(fileSystem, statePath);
       const database = yield* acquireDatabase(statePath, true);
-      const state = yield* hostEffect("read the discovered canonical Workstream", () =>
-        readCanonicalAggregate(database),
+      const state = yield* hostEffect("read the discovered Workstream", () =>
+        readWorkstreamAggregate(database),
       );
       yield* validateIdentity(paths, state.repository, state.id);
       yield* assertGroundedCommonDirectory(state.repository.gitCommonDir);
-      const expected = canonicalPath(paths, state.repository.gitCommonDir, state.id);
+      const expected = workstreamPath(paths, state.repository.gitCommonDir, state.id);
       if (statePath !== expected)
         return yield* invalid(
-          "Canonical statePath does not match the aggregate repository and Workstream identity.",
+          "Workstream statePath does not match the aggregate repository and Workstream identity.",
         );
-      const store = new CanonicalWorkstreamStore(
+      const store = new WorkstreamStore(
         statePath,
         state.id,
         structuredClone(state.repository),
@@ -368,7 +364,7 @@ export class CanonicalWorkstreamStore {
   }
 
   /**
-   * Classify an already-present canonical path: a complete store is a conflict,
+   * Classify an already-present workstream path: a complete store is a conflict,
    * while a process-death residue is classified by content instead of being
    * overwritten or reported as an opaque host failure.
    */
@@ -377,42 +373,40 @@ export class CanonicalWorkstreamStore {
     path: string,
     initial: Workstream,
     entry: StorageEntry,
-  ): Effect.Effect<never, CanonicalStoreError, Scope.Scope> {
+  ): Effect.Effect<never, WorkstreamStoreError, Scope.Scope> {
     return Effect.gen(function* () {
       if (entry.symbolicLink || !entry.regularFile)
-        return yield* invalid(`Canonical database path is not an ordinary file: ${path}.`);
+        return yield* invalid(`Workstream database path is not an ordinary file: ${path}.`);
       if (entry.mode !== FILE_MODE)
         return yield* invalid(
-          `Canonical database is not private (${modeLabel(entry.mode)}): ${path}.`,
+          `Workstream database is not private (${modeLabel(entry.mode)}): ${path}.`,
         );
       if (entry.size === 0)
-        return yield* new CanonicalStoreIncompleteError(
-          `Canonical database is an incomplete creation residue: ${path}.`,
+        return yield* new WorkstreamStoreIncompleteError(
+          `Workstream database is an incomplete creation residue: ${path}.`,
         );
       yield* classifyFileHeader(fileSystem, path);
       const database = yield* acquireDatabase(path, true);
-      const store = new CanonicalWorkstreamStore(
+      const store = new WorkstreamStore(
         path,
         initial.id,
         structuredClone(initial.repository),
         database,
       );
       yield* store.read();
-      return yield* new CanonicalStoreConflictError(`Canonical database already exists: ${path}.`);
+      return yield* new WorkstreamStoreConflictError(
+        `Workstream database already exists: ${path}.`,
+      );
     });
   }
 
   private static initialize(
     path: string,
     initial: Workstream,
-  ): Effect.Effect<
-    CanonicalWorkstreamStore,
-    CanonicalStoreError,
-    Scope.Scope | FileSystem.FileSystem
-  > {
+  ): Effect.Effect<WorkstreamStore, WorkstreamStoreError, Scope.Scope | FileSystem.FileSystem> {
     return Effect.gen(function* () {
       const database = yield* acquireDatabase(path);
-      const store = new CanonicalWorkstreamStore(
+      const store = new WorkstreamStore(
         path,
         initial.id,
         structuredClone(initial.repository),
@@ -437,7 +431,7 @@ export class CanonicalWorkstreamStore {
 
   private initializeEmpty(
     initial: Workstream,
-  ): Effect.Effect<void, CanonicalStoreError, FileSystem.FileSystem> {
+  ): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
     return this.atomic(() => {
       this.database.exec(CREATE_SCHEMA);
       this.database.write(
@@ -454,12 +448,12 @@ export class CanonicalWorkstreamStore {
   }
 
   /** Read without normalization, migration, or writes. */
-  read(): Effect.Effect<Workstream, CanonicalStoreError> {
-    return hostEffect("read the canonical Workstream", () => this.readAggregate());
+  read(): Effect.Effect<Workstream, WorkstreamStoreError> {
+    return hostEffect("read the Workstream", () => this.readAggregate());
   }
 
   /** Atomically read the authoritative aggregate and prove the exact live lease. */
-  readFenced(lease: CanonicalLease): Effect.Effect<Workstream, CanonicalStoreError> {
+  readFenced(lease: WorkstreamLease): Effect.Effect<Workstream, WorkstreamStoreError> {
     return validateLeaseInput(lease).pipe(
       Effect.andThen(
         this.transaction((now) => {
@@ -471,19 +465,19 @@ export class CanonicalWorkstreamStore {
     );
   }
 
-  observeLease(): Effect.Effect<CanonicalLease | undefined, CanonicalStoreError> {
-    return hostEffect("observe the canonical Workstream lease", () => this.readLeaseRow());
+  observeLease(): Effect.Effect<WorkstreamLease | undefined, WorkstreamStoreError> {
+    return hostEffect("observe the Workstream lease", () => this.readLeaseRow());
   }
 
   /**
    * Prove the exact held lease from the lease row alone, without reading or
    * validating the aggregate. Ownership verification never touches task history.
    */
-  checkLease(lease: CanonicalLease): Effect.Effect<void, CanonicalStoreError> {
+  checkLease(lease: WorkstreamLease): Effect.Effect<void, WorkstreamStoreError> {
     return validateLeaseInput(lease).pipe(
       Effect.andThen(
         Clock.clockWith((clock) =>
-          hostEffect("check the canonical Workstream lease", () =>
+          hostEffect("check the Workstream lease", () =>
             this.assertHeldLease(lease, clock.currentTimeMillisUnsafe()),
           ),
         ),
@@ -493,27 +487,27 @@ export class CanonicalWorkstreamStore {
 
   acquireLease(
     owner: CoordinatorIdentity,
-    observed?: CanonicalLease,
-  ): Effect.Effect<CanonicalLease, CanonicalStoreError, FileSystem.FileSystem> {
+    observed?: WorkstreamLease,
+  ): Effect.Effect<WorkstreamLease, WorkstreamStoreError, FileSystem.FileSystem> {
     if (!Value.Check(LeaseOwnerSchema, owner))
-      return Effect.fail(new CanonicalStoreInvalidError("Lease owner is malformed."));
+      return Effect.fail(new WorkstreamStoreInvalidError("Lease owner is malformed."));
     return this.atomic((nowMillis) => {
       const current = this.readLeaseRow();
       if (current === undefined) {
         if (observed !== undefined)
-          throw new CanonicalStoreConflictError(
+          throw new WorkstreamStoreConflictError(
             `Observed lease for ${this.id} no longer matches the store.`,
           );
       } else {
         if (observed === undefined || !sameLease(current, observed))
-          throw new CanonicalStoreConflictError(
+          throw new WorkstreamStoreConflictError(
             `Workstream ${this.id} already has a fenced lease; takeover requires the exact observed lease.`,
           );
         if (instantMillis(current.expiresAt) > nowMillis)
-          throw new CanonicalStoreConflictError(`Observed lease for ${this.id} has not expired.`);
+          throw new WorkstreamStoreConflictError(`Observed lease for ${this.id} has not expired.`);
       }
       const now = isoFromMillis(nowMillis);
-      const lease: CanonicalLease = {
+      const lease: WorkstreamLease = {
         token: newLeaseToken(),
         owner: structuredClone(owner),
         acquiredAt: now,
@@ -526,8 +520,8 @@ export class CanonicalWorkstreamStore {
   }
 
   renewLease(
-    lease: CanonicalLease,
-  ): Effect.Effect<CanonicalLease, CanonicalStoreError, FileSystem.FileSystem> {
+    lease: WorkstreamLease,
+  ): Effect.Effect<WorkstreamLease, WorkstreamStoreError, FileSystem.FileSystem> {
     return validateLeaseInput(lease).pipe(
       Effect.andThen(
         this.atomic((nowMillis) => {
@@ -552,8 +546,8 @@ export class CanonicalWorkstreamStore {
   }
 
   releaseLease(
-    lease: CanonicalLease,
-  ): Effect.Effect<void, CanonicalStoreError, FileSystem.FileSystem> {
+    lease: WorkstreamLease,
+  ): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
     return validateLeaseInput(lease).pipe(
       Effect.andThen(
         this.atomic(() => {
@@ -571,8 +565,12 @@ export class CanonicalWorkstreamStore {
 
   /** Commit coordinator transfer and successor lease as one aggregate transaction. */
   adoptCoordinator(
-    adoption: CanonicalCoordinatorAdoption,
-  ): Effect.Effect<CanonicalCoordinatorAdoptionResult, CanonicalStoreError, FileSystem.FileSystem> {
+    adoption: WorkstreamCoordinatorAdoption,
+  ): Effect.Effect<
+    WorkstreamCoordinatorAdoptionResult,
+    WorkstreamStoreError,
+    FileSystem.FileSystem
+  > {
     return this.atomic((nowMillis) => {
       const current = this.readAggregate();
       const currentLease = this.readLeaseRow();
@@ -581,9 +579,9 @@ export class CanonicalWorkstreamStore {
       const previous = current.coordinatorTransfers.at(-1);
       if (
         previous !== undefined &&
-        canonicalInstantMillis(previous.committedAt, "coordinator transfer") >= nowMillis
+        workstreamInstantMillis(previous.committedAt, "coordinator transfer") >= nowMillis
       )
-        throw new CanonicalStoreConflictError(
+        throw new WorkstreamStoreConflictError(
           "Coordinator adoption time does not advance transfer history.",
         );
       const next: Workstream = structuredClone(current);
@@ -599,7 +597,7 @@ export class CanonicalWorkstreamStore {
       });
       next.coordinator = structuredClone(adoption.coordinator);
       validateWorkstream(next);
-      const lease: CanonicalLease = {
+      const lease: WorkstreamLease = {
         token: newLeaseToken(),
         owner: structuredClone(adoption.coordinator),
         acquiredAt: committedAt,
@@ -613,7 +611,7 @@ export class CanonicalWorkstreamStore {
         current.revision,
       );
       if (changes !== 1)
-        throw new CanonicalStoreConflictError("Coordinator adoption aggregate changed.");
+        throw new WorkstreamStoreConflictError("Coordinator adoption aggregate changed.");
       this.writeLease(lease);
       return { state: structuredClone(next), lease };
     });
@@ -621,8 +619,8 @@ export class CanonicalWorkstreamStore {
 
   private validateAdoption(
     current: Workstream,
-    currentLease: CanonicalLease | undefined,
-    adoption: CanonicalCoordinatorAdoption,
+    currentLease: WorkstreamLease | undefined,
+    adoption: WorkstreamCoordinatorAdoption,
     nowMillis: number,
   ): void {
     this.validateAdoptionAggregate(current, adoption);
@@ -632,7 +630,7 @@ export class CanonicalWorkstreamStore {
 
   private validateAdoptionAggregate(
     current: Workstream,
-    adoption: CanonicalCoordinatorAdoption,
+    adoption: WorkstreamCoordinatorAdoption,
   ): void {
     if (
       adoption.workstreamId !== this.id ||
@@ -640,15 +638,15 @@ export class CanonicalWorkstreamStore {
       current.id !== adoption.workstreamId ||
       !Value.Equal(current.repository, adoption.repository)
     )
-      throw new CanonicalStoreConflictError(
+      throw new WorkstreamStoreConflictError(
         "Coordinator adoption repository or Workstream identity changed.",
       );
     if (current.revision !== adoption.expectedRevision)
-      throw new CanonicalStoreConflictError("Coordinator adoption revision changed.");
+      throw new WorkstreamStoreConflictError("Coordinator adoption revision changed.");
     if (!Value.Equal(current.coordinator, adoption.priorCoordinator))
-      throw new CanonicalStoreConflictError("Coordinator adoption prior owner changed.");
+      throw new WorkstreamStoreConflictError("Coordinator adoption prior owner changed.");
     if (Value.Equal(adoption.coordinator, adoption.priorCoordinator))
-      throw new CanonicalStoreInvalidError("Coordinator adoption requires a different successor.");
+      throw new WorkstreamStoreInvalidError("Coordinator adoption requires a different successor.");
   }
 
   /**
@@ -657,9 +655,9 @@ export class CanonicalWorkstreamStore {
    * no-op. A changed result must be valid at exactly current revision + 1.
    */
   transition(
-    lease: CanonicalLease,
+    lease: WorkstreamLease,
     apply: (current: Workstream) => Workstream,
-  ): Effect.Effect<Workstream, CanonicalStoreError, FileSystem.FileSystem> {
+  ): Effect.Effect<Workstream, WorkstreamStoreError, FileSystem.FileSystem> {
     return validateLeaseInput(lease).pipe(
       Effect.andThen(
         this.atomic((nowMillis, resample) => {
@@ -686,7 +684,7 @@ export class CanonicalWorkstreamStore {
             isoFromMillis(resample()),
           );
           if (changes !== 1)
-            throw new CanonicalStoreConflictError(
+            throw new WorkstreamStoreConflictError(
               `Workstream ${current.id} lost its fenced lease before mutation commit.`,
             );
           return structuredClone(next);
@@ -696,24 +694,24 @@ export class CanonicalWorkstreamStore {
   }
 
   private readAggregate(): Workstream {
-    const state = readCanonicalAggregate(this.database);
+    const state = readWorkstreamAggregate(this.database);
     if (state.id !== this.id || !Value.Equal(state.repository, this.repository))
-      throw new CanonicalStoreInvalidError(
-        "Canonical store belongs to a foreign repository or Workstream identity.",
+      throw new WorkstreamStoreInvalidError(
+        "Workstream store belongs to a foreign repository or Workstream identity.",
       );
     return state;
   }
 
-  private readLeaseRow(): CanonicalLease | undefined {
-    assertCanonicalSchema(this.database);
+  private readLeaseRow(): WorkstreamLease | undefined {
+    assertWorkstreamSchema(this.database);
     const value = this.database.readRow(
       "SELECT token,owner_session_id,owner_session_file,acquired_at,heartbeat_at,expires_at FROM lease WHERE singleton=1",
     );
     if (value === undefined) return undefined;
     if (!Value.Check(LeaseRowSchema, value))
-      throw new CanonicalStoreInvalidError("Canonical lease row is malformed.");
+      throw new WorkstreamStoreInvalidError("Workstream lease row is malformed.");
     const row: LeaseRow = Value.Decode(LeaseRowSchema, value);
-    const lease: CanonicalLease = {
+    const lease: WorkstreamLease = {
       token: row.token,
       owner: { sessionId: row.owner_session_id, sessionFile: row.owner_session_file },
       acquiredAt: row.acquired_at,
@@ -724,7 +722,7 @@ export class CanonicalWorkstreamStore {
     return lease;
   }
 
-  private writeLease(lease: CanonicalLease): void {
+  private writeLease(lease: WorkstreamLease): void {
     this.database.write(
       `INSERT INTO lease(singleton,token,owner_session_id,owner_session_file,acquired_at,heartbeat_at,expires_at)
        VALUES(1,?,?,?,?,?,?)
@@ -740,16 +738,16 @@ export class CanonicalWorkstreamStore {
     );
   }
 
-  private assertHeldLease(lease: CanonicalLease, nowMillis: number): void {
+  private assertHeldLease(lease: WorkstreamLease, nowMillis: number): void {
     const current = this.readLeaseRow();
     if (current === undefined || !sameLeaseHolder(current, lease)) throw leaseConflict(lease);
     if (instantMillis(current.expiresAt) <= nowMillis)
-      throw new CanonicalStoreConflictError("The fenced Workstream lease has expired.");
+      throw new WorkstreamStoreConflictError("The fenced Workstream lease has expired.");
   }
 
   private atomic<A>(
     body: (nowMillis: number, resample: () => number) => A,
-  ): Effect.Effect<A, CanonicalStoreError, FileSystem.FileSystem> {
+  ): Effect.Effect<A, WorkstreamStoreError, FileSystem.FileSystem> {
     return this.transaction((now) => body(now(), now)).pipe(
       Effect.tap(() => secureFiles(this.path)),
     );
@@ -761,10 +759,10 @@ export class CanonicalWorkstreamStore {
    * the lock is held. The native critical section cannot be interrupted, and a
    * failure is rolled back and rethrown with its original typed identity.
    */
-  private transaction<A>(run: (now: () => number) => A): Effect.Effect<A, CanonicalStoreError> {
+  private transaction<A>(run: (now: () => number) => A): Effect.Effect<A, WorkstreamStoreError> {
     return Effect.uninterruptible(
       Clock.clockWith((clock) =>
-        hostEffect("run the canonical transaction", () => {
+        hostEffect("run the workstream transaction", () => {
           this.database.exec("BEGIN IMMEDIATE");
           try {
             const value = run(() => clock.currentTimeMillisUnsafe());
@@ -774,8 +772,8 @@ export class CanonicalWorkstreamStore {
             try {
               this.database.exec("ROLLBACK");
             } catch (rollbackCause) {
-              throw new CanonicalStoreHostError(
-                "roll back the canonical transaction",
+              throw new WorkstreamStoreHostError(
+                "roll back the workstream transaction",
                 new AggregateError([cause, rollbackCause]),
               );
             }
@@ -787,52 +785,50 @@ export class CanonicalWorkstreamStore {
   }
 }
 
-function assertCanonicalSchema(database: CanonicalDatabase): void {
+function assertWorkstreamSchema(database: WorkstreamDatabase): void {
   const tables = database.tableNames();
-  for (const [table, columns] of Object.entries(CANONICAL_SCHEMA)) {
+  for (const [table, columns] of Object.entries(WORKSTREAM_SCHEMA)) {
     if (!tables.includes(table))
-      throw new CanonicalStoreIncompleteError(`Canonical database is missing table: ${table}.`);
+      throw new WorkstreamStoreIncompleteError(`Workstream database is missing table: ${table}.`);
     const present = database.columnNames(table);
     const absent = columns.filter((column) => !present.includes(column));
     if (absent.length > 0)
-      throw new CanonicalStoreIncompleteError(
-        `Canonical table ${table} lacks: ${absent.join(", ")}.`,
+      throw new WorkstreamStoreIncompleteError(
+        `Workstream table ${table} lacks: ${absent.join(", ")}.`,
       );
   }
 }
 
-function readCanonicalAggregate(database: CanonicalDatabase): Workstream {
-  assertCanonicalSchema(database);
+function readWorkstreamAggregate(database: WorkstreamDatabase): Workstream {
+  assertWorkstreamSchema(database);
   const headerValue = database.readRow(
     "SELECT format, version FROM store_header WHERE singleton=1",
   );
   if (!Value.Check(HeaderRowSchema, headerValue))
-    throw new CanonicalStoreIncompleteError("Canonical store header is missing or malformed.");
+    throw new WorkstreamStoreIncompleteError("Workstream store header is missing or malformed.");
   const header: HeaderRow = Value.Decode(HeaderRowSchema, headerValue);
   if (header.format !== STORE_FORMAT || header.version !== STORE_VERSION)
-    throw new CanonicalStoreUnsupportedError("Canonical store header is unsupported.");
+    throw new WorkstreamStoreUnsupportedError("Workstream store header is unsupported.");
   const rowValue = database.readRow(
     "SELECT state_json, revision FROM workstream WHERE singleton=1",
   );
   if (!Value.Check(AggregateRowSchema, rowValue))
-    throw new CanonicalStoreIncompleteError("Canonical Workstream row is missing or malformed.");
+    throw new WorkstreamStoreIncompleteError("Workstream row is missing or malformed.");
   const row: AggregateRow = Value.Decode(AggregateRowSchema, rowValue);
   const state = parseWorkstream(row.state_json);
   if (state.revision !== row.revision)
-    throw new CanonicalStoreInvalidError(
-      "Canonical Workstream revision diverges from its aggregate row.",
-    );
+    throw new WorkstreamStoreInvalidError("Workstream revision diverges from its aggregate row.");
   return state;
 }
 
 function validateInitial(
   paths: Path.Path,
   initial: Workstream,
-): Effect.Effect<void, CanonicalStoreInvalidError> {
-  return domainInvalid("validate initial canonical Workstream", () => {
+): Effect.Effect<void, WorkstreamStoreInvalidError> {
+  return domainInvalid("validate initial Workstream", () => {
     validateIdentitySync(paths, initial.repository, initial.id);
     validateWorkstream(initial);
-    if (initial.revision !== 0) throw new Error("Initial canonical Workstream revision must be 0.");
+    if (initial.revision !== 0) throw new Error("Initial Workstream revision must be 0.");
   });
 }
 
@@ -840,8 +836,8 @@ function validateIdentity(
   paths: Path.Path,
   repository: RepositoryIdentity,
   id: string,
-): Effect.Effect<void, CanonicalStoreInvalidError> {
-  return domainInvalid("validate canonical identity", () =>
+): Effect.Effect<void, WorkstreamStoreInvalidError> {
+  return domainInvalid("validate workstream identity", () =>
     validateIdentitySync(paths, repository, id),
   );
 }
@@ -863,7 +859,6 @@ function validateIdentitySync(paths: Path.Path, repository: RepositoryIdentity, 
 function validateTransition(current: Workstream, next: Workstream): void {
   for (const key of [
     "format",
-    "schema",
     "schemaVersion",
     "id",
     "repository",
@@ -873,16 +868,16 @@ function validateTransition(current: Workstream, next: Workstream): void {
     "createdAt",
   ] as const)
     if (!Value.Equal(next[key], current[key]))
-      throw new CanonicalStoreInvalidError(`Transition cannot rewrite immutable ${key}.`);
+      throw new WorkstreamStoreInvalidError(`Transition cannot rewrite immutable ${key}.`);
   try {
     validateWorkstream(next);
   } catch (cause) {
-    throw new CanonicalStoreInvalidError(
+    throw new WorkstreamStoreInvalidError(
       `Transition returned an invalid Workstream: ${errorMessage(cause)}`,
     );
   }
   if (next.revision !== current.revision + 1)
-    throw new CanonicalStoreInvalidError(
+    throw new WorkstreamStoreInvalidError(
       `Changed transition must return revision ${current.revision + 1}.`,
     );
 }
@@ -892,13 +887,13 @@ function parseWorkstream(text: string): Workstream {
   try {
     value = JSON.parse(text);
   } catch {
-    throw new CanonicalStoreInvalidError("Canonical Workstream is not valid JSON.");
+    throw new WorkstreamStoreInvalidError("Workstream is not valid JSON.");
   }
   if (!Value.Check(WorkstreamSchema, value)) {
     const issue = Value.Errors(WorkstreamSchema, value)[0];
     const location = issue?.instancePath;
-    throw new CanonicalStoreInvalidError(
-      `Canonical Workstream is malformed at ${location === undefined || location === "" ? "/" : location}.`,
+    throw new WorkstreamStoreInvalidError(
+      `Workstream is malformed at ${location === undefined || location === "" ? "/" : location}.`,
     );
   }
   // SAFETY: WorkstreamSchema is transform-free and the value passed its complete structural check.
@@ -906,24 +901,24 @@ function parseWorkstream(text: string): Workstream {
   try {
     validateWorkstreamInvariants(state);
   } catch (cause) {
-    throw new CanonicalStoreInvalidError(
-      `Canonical Workstream violates domain invariants: ${errorMessage(cause)}`,
+    throw new WorkstreamStoreInvalidError(
+      `Workstream violates domain invariants: ${errorMessage(cause)}`,
     );
   }
   return state;
 }
 
-function canonicalPath(paths: Path.Path, gitCommonDir: string, id: string): string {
+function workstreamPath(paths: Path.Path, gitCommonDir: string, id: string): string {
   return paths.join(gitCommonDir, STORAGE_DIRECTORY, WORKSTREAM_DIRECTORY, id, SQLITE_FILENAME);
 }
 
 function acquireDatabase(
   path: string,
   readOnly = false,
-): Effect.Effect<CanonicalDatabase, CanonicalStoreError, Scope.Scope> {
+): Effect.Effect<WorkstreamDatabase, WorkstreamStoreError, Scope.Scope> {
   return Effect.acquireRelease(
-    hostEffect("open and configure the canonical SQLite database", () =>
-      openCanonicalDatabase(path, readOnly),
+    hostEffect("open and configure the workstream SQLite database", () =>
+      openWorkstreamDatabase(path, readOnly),
     ),
     (database) => Effect.sync(() => database.close()),
   );
@@ -932,12 +927,12 @@ function acquireDatabase(
 function createPrivateDatabaseFile(
   fileSystem: FileSystem.FileSystem,
   path: string,
-): Effect.Effect<void, CanonicalStoreError, Scope.Scope> {
+): Effect.Effect<void, WorkstreamStoreError, Scope.Scope> {
   return platform(
-    "create the private canonical database file",
+    "create the private workstream database file",
     Effect.scoped(fileSystem.open(path, { flag: "wx", mode: FILE_MODE })),
   ).pipe(
-    Effect.andThen(platform("set the canonical database mode", fileSystem.chmod(path, FILE_MODE))),
+    Effect.andThen(platform("set the workstream database mode", fileSystem.chmod(path, FILE_MODE))),
   );
 }
 
@@ -945,7 +940,7 @@ function claimStorageDirectories(
   paths: Path.Path,
   fileSystem: FileSystem.FileSystem,
   path: string,
-): Effect.Effect<void, CanonicalStoreError> {
+): Effect.Effect<void, WorkstreamStoreError> {
   return Effect.gen(function* () {
     const workstreamDirectory = paths.dirname(path);
     const workstreamsDirectory = paths.dirname(workstreamDirectory);
@@ -970,7 +965,7 @@ function claimStorageDirectories(
 function claimStorageDirectory(
   fileSystem: FileSystem.FileSystem,
   path: string,
-): Effect.Effect<void, CanonicalStoreError> {
+): Effect.Effect<void, WorkstreamStoreError> {
   return Effect.gen(function* () {
     const entry = yield* inspect(path);
     if (entry.symbolicLink)
@@ -998,7 +993,7 @@ function claimStorageDirectory(
   });
 }
 
-function assertGroundedCommonDirectory(path: string): Effect.Effect<void, CanonicalStoreError> {
+function assertGroundedCommonDirectory(path: string): Effect.Effect<void, WorkstreamStoreError> {
   return Effect.gen(function* () {
     const entry = yield* inspect(path);
     if (!entry.exists || !entry.directory || entry.symbolicLink)
@@ -1009,7 +1004,7 @@ function assertGroundedCommonDirectory(path: string): Effect.Effect<void, Canoni
 function assertPrivateStorage(
   paths: Path.Path,
   path: string,
-): Effect.Effect<void, CanonicalStoreError, FileSystem.FileSystem> {
+): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     for (const directory of [
       paths.dirname(paths.dirname(paths.dirname(path))),
@@ -1021,7 +1016,7 @@ function assertPrivateStorage(
   });
 }
 
-function assertPrivateDirectory(directory: string): Effect.Effect<void, CanonicalStoreError> {
+function assertPrivateDirectory(directory: string): Effect.Effect<void, WorkstreamStoreError> {
   return Effect.gen(function* () {
     const entry = yield* inspect(directory);
     if (!entry.exists || !entry.directory || entry.symbolicLink || entry.mode !== DIRECTORY_MODE)
@@ -1034,15 +1029,15 @@ function assertPrivateDirectory(directory: string): Effect.Effect<void, Canonica
 function assertPrivateDatabaseFile(
   paths: Path.Path,
   path: string,
-): Effect.Effect<void, CanonicalStoreError, FileSystem.FileSystem> {
+): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     const file = yield* inspect(path);
-    if (!file.exists) return yield* invalid(`Canonical database does not exist: ${path}.`);
+    if (!file.exists) return yield* invalid(`Workstream database does not exist: ${path}.`);
     if (file.symbolicLink || !file.regularFile)
-      return yield* invalid(`Canonical database is not an ordinary file: ${path}.`);
+      return yield* invalid(`Workstream database is not an ordinary file: ${path}.`);
     if (file.mode !== FILE_MODE)
       return yield* invalid(
-        `Canonical database is not private (${modeLabel(file.mode)}): ${path}.`,
+        `Workstream database is not private (${modeLabel(file.mode)}): ${path}.`,
       );
     const boundary = paths.dirname(paths.dirname(paths.dirname(paths.dirname(path))));
     const fileSystem = yield* FileSystem.FileSystem;
@@ -1050,20 +1045,20 @@ function assertPrivateDatabaseFile(
       "resolve Git common directory",
       fileSystem.realPath(boundary),
     );
-    const realFile = yield* platform("resolve canonical database", fileSystem.realPath(path));
+    const realFile = yield* platform("resolve workstream database", fileSystem.realPath(path));
     const relative = paths.relative(realBoundary, realFile);
     if (relative === ".." || relative.startsWith(`..${paths.sep}`) || paths.isAbsolute(relative))
-      return yield* invalid(`Canonical database escapes its Git common directory: ${path}.`);
+      return yield* invalid(`Workstream database escapes its Git common directory: ${path}.`);
   });
 }
 
 function classifyFileHeader(
   fileSystem: FileSystem.FileSystem,
   path: string,
-): Effect.Effect<void, CanonicalStoreError> {
+): Effect.Effect<void, WorkstreamStoreError> {
   return Effect.gen(function* () {
     const header = yield* platform(
-      "read the canonical database header",
+      "read the workstream database header",
       Effect.scoped(
         Effect.gen(function* () {
           const file = yield* fileSystem.open(path, { flag: "r" });
@@ -1074,82 +1069,83 @@ function classifyFileHeader(
       ),
     );
     if (header.length === 0)
-      return yield* new CanonicalStoreIncompleteError(
-        `Canonical database creation is incomplete: ${path}.`,
+      return yield* new WorkstreamStoreIncompleteError(
+        `Workstream database creation is incomplete: ${path}.`,
       );
     if (new TextDecoder().decode(header) !== SQLITE_HEADER)
-      return yield* invalid(`Canonical database is not a supported SQLite file: ${path}.`);
+      return yield* invalid(`Workstream database is not a supported SQLite file: ${path}.`);
   });
 }
 
-function validateAdoptionProof(adoption: CanonicalCoordinatorAdoption, nowMillis: number): void {
+function validateAdoptionProof(adoption: WorkstreamCoordinatorAdoption, nowMillis: number): void {
   if (
     !Value.Check(HerdrDeadObservationSchema, adoption.deathObservation) ||
     !Value.Equal(adoption.deathObservation.subject, adoption.priorCoordinator)
   )
-    throw new CanonicalStoreInvalidError(
+    throw new WorkstreamStoreInvalidError(
       "Coordinator adoption requires an exact prior-owner Herdr API dead snapshot.",
     );
-  const observedMillis = canonicalInstantMillis(
+  const observedMillis = workstreamInstantMillis(
     adoption.deathObservation.observedAt,
     "Herdr dead observation",
   );
   if (observedMillis > nowMillis)
-    throw new CanonicalStoreInvalidError(
+    throw new WorkstreamStoreInvalidError(
       "Coordinator adoption Herdr dead observation cannot be in the future.",
     );
 }
 
 function validateAdoptionLease(
-  current: CanonicalLease | undefined,
-  adoption: CanonicalCoordinatorAdoption,
+  current: WorkstreamLease | undefined,
+  adoption: WorkstreamCoordinatorAdoption,
   nowMillis: number,
 ): void {
   if (adoption.observedLease.kind === "absent") {
     if (current !== undefined)
-      throw new CanonicalStoreConflictError(
+      throw new WorkstreamStoreConflictError(
         "An absent lease observation no longer matches the store.",
       );
     return;
   }
   validateLease(adoption.observedLease.lease);
   if (current === undefined || !sameLease(current, adoption.observedLease.lease))
-    throw new CanonicalStoreConflictError("The exact observed adoption lease changed.");
+    throw new WorkstreamStoreConflictError("The exact observed adoption lease changed.");
   if (!Value.Equal(current.owner, adoption.priorCoordinator))
-    throw new CanonicalStoreConflictError(
+    throw new WorkstreamStoreConflictError(
       "The observed adoption lease belongs to another coordinator.",
     );
   if (instantMillis(current.expiresAt) > nowMillis)
-    throw new CanonicalStoreConflictError("The exact observed adoption lease has not expired.");
+    throw new WorkstreamStoreConflictError("The exact observed adoption lease has not expired.");
 }
 
 function validateLeaseInput(
-  lease: CanonicalLease,
-): Effect.Effect<void, CanonicalStoreInvalidError> {
+  lease: WorkstreamLease,
+): Effect.Effect<void, WorkstreamStoreInvalidError> {
   return domainInvalid("validate lease", () => validateLease(lease));
 }
 
-function validateLease(lease: CanonicalLease): void {
+function validateLease(lease: WorkstreamLease): void {
   if (lease.token.length === 0 || !Value.Check(LeaseOwnerSchema, lease.owner))
-    throw new CanonicalStoreInvalidError("Canonical lease identity is malformed.");
+    throw new WorkstreamStoreInvalidError("Workstream lease identity is malformed.");
   for (const instant of [lease.acquiredAt, lease.heartbeatAt, lease.expiresAt])
     instantMillis(instant);
 }
 
 function instantMillis(value: string): number {
-  return canonicalInstantMillis(value, "lease");
+  return workstreamInstantMillis(value, "lease");
 }
 
-function canonicalInstantMillis(value: string, subject: string): number {
-  const parsed = DateTime.make(value);
-  if (Option.isNone(parsed) || DateTime.toDate(parsed.value).toISOString() !== value)
-    throw new CanonicalStoreInvalidError(
-      `Canonical ${subject} contains an invalid instant: ${value}.`,
+function workstreamInstantMillis(value: string, subject: string): number {
+  try {
+    return parseInstantMillis(value);
+  } catch {
+    throw new WorkstreamStoreInvalidError(
+      `Workstream ${subject} contains an invalid instant: ${value}.`,
     );
-  return DateTime.toDate(parsed.value).getTime();
+  }
 }
 
-function sameLease(left: CanonicalLease, right: CanonicalLease): boolean {
+function sameLease(left: WorkstreamLease, right: WorkstreamLease): boolean {
   return (
     sameLeaseHolder(left, right) &&
     left.acquiredAt === right.acquiredAt &&
@@ -1158,12 +1154,12 @@ function sameLease(left: CanonicalLease, right: CanonicalLease): boolean {
   );
 }
 
-function sameLeaseHolder(left: CanonicalLease, right: CanonicalLease): boolean {
+function sameLeaseHolder(left: WorkstreamLease, right: WorkstreamLease): boolean {
   return left.token === right.token && Value.Equal(left.owner, right.owner);
 }
 
-function leaseConflict(lease: CanonicalLease): CanonicalStoreConflictError {
-  return new CanonicalStoreConflictError(
+function leaseConflict(lease: WorkstreamLease): WorkstreamStoreConflictError {
+  return new WorkstreamStoreConflictError(
     `Session ${lease.owner.sessionId} does not hold this store's fenced lease.`,
   );
 }
@@ -1176,7 +1172,7 @@ function isoFromMillis(millis: number): string {
   return DateTime.toDate(DateTime.makeUnsafe(millis)).toISOString();
 }
 
-function inspect(path: string): Effect.Effect<StorageEntry, CanonicalStoreError> {
+function inspect(path: string): Effect.Effect<StorageEntry, WorkstreamStoreError> {
   return hostEffect("inspect storage entry without following links", () =>
     inspectStorageEntry(path),
   );
@@ -1185,7 +1181,7 @@ function inspect(path: string): Effect.Effect<StorageEntry, CanonicalStoreError>
 /** Contain the database and any journal/WAL sidecars to 0600 through Effect FileSystem. */
 function secureFiles(
   path: string,
-): Effect.Effect<void, CanonicalStoreError, FileSystem.FileSystem> {
+): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     for (const suffix of ["", "-journal", "-wal", "-shm"]) {
@@ -1201,44 +1197,44 @@ function modeLabel(mode: number): string {
   return `0${mode.toString(8).padStart(3, "0")}`;
 }
 
-function hostEffect<A>(operation: string, run: () => A): Effect.Effect<A, CanonicalStoreError> {
+function hostEffect<A>(operation: string, run: () => A): Effect.Effect<A, WorkstreamStoreError> {
   return Effect.try({ try: run, catch: (cause) => toStoreError(cause, operation) });
 }
 
 function platform<A, R>(
   operation: string,
   effect: Effect.Effect<A, PlatformError, R>,
-): Effect.Effect<A, CanonicalStoreError, R> {
-  return effect.pipe(Effect.mapError((cause) => new CanonicalStoreHostError(operation, cause)));
+): Effect.Effect<A, WorkstreamStoreError, R> {
+  return effect.pipe(Effect.mapError((cause) => new WorkstreamStoreHostError(operation, cause)));
 }
 
 function domainInvalid<A>(
   operation: string,
   run: () => A,
-): Effect.Effect<A, CanonicalStoreInvalidError> {
+): Effect.Effect<A, WorkstreamStoreInvalidError> {
   return Effect.try({
     try: run,
     catch: (cause) =>
-      cause instanceof CanonicalStoreInvalidError
+      cause instanceof WorkstreamStoreInvalidError
         ? cause
-        : new CanonicalStoreInvalidError(`${operation}: ${errorMessage(cause)}`),
+        : new WorkstreamStoreInvalidError(`${operation}: ${errorMessage(cause)}`),
   });
 }
 
-function invalid(message: string): Effect.Effect<never, CanonicalStoreInvalidError> {
-  return Effect.fail(new CanonicalStoreInvalidError(message));
+function invalid(message: string): Effect.Effect<never, WorkstreamStoreInvalidError> {
+  return Effect.fail(new WorkstreamStoreInvalidError(message));
 }
 
-function toStoreError(cause: unknown, operation: string): CanonicalStoreError {
+function toStoreError(cause: unknown, operation: string): WorkstreamStoreError {
   if (
-    cause instanceof CanonicalStoreInvalidError ||
-    cause instanceof CanonicalStoreIncompleteError ||
-    cause instanceof CanonicalStoreUnsupportedError ||
-    cause instanceof CanonicalStoreConflictError ||
-    cause instanceof CanonicalStoreHostError
+    cause instanceof WorkstreamStoreInvalidError ||
+    cause instanceof WorkstreamStoreIncompleteError ||
+    cause instanceof WorkstreamStoreUnsupportedError ||
+    cause instanceof WorkstreamStoreConflictError ||
+    cause instanceof WorkstreamStoreHostError
   )
     return cause;
-  return new CanonicalStoreHostError(operation, cause);
+  return new WorkstreamStoreHostError(operation, cause);
 }
 
 function errorMessage(cause: unknown): string {

@@ -1,103 +1,19 @@
-import { type Static, Type } from "typebox";
-import { decodeCommand } from "./canonical-commands.js";
-import {
-  type Attempt,
-  type CandidateLineage,
-  type ModelSelection,
-  ReviewSubjectSchema,
-  type Task,
-} from "./domain/workstream.js";
+import type { Attempt, ModelSelection, Task } from "../domain/workstream.js";
 import {
   configuredTarget,
   implementationTargets,
   type ModelPolicy,
   resolveSelection,
   type SelectionRequest,
-  SelectionRequestSchema,
-} from "./model-policy.js";
-
-const NonEmptyString = Type.String({ minLength: 1 });
-const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
-const TaskIdentity = { taskId: NonEmptyString };
-const Objective = { objective: NonEmptyString };
-
-export const CanonicalEnqueueCommandSchema = Type.Union([
-  Type.Object(
-    {
-      ...TaskIdentity,
-      ...Objective,
-      kind: Type.Literal("research"),
-      expectedEvidence: Type.Array(NonEmptyString, { minItems: 1 }),
-      selection: Type.Optional(SelectionRequestSchema),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      ...TaskIdentity,
-      ...Objective,
-      kind: Type.Literal("experiment"),
-      permittedEffects: Type.Array(NonEmptyString, { minItems: 1 }),
-      stopCondition: NonEmptyString,
-      expectedEvidence: Type.Array(NonEmptyString, { minItems: 1 }),
-      selection: Type.Optional(SelectionRequestSchema),
-      baseRevision: Type.Optional(Commit),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      ...TaskIdentity,
-      ...Objective,
-      kind: Type.Literal("implementation"),
-      acceptance: Type.Array(NonEmptyString, { minItems: 1 }),
-      useEscalationExecutor: Type.Optional(Type.Boolean()),
-      candidateOf: Type.Optional(NonEmptyString),
-      baseRevision: Type.Optional(Commit),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      ...TaskIdentity,
-      ...Objective,
-      kind: Type.Literal("review"),
-      subject: ReviewSubjectSchema,
-      concern: NonEmptyString,
-      selection: Type.Optional(SelectionRequestSchema),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      ...TaskIdentity,
-      ...Objective,
-      kind: Type.Literal("consultation"),
-      context: Type.Optional(Type.String({ maxLength: 20_000 })),
-      advisor: Type.Optional(NonEmptyString),
-    },
-    { additionalProperties: false },
-  ),
-]);
-export type CanonicalEnqueueCommand = Static<typeof CanonicalEnqueueCommandSchema>;
-
-export const CanonicalAppendCommandSchema = Type.Object(
-  {
-    taskId: NonEmptyString,
-    continuationOf: Type.Optional(NonEmptyString),
-    candidateOf: Type.Optional(NonEmptyString),
-    baseRevision: Type.Optional(Commit),
-    selection: Type.Optional(SelectionRequestSchema),
-    useEscalationExecutor: Type.Optional(Type.Boolean()),
-  },
-  { additionalProperties: false },
-);
-export type CanonicalAppendCommand = Static<typeof CanonicalAppendCommandSchema>;
-
-export interface ResolvedQueueFacts {
-  readonly baseRevision?: string;
-  readonly candidate?: CandidateLineage;
-}
+} from "../model-policy.js";
+import {
+  decodeCommand,
+  type ResolvedQueueFacts,
+  type WorkstreamAppendCommand,
+  WorkstreamAppendCommandSchema,
+  type WorkstreamEnqueueCommand,
+  WorkstreamEnqueueCommandSchema,
+} from "./commands.js";
 
 export interface EnqueuePlan {
   readonly taskId: string;
@@ -116,16 +32,16 @@ export interface AppendPlan {
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict enqueue schema decodes this external boundary value.
-export function decodeEnqueue(value: unknown): CanonicalEnqueueCommand {
+export function decodeEnqueue(value: unknown): WorkstreamEnqueueCommand {
   // SAFETY: strict schema validation in decodeCommand establishes the complete enqueue shape.
   return decodeCommand(
-    CanonicalEnqueueCommandSchema,
+    WorkstreamEnqueueCommandSchema,
     value,
-    "canonical enqueue command",
-  ) as CanonicalEnqueueCommand;
+    "workstream enqueue command",
+  ) as WorkstreamEnqueueCommand;
 }
 
-export function planEnqueue(command: CanonicalEnqueueCommand, policy: ModelPolicy): EnqueuePlan {
+export function planEnqueue(command: WorkstreamEnqueueCommand, policy: ModelPolicy): EnqueuePlan {
   const selections = taskSelections(command, policy);
   return {
     taskId: command.taskId,
@@ -133,7 +49,7 @@ export function planEnqueue(command: CanonicalEnqueueCommand, policy: ModelPolic
     materialize: (attemptIds, now, intentIndex, facts) => {
       if (attemptIds.length !== selections.length)
         throw new Error(
-          "Canonical Task materialization requires one identity per resolved Attempt.",
+          "Workstream Task materialization requires one identity per resolved Attempt.",
         );
       const attempts = selections.map((selection, index) =>
         queuedAttempt(exactId(attemptIds, index), selection, now, facts),
@@ -144,17 +60,17 @@ export function planEnqueue(command: CanonicalEnqueueCommand, policy: ModelPolic
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict append schema decodes this external boundary value.
-export function decodeAppend(value: unknown): CanonicalAppendCommand {
+export function decodeAppend(value: unknown): WorkstreamAppendCommand {
   // SAFETY: strict schema validation in decodeCommand establishes the complete append shape.
   return decodeCommand(
-    CanonicalAppendCommandSchema,
+    WorkstreamAppendCommandSchema,
     value,
-    "canonical append command",
-  ) as CanonicalAppendCommand;
+    "workstream append command",
+  ) as WorkstreamAppendCommand;
 }
 
 export function planAppend(
-  command: CanonicalAppendCommand,
+  command: WorkstreamAppendCommand,
   task: Task,
   policy: ModelPolicy,
 ): AppendPlan {
@@ -165,7 +81,7 @@ export function planAppend(
     attemptCount: selections.length,
     materialize: (attemptIds, now, facts) => {
       if (attemptIds.length !== selections.length)
-        throw new Error("Canonical Attempt append requires one identity per resolved selection.");
+        throw new Error("Workstream Attempt append requires one identity per resolved selection.");
       return selections.map((selection, index) => {
         const continuation = index === 0 ? command.continuationOf : undefined;
         return queuedAttempt(
@@ -180,7 +96,7 @@ export function planAppend(
 }
 
 function taskSelections(
-  command: CanonicalEnqueueCommand,
+  command: WorkstreamEnqueueCommand,
   policy: ModelPolicy,
 ): readonly ModelSelection[] {
   switch (command.kind) {
@@ -197,7 +113,7 @@ function taskSelections(
 }
 
 function appendSelections(
-  command: CanonicalAppendCommand,
+  command: WorkstreamAppendCommand,
   task: Task,
   policy: ModelPolicy,
 ): readonly ModelSelection[] {
@@ -264,8 +180,8 @@ function implementationSelection(policy: ModelPolicy, escalated: boolean): Model
 }
 
 function rejectAppendFields(
-  command: CanonicalAppendCommand,
-  fields: readonly (keyof CanonicalAppendCommand)[],
+  command: WorkstreamAppendCommand,
+  fields: readonly (keyof WorkstreamAppendCommand)[],
   kind: Task["kind"],
 ): void {
   for (const field of fields)
@@ -293,7 +209,7 @@ function queuedAttempt(
 }
 
 function taskFor(
-  command: CanonicalEnqueueCommand,
+  command: WorkstreamEnqueueCommand,
   id: string,
   attempts: Attempt[],
   now: string,
@@ -329,6 +245,6 @@ function taskFor(
 
 function exactId(ids: readonly string[], index: number): string {
   const id = ids[index];
-  if (id === undefined) throw new Error("Canonical Attempt identity is missing.");
+  if (id === undefined) throw new Error("Workstream Attempt identity is missing.");
   return id;
 }

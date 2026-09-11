@@ -1,5 +1,5 @@
 /**
- * Canonical transient reconciliation scheduler. It consumes one pure
+ * Workstream transient reconciliation scheduler. It consumes one pure
  * `FrontierEntry` at a time and hands it, plus an exact-key runtime-owned
  * `ReconciliationControl`, to the injected driver (the driver owns external effects).
  * Attachment, manual reconcile, and committed affected-key notifications are
@@ -26,13 +26,6 @@ import {
   Ref,
   Semaphore,
 } from "effect";
-import {
-  applyAffectedKeys,
-  classifyWorkstream,
-  FRONTIER_KIND_ORDER,
-  type FrontierEntry,
-  WORKER_POLL_INTERVAL_MILLIS,
-} from "./canonical-frontier.js";
 import type {
   Attempt,
   AttemptKey,
@@ -44,7 +37,14 @@ import type {
   TerminalObservation,
   WorkerExecution,
   Workstream,
-} from "./domain/workstream.js";
+} from "../domain/workstream.js";
+import {
+  applyAffectedKeys,
+  classifyWorkstream,
+  FRONTIER_KIND_ORDER,
+  type FrontierEntry,
+  WORKER_POLL_INTERVAL_MILLIS,
+} from "./frontier.js";
 
 export type ResolvedReviewInput = Readonly<
   | { kind: "revision"; revision: string }
@@ -64,7 +64,7 @@ export interface ReconciliationContext {
   readonly intent: Readonly<{ index: number; value: Workstream["intents"][number] }>;
   readonly task: Readonly<TaskContract>;
   readonly attempt: Readonly<Attempt>;
-  /** Present only for review Tasks; references are resolved to canonical content. */
+  /** Present only for review Tasks; references are resolved to workstream content. */
   readonly reviewInput?: ResolvedReviewInput;
   /** Session trajectory resolved from `continuationOf`, when the parent exists. */
   readonly continuationSessionFile?: string;
@@ -88,7 +88,7 @@ export type ReconciliationMutation = Readonly<
   | { kind: "record_delivery_success" }
 >;
 
-export interface ReconciliationCommitReceipt {
+interface ReconciliationCommitReceipt {
   readonly key: AttemptKey;
   readonly revision: number;
   readonly context: ReconciliationContext;
@@ -126,7 +126,7 @@ export type ReconciliationOutcome =
   | { readonly kind: "waiting" }
   | { readonly kind: "blocked"; readonly detail: string };
 
-/** Narrow canonical port: one immutable entry plus its exact-key control. */
+/** Narrow workstream port: one immutable entry plus its exact-key control. */
 export interface ReconciliationDriver {
   readonly reconcile: (
     entry: FrontierEntry,

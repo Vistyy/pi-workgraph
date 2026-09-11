@@ -11,8 +11,8 @@ const NOTEPAD_STATE_ENTRY = "pi-workgraph-coordinator-notepad-state";
 const NOTEPAD_PREFIX = "[WORKGRAPH PENDING ITEMS]";
 
 type SessionOwner = Pick<HumanInputReceiptData, "sessionId" | "sessionFile">;
-export type PendingItem = { id: string; text: string };
-export type CoordinatorNotepadState = { version: 2; items: PendingItem[] };
+type PendingItem = { id: string; text: string };
+type CoordinatorNotepadState = { version: 2; items: PendingItem[] };
 
 const PendingItemSchema = Type.Object(
   { id: Type.String({ minLength: 1 }), text: Type.String({ minLength: 1 }) },
@@ -31,7 +31,6 @@ const NotepadRequestSchema = Type.Object({
 type InstallOptions = {
   owner(ctx: ExtensionContext): SessionOwner;
   serialize<T>(run: () => Promise<T>): Promise<T>;
-  onHumanInput?(receipt: HumanInputReceiptData): Promise<void>;
 };
 
 export type CoordinatorSessionState = {
@@ -88,7 +87,7 @@ export function installCoordinatorSessionState(
       };
       pi.appendEntry(HUMAN_INPUT_ENTRY, receipt);
       receipts.push(receipt);
-      return Promise.resolve(options.onHumanInput?.(receipt)).then(() => undefined);
+      return Promise.resolve();
     });
   });
 

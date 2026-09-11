@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/any-unknown-in-error-context -- Pi callbacks are the sole Promise facade over canonical Effects whose independently typed failures converge at this host boundary. */
+/* oxlint-disable effecttsgo/any-unknown-in-error-context -- Pi callbacks are the sole Promise facade over workstream Effects whose independently typed failures converge at this host boundary. */
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- The in-scope factory reads one immutable packaged instruction asset before registering its lifecycle hooks.
 import { readFileSync } from "node:fs";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -7,16 +7,16 @@ import { Data, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { installCalmMode, isCoordinatorScope } from "../src/calm.js";
-import { NonBlankReasonSchema } from "../src/canonical-commands.js";
+import { NonBlankReasonSchema } from "../src/coordination/commands.js";
 import {
-  CANONICAL_POINTER_ENTRY,
-  CanonicalCoordinatorController,
-  type CanonicalCoordinatorControllerOptions,
-  type CanonicalPointerRestoration,
-  CanonicalWorkstreamPointerSchema,
-} from "../src/canonical-coordinator-controller.js";
-import { CanonicalInspectionRequestSchema } from "../src/canonical-inspection.js";
-import type { CanonicalRuntime } from "../src/canonical-runtime.js";
+  WORKSTREAM_POINTER_ENTRY,
+  WorkstreamCoordinatorController,
+  type WorkstreamCoordinatorControllerOptions,
+  type WorkstreamPointerRestoration,
+  WorkstreamPointerSchema,
+} from "../src/coordination/controller.js";
+import { WorkstreamInspectionRequestSchema } from "../src/coordination/inspection.js";
+import type { WorkstreamRuntime } from "../src/coordination/runtime.js";
 import { installCoordinatorSessionState } from "../src/coordinator-notepad.js";
 import type { HandoffGrant, HumanInputReceiptData } from "../src/domain/workstream.js";
 import {
@@ -182,9 +182,9 @@ const CompleteSchema = Type.Object(
   { additionalProperties: false },
 );
 
-export default function canonicalCoordinator(
+export default function workstreamCoordinator(
   pi: ExtensionAPI,
-  options: CanonicalCoordinatorControllerOptions = {},
+  options: WorkstreamCoordinatorControllerOptions = {},
 ): void {
   if (!isCoordinatorScope(process.env)) return;
   const guidance = readFileSync(new URL("../COORDINATOR.md", import.meta.url), "utf8").trim();
@@ -207,10 +207,10 @@ export default function canonicalCoordinator(
       ctx.ui.setStatus("workgraph", `WG ${state.lifecycle} - ${active} active`);
       calm.setActiveWorkers(active);
     } catch {
-      // Presentation is best-effort and cannot alter canonical commit or lease state.
+      // Presentation is best-effort and cannot alter workstream commit or lease state.
     }
   };
-  const controller = new CanonicalCoordinatorController(pi, options, publish);
+  const controller = new WorkstreamCoordinatorController(pi, options, publish);
   let sessionTail = Promise.resolve();
   const session = installCoordinatorSessionState(pi, {
     owner: (ctx) => controller.owner(ctx),
@@ -247,13 +247,13 @@ export default function canonicalCoordinator(
     content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
     details: value,
   });
-  const pointer = (ctx: ExtensionContext): CanonicalPointerRestoration => {
+  const pointer = (ctx: ExtensionContext): WorkstreamPointerRestoration => {
     const entry = ctx.sessionManager
       .getBranch()
-      .findLast((item) => item.type === "custom" && item.customType === CANONICAL_POINTER_ENTRY);
+      .findLast((item) => item.type === "custom" && item.customType === WORKSTREAM_POINTER_ENTRY);
     if (entry?.type !== "custom") return undefined;
-    return Value.Check(CanonicalWorkstreamPointerSchema, entry.data)
-      ? Value.Decode(CanonicalWorkstreamPointerSchema, entry.data)
+    return Value.Check(WorkstreamPointerSchema, entry.data)
+      ? Value.Decode(WorkstreamPointerSchema, entry.data)
       : "malformed";
   };
 
@@ -270,10 +270,7 @@ export default function canonicalCoordinator(
         yield* triggerHandoffKickoff(pi, ctx, grant);
       }).pipe(Effect.onError(() => controller.close(ctx).pipe(Effect.ignore))),
     ).catch((error) => {
-      ctx.ui.notify(
-        `Canonical Workstream reattachment skipped: ${publicMessage(error)}`,
-        "warning",
-      );
+      ctx.ui.notify(`Workstream reattachment skipped: ${publicMessage(error)}`, "warning");
     }),
   );
   pi.on("session_shutdown", (_event, ctx) => run(controller.close(ctx)));
@@ -287,7 +284,7 @@ export default function canonicalCoordinator(
     name: "workgraph_models",
     label: "Workgraph Models",
     description:
-      "List the exact configured canonical model targets for a selectable read-only role.",
+      "List the exact configured workstream model targets for a selectable read-only role.",
     promptSnippet: "Inspect configured Workgraph model targets",
     parameters: Type.Object(
       { role: StringEnum(MODEL_LIST_ROLES) },
@@ -310,7 +307,7 @@ export default function canonicalCoordinator(
     name: "workgraph_intent",
     label: "Workgraph Intent",
     description:
-      "Create or revise the canonical Intent from an exact genuine current-session receipt; initial creation fixes the repository.",
+      "Create or revise the workstream Intent from an exact genuine current-session receipt; initial creation fixes the repository.",
     parameters: IntentSchema,
     execute(_id, params, signal, _update, ctx) {
       return run(
@@ -348,7 +345,7 @@ export default function canonicalCoordinator(
     name: "workgraph_research",
     label: "Workgraph Research",
     description:
-      "Create one frozen canonical research or bounded disposable-experiment Task and its initial Attempt selection.",
+      "Create one frozen workstream research or bounded disposable-experiment Task and its initial Attempt selection.",
     promptSnippet: "Delegate research or a bounded experiment",
     parameters: ResearchSchema,
     execute(_id, params, signal) {
@@ -435,7 +432,7 @@ export default function canonicalCoordinator(
     name: "workgraph_review",
     label: "Workgraph Review",
     description:
-      "Create one frozen canonical review Task for exact retained result, artifact, comparison, or revision evidence.",
+      "Create one frozen workstream review Task for exact retained result, artifact, comparison, or revision evidence.",
     promptSnippet: "Delegate selective review",
     parameters: ReviewSchema,
     execute(_id, params, signal) {
@@ -461,7 +458,7 @@ export default function canonicalCoordinator(
     name: "workgraph_attempt",
     label: "Workgraph Attempt",
     description:
-      "Append canonical Attempt(s) to one exact frozen current-Intent Task after all prior Attempts are operationally stable.",
+      "Append workstream Attempt(s) to one exact frozen current-Intent Task after all prior Attempts are operationally stable.",
     parameters: AttemptSchema,
     execute(_id, params, signal) {
       return run(
@@ -486,9 +483,9 @@ export default function canonicalCoordinator(
     name: "workgraph_inspect",
     label: "Workgraph Inspect",
     description:
-      "Return one bounded typed canonical inspection section using exact handles and an opaque revision-bound cursor.",
-    promptSnippet: "Inspect canonical Workgraph state and retained evidence",
-    parameters: CanonicalInspectionRequestSchema,
+      "Return one bounded typed workstream inspection section using exact handles and an opaque revision-bound cursor.",
+    promptSnippet: "Inspect workstream Workgraph state and retained evidence",
+    parameters: WorkstreamInspectionRequestSchema,
     execute(_id, params, signal) {
       return run(Effect.map(controller.inspect(params), toolResult), signal);
     },
@@ -497,7 +494,7 @@ export default function canonicalCoordinator(
     name: "workgraph_control",
     label: "Workgraph Control",
     description:
-      "Suspend, resume, cancel, steer, apply, or release output through exact canonical command and lease boundaries.",
+      "Suspend, resume, cancel, steer, apply, or release output through exact workstream command and lease boundaries.",
     parameters: ControlSchema,
     execute(_id, params, signal) {
       return run(
@@ -516,7 +513,7 @@ export default function canonicalCoordinator(
     name: "workgraph_adopt",
     label: "Workgraph Adopt",
     description:
-      "Discover an exact canonical state path and attach it, transferring only after exact prior-coordinator Herdr death proof.",
+      "Discover an exact workstream state path and attach it, transferring only after exact prior-coordinator Herdr death proof.",
     parameters: Type.Object({ statePath: NonEmpty }, { additionalProperties: false }),
     execute(_id, params, signal, _update, ctx) {
       return run(Effect.map(controller.adopt(ctx, params.statePath), toolResult), signal);
@@ -526,7 +523,7 @@ export default function canonicalCoordinator(
     name: "workgraph_complete",
     label: "Workgraph Complete",
     description:
-      "Record the coordinator's goal evidence and limitations only after canonical operational accounting permits completion.",
+      "Record the coordinator's goal evidence and limitations only after workstream operational accounting permits completion.",
     parameters: CompleteSchema,
     execute(_id, params, signal) {
       return run(
@@ -557,7 +554,7 @@ function intentRequest(params: Static<typeof IntentSchema>): {
     : { ...base, targetRepository: params.targetRepository };
 }
 
-function controlOperation(runtime: CanonicalRuntime, params: Static<typeof ControlSchema>) {
+function controlOperation(runtime: WorkstreamRuntime, params: Static<typeof ControlSchema>) {
   switch (params.action) {
     case "suspend":
       return runtime.suspend({ reason: params.reason });
@@ -578,9 +575,9 @@ function controlOperation(runtime: CanonicalRuntime, params: Static<typeof Contr
 }
 
 function action<Error>(
-  controller: CanonicalCoordinatorController,
+  controller: WorkstreamCoordinatorController,
   operation: (
-    runtime: CanonicalRuntime,
+    runtime: WorkstreamRuntime,
   ) => Effect.Effect<
     import("../src/domain/workstream.js").Workstream,
     Error,
@@ -611,14 +608,14 @@ function reviewSubject(subject: Static<typeof PublicReviewSubjectSchema>) {
   }
 }
 
-function validateChildPointer(pointer: CanonicalPointerRestoration, grant: HandoffGrant): void {
+function validateChildPointer(pointer: WorkstreamPointerRestoration, grant: HandoffGrant): void {
   if (
     pointer === "malformed" ||
     pointer === undefined ||
     pointer.workstreamId !== handoffChildWorkstreamId(grant.id) ||
     !Value.Equal(pointer.repository, grant.targetRepository)
   )
-    throw new Error("Retained canonical pointer conflicts with the child Handoff Grant.");
+    throw new Error("Retained workstream pointer conflicts with the child Handoff Grant.");
 }
 
 function triggerHandoffKickoff(

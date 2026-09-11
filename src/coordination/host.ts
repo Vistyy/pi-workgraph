@@ -3,24 +3,10 @@
  * The reconciliation driver remains free of aggregate, store, and frontier state.
  */
 import { Effect, Path } from "effect";
-import { CanonicalCommandError, type CanonicalCommandPorts } from "./canonical-commands.js";
-import type {
-  CanonicalDeliveryPort,
-  CanonicalGitPort,
-  CanonicalReconciliationPorts,
-  CanonicalSessionPort,
-  CanonicalWorkerPort,
-} from "./canonical-driver.js";
-import { makeCanonicalReconciliationDriver } from "./canonical-driver.js";
-import {
-  ReconciliationControlError,
-  type ReconciliationDriver,
-  ReconciliationDriverError,
-} from "./canonical-reconciliation.js";
-import type { RepositoryIdentity } from "./domain/workstream.js";
-import type { GitRepository, WorktreePlacement } from "./git.js";
-import type { HerdrCliRuntime } from "./herdr.js";
-import { WorkerLaunchError } from "./herdr-launch.js";
+import type { RepositoryIdentity } from "../domain/workstream.js";
+import type { GitRepository, WorktreePlacement } from "../git.js";
+import type { HerdrCliRuntime } from "../herdr.js";
+import { WorkerLaunchError } from "../herdr-launch.js";
 import {
   createWorkerSessionEffect,
   effectiveModelObservations,
@@ -30,9 +16,23 @@ import {
   observeNativeFailure,
   readWorkerText,
   readWorkgraphReportResult,
-} from "./pi-process.js";
+} from "../pi-process.js";
+import { WorkstreamCommandError, type WorkstreamCommandPorts } from "./commands.js";
+import type {
+  WorkstreamDeliveryPort,
+  WorkstreamGitPort,
+  WorkstreamReconciliationPorts,
+  WorkstreamSessionPort,
+  WorkstreamWorkerPort,
+} from "./driver.js";
+import { makeWorkstreamReconciliationDriver } from "./driver.js";
+import {
+  ReconciliationControlError,
+  type ReconciliationDriver,
+  ReconciliationDriverError,
+} from "./reconciliation.js";
 
-export function liveGitPort(git: GitRepository): CanonicalGitPort {
+export function liveGitPort(git: GitRepository): WorkstreamGitPort {
   return {
     projectRoot: git.root,
     gitCommonDir: git.commonDir,
@@ -64,7 +64,7 @@ export function liveGitPort(git: GitRepository): CanonicalGitPort {
   };
 }
 
-function liveWorkerPort(workers: HerdrCliRuntime, workspaceId: string): CanonicalWorkerPort {
+function liveWorkerPort(workers: HerdrCliRuntime, workspaceId: string): WorkstreamWorkerPort {
   return {
     workspaceId,
     launch: (request) =>
@@ -105,7 +105,7 @@ function liveWorkerPort(workers: HerdrCliRuntime, workspaceId: string): Canonica
   };
 }
 
-function liveSessionPort(repository: RepositoryIdentity): CanonicalSessionPort {
+function liveSessionPort(repository: RepositoryIdentity): WorkstreamSessionPort {
   return {
     sessionDirectory: (runId) =>
       Effect.map(Path.Path, (path) =>
@@ -126,10 +126,10 @@ function liveSessionPort(repository: RepositoryIdentity): CanonicalSessionPort {
   };
 }
 
-export function liveCanonicalCommandPorts(
+export function liveWorkstreamCommandPorts(
   git: GitRepository,
   workers: HerdrCliRuntime,
-): CanonicalCommandPorts {
+): WorkstreamCommandPorts {
   return {
     git: {
       resolveRevision: (revision) =>
@@ -174,33 +174,33 @@ export function liveCanonicalCommandPorts(
 function commandHostEffect<A, E extends { readonly message: string }, R>(
   operation: string,
   effect: Effect.Effect<A, E, R>,
-): Effect.Effect<A, CanonicalCommandError, R> {
+): Effect.Effect<A, WorkstreamCommandError, R> {
   return effect.pipe(
     Effect.mapError(
-      (cause) => new CanonicalCommandError({ operation, message: cause.message, cause }),
+      (cause) => new WorkstreamCommandError({ operation, message: cause.message, cause }),
     ),
   );
 }
 
-export interface CanonicalHostOptions {
+export interface WorkstreamHostOptions {
   readonly repository: RepositoryIdentity;
   readonly workspaceId: string;
   readonly git: GitRepository;
   readonly workers: HerdrCliRuntime;
-  readonly delivery: CanonicalDeliveryPort;
+  readonly delivery: WorkstreamDeliveryPort;
   /** Host-only configuration injected into the pure driver; defaults to the host process. */
   readonly codingAgentDir?: string;
   /** Test seam: replace any narrow port while keeping the rest live. */
-  readonly overrides?: Partial<CanonicalReconciliationPorts>;
+  readonly overrides?: Partial<WorkstreamReconciliationPorts>;
 }
 
 /** One production-usable driver over the existing host adapters. */
-export function makeLiveCanonicalReconciliationDriver(
-  options: CanonicalHostOptions,
+export function makeLiveWorkstreamReconciliationDriver(
+  options: WorkstreamHostOptions,
 ): ReconciliationDriver {
   const { PI_CODING_AGENT_DIR: hostCodingAgentDir } = process.env;
   const codingAgentDir = options.codingAgentDir ?? hostCodingAgentDir;
-  const ports: CanonicalReconciliationPorts = {
+  const ports: WorkstreamReconciliationPorts = {
     git: liveGitPort(options.git),
     workers: liveWorkerPort(options.workers, options.workspaceId),
     sessions: liveSessionPort(options.repository),
@@ -208,7 +208,7 @@ export function makeLiveCanonicalReconciliationDriver(
     host: codingAgentDir === undefined ? {} : { codingAgentDir },
     ...options.overrides,
   };
-  return makeCanonicalReconciliationDriver(ports);
+  return makeWorkstreamReconciliationDriver(ports);
 }
 
 function hostFailure(

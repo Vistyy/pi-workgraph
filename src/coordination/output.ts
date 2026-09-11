@@ -1,25 +1,25 @@
 import { Effect } from "effect";
 import {
-  type ApplyCommand,
-  ApplyCommandSchema,
-  type CanonicalCommandError,
-  type CanonicalCommandPorts,
-  commandFailure,
-  decodeCommandEffect,
-  exactAttempt,
-  exactAttemptEffect,
-  type ReleaseOutputCommand,
-  ReleaseOutputCommandSchema,
-} from "./canonical-commands.js";
-import {
   changedImplementationCommit,
   checkpointApplication,
   checkpointCleanup,
   checkpointOutputRelease,
   type Placement,
   type Workstream,
-} from "./domain/workstream.js";
-import type { CandidateApplicationSource, WorktreePlacement } from "./git.js";
+} from "../domain/workstream.js";
+import type { CandidateApplicationSource, WorktreePlacement } from "../git.js";
+import {
+  type ApplyCommand,
+  ApplyCommandSchema,
+  commandFailure,
+  decodeCommandEffect,
+  exactAttempt,
+  exactAttemptEffect,
+  type ReleaseOutputCommand,
+  ReleaseOutputCommandSchema,
+  type WorkstreamCommandError,
+  type WorkstreamCommandPorts,
+} from "./commands.js";
 
 export interface MaintainedOutputControl<E, R> {
   readonly state: Effect.Effect<Workstream, E, R>;
@@ -30,14 +30,14 @@ export interface MaintainedOutputControl<E, R> {
   ) => Effect.Effect<Workstream, E, R>;
   readonly fence: Effect.Effect<void, E, R>;
   readonly now: Effect.Effect<string, never, R>;
-  readonly ports: CanonicalCommandPorts;
+  readonly ports: WorkstreamCommandPorts;
 }
 
 export function applyMaintainedOutput<E, R>(
   control: MaintainedOutputControl<E, R>,
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict application schema owns this external command boundary.
   value: unknown,
-): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
+): Effect.Effect<Workstream, E | WorkstreamCommandError, R> {
   return Effect.gen(function* () {
     const input = yield* decodeCommandEffect<ApplyCommand>(
       ApplyCommandSchema,
@@ -104,7 +104,7 @@ function resumeApplication<E, R>(
   attemptId: string,
   source: CandidateApplicationSource,
   destination: { readonly expectedRef: string; readonly expectedHead: string },
-): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
+): Effect.Effect<Workstream, E | WorkstreamCommandError, R> {
   return Effect.gen(function* () {
     const recovered = yield* Effect.result(
       control.ports.git.recoverCandidateApplication(destination, source),
@@ -147,8 +147,8 @@ function failApplication<E, R>(
   attemptId: string,
   source: CandidateApplicationSource,
   destination: { readonly expectedRef: string; readonly expectedHead: string },
-  failure: CanonicalCommandError,
-): Effect.Effect<never, E | CanonicalCommandError, R> {
+  failure: WorkstreamCommandError,
+): Effect.Effect<never, E | WorkstreamCommandError, R> {
   return Effect.gen(function* () {
     const classification = yield* Effect.result(
       control.ports.git.recoverCandidateApplication(destination, source),
@@ -165,7 +165,7 @@ export function releaseMaintainedOutput<E, R>(
   control: MaintainedOutputControl<E, R>,
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict release schema owns this external command boundary.
   value: unknown,
-): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
+): Effect.Effect<Workstream, E | WorkstreamCommandError, R> {
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: every branch preserves one destructive-release fence or durable checkpoint.
   return Effect.gen(function* () {
     const input = yield* decodeCommandEffect<ReleaseOutputCommand>(
@@ -261,7 +261,7 @@ function completeReleasedCleanup<E, R>(
   key: ReturnType<typeof exactAttempt>["key"],
   expectedHead: string,
   completedAt?: string,
-): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
+): Effect.Effect<Workstream, E | WorkstreamCommandError, R> {
   return Effect.gen(function* () {
     if (exactAttempt(state, key.attemptId).attempt.cleanup?.state === "completed") return state;
     const now = completedAt ?? (yield* control.now);
@@ -279,7 +279,7 @@ function completeReleasedCleanup<E, R>(
 function sourceFor<E, R>(
   control: MaintainedOutputControl<E, R>,
   attempt: ReturnType<typeof exactAttempt>["attempt"],
-): Effect.Effect<CandidateApplicationSource, CanonicalCommandError, R> {
+): Effect.Effect<CandidateApplicationSource, WorkstreamCommandError, R> {
   return Effect.gen(function* () {
     const commit = changedImplementationCommit(attempt);
     const candidate = attempt.candidate;
@@ -304,7 +304,7 @@ function sourceFor<E, R>(
     if (validated.commit !== commit || validated.rootCommit !== candidate.rootCommit)
       return yield* failure(
         "apply candidate",
-        "Validated candidate differs from canonical lineage.",
+        "Validated candidate differs from workstream lineage.",
       );
     return {
       rootCommit: validated.rootCommit,
@@ -319,7 +319,7 @@ function appliedCheckpoint<E, R>(
   state: Workstream,
   attemptId: string,
   revision: string,
-): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
+): Effect.Effect<Workstream, E | WorkstreamCommandError, R> {
   return Effect.gen(function* () {
     const located = yield* locate(state, attemptId);
     const application = located.attempt.application;
@@ -338,7 +338,7 @@ function blockedApplication<E, R>(
   state: Workstream,
   attemptId: string,
   error: string,
-): Effect.Effect<Workstream, E | CanonicalCommandError, R> {
+): Effect.Effect<Workstream, E | WorkstreamCommandError, R> {
   return Effect.gen(function* () {
     const located = yield* locate(state, attemptId);
     const application = located.attempt.application;
@@ -365,10 +365,10 @@ function placementFor(
 function locate(
   state: Workstream,
   id: string,
-): Effect.Effect<ReturnType<typeof exactAttempt>, CanonicalCommandError> {
+): Effect.Effect<ReturnType<typeof exactAttempt>, WorkstreamCommandError> {
   return exactAttemptEffect(state, id);
 }
 
-function failure(operation: string, message: string, cause?: unknown): CanonicalCommandError {
+function failure(operation: string, message: string, cause?: unknown): WorkstreamCommandError {
   return commandFailure(operation, message, cause);
 }

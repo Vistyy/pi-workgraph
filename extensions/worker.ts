@@ -2,13 +2,15 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 import { Config, ConfigProvider, Data, DateTime, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { ThinkingSchema } from "../src/model-policy.js";
+import { ThinkingSchema } from "../src/domain/model-target.js";
 import {
-  type ImplementationReport,
+  type ImplementationReportInput,
   isWorkerReport,
+  isWorkerReportInput,
   reportSchemaForMode,
   type WorkerMode,
   type WorkerReport,
+  type WorkerReportInput,
   type WorkerSessionMode,
 } from "../src/report-schema.js";
 import {
@@ -566,7 +568,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       "Use workgraph_report as the final action. Choose the status that matches the actual outcome; report failures as failed rather than implying completion, and include actual evidence and explicit limitations.",
     ],
     parameters: reportSchemaForMode(mode),
-    execute(_id, params: WorkerReport, _signal, _update, ctx) {
+    execute(_id, params: WorkerReportInput, _signal, _update, ctx) {
       return Effect.runPromise(
         Effect.gen(function* () {
           const result = yield* handleWorkerReport(pi, ctx.cwd, params, {
@@ -974,11 +976,11 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
 function handleWorkerReport(
   pi: ExtensionAPI,
   cwd: string,
-  params: WorkerReport,
+  params: WorkerReportInput,
   execution: WorkerReportExecutionState,
 ) {
   return Effect.gen(function* () {
-    if (!isWorkerReport(params) || params.kind !== execution.mode)
+    if (!isWorkerReportInput(params) || params.kind !== execution.mode)
       return yield* contractFailure(`Report must satisfy the ${execution.mode} contract.`);
     if (params.kind !== "implementation" || params.status !== "completed") {
       // Read-only is an instruction and authority boundary, not a filesystem sandbox.
@@ -1002,7 +1004,7 @@ function handleWorkerReport(
 function noChangeImplementationReport(
   pi: ExtensionAPI,
   cwd: string,
-  report: Extract<ImplementationReport, { outcome: "no_change" }>,
+  report: Extract<ImplementationReportInput, { outcome: "no_change" }>,
   execution: WorkerReportExecutionState,
 ) {
   return Effect.gen(function* () {
@@ -1030,7 +1032,7 @@ function noChangeImplementationReport(
 function changedImplementationReport(
   pi: ExtensionAPI,
   cwd: string,
-  report: Extract<ImplementationReport, { outcome: "changed" }>,
+  report: Extract<ImplementationReportInput, { outcome: "changed" }>,
   execution: WorkerReportExecutionState,
 ) {
   return Effect.gen(function* () {

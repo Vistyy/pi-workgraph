@@ -291,7 +291,7 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
       agentDir: join(f.parent, "agent"),
       settingsManager: settings,
       additionalExtensionPaths: [
-        resolve("extensions/canonical-coordinator.ts"),
+        resolve("extensions/coordinator.ts"),
         resolve("extensions/worker.ts"),
       ],
       noContextFiles: true,
@@ -632,7 +632,7 @@ void test("real Pi coordinator preserves the provider prefix across agent starts
       cwd: f.root,
       agentDir: join(f.parent, "agent"),
       settingsManager: settings,
-      additionalExtensionPaths: [resolve("extensions/canonical-coordinator.ts")],
+      additionalExtensionPaths: [resolve("extensions/coordinator.ts")],
       noContextFiles: true,
       noPromptTemplates: true,
       noSkills: true,

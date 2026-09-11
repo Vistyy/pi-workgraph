@@ -25,18 +25,17 @@ import {
   deliveryRetryDelayMillis,
   type FrontierEntry,
   WORKER_POLL_INTERVAL_MILLIS,
-} from "../src/canonical-frontier.js";
+} from "../src/coordination/frontier.js";
 import {
   type ReconciliationContext,
   type ReconciliationDriver,
   ReconciliationDriverError,
-} from "../src/canonical-reconciliation.js";
+} from "../src/coordination/reconciliation.js";
 import {
-  CanonicalRuntime,
-  type CanonicalRuntimeAcquisition,
-  type CanonicalRuntimeError,
-} from "../src/canonical-runtime.js";
-import { CanonicalWorkstreamStore } from "../src/canonical-workstream-store.js";
+  WorkstreamRuntime,
+  type WorkstreamRuntimeAcquisition,
+  type WorkstreamRuntimeError,
+} from "../src/coordination/runtime.js";
 import {
   type Attempt,
   type AttemptKey,
@@ -62,6 +61,7 @@ import {
 } from "../src/domain/workstream.js";
 import type { ModelPolicy } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
+import { WorkstreamStore } from "../src/storage/workstream-store.js";
 
 const T0 = "2024-01-01T00:00:00.000Z";
 const T1 = "2024-01-01T00:00:01.000Z";
@@ -148,6 +148,7 @@ function reported(implementation = false): TerminalObservation {
         kind: "implementation" as const,
         outcome: "changed" as const,
         commit: CHANGED,
+        changedFiles: ["change.txt"],
         summary: "Changed.",
       }
     : { ...base, kind: "research" as const, summary: "Reported." };
@@ -410,7 +411,7 @@ async function withFixture(run: (f: Fixture) => Promise<void>): Promise<void> {
   }
 }
 
-function runCanonical<A, E>(
+function runWorkstream<A, E>(
   program: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path | Scope.Scope>,
   clock?: Clock.Clock,
 ): Promise<A> {
@@ -434,17 +435,15 @@ const freshWorkstream = (f: Fixture) =>
     createdAt: T0,
   });
 const createStore = (state: Workstream) =>
-  CanonicalWorkstreamStore.create(state).pipe(Effect.map((attachment) => attachment.store));
+  WorkstreamStore.create(state).pipe(Effect.map((attachment) => attachment.store));
 const openStore = (f: Fixture) =>
-  CanonicalWorkstreamStore.open(ID, f.repository).pipe(
-    Effect.map((attachment) => attachment.store),
-  );
+  WorkstreamStore.open(ID, f.repository).pipe(Effect.map((attachment) => attachment.store));
 const acquire = (
   f: Fixture,
   driver: ReconciliationDriver,
-  extra: Partial<CanonicalRuntimeAcquisition> = {},
+  extra: Partial<WorkstreamRuntimeAcquisition> = {},
 ) =>
-  CanonicalRuntime.acquire({
+  WorkstreamRuntime.acquire({
     id: ID,
     repository: f.repository,
     coordinator: COORDINATOR,
@@ -461,7 +460,7 @@ const waitFor = (condition: Effect.Effect<boolean>): Effect.Effect<Option.Option
     while (!(yield* condition)) yield* Effect.sleep("5 millis");
   }).pipe(Effect.timeoutOption("3 seconds"));
 const expectSome = (option: Option.Option<unknown>) => assert.equal(Option.isSome(option), true);
-const awaitKind = (runtime: CanonicalRuntime, kind: string, attemptId: string) =>
+const awaitKind = (runtime: WorkstreamRuntime, kind: string, attemptId: string) =>
   waitFor(runtime.frontierSnapshot().pipe(Effect.map((entries) => has(entries, kind, attemptId))));
 
 /** One fresh store plus its runtime, closed after the body settles. */
@@ -469,15 +468,15 @@ async function withRuntime(
   f: Fixture,
   options: {
     readonly driver: ReconciliationDriver;
-    readonly extra?: Partial<CanonicalRuntimeAcquisition>;
+    readonly extra?: Partial<WorkstreamRuntimeAcquisition>;
     readonly clock?: Clock.Clock;
     readonly initial?: (f: Fixture) => Workstream;
   },
   body: (
-    runtime: CanonicalRuntime,
-  ) => Effect.Effect<void, CanonicalRuntimeError, FileSystem.FileSystem | Path.Path | Scope.Scope>,
+    runtime: WorkstreamRuntime,
+  ) => Effect.Effect<void, WorkstreamRuntimeError, FileSystem.FileSystem | Path.Path | Scope.Scope>,
 ): Promise<void> {
-  await runCanonical(
+  await runWorkstream(
     Effect.gen(function* () {
       yield* createStore((options.initial ?? freshWorkstream)(f));
       const runtime = yield* acquire(f, options.driver, options.extra ?? {});
@@ -592,7 +591,7 @@ void test("suspend waits for dispatched work, removes stale effects, and resume 
   await withFixture((f) => {
     let queuedDispatches = 0;
     let placementDispatches = 0;
-    return runCanonical(
+    return runWorkstream(
       Effect.gen(function* () {
         yield* createStore(freshWorkstream(f));
         const dispatched = yield* Deferred.make<void>();
@@ -664,7 +663,7 @@ void test("suspend waits for dispatched work, removes stale effects, and resume 
 
 void test("interrupting suspension before the dispatch barrier leaves lifecycle active", async () => {
   await withFixture((f) =>
-    runCanonical(
+    runWorkstream(
       Effect.gen(function* () {
         yield* createStore(freshWorkstream(f));
         const dispatched = yield* Deferred.make<void>();
@@ -700,7 +699,7 @@ void test("interrupting suspension before the dispatch barrier leaves lifecycle 
 
 void test("deferred interruption after suspension transition entry clears stale runnable effects", async () => {
   await withFixture((f) =>
-    runCanonical(
+    runWorkstream(
       Effect.gen(function* () {
         const seed = yield* createStore(freshWorkstream(f));
         const seedLease = yield* seed.acquireLease(COORDINATOR);
@@ -817,7 +816,7 @@ function reviewTaskFor(id: string, subject: Extract<Task, { kind: "review" }>["s
     intentIndex: 0,
     createdAt: T0,
     subject,
-    concern: "Review the referenced canonical content.",
+    concern: "Review the referenced workstream content.",
     attempts: [
       {
         id: `${id}-a`,
@@ -874,7 +873,7 @@ function reviewWorkstream(f: Fixture): Workstream {
   return { ...ws, revision: 0 };
 }
 
-void test("a review dispatch context resolves only the referenced canonical content", async () => {
+void test("a review dispatch context resolves only the referenced workstream content", async () => {
   const inputs = new Map<string, ReconciliationContext["reviewInput"]>();
   const driver = driverFrom((_entry, control) =>
     Effect.sync(() => {
@@ -930,7 +929,7 @@ void test("a coalesced wake never blocks a commit while the single driver fiber 
     withRuntime(f, { driver }, (runtime) =>
       Effect.gen(function* () {
         yield* runtime.enqueue({
-          taskId: "queued-canonical-frontier.test-1",
+          taskId: "queued-workstream-frontier.test-1",
           kind: "research",
           objective: "Gated",
           expectedEvidence: ["evidence"],
@@ -941,7 +940,7 @@ void test("a coalesced wake never blocks a commit while the single driver fiber 
         const burst = yield* Effect.all(
           Array.from({ length: 5 }, (_, index) =>
             runtime.enqueue({
-              taskId: `queued-canonical-frontier.test-${index + 2}`,
+              taskId: `queued-workstream-frontier.test-${index + 2}`,
               kind: "research",
               objective: `Burst ${index}`,
               expectedEvidence: ["evidence"],
@@ -1178,7 +1177,7 @@ void test("stable history sleeps without aggregate reads; manual reconcile alone
 void test("close interrupts and joins driver work before the lease is released", async () => {
   await withFixture(async (f) => {
     const entered = await Effect.runPromise(Deferred.make<void>());
-    await runCanonical(
+    await runWorkstream(
       Effect.gen(function* () {
         yield* createStore(freshWorkstream(f));
         const store = yield* openStore(f);
@@ -1199,7 +1198,7 @@ void test("close interrupts and joins driver work before the lease is released",
         );
         const runtime = yield* acquire(f, driver);
         yield* runtime.enqueue({
-          taskId: "queued-canonical-frontier.test-3",
+          taskId: "queued-workstream-frontier.test-3",
           kind: "research",
           objective: "Interrupt",
           expectedEvidence: ["evidence"],

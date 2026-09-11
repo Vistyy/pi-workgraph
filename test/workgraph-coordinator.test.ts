@@ -14,9 +14,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
-import canonicalCoordinator from "../extensions/canonical-coordinator.js";
-import { CANONICAL_POINTER_ENTRY } from "../src/canonical-coordinator-controller.js";
-import { CanonicalWorkstreamStore } from "../src/canonical-workstream-store.js";
+import workstreamCoordinator from "../extensions/coordinator.js";
+import { WORKSTREAM_POINTER_ENTRY } from "../src/coordination/controller.js";
 import type { HandoffGrant } from "../src/domain/workstream.js";
 import { createWorkstream } from "../src/domain/workstream.js";
 import {
@@ -27,6 +26,7 @@ import {
 } from "../src/handoff-session.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { liveLayer } from "../src/node-platform.js";
+import { WorkstreamStore } from "../src/storage/workstream-store.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "./decoders.js";
 import { extensionFixture, git, usage } from "./helpers.js";
 
@@ -99,10 +99,10 @@ function appendHandoffInvocation(
 
 async function fixture(
   actions: Partial<ExtensionActions> = {},
-  extensionFactories: InlineExtension[] = [canonicalCoordinator],
+  extensionFactories: InlineExtension[] = [workstreamCoordinator],
   childGrant?: (repository: { projectRoot: string; gitCommonDir: string }) => HandoffGrant,
 ) {
-  const parent = await mkdtemp(join(tmpdir(), "canonical-coordinator-"));
+  const parent = await mkdtemp(join(tmpdir(), "workstream-coordinator-"));
   const root = join(parent, "repo");
   await mkdir(root);
   await git(root, "init", "-b", "main");
@@ -148,12 +148,12 @@ async function fixture(
   };
 }
 
-void test("package and staged factory register only the canonical coordinator and worker", async () => {
+void test("package and staged factory register only the workstream coordinator and worker", async () => {
   const packaged = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as {
     pi: { extensions: string[] };
   };
   assert.deepEqual(packaged.pi.extensions, [
-    "./extensions/canonical-coordinator.ts",
+    "./extensions/coordinator.ts",
     "./extensions/worker.ts",
   ]);
   const f = await fixture();
@@ -168,7 +168,7 @@ void test("package and staged factory register only the canonical coordinator an
 });
 
 void test("child session bootstrap creates the grant-grounded first Intent and triggers kickoff once", async () => {
-  const f = await fixture({}, [canonicalCoordinator], childGrant);
+  const f = await fixture({}, [workstreamCoordinator], childGrant);
   try {
     assert.ok(f.grant !== undefined);
     await f.runner.emit({ type: "session_start", reason: "new" });
@@ -202,14 +202,16 @@ void test("child session bootstrap creates the grant-grounded first Intent and t
 });
 
 void test("conflicting first grounding disables an attached child Workstream", async () => {
-  const f = await fixture({}, [canonicalCoordinator], (repository) =>
+  const f = await fixture({}, [workstreamCoordinator], (repository) =>
     childGrant(repository, "grant-conflicting-grounding"),
   );
   try {
     await f.runner.emit({ type: "session_start", reason: "new" });
     const pointer = f.session
       .getBranch()
-      .findLast((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
+      .findLast(
+        (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
+      );
     assert.ok(pointer?.type === "custom");
     const path = (pointer.data as { path: string }).path;
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
@@ -230,7 +232,7 @@ void test("conflicting first grounding disables an attached child Workstream", a
     await f.runner.emit({ type: "session_start", reason: "reload" });
     await assert.rejects(
       f.call("workgraph_inspect", { section: "overview" }),
-      /No canonical Workstream is attached/,
+      /No Workstream is attached/,
     );
     const readback = new DatabaseSync(path, { readOnly: true });
     assert.equal(readback.prepare("SELECT token FROM lease WHERE singleton=1").get(), undefined);
@@ -248,7 +250,7 @@ void test("kickoff host failure leaves a durable uncertain claim and never resen
         throw new Error("native send failed");
       },
     },
-    [canonicalCoordinator],
+    [workstreamCoordinator],
     (repository) => childGrant(repository, "grant-kickoff-host-failure"),
   );
   try {
@@ -267,7 +269,7 @@ void test("kickoff host failure leaves a durable uncertain claim and never resen
     );
     await assert.rejects(
       f.call("workgraph_inspect", { section: "overview" }),
-      /No canonical Workstream is attached/,
+      /No Workstream is attached/,
     );
 
     await f.runner.emit({ type: "session_start", reason: "reload" });
@@ -287,7 +289,7 @@ void test("kickoff host failure leaves a durable uncertain claim and never resen
 });
 
 void test("handoff tool checkpoints one successful independent launch and exact replay mutates no remote", async () => {
-  const native = await mkdtemp(join(tmpdir(), "canonical-handoff-herdr-"));
+  const native = await mkdtemp(join(tmpdir(), "workstream-handoff-herdr-"));
   const command = join(native, "herdr.mjs");
   const stateFile = join(native, "state.json");
   const logFile = join(native, "calls.jsonl");
@@ -307,7 +309,7 @@ else console.log(JSON.stringify({result:{}}));
   );
   await chmod(command, 0o755);
   const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "parent" });
-  const f = await fixture({}, [(pi) => canonicalCoordinator(pi, { workers: () => runtime })]);
+  const f = await fixture({}, [(pi) => workstreamCoordinator(pi, { workers: () => runtime })]);
   try {
     await f.input("Coordinate the parent request");
     await f.call("workgraph_intent", {
@@ -325,12 +327,14 @@ else console.log(JSON.stringify({result:{}}));
     assert.equal(await readFile(logFile, "utf8"), beforeReplay);
     const pointerEntry = f.session
       .getBranch()
-      .findLast((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
+      .findLast(
+        (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
+      );
     assert.ok(pointerEntry?.type === "custom");
     const attachment = await Effect.runPromise(
-      Effect.scoped(
-        CanonicalWorkstreamStore.discover((pointerEntry.data as { path: string }).path),
-      ).pipe(Effect.provide(liveLayer)),
+      Effect.scoped(WorkstreamStore.discover((pointerEntry.data as { path: string }).path)).pipe(
+        Effect.provide(liveLayer),
+      ),
     );
     assert.equal(attachment.state.handoffs?.[0]?.phase, "launched");
     await rm((first.details as { childSessionFile: string }).childSessionFile, { force: true });
@@ -342,7 +346,7 @@ else console.log(JSON.stringify({result:{}}));
 
 void test("handoff recovery probes exact workspace and child agent after interrupted remote responses", async () => {
   for (const failure of ["workspace", "start"] as const) {
-    const native = await mkdtemp(join(tmpdir(), `canonical-handoff-${failure}-`));
+    const native = await mkdtemp(join(tmpdir(), `workstream-handoff-${failure}-`));
     const command = join(native, "herdr.mjs");
     const stateFile = join(native, "state.json");
     const failedFile = join(native, "failed");
@@ -368,7 +372,7 @@ else console.log(JSON.stringify({result:{}}));
     );
     await chmod(command, 0o755);
     const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "parent" });
-    const f = await fixture({}, [(pi) => canonicalCoordinator(pi, { workers: () => runtime })]);
+    const f = await fixture({}, [(pi) => workstreamCoordinator(pi, { workers: () => runtime })]);
     try {
       await f.input("Parent request");
       await f.call("workgraph_intent", { statement: "Parent request" });
@@ -399,13 +403,13 @@ else console.log(JSON.stringify({result:{}}));
       const pointer = f.session
         .getBranch()
         .findLast(
-          (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
+          (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
         );
       assert.ok(pointer?.type === "custom");
       const attachment = await Effect.runPromise(
-        Effect.scoped(
-          CanonicalWorkstreamStore.discover((pointer.data as { path: string }).path),
-        ).pipe(Effect.provide(liveLayer)),
+        Effect.scoped(WorkstreamStore.discover((pointer.data as { path: string }).path)).pipe(
+          Effect.provide(liveLayer),
+        ),
       );
       assert.equal(attachment.state.handoffs?.length, 1);
       assert.equal(attachment.state.handoffs?.[0]?.toolCallId, "original-call");
@@ -423,7 +427,7 @@ else console.log(JSON.stringify({result:{}}));
   }
 });
 
-void test("canonical tool schemas expose release_output and every runtime facade returns a Promise without an attachment", async () => {
+void test("workstream tool schemas expose release_output and every runtime facade returns a Promise without an attachment", async () => {
   const f = await fixture();
   try {
     const control = f.runner.getToolDefinition("workgraph_control");
@@ -474,7 +478,7 @@ void test("canonical tool schemas expose release_output and every runtime facade
         f.runner.createContext(),
       );
       assert.ok(result instanceof Promise, `${name} must return a Promise`);
-      await assert.rejects(result, /No canonical Workstream is attached/);
+      await assert.rejects(result, /No Workstream is attached/);
     }
   } finally {
     await f.dispose();
@@ -488,13 +492,13 @@ void test("session_start closes the attached runtime before rejecting a differen
     await f.call("workgraph_intent", { statement: "Create the original Workstream" });
     const originalPointer = f.session
       .getBranch()
-      .findLast((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
+      .findLast(
+        (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
+      );
     assert.ok(originalPointer?.type === "custom");
     const originalPath = (originalPointer.data as { path: string }).path;
     const original = await Effect.runPromise(
-      Effect.scoped(CanonicalWorkstreamStore.discover(originalPath)).pipe(
-        Effect.provide(liveLayer),
-      ),
+      Effect.scoped(WorkstreamStore.discover(originalPath)).pipe(Effect.provide(liveLayer)),
     );
     const intent = original.state.intents[0];
     assert.ok(intent !== undefined);
@@ -507,12 +511,12 @@ void test("session_start closes the attached runtime before rejecting a differen
       createdAt: "2024-01-01T00:00:00.000Z",
     });
     const target = await Effect.runPromise(
-      Effect.scoped(CanonicalWorkstreamStore.create(targetState)).pipe(Effect.provide(liveLayer)),
+      Effect.scoped(WorkstreamStore.create(targetState)).pipe(Effect.provide(liveLayer)),
     );
     const targetBefore = await readFile(target.store.path);
     const originalStateBefore = original.state;
 
-    f.session.appendCustomEntry(CANONICAL_POINTER_ENTRY, {
+    f.session.appendCustomEntry(WORKSTREAM_POINTER_ENTRY, {
       version: 1,
       phase: "attached",
       path: target.store.path,
@@ -522,7 +526,7 @@ void test("session_start closes the attached runtime before rejecting a differen
 
     await assert.rejects(
       f.call("workgraph_inspect", { section: "overview" }),
-      /No canonical Workstream is attached/,
+      /No Workstream is attached/,
     );
     const database = new DatabaseSync(originalPath, { readOnly: true });
     const lease = database.prepare("SELECT token FROM lease WHERE singleton=1").get();
@@ -542,7 +546,7 @@ void test("session_start closes the attached runtime before rejecting a differen
     assert.equal(
       f.session
         .getBranch()
-        .filter((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY)
+        .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY)
         .length,
       3,
     );
@@ -551,13 +555,13 @@ void test("session_start closes the attached runtime before rejecting a differen
   }
 });
 
-void test("prepared pointer append failure creates no canonical store", async () => {
+void test("prepared pointer append failure creates no workstream store", async () => {
   let session: Awaited<ReturnType<typeof extensionFixture>>["session"] | undefined;
   let pointerAppends = 0;
   const f = await fixture({
     appendEntry(type, data) {
       session?.appendCustomEntry(type, data);
-      if (type === CANONICAL_POINTER_ENTRY) {
+      if (type === WORKSTREAM_POINTER_ENTRY) {
         pointerAppends += 1;
         throw new Error("pointer append failed");
       }
@@ -575,12 +579,12 @@ void test("prepared pointer append failure creates no canonical store", async ()
     await f.input("Do not create a second Workstream");
     await assert.rejects(
       f.call("workgraph_intent", { statement: "Do not create a second Workstream" }),
-      /retained canonical pointer/,
+      /retained workstream pointer/,
     );
     assert.equal(pointerAppends, 1);
     const pointers = f.session
       .getBranch()
-      .filter((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
+      .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY);
     assert.equal(pointers.length, 1);
     assert.ok(pointers[0]?.type === "custom");
     assert.equal((pointers[0].data as { phase?: unknown }).phase, "prepared");
@@ -621,9 +625,9 @@ void test("repository proof rejects a crafted aggregate before lease or pointer 
       createdAt: "2024-01-01T00:00:00.000Z",
     });
     const attachment = await Effect.runPromise(
-      Effect.scoped(CanonicalWorkstreamStore.create(initial)).pipe(Effect.provide(liveLayer)),
+      Effect.scoped(WorkstreamStore.create(initial)).pipe(Effect.provide(liveLayer)),
     );
-    f.session.appendCustomEntry(CANONICAL_POINTER_ENTRY, {
+    f.session.appendCustomEntry(WORKSTREAM_POINTER_ENTRY, {
       version: 1,
       phase: "attached",
       path: attachment.store.path,
@@ -639,7 +643,7 @@ void test("repository proof rejects a crafted aggregate before lease or pointer 
     assert.equal(
       f.session
         .getBranch()
-        .filter((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY)
+        .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY)
         .length,
       1,
     );
@@ -651,7 +655,7 @@ void test("repository proof rejects a crafted aggregate before lease or pointer 
 void test("current Pi input survives session restoration and grounds one private Workstream", async () => {
   const f = await fixture();
   try {
-    await f.input("Build the canonical target", "interactive");
+    await f.input("Build the workstream target", "interactive");
     const receipt = f.session
       .getBranch()
       .find((entry) => entry.type === "custom" && entry.customType === "pi-workgraph-human-input");
@@ -662,7 +666,7 @@ void test("current Pi input survives session restoration and grounds one private
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
     await f.runner.emit({ type: "session_start", reason: "reload" });
     await f.call("workgraph_intent", {
-      statement: "Build the canonical target",
+      statement: "Build the workstream target",
       constraints: ["Keep the current state loaded"],
       authorityReceiptId: (receipt.data as { id: string }).id,
     });
@@ -672,7 +676,7 @@ void test("current Pi input survives session restoration and grounds one private
     );
     assert.equal(receipts.length, 1);
     const pointers = branch.filter(
-      (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
+      (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
     );
     assert.equal(pointers.length, 2);
     const prepared = pointers[0];
@@ -698,16 +702,16 @@ void test("current Pi input survives session restoration and grounds one private
     );
     assert.ok(lease !== undefined);
     const discovered = await Effect.runPromise(
-      Effect.scoped(CanonicalWorkstreamStore.discover(path)).pipe(Effect.provide(liveLayer)),
+      Effect.scoped(WorkstreamStore.discover(path)).pipe(Effect.provide(liveLayer)),
     );
     assert.equal(discovered.state.intents.length, 1);
 
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
-    f.session.appendCustomEntry(CANONICAL_POINTER_ENTRY, structuredClone(prepared.data));
+    f.session.appendCustomEntry(WORKSTREAM_POINTER_ENTRY, structuredClone(prepared.data));
     await f.runner.emit({ type: "session_start", reason: "reload" });
     const replayed = f.session
       .getBranch()
-      .filter((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
+      .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY);
     assert.equal(replayed.length, 4);
     const replayAttachment = replayed.at(-1);
     assert.ok(replayAttachment?.type === "custom");
@@ -726,7 +730,9 @@ void test("prepared adoption replays an already-committed exact transfer once", 
     await source.call("workgraph_intent", { statement: "Create an adoptable Workstream" });
     const pointer = source.session
       .getBranch()
-      .findLast((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
+      .findLast(
+        (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
+      );
     assert.ok(pointer?.type === "custom");
     const statePath = (pointer.data as { path: string }).path;
     await source.runner.emit({ type: "session_shutdown", reason: "reload" });
@@ -746,7 +752,7 @@ void test("prepared adoption replays an already-committed exact transfer once", 
       successorParent,
       {
         appendEntry(type, data) {
-          if (type === CANONICAL_POINTER_ENTRY) {
+          if (type === WORKSTREAM_POINTER_ENTRY) {
             const phase = (data as { phase?: unknown }).phase;
             if (phase === "attached" && interruptAttached) {
               interruptAttached = false;
@@ -756,7 +762,7 @@ void test("prepared adoption replays an already-committed exact transfer once", 
           successorSession?.appendCustomEntry(type, data);
         },
       },
-      [(pi) => canonicalCoordinator(pi, { workers: () => workers })],
+      [(pi) => workstreamCoordinator(pi, { workers: () => workers })],
     );
     successorSession = successor.session;
     await assert.rejects(
@@ -766,12 +772,12 @@ void test("prepared adoption replays an already-committed exact transfer once", 
     await successor.runner.emit({ type: "session_shutdown", reason: "reload" });
     await successor.runner.emit({ type: "session_start", reason: "reload" });
     const discovered = await Effect.runPromise(
-      Effect.scoped(CanonicalWorkstreamStore.discover(statePath)).pipe(Effect.provide(liveLayer)),
+      Effect.scoped(WorkstreamStore.discover(statePath)).pipe(Effect.provide(liveLayer)),
     );
     assert.equal(discovered.state.coordinatorTransfers.length, 1);
     const retainedPointers = successor.session
       .getBranch()
-      .filter((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
+      .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY);
     assert.deepEqual(
       retainedPointers.map((entry) =>
         entry.type === "custom" ? (entry.data as { phase: string }).phase : "invalid",
@@ -793,7 +799,9 @@ void test("intent revision selects the latest eligible receipt and rejects repos
     await f.call("workgraph_intent", { statement: "Revised scope" });
     const pointer = f.session
       .getBranch()
-      .findLast((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY);
+      .findLast(
+        (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
+      );
     assert.ok(pointer?.type === "custom");
     const path = (pointer.data as { path: string }).path;
     const readState = () => {
@@ -833,7 +841,7 @@ void test("intent revision selects the latest eligible receipt and rejects repos
   }
 });
 
-void test("missing receipt rejects before canonical storage or pointer creation", async () => {
+void test("missing receipt rejects before workstream storage or pointer creation", async () => {
   const f = await fixture();
   try {
     await assert.rejects(
@@ -843,7 +851,7 @@ void test("missing receipt rejects before canonical storage or pointer creation"
     assert.equal(
       f.session
         .getBranch()
-        .some((entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY),
+        .some((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY),
       false,
     );
   } finally {

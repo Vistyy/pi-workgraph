@@ -1,22 +1,19 @@
 import { Data, Effect } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
-import type {
-  CanonicalAppendCommand,
-  CanonicalEnqueueCommand,
-  ResolvedQueueFacts,
-} from "./canonical-queue.js";
 import {
   type Attempt,
   type AttemptKey,
+  type CandidateLineage,
   changedImplementationCommit,
   findAttemptLocation,
   findTask,
   IntentSchema,
   isRetainedCandidateParent,
+  ReviewSubjectSchema,
   type Task,
   type Workstream,
-} from "./domain/workstream.js";
+} from "../domain/workstream.js";
 import type {
   CandidateApplicationDestination,
   CandidateApplicationSource,
@@ -24,13 +21,96 @@ import type {
   ValidatedCandidate,
   WorktreeCleanupResult,
   WorktreePlacement,
-} from "./git.js";
-import { EvidenceSchema } from "./report-schema.js";
-import type { WorkerIdentity } from "./types.js";
+} from "../git.js";
+import { SelectionRequestSchema } from "../model-policy.js";
+import { EvidenceSchema } from "../report-schema.js";
+import type { WorkerIdentity } from "../types.js";
 
 const NonEmptyString = Type.String({ minLength: 1 });
 export const NonBlankReasonSchema = Type.String({ minLength: 1, pattern: "\\S" });
 const AttemptHandle = { attemptId: NonEmptyString };
+const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
+const TaskIdentity = { taskId: NonEmptyString };
+const Objective = { objective: NonEmptyString };
+
+export const WorkstreamEnqueueCommandSchema = Type.Union([
+  Type.Object(
+    {
+      ...TaskIdentity,
+      ...Objective,
+      kind: Type.Literal("research"),
+      expectedEvidence: Type.Array(NonEmptyString, { minItems: 1 }),
+      selection: Type.Optional(SelectionRequestSchema),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      ...TaskIdentity,
+      ...Objective,
+      kind: Type.Literal("experiment"),
+      permittedEffects: Type.Array(NonEmptyString, { minItems: 1 }),
+      stopCondition: NonEmptyString,
+      expectedEvidence: Type.Array(NonEmptyString, { minItems: 1 }),
+      selection: Type.Optional(SelectionRequestSchema),
+      baseRevision: Type.Optional(Commit),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      ...TaskIdentity,
+      ...Objective,
+      kind: Type.Literal("implementation"),
+      acceptance: Type.Array(NonEmptyString, { minItems: 1 }),
+      useEscalationExecutor: Type.Optional(Type.Boolean()),
+      candidateOf: Type.Optional(NonEmptyString),
+      baseRevision: Type.Optional(Commit),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      ...TaskIdentity,
+      ...Objective,
+      kind: Type.Literal("review"),
+      subject: ReviewSubjectSchema,
+      concern: NonEmptyString,
+      selection: Type.Optional(SelectionRequestSchema),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      ...TaskIdentity,
+      ...Objective,
+      kind: Type.Literal("consultation"),
+      context: Type.Optional(Type.String({ maxLength: 20_000 })),
+      advisor: Type.Optional(NonEmptyString),
+    },
+    { additionalProperties: false },
+  ),
+]);
+export type WorkstreamEnqueueCommand = Static<typeof WorkstreamEnqueueCommandSchema>;
+
+export const WorkstreamAppendCommandSchema = Type.Object(
+  {
+    taskId: NonEmptyString,
+    continuationOf: Type.Optional(NonEmptyString),
+    candidateOf: Type.Optional(NonEmptyString),
+    baseRevision: Type.Optional(Commit),
+    selection: Type.Optional(SelectionRequestSchema),
+    useEscalationExecutor: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+export type WorkstreamAppendCommand = Static<typeof WorkstreamAppendCommandSchema>;
+
+export interface ResolvedQueueFacts {
+  readonly baseRevision?: string;
+  readonly candidate?: CandidateLineage;
+}
+
 export const ReviseIntentCommandSchema = IntentSchema;
 export const CompleteCommandSchema = Type.Object(
   {
@@ -64,19 +144,17 @@ export const ReleaseOutputCommandSchema = Type.Object(
 export type CompleteCommand = Static<typeof CompleteCommandSchema>;
 export type SuspendCommand = Static<typeof SuspendCommandSchema>;
 export type ResumeCommand = Static<typeof ResumeCommandSchema>;
-export type CancelCommand = Static<typeof CancelCommandSchema>;
-export type SteerCommand = Static<typeof SteerCommandSchema>;
 export type ApplyCommand = Static<typeof ApplyCommandSchema>;
 export type ReleaseOutputCommand = Static<typeof ReleaseOutputCommandSchema>;
 
-export class CanonicalCommandError extends Data.TaggedError("CanonicalCommandError")<{
+export class WorkstreamCommandError extends Data.TaggedError("WorkstreamCommandError")<{
   readonly operation: string;
   readonly message: string;
   readonly cause?: unknown;
 }> {}
 
-type CommandEffect<A> = Effect.Effect<A, CanonicalCommandError>;
-export interface CanonicalCommandGitPort {
+type CommandEffect<A> = Effect.Effect<A, WorkstreamCommandError>;
+export interface WorkstreamCommandGitPort {
   readonly resolveRevision: (revision: string) => CommandEffect<string>;
   readonly head: CommandEffect<string>;
   readonly cleanHead: CommandEffect<string>;
@@ -102,12 +180,12 @@ export interface CanonicalCommandGitPort {
     expectedHead: string,
   ) => CommandEffect<WorktreeCleanupResult>;
 }
-export interface CanonicalCommandWorkerPort {
+interface WorkstreamCommandWorkerPort {
   readonly steer: (identity: WorkerIdentity, instruction: string) => CommandEffect<void>;
 }
-export interface CanonicalCommandPorts {
-  readonly git: CanonicalCommandGitPort;
-  readonly workers: CanonicalCommandWorkerPort;
+export interface WorkstreamCommandPorts {
+  readonly git: WorkstreamCommandGitPort;
+  readonly workers: WorkstreamCommandWorkerPort;
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Explicit command values are decoded by the supplied strict TypeBox schema.
@@ -168,8 +246,8 @@ export function exactAttemptEffect(
 
 export function enqueueFacts(
   workstream: Workstream,
-  command: CanonicalEnqueueCommand,
-  git: CanonicalCommandGitPort | undefined,
+  command: WorkstreamEnqueueCommand,
+  git: WorkstreamCommandGitPort | undefined,
 ): CommandEffect<ResolvedQueueFacts> {
   return Effect.gen(function* () {
     if (command.kind === "experiment") {
@@ -201,8 +279,8 @@ export function enqueueFacts(
 
 export function appendFacts(
   workstream: Workstream,
-  command: CanonicalAppendCommand,
-  git: CanonicalCommandGitPort | undefined,
+  command: WorkstreamAppendCommand,
+  git: WorkstreamCommandGitPort | undefined,
 ): CommandEffect<ResolvedQueueFacts> {
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: kind-owned preflight stays explicit so incompatible fields cannot share Git behavior.
   return Effect.gen(function* () {
@@ -236,7 +314,7 @@ export function appendFacts(
 function candidateFacts(
   workstream: Workstream,
   command: { readonly candidateOf: string; readonly baseRevision?: string },
-  commandGit: CanonicalCommandGitPort,
+  commandGit: WorkstreamCommandGitPort,
 ): CommandEffect<ResolvedQueueFacts> {
   return Effect.gen(function* () {
     const { parent, parentCommit, rootCommit, placement } = yield* retainedCandidate(
@@ -247,7 +325,7 @@ function candidateFacts(
     if (validated.commit !== parentCommit || validated.rootCommit !== rootCommit)
       return yield* commandFailure(
         "append candidate",
-        "Retained candidate Git lineage does not match canonical state.",
+        "Retained candidate Git lineage does not match workstream state.",
       );
     const requestedBase =
       command.baseRevision === undefined
@@ -320,7 +398,7 @@ function retainedCandidate(
   });
 }
 
-function ineligibleCandidate(attemptId: string): CanonicalCommandError {
+function ineligibleCandidate(attemptId: string): WorkstreamCommandError {
   return commandFailure(
     "append candidate",
     `Attempt ${attemptId} is not an eligible retained implementation parent.`,
@@ -328,11 +406,11 @@ function ineligibleCandidate(attemptId: string): CanonicalCommandError {
 }
 
 function requireGit(
-  git: CanonicalCommandGitPort | undefined,
-): CommandEffect<CanonicalCommandGitPort> {
+  git: WorkstreamCommandGitPort | undefined,
+): CommandEffect<WorkstreamCommandGitPort> {
   return git === undefined
     ? Effect.fail(
-        commandFailure("canonical queue preflight", "Canonical Git command port is unavailable."),
+        commandFailure("workstream queue preflight", "Workstream Git command port is unavailable."),
       )
     : Effect.succeed(git);
 }
@@ -340,7 +418,7 @@ function requireGit(
 function continuationFailure(
   task: NonNullable<ReturnType<typeof findTask>>,
   attemptId: string,
-): CanonicalCommandError | undefined {
+): WorkstreamCommandError | undefined {
   const parent = task.attempts.find((attempt) => attempt.id === attemptId);
   return parent?.state === "finished" &&
     parent.execution?.sessionFile !== undefined &&
@@ -354,13 +432,13 @@ function continuationFailure(
 }
 
 function resolvedBase(
-  git: CanonicalCommandGitPort,
+  git: WorkstreamCommandGitPort,
   revision: string | undefined,
 ): CommandEffect<string> {
   return revision === undefined ? exactHead(git) : exactRevision(git, revision);
 }
 
-function exactHead(git: CanonicalCommandGitPort): CommandEffect<string> {
+function exactHead(git: WorkstreamCommandGitPort): CommandEffect<string> {
   return git.head.pipe(
     Effect.filterOrFail(
       (head) => /^[0-9a-f]{40,64}$/.test(head),
@@ -369,7 +447,7 @@ function exactHead(git: CanonicalCommandGitPort): CommandEffect<string> {
   );
 }
 
-function exactRevision(git: CanonicalCommandGitPort, revision: string): CommandEffect<string> {
+function exactRevision(git: WorkstreamCommandGitPort, revision: string): CommandEffect<string> {
   return Effect.gen(function* () {
     const resolved = yield* git.resolveRevision(revision);
     if (!/^[0-9a-f]{40,64}$/.test(resolved))
@@ -382,8 +460,8 @@ export function commandFailure(
   operation: string,
   message: string,
   cause?: unknown,
-): CanonicalCommandError {
-  return new CanonicalCommandError(
+): WorkstreamCommandError {
+  return new WorkstreamCommandError(
     cause === undefined ? { operation, message } : { operation, message, cause },
   );
 }

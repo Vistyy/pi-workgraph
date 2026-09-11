@@ -2,15 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Effect } from "effect";
 import {
-  CanonicalInspectionError,
-  type CanonicalInspectionRequest,
-  type CanonicalInspectionView,
-  canonicalOutcomeNotification,
-  inspectCanonical,
+  inspectWorkstream,
   MAX_DELIVERY_NOTIFICATION_CHARS,
-  projectCanonicalAction,
-} from "../src/canonical-inspection.js";
-import type { CanonicalRuntimeInspectionSnapshot } from "../src/canonical-runtime.js";
+  projectWorkstreamAction,
+  WorkstreamInspectionError,
+  type WorkstreamInspectionRequest,
+  type WorkstreamInspectionView,
+  workstreamOutcomeNotification,
+} from "../src/coordination/inspection.js";
+import type { WorkstreamRuntimeInspectionSnapshot } from "../src/coordination/runtime.js";
 import {
   type Attempt,
   completeWorkstream,
@@ -39,9 +39,9 @@ function queuedAttempt(id: string): Attempt {
   };
 }
 
-function completeFixture(): CanonicalRuntimeInspectionSnapshot {
+function completeFixture(): WorkstreamRuntimeInspectionSnapshot {
   let state = createWorkstream({
-    id: "canonical-inspection",
+    id: "workstream-inspection",
     purpose: `Inspect one complete Workstream ${"bounded context ".repeat(80)}`,
     repository: { projectRoot: "/repo", gitCommonDir: "/repo/.git" },
     coordinator: { sessionId: "session", sessionFile: "/session.jsonl" },
@@ -54,7 +54,7 @@ function completeFixture(): CanonicalRuntimeInspectionSnapshot {
         sessionId: "session",
         sessionFile: "/session.jsonl",
         source: "interactive",
-        text: "Inspect the canonical aggregate.",
+        text: "Inspect the workstream aggregate.",
         receivedAt: T0,
       },
       recordedAt: T0,
@@ -113,7 +113,7 @@ function completeFixture(): CanonicalRuntimeInspectionSnapshot {
     state,
     {
       conclusion: `Inspection complete ${"conclusion detail ".repeat(80)}`,
-      evidence: [{ label: "flow", observation: "All sections retain canonical facts." }],
+      evidence: [{ label: "flow", observation: "All sections retain workstream facts." }],
       limitations: [],
       completedAt: T1,
     },
@@ -135,28 +135,28 @@ function completeFixture(): CanonicalRuntimeInspectionSnapshot {
   };
 }
 
-type ViewFor<Section extends CanonicalInspectionRequest["section"]> = Extract<
-  CanonicalInspectionView,
+type ViewFor<Section extends WorkstreamInspectionRequest["section"]> = Extract<
+  WorkstreamInspectionView,
   { readonly section: Section }
 >;
 
-async function inspectTyped<Section extends CanonicalInspectionRequest["section"]>(
-  snapshot: CanonicalRuntimeInspectionSnapshot,
-  request: CanonicalInspectionRequest & { readonly section: Section },
+async function inspectTyped<Section extends WorkstreamInspectionRequest["section"]>(
+  snapshot: WorkstreamRuntimeInspectionSnapshot,
+  request: WorkstreamInspectionRequest & { readonly section: Section },
 ): Promise<ViewFor<Section>> {
-  return Effect.runPromise(inspectCanonical(snapshot, request));
+  return Effect.runPromise(inspectWorkstream(snapshot, request));
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Rejection cases intentionally exercise the schema-owning external boundary.
-async function inspect(snapshot: CanonicalRuntimeInspectionSnapshot, request: unknown) {
-  return Effect.runPromise(inspectCanonical(snapshot, request));
+async function inspect(snapshot: WorkstreamRuntimeInspectionSnapshot, request: unknown) {
+  return Effect.runPromise(inspectWorkstream(snapshot, request));
 }
 
 async function collectText(
-  snapshot: CanonicalRuntimeInspectionSnapshot,
-  request: CanonicalInspectionRequest,
+  snapshot: WorkstreamRuntimeInspectionSnapshot,
+  request: WorkstreamInspectionRequest,
 ): Promise<string> {
-  let current: CanonicalInspectionRequest = request;
+  let current: WorkstreamInspectionRequest = request;
   let result = "";
   for (let page = 0; page < 100; page += 1) {
     const view = await inspectTyped(snapshot, current);
@@ -195,16 +195,16 @@ void test("overview and context expose the bounded current suspension fact", asy
   assert.match(context, /"reason": "Await explicit input\."/);
   assert.match(context, /"suspendedAt": "2026-01-01T00:00:01\.000Z"/);
   const suspendedAction = await Effect.runPromise(
-    projectCanonicalAction(snapshot, { action: "suspend" }),
+    projectWorkstreamAction(snapshot, { action: "suspend" }),
   );
   assert.deepEqual(suspendedAction.workstream.suspension, workstream.suspension);
   const activeAction = await Effect.runPromise(
-    projectCanonicalAction({ workstream: initial, reconciliation: [] }, { action: "create" }),
+    projectWorkstreamAction({ workstream: initial, reconciliation: [] }, { action: "create" }),
   );
   assert.equal("suspension" in activeAction.workstream, false);
 });
 
-void test("one complete canonical Workstream projects all sections with one bounded cursor", async () => {
+void test("one complete Workstream projects all sections with one bounded cursor", async () => {
   const snapshot = completeFixture();
   const outcomeId = "attempt-1:outcome";
   const requests = [
@@ -265,7 +265,7 @@ void test("cursor integrity, selectors, revisions, budgets, and exact handles re
   });
   assert.ok(first.next?.cursor !== undefined);
   const cursor = first.next.cursor;
-  const failures: ReadonlyArray<readonly [unknown, CanonicalInspectionError["code"]]> = [
+  const failures: ReadonlyArray<readonly [unknown, WorkstreamInspectionError["code"]]> = [
     [{ section: "report", outcomeId: "attempt-1:outcome", cursor: "malformed" }, "invalid_cursor"],
     [{ section: "report", outcomeId: "attempt-1:outcome", cursor: `${cursor}x` }, "invalid_cursor"],
     [{ section: "evidence", outcomeId: "attempt-1:outcome", cursor }, "cursor_mismatch"],
@@ -280,20 +280,20 @@ void test("cursor integrity, selectors, revisions, budgets, and exact handles re
   for (const [request, code] of failures)
     await assert.rejects(
       () => inspect(snapshot, request),
-      (error) => error instanceof CanonicalInspectionError && error.code === code,
+      (error) => error instanceof WorkstreamInspectionError && error.code === code,
     );
   const advanced = structuredClone(snapshot);
   advanced.workstream.revision += 1;
   await assert.rejects(
     () => inspect(advanced, first.next),
-    (error) => error instanceof CanonicalInspectionError && error.code === "cursor_mismatch",
+    (error) => error instanceof WorkstreamInspectionError && error.code === "cursor_mismatch",
   );
 
   const malformed = structuredClone(snapshot);
   Reflect.set(malformed.workstream, "purpose", undefined);
   await assert.rejects(
     () => inspect(malformed, { section: "overview" }),
-    (error) => error instanceof CanonicalInspectionError && error.code === "internal_failure",
+    (error) => error instanceof WorkstreamInspectionError && error.code === "internal_failure",
   );
 });
 
@@ -301,7 +301,7 @@ void test("action and delivery projections stay compact and identify exact retri
   const snapshot = completeFixture();
   const base = snapshot.reconciliation[0] ?? assert.fail("reconciliation fixture");
   const { blockedReason: _blockedReason, ...unblocked } = base;
-  const mixedSnapshot: CanonicalRuntimeInspectionSnapshot = {
+  const mixedSnapshot: WorkstreamRuntimeInspectionSnapshot = {
     workstream: snapshot.workstream,
     reconciliation: [
       unblocked,
@@ -313,7 +313,7 @@ void test("action and delivery projections stay compact and identify exact retri
     ],
   };
   const action = await Effect.runPromise(
-    projectCanonicalAction(mixedSnapshot, {
+    projectWorkstreamAction(mixedSnapshot, {
       action: `record delivery ${"action ".repeat(100)}`,
       message: "Delivered.",
       taskId: "task-exact",
@@ -334,7 +334,7 @@ void test("action and delivery projections stay compact and identify exact retri
   assert.equal(action.blocked.truncated, true);
 
   const notification = await Effect.runPromise(
-    canonicalOutcomeNotification(snapshot, "attempt-1:outcome"),
+    workstreamOutcomeNotification(snapshot, "attempt-1:outcome"),
   );
   assert.ok(notification.length <= MAX_DELIVERY_NOTIFICATION_CHARS);
   assert.match(notification, /Task task-exact; Attempt attempt-1; Outcome attempt-1:outcome/);

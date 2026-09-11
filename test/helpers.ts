@@ -100,13 +100,7 @@ export async function extensionFixture(
     agentDir: join(parent, "agent"),
     additionalExtensionPaths:
       extensionFactories.length === 0
-        ? [
-            resolve(
-              name === "coordinator"
-                ? "extensions/canonical-coordinator.ts"
-                : "extensions/worker.ts",
-            ),
-          ]
+        ? [resolve(name === "coordinator" ? "extensions/coordinator.ts" : "extensions/worker.ts")]
         : [],
     extensionFactories,
     noExtensions: extensionFactories.length > 0,
