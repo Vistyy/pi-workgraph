@@ -33,7 +33,7 @@ import {
   type CanonicalStoreAttachment,
   CanonicalWorkstreamStore,
 } from "./canonical-workstream-store.js";
-import type { HumanInputReceipt } from "./domain/workstream.js";
+import type { HumanInputReceiptData } from "./domain/workstream.js";
 import {
   type CoordinatorIdentity,
   createWorkstream,
@@ -252,7 +252,7 @@ export class CanonicalCoordinatorController {
 
   establish(
     ctx: ExtensionContext,
-    receipt: HumanInputReceipt,
+    receipt: HumanInputReceiptData,
     request: { statement: string; constraints: readonly string[]; targetRepository?: string },
   ): Effect.Effect<CanonicalActionProjection, unknown, Requirements> {
     return this.serialize(
@@ -271,7 +271,7 @@ export class CanonicalCoordinatorController {
             const intent: Intent = {
               statement: request.statement,
               constraints: [...request.constraints],
-              grounding: receipt,
+              grounding: { kind: "human_input_receipt", ...receipt },
               recordedAt: yield* nowIso,
             };
             yield* active.runtime.reviseIntent(intent);
@@ -289,7 +289,7 @@ export class CanonicalCoordinatorController {
           const intent: Intent = {
             statement: request.statement,
             constraints: [...request.constraints],
-            grounding: receipt,
+            grounding: { kind: "human_input_receipt", ...receipt },
             recordedAt: now,
           };
           const initial = createWorkstream({

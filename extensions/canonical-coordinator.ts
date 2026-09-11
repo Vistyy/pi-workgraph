@@ -18,7 +18,7 @@ import {
 import { CanonicalInspectionRequestSchema } from "../src/canonical-inspection.js";
 import type { CanonicalRuntime } from "../src/canonical-runtime.js";
 import { installCoordinatorSessionState } from "../src/coordinator-notepad.js";
-import type { HandoffGrant, HumanInputReceipt } from "../src/domain/workstream.js";
+import type { HandoffGrant, HumanInputReceiptData } from "../src/domain/workstream.js";
 import {
   deterministicChildSessionId,
   HANDOFF_KICKOFF_CLAIM_ENTRY,
@@ -231,7 +231,7 @@ export default function canonicalCoordinator(
     >,
     signal?: AbortSignal,
   ) => Effect.runPromise(effect.pipe(Effect.provide(liveLayer)), { signal });
-  const receipt = (ctx: ExtensionContext, id?: string): HumanInputReceipt => {
+  const receipt = (ctx: ExtensionContext, id?: string): HumanInputReceiptData => {
     const owner = controller.owner(ctx);
     const eligible = session
       .getHumanReceipts()

@@ -4,13 +4,13 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 import { DateTime } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { type HumanInputReceipt, HumanInputReceiptSchema } from "./domain/workstream.js";
+import { type HumanInputReceiptData, HumanInputReceiptDataSchema } from "./domain/workstream.js";
 
 const HUMAN_INPUT_ENTRY = "pi-workgraph-human-input";
 const NOTEPAD_STATE_ENTRY = "pi-workgraph-coordinator-notepad-state";
 const NOTEPAD_PREFIX = "[WORKGRAPH PENDING ITEMS]";
 
-type SessionOwner = Pick<HumanInputReceipt, "sessionId" | "sessionFile">;
+type SessionOwner = Pick<HumanInputReceiptData, "sessionId" | "sessionFile">;
 export type PendingItem = { id: string; text: string };
 export type CoordinatorNotepadState = { version: 2; items: PendingItem[] };
 
@@ -31,11 +31,11 @@ const NotepadRequestSchema = Type.Object({
 type InstallOptions = {
   owner(ctx: ExtensionContext): SessionOwner;
   serialize<T>(run: () => Promise<T>): Promise<T>;
-  onHumanInput?(receipt: HumanInputReceipt): Promise<void>;
+  onHumanInput?(receipt: HumanInputReceiptData): Promise<void>;
 };
 
 export type CoordinatorSessionState = {
-  getHumanReceipts(): HumanInputReceipt[];
+  getHumanReceipts(): HumanInputReceiptData[];
   getNotepadState(): CoordinatorNotepadState;
 };
 
@@ -45,7 +45,7 @@ export function installCoordinatorSessionState(
   options: InstallOptions,
 ): CoordinatorSessionState {
   let state = emptyState();
-  let receipts: HumanInputReceipt[] = [];
+  let receipts: HumanInputReceiptData[] = [];
 
   const persist = (): void => {
     pi.appendEntry(NOTEPAD_STATE_ENTRY, cloneState(state));
@@ -79,8 +79,7 @@ export function installCoordinatorSessionState(
     const source = event.source;
     const receivedAt = DateTime.formatIso(DateTime.nowUnsafe());
     return options.serialize(() => {
-      const receipt: HumanInputReceipt = {
-        kind: "human_input_receipt",
+      const receipt: HumanInputReceiptData = {
         id: randomUUID(),
         ...options.owner(ctx),
         source,
@@ -152,16 +151,16 @@ function cloneState(state: CoordinatorNotepadState): CoordinatorNotepadState {
   return structuredClone(state);
 }
 
-function receiptFromEntry(entry: SessionEntry, owner: SessionOwner): HumanInputReceipt[] {
+function receiptFromEntry(entry: SessionEntry, owner: SessionOwner): HumanInputReceiptData[] {
   if (
     entry.type !== "custom" ||
     entry.customType !== HUMAN_INPUT_ENTRY ||
-    !Value.Check(HumanInputReceiptSchema, entry.data) ||
+    !Value.Check(HumanInputReceiptDataSchema, entry.data) ||
     entry.data.sessionId !== owner.sessionId ||
     entry.data.sessionFile !== owner.sessionFile
   )
     return [];
-  return [Value.Decode(HumanInputReceiptSchema, entry.data)];
+  return [Value.Decode(HumanInputReceiptDataSchema, entry.data)];
 }
 
 function applyNotepadAction(

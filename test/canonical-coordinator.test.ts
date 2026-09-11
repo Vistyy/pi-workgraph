@@ -648,22 +648,29 @@ void test("repository proof rejects a crafted aggregate before lease or pointer 
   }
 });
 
-void test("genuine Pi input creates one receipt-grounded private canonical Workstream", async () => {
+void test("current Pi input survives session restoration and grounds one private Workstream", async () => {
   const f = await fixture();
   try {
     await f.input("Build the canonical target", "interactive");
+    const receipt = f.session
+      .getBranch()
+      .find((entry) => entry.type === "custom" && entry.customType === "pi-workgraph-human-input");
+    assert.ok(receipt?.type === "custom");
+    assert.equal(typeof (receipt.data as { receivedAt?: unknown }).receivedAt, "string");
+    assert.equal("kind" in (receipt.data as object), false);
+
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    await f.runner.emit({ type: "session_start", reason: "reload" });
     await f.call("workgraph_intent", {
       statement: "Build the canonical target",
       constraints: ["Keep the current state loaded"],
+      authorityReceiptId: (receipt.data as { id: string }).id,
     });
     const branch = f.session.getBranch();
     const receipts = branch.filter(
       (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-human-input",
     );
     assert.equal(receipts.length, 1);
-    const receipt = receipts[0];
-    assert.ok(receipt?.type === "custom");
-    assert.equal(typeof (receipt.data as { receivedAt?: unknown }).receivedAt, "string");
     const pointers = branch.filter(
       (entry) => entry.type === "custom" && entry.customType === CANONICAL_POINTER_ENTRY,
     );

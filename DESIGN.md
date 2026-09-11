@@ -46,7 +46,7 @@ Base revisions, isolated worktrees, shared placements, exact-revision review ins
 
 Routine notifications should communicate a useful bounded outcome without replaying the work history.
 Optional drill-down should expose the complete retained evidence, findings, uncertainty, provenance, and recovery details without loss.
-Concise presentation must not erase information needed for a later decision. Worker reports should retain concrete evidence, findings, and uncertainty without mandatory classifications that add no distinct decision or evidence value; historical raw content remains readable.
+Concise presentation must not erase information needed for a later decision. Worker reports retain concrete evidence, findings, and uncertainty without mandatory classifications that add no distinct decision or evidence value; one strict current shape bounds tool input, persistence, and restoration alike.
 
 User-facing task handles should be short and semantic so people can discuss purpose rather than storage mechanics.
 Internal identities must remain exact and authoritative wherever ownership, settlement, cleanup, or recovery depends on them.

@@ -45,7 +45,7 @@ const CoordinatorTransferSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-export const HumanInputReceiptSchema = Type.Object(
+const HumanInputReceiptSchema = Type.Object(
   {
     kind: Type.Literal("human_input_receipt"),
     id: NonEmptyString,
@@ -57,6 +57,7 @@ export const HumanInputReceiptSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+export const HumanInputReceiptDataSchema = Type.Omit(HumanInputReceiptSchema, ["kind"]);
 export const HandoffGrantSchema = Type.Object(
   {
     kind: Type.Literal("handoff_grant"),
@@ -534,6 +535,7 @@ export type CoordinatorIdentity = Static<typeof CoordinatorIdentitySchema>;
 export type HerdrDeadObservation = Static<typeof HerdrDeadObservationSchema>;
 export type CoordinatorTransfer = Static<typeof CoordinatorTransferSchema>;
 export type HumanInputReceipt = Static<typeof HumanInputReceiptSchema>;
+export type HumanInputReceiptData = Static<typeof HumanInputReceiptDataSchema>;
 export type HandoffGrant = Static<typeof HandoffGrantSchema>;
 export type HandoffCheckpoint = Static<typeof HandoffCheckpointSchema>;
 export type Intent = Static<typeof IntentSchema>;
