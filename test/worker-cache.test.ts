@@ -661,7 +661,7 @@ void test("real Pi coordinator preserves the provider prefix across agent starts
     assertPrefix(provider.requests);
     for (const request of provider.requests) {
       assert.equal(request.raw.split("# Workgraph coordinator").length - 1, 1);
-      assert.match(request.raw, /Worker count and model diversity are independent/);
+      assert.match(request.raw, /Choose worker count from useful independent assignments/);
     }
     const branch = JSON.stringify(session.getBranch());
     assert.ok(branch.includes("Result crossed the real Pi boundary."));
