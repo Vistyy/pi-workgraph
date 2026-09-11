@@ -552,6 +552,7 @@ async function seeded(
         id: ID,
         repository: h.repository,
         coordinator: COORDINATOR,
+        ownership: { kind: "attach" },
         policyPath: h.policyPath,
         driver,
         commands: commandOverride,

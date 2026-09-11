@@ -5,10 +5,11 @@ import { ModelTargetSchema } from "./model-target.js";
 
 const CANONICAL_WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
 const CANONICAL_WORKSTREAM_SCHEMA = "coordination-domain" as const;
-const CANONICAL_WORKSTREAM_SCHEMA_VERSION = 1 as const;
+const CANONICAL_WORKSTREAM_SCHEMA_VERSION = 2 as const;
 
 const NonEmptyString = Type.String({ minLength: 1 });
 const Timestamp = Type.String({ minLength: 1 });
+const TransferTimestamp = Type.String({ format: "date-time" });
 const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
 const stringLiterals = <const Values extends readonly string[]>(values: Values) =>
   Type.Unsafe<Values[number]>({ type: "string", enum: [...values] });
@@ -19,6 +20,36 @@ const RepositoryIdentitySchema = Type.Object(
 );
 const CoordinatorIdentitySchema = Type.Object(
   { sessionId: NonEmptyString, sessionFile: NonEmptyString },
+  { additionalProperties: false },
+);
+export const HerdrDeadObservationSchema = Type.Object(
+  {
+    kind: Type.Literal("herdr_dead"),
+    subject: CoordinatorIdentitySchema,
+    observedAt: TransferTimestamp,
+    provenance: Type.Object(
+      {
+        workspaceId: Type.String({ minLength: 1, maxLength: 256 }),
+        tabId: Type.String({ minLength: 1, maxLength: 256 }),
+        paneId: Type.String({ minLength: 1, maxLength: 256 }),
+        terminalId: Type.String({ minLength: 1, maxLength: 256 }),
+        agentName: Type.String({ minLength: 1, maxLength: 256 }),
+        sessionFile: Type.String({ minLength: 1, maxLength: 4096 }),
+      },
+      { additionalProperties: false },
+    ),
+  },
+  { additionalProperties: false },
+);
+const CoordinatorTransferSchema = Type.Object(
+  {
+    from: CoordinatorIdentitySchema,
+    to: CoordinatorIdentitySchema,
+    committedRevision: Type.Integer({ minimum: 1 }),
+    committedAt: TransferTimestamp,
+    intentCountBoundary: Type.Integer({ minimum: 1 }),
+    deathObservation: HerdrDeadObservationSchema,
+  },
   { additionalProperties: false },
 );
 const HumanInputReceiptSchema = Type.Object(
@@ -434,6 +465,7 @@ export const WorkstreamSchema = Type.Object(
     purpose: NonEmptyString,
     repository: RepositoryIdentitySchema,
     coordinator: CoordinatorIdentitySchema,
+    coordinatorTransfers: Type.Array(CoordinatorTransferSchema),
     lifecycle: stringLiterals(["active", "completed"] as const),
     intents: Type.Array(IntentSchema, { minItems: 1 }),
     tasks: Type.Array(TaskSchema),
@@ -446,6 +478,8 @@ export const WorkstreamSchema = Type.Object(
 
 export type RepositoryIdentity = Static<typeof RepositoryIdentitySchema>;
 export type CoordinatorIdentity = Static<typeof CoordinatorIdentitySchema>;
+export type HerdrDeadObservation = Static<typeof HerdrDeadObservationSchema>;
+export type CoordinatorTransfer = Static<typeof CoordinatorTransferSchema>;
 export type HumanInputReceipt = Static<typeof HumanInputReceiptSchema>;
 export type HandoffGrant = Static<typeof HandoffGrantSchema>;
 export type Intent = Static<typeof IntentSchema>;
@@ -505,6 +539,7 @@ export function validateWorkstream(value: Workstream): void {
       `Invalid canonical Workstream at ${issue?.instancePath === undefined || issue.instancePath === "" ? "/" : issue.instancePath}: ${issue?.message ?? "schema mismatch"}.`,
     );
   }
+  validateCoordinatorTransfers(value);
   validateGrounding(value);
   unique(
     value.tasks.map((task) => task.id),
@@ -535,12 +570,73 @@ export function validateWorkstream(value: Workstream): void {
   validateLifecycle(value);
 }
 
+function validateCoordinatorTransfers(workstream: Workstream): void {
+  let position: TransferPosition = {
+    owner: workstream.coordinatorTransfers[0]?.from ?? workstream.coordinator,
+    revision: 0,
+    committedAt: "",
+    intentBoundary: 0,
+  };
+  for (const transfer of workstream.coordinatorTransfers)
+    position = validateCoordinatorTransfer(workstream, transfer, position);
+  if (!sameValue(position.owner, workstream.coordinator))
+    throw new Error("Current coordinator does not match transfer history.");
+}
+
+type TransferPosition = {
+  readonly owner: CoordinatorIdentity;
+  readonly revision: number;
+  readonly committedAt: string;
+  readonly intentBoundary: number;
+};
+
+function validateCoordinatorTransfer(
+  workstream: Workstream,
+  transfer: CoordinatorTransfer,
+  prior: TransferPosition,
+): TransferPosition {
+  if (!sameValue(transfer.from, prior.owner))
+    throw new Error("Coordinator transfer history is not continuous.");
+  if (!sameValue(transfer.deathObservation.subject, transfer.from))
+    throw new Error("Coordinator transfer death observation names another subject.");
+  if (transfer.deathObservation.provenance.sessionFile !== transfer.from.sessionFile)
+    throw new Error("Coordinator transfer provenance names another session file.");
+  if (
+    transfer.committedRevision <= prior.revision ||
+    transfer.committedRevision > workstream.revision
+  )
+    throw new Error("Coordinator transfer revisions must be strictly increasing and committed.");
+  if (prior.committedAt !== "" && transfer.committedAt <= prior.committedAt)
+    throw new Error("Coordinator transfer times must be strictly increasing.");
+  if (
+    transfer.intentCountBoundary < prior.intentBoundary ||
+    transfer.intentCountBoundary > workstream.intents.length
+  )
+    throw new Error("Coordinator transfer Intent boundary is outside retained history.");
+  return {
+    owner: transfer.to,
+    revision: transfer.committedRevision,
+    committedAt: transfer.committedAt,
+    intentBoundary: transfer.intentCountBoundary,
+  };
+}
+
+function coordinatorAtIntent(workstream: Workstream, index: number): CoordinatorIdentity {
+  let owner = workstream.coordinatorTransfers[0]?.from ?? workstream.coordinator;
+  for (const transfer of workstream.coordinatorTransfers) {
+    if (index < transfer.intentCountBoundary) break;
+    owner = transfer.to;
+  }
+  return owner;
+}
+
 function validateGrounding(workstream: Workstream): void {
   for (const [index, intent] of workstream.intents.entries()) {
     if (intent.grounding.kind === "human_input_receipt") {
+      const owner = coordinatorAtIntent(workstream, index);
       if (
-        intent.grounding.sessionId !== workstream.coordinator.sessionId ||
-        intent.grounding.sessionFile !== workstream.coordinator.sessionFile
+        intent.grounding.sessionId !== owner.sessionId ||
+        intent.grounding.sessionFile !== owner.sessionFile
       )
         throw new Error(`Intent ${index} direct receipt belongs to another coordinator session.`);
     } else {
@@ -1113,6 +1209,7 @@ export function createWorkstream(input: {
     purpose: input.purpose,
     repository: clone(input.repository),
     coordinator: clone(input.coordinator),
+    coordinatorTransfers: [],
     lifecycle: "active",
     intents: [clone(input.intent)],
     tasks: [],

@@ -11,6 +11,8 @@ import {
 } from "./canonical-sqlite-host.js";
 import {
   type CoordinatorIdentity,
+  type HerdrDeadObservation,
+  HerdrDeadObservationSchema,
   type RepositoryIdentity,
   validateWorkstream,
   type Workstream,
@@ -92,6 +94,25 @@ export interface CanonicalLease {
   readonly acquiredAt: string;
   readonly heartbeatAt: string;
   readonly expiresAt: string;
+}
+
+export type CanonicalObservedLease =
+  | { readonly kind: "absent" }
+  | { readonly kind: "present"; readonly lease: CanonicalLease };
+
+export interface CanonicalCoordinatorAdoption {
+  readonly repository: RepositoryIdentity;
+  readonly workstreamId: string;
+  readonly expectedRevision: number;
+  readonly priorCoordinator: CoordinatorIdentity;
+  readonly coordinator: CoordinatorIdentity;
+  readonly observedLease: CanonicalObservedLease;
+  readonly deathObservation: HerdrDeadObservation;
+}
+
+export interface CanonicalCoordinatorAdoptionResult {
+  readonly state: Workstream;
+  readonly lease: CanonicalLease;
 }
 
 export class CanonicalStoreInvalidError extends Data.TaggedError("CanonicalStoreInvalidError")<{
@@ -374,19 +395,7 @@ export class CanonicalWorkstreamStore {
         heartbeatAt: now,
         expiresAt: isoFromMillis(nowMillis + LEASE_DURATION_MILLIS),
       };
-      this.database.write(
-        `INSERT INTO lease(singleton,token,owner_session_id,owner_session_file,acquired_at,heartbeat_at,expires_at)
-               VALUES(1,?,?,?,?,?,?)
-               ON CONFLICT(singleton) DO UPDATE SET token=excluded.token,
-               owner_session_id=excluded.owner_session_id, owner_session_file=excluded.owner_session_file,
-               acquired_at=excluded.acquired_at, heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at`,
-        lease.token,
-        lease.owner.sessionId,
-        lease.owner.sessionFile,
-        lease.acquiredAt,
-        lease.heartbeatAt,
-        lease.expiresAt,
-      );
+      this.writeLease(lease);
       return lease;
     });
   }
@@ -433,6 +442,85 @@ export class CanonicalWorkstreamStore {
         }),
       ),
     );
+  }
+
+  /** Commit coordinator transfer and successor lease as one aggregate transaction. */
+  adoptCoordinator(
+    adoption: CanonicalCoordinatorAdoption,
+  ): Effect.Effect<CanonicalCoordinatorAdoptionResult, CanonicalStoreError, FileSystem.FileSystem> {
+    return this.atomic((nowMillis) => {
+      const current = this.readAggregate();
+      const currentLease = this.readLeaseRow();
+      this.validateAdoption(current, currentLease, adoption, nowMillis);
+      const committedAt = isoFromMillis(nowMillis);
+      const previous = current.coordinatorTransfers.at(-1);
+      if (previous !== undefined && previous.committedAt >= committedAt)
+        throw new CanonicalStoreConflictError(
+          "Coordinator adoption time does not advance transfer history.",
+        );
+      const next: Workstream = structuredClone(current);
+      next.revision = current.revision + 1;
+      next.updatedAt = committedAt;
+      next.coordinatorTransfers.push({
+        from: structuredClone(adoption.priorCoordinator),
+        to: structuredClone(adoption.coordinator),
+        committedRevision: next.revision,
+        committedAt,
+        intentCountBoundary: current.intents.length,
+        deathObservation: structuredClone(adoption.deathObservation),
+      });
+      next.coordinator = structuredClone(adoption.coordinator);
+      validateWorkstream(next);
+      const lease: CanonicalLease = {
+        token: newLeaseToken(),
+        owner: structuredClone(adoption.coordinator),
+        acquiredAt: committedAt,
+        heartbeatAt: committedAt,
+        expiresAt: isoFromMillis(nowMillis + LEASE_DURATION_MILLIS),
+      };
+      const changes = this.database.write(
+        "UPDATE workstream SET state_json=?, revision=? WHERE singleton=1 AND revision=?",
+        serializeState(next),
+        next.revision,
+        current.revision,
+      );
+      if (changes !== 1)
+        throw new CanonicalStoreConflictError("Coordinator adoption aggregate changed.");
+      this.writeLease(lease);
+      return { state: structuredClone(next), lease };
+    });
+  }
+
+  private validateAdoption(
+    current: Workstream,
+    currentLease: CanonicalLease | undefined,
+    adoption: CanonicalCoordinatorAdoption,
+    nowMillis: number,
+  ): void {
+    this.validateAdoptionAggregate(current, adoption);
+    validateAdoptionProof(adoption);
+    validateAdoptionLease(currentLease, adoption, nowMillis);
+  }
+
+  private validateAdoptionAggregate(
+    current: Workstream,
+    adoption: CanonicalCoordinatorAdoption,
+  ): void {
+    if (
+      adoption.workstreamId !== this.id ||
+      !Value.Equal(adoption.repository, this.repository) ||
+      current.id !== adoption.workstreamId ||
+      !Value.Equal(current.repository, adoption.repository)
+    )
+      throw new CanonicalStoreConflictError(
+        "Coordinator adoption repository or Workstream identity changed.",
+      );
+    if (current.revision !== adoption.expectedRevision)
+      throw new CanonicalStoreConflictError("Coordinator adoption revision changed.");
+    if (!Value.Equal(current.coordinator, adoption.priorCoordinator))
+      throw new CanonicalStoreConflictError("Coordinator adoption prior owner changed.");
+    if (Value.Equal(adoption.coordinator, adoption.priorCoordinator))
+      throw new CanonicalStoreInvalidError("Coordinator adoption requires a different successor.");
   }
 
   /**
@@ -546,6 +634,22 @@ export class CanonicalWorkstreamStore {
     return lease;
   }
 
+  private writeLease(lease: CanonicalLease): void {
+    this.database.write(
+      `INSERT INTO lease(singleton,token,owner_session_id,owner_session_file,acquired_at,heartbeat_at,expires_at)
+       VALUES(1,?,?,?,?,?,?)
+       ON CONFLICT(singleton) DO UPDATE SET token=excluded.token,
+       owner_session_id=excluded.owner_session_id, owner_session_file=excluded.owner_session_file,
+       acquired_at=excluded.acquired_at, heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at`,
+      lease.token,
+      lease.owner.sessionId,
+      lease.owner.sessionFile,
+      lease.acquiredAt,
+      lease.heartbeatAt,
+      lease.expiresAt,
+    );
+  }
+
   private assertHeldLease(lease: CanonicalLease, nowMillis: number): void {
     const current = this.readLeaseRow();
     if (current === undefined || !sameLeaseHolder(current, lease)) throw leaseConflict(lease);
@@ -629,6 +733,19 @@ function validateIdentitySync(paths: Path.Path, repository: RepositoryIdentity, 
 }
 
 function validateTransition(current: Workstream, next: Workstream): void {
+  for (const key of [
+    "format",
+    "schema",
+    "schemaVersion",
+    "id",
+    "repository",
+    "coordinator",
+    "coordinatorTransfers",
+    "purpose",
+    "createdAt",
+  ] as const)
+    if (!Value.Equal(next[key], current[key]))
+      throw new CanonicalStoreInvalidError(`Transition cannot rewrite immutable ${key}.`);
   try {
     validateWorkstream(next);
   } catch (cause) {
@@ -640,18 +757,6 @@ function validateTransition(current: Workstream, next: Workstream): void {
     throw new CanonicalStoreInvalidError(
       `Changed transition must return revision ${current.revision + 1}.`,
     );
-  for (const key of [
-    "format",
-    "schema",
-    "schemaVersion",
-    "id",
-    "repository",
-    "coordinator",
-    "purpose",
-    "createdAt",
-  ] as const)
-    if (!Value.Equal(next[key], current[key]))
-      throw new CanonicalStoreInvalidError(`Transition cannot rewrite immutable ${key}.`);
 }
 
 function parseWorkstream(text: string): Workstream {
@@ -846,6 +951,40 @@ function classifyFileHeader(
     if (new TextDecoder().decode(header) !== SQLITE_HEADER)
       return yield* invalid(`Canonical database is not a supported SQLite file: ${path}.`);
   });
+}
+
+function validateAdoptionProof(adoption: CanonicalCoordinatorAdoption): void {
+  if (
+    !Value.Check(HerdrDeadObservationSchema, adoption.deathObservation) ||
+    !Value.Equal(adoption.deathObservation.subject, adoption.priorCoordinator) ||
+    adoption.deathObservation.provenance.sessionFile !== adoption.priorCoordinator.sessionFile
+  )
+    throw new CanonicalStoreInvalidError(
+      "Coordinator adoption requires a Herdr-dead observation bound to the exact prior owner.",
+    );
+}
+
+function validateAdoptionLease(
+  current: CanonicalLease | undefined,
+  adoption: CanonicalCoordinatorAdoption,
+  nowMillis: number,
+): void {
+  if (adoption.observedLease.kind === "absent") {
+    if (current !== undefined)
+      throw new CanonicalStoreConflictError(
+        "An absent lease observation no longer matches the store.",
+      );
+    return;
+  }
+  validateLease(adoption.observedLease.lease);
+  if (current === undefined || !sameLease(current, adoption.observedLease.lease))
+    throw new CanonicalStoreConflictError("The exact observed adoption lease changed.");
+  if (!Value.Equal(current.owner, adoption.priorCoordinator))
+    throw new CanonicalStoreConflictError(
+      "The observed adoption lease belongs to another coordinator.",
+    );
+  if (instantMillis(current.expiresAt) > nowMillis)
+    throw new CanonicalStoreConflictError("The exact observed adoption lease has not expired.");
 }
 
 function validateLeaseInput(

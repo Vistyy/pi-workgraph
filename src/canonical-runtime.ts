@@ -50,8 +50,21 @@ import {
   type ResolvedReviewInput,
 } from "./canonical-reconciliation.js";
 import {
+  CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+  closeRuntimeGeneration,
+  compatibleRuntimeGeneration,
+  publishRuntimeGeneration,
+  type RuntimeGenerationEntry,
+  type RuntimeGenerationHandle,
+  type RuntimeGenerationQuiescence,
+  type RuntimeGenerationRegistryError,
+  reserveRuntimeGenerationPath,
+  runtimeGeneration,
+  unregisterRuntimeGeneration,
+} from "./canonical-runtime-generation.js";
+import {
+  type CanonicalCoordinatorAdoption,
   type CanonicalLease,
-  CanonicalStoreConflictError,
   type CanonicalStoreError,
   CanonicalWorkstreamStore,
 } from "./canonical-workstream-store.js";
@@ -67,6 +80,7 @@ import {
   findAttempt,
   findOutcome,
   findTask,
+  type HerdrDeadObservation,
   type Intent,
   type Outcome,
   type RepositoryIdentity,
@@ -88,7 +102,12 @@ export class CanonicalRuntimeIdentityError extends Data.TaggedError(
 }> {}
 
 export class CanonicalRuntimeLeaseError extends Data.TaggedError("CanonicalRuntimeLeaseError")<{
-  readonly code: "lease_takeover_requires_dead_owner";
+  readonly code:
+    | "lease_already_held"
+    | "generation_proof_missing"
+    | "generation_proof_mismatch"
+    | "generation_not_quiescent"
+    | "lease_changed_after_close";
   readonly message: string;
 }> {}
 
@@ -118,6 +137,7 @@ export type CanonicalRuntimeError =
   | CanonicalRuntimeStoppedError
   | CanonicalRuntimeStaleError
   | CanonicalRuntimeOperationError
+  | RuntimeGenerationRegistryError
   | CanonicalCommandError;
 
 export type CanonicalRuntimeEffect<A> = Effect.Effect<
@@ -131,12 +151,16 @@ export interface CanonicalRuntimeInspectionSnapshot {
   readonly reconciliation: readonly ReconciliationFrontierObservation[];
 }
 
+export type CanonicalRuntimeOwnership =
+  | { readonly kind: "attach" }
+  | { readonly kind: "recover" }
+  | { readonly kind: "adopt"; readonly deathObservation: HerdrDeadObservation };
+
 export interface CanonicalRuntimeAcquisition {
   readonly id: string;
   readonly repository: RepositoryIdentity;
   readonly coordinator: CoordinatorIdentity;
-  /** Only proven prior-owner death permits lease takeover. */
-  readonly priorOwnerLiveness?: "alive" | "dead" | "unknown";
+  readonly ownership: CanonicalRuntimeOwnership;
   readonly policyPath?: string;
   readonly driver: ReconciliationDriver;
   readonly commands?: CanonicalCommandPorts;
@@ -163,7 +187,10 @@ export class CanonicalRuntime {
     private readonly closeRequest: Deferred.Deferred<CanonicalRuntimeError | undefined>,
     private readonly shutdownClaimed: Ref.Ref<boolean>,
     private readonly completion: Deferred.Deferred<void, CanonicalRuntimeError>,
+    private readonly generationQuiescence: Deferred.Deferred<RuntimeGenerationQuiescence>,
+    private readonly releaseFailure: Ref.Ref<CanonicalStoreError | undefined>,
     private readonly acquisition: CanonicalRuntimeAcquisition,
+    private generationHandle?: RuntimeGenerationHandle,
   ) {}
 
   /**
@@ -197,9 +224,12 @@ export class CanonicalRuntime {
       const resourceScope = yield* Effect.acquireRelease(Scope.make("sequential"), (scope) =>
         Scope.close(scope, Exit.void),
       );
-      const runtime = yield* CanonicalRuntime.build(resourceScope, acquisition).pipe(
+      const path = yield* CanonicalWorkstreamStore.pathFor(acquisition.repository, acquisition.id);
+      const releaseReservation = yield* reserveRuntimeGenerationPath(path);
+      const runtime = yield* CanonicalRuntime.build(resourceScope, acquisition, path).pipe(
         Scope.provide(resourceScope),
         Effect.onError((cause) => Scope.close(resourceScope, Exit.failCause(cause))),
+        Effect.ensuring(Effect.sync(releaseReservation)),
       );
       // This controller is owned by the caller Scope, never the global Scope and
       // never the child Scope whose FiberSet it may need to close.
@@ -211,6 +241,7 @@ export class CanonicalRuntime {
   private static build(
     resourceScope: Scope.Scope,
     acquisition: CanonicalRuntimeAcquisition,
+    path: string,
   ): Effect.Effect<
     CanonicalRuntime,
     CanonicalRuntimeError,
@@ -221,26 +252,21 @@ export class CanonicalRuntime {
         acquisition.id,
         acquisition.repository,
       );
-      const { store, state } = attachment;
-      if (!sameCoordinator(state.coordinator, acquisition.coordinator))
-        return yield* new CanonicalRuntimeIdentityError({
-          message: `Workstream ${acquisition.id} is coordinated by another session; adoption is a separate authority boundary.`,
-        });
-      const observed = yield* store.observeLease();
-      const lease = yield* Effect.acquireRelease(
-        acquireLease(store, acquisition, observed),
-        (held) =>
-          // Release the exact current lease only while it is still held. A conflict
-          // means it is no longer ours, so nothing is released twice. Caller-Scope
-          // owner finalization intentionally contains a duplicate close failure;
-          // close()/awaitClosed() retain the typed completion failure.
-          store.releaseLease(held).pipe(
-            Effect.catchIf(
-              (error) => error instanceof CanonicalStoreConflictError,
-              () => Effect.void,
+      const { store } = attachment;
+      const owned = yield* prepareOwnership(store, attachment.state, acquisition, path);
+      const state = owned.state;
+      const releaseFailure = yield* Ref.make<CanonicalStoreError | undefined>(undefined);
+      const lease = yield* Effect.acquireRelease(Effect.succeed(owned.lease), (held) =>
+        store.releaseLease(held).pipe(
+          Effect.catch((error) =>
+            store.observeLease().pipe(
+              Effect.flatMap((row) =>
+                row === undefined ? Effect.void : Ref.set(releaseFailure, error),
+              ),
+              Effect.catch(() => Ref.set(releaseFailure, error)),
             ),
-            Effect.orDie,
           ),
+        ),
       );
       const semaphore = yield* Semaphore.make(1);
       const fibers = yield* FiberSet.make<unknown, never>();
@@ -254,6 +280,7 @@ export class CanonicalRuntime {
       const closeRequest = yield* Deferred.make<CanonicalRuntimeError | undefined>();
       const shutdownClaimed = yield* Ref.make(false);
       const completion = yield* Deferred.make<void, CanonicalRuntimeError>();
+      const generationQuiescence = yield* Deferred.make<RuntimeGenerationQuiescence>();
       const runtime = new CanonicalRuntime(
         resourceScope,
         store,
@@ -265,16 +292,37 @@ export class CanonicalRuntime {
         closeRequest,
         shutdownClaimed,
         completion,
+        generationQuiescence,
+        releaseFailure,
         acquisition,
       );
-      // The exact-key control must be usable before the first attachment wake can
-      // dispatch, so it is installed while the scheduler is still asleep.
-      yield* scheduler.provideControls((key) => runtime.controlFor(key));
-      // The attachment read is the one full classification; the scheduler then
-      // sleeps until a committed notification or manual reconcile wakes it.
-      yield* scheduler.attach(state);
-      yield* FiberSet.run(fibers, runtime.heartbeatLoop());
-      yield* FiberSet.run(fibers, scheduler.run());
+      const handle: RuntimeGenerationHandle = {
+        // oxlint-disable-next-line effecttsgo/run-effect-inside-effect -- The versioned globalThis protocol invokes this host Promise after acquisition has returned.
+        close: () => Effect.runPromise(runtime.closeForGeneration()),
+      };
+      runtime.generationHandle = handle;
+      const entry: RuntimeGenerationEntry = {
+        protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+        path,
+        workstreamId: acquisition.id,
+        coordinator: structuredClone(acquisition.coordinator),
+        token: lease.token,
+        handle,
+        status: "active",
+      };
+      publishRuntimeGeneration(entry);
+      yield* Effect.gen(function* () {
+        yield* scheduler.provideControls((key) => runtime.controlFor(key));
+        yield* scheduler.attach(state);
+        yield* FiberSet.run(fibers, runtime.heartbeatLoop());
+        yield* FiberSet.run(fibers, scheduler.run());
+      }).pipe(
+        Effect.onError(() =>
+          Effect.sync(() => {
+            entry.status = "failed";
+          }),
+        ),
+      );
       return runtime;
     });
   }
@@ -810,7 +858,17 @@ export class CanonicalRuntime {
           if (owned) return undefined;
           const fatal = yield* Deferred.await(this.closeRequest);
           const exit = yield* Effect.exit(Scope.close(this.resourceScope, Exit.void));
-          const closeError = Exit.isFailure(exit) ? closeFailure(exit.cause) : undefined;
+          const resourceError = Exit.isFailure(exit) ? closeFailure(exit.cause) : undefined;
+          yield* Deferred.succeed(
+            this.generationQuiescence,
+            resourceError === undefined
+              ? { quiescent: true }
+              : { quiescent: false, detail: resourceError.message },
+          );
+          const releaseError = yield* Ref.get(this.releaseFailure);
+          const closeError =
+            resourceError ??
+            (releaseError === undefined ? undefined : releaseFailureError(releaseError));
           if (closeError === undefined) yield* Deferred.succeed(this.completion, undefined);
           else yield* Deferred.fail(this.completion, closeError);
           if (fatal === undefined) return undefined;
@@ -830,11 +888,27 @@ export class CanonicalRuntime {
   }
 
   private ownerFinalizer(): Effect.Effect<void> {
-    return this.requestClose().pipe(Effect.andThen(this.shutdown()), Effect.ignore);
+    return this.requestClose().pipe(
+      Effect.andThen(this.shutdown()),
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (this.generationHandle !== undefined)
+            unregisterRuntimeGeneration(this.store.path, this.lease.token, this.generationHandle);
+        }),
+      ),
+      Effect.ignore,
+    );
   }
 
   private closeEffect(): Effect.Effect<void, CanonicalRuntimeError> {
     return this.requestClose().pipe(Effect.andThen(this.shutdown()));
+  }
+
+  private closeForGeneration(): Effect.Effect<RuntimeGenerationQuiescence> {
+    return this.requestClose().pipe(
+      Effect.andThen(this.shutdown().pipe(Effect.ignore)),
+      Effect.andThen(Deferred.await(this.generationQuiescence)),
+    );
   }
 }
 
@@ -870,23 +944,247 @@ function planCancellation(
   return checkpointCancellation(state, key, { state: "requested", requestedAt: now, reason }, now);
 }
 
-function acquireLease(
+function prepareOwnership(
+  store: CanonicalWorkstreamStore,
+  initial: Workstream,
+  acquisition: CanonicalRuntimeAcquisition,
+  path: string,
+): Effect.Effect<
+  { readonly state: Workstream; readonly lease: CanonicalLease },
+  CanonicalRuntimeError,
+  FileSystem.FileSystem
+> {
+  return Effect.gen(function* () {
+    const observed = yield* store.observeLease();
+    if (sameCoordinator(initial.coordinator, acquisition.coordinator))
+      return yield* prepareCurrentCoordinator(store, initial, acquisition, path, observed);
+    if (acquisition.ownership.kind !== "adopt")
+      return yield* new CanonicalRuntimeIdentityError({
+        message: `Workstream ${acquisition.id} is coordinated by ${initial.coordinator.sessionId}; different-session attachment requires explicit adoption.`,
+      });
+    return yield* adoptDifferentCoordinator(
+      store,
+      initial,
+      acquisition,
+      path,
+      observed,
+      acquisition.ownership.deathObservation,
+    );
+  });
+}
+
+function prepareCurrentCoordinator(
+  store: CanonicalWorkstreamStore,
+  initial: Workstream,
+  acquisition: CanonicalRuntimeAcquisition,
+  path: string,
+  observed: CanonicalLease | undefined,
+): Effect.Effect<
+  { readonly state: Workstream; readonly lease: CanonicalLease },
+  CanonicalRuntimeError,
+  FileSystem.FileSystem
+> {
+  if (observed === undefined) {
+    const retained = runtimeGeneration(path);
+    if (retained?.status === "failed" || retained?.status === "closing")
+      return leaseError(
+        "generation_not_quiescent",
+        path,
+        undefined,
+        `the retained process-local generation is ${retained.status}`,
+      );
+    return store
+      .acquireLease(acquisition.coordinator)
+      .pipe(Effect.map((lease) => ({ state: initial, lease })));
+  }
+  if (acquisition.ownership.kind === "attach")
+    return leaseError(
+      "lease_already_held",
+      path,
+      observed,
+      "ordinary attachment found an existing same-session lease; explicit controlled recovery is required",
+    );
+  if (acquisition.ownership.kind === "adopt")
+    return leaseError(
+      "generation_proof_mismatch",
+      path,
+      observed,
+      "Herdr-dead proof cannot authorize same-session generation recovery; explicit controlled recovery is required",
+    );
+  return recoverGeneration(store, acquisition, path, observed);
+}
+
+function adoptDifferentCoordinator(
+  store: CanonicalWorkstreamStore,
+  initial: Workstream,
+  acquisition: CanonicalRuntimeAcquisition,
+  path: string,
+  observed: CanonicalLease | undefined,
+  deathObservation: HerdrDeadObservation,
+): Effect.Effect<
+  { readonly state: Workstream; readonly lease: CanonicalLease },
+  CanonicalRuntimeError,
+  FileSystem.FileSystem
+> {
+  return Effect.gen(function* () {
+    const local = runtimeGeneration(path);
+    if (local !== undefined)
+      yield* quiesceAdoptionGeneration(local, initial, acquisition, path, observed);
+    const locallyQuiesced = local !== undefined;
+    const current = yield* store.read();
+    if (!Value.Equal(current, initial))
+      return yield* new CanonicalRuntimeIdentityError({
+        message: `Canonical state changed before coordinator adoption at ${path}.`,
+      });
+    const currentLease = yield* store.observeLease();
+    yield* validateAdoptionReobservation(path, observed, currentLease, locallyQuiesced);
+    const adoption: CanonicalCoordinatorAdoption = {
+      repository: acquisition.repository,
+      workstreamId: acquisition.id,
+      expectedRevision: initial.revision,
+      priorCoordinator: initial.coordinator,
+      coordinator: acquisition.coordinator,
+      observedLease:
+        currentLease === undefined ? { kind: "absent" } : { kind: "present", lease: currentLease },
+      deathObservation,
+    };
+    return yield* store.adoptCoordinator(adoption);
+  });
+}
+
+function validateAdoptionReobservation(
+  path: string,
+  before: CanonicalLease | undefined,
+  after: CanonicalLease | undefined,
+  locallyQuiesced: boolean,
+): Effect.Effect<void, CanonicalRuntimeLeaseError> {
+  if (before === undefined && after === undefined) return Effect.void;
+  if (before !== undefined && after !== undefined && sameExactLease(before, after))
+    return Effect.void;
+  if (before !== undefined && after === undefined && locallyQuiesced) return Effect.void;
+  return leaseError(
+    "lease_changed_after_close",
+    path,
+    after,
+    "the lease row changed after the adoption observation",
+  );
+}
+
+function quiesceAdoptionGeneration(
+  local: RuntimeGenerationEntry,
+  initial: Workstream,
+  acquisition: CanonicalRuntimeAcquisition,
+  path: string,
+  observed: CanonicalLease | undefined,
+): Effect.Effect<void, CanonicalRuntimeLeaseError> {
+  return Effect.gen(function* () {
+    if (
+      !compatibleRuntimeGeneration(local, {
+        path,
+        workstreamId: acquisition.id,
+        coordinator: initial.coordinator,
+        lease: observed ?? diagnosticLease(initial.coordinator),
+      })
+    )
+      return yield* leaseError(
+        "generation_proof_mismatch",
+        path,
+        observed,
+        "a local prior generation exists but does not match the exact persisted owner and lease",
+      );
+    const result = yield* Effect.promise(() => closeRuntimeGeneration(local));
+    if (!result.quiescent)
+      return yield* leaseError(
+        "generation_not_quiescent",
+        path,
+        observed,
+        result.detail ?? "the local prior generation did not prove quiescence",
+      );
+  });
+}
+
+function recoverGeneration(
   store: CanonicalWorkstreamStore,
   acquisition: CanonicalRuntimeAcquisition,
-  observed: CanonicalLease | undefined,
-): Effect.Effect<CanonicalLease, CanonicalRuntimeError, FileSystem.FileSystem> {
+  path: string,
+  observed: CanonicalLease,
+): Effect.Effect<
+  { readonly state: Workstream; readonly lease: CanonicalLease },
+  CanonicalRuntimeError,
+  FileSystem.FileSystem
+> {
   return Effect.gen(function* () {
-    if (observed === undefined) return yield* store.acquireLease(acquisition.coordinator);
-    // An existing lease is replaceable only with its exact expired observation
-    // and caller-supplied proof that its prior owner is dead. The store fences
-    // the exact observation and expiry; the runtime owns the liveness rule.
-    if (acquisition.priorOwnerLiveness !== "dead")
-      return yield* new CanonicalRuntimeLeaseError({
-        code: "lease_takeover_requires_dead_owner",
-        message: `Workstream ${acquisition.id} already has a fenced lease; replacement requires the exact expired observation and caller-supplied prior-owner liveness "dead".`,
-      });
-    return yield* store.acquireLease(acquisition.coordinator, observed);
+    const entry = runtimeGeneration(path);
+    if (entry === undefined)
+      return yield* leaseError(
+        "generation_proof_missing",
+        path,
+        observed,
+        "no compatible process-local generation exists; cross-process same-session recovery is unsupported",
+      );
+    if (
+      !compatibleRuntimeGeneration(entry, {
+        path,
+        workstreamId: acquisition.id,
+        coordinator: acquisition.coordinator,
+        lease: observed,
+      })
+    )
+      return yield* leaseError(
+        "generation_proof_mismatch",
+        path,
+        observed,
+        "the process-local generation has a mismatched protocol, path, Workstream, owner, or token",
+      );
+    const result = yield* Effect.promise(() => closeRuntimeGeneration(entry));
+    if (!result.quiescent)
+      return yield* leaseError(
+        "generation_not_quiescent",
+        path,
+        observed,
+        result.detail ?? "the prior runtime did not prove operation and resource quiescence",
+      );
+    const after = yield* store.observeLease();
+    if (after === undefined)
+      return {
+        state: yield* store.read(),
+        lease: yield* store.acquireLease(acquisition.coordinator),
+      };
+    if (!sameExactLease(after, observed))
+      return yield* leaseError(
+        "lease_changed_after_close",
+        path,
+        after,
+        "the lease row changed while the prior runtime closed",
+      );
+    return {
+      state: yield* store.read(),
+      lease: yield* store.acquireLease(acquisition.coordinator, after),
+    };
   });
+}
+
+function leaseError(
+  code: CanonicalRuntimeLeaseError["code"],
+  path: string,
+  observed: CanonicalLease | undefined,
+  proof: string,
+): Effect.Effect<never, CanonicalRuntimeLeaseError> {
+  const row =
+    observed === undefined
+      ? "observed lease absence"
+      : `observed owner ${observed.owner.sessionId}, token ${observed.token}, expiry ${observed.expiresAt}`;
+  return Effect.fail(
+    new CanonicalRuntimeLeaseError({ code, message: `${path}: ${row}; ${proof}.` }),
+  );
+}
+
+function sameExactLease(left: CanonicalLease, right: CanonicalLease): boolean {
+  return Value.Equal(left, right);
+}
+
+function diagnosticLease(owner: CoordinatorIdentity): CanonicalLease {
+  return { token: "<absent>", owner, acquiredAt: "", heartbeatAt: "", expiresAt: "" };
 }
 
 /** A mutable context shape so optional facts are added only when present. */
@@ -975,6 +1273,14 @@ function staleError(operation: string): CanonicalRuntimeStaleError {
   return new CanonicalRuntimeStaleError({
     operation,
     message: `${operation} planned from a projection that no longer matches the authoritative aggregate; run an authoritative read or manual reconcile before retrying.`,
+  });
+}
+
+function releaseFailureError(cause: CanonicalStoreError): CanonicalRuntimeOperationError {
+  return new CanonicalRuntimeOperationError({
+    operation: "release canonical runtime lease",
+    message: "Runtime resources are quiescent but exact lease release failed.",
+    cause,
   });
 }
 

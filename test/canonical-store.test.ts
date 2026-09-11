@@ -106,6 +106,22 @@ function receipt(id: string, text: string): Intent["grounding"] {
   };
 }
 
+function deadObservation(subject = COORDINATOR) {
+  return {
+    kind: "herdr_dead" as const,
+    subject,
+    observedAt: T0,
+    provenance: {
+      workspaceId: "workspace",
+      tabId: "tab",
+      paneId: "pane",
+      terminalId: "terminal",
+      agentName: "coordinator",
+      sessionFile: subject.sessionFile,
+    },
+  };
+}
+
 function intent(statement: string, receiptId = "receipt-1"): Intent {
   return {
     statement,
@@ -423,6 +439,143 @@ void test("canonical lease observation, fencing, and expired takeover stay exact
       ),
       /malformed|invalid instant/,
     );
+  } finally {
+    await rm(fixture.parent, { recursive: true, force: true });
+  }
+});
+
+void test("coordinator adoption atomically transfers ownership and installs one fresh lease", async () => {
+  const fixture = await canonicalFixture();
+  const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+  await Effect.runPromise(clock.setTime(START_MILLIS));
+  try {
+    const observed = await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* createCanonical(fixture);
+        return yield* store.acquireLease(COORDINATOR);
+      }),
+      clock,
+    );
+    const beforeBytes = await readFile(storagePath(fixture));
+    await assert.rejects(
+      runCanonical(
+        Effect.gen(function* () {
+          const store = yield* openCanonical(fixture);
+          return yield* store.adoptCoordinator({
+            repository: fixture.repository,
+            workstreamId: ID,
+            expectedRevision: 0,
+            priorCoordinator: COORDINATOR,
+            coordinator: OWNER_B,
+            observedLease: { kind: "present", lease: observed },
+            deathObservation: deadObservation(),
+          });
+        }),
+        clock,
+      ),
+      /has not expired/,
+    );
+    assert.deepEqual(await readFile(storagePath(fixture)), beforeBytes);
+    await assert.rejects(
+      runCanonical(
+        Effect.gen(function* () {
+          const store = yield* openCanonical(fixture);
+          return yield* store.adoptCoordinator({
+            repository: fixture.repository,
+            workstreamId: ID,
+            expectedRevision: 0,
+            priorCoordinator: COORDINATOR,
+            coordinator: OWNER_B,
+            observedLease: { kind: "absent" },
+            deathObservation: deadObservation(OWNER_B),
+          });
+        }),
+        clock,
+      ),
+      /exact prior owner|absent lease observation/,
+    );
+    assert.deepEqual(await readFile(storagePath(fixture)), beforeBytes);
+
+    await Effect.runPromise(clock.setTime(START_MILLIS + 30_001));
+    rawDatabase(storagePath(fixture), (database) =>
+      database.exec(
+        "CREATE TRIGGER reject_adoption BEFORE UPDATE ON workstream BEGIN SELECT RAISE(FAIL, 'adoption blocked'); END",
+      ),
+    );
+    await assert.rejects(
+      runCanonical(
+        Effect.gen(function* () {
+          const store = yield* openCanonical(fixture);
+          return yield* store.adoptCoordinator({
+            repository: fixture.repository,
+            workstreamId: ID,
+            expectedRevision: 0,
+            priorCoordinator: COORDINATOR,
+            coordinator: OWNER_B,
+            observedLease: { kind: "present", lease: observed },
+            deathObservation: deadObservation(),
+          });
+        }),
+        clock,
+      ),
+      /canonical transaction/,
+    );
+    const rolledBack = await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* openCanonical(fixture);
+        return { state: yield* store.read(), lease: yield* store.observeLease() };
+      }),
+      clock,
+    );
+    assert.equal(rolledBack.state.revision, 0);
+    assert.deepEqual(rolledBack.lease, observed);
+    rawDatabase(storagePath(fixture), (database) => database.exec("DROP TRIGGER reject_adoption"));
+
+    const adopted = await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* openCanonical(fixture);
+        return yield* store.adoptCoordinator({
+          repository: fixture.repository,
+          workstreamId: ID,
+          expectedRevision: 0,
+          priorCoordinator: COORDINATOR,
+          coordinator: OWNER_B,
+          observedLease: { kind: "present", lease: observed },
+          deathObservation: deadObservation(),
+        });
+      }),
+      clock,
+    );
+    assert.equal(adopted.state.revision, 1);
+    assert.deepEqual(adopted.state.coordinator, OWNER_B);
+    assert.equal(adopted.state.coordinatorTransfers.length, 1);
+    assert.equal(adopted.state.coordinatorTransfers[0]?.intentCountBoundary, 1);
+    assert.deepEqual(adopted.lease.owner, OWNER_B);
+    assert.notEqual(adopted.lease.token, observed.token);
+
+    await assert.rejects(
+      runCanonical(
+        Effect.gen(function* () {
+          const store = yield* openCanonical(fixture);
+          return yield* store.transition(adopted.lease, (current) => ({
+            ...current,
+            revision: current.revision + 1,
+            coordinatorTransfers: [],
+          }));
+        }),
+        clock,
+      ),
+      /immutable coordinatorTransfers/,
+    );
+    const replay = await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* openCanonical(fixture);
+        return { state: yield* store.read(), lease: yield* store.observeLease() };
+      }),
+      clock,
+    );
+    assert.equal(replay.state.coordinatorTransfers.length, 1);
+    assert.deepEqual(replay.lease, adopted.lease);
   } finally {
     await rm(fixture.parent, { recursive: true, force: true });
   }

@@ -420,6 +420,7 @@ const acquire = (
     coordinator: COORDINATOR,
     policyPath: f.policyPath,
     driver,
+    ownership: { kind: "attach" },
     ...extra,
   });
 const driverFrom = (handler: ReconciliationDriver["reconcile"]): ReconciliationDriver => ({

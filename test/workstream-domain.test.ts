@@ -899,6 +899,75 @@ void test("grant is creation-only first grounding and revisions require a curren
   );
 });
 
+void test("coordinator transfer history preserves direct receipt ownership intervals", () => {
+  const initial = base();
+  assert.deepEqual(initial.coordinatorTransfers, []);
+  const successor = { sessionId: "successor", sessionFile: "/successor.json" };
+  const adopted = structuredClone(initial);
+  adopted.revision = 1;
+  adopted.updatedAt = "2024-01-02T00:00:00.000Z";
+  adopted.coordinator = successor;
+  adopted.coordinatorTransfers.push({
+    from: coordinator,
+    to: successor,
+    committedRevision: 1,
+    committedAt: "2024-01-02T00:00:00.000Z",
+    intentCountBoundary: 1,
+    deathObservation: {
+      kind: "herdr_dead",
+      subject: coordinator,
+      observedAt: "2024-01-01T00:00:00.000Z",
+      provenance: {
+        workspaceId: "workspace",
+        tabId: "tab",
+        paneId: "pane",
+        terminalId: "terminal",
+        agentName: "coordinator",
+        sessionFile: coordinator.sessionFile,
+      },
+    },
+  });
+  validateWorkstream(adopted);
+  const revised = reviseIntent(
+    adopted,
+    {
+      statement: "Successor intent.",
+      constraints: [],
+      grounding: {
+        kind: "human_input_receipt",
+        id: "successor receipt",
+        sessionId: successor.sessionId,
+        sessionFile: successor.sessionFile,
+        source: "interactive",
+        text: "Successor intent.",
+        receivedAt: "t2",
+      },
+      recordedAt: "t2",
+    },
+    "t2",
+  );
+  validateWorkstream(revised);
+
+  const rewritten = structuredClone(revised);
+  const firstIntent = rewritten.intents[0];
+  assert.ok(firstIntent !== undefined && firstIntent.grounding.kind === "human_input_receipt");
+  rewritten.intents[0] = {
+    ...firstIntent,
+    grounding: { ...firstIntent.grounding, sessionId: successor.sessionId },
+  };
+  assert.throws(() => validateWorkstream(rewritten), /Intent 0 direct receipt/);
+  assert.throws(
+    () => reviseIntent(adopted, { ...intent, recordedAt: "t2" }, "t2"),
+    /current coordinator/,
+  );
+
+  const broken = structuredClone(adopted);
+  const firstTransfer = broken.coordinatorTransfers[0];
+  assert.ok(firstTransfer !== undefined);
+  firstTransfer.from = successor;
+  assert.throws(() => validateWorkstream(broken), /death observation|transfer history/);
+});
+
 void test("report kind follows Task kind and first terminal replay uses structural equality", () => {
   const researchObservation = reported();
   assert.equal(researchObservation.kind, "reported");
