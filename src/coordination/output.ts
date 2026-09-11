@@ -22,7 +22,7 @@ import {
 } from "./commands.js";
 
 export interface MaintainedOutputControl<E, R> {
-  readonly state: Effect.Effect<Workstream, E, R>;
+  readonly state: (attemptId: string) => Effect.Effect<Workstream, E, R>;
   readonly commit: (
     operation: string,
     key: ReturnType<typeof exactAttempt>["key"],
@@ -44,7 +44,7 @@ export function applyMaintainedOutput<E, R>(
       value,
       "application command",
     );
-    let state = yield* control.state;
+    let state = yield* control.state(input.attemptId);
     const located = yield* locate(state, input.attemptId);
     if (state.lifecycle !== "completed" && located.task.intentIndex !== state.intents.length - 1)
       return yield* failure(
@@ -117,7 +117,7 @@ function resumeApplication<E, R>(
       return yield* appliedCheckpoint(control, state, attemptId, recovered.success.head);
 
     yield* control.fence;
-    state = yield* control.state;
+    state = yield* control.state(attemptId);
     const located = yield* locate(state, attemptId);
     source = yield* sourceFor(control, located.attempt);
     const prepared = yield* Effect.result(
@@ -173,7 +173,7 @@ export function releaseMaintainedOutput<E, R>(
       value,
       "output release command",
     );
-    let state = yield* control.state;
+    let state = yield* control.state(input.attemptId);
     const located = yield* locate(state, input.attemptId);
     if (state.lifecycle !== "completed" && located.task.intentIndex !== state.intents.length - 1)
       return yield* failure(

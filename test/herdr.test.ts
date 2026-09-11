@@ -1248,7 +1248,7 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   }
 });
 
-await test("progressive launch fences the lease immediately before each mutating remote call", async () => {
+await test("progressive launch fences runtime ownership before each mutating remote call", async () => {
   class FenceLostError extends Data.TaggedError("FenceLostError")<{ readonly detail: string }> {}
   const parent = await mkdtemp(join(tmpdir(), "pi-workgraph-herdr-fence-"));
   const log = join(parent, "commands.jsonl");
@@ -1296,7 +1296,7 @@ await test("progressive launch fences the lease immediately before each mutating
             Effect.gen(function* () {
               fenceCount += 1;
               if (fenceCount === 2)
-                return yield* new FenceLostError({ detail: "lease lost before agent start" });
+                return yield* new FenceLostError({ detail: "ownership lost before agent start" });
             }),
         }),
       ),

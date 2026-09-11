@@ -1,17 +1,7 @@
 /* oxlint-disable effecttsgo/any-unknown-in-error-context, effecttsgo/global-error-in-effect-failure, typescript/no-this-alias, anti-slop/no-conditional-empty-object-spread, anti-slop/no-runtime-typeof -- The controller composes independently typed workstream/host failures at the single Pi Promise boundary; messages are bounded before presentation, optional properties retain exact external schemas, and the delivery closure must retain its controller owner. */
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import {
-  Clock,
-  Data,
-  DateTime,
-  Effect,
-  Exit,
-  type FileSystem,
-  type Path,
-  Scope,
-  Semaphore,
-} from "effect";
+import { Clock, Data, DateTime, Effect, Exit, type FileSystem, type Path, Semaphore } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import type { HumanInputReceiptData } from "../domain/workstream.js";
@@ -19,11 +9,9 @@ import {
   type CoordinatorIdentity,
   createWorkstream,
   type HandoffGrant,
-  HerdrDeadObservationSchema,
   type Intent,
   type RepositoryIdentity,
   type Workstream,
-  WorkstreamSchema,
 } from "../domain/workstream.js";
 import { GitRepository, inspectRepository } from "../git.js";
 import { handoffChildWorkstreamId } from "../handoff-session.js";
@@ -44,7 +32,7 @@ import {
   workstreamOutcomeNotification,
 } from "./inspection.js";
 import { ReconciliationDriverError } from "./reconciliation.js";
-import { WorkstreamRuntime, type WorkstreamRuntimeOwnership } from "./runtime.js";
+import { WorkstreamRuntime } from "./runtime.js";
 
 export const WORKSTREAM_POINTER_ENTRY = "pi-workgraph-workstream-pointer";
 const WORKSTREAM_MESSAGE = "pi-workgraph-workstream";
@@ -63,63 +51,16 @@ const PointerOwnerSchema = Type.Object(
   { sessionId: NonBlank, sessionFile: NonBlank },
   { additionalProperties: false },
 );
-const PointerBase = {
-  version: Type.Literal(1),
-  path: NonBlank,
-  workstreamId: NonBlank,
-  repository: PointerRepositorySchema,
-};
-export const WorkstreamPointerSchema = Type.Union([
-  Type.Object(
-    {
-      ...PointerBase,
-      phase: Type.Literal("attached"),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      ...PointerBase,
-      phase: Type.Literal("prepared"),
-      operation: Type.Object(
-        { kind: Type.Literal("create"), initial: WorkstreamSchema },
-        { additionalProperties: false },
-      ),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      ...PointerBase,
-      phase: Type.Literal("prepared"),
-      operation: Type.Object(
-        {
-          kind: Type.Literal("recover"),
-          expectedOwner: PointerOwnerSchema,
-        },
-        { additionalProperties: false },
-      ),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      ...PointerBase,
-      phase: Type.Literal("prepared"),
-      operation: Type.Object(
-        {
-          kind: Type.Literal("adopt"),
-          expectedPriorOwner: PointerOwnerSchema,
-          expectedOwner: PointerOwnerSchema,
-          expectedRevision: Type.Integer({ minimum: 0 }),
-          deathObservation: HerdrDeadObservationSchema,
-        },
-        { additionalProperties: false },
-      ),
-    },
-    { additionalProperties: false },
-  ),
-]);
+export const WorkstreamPointerSchema = Type.Object(
+  {
+    version: Type.Literal(1),
+    path: NonBlank,
+    workstreamId: NonBlank,
+    repository: PointerRepositorySchema,
+    owner: PointerOwnerSchema,
+  },
+  { additionalProperties: false },
+);
 export type WorkstreamPointer = Static<typeof WorkstreamPointerSchema>;
 export type WorkstreamPointerRestoration = WorkstreamPointer | "malformed" | undefined;
 
@@ -132,19 +73,21 @@ export interface WorkstreamCoordinatorControllerOptions {
 
 type Requirements = FileSystem.FileSystem | Path.Path;
 type Active = {
+  readonly token: symbol;
   readonly runtime: WorkstreamRuntime;
-  readonly scope: Scope.Closeable;
   readonly path: string;
   readonly id: string;
   readonly repository: RepositoryIdentity;
   readonly owner: CoordinatorIdentity;
 };
 
+const PROCESS_LIFECYCLE = Semaphore.makeUnsafe(1);
+const PROCESS_RUNTIMES = new Map<string, Active>();
+
 export class WorkstreamCoordinatorController {
   private active: Active | undefined;
   private pointerBlocked = false;
   private startupFailure: string | undefined;
-  private readonly semaphore = Semaphore.makeUnsafe(1);
 
   constructor(
     private readonly pi: ExtensionAPI,
@@ -160,7 +103,7 @@ export class WorkstreamCoordinatorController {
   }
 
   serialize<A, E>(effect: Effect.Effect<A, E, Requirements>): Effect.Effect<A, E, Requirements> {
-    return this.semaphore.withPermit(effect);
+    return PROCESS_LIFECYCLE.withPermit(effect);
   }
 
   restore(ctx: ExtensionContext, retained: () => WorkstreamPointerRestoration) {
@@ -176,11 +119,10 @@ export class WorkstreamCoordinatorController {
         if (pointer === "malformed")
           return yield* Effect.fail(new Error("Workstream pointer is malformed."));
         const owner = this.owner(ctx);
-        const { discovered, ownership } = yield* this.prepareRestoration(pointer, owner);
-        const next = yield* this.acquire(ctx, discovered, ownership, owner);
-        this.active = next;
-        if (pointer.phase === "prepared") yield* this.persistPointer(attachedPointer(pointer));
-        else this.pointerBlocked = false;
+        const discovered = yield* this.prepareRestoration(pointer, owner);
+        const next = yield* this.acquire(ctx, discovered, owner);
+        yield* this.activate(next);
+        this.pointerBlocked = false;
         this.publish(ctx, yield* next.runtime.snapshot());
         this.startupFailure = undefined;
       }.bind(this),
@@ -197,46 +139,18 @@ export class WorkstreamCoordinatorController {
   private prepareRestoration(
     pointer: WorkstreamPointer,
     owner: CoordinatorIdentity,
-  ): Effect.Effect<
-    { discovered: WorkstreamStoreAttachment; ownership: WorkstreamRuntimeOwnership },
-    unknown,
-    Requirements
-  > {
+  ): Effect.Effect<WorkstreamStoreAttachment, unknown, Requirements> {
     return Effect.gen(
       function* (this: WorkstreamCoordinatorController) {
-        if (pointer.phase === "prepared" && pointer.operation.kind === "create") {
-          if (
-            !pointerMatches(pointer, pointer.operation.initial) ||
-            !sameOwner(pointer.operation.initial.coordinator, owner)
-          )
-            return yield* Effect.fail(new Error("Prepared creation identity changed."));
-          yield* this.proveRepository(pointer.operation.initial.repository);
-          const discovered = yield* Effect.scoped(
-            WorkstreamStore.resumeCreate(pointer.operation.initial),
-          );
-          return { discovered, ownership: { kind: "recover" } as const };
-        }
+        yield* requireExactOwner(pointer.owner, owner);
         const discovered = yield* this.discover(pointer.path);
         if (!pointerMatches(pointer, discovered.state))
           return yield* Effect.fail(
-            new Error("Workstream pointer identity does not match its aggregate."),
+            new Error("Workstream pointer identity does not match its records."),
           );
         yield* this.proveRepository(discovered.state.repository);
-        if (pointer.phase === "attached") {
-          yield* requireExactOwner(discovered.state.coordinator, owner);
-          return { discovered, ownership: { kind: "recover" } as const };
-        }
-        if (pointer.operation.kind === "recover") {
-          yield* requireExactOwner(pointer.operation.expectedOwner, owner);
-          yield* requireExactOwner(discovered.state.coordinator, owner);
-          return { discovered, ownership: { kind: "recover" } as const };
-        }
-        if (pointer.operation.kind === "adopt")
-          return {
-            discovered,
-            ownership: yield* preparedAdoptionOwnership(discovered.state, pointer.operation, owner),
-          };
-        return yield* Effect.fail(new Error("Prepared creation pointer was not replayable."));
+        yield* requireExactOwner(discovered.state.coordinator, owner);
+        return discovered;
       }.bind(this),
     );
   }
@@ -266,9 +180,9 @@ export class WorkstreamCoordinatorController {
               recordedAt: yield* nowIso,
             };
             yield* active.runtime.reviseIntent(intent);
-            return yield* projectWorkstreamAction(yield* active.runtime.inspectionSnapshot(), {
-              action: "workgraph_intent",
-            });
+            const snapshot = yield* active.runtime.inspectionSnapshot();
+            this.publish(ctx, snapshot.workstream);
+            return yield* projectWorkstreamAction(snapshot, { action: "workgraph_intent" });
           }
           if (this.pointerBlocked)
             return yield* Effect.fail(blockedEstablishmentError(this.startupFailure));
@@ -293,17 +207,16 @@ export class WorkstreamCoordinatorController {
           });
           const pointer: WorkstreamPointer = {
             version: 1,
-            phase: "prepared",
             path,
             workstreamId: id,
             repository,
-            operation: { kind: "create", initial: structuredClone(initial) },
+            owner: structuredClone(initial.coordinator),
           };
           yield* this.persistPointer(pointer);
           const discovered = yield* Effect.scoped(WorkstreamStore.resumeCreate(initial));
-          const next = yield* this.acquire(ctx, discovered, { kind: "attach" }, this.owner(ctx));
-          this.active = next;
-          yield* this.persistPointer(attachedPointer(pointer));
+          const next = yield* this.acquire(ctx, discovered, this.owner(ctx));
+          yield* this.activate(next);
+          this.pointerBlocked = false;
           const state = yield* next.runtime.snapshot();
           this.publish(ctx, state);
           return yield* projectWorkstreamAction(yield* next.runtime.inspectionSnapshot(), {
@@ -376,84 +289,17 @@ export class WorkstreamCoordinatorController {
           });
           const pointer: WorkstreamPointer = {
             version: 1,
-            phase: "prepared",
             path,
             workstreamId: id,
             repository: structuredClone(grant.targetRepository),
-            operation: { kind: "create", initial },
+            owner: structuredClone(owner),
           };
           yield* this.persistPointer(pointer);
           const discovered = yield* Effect.scoped(WorkstreamStore.resumeCreate(initial));
-          const next = yield* this.acquire(ctx, discovered, { kind: "attach" }, owner);
-          this.active = next;
-          yield* this.persistPointer(attachedPointer(pointer));
+          const next = yield* this.acquire(ctx, discovered, owner);
+          yield* this.activate(next);
+          this.pointerBlocked = false;
           this.publish(ctx, yield* next.runtime.snapshot());
-        }.bind(this),
-      ),
-    );
-  }
-
-  adopt(
-    ctx: ExtensionContext,
-    statePath: string,
-  ): Effect.Effect<WorkstreamActionProjection, unknown, Requirements> {
-    return this.serialize(
-      Effect.gen(
-        function* (this: WorkstreamCoordinatorController) {
-          const discovered = yield* this.discover(statePath);
-          yield* this.proveRepository(discovered.state.repository);
-          const owner = this.owner(ctx);
-          const prior = discovered.state.coordinator;
-          let ownership: WorkstreamRuntimeOwnership;
-          let pointer: WorkstreamPointer;
-          if (sameOwner(prior, owner)) {
-            ownership = { kind: "recover" };
-            pointer = {
-              version: 1,
-              phase: "prepared",
-              path: statePath,
-              workstreamId: discovered.state.id,
-              repository: structuredClone(discovered.state.repository),
-              operation: { kind: "recover", expectedOwner: structuredClone(owner) },
-            };
-          } else {
-            const workers = this.options.workers?.() ?? new HerdrCliRuntime();
-            const liveness = yield* workers.coordinatorLiveness(prior.sessionFile);
-            if (liveness !== "dead")
-              return yield* Effect.fail(
-                new Error(`Prior coordinator liveness is ${liveness}; adoption requires dead.`),
-              );
-            const deathObservation = {
-              subject: structuredClone(prior),
-              observedAt: yield* nowIso,
-              source: "herdr_api_snapshot_dead" as const,
-            };
-            ownership = { kind: "adopt", deathObservation };
-            pointer = {
-              version: 1,
-              phase: "prepared",
-              path: statePath,
-              workstreamId: discovered.state.id,
-              repository: structuredClone(discovered.state.repository),
-              operation: {
-                kind: "adopt",
-                expectedPriorOwner: structuredClone(prior),
-                expectedOwner: structuredClone(owner),
-                expectedRevision: discovered.state.revision,
-                deathObservation,
-              },
-            };
-          }
-          yield* this.persistPointer(pointer);
-          yield* this.closeOwned(ctx);
-          const next = yield* this.acquire(ctx, discovered, ownership, owner);
-          this.active = next;
-          yield* this.persistPointer(attachedPointer(pointer));
-          const state = yield* next.runtime.snapshot();
-          this.publish(ctx, state);
-          return yield* projectWorkstreamAction(yield* next.runtime.inspectionSnapshot(), {
-            action: "workgraph_adopt",
-          });
         }.bind(this),
       ),
     );
@@ -474,7 +320,7 @@ export class WorkstreamCoordinatorController {
   }
 
   action(
-    operation: (runtime: WorkstreamRuntime) => Effect.Effect<Workstream, unknown, Requirements>,
+    operation: (runtime: WorkstreamRuntime) => Effect.Effect<unknown, unknown, Requirements>,
     projection: {
       action: string;
       message?: string;
@@ -488,10 +334,8 @@ export class WorkstreamCoordinatorController {
         function* (this: WorkstreamCoordinatorController) {
           const active = yield* requireActive(this.active);
           yield* operation(active.runtime);
-          return yield* projectWorkstreamAction(
-            yield* active.runtime.inspectionSnapshot(),
-            projection,
-          );
+          const snapshot = yield* active.runtime.inspectionSnapshot();
+          return yield* projectWorkstreamAction(snapshot, projection);
         }.bind(this),
       ),
     );
@@ -512,21 +356,22 @@ export class WorkstreamCoordinatorController {
         inspected.root !== repository.projectRoot ||
         inspected.commonDir !== repository.gitCommonDir
       )
-        return yield* Effect.fail(
-          new Error("Workstream aggregate repository identity does not match Git."),
-        );
+        return yield* Effect.fail(new Error("Workstream repository identity does not match Git."));
     });
   }
 
   private acquire(
     ctx: ExtensionContext,
     attachment: WorkstreamStoreAttachment,
-    ownership: WorkstreamRuntimeOwnership,
     owner: CoordinatorIdentity,
   ): Effect.Effect<Active, unknown, Requirements> {
     return Effect.gen(
       function* (this: WorkstreamCoordinatorController) {
-        const scope = yield* Scope.make("sequential");
+        const prior = PROCESS_RUNTIMES.get(attachment.store.path);
+        if (prior !== undefined) {
+          PROCESS_RUNTIMES.delete(attachment.store.path);
+          yield* prior.runtime.close();
+        }
         const workers = this.options.workers?.() ?? new HerdrCliRuntime();
         const git = new GitRepository(
           attachment.state.repository.projectRoot,
@@ -534,6 +379,7 @@ export class WorkstreamCoordinatorController {
         );
         let runtime: WorkstreamRuntime | undefined;
         const controller = this;
+        const token = Symbol(attachment.state.id);
         const { HERDR_WORKSPACE_ID: hostWorkspaceId, PI_CODING_AGENT_DIR: hostAgentDir } =
           process.env;
         const driver = makeLiveWorkstreamReconciliationDriver({
@@ -595,7 +441,7 @@ export class WorkstreamCoordinatorController {
             id: attachment.state.id,
             repository: attachment.state.repository,
             coordinator: owner,
-            ownership,
+            owns: () => PROCESS_RUNTIMES.get(attachment.store.path)?.token === token,
             driver,
             commands: liveWorkstreamCommandPorts(git, workers),
             onCommitted: (state) => Effect.sync(() => this.publish(ctx, state)).pipe(Effect.ignore),
@@ -604,22 +450,33 @@ export class WorkstreamCoordinatorController {
             ...(this.options.policyPath === undefined
               ? {}
               : { policyPath: this.options.policyPath }),
-          }).pipe(Scope.provide(scope)),
+          }),
         );
-        if (Exit.isFailure(acquired)) {
-          yield* Scope.close(scope, acquired);
-          return yield* Effect.failCause(acquired.cause);
-        }
+        if (Exit.isFailure(acquired)) return yield* Effect.failCause(acquired.cause);
         runtime = acquired.value;
         return {
+          token,
           runtime,
-          scope,
           path: attachment.store.path,
           id: attachment.state.id,
           repository: structuredClone(attachment.state.repository),
           owner: structuredClone(owner),
         };
       }.bind(this),
+    );
+  }
+
+  private activate(next: Active): Effect.Effect<void, unknown, Requirements> {
+    this.active = next;
+    PROCESS_RUNTIMES.set(next.path, next);
+    return next.runtime.start().pipe(
+      Effect.onError(() =>
+        Effect.sync(() => {
+          if (this.active?.token === next.token) this.active = undefined;
+          if (PROCESS_RUNTIMES.get(next.path)?.token === next.token)
+            PROCESS_RUNTIMES.delete(next.path);
+        }).pipe(Effect.andThen(next.runtime.close()), Effect.ignore),
+      ),
     );
   }
 
@@ -648,8 +505,9 @@ export class WorkstreamCoordinatorController {
         const active = this.active;
         if (active === undefined) return;
         this.active = undefined;
+        if (PROCESS_RUNTIMES.get(active.path)?.token === active.token)
+          PROCESS_RUNTIMES.delete(active.path);
         const closed = yield* Effect.exit(active.runtime.close());
-        yield* Scope.close(active.scope, closed);
         this.publish(ctx, undefined);
         return yield* closed;
       }.bind(this),
@@ -657,13 +515,8 @@ export class WorkstreamCoordinatorController {
   }
 
   private persistPointer(pointer: WorkstreamPointer): Effect.Effect<void, CoordinatorHostError> {
-    if (pointer.phase === "prepared") this.pointerBlocked = true;
-    return Effect.map(
-      hostTry(() => this.pi.appendEntry(WORKSTREAM_POINTER_ENTRY, structuredClone(pointer))),
-      () => {
-        if (pointer.phase === "attached") this.pointerBlocked = false;
-      },
-    );
+    this.pointerBlocked = true;
+    return hostTry(() => this.pi.appendEntry(WORKSTREAM_POINTER_ENTRY, structuredClone(pointer)));
   }
 }
 
@@ -674,7 +527,7 @@ const nowIso = Clock.clockWith((clock) =>
 function blockedEstablishmentError(diagnostic: string | undefined): Error {
   return new Error(
     diagnostic === undefined
-      ? "A retained workstream pointer must be recovered or explicitly adopted."
+      ? "A retained workstream pointer must be recovered by its exact coordinator session."
       : `Workstream startup remains blocked by retained state: ${diagnostic}`,
   );
 }
@@ -691,28 +544,7 @@ function requireExactOwner(
 ): Effect.Effect<void, Error> {
   return sameOwner(actual, expected)
     ? Effect.void
-    : Effect.fail(
-        new Error("Workstream pointer belongs to a different coordinator; use explicit adoption."),
-      );
-}
-
-function preparedAdoptionOwnership(
-  state: Workstream,
-  operation: Extract<
-    Extract<WorkstreamPointer, { phase: "prepared" }>["operation"],
-    { kind: "adopt" }
-  >,
-  owner: CoordinatorIdentity,
-): Effect.Effect<WorkstreamRuntimeOwnership, Error> {
-  if (!sameOwner(operation.expectedOwner, owner))
-    return Effect.fail(new Error("Prepared adoption successor changed."));
-  if (sameOwner(state.coordinator, operation.expectedPriorOwner))
-    return state.revision === operation.expectedRevision
-      ? Effect.succeed({ kind: "adopt", deathObservation: operation.deathObservation })
-      : Effect.fail(new Error("Prepared adoption state changed."));
-  return sameOwner(state.coordinator, owner) && transferMatches(state, operation)
-    ? Effect.succeed({ kind: "recover" })
-    : Effect.fail(new Error("Prepared adoption identity changed."));
+    : Effect.fail(new Error("Workstream pointer belongs to a different coordinator session."));
 }
 
 function deliveryTry<A>(run: () => A): Effect.Effect<A, ReconciliationDriverError> {
@@ -738,33 +570,6 @@ function pointerMatches(pointer: WorkstreamPointer, state: Workstream): boolean 
     pointer.workstreamId === state.id &&
     Value.Equal(pointer.repository, state.repository) &&
     pointer.path.length > 0
-  );
-}
-
-function attachedPointer(pointer: WorkstreamPointer): WorkstreamPointer {
-  return {
-    version: pointer.version,
-    phase: "attached",
-    path: pointer.path,
-    workstreamId: pointer.workstreamId,
-    repository: structuredClone(pointer.repository),
-  };
-}
-
-function transferMatches(
-  state: Workstream,
-  operation: Extract<
-    Extract<WorkstreamPointer, { phase: "prepared" }>["operation"],
-    { kind: "adopt" }
-  >,
-): boolean {
-  const transfer = state.coordinatorTransfers.at(-1);
-  return (
-    transfer !== undefined &&
-    transfer.committedRevision === operation.expectedRevision + 1 &&
-    sameOwner(transfer.from, operation.expectedPriorOwner) &&
-    sameOwner(transfer.to, operation.expectedOwner) &&
-    Value.Equal(transfer.deathObservation, operation.deathObservation)
   );
 }
 

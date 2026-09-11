@@ -9,7 +9,6 @@ const WORKSTREAM_SCHEMA_VERSION = 3 as const;
 
 const NonEmptyString = NonEmptyStringSchema;
 const Timestamp = InstantSchema;
-const TransferTimestamp = InstantSchema;
 const Commit = CommitSchema;
 const stringLiterals = <const Values extends readonly string[]>(values: Values) =>
   Type.Unsafe<Values[number]>({ type: "string", enum: [...values] });
@@ -20,25 +19,6 @@ const RepositoryIdentitySchema = Type.Object(
 );
 const CoordinatorIdentitySchema = Type.Object(
   { sessionId: NonEmptyString, sessionFile: NonEmptyString },
-  { additionalProperties: false },
-);
-export const HerdrDeadObservationSchema = Type.Object(
-  {
-    subject: CoordinatorIdentitySchema,
-    observedAt: TransferTimestamp,
-    source: Type.Literal("herdr_api_snapshot_dead"),
-  },
-  { additionalProperties: false },
-);
-const CoordinatorTransferSchema = Type.Object(
-  {
-    from: CoordinatorIdentitySchema,
-    to: CoordinatorIdentitySchema,
-    committedRevision: Type.Integer({ minimum: 1 }),
-    committedAt: TransferTimestamp,
-    intentCountBoundary: Type.Integer({ minimum: 1 }),
-    deathObservation: HerdrDeadObservationSchema,
-  },
   { additionalProperties: false },
 );
 const HumanInputReceiptSchema = Type.Object(
@@ -447,7 +427,7 @@ const CompletionSchema = Type.Object(
   { additionalProperties: false },
 );
 const SuspensionSchema = Type.Object(
-  { reason: NonEmptyString, suspendedAt: TransferTimestamp },
+  { reason: NonEmptyString, suspendedAt: Timestamp },
   { additionalProperties: false },
 );
 export const WorkstreamSchema = Type.Object(
@@ -459,7 +439,6 @@ export const WorkstreamSchema = Type.Object(
     purpose: NonEmptyString,
     repository: RepositoryIdentitySchema,
     coordinator: CoordinatorIdentitySchema,
-    coordinatorTransfers: Type.Array(CoordinatorTransferSchema),
     lifecycle: stringLiterals(["active", "suspended", "completed"] as const),
     suspension: Type.Optional(SuspensionSchema),
     intents: Type.Array(IntentSchema, { minItems: 1 }),
@@ -473,8 +452,6 @@ export const WorkstreamSchema = Type.Object(
 
 export type RepositoryIdentity = Static<typeof RepositoryIdentitySchema>;
 export type CoordinatorIdentity = Static<typeof CoordinatorIdentitySchema>;
-export type HerdrDeadObservation = Static<typeof HerdrDeadObservationSchema>;
-type CoordinatorTransfer = Static<typeof CoordinatorTransferSchema>;
 export type HumanInputReceiptData = Static<typeof HumanInputReceiptDataSchema>;
 export type HandoffGrant = Static<typeof HandoffGrantSchema>;
 export type Intent = Static<typeof IntentSchema>;
@@ -540,7 +517,6 @@ export function validateWorkstream(value: Workstream): void {
 
 /** Validate domain relationships after the caller has checked WorkstreamSchema. */
 export function validateWorkstreamInvariants(value: Workstream): void {
-  validateCoordinatorTransfers(value);
   validateGrounding(value);
   unique(
     value.tasks.map((task) => task.id),
@@ -571,75 +547,12 @@ export function validateWorkstreamInvariants(value: Workstream): void {
   validateLifecycle(value);
 }
 
-function validateCoordinatorTransfers(workstream: Workstream): void {
-  let position: TransferPosition = {
-    owner: workstream.coordinatorTransfers[0]?.from ?? workstream.coordinator,
-    revision: 0,
-    committedAt: "",
-    intentBoundary: 0,
-  };
-  for (const transfer of workstream.coordinatorTransfers)
-    position = validateCoordinatorTransfer(workstream, transfer, position);
-  if (!sameValue(position.owner, workstream.coordinator))
-    throw new Error("Current coordinator does not match transfer history.");
-}
-
-type TransferPosition = {
-  readonly owner: CoordinatorIdentity;
-  readonly revision: number;
-  readonly committedAt: string;
-  readonly intentBoundary: number;
-};
-
-function validateCoordinatorTransfer(
-  workstream: Workstream,
-  transfer: CoordinatorTransfer,
-  prior: TransferPosition,
-): TransferPosition {
-  if (!sameValue(transfer.from, prior.owner))
-    throw new Error("Coordinator transfer history is not continuous.");
-  if (sameValue(transfer.from, transfer.to))
-    throw new Error("Coordinator transfer must change coordinator identity.");
-  if (!sameValue(transfer.deathObservation.subject, transfer.from))
-    throw new Error("Coordinator transfer death observation names another subject.");
-  if (transfer.deathObservation.observedAt > transfer.committedAt)
-    throw new Error("Coordinator transfer death observation is later than its commit.");
-  if (
-    transfer.committedRevision <= prior.revision ||
-    transfer.committedRevision > workstream.revision
-  )
-    throw new Error("Coordinator transfer revisions must be strictly increasing and committed.");
-  if (prior.committedAt !== "" && transfer.committedAt <= prior.committedAt)
-    throw new Error("Coordinator transfer times must be strictly increasing.");
-  if (
-    transfer.intentCountBoundary < prior.intentBoundary ||
-    transfer.intentCountBoundary > workstream.intents.length
-  )
-    throw new Error("Coordinator transfer Intent boundary is outside retained history.");
-  return {
-    owner: transfer.to,
-    revision: transfer.committedRevision,
-    committedAt: transfer.committedAt,
-    intentBoundary: transfer.intentCountBoundary,
-  };
-}
-
-function coordinatorAtIntent(workstream: Workstream, index: number): CoordinatorIdentity {
-  let owner = workstream.coordinatorTransfers[0]?.from ?? workstream.coordinator;
-  for (const transfer of workstream.coordinatorTransfers) {
-    if (index < transfer.intentCountBoundary) break;
-    owner = transfer.to;
-  }
-  return owner;
-}
-
 function validateGrounding(workstream: Workstream): void {
   for (const [index, intent] of workstream.intents.entries()) {
     if (intent.grounding.kind === "human_input_receipt") {
-      const owner = coordinatorAtIntent(workstream, index);
       if (
-        intent.grounding.sessionId !== owner.sessionId ||
-        intent.grounding.sessionFile !== owner.sessionFile
+        intent.grounding.sessionId !== workstream.coordinator.sessionId ||
+        intent.grounding.sessionFile !== workstream.coordinator.sessionFile
       )
         throw new Error(`Intent ${index} direct receipt belongs to another coordinator session.`);
     } else {
@@ -1191,7 +1104,7 @@ export function findAttemptLocation(
   }
   return undefined;
 }
-export function findOutcome(workstream: Workstream, outcomeId: string): Outcome | undefined {
+function findOutcome(workstream: Workstream, outcomeId: string): Outcome | undefined {
   for (const task of workstream.tasks)
     for (const attempt of task.attempts)
       if (attempt.outcome?.id === outcomeId) return attempt.outcome;
@@ -1222,7 +1135,6 @@ export function createWorkstream(input: {
     purpose: input.purpose,
     repository: clone(input.repository),
     coordinator: clone(input.coordinator),
-    coordinatorTransfers: [],
     lifecycle: "active",
     intents: [clone(input.intent)],
     tasks: [],

@@ -2,16 +2,13 @@
  * Workstream transient reconciliation scheduler. It consumes one pure
  * `FrontierEntry` at a time and hands it, plus an exact-key runtime-owned
  * `ReconciliationControl`, to the injected driver (the driver owns external effects).
- * Attachment, manual reconcile, and committed affected-key notifications are
- * its only frontier inputs; it never reads or parses the SQLite aggregate.
+ * It derives each candidate from the current SQLite record view. Attachment,
+ * manual reconcile, and committed-key notifications only coalesce a wake; no
+ * durable frontier or full-state mirror is retained.
  *
- * It runs as one caller-Scope/FiberSet-owned fiber, owns one capacity-one
- * coalesced wake plus per-entry transient deadlines and in-memory blocks, and
- * sleeps whenever there is no transient work. Scheduler-local Refs are
- * serialized only against each other, deliberately not under the runtime
- * mutation Semaphore, which owns durable commits and snapshot replacement.
- * Attachment intentionally wakes recovery so a rebuilt frontier is inspected
- * promptly.
+ * It runs as one caller-Scope/FiberSet-owned fiber with one capacity-one wake
+ * and retains only transient deadlines and diagnostic blocks. The runtime's
+ * single mutation Semaphore owns durable state and external-effect boundaries.
  */
 import {
   Cause,
@@ -24,7 +21,6 @@ import {
   type Path,
   Queue,
   Ref,
-  Semaphore,
 } from "effect";
 import type {
   Attempt,
@@ -38,9 +34,8 @@ import type {
   WorkerExecution,
   Workstream,
 } from "../domain/workstream.js";
+import type { WorkstreamStoreError } from "../storage/workstream-store.js";
 import {
-  applyAffectedKeys,
-  classifyWorkstream,
   FRONTIER_KIND_ORDER,
   type FrontierEntry,
   WORKER_POLL_INTERVAL_MILLIS,
@@ -95,7 +90,7 @@ interface ReconciliationCommitReceipt {
 }
 
 /**
- * One commit attempt. `committed` always means the aggregate changed and its
+ * One commit attempt. `committed` always means records changed and its
  * exact key was notified; `no_change` means the transition was a durable no-op
  * and therefore manufactured no progress and notified nothing.
  */
@@ -141,7 +136,9 @@ export interface ReconciliationDriver {
 /** One attention reason; the scheduler never persists speculative state. */
 export type ReconciliationAttention = (detail: string) => Effect.Effect<void, never>;
 
-export type ControlFactory = (key: AttemptKey) => ReconciliationControl;
+export type ControlFactory = (
+  key: AttemptKey,
+) => Effect.Effect<ReconciliationControl, ReconciliationControlError, FileSystem.FileSystem>;
 
 export interface ReconciliationFrontierObservation {
   readonly entry: FrontierEntry;
@@ -155,30 +152,29 @@ interface TransientEntryObservation {
 }
 
 interface SchedulerState {
-  readonly entries: readonly FrontierEntry[];
   readonly observations: ReadonlyMap<string, TransientEntryObservation>;
 }
 
-const EMPTY_STATE: SchedulerState = {
-  entries: [],
-  observations: new Map(),
-};
+const EMPTY_STATE: SchedulerState = { observations: new Map() };
 
 /**
- * Lease-lifetime reconciliation scheduler. Durable mutation happens only
- * through the runtime's Semaphore-backed control, while scheduler-local
- * frontier and deadline Refs are serialized only against each other. The
- * frontier therefore never observes a partial durable aggregate transition.
+ * Runtime-lifetime reconciliation scheduler. Durable mutation happens only
+ * through the runtime's Semaphore-backed control; scheduler Refs contain only
+ * transient timing and diagnostic observations.
  */
 export class ReconciliationScheduler {
   private constructor(
     private readonly driver: ReconciliationDriver,
     private readonly attention: ReconciliationAttention,
     private readonly controls: Ref.Ref<ControlFactory | undefined>,
+    private readonly source: Ref.Ref<
+      | (() => Effect.Effect<FrontierEntry[], WorkstreamStoreError, FileSystem.FileSystem>)
+      | undefined
+    >,
     private readonly state: Ref.Ref<SchedulerState>,
     private readonly wake: Queue.Queue<void>,
-    private readonly dispatchGate: Semaphore.Semaphore,
     private readonly dispatchPaused: Ref.Ref<boolean>,
+    private readonly dispatching: Ref.Ref<boolean>,
   ) {}
 
   static make(
@@ -189,16 +185,21 @@ export class ReconciliationScheduler {
       const state = yield* Ref.make<SchedulerState>(EMPTY_STATE);
       const wake = yield* Queue.dropping<void>(1);
       const controls = yield* Ref.make<ControlFactory | undefined>(undefined);
-      const dispatchGate = yield* Semaphore.make(1);
+      const source = yield* Ref.make<
+        | (() => Effect.Effect<FrontierEntry[], WorkstreamStoreError, FileSystem.FileSystem>)
+        | undefined
+      >(undefined);
       const dispatchPaused = yield* Ref.make(false);
+      const dispatching = yield* Ref.make(false);
       return new ReconciliationScheduler(
         driver,
         attention,
         controls,
+        source,
         state,
         wake,
-        dispatchGate,
         dispatchPaused,
+        dispatching,
       );
     });
   }
@@ -211,15 +212,16 @@ export class ReconciliationScheduler {
   readonly provideControls = (factory: ControlFactory): Effect.Effect<void> =>
     Ref.set(this.controls, factory);
 
+  readonly provideSource = (
+    source: () => Effect.Effect<FrontierEntry[], WorkstreamStoreError, FileSystem.FileSystem>,
+  ): Effect.Effect<void> => Ref.set(this.source, source);
+
   /**
-   * Full classification: one authoritative aggregate read, transient state
-   * cleared. Attachment and manual reconcile share this single implementation.
+   * Clear transient observations and coalesce one wake. Classification reads
+   * current records when the reconciler actually runs.
    */
-  readonly attach = (workstream: Workstream): Effect.Effect<void> =>
-    Ref.set(this.state, {
-      entries: classifyWorkstream(workstream),
-      observations: new Map(),
-    }).pipe(Effect.andThen(this.signal()));
+  readonly attach = (): Effect.Effect<void> =>
+    Ref.set(this.state, EMPTY_STATE).pipe(Effect.andThen(this.signal()));
 
   /**
    * Incremental committed-transition hook: replace only the explicitly affected
@@ -227,27 +229,34 @@ export class ReconciliationScheduler {
    * calls this with its exact keys after a successful commit.
    */
   readonly notifyCommitted = (
-    workstream: Workstream,
+    _workstream: Workstream,
     keys: readonly AttemptKey[],
   ): Effect.Effect<void> =>
     Ref.update(this.state, (current) => {
       const observations = new Map(current.observations);
       for (const key of keys)
         for (const kind of FRONTIER_KIND_ORDER) observations.delete(identityOf(key, kind));
-      return {
-        entries: applyAffectedKeys(current.entries, workstream, keys),
-        observations,
-      };
+      return { observations };
     }).pipe(Effect.andThen(this.signal()));
 
-  readonly snapshot = (): Effect.Effect<FrontierEntry[]> =>
-    Ref.get(this.state).pipe(Effect.map((current) => structuredClone([...current.entries])));
+  readonly snapshot = (): Effect.Effect<FrontierEntry[], never, FileSystem.FileSystem> =>
+    this.currentEntries().pipe(
+      Effect.orElseSucceed(() => []),
+      Effect.map((entries) => structuredClone(entries)),
+    );
 
-  readonly inspectionSnapshot = (): Effect.Effect<ReconciliationFrontierObservation[]> =>
-    Ref.get(this.state).pipe(
-      Effect.map((current) =>
+  readonly inspectionSnapshot = (): Effect.Effect<
+    ReconciliationFrontierObservation[],
+    never,
+    FileSystem.FileSystem
+  > =>
+    Effect.zip(
+      this.currentEntries().pipe(Effect.orElseSucceed(() => [])),
+      Ref.get(this.state),
+    ).pipe(
+      Effect.map(([entries, current]) =>
         structuredClone(
-          current.entries.map((entry) => {
+          entries.map((entry) => {
             const transient = current.observations.get(identityOf(entry.key, entry.kind));
             const deadlineMillis = Math.max(transient?.deadlineMillis ?? 0, entryDueMillis(entry));
             const observation: ReconciliationFrontierObservation = { entry };
@@ -272,7 +281,13 @@ export class ReconciliationScheduler {
   ): Effect.Effect<A, E, R> =>
     Effect.acquireUseRelease(
       Ref.set(this.dispatchPaused, true),
-      () => this.dispatchGate.withPermit(effect),
+      () =>
+        Effect.gen(
+          function* (this: ReconciliationScheduler) {
+            while (yield* Ref.get(this.dispatching)) yield* Effect.yieldNow;
+            return yield* effect;
+          }.bind(this),
+        ),
       () => Ref.set(this.dispatchPaused, false).pipe(Effect.andThen(this.signal())),
     );
 
@@ -283,10 +298,11 @@ export class ReconciliationScheduler {
         while (true) {
           const now = yield* nowMillis();
           const state = yield* Ref.get(this.state);
-          const candidate = nextCandidate(state, now);
+          const entries = yield* this.currentEntries().pipe(Effect.orElseSucceed(() => []));
+          const candidate = nextCandidate(entries, state, now);
           if (candidate === undefined) {
             // No transient work: sleep until an explicit wake (commit or manual
-            // reconcile). No aggregate reconciliation loop exists here.
+            // reconcile). No polling loop exists here.
             yield* Queue.take(this.wake);
             continue;
           }
@@ -312,14 +328,19 @@ export class ReconciliationScheduler {
     entry: FrontierEntry,
     now: number,
   ): Effect.Effect<void, never, FileSystem.FileSystem | Path.Path> {
-    return this.dispatchGate.withPermit(
-      Effect.flatMap(this.dispatchAllowed(entry), (allowed) =>
-        allowed ? this.dispatchEntry(entry, now) : Effect.void,
-      ),
+    return Effect.acquireUseRelease(
+      Ref.set(this.dispatching, true),
+      () =>
+        Effect.flatMap(this.dispatchAllowed(entry), (allowed) =>
+          allowed ? this.dispatchEntry(entry, now) : Effect.void,
+        ),
+      () => Ref.set(this.dispatching, false),
     );
   }
 
-  private dispatchAllowed(entry: FrontierEntry): Effect.Effect<boolean> {
+  private dispatchAllowed(
+    entry: FrontierEntry,
+  ): Effect.Effect<boolean, never, FileSystem.FileSystem> {
     return Effect.zipWith(
       Ref.get(this.dispatchPaused),
       this.contains(entry),
@@ -333,12 +354,9 @@ export class ReconciliationScheduler {
   ): Effect.Effect<void, never, FileSystem.FileSystem | Path.Path> {
     return Effect.gen(
       function* (this: ReconciliationScheduler) {
-        const factory = yield* Ref.get(this.controls);
-        if (factory === undefined) {
-          yield* this.block(entry, "Reconciliation control is not available; obligation retained.");
-          return;
-        }
-        const exit = yield* Effect.exit(this.driver.reconcile(entry, factory(entry.key)));
+        const control = yield* this.resolveControl(entry);
+        if (control === undefined) return;
+        const exit = yield* Effect.exit(this.driver.reconcile(entry, control));
         // A control commit replaces this exact dispatched object through the
         // affected-key notification. When that happened, the driver's stale
         // outcome must not block or erase the replacement.
@@ -369,6 +387,24 @@ export class ReconciliationScheduler {
     );
   }
 
+  private resolveControl(
+    entry: FrontierEntry,
+  ): Effect.Effect<ReconciliationControl | undefined, never, FileSystem.FileSystem> {
+    return Effect.gen(
+      function* (this: ReconciliationScheduler) {
+        const factory = yield* Ref.get(this.controls);
+        if (factory === undefined) {
+          yield* this.block(entry, "Reconciliation control is not available; obligation retained.");
+          return undefined;
+        }
+        const result = yield* Effect.result(factory(entry.key));
+        if (result._tag === "Success") return result.success;
+        yield* this.block(entry, result.failure.detail);
+        return undefined;
+      }.bind(this),
+    );
+  }
+
   private wait(entry: FrontierEntry, now: number): Effect.Effect<void> {
     const retry = retryDelayFor(entry);
     if (retry === undefined) {
@@ -393,8 +429,25 @@ export class ReconciliationScheduler {
     })).pipe(Effect.andThen(this.attention(detail)));
   }
 
-  private contains(entry: FrontierEntry): Effect.Effect<boolean> {
-    return Ref.get(this.state).pipe(Effect.map((current) => current.entries.includes(entry)));
+  private contains(entry: FrontierEntry): Effect.Effect<boolean, never, FileSystem.FileSystem> {
+    return this.currentEntries().pipe(
+      Effect.map((entries) =>
+        entries.some(
+          (value) => identityOf(value.key, value.kind) === identityOf(entry.key, entry.kind),
+        ),
+      ),
+      Effect.orElseSucceed(() => false),
+    );
+  }
+
+  private currentEntries(): Effect.Effect<
+    FrontierEntry[],
+    WorkstreamStoreError,
+    FileSystem.FileSystem
+  > {
+    return Effect.flatMap(Ref.get(this.source), (source) =>
+      source === undefined ? Effect.succeed([]) : source(),
+    );
   }
 
   /** Consume the coalesced wake produced by the commit that replaced this entry. */
@@ -404,11 +457,12 @@ export class ReconciliationScheduler {
 }
 
 function nextCandidate(
+  entries: readonly FrontierEntry[],
   state: SchedulerState,
   now: number,
 ): { readonly entry: FrontierEntry; readonly delayMillis: number } | undefined {
   let best: { entry: FrontierEntry; due: number } | undefined;
-  for (const entry of state.entries) {
+  for (const entry of entries) {
     const identity = identityOf(entry.key, entry.kind);
     const transient = state.observations.get(identity);
     if (transient?.blockedReason !== undefined) continue;

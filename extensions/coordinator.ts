@@ -205,7 +205,7 @@ export default function workstreamCoordinator(
       ctx.ui.setStatus("workgraph", `WG ${state.lifecycle} - ${active} active`);
       calm.setActiveWorkers(active);
     } catch {
-      // Presentation is best-effort and cannot alter workstream commit or lease state.
+      // Presentation is best-effort and cannot alter committed Workstream records.
     }
   };
   const controller = new WorkstreamCoordinatorController(pi, options, publish);
@@ -491,7 +491,7 @@ export default function workstreamCoordinator(
     name: "workgraph_control",
     label: "Workgraph Control",
     description:
-      "Suspend, resume, cancel, steer, apply, or release output through exact workstream command and lease boundaries.",
+      "Suspend, resume, cancel, steer, apply, or release output through exact Workstream record boundaries.",
     parameters: ControlSchema,
     execute(_id, params, signal) {
       return run(
@@ -504,16 +504,6 @@ export default function workstreamCoordinator(
         ),
         signal,
       );
-    },
-  });
-  pi.registerTool({
-    name: "workgraph_adopt",
-    label: "Workgraph Adopt",
-    description:
-      "Discover an exact workstream state path and attach it, transferring only after exact prior-coordinator Herdr death proof.",
-    parameters: Type.Object({ statePath: NonEmpty }, { additionalProperties: false }),
-    execute(_id, params, signal, _update, ctx) {
-      return run(Effect.map(controller.adopt(ctx, params.statePath), toolResult), signal);
     },
   });
   pi.registerTool({
@@ -576,7 +566,7 @@ function action<Error>(
   operation: (
     runtime: WorkstreamRuntime,
   ) => Effect.Effect<
-    import("../src/domain/workstream.js").Workstream,
+    unknown,
     Error,
     import("effect").FileSystem.FileSystem | import("effect").Path.Path
   >,

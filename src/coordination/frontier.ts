@@ -1,9 +1,4 @@
-/**
- * Lease-lifetime optimization over committed state, never authority. Full
- * rebuilds use fenced SQLite reads; incremental updates name affected keys.
- * Classification is pure and excludes settled, stale-Intent, manual, blocked,
- * and ambiguous work.
- */
+/** Pure classification of current SQLite facts for the coalesced reconciler. */
 import { DateTime } from "effect";
 import {
   type Attempt,
@@ -32,8 +27,8 @@ interface ReadyWorkerIdentity {
   readonly sessionFile: string;
 }
 
-export const DELIVERY_RETRY_BASE_MILLIS = 1_000;
-export const DELIVERY_RETRY_CAP_MILLIS = 30_000;
+const DELIVERY_RETRY_BASE_MILLIS = 1_000;
+const DELIVERY_RETRY_CAP_MILLIS = 30_000;
 export const WORKER_POLL_INTERVAL_MILLIS = 1_000;
 
 /** Shared ordering for classification, replacement, and transient bookkeeping. */
@@ -96,12 +91,12 @@ export type FrontierEntry = Readonly<
  * from one second to a thirty-second cap. The wait is measured from the last
  * recorded failure, so it is derived transiently and never persisted.
  */
-export function deliveryRetryDelayMillis(failureCount: number): number {
+function deliveryRetryDelayMillis(failureCount: number): number {
   if (failureCount <= 0) return 0;
   return Math.min(DELIVERY_RETRY_BASE_MILLIS * 2 ** (failureCount - 1), DELIVERY_RETRY_CAP_MILLIS);
 }
 
-export function deliveryDueAt(delivery: Delivery | undefined): string | undefined {
+function deliveryDueAt(delivery: Delivery | undefined): string | undefined {
   if (delivery === undefined || delivery.state !== "pending") return undefined;
   const lastFailure = delivery.failureHistory.at(-1);
   if (lastFailure === undefined) return undefined;
@@ -111,47 +106,16 @@ export function deliveryDueAt(delivery: Delivery | undefined): string | undefine
   return DateTime.toDate(DateTime.makeUnsafe(due)).toISOString();
 }
 
-/** Preserve aggregate order and workstream per-Attempt kind order. */
-export function classifyWorkstream(workstream: Workstream): FrontierEntry[] {
-  const entries: FrontierEntry[] = [];
-  for (const task of workstream.tasks)
-    for (const attempt of task.attempts)
-      entries.push(
-        ...classifyAttempt(task, attempt, currentIntentIndex(workstream), workstream.lifecycle),
-      );
-  return entries;
-}
-
-/**
- * Recompute entries only for the explicitly affected Attempt keys, preserving
- * every other entry at its existing position. A key that already has entries
- * keeps the position of its first one; a truly new key is appended in the order
- * the caller supplied. Unknown keys contribute nothing rather than failing, so
- * a caller may pass a conservative superset of a commit's keys.
- */
-export function applyAffectedKeys(
-  frontier: readonly FrontierEntry[],
-  workstream: Workstream,
-  keys: Iterable<AttemptKey>,
+/** Preserve record order and per-Attempt kind order. */
+/** Classify directly queried actionable rows without assembling a Workstream. */
+export function classifyActionable(
+  lifecycle: Workstream["lifecycle"],
+  currentIntentIndex: number,
+  records: readonly Readonly<{ task: Task; attempt: Attempt }>[],
 ): FrontierEntry[] {
-  const currentIntent = currentIntentIndex(workstream);
-  let next: FrontierEntry[] = [...frontier];
-  const applied = new Set<string>();
-  for (const key of keys) {
-    const identity = keyOf(key);
-    if (applied.has(identity)) continue;
-    applied.add(identity);
-    const located = locate(workstream, key);
-    const replacement =
-      located === undefined
-        ? []
-        : classifyAttempt(located.task, located.attempt, currentIntent, workstream.lifecycle);
-    const firstIndex = next.findIndex((entry) => keyOf(entry.key) === identity);
-    const retained = next.filter((entry) => keyOf(entry.key) !== identity);
-    const insertAt = firstIndex < 0 ? retained.length : firstIndex;
-    next = [...retained.slice(0, insertAt), ...replacement, ...retained.slice(insertAt)];
-  }
-  return next;
+  return records.flatMap(({ task, attempt }) =>
+    classifyAttempt(task, attempt, currentIntentIndex, lifecycle),
+  );
 }
 
 function classifyAttempt(
@@ -272,20 +236,3 @@ type Mutable<Value> = { -readonly [Key in keyof Value]: Value[Key] };
 type CancellationEntry = Mutable<Extract<FrontierEntry, { kind: "cancellation" }>>;
 type CleanupEntry = Mutable<Extract<FrontierEntry, { kind: "cleanup" }>>;
 type PlacementRecoveryEntry = Mutable<Extract<FrontierEntry, { kind: "placement_recovery" }>>;
-
-function currentIntentIndex(workstream: Workstream): number {
-  return workstream.intents.length - 1;
-}
-
-function locate(
-  workstream: Workstream,
-  key: AttemptKey,
-): { task: Task; attempt: Attempt } | undefined {
-  const task = workstream.tasks.find((candidate) => candidate.id === key.taskId);
-  const attempt = task?.attempts.find((candidate) => candidate.id === key.attemptId);
-  return task === undefined || attempt === undefined ? undefined : { task, attempt };
-}
-
-function keyOf(key: AttemptKey): string {
-  return `${key.taskId}\u0000${key.attemptId}`;
-}

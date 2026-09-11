@@ -52,7 +52,7 @@ export interface WorkerLaunchEffectRequest<E = never, R = never> extends WorkerL
   onPreflight?: () => Effect.Effect<void, E, R>;
   onSubmitted?: () => Effect.Effect<void, E, R>;
   /**
-   * Lease-lifetime fence invoked immediately before every mutating Herdr remote
+   * Runtime-owner fence invoked immediately before every mutating Herdr remote
    * call, including after an intervening durable checkpoint.
    */
   onFence?: () => Effect.Effect<void, E, R>;
@@ -241,7 +241,7 @@ function checkpointAfterRemote<A, E, R, Locator extends WorkerLaunchLocator>(
   );
 }
 
-/** Fence the exact lease immediately before one mutating remote call. */
+/** Recheck exact runtime ownership immediately before one mutating remote call. */
 function fenced<A, E, R>(
   request: { readonly onFence?: () => Effect.Effect<void, E, R> },
   remote: Effect.Effect<A, HerdrProtocolError | WorkerLaunchReadinessError, R>,

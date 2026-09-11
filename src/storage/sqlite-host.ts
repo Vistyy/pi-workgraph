@@ -1,7 +1,6 @@
-import { randomUUID } from "node:crypto";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Workstream storage identity requires no-follow entry inspection (symlink kind, permission bits, and file size); Effect's FileSystem service follows links and exposes no lstat.
 import { lstatSync } from "node:fs";
-// node:sqlite is the workstream private aggregate-and-lease transaction guarantee; it has no Effect service equivalent.
+// node:sqlite owns the native record transaction guarantee; it has no Effect service equivalent.
 import { DatabaseSync } from "node:sqlite";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
@@ -26,7 +25,8 @@ export interface WorkstreamDatabase {
   tableNames(): string[];
   columnNames(table: string): string[];
   readRow(statement: string, ...parameters: Array<string | number>): NodeSqliteRow | undefined;
-  write(statement: string, ...parameters: Array<string | number>): number;
+  readRows(statement: string, ...parameters: Array<string | number>): NodeSqliteRow[];
+  write(statement: string, ...parameters: Array<string | number | null>): number;
   close(): void;
 }
 
@@ -79,14 +79,11 @@ export function openWorkstreamDatabase(path: string, readOnly = false): Workstre
     tableNames: () => names("SELECT name FROM sqlite_master WHERE type='table'"),
     columnNames: (table) => names(`PRAGMA table_info(${table})`),
     readRow: (statement, ...parameters) => database.prepare(statement).get(...parameters),
+    readRows: (statement, ...parameters) => database.prepare(statement).all(...parameters),
     write: (statement, ...parameters) =>
       Number(database.prepare(statement).run(...parameters).changes),
     close: () => {
       database.close();
     },
   };
-}
-
-export function newLeaseToken(): string {
-  return randomUUID();
 }

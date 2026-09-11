@@ -59,6 +59,20 @@ function childGrant(
   };
 }
 
+async function recordSnapshot(path: string): Promise<Record<string, unknown[]>> {
+  const database = new DatabaseSync(path, { readOnly: true });
+  try {
+    return Object.fromEntries(
+      ["metadata", "intents", "tasks", "attempts", "outcomes", "deliveries"].map((table) => [
+        table,
+        database.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+      ]),
+    );
+  } finally {
+    database.close();
+  }
+}
+
 const TARGET_TOOLS = [
   "workgraph_models",
   "workgraph_intent",
@@ -70,7 +84,6 @@ const TARGET_TOOLS = [
   "workgraph_attempt",
   "workgraph_inspect",
   "workgraph_control",
-  "workgraph_adopt",
   "workgraph_complete",
   "workgraph_notepad",
 ] as const;
@@ -235,16 +248,14 @@ void test("conflicting first grounding disables an attached child Workstream", a
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
 
     const database = new DatabaseSync(path);
-    const row = database.prepare("SELECT state_json FROM workstream WHERE singleton=1").get() as {
-      state_json: string;
+    const row = database.prepare("SELECT intent_json FROM intents WHERE intent_index=0").get() as {
+      intent_json: string;
     };
-    const state = JSON.parse(row.state_json) as { intents: Array<{ statement: string }> };
-    const first = state.intents[0];
-    assert.ok(first !== undefined);
+    const first = JSON.parse(row.intent_json) as { statement: string };
     first.statement = "Conflicting first grounding";
     database
-      .prepare("UPDATE workstream SET state_json=? WHERE singleton=1")
-      .run(JSON.stringify(state));
+      .prepare("UPDATE intents SET intent_json=? WHERE intent_index=0")
+      .run(JSON.stringify(first));
     database.close();
 
     await f.runner.emit({ type: "session_start", reason: "reload" });
@@ -253,7 +264,10 @@ void test("conflicting first grounding disables an attached child Workstream", a
       /No Workstream is attached/,
     );
     const readback = new DatabaseSync(path, { readOnly: true });
-    assert.equal(readback.prepare("SELECT token FROM lease WHERE singleton=1").get(), undefined);
+    assert.equal(
+      readback.prepare("SELECT revision FROM metadata WHERE singleton=1").get() !== undefined,
+      true,
+    );
     readback.close();
     assert.ok(f.notifications.some((item) => /first Intent does not match/.test(item.message)));
   } finally {
@@ -341,11 +355,7 @@ else console.log(JSON.stringify({result:{}}));
       );
     assert.ok(pointer?.type === "custom");
     const parentStatePath = (pointer.data as { path: string }).path;
-    const parentDatabase = new DatabaseSync(parentStatePath, { readOnly: true });
-    const parentStateBefore = parentDatabase
-      .prepare("SELECT state_json FROM workstream WHERE singleton=1")
-      .get() as { state_json: string };
-    parentDatabase.close();
+    const parentStateBefore = await recordSnapshot(parentStatePath);
 
     const clean = await f.callWithId("clean-call", "workgraph_handoff", {
       request: "Perform the clean child part",
@@ -395,12 +405,8 @@ else console.log(JSON.stringify({result:{}}));
         ).length,
       1,
     );
-    const parentReadback = new DatabaseSync(parentStatePath, { readOnly: true });
-    const parentStateAfter = parentReadback
-      .prepare("SELECT state_json FROM workstream WHERE singleton=1")
-      .get() as { state_json: string };
-    parentReadback.close();
-    assert.equal(parentStateAfter.state_json, parentStateBefore.state_json);
+    const parentStateAfter = await recordSnapshot(parentStatePath);
+    assert.deepEqual(parentStateAfter, parentStateBefore);
     const calls = (await readFile(logFile, "utf8"))
       .trim()
       .split("\n")
@@ -649,14 +655,10 @@ void test("session_start closes the attached runtime before rejecting a differen
       f.call("workgraph_inspect", { section: "overview" }),
       /No Workstream is attached/,
     );
-    const database = new DatabaseSync(originalPath, { readOnly: true });
-    const lease = database.prepare("SELECT token FROM lease WHERE singleton=1").get();
-    const row = database.prepare("SELECT state_json FROM workstream WHERE singleton=1").get() as {
-      state_json: string;
-    };
-    database.close();
-    assert.equal(lease, undefined);
-    assert.deepEqual(JSON.parse(row.state_json), originalStateBefore);
+    const originalAfter = await Effect.runPromise(
+      Effect.scoped(WorkstreamStore.discover(originalPath)).pipe(Effect.provide(liveLayer)),
+    );
+    assert.deepEqual(originalAfter.state, originalStateBefore);
     assert.deepEqual(await readFile(target.store.path), targetBefore);
 
     await f.input("Do not create another Workstream");
@@ -669,7 +671,43 @@ void test("session_start closes the attached runtime before rejecting a differen
         .getBranch()
         .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY)
         .length,
-      3,
+      2,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("concurrent same-session reloads serialize close and publish one usable runtime", async () => {
+  const f = await fixture();
+  try {
+    await f.input("Serialize runtime reload");
+    await f.call("workgraph_intent", { statement: "Serialize runtime reload" });
+    await Effect.runPromise(
+      Effect.timeoutOrElse(
+        Effect.tryPromise(() =>
+          Promise.all([
+            f.runner.emit({ type: "session_start", reason: "reload" }),
+            f.runner.emit({ type: "session_start", reason: "reload" }),
+          ]),
+        ),
+        {
+          duration: "2 seconds",
+          orElse: () => Effect.die(new Error("concurrent reload timed out")),
+        },
+      ),
+    );
+    const inspected = await f.call("workgraph_inspect", { section: "overview" });
+    assert.equal(
+      (inspected.details as { summary: { purpose: string } }).summary.purpose,
+      "Serialize runtime reload",
+    );
+    assert.equal(
+      f.session
+        .getBranch()
+        .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY)
+        .length,
+      1,
     );
   } finally {
     await f.dispose();
@@ -708,14 +746,15 @@ void test("prepared pointer append failure creates no workstream store", async (
       .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY);
     assert.equal(pointers.length, 1);
     assert.ok(pointers[0]?.type === "custom");
-    assert.equal((pointers[0].data as { phase?: unknown }).phase, "prepared");
+    assert.equal((pointers[0].data as { version?: unknown }).version, 1);
+    assert.equal(typeof (pointers[0].data as { owner?: unknown }).owner, "object");
     await assert.rejects(readdir(join(f.root, ".git", "pi-workgraph")), /ENOENT/);
   } finally {
     await f.dispose();
   }
 });
 
-void test("repository proof rejects a crafted aggregate before lease or pointer effects", async () => {
+void test("repository proof rejects crafted records before runtime or pointer effects", async () => {
   const f = await fixture();
   try {
     const foreignRoot = join(f.parent, "not-a-repository");
@@ -759,7 +798,7 @@ void test("repository proof rejects a crafted aggregate before lease or pointer 
     await f.runner.emit({ type: "session_start", reason: "reload" });
     assert.deepEqual(await readFile(attachment.store.path), before);
     const database = new DatabaseSync(attachment.store.path, { readOnly: true });
-    assert.equal(database.prepare("SELECT token FROM lease").get(), undefined);
+    assert.equal(database.prepare("SELECT revision FROM metadata").get() !== undefined, true);
     database.close();
     assert.equal(
       f.session
@@ -799,115 +838,39 @@ void test("current Pi input survives session restoration and grounds one private
     const pointers = branch.filter(
       (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
     );
-    assert.equal(pointers.length, 2);
-    const prepared = pointers[0];
-    const attached = pointers[1];
-    assert.ok(prepared?.type === "custom" && attached?.type === "custom");
-    assert.equal((prepared.data as { phase: string }).phase, "prepared");
-    assert.equal((attached.data as { phase: string }).phase, "attached");
-    const path = (attached.data as { path: string }).path;
-    const database = new DatabaseSync(path, { readOnly: true });
-    const row = database.prepare("SELECT state_json FROM workstream WHERE singleton=1").get() as {
-      state_json: string;
-    };
-    const lease = database.prepare("SELECT owner_session_id FROM lease WHERE singleton=1").get();
-    database.close();
-    const state = JSON.parse(row.state_json) as {
-      intents: Array<{ grounding: { id: string; receivedAt: string } }>;
-    };
-    assert.equal(state.intents.length, 1);
-    assert.equal(state.intents[0]?.grounding.id, (receipt.data as { id: string }).id);
-    assert.equal(
-      state.intents[0]?.grounding.receivedAt,
-      (receipt.data as { receivedAt: string }).receivedAt,
+    assert.equal(pointers.length, 1);
+    const pointer = pointers[0];
+    assert.ok(pointer?.type === "custom");
+    assert.equal((pointer.data as { version: number }).version, 1);
+    const path = (pointer.data as { path: string }).path;
+    const stored = await Effect.runPromise(
+      Effect.scoped(WorkstreamStore.discover(path)).pipe(Effect.provide(liveLayer)),
     );
-    assert.ok(lease !== undefined);
+    const state = stored.state;
+    assert.equal(state.intents.length, 1);
+    const grounding = state.intents[0]?.grounding;
+    assert.equal(grounding?.kind, "human_input_receipt");
+    assert.ok(grounding?.kind === "human_input_receipt");
+    assert.equal(grounding.id, (receipt.data as { id: string }).id);
+    assert.equal(grounding.receivedAt, (receipt.data as { receivedAt: string }).receivedAt);
     const discovered = await Effect.runPromise(
       Effect.scoped(WorkstreamStore.discover(path)).pipe(Effect.provide(liveLayer)),
     );
     assert.equal(discovered.state.intents.length, 1);
 
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
-    f.session.appendCustomEntry(WORKSTREAM_POINTER_ENTRY, structuredClone(prepared.data));
+    f.session.appendCustomEntry(WORKSTREAM_POINTER_ENTRY, structuredClone(pointer.data));
     await f.runner.emit({ type: "session_start", reason: "reload" });
     const replayed = f.session
       .getBranch()
       .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY);
-    assert.equal(replayed.length, 4);
+    assert.equal(replayed.length, 2);
     const replayAttachment = replayed.at(-1);
     assert.ok(replayAttachment?.type === "custom");
-    assert.equal((replayAttachment.data as { phase: string }).phase, "attached");
+    assert.equal((replayAttachment.data as { version: number }).version, 1);
     assert.equal((replayAttachment.data as { path: string }).path, path);
   } finally {
     await f.dispose();
-  }
-});
-
-void test("prepared adoption replays an already-committed exact transfer once", async () => {
-  const source = await fixture();
-  let successor: Awaited<ReturnType<typeof extensionFixture>> | undefined;
-  try {
-    await source.input("Create an adoptable Workstream");
-    await source.call("workgraph_intent", { statement: "Create an adoptable Workstream" });
-    const pointer = source.session
-      .getBranch()
-      .findLast(
-        (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
-      );
-    assert.ok(pointer?.type === "custom");
-    const statePath = (pointer.data as { path: string }).path;
-    await source.runner.emit({ type: "session_shutdown", reason: "reload" });
-
-    const successorParent = join(source.parent, "successor");
-    await mkdir(successorParent);
-    Reflect.set(process.env, "PI_CODING_AGENT_DIR", join(successorParent, "agent"));
-    let successorSession: Awaited<ReturnType<typeof extensionFixture>>["session"] | undefined;
-    let interruptAttached = true;
-    const workers = new HerdrCliRuntime("unused", {});
-    Object.defineProperty(workers, "coordinatorLiveness", {
-      value: () => Effect.succeed("dead" as const),
-    });
-    successor = await extensionFixture(
-      "coordinator",
-      source.root,
-      successorParent,
-      {
-        appendEntry(type, data) {
-          if (type === WORKSTREAM_POINTER_ENTRY) {
-            const phase = (data as { phase?: unknown }).phase;
-            if (phase === "attached" && interruptAttached) {
-              interruptAttached = false;
-              throw new Error("interrupt after transfer");
-            }
-          }
-          successorSession?.appendCustomEntry(type, data);
-        },
-      },
-      [(pi) => workstreamCoordinator(pi, { workers: () => workers })],
-    );
-    successorSession = successor.session;
-    await assert.rejects(
-      successor.call("workgraph_adopt", { statePath }),
-      /interrupt after transfer/,
-    );
-    await successor.runner.emit({ type: "session_shutdown", reason: "reload" });
-    await successor.runner.emit({ type: "session_start", reason: "reload" });
-    const discovered = await Effect.runPromise(
-      Effect.scoped(WorkstreamStore.discover(statePath)).pipe(Effect.provide(liveLayer)),
-    );
-    assert.equal(discovered.state.coordinatorTransfers.length, 1);
-    const retainedPointers = successor.session
-      .getBranch()
-      .filter((entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY);
-    assert.deepEqual(
-      retainedPointers.map((entry) =>
-        entry.type === "custom" ? (entry.data as { phase: string }).phase : "invalid",
-      ),
-      ["prepared", "attached"],
-    );
-  } finally {
-    if (successor !== undefined) await successor.close();
-    await source.dispose();
   }
 });
 
@@ -925,21 +888,18 @@ void test("intent revision selects the latest eligible receipt and rejects repos
       );
     assert.ok(pointer?.type === "custom");
     const path = (pointer.data as { path: string }).path;
-    const readState = () => {
-      const database = new DatabaseSync(path, { readOnly: true });
-      const row = database.prepare("SELECT state_json FROM workstream WHERE singleton=1").get() as {
-        state_json: string;
-      };
-      database.close();
-      return JSON.parse(row.state_json) as {
-        revision: number;
-        intents: Array<{ statement: string; grounding: { text: string; source: string } }>;
-      };
-    };
-    const revised = readState();
+    const readState = async () =>
+      (
+        await Effect.runPromise(
+          Effect.scoped(WorkstreamStore.discover(path)).pipe(Effect.provide(liveLayer)),
+        )
+      ).state;
+    const revised = await readState();
     assert.equal(revised.revision, 1);
-    assert.equal(revised.intents[1]?.grounding.text, "Revised scope");
-    assert.equal(revised.intents[1]?.grounding.source, "rpc");
+    const grounding = revised.intents[1]?.grounding;
+    assert.ok(grounding?.kind === "human_input_receipt");
+    assert.equal(grounding.text, "Revised scope");
+    assert.equal(grounding.source, "rpc");
 
     const foreign = join(f.parent, "foreign");
     await mkdir(foreign);
@@ -956,7 +916,7 @@ void test("intent revision selects the latest eligible receipt and rejects repos
       }),
       /cannot switch repositories/,
     );
-    assert.equal(readState().revision, 1);
+    assert.equal((await readState()).revision, 1);
   } finally {
     await f.dispose();
   }

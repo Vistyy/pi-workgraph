@@ -32,7 +32,7 @@ import {
   ReconciliationDriverError,
 } from "./reconciliation.js";
 
-export function liveGitPort(git: GitRepository): WorkstreamGitPort {
+function liveGitPort(git: GitRepository): WorkstreamGitPort {
   return {
     projectRoot: git.root,
     gitCommonDir: git.commonDir,

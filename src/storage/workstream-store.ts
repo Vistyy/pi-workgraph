@@ -1,21 +1,28 @@
-import { Clock, Data, DateTime, Effect, FileSystem, Path, type Scope } from "effect";
+/* oxlint-disable anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/no-widen-then-assert, anti-slop/require-safety-comment-for-type-assertion -- node:sqlite exposes untyped host rows; this boundary assembles them once and validates the complete strict Workstream schema before returning domain data. */
+import { Clock, Data, Effect, FileSystem, Path, type Scope } from "effect";
 import type { PlatformError } from "effect/PlatformError";
-import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { InstantSchema, instantMillis as parseInstantMillis } from "../domain/values.js";
+import type {
+  Attempt,
+  AttemptKey,
+  Completion,
+  CoordinatorIdentity,
+  Intent,
+  RepositoryIdentity,
+  Suspension,
+  Task,
+  Workstream,
+} from "../domain/workstream.js";
 import {
-  type CoordinatorIdentity,
-  type HerdrDeadObservation,
-  HerdrDeadObservationSchema,
-  type RepositoryIdentity,
+  AttemptSchema,
+  IntentSchema,
+  TaskSchema,
   validateWorkstream,
   validateWorkstreamInvariants,
-  type Workstream,
   WorkstreamSchema,
 } from "../domain/workstream.js";
 import {
   inspectStorageEntry,
-  newLeaseToken,
   openWorkstreamDatabase,
   type StorageEntry,
   type WorkstreamDatabase,
@@ -23,100 +30,41 @@ import {
 
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
-const LEASE_DURATION_MILLIS = 30_000;
 const SQLITE_HEADER = "SQLite format 3\u0000";
 const SQLITE_FILENAME = "workstream.sqlite";
-const STORE_FORMAT = "pi-workgraph-workstream-sqlite";
-const STORE_VERSION = 2;
+const STORE_FORMAT = "pi-workgraph-record-store";
+const STORE_VERSION = 1;
 const STORAGE_DIRECTORY = "pi-workgraph";
 const WORKSTREAM_DIRECTORY = "workstreams";
-const columnList = (value: string) => value.split(" ");
+const columns = (value: string) => value.split(" ");
 
-/** Complete workstream schema contract: each table must exist with these columns. */
-const WORKSTREAM_SCHEMA = {
-  store_header: columnList("format version"),
-  workstream: columnList("state_json revision"),
-  lease: columnList(
-    "token owner_session_id owner_session_file acquired_at heartbeat_at expires_at",
+const RECORD_SCHEMA = {
+  store_header: columns("format version"),
+  metadata: columns(
+    "id purpose project_root git_common_dir owner_session_id owner_session_file revision lifecycle suspension_json completion_json created_at updated_at",
   ),
+  intents: columns("intent_index intent_json"),
+  tasks: columns("task_id intent_index kind contract_json"),
+  attempts: columns("attempt_id task_id sequence operational_json"),
+  outcomes: columns("outcome_id attempt_id outcome_json"),
+  deliveries: columns("outcome_id delivery_json"),
 };
 
 const CREATE_SCHEMA = `
-CREATE TABLE store_header (
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  format TEXT NOT NULL,
-  version INTEGER NOT NULL
-);
-CREATE TABLE workstream (
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  state_json TEXT NOT NULL,
-  revision INTEGER NOT NULL
-);
-CREATE TABLE lease (
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  token TEXT NOT NULL,
-  owner_session_id TEXT NOT NULL,
-  owner_session_file TEXT NOT NULL,
-  acquired_at TEXT NOT NULL,
-  heartbeat_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL
-);
+CREATE TABLE store_header (singleton INTEGER PRIMARY KEY CHECK(singleton=1), format TEXT NOT NULL, version INTEGER NOT NULL) STRICT;
+CREATE TABLE metadata (
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL, purpose TEXT NOT NULL,
+ project_root TEXT NOT NULL, git_common_dir TEXT NOT NULL, owner_session_id TEXT NOT NULL,
+ owner_session_file TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>=0),
+ lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active','suspended','completed')),
+ suspension_json TEXT, completion_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+) STRICT;
+CREATE TABLE intents (intent_index INTEGER PRIMARY KEY CHECK(intent_index>=0), intent_json TEXT NOT NULL) STRICT;
+CREATE TABLE tasks (task_id TEXT PRIMARY KEY, intent_index INTEGER NOT NULL REFERENCES intents(intent_index), kind TEXT NOT NULL, contract_json TEXT NOT NULL) STRICT;
+CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), sequence INTEGER NOT NULL CHECK(sequence>=0), operational_json TEXT NOT NULL, UNIQUE(task_id,sequence)) STRICT;
+CREATE TABLE outcomes (outcome_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id), outcome_json TEXT NOT NULL) STRICT;
+CREATE TABLE deliveries (outcome_id TEXT PRIMARY KEY REFERENCES outcomes(outcome_id), delivery_json TEXT NOT NULL) STRICT;
 `;
-
-const HeaderRowSchema = Type.Object(
-  { format: Type.String({ minLength: 1 }), version: Type.Integer() },
-  { additionalProperties: false },
-);
-const AggregateRowSchema = Type.Object(
-  { state_json: Type.String(), revision: Type.Integer({ minimum: 0 }) },
-  { additionalProperties: false },
-);
-const LeaseOwnerSchema = Type.Object(
-  { sessionId: Type.String({ minLength: 1 }), sessionFile: Type.String({ minLength: 1 }) },
-  { additionalProperties: false },
-);
-const IsoInstantSchema = InstantSchema;
-const LeaseRowSchema = Type.Object(
-  {
-    token: Type.String({ minLength: 1 }),
-    owner_session_id: Type.String({ minLength: 1 }),
-    owner_session_file: Type.String({ minLength: 1 }),
-    acquired_at: IsoInstantSchema,
-    heartbeat_at: IsoInstantSchema,
-    expires_at: IsoInstantSchema,
-  },
-  { additionalProperties: false },
-);
-type HeaderRow = Static<typeof HeaderRowSchema>;
-type AggregateRow = Static<typeof AggregateRowSchema>;
-type LeaseRow = Static<typeof LeaseRowSchema>;
-
-export interface WorkstreamLease {
-  readonly token: string;
-  readonly owner: CoordinatorIdentity;
-  readonly acquiredAt: string;
-  readonly heartbeatAt: string;
-  readonly expiresAt: string;
-}
-
-type WorkstreamObservedLease =
-  | { readonly kind: "absent" }
-  | { readonly kind: "present"; readonly lease: WorkstreamLease };
-
-export interface WorkstreamCoordinatorAdoption {
-  readonly repository: RepositoryIdentity;
-  readonly workstreamId: string;
-  readonly expectedRevision: number;
-  readonly priorCoordinator: CoordinatorIdentity;
-  readonly coordinator: CoordinatorIdentity;
-  readonly observedLease: WorkstreamObservedLease;
-  readonly deathObservation: HerdrDeadObservation;
-}
-
-export interface WorkstreamCoordinatorAdoptionResult {
-  readonly state: Workstream;
-  readonly lease: WorkstreamLease;
-}
 
 export class WorkstreamStoreInvalidError extends Data.TaggedError("WorkstreamStoreInvalidError")<{
   readonly code: "workstream_store_invalid";
@@ -126,10 +74,7 @@ export class WorkstreamStoreInvalidError extends Data.TaggedError("WorkstreamSto
     super({ code: "workstream_store_invalid", message });
   }
 }
-
-export class WorkstreamStoreIncompleteError extends Data.TaggedError(
-  "WorkstreamStoreIncompleteError",
-)<{
+class WorkstreamStoreIncompleteError extends Data.TaggedError("WorkstreamStoreIncompleteError")<{
   readonly code: "workstream_store_incomplete";
   readonly message: string;
 }> {
@@ -137,19 +82,14 @@ export class WorkstreamStoreIncompleteError extends Data.TaggedError(
     super({ code: "workstream_store_incomplete", message });
   }
 }
-
 export class WorkstreamStoreUnsupportedError extends Data.TaggedError(
   "WorkstreamStoreUnsupportedError",
-)<{
-  readonly code: "workstream_store_unsupported";
-  readonly message: string;
-}> {
+)<{ readonly code: "workstream_store_unsupported"; readonly message: string }> {
   constructor(message: string) {
     super({ code: "workstream_store_unsupported", message });
   }
 }
-
-export class WorkstreamStoreConflictError extends Data.TaggedError("WorkstreamStoreConflictError")<{
+class WorkstreamStoreConflictError extends Data.TaggedError("WorkstreamStoreConflictError")<{
   readonly code: "workstream_store_conflict";
   readonly message: string;
 }> {
@@ -157,8 +97,7 @@ export class WorkstreamStoreConflictError extends Data.TaggedError("WorkstreamSt
     super({ code: "workstream_store_conflict", message });
   }
 }
-
-export class WorkstreamStoreHostError extends Data.TaggedError("WorkstreamStoreHostError")<{
+class WorkstreamStoreHostError extends Data.TaggedError("WorkstreamStoreHostError")<{
   readonly code: "workstream_store_host_failed";
   readonly operation: string;
   readonly message: string;
@@ -173,7 +112,6 @@ export class WorkstreamStoreHostError extends Data.TaggedError("WorkstreamStoreH
     });
   }
 }
-
 export type WorkstreamStoreError =
   | WorkstreamStoreInvalidError
   | WorkstreamStoreIncompleteError
@@ -181,20 +119,50 @@ export type WorkstreamStoreError =
   | WorkstreamStoreConflictError
   | WorkstreamStoreHostError;
 
-/**
- * One scoped store plus its validated attachment read, so callers never
- * re-read what open/create already established.
- */
 export interface WorkstreamStoreAttachment {
   readonly store: WorkstreamStore;
   readonly state: Workstream;
 }
 
-/**
- * Unwired workstream persistence for one settled domain Workstream and its lease.
- * Effect owns scope, time, filesystem/path work, interruption, and transaction
- * sequencing; workstream-sqlite-host owns only guarantees unavailable there.
- */
+export type WorkstreamRecordMutation = Readonly<
+  | { kind: "append_intent"; intent: Intent; updatedAt: string }
+  | { kind: "create_task"; task: Task; updatedAt: string }
+  | { kind: "append_attempts"; taskId: string; attempts: readonly Attempt[]; updatedAt: string }
+  | {
+      kind: "update_attempt";
+      key: AttemptKey;
+      attempt: Attempt;
+      completion?: Completion;
+      updatedAt: string;
+    }
+  | {
+      kind: "update_lifecycle";
+      lifecycle: Workstream["lifecycle"];
+      suspension?: Suspension;
+      completion?: Completion;
+      updatedAt: string;
+    }
+>;
+
+export interface AttemptRecords {
+  readonly revision: number;
+  readonly lifecycle: Workstream["lifecycle"];
+  readonly workstreamId: string;
+  readonly repository: RepositoryIdentity;
+  readonly currentIntentIndex: number;
+  readonly suspension?: Suspension;
+  readonly completion?: Completion;
+  readonly intent: Intent;
+  readonly task: Task;
+  readonly attempt: Attempt;
+}
+
+export interface ActionableRecords {
+  readonly lifecycle: Workstream["lifecycle"];
+  readonly currentIntentIndex: number;
+  readonly records: readonly Readonly<{ task: Task; attempt: Attempt }>[];
+}
+/** Private record store. Full assembly is reserved for inspection and pure-domain validation. */
 export class WorkstreamStore {
   private constructor(
     readonly path: string,
@@ -209,12 +177,11 @@ export class WorkstreamStore {
   ): Effect.Effect<string, WorkstreamStoreInvalidError, Path.Path> {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
-      yield* validateIdentity(paths, repository, id);
+      validateIdentity(paths, repository, id);
       return workstreamPath(paths, repository.gitCommonDir, id);
     });
   }
 
-  /** Persist an already-grounded, invariant-valid revision-0 Workstream verbatim. */
   static create(
     initial: Workstream,
   ): Effect.Effect<
@@ -224,32 +191,23 @@ export class WorkstreamStore {
   > {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
-      const fileSystem = yield* FileSystem.FileSystem;
-      yield* validateInitial(paths, initial);
+      const fs = yield* FileSystem.FileSystem;
+      validateInitial(paths, initial);
       const path = workstreamPath(paths, initial.repository.gitCommonDir, initial.id);
-      yield* assertGroundedCommonDirectory(initial.repository.gitCommonDir);
-      yield* claimStorageDirectories(paths, fileSystem, path);
-      const existing = yield* inspect(path);
-      if (existing.exists)
-        return yield* WorkstreamStore.classifyExisting(fileSystem, path, initial, existing);
-
-      const store = yield* Effect.acquireUseRelease(
-        createPrivateDatabaseFile(fileSystem, path),
-        () => WorkstreamStore.initialize(path, initial),
-        (_, exit) =>
-          exit._tag === "Success"
-            ? Effect.void
-            : platform("remove the incomplete workstream database", fileSystem.remove(path)).pipe(
-                Effect.ignore,
-              ),
+      yield* claimStorageDirectories(paths, fs, path);
+      const entry = yield* inspect(path);
+      if (entry.exists)
+        return yield* new WorkstreamStoreConflictError(
+          `Workstream database already exists: ${path}.`,
+        );
+      yield* createPrivateDatabaseFile(fs, path);
+      return yield* Effect.onError(WorkstreamStore.initialize(path, initial), () =>
+        platform("remove incomplete workstream database", fs.remove(path)).pipe(Effect.ignore),
       );
-      // The persisted aggregate is exactly the validated initial state, so the
-      // caller seeds from the already-known value instead of re-reading it.
-      return { store, state: structuredClone(initial) };
     });
   }
 
-  /** Resume only the exact pointer-declared initial creation without deleting retained residue. */
+  /** Recover only absent/empty creation residue, or attach an exact valid advanced store without resetting it. */
   static resumeCreate(
     initial: Workstream,
   ): Effect.Effect<
@@ -259,49 +217,29 @@ export class WorkstreamStore {
   > {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
-      const fileSystem = yield* FileSystem.FileSystem;
-      yield* validateInitial(paths, initial);
+      const fs = yield* FileSystem.FileSystem;
+      validateInitial(paths, initial);
       const path = workstreamPath(paths, initial.repository.gitCommonDir, initial.id);
-      yield* assertGroundedCommonDirectory(initial.repository.gitCommonDir);
-      yield* claimStorageDirectories(paths, fileSystem, path);
-      const existing = yield* inspect(path);
-      if (!existing.exists) {
-        yield* createPrivateDatabaseFile(fileSystem, path);
-        const store = yield* WorkstreamStore.initialize(path, initial);
-        return { store, state: structuredClone(initial) };
-      }
-      if (existing.symbolicLink || !existing.regularFile || existing.mode !== FILE_MODE)
+      yield* claimStorageDirectories(paths, fs, path);
+      const entry = yield* inspect(path);
+      if (!entry.exists) yield* createPrivateDatabaseFile(fs, path);
+      else if (entry.symbolicLink || !entry.regularFile || entry.mode !== FILE_MODE)
         return yield* invalid(
-          `Workstream database residue is not an exact private ordinary file: ${path}.`,
+          `Workstream creation residue is not a private ordinary file: ${path}.`,
         );
-      if (existing.size === 0) {
-        const store = yield* WorkstreamStore.initialize(path, initial);
-        return { store, state: structuredClone(initial) };
-      }
-      yield* classifyFileHeader(fileSystem, path);
-      const database = yield* acquireDatabase(path);
-      if (database.tableNames().length === 0) {
-        const store = new WorkstreamStore(
-          path,
-          initial.id,
-          structuredClone(initial.repository),
-          database,
-        );
-        yield* store.initializeEmpty(initial);
-        return { store, state: structuredClone(initial) };
-      }
-      const store = new WorkstreamStore(
-        path,
-        initial.id,
-        structuredClone(initial.repository),
-        database,
-      );
-      const state = yield* store.read();
-      if (!Value.Equal(state, initial))
+      if (!entry.exists || entry.size === 0)
+        return yield* WorkstreamStore.initialize(path, initial);
+      yield* classifyFileHeader(fs, path);
+      const attached = yield* WorkstreamStore.openAt(path, false);
+      if (
+        attached.state.id !== initial.id ||
+        !Value.Equal(attached.state.repository, initial.repository) ||
+        !Value.Equal(attached.state.coordinator, initial.coordinator)
+      )
         return yield* new WorkstreamStoreConflictError(
-          `Workstream database does not equal its prepared creation declaration: ${path}.`,
+          "Advanced creation recovery identity does not match the prepared Workstream.",
         );
-      return { store, state };
+      return attached;
     });
   }
 
@@ -315,21 +253,18 @@ export class WorkstreamStore {
   > {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
-      const fileSystem = yield* FileSystem.FileSystem;
-      yield* validateIdentity(paths, repository, id);
+      validateIdentity(paths, repository, id);
       const path = workstreamPath(paths, repository.gitCommonDir, id);
-      yield* assertGroundedCommonDirectory(repository.gitCommonDir);
       yield* assertPrivateStorage(paths, path);
-      yield* classifyFileHeader(fileSystem, path);
-      const database = yield* acquireDatabase(path);
-      const store = new WorkstreamStore(path, id, structuredClone(repository), database);
-      return { store, state: yield* store.read() };
+      const attached = yield* WorkstreamStore.openAt(path, false);
+      if (attached.state.id !== id || !Value.Equal(attached.state.repository, repository))
+        return yield* invalid("Workstream store has a foreign identity.");
+      return attached;
     });
   }
 
-  /** Discover one exact workstream attachment from an explicit untrusted path without writing. */
   static discover(
-    statePath: string,
+    path: string,
   ): Effect.Effect<
     WorkstreamStoreAttachment,
     WorkstreamStoreError,
@@ -337,73 +272,47 @@ export class WorkstreamStore {
   > {
     return Effect.gen(function* () {
       const paths = yield* Path.Path;
-      const fileSystem = yield* FileSystem.FileSystem;
-      if (!paths.isAbsolute(statePath) || paths.resolve(statePath) !== statePath)
+      if (!paths.isAbsolute(path) || paths.resolve(path) !== path)
         return yield* invalid("Workstream statePath must be absolute and normalized.");
-      yield* assertPrivateStorage(paths, statePath);
-      yield* classifyFileHeader(fileSystem, statePath);
-      const database = yield* acquireDatabase(statePath, true);
-      const state = yield* hostEffect("read the discovered Workstream", () =>
-        readWorkstreamAggregate(database),
-      );
-      yield* validateIdentity(paths, state.repository, state.id);
-      yield* assertGroundedCommonDirectory(state.repository.gitCommonDir);
-      const expected = workstreamPath(paths, state.repository.gitCommonDir, state.id);
-      if (statePath !== expected)
-        return yield* invalid(
-          "Workstream statePath does not match the aggregate repository and Workstream identity.",
-        );
-      const store = new WorkstreamStore(
-        statePath,
-        state.id,
-        structuredClone(state.repository),
-        database,
-      );
-      return { store, state: structuredClone(state) };
+      yield* assertPrivateStorage(paths, path);
+      const attached = yield* WorkstreamStore.openAt(path, true);
+      validateIdentity(paths, attached.state.repository, attached.state.id);
+      if (workstreamPath(paths, attached.state.repository.gitCommonDir, attached.state.id) !== path)
+        return yield* invalid("Workstream statePath does not match its record identity.");
+      return attached;
     });
   }
 
-  /**
-   * Classify an already-present workstream path: a complete store is a conflict,
-   * while a process-death residue is classified by content instead of being
-   * overwritten or reported as an opaque host failure.
-   */
-  private static classifyExisting(
-    fileSystem: FileSystem.FileSystem,
+  private static openAt(
     path: string,
-    initial: Workstream,
-    entry: StorageEntry,
-  ): Effect.Effect<never, WorkstreamStoreError, Scope.Scope> {
+    readOnly: boolean,
+  ): Effect.Effect<
+    WorkstreamStoreAttachment,
+    WorkstreamStoreError,
+    Scope.Scope | FileSystem.FileSystem
+  > {
     return Effect.gen(function* () {
-      if (entry.symbolicLink || !entry.regularFile)
-        return yield* invalid(`Workstream database path is not an ordinary file: ${path}.`);
-      if (entry.mode !== FILE_MODE)
-        return yield* invalid(
-          `Workstream database is not private (${modeLabel(entry.mode)}): ${path}.`,
-        );
-      if (entry.size === 0)
-        return yield* new WorkstreamStoreIncompleteError(
-          `Workstream database is an incomplete creation residue: ${path}.`,
-        );
-      yield* classifyFileHeader(fileSystem, path);
-      const database = yield* acquireDatabase(path, true);
-      const store = new WorkstreamStore(
-        path,
-        initial.id,
-        structuredClone(initial.repository),
-        database,
-      );
-      yield* store.read();
-      return yield* new WorkstreamStoreConflictError(
-        `Workstream database already exists: ${path}.`,
-      );
+      const fs = yield* FileSystem.FileSystem;
+      yield* classifyFileHeader(fs, path);
+      const database = yield* acquireDatabase(path, readOnly);
+      assertRecordSchema(database);
+      assertHeader(database);
+      const state = readRecords(database);
+      return {
+        store: new WorkstreamStore(path, state.id, structuredClone(state.repository), database),
+        state,
+      };
     });
   }
 
   private static initialize(
     path: string,
     initial: Workstream,
-  ): Effect.Effect<WorkstreamStore, WorkstreamStoreError, Scope.Scope | FileSystem.FileSystem> {
+  ): Effect.Effect<
+    WorkstreamStoreAttachment,
+    WorkstreamStoreError,
+    Scope.Scope | FileSystem.FileSystem
+  > {
     return Effect.gen(function* () {
       const database = yield* acquireDatabase(path);
       const store = new WorkstreamStore(
@@ -419,824 +328,928 @@ export class WorkstreamStore {
           STORE_FORMAT,
           STORE_VERSION,
         );
-        database.write(
-          "INSERT INTO workstream(singleton,state_json,revision) VALUES(1,?,?)",
-          serializeState(initial),
-          initial.revision,
-        );
+        writeRecords(database, initial);
       });
-      return store;
+      return { store, state: structuredClone(initial) };
     });
   }
 
-  private initializeEmpty(
-    initial: Workstream,
-  ): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
-    return this.atomic(() => {
-      this.database.exec(CREATE_SCHEMA);
-      this.database.write(
-        "INSERT INTO store_header(singleton,format,version) VALUES(1,?,?)",
-        STORE_FORMAT,
-        STORE_VERSION,
-      );
-      this.database.write(
-        "INSERT INTO workstream(singleton,state_json,revision) VALUES(1,?,?)",
-        serializeState(initial),
-        initial.revision,
-      );
-    });
-  }
-
-  /** Read without normalization, migration, or writes. */
+  /** Assemble the complete immutable inspection view; command paths should prefer keyed reads. */
   read(): Effect.Effect<Workstream, WorkstreamStoreError> {
-    return hostEffect("read the Workstream", () => this.readAggregate());
+    return hostEffect("read Workstream records", () => this.readChecked());
   }
 
-  /** Atomically read the authoritative aggregate and prove the exact live lease. */
-  readFenced(lease: WorkstreamLease): Effect.Effect<Workstream, WorkstreamStoreError> {
-    return validateLeaseInput(lease).pipe(
-      Effect.andThen(
-        this.transaction((now) => {
-          const current = this.readAggregate();
-          this.assertHeldLease(lease, now());
-          return current;
-        }),
-      ),
-    );
-  }
-
-  observeLease(): Effect.Effect<WorkstreamLease | undefined, WorkstreamStoreError> {
-    return hostEffect("observe the Workstream lease", () => this.readLeaseRow());
-  }
-
-  /**
-   * Prove the exact held lease from the lease row alone, without reading or
-   * validating the aggregate. Ownership verification never touches task history.
-   */
-  checkLease(lease: WorkstreamLease): Effect.Effect<void, WorkstreamStoreError> {
-    return validateLeaseInput(lease).pipe(
-      Effect.andThen(
-        Clock.clockWith((clock) =>
-          hostEffect("check the Workstream lease", () =>
-            this.assertHeldLease(lease, clock.currentTimeMillisUnsafe()),
-          ),
+  /** Query only rows whose durable state can produce reconciliation work. */
+  readActionable(): Effect.Effect<ActionableRecords, WorkstreamStoreError> {
+    return hostEffect("read actionable Workstream records", () => {
+      const metadata = requiredRow(
+        this.database.readRow(
+          "SELECT lifecycle,(SELECT max(intent_index) FROM intents) AS current_intent FROM metadata WHERE singleton=1",
         ),
-      ),
-    );
-  }
-
-  acquireLease(
-    owner: CoordinatorIdentity,
-    observed?: WorkstreamLease,
-  ): Effect.Effect<WorkstreamLease, WorkstreamStoreError, FileSystem.FileSystem> {
-    if (!Value.Check(LeaseOwnerSchema, owner))
-      return Effect.fail(new WorkstreamStoreInvalidError("Lease owner is malformed."));
-    return this.atomic((nowMillis) => {
-      const current = this.readLeaseRow();
-      if (current === undefined) {
-        if (observed !== undefined)
-          throw new WorkstreamStoreConflictError(
-            `Observed lease for ${this.id} no longer matches the store.`,
-          );
-      } else {
-        if (observed === undefined || !sameLease(current, observed))
-          throw new WorkstreamStoreConflictError(
-            `Workstream ${this.id} already has a fenced lease; takeover requires the exact observed lease.`,
-          );
-        if (instantMillis(current.expiresAt) > nowMillis)
-          throw new WorkstreamStoreConflictError(`Observed lease for ${this.id} has not expired.`);
-      }
-      const now = isoFromMillis(nowMillis);
-      const lease: WorkstreamLease = {
-        token: newLeaseToken(),
-        owner: structuredClone(owner),
-        acquiredAt: now,
-        heartbeatAt: now,
-        expiresAt: isoFromMillis(nowMillis + LEASE_DURATION_MILLIS),
-      };
-      this.writeLease(lease);
-      return lease;
-    });
-  }
-
-  renewLease(
-    lease: WorkstreamLease,
-  ): Effect.Effect<WorkstreamLease, WorkstreamStoreError, FileSystem.FileSystem> {
-    return validateLeaseInput(lease).pipe(
-      Effect.andThen(
-        this.atomic((nowMillis) => {
-          this.assertHeldLease(lease, nowMillis);
-          const heartbeatAt = isoFromMillis(nowMillis);
-          const expiresAt = isoFromMillis(nowMillis + LEASE_DURATION_MILLIS);
-          const changes = this.database.write(
-            `UPDATE lease SET heartbeat_at=?, expires_at=?
-               WHERE singleton=1 AND token=? AND owner_session_id=? AND owner_session_file=? AND expires_at>?`,
-            heartbeatAt,
-            expiresAt,
-            lease.token,
-            lease.owner.sessionId,
-            lease.owner.sessionFile,
-            isoFromMillis(nowMillis),
-          );
-          if (changes !== 1) throw leaseConflict(lease);
-          return { ...lease, heartbeatAt, expiresAt };
-        }),
-      ),
-    );
-  }
-
-  releaseLease(
-    lease: WorkstreamLease,
-  ): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
-    return validateLeaseInput(lease).pipe(
-      Effect.andThen(
-        this.atomic(() => {
-          const changes = this.database.write(
-            "DELETE FROM lease WHERE singleton=1 AND token=? AND owner_session_id=? AND owner_session_file=?",
-            lease.token,
-            lease.owner.sessionId,
-            lease.owner.sessionFile,
-          );
-          if (changes !== 1) throw leaseConflict(lease);
-        }),
-      ),
-    );
-  }
-
-  /** Commit coordinator transfer and successor lease as one aggregate transaction. */
-  adoptCoordinator(
-    adoption: WorkstreamCoordinatorAdoption,
-  ): Effect.Effect<
-    WorkstreamCoordinatorAdoptionResult,
-    WorkstreamStoreError,
-    FileSystem.FileSystem
-  > {
-    return this.atomic((nowMillis) => {
-      const current = this.readAggregate();
-      const currentLease = this.readLeaseRow();
-      this.validateAdoption(current, currentLease, adoption, nowMillis);
-      const committedAt = isoFromMillis(nowMillis);
-      const previous = current.coordinatorTransfers.at(-1);
-      if (
-        previous !== undefined &&
-        workstreamInstantMillis(previous.committedAt, "coordinator transfer") >= nowMillis
-      )
-        throw new WorkstreamStoreConflictError(
-          "Coordinator adoption time does not advance transfer history.",
-        );
-      const next: Workstream = structuredClone(current);
-      next.revision = current.revision + 1;
-      next.updatedAt = committedAt;
-      next.coordinatorTransfers.push({
-        from: structuredClone(adoption.priorCoordinator),
-        to: structuredClone(adoption.coordinator),
-        committedRevision: next.revision,
-        committedAt,
-        intentCountBoundary: current.intents.length,
-        deathObservation: structuredClone(adoption.deathObservation),
+        "metadata",
+      );
+      const lifecycle = stringField(metadata, "lifecycle") as Workstream["lifecycle"];
+      if (lifecycle !== "active" && lifecycle !== "suspended" && lifecycle !== "completed")
+        throw new WorkstreamStoreInvalidError("lifecycle is malformed.");
+      const currentIntentIndex = numberField(metadata, "current_intent");
+      const rows = this.database.readRows(
+        `SELECT t.contract_json,a.operational_json,o.outcome_json,d.delivery_json
+         FROM attempts a JOIN tasks t ON t.task_id=a.task_id
+         LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id
+         LEFT JOIN deliveries d ON d.outcome_id=o.outcome_id
+         WHERE json_extract(a.operational_json,'$.state') IN ('queued','active')
+            OR (json_extract(a.operational_json,'$.state')='finished' AND
+                (json_extract(d.delivery_json,'$.state')='pending'
+                 OR (json_extract(a.operational_json,'$.execution.placement') IS NOT NULL AND
+                     (json_extract(a.operational_json,'$.cleanup') IS NULL OR json_extract(a.operational_json,'$.cleanup.state')='pending'))))
+         ORDER BY a.rowid`,
+      );
+      const records = rows.map((row) => {
+        const operational = parseJson(stringField(row, "operational_json")) as Record<
+          string,
+          unknown
+        >;
+        // biome-ignore lint/complexity/useLiteralKeys: node:sqlite rows are index-signature records under strict TypeScript.
+        const outcomeValue = row["outcome_json"];
+        const attemptValue =
+          outcomeValue === null
+            ? operational
+            : {
+                ...operational,
+                outcome: {
+                  ...(parseJson(stringField(row, "outcome_json")) as Record<string, unknown>),
+                  delivery: parseJson(stringField(row, "delivery_json")),
+                },
+              };
+        const taskValue = {
+          ...(parseJson(stringField(row, "contract_json")) as Record<string, unknown>),
+          attempts: [attemptValue],
+        };
+        if (!Value.Check(TaskSchema, taskValue) || !Value.Check(AttemptSchema, attemptValue))
+          throw new WorkstreamStoreInvalidError("Actionable Task or Attempt record is malformed.");
+        return {
+          task: structuredClone(taskValue as Task),
+          attempt: structuredClone(attemptValue as Attempt),
+        };
       });
-      next.coordinator = structuredClone(adoption.coordinator);
-      validateWorkstream(next);
-      const lease: WorkstreamLease = {
-        token: newLeaseToken(),
-        owner: structuredClone(adoption.coordinator),
-        acquiredAt: committedAt,
-        heartbeatAt: committedAt,
-        expiresAt: isoFromMillis(nowMillis + LEASE_DURATION_MILLIS),
-      };
-      const changes = this.database.write(
-        "UPDATE workstream SET state_json=?, revision=? WHERE singleton=1 AND revision=?",
-        serializeState(next),
-        next.revision,
-        current.revision,
-      );
-      if (changes !== 1)
-        throw new WorkstreamStoreConflictError("Coordinator adoption aggregate changed.");
-      this.writeLease(lease);
-      return { state: structuredClone(next), lease };
+      return { lifecycle, currentIntentIndex, records };
     });
   }
 
-  private validateAdoption(
-    current: Workstream,
-    currentLease: WorkstreamLease | undefined,
-    adoption: WorkstreamCoordinatorAdoption,
-    nowMillis: number,
-  ): void {
-    this.validateAdoptionAggregate(current, adoption);
-    validateAdoptionProof(adoption, nowMillis);
-    validateAdoptionLease(currentLease, adoption, nowMillis);
-  }
-
-  private validateAdoptionAggregate(
-    current: Workstream,
-    adoption: WorkstreamCoordinatorAdoption,
-  ): void {
-    if (
-      adoption.workstreamId !== this.id ||
-      !Value.Equal(adoption.repository, this.repository) ||
-      current.id !== adoption.workstreamId ||
-      !Value.Equal(current.repository, adoption.repository)
-    )
-      throw new WorkstreamStoreConflictError(
-        "Coordinator adoption repository or Workstream identity changed.",
+  /** Minimal current-Intent projection for queue planning; it contains no Task scan. */
+  readPlanningState(): Effect.Effect<Workstream, WorkstreamStoreError> {
+    return hostEffect("read Workstream planning metadata", () => {
+      const row = requiredRow(
+        this.database.readRow(
+          `SELECT m.*,(SELECT max(intent_index) FROM intents) AS current_intent,
+                  (SELECT intent_json FROM intents ORDER BY intent_index DESC LIMIT 1) AS intent_json
+           FROM metadata m WHERE singleton=1`,
+        ),
+        "metadata",
       );
-    if (current.revision !== adoption.expectedRevision)
-      throw new WorkstreamStoreConflictError("Coordinator adoption revision changed.");
-    if (!Value.Equal(current.coordinator, adoption.priorCoordinator))
-      throw new WorkstreamStoreConflictError("Coordinator adoption prior owner changed.");
-    if (Value.Equal(adoption.coordinator, adoption.priorCoordinator))
-      throw new WorkstreamStoreInvalidError("Coordinator adoption requires a different successor.");
+      const currentIntentIndex = numberField(row, "current_intent");
+      const intent = parseJson(stringField(row, "intent_json"));
+      if (!Value.Check(IntentSchema, intent))
+        throw new WorkstreamStoreInvalidError("Current Intent record is malformed.");
+      return {
+        format: "pi-workgraph-workstream",
+        schemaVersion: 3,
+        revision: numberField(row, "revision"),
+        id: stringField(row, "id"),
+        purpose: stringField(row, "purpose"),
+        repository: {
+          projectRoot: stringField(row, "project_root"),
+          gitCommonDir: stringField(row, "git_common_dir"),
+        },
+        coordinator: {
+          sessionId: stringField(row, "owner_session_id"),
+          sessionFile: stringField(row, "owner_session_file"),
+        },
+        lifecycle: stringField(row, "lifecycle") as Workstream["lifecycle"],
+        ...nullableJson(row, "suspension_json", "suspension"),
+        intents: Array.from({ length: currentIntentIndex + 1 }, () =>
+          structuredClone(intent as Intent),
+        ),
+        tasks: [],
+        ...nullableJson(row, "completion_json", "completion"),
+        createdAt: stringField(row, "created_at"),
+        updatedAt: stringField(row, "updated_at"),
+      };
+    });
   }
 
-  /**
-   * Persist one settled domain transition. The callback receives a clone of the
-   * validated authoritative aggregate; returning that input object is the only
-   * no-op. A changed result must be valid at exactly current revision + 1.
-   */
-  transition(
-    lease: WorkstreamLease,
-    apply: (current: Workstream) => Workstream,
-  ): Effect.Effect<Workstream, WorkstreamStoreError, FileSystem.FileSystem> {
-    return validateLeaseInput(lease).pipe(
-      Effect.andThen(
-        this.atomic((nowMillis, resample) => {
-          const current = this.readAggregate();
-          this.assertHeldLease(lease, nowMillis);
-          const input = structuredClone(current);
-          const next = apply(input);
-          if (next === input) return structuredClone(current);
-          validateTransition(current, next);
-          // The callback may consume arbitrary time, so the final lease
-          // predicate uses a sample taken only after it returned.
-          const changes = this.database.write(
-            `UPDATE workstream SET state_json=?, revision=?
-             WHERE singleton=1 AND revision=? AND EXISTS (
-               SELECT 1 FROM lease WHERE singleton=1 AND token=? AND owner_session_id=?
-               AND owner_session_file=? AND expires_at>?
-             )`,
-            serializeState(next),
-            next.revision,
-            current.revision,
-            lease.token,
-            lease.owner.sessionId,
-            lease.owner.sessionFile,
-            isoFromMillis(resample()),
-          );
-          if (changes !== 1)
-            throw new WorkstreamStoreConflictError(
-              `Workstream ${current.id} lost its fenced lease before mutation commit.`,
-            );
-          return structuredClone(next);
-        }),
+  /** Query only Tasks that can affect completion accounting or candidate inclusion. */
+  readCompletionState(): Effect.Effect<Workstream, WorkstreamStoreError> {
+    return Effect.gen(
+      function* (this: WorkstreamStore) {
+        const state = yield* this.readPlanningState();
+        const taskIds = yield* hostEffect("read completion-related Task keys", () =>
+          this.database
+            .readRows(
+              `SELECT DISTINCT a.task_id FROM attempts a
+               JOIN tasks t ON t.task_id=a.task_id
+               LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id
+               LEFT JOIN deliveries d ON d.outcome_id=o.outcome_id
+               WHERE json_extract(a.operational_json,'$.state')!='finished'
+                  OR coalesce(json_extract(d.delivery_json,'$.state'),'pending')!='delivered'
+                  OR json_extract(a.operational_json,'$.application.state') IN ('pending','blocked','applied')
+                  OR (json_extract(a.operational_json,'$.execution.placement') IS NOT NULL AND
+                      (json_extract(a.operational_json,'$.cleanup.state')!='completed'
+                       OR coalesce(json_extract(a.operational_json,'$.cleanup.workerClosed'),0)!=1))
+                  OR (json_extract(a.operational_json,'$.execution.placement.kind')='isolated_worktree'
+                      AND coalesce(json_extract(a.operational_json,'$.outputRelease.state'),'')!='completed')
+               ORDER BY a.task_id`,
+            )
+            .map((row) => stringField(row, "task_id")),
+        );
+        state.tasks.push(...(yield* Effect.forEach(taskIds, (id) => this.readTask(id))));
+        return state;
+      }.bind(this),
+    );
+  }
+
+  taskExists(taskId: string): Effect.Effect<boolean, WorkstreamStoreError> {
+    return hostEffect(
+      "read keyed Task identity",
+      () =>
+        this.database.readRow("SELECT task_id FROM tasks WHERE task_id=?", taskId) !== undefined,
+    );
+  }
+
+  readTask(taskId: string): Effect.Effect<Task, WorkstreamStoreError> {
+    return Effect.gen(
+      function* (this: WorkstreamStore) {
+        const ids = yield* hostEffect("read Task Attempt keys", () =>
+          this.database
+            .readRows("SELECT attempt_id FROM attempts WHERE task_id=? ORDER BY sequence", taskId)
+            .map((row) => stringField(row, "attempt_id")),
+        );
+        if (ids.length === 0)
+          return yield* new WorkstreamStoreConflictError(`Unknown Task ${taskId}.`);
+        const records = yield* Effect.forEach(ids, (id) => this.readAttempt(taskId, id));
+        const first = records[0];
+        if (first === undefined)
+          return yield* new WorkstreamStoreConflictError(`Unknown Task ${taskId}.`);
+        return { ...first.task, attempts: records.map((record) => record.attempt) } as Task;
+      }.bind(this),
+    );
+  }
+
+  readAttemptForOutcome(outcomeId: string): Effect.Effect<AttemptRecords, WorkstreamStoreError> {
+    return Effect.flatMap(
+      hostEffect("read Outcome Attempt key", () => {
+        const row = this.database.readRow(
+          "SELECT a.task_id,a.attempt_id FROM outcomes o JOIN attempts a ON a.attempt_id=o.attempt_id WHERE o.outcome_id=?",
+          outcomeId,
+        );
+        if (row === undefined)
+          throw new WorkstreamStoreConflictError(`Unknown Outcome ${outcomeId}.`);
+        return { taskId: stringField(row, "task_id"), attemptId: stringField(row, "attempt_id") };
+      }),
+      (key) => this.readAttempt(key.taskId, key.attemptId),
+    );
+  }
+
+  readRevision(): Effect.Effect<number, WorkstreamStoreError> {
+    return hostEffect("read Workstream revision", () =>
+      integerField(
+        this.database.readRow("SELECT revision FROM metadata WHERE singleton=1"),
+        "revision",
       ),
     );
   }
 
-  private readAggregate(): Workstream {
-    const state = readWorkstreamAggregate(this.database);
-    if (state.id !== this.id || !Value.Equal(state.repository, this.repository))
-      throw new WorkstreamStoreInvalidError(
-        "Workstream store belongs to a foreign repository or Workstream identity.",
+  readAttempt(
+    taskId: string | undefined,
+    attemptId: string,
+  ): Effect.Effect<AttemptRecords, WorkstreamStoreError> {
+    return hostEffect("read keyed Attempt context", () => {
+      const statement = `SELECT m.id,m.project_root,m.git_common_dir,m.revision,m.lifecycle,m.suspension_json,m.completion_json,
+                (SELECT max(intent_index) FROM intents) AS current_intent,
+                i.intent_json,t.contract_json,a.operational_json,o.outcome_json,d.delivery_json
+         FROM attempts a JOIN tasks t ON t.task_id=a.task_id
+         JOIN intents i ON i.intent_index=t.intent_index JOIN metadata m ON m.singleton=1
+         LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id
+         LEFT JOIN deliveries d ON d.outcome_id=o.outcome_id
+         WHERE ${taskId === undefined ? "a.attempt_id=?" : "t.task_id=? AND a.attempt_id=?"}`;
+      const row =
+        taskId === undefined
+          ? this.database.readRow(statement, attemptId)
+          : this.database.readRow(statement, taskId, attemptId);
+      if (row === undefined)
+        throw new WorkstreamStoreConflictError(`Unknown Attempt ${attemptId}.`);
+      const operational = parseJson(stringField(row, "operational_json")) as Record<
+        string,
+        unknown
+      >;
+      const attemptValue =
+        // biome-ignore lint/complexity/useLiteralKeys: node:sqlite rows are index-signature records under strict TypeScript.
+        row["outcome_json"] === null
+          ? operational
+          : {
+              ...operational,
+              outcome: {
+                ...(parseJson(stringField(row, "outcome_json")) as Record<string, unknown>),
+                delivery: parseJson(stringField(row, "delivery_json")),
+              },
+            };
+      const taskValue = {
+        ...(parseJson(stringField(row, "contract_json")) as Record<string, unknown>),
+        attempts: [attemptValue],
+      };
+      const intentValue = parseJson(stringField(row, "intent_json"));
+      if (
+        !Value.Check(IntentSchema, intentValue) ||
+        !Value.Check(TaskSchema, taskValue) ||
+        !Value.Check(AttemptSchema, attemptValue)
+      )
+        throw new WorkstreamStoreInvalidError("Keyed Attempt records are malformed.");
+      const lifecycle = {
+        ...nullableJson(row, "suspension_json", "suspension"),
+        ...nullableJson(row, "completion_json", "completion"),
+      } as { suspension?: Suspension; completion?: Completion };
+      return {
+        revision: numberField(row, "revision"),
+        lifecycle: stringField(row, "lifecycle") as Workstream["lifecycle"],
+        workstreamId: stringField(row, "id"),
+        repository: {
+          projectRoot: stringField(row, "project_root"),
+          gitCommonDir: stringField(row, "git_common_dir"),
+        },
+        currentIntentIndex: numberField(row, "current_intent"),
+        ...lifecycle,
+        intent: structuredClone(intentValue as Intent),
+        task: structuredClone(taskValue as Task),
+        attempt: structuredClone(attemptValue as Attempt),
+      };
+    });
+  }
+
+  readOutcome(
+    outcomeId: string,
+  ): Effect.Effect<NonNullable<Attempt["outcome"]>, WorkstreamStoreError> {
+    return hostEffect("read keyed Outcome record", () => {
+      const row = this.database.readRow(
+        `SELECT o.outcome_json,d.delivery_json FROM outcomes o
+         JOIN deliveries d ON d.outcome_id=o.outcome_id WHERE o.outcome_id=?`,
+        outcomeId,
       );
+      if (row === undefined)
+        throw new WorkstreamStoreConflictError(`Unknown Outcome ${outcomeId}.`);
+      const value = {
+        ...(parseJson(stringField(row, "outcome_json")) as Record<string, unknown>),
+        delivery: parseJson(stringField(row, "delivery_json")),
+      };
+      return structuredClone(value as NonNullable<Attempt["outcome"]>);
+    });
+  }
+
+  /** Apply one purpose-specific record mutation with an owner/revision fence. */
+  mutateRecords(
+    owner: CoordinatorIdentity,
+    expectedRevision: number,
+    mutation: WorkstreamRecordMutation,
+  ): Effect.Effect<number, WorkstreamStoreError, FileSystem.FileSystem> {
+    return this.atomic(() => {
+      const metadata = requiredRow(
+        this.database.readRow(
+          "SELECT owner_session_id,owner_session_file,revision FROM metadata WHERE singleton=1",
+        ),
+        "metadata",
+      );
+      if (
+        stringField(metadata, "owner_session_id") !== owner.sessionId ||
+        stringField(metadata, "owner_session_file") !== owner.sessionFile
+      )
+        throw new WorkstreamStoreConflictError("Workstream owner changed during mutation.");
+      const revision = numberField(metadata, "revision");
+      if (revision !== expectedRevision)
+        throw new WorkstreamStoreConflictError(
+          `Expected revision ${expectedRevision}, found ${revision}.`,
+        );
+      applyRecordMutation(this.database, mutation);
+      const nextRevision = revision + 1;
+      const changed = this.database.write(
+        "UPDATE metadata SET revision=?,updated_at=? WHERE singleton=1 AND revision=? AND owner_session_id=? AND owner_session_file=?",
+        nextRevision,
+        mutation.updatedAt,
+        revision,
+        owner.sessionId,
+        owner.sessionFile,
+      );
+      if (changed !== 1)
+        throw new WorkstreamStoreConflictError("Workstream revision changed during mutation.");
+      return nextRevision;
+    });
+  }
+
+  private readChecked(): Workstream {
+    const state = readRecords(this.database);
+    if (state.id !== this.id || !Value.Equal(state.repository, this.repository))
+      throw new WorkstreamStoreInvalidError("Workstream store has a foreign identity.");
     return state;
   }
 
-  private readLeaseRow(): WorkstreamLease | undefined {
-    assertWorkstreamSchema(this.database);
-    const value = this.database.readRow(
-      "SELECT token,owner_session_id,owner_session_file,acquired_at,heartbeat_at,expires_at FROM lease WHERE singleton=1",
-    );
-    if (value === undefined) return undefined;
-    if (!Value.Check(LeaseRowSchema, value))
-      throw new WorkstreamStoreInvalidError("Workstream lease row is malformed.");
-    const row: LeaseRow = Value.Decode(LeaseRowSchema, value);
-    const lease: WorkstreamLease = {
-      token: row.token,
-      owner: { sessionId: row.owner_session_id, sessionFile: row.owner_session_file },
-      acquiredAt: row.acquired_at,
-      heartbeatAt: row.heartbeat_at,
-      expiresAt: row.expires_at,
-    };
-    validateLease(lease);
-    return lease;
-  }
-
-  private writeLease(lease: WorkstreamLease): void {
-    this.database.write(
-      `INSERT INTO lease(singleton,token,owner_session_id,owner_session_file,acquired_at,heartbeat_at,expires_at)
-       VALUES(1,?,?,?,?,?,?)
-       ON CONFLICT(singleton) DO UPDATE SET token=excluded.token,
-       owner_session_id=excluded.owner_session_id, owner_session_file=excluded.owner_session_file,
-       acquired_at=excluded.acquired_at, heartbeat_at=excluded.heartbeat_at, expires_at=excluded.expires_at`,
-      lease.token,
-      lease.owner.sessionId,
-      lease.owner.sessionFile,
-      lease.acquiredAt,
-      lease.heartbeatAt,
-      lease.expiresAt,
-    );
-  }
-
-  private assertHeldLease(lease: WorkstreamLease, nowMillis: number): void {
-    const current = this.readLeaseRow();
-    if (current === undefined || !sameLeaseHolder(current, lease)) throw leaseConflict(lease);
-    if (instantMillis(current.expiresAt) <= nowMillis)
-      throw new WorkstreamStoreConflictError("The fenced Workstream lease has expired.");
-  }
-
   private atomic<A>(
-    body: (nowMillis: number, resample: () => number) => A,
+    body: (nowMillis: number) => A,
   ): Effect.Effect<A, WorkstreamStoreError, FileSystem.FileSystem> {
-    return this.transaction((now) => body(now(), now)).pipe(
-      Effect.tap(() => secureFiles(this.path)),
-    );
-  }
-
-  /**
-   * Run one write transaction. `BEGIN IMMEDIATE` takes the SQLite write lock
-   * before the body samples the Clock, so every decision uses a time read after
-   * the lock is held. The native critical section cannot be interrupted, and a
-   * failure is rolled back and rethrown with its original typed identity.
-   */
-  private transaction<A>(run: (now: () => number) => A): Effect.Effect<A, WorkstreamStoreError> {
     return Effect.uninterruptible(
       Clock.clockWith((clock) =>
-        hostEffect("run the workstream transaction", () => {
+        hostEffect("run Workstream record transaction", () => {
           this.database.exec("BEGIN IMMEDIATE");
           try {
-            const value = run(() => clock.currentTimeMillisUnsafe());
+            const value = body(clock.currentTimeMillisUnsafe());
             this.database.exec("COMMIT");
             return value;
           } catch (cause) {
             try {
               this.database.exec("ROLLBACK");
-            } catch (rollbackCause) {
+            } catch (rollback) {
               throw new WorkstreamStoreHostError(
-                "roll back the workstream transaction",
-                new AggregateError([cause, rollbackCause]),
+                "roll back Workstream record transaction",
+                new AggregateError([cause, rollback]),
               );
             }
             throw cause;
           }
         }),
       ),
+    ).pipe(Effect.tap(() => secureFiles(this.path)));
+  }
+}
+
+function writeRecords(database: WorkstreamDatabase, state: Workstream): void {
+  database.write(
+    `INSERT INTO metadata(singleton,id,purpose,project_root,git_common_dir,owner_session_id,owner_session_file,revision,lifecycle,suspension_json,completion_json,created_at,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    state.id,
+    state.purpose,
+    state.repository.projectRoot,
+    state.repository.gitCommonDir,
+    state.coordinator.sessionId,
+    state.coordinator.sessionFile,
+    state.revision,
+    state.lifecycle,
+    optionalJson(state.suspension),
+    optionalJson(state.completion),
+    state.createdAt,
+    state.updatedAt,
+  );
+  state.intents.forEach((value, index) => {
+    database.write("INSERT INTO intents(intent_index,intent_json) VALUES(?,?)", index, json(value));
+  });
+  for (const task of state.tasks) {
+    const { attempts, ...contract } = task;
+    database.write(
+      "INSERT INTO tasks(task_id,intent_index,kind,contract_json) VALUES(?,?,?,?)",
+      task.id,
+      task.intentIndex,
+      task.kind,
+      json(contract),
     );
-  }
-}
-
-function assertWorkstreamSchema(database: WorkstreamDatabase): void {
-  const tables = database.tableNames();
-  for (const [table, columns] of Object.entries(WORKSTREAM_SCHEMA)) {
-    if (!tables.includes(table))
-      throw new WorkstreamStoreIncompleteError(`Workstream database is missing table: ${table}.`);
-    const present = database.columnNames(table);
-    const absent = columns.filter((column) => !present.includes(column));
-    if (absent.length > 0)
-      throw new WorkstreamStoreIncompleteError(
-        `Workstream table ${table} lacks: ${absent.join(", ")}.`,
+    attempts.forEach((attempt, sequence) => {
+      const { outcome, ...operational } = attempt;
+      database.write(
+        "INSERT INTO attempts(attempt_id,task_id,sequence,operational_json) VALUES(?,?,?,?)",
+        attempt.id,
+        task.id,
+        sequence,
+        json(operational),
       );
+      if (outcome !== undefined) {
+        const { delivery, ...immutableOutcome } = outcome;
+        database.write(
+          "INSERT INTO outcomes(outcome_id,attempt_id,outcome_json) VALUES(?,?,?)",
+          outcome.id,
+          attempt.id,
+          json(immutableOutcome),
+        );
+        database.write(
+          "INSERT INTO deliveries(outcome_id,delivery_json) VALUES(?,?)",
+          outcome.id,
+          json(delivery),
+        );
+      }
+    });
+  }
+}
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: the closed mutation union keeps each table-owned transaction explicit.
+function applyRecordMutation(
+  database: WorkstreamDatabase,
+  mutation: WorkstreamRecordMutation,
+): void {
+  switch (mutation.kind) {
+    case "append_intent": {
+      if (!Value.Check(IntentSchema, mutation.intent))
+        throw new WorkstreamStoreInvalidError("Intent record is malformed.");
+      const row = requiredRow(
+        database.readRow(
+          "SELECT lifecycle,(SELECT max(intent_index) FROM intents) AS current_intent FROM metadata WHERE singleton=1",
+        ),
+        "metadata",
+      );
+      if (stringField(row, "lifecycle") !== "active")
+        throw new WorkstreamStoreConflictError(
+          "Cannot revise Intent outside an active Workstream.",
+        );
+      if (
+        mutation.intent.grounding.kind !== "human_input_receipt" ||
+        mutation.intent.grounding.sessionId !==
+          stringField(metadataOwner(database), "owner_session_id") ||
+        mutation.intent.grounding.sessionFile !==
+          stringField(metadataOwner(database), "owner_session_file")
+      )
+        throw new WorkstreamStoreConflictError(
+          "Revised Intent requires a direct receipt from the current owner.",
+        );
+      database.write(
+        "INSERT INTO intents(intent_index,intent_json) VALUES(?,?)",
+        numberField(row, "current_intent") + 1,
+        json(mutation.intent),
+      );
+      return;
+    }
+    case "create_task": {
+      if (!Value.Check(TaskSchema, mutation.task))
+        throw new WorkstreamStoreInvalidError("Task record is malformed.");
+      const row = requiredRow(
+        database.readRow(
+          "SELECT lifecycle,(SELECT max(intent_index) FROM intents) AS current_intent FROM metadata WHERE singleton=1",
+        ),
+        "metadata",
+      );
+      if (
+        stringField(row, "lifecycle") !== "active" ||
+        mutation.task.intentIndex !== numberField(row, "current_intent")
+      )
+        throw new WorkstreamStoreConflictError(
+          "Task does not belong to the active current Intent.",
+        );
+      insertTaskRecords(database, mutation.task);
+      return;
+    }
+    case "append_attempts": {
+      const task = database.readRow(
+        "SELECT intent_index FROM tasks WHERE task_id=?",
+        mutation.taskId,
+      );
+      if (task === undefined)
+        throw new WorkstreamStoreConflictError(`Unknown Task ${mutation.taskId}.`);
+      const nextSequence = integerField(
+        database.readRow(
+          "SELECT coalesce(max(sequence),-1)+1 AS sequence FROM attempts WHERE task_id=?",
+          mutation.taskId,
+        ),
+        "sequence",
+      );
+      mutation.attempts.forEach((attempt, offset) => {
+        insertAttemptRecord(database, mutation.taskId, nextSequence + offset, attempt);
+      });
+      return;
+    }
+    case "update_attempt": {
+      if (
+        !Value.Check(AttemptSchema, mutation.attempt) ||
+        mutation.attempt.id !== mutation.key.attemptId
+      )
+        throw new WorkstreamStoreInvalidError("Attempt record is malformed or mismatched.");
+      const existing = database.readRow(
+        "SELECT attempt_id FROM attempts WHERE task_id=? AND attempt_id=?",
+        mutation.key.taskId,
+        mutation.key.attemptId,
+      );
+      if (existing === undefined)
+        throw new WorkstreamStoreConflictError(`Unknown Attempt ${mutation.key.attemptId}.`);
+      writeAttemptRecord(database, mutation.key.taskId, mutation.attempt);
+      if (mutation.completion !== undefined)
+        database.write(
+          "UPDATE metadata SET completion_json=? WHERE singleton=1",
+          json(mutation.completion),
+        );
+      return;
+    }
+    case "update_lifecycle": {
+      const current = stringField(
+        requiredRow(
+          database.readRow("SELECT lifecycle FROM metadata WHERE singleton=1"),
+          "metadata",
+        ),
+        "lifecycle",
+      );
+      const valid =
+        (current === "active" &&
+          mutation.lifecycle === "suspended" &&
+          mutation.suspension !== undefined &&
+          mutation.completion === undefined) ||
+        (current === "suspended" &&
+          mutation.lifecycle === "active" &&
+          mutation.suspension === undefined &&
+          mutation.completion === undefined) ||
+        (current === "active" &&
+          mutation.lifecycle === "completed" &&
+          mutation.suspension === undefined &&
+          mutation.completion !== undefined);
+      if (!valid)
+        throw new WorkstreamStoreConflictError(
+          `Invalid Workstream lifecycle transition from ${current} to ${mutation.lifecycle}.`,
+        );
+      database.write(
+        "UPDATE metadata SET lifecycle=?,suspension_json=?,completion_json=? WHERE singleton=1",
+        mutation.lifecycle,
+        optionalJson(mutation.suspension),
+        optionalJson(mutation.completion),
+      );
+      return;
+    }
   }
 }
 
-function readWorkstreamAggregate(database: WorkstreamDatabase): Workstream {
-  assertWorkstreamSchema(database);
-  const headerValue = database.readRow(
-    "SELECT format, version FROM store_header WHERE singleton=1",
+function metadataOwner(database: WorkstreamDatabase): Record<string, unknown> {
+  return requiredRow(
+    database.readRow("SELECT owner_session_id,owner_session_file FROM metadata WHERE singleton=1"),
+    "metadata owner",
   );
-  if (!Value.Check(HeaderRowSchema, headerValue))
-    throw new WorkstreamStoreIncompleteError("Workstream store header is missing or malformed.");
-  const header: HeaderRow = Value.Decode(HeaderRowSchema, headerValue);
-  if (header.format !== STORE_FORMAT || header.version !== STORE_VERSION)
-    throw new WorkstreamStoreUnsupportedError("Workstream store header is unsupported.");
-  const rowValue = database.readRow(
-    "SELECT state_json, revision FROM workstream WHERE singleton=1",
-  );
-  if (!Value.Check(AggregateRowSchema, rowValue))
-    throw new WorkstreamStoreIncompleteError("Workstream row is missing or malformed.");
-  const row: AggregateRow = Value.Decode(AggregateRowSchema, rowValue);
-  const state = parseWorkstream(row.state_json);
-  if (state.revision !== row.revision)
-    throw new WorkstreamStoreInvalidError("Workstream revision diverges from its aggregate row.");
-  return state;
 }
 
-function validateInitial(
-  paths: Path.Path,
-  initial: Workstream,
-): Effect.Effect<void, WorkstreamStoreInvalidError> {
-  return domainInvalid("validate initial Workstream", () => {
-    validateIdentitySync(paths, initial.repository, initial.id);
-    validateWorkstream(initial);
-    if (initial.revision !== 0) throw new Error("Initial Workstream revision must be 0.");
+function insertTaskRecords(database: WorkstreamDatabase, task: Task): void {
+  const { attempts, ...contract } = task;
+  database.write(
+    "INSERT INTO tasks(task_id,intent_index,kind,contract_json) VALUES(?,?,?,?)",
+    task.id,
+    task.intentIndex,
+    task.kind,
+    json(contract),
+  );
+  attempts.forEach((attempt, sequence) => {
+    insertAttemptRecord(database, task.id, sequence, attempt);
   });
 }
 
-function validateIdentity(
-  paths: Path.Path,
-  repository: RepositoryIdentity,
-  id: string,
-): Effect.Effect<void, WorkstreamStoreInvalidError> {
-  return domainInvalid("validate workstream identity", () =>
-    validateIdentitySync(paths, repository, id),
+function insertAttemptRecord(
+  database: WorkstreamDatabase,
+  taskId: string,
+  sequence: number,
+  attempt: Attempt,
+): void {
+  if (!Value.Check(AttemptSchema, attempt))
+    throw new WorkstreamStoreInvalidError("Attempt record is malformed.");
+  const { outcome, ...operational } = attempt;
+  database.write(
+    "INSERT INTO attempts(attempt_id,task_id,sequence,operational_json) VALUES(?,?,?,?)",
+    attempt.id,
+    taskId,
+    sequence,
+    json(operational),
+  );
+  if (outcome !== undefined) insertOutcomeRecord(database, attempt.id, outcome);
+}
+
+function writeAttemptRecord(database: WorkstreamDatabase, taskId: string, attempt: Attempt): void {
+  const { outcome, ...operational } = attempt;
+  const changed = database.write(
+    "UPDATE attempts SET operational_json=? WHERE attempt_id=? AND task_id=?",
+    json(operational),
+    attempt.id,
+    taskId,
+  );
+  if (changed !== 1) throw new WorkstreamStoreConflictError(`Unknown Attempt ${attempt.id}.`);
+  const prior = database.readRow(
+    "SELECT outcome_id,outcome_json FROM outcomes WHERE attempt_id=?",
+    attempt.id,
+  );
+  if (outcome === undefined) {
+    if (prior !== undefined)
+      throw new WorkstreamStoreInvalidError(`Outcome for ${attempt.id} is immutable.`);
+    return;
+  }
+  if (prior === undefined) {
+    insertOutcomeRecord(database, attempt.id, outcome);
+    return;
+  }
+  const { delivery, ...immutableOutcome } = outcome;
+  if (
+    stringField(prior, "outcome_id") !== outcome.id ||
+    !Value.Equal(parseJson(stringField(prior, "outcome_json")), immutableOutcome)
+  )
+    throw new WorkstreamStoreInvalidError(`Outcome ${outcome.id} is immutable.`);
+  database.write(
+    "UPDATE deliveries SET delivery_json=? WHERE outcome_id=?",
+    json(delivery),
+    outcome.id,
   );
 }
 
-function validateIdentitySync(paths: Path.Path, repository: RepositoryIdentity, id: string): void {
-  const safeSegment = id.length > 0 && id !== "." && id !== ".." && paths.basename(id) === id;
-  if (!safeSegment) throw new Error(`Workstream id is not a safe path segment: ${id}.`);
-  if (repository.projectRoot.length === 0 || repository.gitCommonDir.length === 0)
-    throw new Error("Repository identity paths must be nonempty.");
-  if (
-    !paths.isAbsolute(repository.projectRoot) ||
-    !paths.isAbsolute(repository.gitCommonDir) ||
-    paths.resolve(repository.projectRoot) !== repository.projectRoot ||
-    paths.resolve(repository.gitCommonDir) !== repository.gitCommonDir
-  )
-    throw new Error("Repository identity must contain absolute normalized paths.");
+function insertOutcomeRecord(
+  database: WorkstreamDatabase,
+  attemptId: string,
+  outcome: NonNullable<Attempt["outcome"]>,
+): void {
+  const { delivery, ...immutableOutcome } = outcome;
+  database.write(
+    "INSERT INTO outcomes(outcome_id,attempt_id,outcome_json) VALUES(?,?,?)",
+    outcome.id,
+    attemptId,
+    json(immutableOutcome),
+  );
+  database.write(
+    "INSERT INTO deliveries(outcome_id,delivery_json) VALUES(?,?)",
+    outcome.id,
+    json(delivery),
+  );
 }
 
-function validateTransition(current: Workstream, next: Workstream): void {
-  for (const key of [
-    "format",
-    "schemaVersion",
-    "id",
-    "repository",
-    "coordinator",
-    "coordinatorTransfers",
-    "purpose",
-    "createdAt",
-  ] as const)
-    if (!Value.Equal(next[key], current[key]))
-      throw new WorkstreamStoreInvalidError(`Transition cannot rewrite immutable ${key}.`);
-  try {
-    validateWorkstream(next);
-  } catch (cause) {
+function readRecords(database: WorkstreamDatabase): Workstream {
+  assertRecordSchema(database);
+  assertHeader(database);
+  const metadata = requiredRow(
+    database.readRow("SELECT * FROM metadata WHERE singleton=1"),
+    "metadata",
+  );
+  const intents = database
+    .readRows("SELECT intent_json FROM intents ORDER BY intent_index")
+    .map((row) => parseJson(stringField(row, "intent_json")));
+  const tasks = database
+    .readRows("SELECT task_id,contract_json FROM tasks ORDER BY rowid")
+    .map((row) => {
+      const contract = parseJson(stringField(row, "contract_json")) as Record<string, unknown>;
+      const attempts = database
+        .readRows(
+          "SELECT attempt_id,operational_json FROM attempts WHERE task_id=? ORDER BY sequence",
+          stringField(row, "task_id"),
+        )
+        .map((attemptRow) => {
+          const operational = parseJson(stringField(attemptRow, "operational_json")) as Record<
+            string,
+            unknown
+          >;
+          const outcomeRow = database.readRow(
+            "SELECT outcome_id,outcome_json FROM outcomes WHERE attempt_id=?",
+            stringField(attemptRow, "attempt_id"),
+          );
+          if (outcomeRow === undefined) return operational;
+          const outcome = parseJson(stringField(outcomeRow, "outcome_json")) as Record<
+            string,
+            unknown
+          >;
+          const delivery = requiredRow(
+            database.readRow(
+              "SELECT delivery_json FROM deliveries WHERE outcome_id=?",
+              stringField(outcomeRow, "outcome_id"),
+            ),
+            "delivery",
+          );
+          return {
+            ...operational,
+            outcome: { ...outcome, delivery: parseJson(stringField(delivery, "delivery_json")) },
+          };
+        });
+      return { ...contract, attempts };
+    });
+  const state: unknown = {
+    format: "pi-workgraph-workstream",
+    schemaVersion: 3,
+    revision: numberField(metadata, "revision"),
+    id: stringField(metadata, "id"),
+    purpose: stringField(metadata, "purpose"),
+    repository: {
+      projectRoot: stringField(metadata, "project_root"),
+      gitCommonDir: stringField(metadata, "git_common_dir"),
+    },
+    coordinator: {
+      sessionId: stringField(metadata, "owner_session_id"),
+      sessionFile: stringField(metadata, "owner_session_file"),
+    },
+    lifecycle: stringField(metadata, "lifecycle"),
+    ...nullableJson(metadata, "suspension_json", "suspension"),
+    intents,
+    tasks,
+    ...nullableJson(metadata, "completion_json", "completion"),
+    createdAt: stringField(metadata, "created_at"),
+    updatedAt: stringField(metadata, "updated_at"),
+  };
+  if (!Value.Check(WorkstreamSchema, state)) {
+    const issue = Value.Errors(WorkstreamSchema, state)[0];
     throw new WorkstreamStoreInvalidError(
-      `Transition returned an invalid Workstream: ${errorMessage(cause)}`,
+      `Workstream records are malformed at ${issue?.instancePath === undefined || issue.instancePath === "" ? "/" : issue.instancePath}.`,
     );
   }
-  if (next.revision !== current.revision + 1)
+  try {
+    validateWorkstreamInvariants(state as Workstream);
+  } catch (cause) {
     throw new WorkstreamStoreInvalidError(
-      `Changed transition must return revision ${current.revision + 1}.`,
+      `Workstream records violate invariants: ${message(cause)}`,
+    );
+  }
+  return structuredClone(state as Workstream);
+}
+function nullableJson(row: Record<string, unknown>, field: string, property: string): object {
+  const value = row[field];
+  if (value === null) return {};
+  if (typeof value !== "string") throw new WorkstreamStoreInvalidError(`${field} is malformed.`);
+  return { [property]: parseJson(value) };
+}
+function assertHeader(database: WorkstreamDatabase): void {
+  const row = requiredRow(
+    database.readRow("SELECT format,version FROM store_header WHERE singleton=1"),
+    "store header",
+  );
+  if (stringField(row, "format") !== STORE_FORMAT || numberField(row, "version") !== STORE_VERSION)
+    throw new WorkstreamStoreUnsupportedError(
+      "Workstream store format is unsupported; historical aggregate stores are retained without migration.",
     );
 }
-
-function parseWorkstream(text: string): Workstream {
-  let value: unknown;
+function assertRecordSchema(database: WorkstreamDatabase): void {
+  const tables = database.tableNames();
+  for (const [table, expected] of Object.entries(RECORD_SCHEMA)) {
+    if (!tables.includes(table))
+      throw new WorkstreamStoreUnsupportedError(
+        `Workstream database is not a record store (missing ${table}).`,
+      );
+    const actual = database.columnNames(table);
+    const absent = expected.filter((name) => !actual.includes(name));
+    if (absent.length > 0)
+      throw new WorkstreamStoreIncompleteError(
+        `Workstream record table ${table} lacks ${absent.join(", ")}.`,
+      );
+  }
+}
+function validateInitial(paths: Path.Path, state: Workstream): void {
+  validateIdentity(paths, state.repository, state.id);
+  validateWorkstream(state);
+  if (state.revision !== 0)
+    throw new WorkstreamStoreInvalidError("Initial Workstream revision must be zero.");
+}
+function validateIdentity(paths: Path.Path, repository: RepositoryIdentity, id: string): void {
+  if (!id || id === "." || id === ".." || paths.basename(id) !== id)
+    throw new WorkstreamStoreInvalidError("Workstream id is not a safe path segment.");
+  for (const value of [repository.projectRoot, repository.gitCommonDir])
+    if (!paths.isAbsolute(value) || paths.resolve(value) !== value)
+      throw new WorkstreamStoreInvalidError(
+        "Repository identity paths must be absolute and normalized.",
+      );
+}
+function json(value: unknown): string {
+  return JSON.stringify(value);
+}
+function optionalJson(value: unknown): string | null {
+  return value === undefined ? null : json(value);
+}
+function parseJson(value: string): unknown {
   try {
-    value = JSON.parse(text);
+    return JSON.parse(value);
   } catch {
-    throw new WorkstreamStoreInvalidError("Workstream is not valid JSON.");
+    throw new WorkstreamStoreInvalidError("Record JSON is malformed.");
   }
-  if (!Value.Check(WorkstreamSchema, value)) {
-    const issue = Value.Errors(WorkstreamSchema, value)[0];
-    const location = issue?.instancePath;
-    throw new WorkstreamStoreInvalidError(
-      `Workstream is malformed at ${location === undefined || location === "" ? "/" : location}.`,
-    );
-  }
-  // SAFETY: WorkstreamSchema is transform-free and the value passed its complete structural check.
-  const state = value as Workstream;
-  try {
-    validateWorkstreamInvariants(state);
-  } catch (cause) {
-    throw new WorkstreamStoreInvalidError(
-      `Workstream violates domain invariants: ${errorMessage(cause)}`,
-    );
-  }
-  return state;
 }
-
-function workstreamPath(paths: Path.Path, gitCommonDir: string, id: string): string {
-  return paths.join(gitCommonDir, STORAGE_DIRECTORY, WORKSTREAM_DIRECTORY, id, SQLITE_FILENAME);
+function requiredRow(
+  value: Record<string, unknown> | undefined,
+  name: string,
+): Record<string, unknown> {
+  if (value === undefined)
+    throw new WorkstreamStoreIncompleteError(`Workstream ${name} row is missing.`);
+  return value;
 }
-
+function stringField(row: Record<string, unknown>, name: string): string {
+  const value = row[name];
+  if (typeof value !== "string") throw new WorkstreamStoreInvalidError(`${name} is malformed.`);
+  return value;
+}
+function numberField(row: Record<string, unknown>, name: string): number {
+  const value = row[name];
+  if (typeof value !== "number" || !Number.isSafeInteger(value))
+    throw new WorkstreamStoreInvalidError(`${name} is malformed.`);
+  return value;
+}
+function integerField(row: Record<string, unknown> | undefined, name: string): number {
+  return numberField(requiredRow(row, name), name);
+}
+function workstreamPath(paths: Path.Path, common: string, id: string): string {
+  return paths.join(common, STORAGE_DIRECTORY, WORKSTREAM_DIRECTORY, id, SQLITE_FILENAME);
+}
 function acquireDatabase(
   path: string,
   readOnly = false,
 ): Effect.Effect<WorkstreamDatabase, WorkstreamStoreError, Scope.Scope> {
   return Effect.acquireRelease(
-    hostEffect("open and configure the workstream SQLite database", () =>
-      openWorkstreamDatabase(path, readOnly),
-    ),
+    hostEffect("open Workstream SQLite database", () => openWorkstreamDatabase(path, readOnly)),
     (database) => Effect.sync(() => database.close()),
   );
 }
-
 function createPrivateDatabaseFile(
-  fileSystem: FileSystem.FileSystem,
+  fs: FileSystem.FileSystem,
   path: string,
 ): Effect.Effect<void, WorkstreamStoreError, Scope.Scope> {
   return platform(
-    "create the private workstream database file",
-    Effect.scoped(fileSystem.open(path, { flag: "wx", mode: FILE_MODE })),
-  ).pipe(
-    Effect.andThen(platform("set the workstream database mode", fileSystem.chmod(path, FILE_MODE))),
-  );
+    "create private Workstream database",
+    Effect.scoped(fs.open(path, { flag: "wx", mode: FILE_MODE })),
+  ).pipe(Effect.andThen(platform("secure Workstream database", fs.chmod(path, FILE_MODE))));
 }
-
 function claimStorageDirectories(
   paths: Path.Path,
-  fileSystem: FileSystem.FileSystem,
+  fs: FileSystem.FileSystem,
   path: string,
 ): Effect.Effect<void, WorkstreamStoreError> {
-  return Effect.gen(function* () {
-    const workstreamDirectory = paths.dirname(path);
-    const workstreamsDirectory = paths.dirname(workstreamDirectory);
-    const storageDirectory = paths.dirname(workstreamsDirectory);
-    const gitCommonDir = paths.dirname(storageDirectory);
-    for (const component of [storageDirectory, workstreamsDirectory, workstreamDirectory])
-      yield* claimStorageDirectory(fileSystem, component);
-    const realBoundary = yield* platform(
-      "resolve the Git common directory",
-      fileSystem.realPath(gitCommonDir),
-    );
-    const realWorkstream = yield* platform(
-      "resolve the Workstream directory",
-      fileSystem.realPath(workstreamDirectory),
-    );
-    const relative = paths.relative(realBoundary, realWorkstream);
-    if (relative === ".." || relative.startsWith(`..${paths.sep}`) || paths.isAbsolute(relative))
-      return yield* invalid(`Workstream storage escapes its Git common directory: ${path}.`);
-  });
-}
-
-function claimStorageDirectory(
-  fileSystem: FileSystem.FileSystem,
-  path: string,
-): Effect.Effect<void, WorkstreamStoreError> {
-  return Effect.gen(function* () {
-    const entry = yield* inspect(path);
-    if (entry.symbolicLink)
-      return yield* invalid(`Workstream storage component is a symbolic link: ${path}.`);
-    if (entry.exists && !entry.directory)
-      return yield* invalid(`Workstream storage component is not a directory: ${path}.`);
-    if (entry.exists) {
-      if (entry.mode !== DIRECTORY_MODE)
-        return yield* invalid(
-          `Pre-existing Workstream storage component is unsafe (${modeLabel(entry.mode)}): ${path}.`,
-        );
-      return;
-    }
-    yield* platform(
-      "create private Workstream storage directory",
-      fileSystem.makeDirectory(path, { mode: DIRECTORY_MODE }),
-    );
-    yield* platform(
-      "set private Workstream directory mode",
-      fileSystem.chmod(path, DIRECTORY_MODE),
-    );
-    const created = yield* inspect(path);
-    if (!created.directory || created.symbolicLink || created.mode !== DIRECTORY_MODE)
-      return yield* invalid(`Created Workstream storage component is unsafe: ${path}.`);
-  });
-}
-
-function assertGroundedCommonDirectory(path: string): Effect.Effect<void, WorkstreamStoreError> {
-  return Effect.gen(function* () {
-    const entry = yield* inspect(path);
-    if (!entry.exists || !entry.directory || entry.symbolicLink)
-      return yield* invalid(`Git common directory is not an ordinary directory: ${path}.`);
-  });
-}
-
-function assertPrivateStorage(
-  paths: Path.Path,
-  path: string,
-): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     for (const directory of [
       paths.dirname(paths.dirname(paths.dirname(path))),
       paths.dirname(paths.dirname(path)),
       paths.dirname(path),
-    ])
-      yield* assertPrivateDirectory(directory);
-    yield* assertPrivateDatabaseFile(paths, path);
+    ]) {
+      const entry = yield* inspect(directory);
+      if (
+        entry.symbolicLink ||
+        (entry.exists && (!entry.directory || entry.mode !== DIRECTORY_MODE))
+      )
+        return yield* invalid(`Unsafe Workstream storage directory: ${directory}.`);
+      if (!entry.exists) {
+        yield* platform(
+          "create private Workstream directory",
+          fs.makeDirectory(directory, { mode: DIRECTORY_MODE }),
+        );
+        yield* platform("secure Workstream directory", fs.chmod(directory, DIRECTORY_MODE));
+      }
+    }
   });
 }
-
-function assertPrivateDirectory(directory: string): Effect.Effect<void, WorkstreamStoreError> {
-  return Effect.gen(function* () {
-    const entry = yield* inspect(directory);
-    if (!entry.exists || !entry.directory || entry.symbolicLink || entry.mode !== DIRECTORY_MODE)
-      return yield* invalid(
-        `Workstream storage component is not a private ordinary directory: ${directory}.`,
-      );
-  });
-}
-
-function assertPrivateDatabaseFile(
+function assertPrivateStorage(
   paths: Path.Path,
-  path: string,
-): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
-  return Effect.gen(function* () {
-    const file = yield* inspect(path);
-    if (!file.exists) return yield* invalid(`Workstream database does not exist: ${path}.`);
-    if (file.symbolicLink || !file.regularFile)
-      return yield* invalid(`Workstream database is not an ordinary file: ${path}.`);
-    if (file.mode !== FILE_MODE)
-      return yield* invalid(
-        `Workstream database is not private (${modeLabel(file.mode)}): ${path}.`,
-      );
-    const boundary = paths.dirname(paths.dirname(paths.dirname(paths.dirname(path))));
-    const fileSystem = yield* FileSystem.FileSystem;
-    const realBoundary = yield* platform(
-      "resolve Git common directory",
-      fileSystem.realPath(boundary),
-    );
-    const realFile = yield* platform("resolve workstream database", fileSystem.realPath(path));
-    const relative = paths.relative(realBoundary, realFile);
-    if (relative === ".." || relative.startsWith(`..${paths.sep}`) || paths.isAbsolute(relative))
-      return yield* invalid(`Workstream database escapes its Git common directory: ${path}.`);
-  });
-}
-
-function classifyFileHeader(
-  fileSystem: FileSystem.FileSystem,
   path: string,
 ): Effect.Effect<void, WorkstreamStoreError> {
   return Effect.gen(function* () {
-    const header = yield* platform(
-      "read the workstream database header",
+    for (const directory of [
+      paths.dirname(paths.dirname(paths.dirname(path))),
+      paths.dirname(paths.dirname(path)),
+      paths.dirname(path),
+    ]) {
+      const entry = yield* inspect(directory);
+      if (!entry.directory || entry.symbolicLink || entry.mode !== DIRECTORY_MODE)
+        return yield* invalid(`Workstream storage directory is unsafe: ${directory}.`);
+    }
+    const file = yield* inspect(path);
+    if (!file.regularFile || file.symbolicLink || file.mode !== FILE_MODE)
+      return yield* invalid(`Workstream database is not a private ordinary file: ${path}.`);
+  });
+}
+function classifyFileHeader(
+  fs: FileSystem.FileSystem,
+  path: string,
+): Effect.Effect<void, WorkstreamStoreError> {
+  return Effect.gen(function* () {
+    const bytes = yield* platform(
+      "read Workstream database header",
       Effect.scoped(
         Effect.gen(function* () {
-          const file = yield* fileSystem.open(path, { flag: "r" });
-          const bytes = new Uint8Array(16);
-          const count = yield* file.read(bytes);
-          return bytes.subarray(0, Number(count));
+          const file = yield* fs.open(path, { flag: "r" });
+          const value = new Uint8Array(16);
+          const count = yield* file.read(value);
+          return value.subarray(0, Number(count));
         }),
       ),
     );
-    if (header.length === 0)
+    if (bytes.length === 0)
       return yield* new WorkstreamStoreIncompleteError(
-        `Workstream database creation is incomplete: ${path}.`,
+        "Workstream database is empty creation residue.",
       );
-    if (new TextDecoder().decode(header) !== SQLITE_HEADER)
-      return yield* invalid(`Workstream database is not a supported SQLite file: ${path}.`);
+    if (new TextDecoder().decode(bytes) !== SQLITE_HEADER)
+      return yield* invalid("Workstream database is not SQLite.");
   });
 }
-
-function validateAdoptionProof(adoption: WorkstreamCoordinatorAdoption, nowMillis: number): void {
-  if (
-    !Value.Check(HerdrDeadObservationSchema, adoption.deathObservation) ||
-    !Value.Equal(adoption.deathObservation.subject, adoption.priorCoordinator)
-  )
-    throw new WorkstreamStoreInvalidError(
-      "Coordinator adoption requires an exact prior-owner Herdr API dead snapshot.",
-    );
-  const observedMillis = workstreamInstantMillis(
-    adoption.deathObservation.observedAt,
-    "Herdr dead observation",
-  );
-  if (observedMillis > nowMillis)
-    throw new WorkstreamStoreInvalidError(
-      "Coordinator adoption Herdr dead observation cannot be in the future.",
-    );
-}
-
-function validateAdoptionLease(
-  current: WorkstreamLease | undefined,
-  adoption: WorkstreamCoordinatorAdoption,
-  nowMillis: number,
-): void {
-  if (adoption.observedLease.kind === "absent") {
-    if (current !== undefined)
-      throw new WorkstreamStoreConflictError(
-        "An absent lease observation no longer matches the store.",
-      );
-    return;
-  }
-  validateLease(adoption.observedLease.lease);
-  if (current === undefined || !sameLease(current, adoption.observedLease.lease))
-    throw new WorkstreamStoreConflictError("The exact observed adoption lease changed.");
-  if (!Value.Equal(current.owner, adoption.priorCoordinator))
-    throw new WorkstreamStoreConflictError(
-      "The observed adoption lease belongs to another coordinator.",
-    );
-  if (instantMillis(current.expiresAt) > nowMillis)
-    throw new WorkstreamStoreConflictError("The exact observed adoption lease has not expired.");
-}
-
-function validateLeaseInput(
-  lease: WorkstreamLease,
-): Effect.Effect<void, WorkstreamStoreInvalidError> {
-  return domainInvalid("validate lease", () => validateLease(lease));
-}
-
-function validateLease(lease: WorkstreamLease): void {
-  if (lease.token.length === 0 || !Value.Check(LeaseOwnerSchema, lease.owner))
-    throw new WorkstreamStoreInvalidError("Workstream lease identity is malformed.");
-  for (const instant of [lease.acquiredAt, lease.heartbeatAt, lease.expiresAt])
-    instantMillis(instant);
-}
-
-function instantMillis(value: string): number {
-  return workstreamInstantMillis(value, "lease");
-}
-
-function workstreamInstantMillis(value: string, subject: string): number {
-  try {
-    return parseInstantMillis(value);
-  } catch {
-    throw new WorkstreamStoreInvalidError(
-      `Workstream ${subject} contains an invalid instant: ${value}.`,
-    );
-  }
-}
-
-function sameLease(left: WorkstreamLease, right: WorkstreamLease): boolean {
-  return (
-    sameLeaseHolder(left, right) &&
-    left.acquiredAt === right.acquiredAt &&
-    left.heartbeatAt === right.heartbeatAt &&
-    left.expiresAt === right.expiresAt
-  );
-}
-
-function sameLeaseHolder(left: WorkstreamLease, right: WorkstreamLease): boolean {
-  return left.token === right.token && Value.Equal(left.owner, right.owner);
-}
-
-function leaseConflict(lease: WorkstreamLease): WorkstreamStoreConflictError {
-  return new WorkstreamStoreConflictError(
-    `Session ${lease.owner.sessionId} does not hold this store's fenced lease.`,
-  );
-}
-
-function serializeState(state: Workstream): string {
-  return `${JSON.stringify(state, null, 2)}\n`;
-}
-
-function isoFromMillis(millis: number): string {
-  return DateTime.toDate(DateTime.makeUnsafe(millis)).toISOString();
-}
-
-function inspect(path: string): Effect.Effect<StorageEntry, WorkstreamStoreError> {
-  return hostEffect("inspect storage entry without following links", () =>
-    inspectStorageEntry(path),
-  );
-}
-
-/** Contain the database and any journal/WAL sidecars to 0600 through Effect FileSystem. */
 function secureFiles(
   path: string,
 ): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
-    const fileSystem = yield* FileSystem.FileSystem;
+    const fs = yield* FileSystem.FileSystem;
     for (const suffix of ["", "-journal", "-wal", "-shm"]) {
-      const target = `${path}${suffix}`;
-      if (suffix !== "" && !(yield* platform(`inspect ${target}`, fileSystem.exists(target))))
-        continue;
-      yield* platform(`secure ${target}`, fileSystem.chmod(target, FILE_MODE));
+      const file = `${path}${suffix}`;
+      if (suffix && !(yield* platform("inspect SQLite sidecar", fs.exists(file)))) continue;
+      yield* platform("secure SQLite file", fs.chmod(file, FILE_MODE));
     }
   });
 }
-
-function modeLabel(mode: number): string {
-  return `0${mode.toString(8).padStart(3, "0")}`;
+function inspect(path: string): Effect.Effect<StorageEntry, WorkstreamStoreError> {
+  return hostEffect("inspect Workstream storage", () => inspectStorageEntry(path));
 }
-
+function invalid(text: string): Effect.Effect<never, WorkstreamStoreInvalidError> {
+  return Effect.fail(new WorkstreamStoreInvalidError(text));
+}
 function hostEffect<A>(operation: string, run: () => A): Effect.Effect<A, WorkstreamStoreError> {
-  return Effect.try({ try: run, catch: (cause) => toStoreError(cause, operation) });
+  return Effect.try({
+    try: run,
+    catch: (cause) =>
+      cause instanceof WorkstreamStoreInvalidError ||
+      cause instanceof WorkstreamStoreIncompleteError ||
+      cause instanceof WorkstreamStoreUnsupportedError ||
+      cause instanceof WorkstreamStoreConflictError ||
+      cause instanceof WorkstreamStoreHostError
+        ? cause
+        : new WorkstreamStoreHostError(operation, cause),
+  });
 }
-
 function platform<A, R>(
   operation: string,
   effect: Effect.Effect<A, PlatformError, R>,
 ): Effect.Effect<A, WorkstreamStoreError, R> {
   return effect.pipe(Effect.mapError((cause) => new WorkstreamStoreHostError(operation, cause)));
 }
-
-function domainInvalid<A>(
-  operation: string,
-  run: () => A,
-): Effect.Effect<A, WorkstreamStoreInvalidError> {
-  return Effect.try({
-    try: run,
-    catch: (cause) =>
-      cause instanceof WorkstreamStoreInvalidError
-        ? cause
-        : new WorkstreamStoreInvalidError(`${operation}: ${errorMessage(cause)}`),
-  });
-}
-
-function invalid(message: string): Effect.Effect<never, WorkstreamStoreInvalidError> {
-  return Effect.fail(new WorkstreamStoreInvalidError(message));
-}
-
-function toStoreError(cause: unknown, operation: string): WorkstreamStoreError {
-  if (
-    cause instanceof WorkstreamStoreInvalidError ||
-    cause instanceof WorkstreamStoreIncompleteError ||
-    cause instanceof WorkstreamStoreUnsupportedError ||
-    cause instanceof WorkstreamStoreConflictError ||
-    cause instanceof WorkstreamStoreHostError
-  )
-    return cause;
-  return new WorkstreamStoreHostError(operation, cause);
-}
-
-function errorMessage(cause: unknown): string {
-  return cause instanceof Error ? cause.message.slice(0, 300) : "unspecified failure";
+function message(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
 }
