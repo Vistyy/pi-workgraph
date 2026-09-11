@@ -652,9 +652,9 @@ export class CanonicalWorkstreamStore {
   }
 
   /**
-   * Persist one settled domain transition. The callback receives the validated
-   * authoritative aggregate; returning that same object is the only no-op.
-   * A changed result must be valid at exactly current revision + 1.
+   * Persist one settled domain transition. The callback receives a clone of the
+   * validated authoritative aggregate; returning that input object is the only
+   * no-op. A changed result must be valid at exactly current revision + 1.
    */
   transition(
     lease: CanonicalLease,
@@ -665,8 +665,9 @@ export class CanonicalWorkstreamStore {
         this.atomic((nowMillis, resample) => {
           const current = this.readAggregate();
           this.assertHeldLease(lease, nowMillis);
-          const next = apply(current);
-          if (next === current) return structuredClone(current);
+          const input = structuredClone(current);
+          const next = apply(input);
+          if (next === input) return structuredClone(current);
           validateTransition(current, next);
           // The callback may consume arbitrary time, so the final lease
           // predicate uses a sample taken only after it returned.

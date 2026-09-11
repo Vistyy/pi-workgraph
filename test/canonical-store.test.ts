@@ -848,9 +848,10 @@ void test("canonical transition stays no-op exact, rejects invalid results, and 
         let callbackInput: Workstream | undefined;
         const noop = yield* store.transition(lease, (current) => {
           callbackInput = current;
+          current.purpose = "Discarded in-place mutation.";
           return current;
         });
-        assert.equal(noop.revision, before.revision);
+        assert.deepEqual(noop, before);
         assert.notStrictEqual(noop, callbackInput);
         assert.notStrictEqual(noop.tasks, callbackInput?.tasks);
       }),
@@ -873,6 +874,13 @@ void test("canonical transition stays no-op exact, rejects invalid results, and 
     const cases: ReadonlyArray<readonly [(current: Workstream) => Workstream, RegExp]> = [
       [
         (current) => ({ ...current, id: "renamed", revision: current.revision + 1 }),
+        /immutable id/,
+      ],
+      [
+        (current) => {
+          current.id = "renamed-in-place";
+          return { ...current, revision: current.revision + 1 };
+        },
         /immutable id/,
       ],
       [
