@@ -144,6 +144,13 @@ export interface WorkerCleanupResult {
   detail: string;
 }
 
+export interface WorkerTerminationResult {
+  state: "completed" | "blocked";
+  identity: WorkerIdentity;
+  observedAt: string;
+  detail: string;
+}
+
 interface HerdrProcessEnvironment extends NodeJS.ProcessEnv {
   HERDR_ENV?: string;
   HERDR_WORKSPACE_ID?: string;
@@ -654,21 +661,6 @@ export class HerdrCliRuntime {
     );
   };
 
-  readonly interrupt = (
-    identity: WorkerIdentity,
-  ): Effect.Effect<HerdrObservation, HerdrProtocolError> => {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        yield* this.observe(identity);
-        yield* this.transport.call(
-          ["agent", "send-keys", identity.agentName, "esc"],
-          decodeSuccessResponse,
-        );
-        return yield* this.observe(identity);
-      }.bind(this),
-    );
-  };
-
   readonly steer = (
     identity: WorkerIdentity,
     instruction: string,
@@ -692,6 +684,53 @@ export class HerdrCliRuntime {
         yield* this.transport.call(
           ["agent", "prompt", identity.agentName, trimmed],
           decodeSuccessResponse,
+        );
+      }.bind(this),
+    );
+  };
+
+  /** Close a cancelled Worker regardless of status and prove its exact agent and tab are absent. */
+  readonly terminate = (
+    identity: WorkerIdentity,
+  ): Effect.Effect<WorkerTerminationResult, HerdrProtocolError> => {
+    return Effect.gen(
+      function* (this: HerdrCliRuntime) {
+        const before = yield* this.inspect(identity);
+        if (before.status === "absent")
+          return {
+            state: "completed" as const,
+            identity,
+            observedAt: before.observedAt,
+            detail: before.detail,
+          };
+
+        const close = yield* Effect.result(
+          this.transport.call(["tab", "close", identity.tabId], decodeSuccessResponse),
+        );
+        const after = yield* Effect.result(this.inspect(identity));
+        if (after._tag === "Success" && after.success.status === "absent")
+          return {
+            state: "completed" as const,
+            identity,
+            observedAt: after.success.observedAt,
+            detail: `Closed and verified exact Herdr agent ${identity.agentName} and tab ${identity.tabId} are absent.`,
+          };
+        if (after._tag === "Success")
+          return {
+            state: "blocked" as const,
+            identity,
+            observedAt: after.success.observedAt,
+            detail:
+              close._tag === "Failure"
+                ? `Herdr tab close was uncertain and the exact Worker remains ${after.success.status}: ${close.failure.detail}`
+                : `Exact Worker remains ${after.success.status} after Herdr closed tab ${identity.tabId}.`,
+          };
+        return yield* protocolFailure(
+          ["tab", "close", identity.tabId],
+          "identity",
+          close._tag === "Failure"
+            ? `Herdr tab close was uncertain and exact post-close absence could not be verified. Close error: ${close.failure.detail} Inspection error: ${after.failure.detail}`
+            : `Herdr accepted tab close, but exact post-close absence could not be verified: ${after.failure.detail}`,
         );
       }.bind(this),
     );

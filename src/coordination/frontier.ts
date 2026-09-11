@@ -189,7 +189,7 @@ function classifyActive(
   const launch = execution?.launch;
   const cancellation = execution?.cancellation;
   // An active cancellation stays in the frontier for every checkpoint state,
-  // including submitted_or_observed, until the Attempt terminalizes. Its exact
+  // including terminated, until the Attempt terminalizes. Its exact
   // ready Worker, when present, is what supports repeated polling.
   if (cancellation !== undefined) {
     const entry: CancellationEntry = { kind: "cancellation", key, cancellation, placement };

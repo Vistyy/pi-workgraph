@@ -92,9 +92,12 @@ export interface WorkstreamWorkerPort {
   readonly inspect: (
     identity: WorkerIdentity,
   ) => Effect.Effect<WorkerPresence, ReconciliationDriverError>;
-  readonly interrupt: (
+  readonly terminate: (
     identity: WorkerIdentity,
-  ) => Effect.Effect<WorkerPresence, ReconciliationDriverError>;
+  ) => Effect.Effect<
+    { readonly state: "completed" | "blocked"; readonly detail: string },
+    ReconciliationDriverError
+  >;
   readonly steer: (
     identity: WorkerIdentity,
     instruction: string,
@@ -789,8 +792,10 @@ function reconcileCancellation(
       return blocked("Cancellation requires a durable placement declaration.");
     const checkpoint = entry.cancellation;
     if (checkpoint.state === "requested") return yield* beginCancellation(ports, control, entry);
-    if (checkpoint.state === "uncertain") return yield* resumeInterrupt(ports, control, entry);
-    return yield* closeCancelled(ports, control, entry, checkpoint);
+    if (checkpoint.state === "uncertain") return yield* resumeTermination(ports, control, entry);
+    if (checkpoint.state === "blocked")
+      return yield* resumeBlockedTermination(ports, control, entry, checkpoint);
+    return yield* settleCancelled(control, checkpoint);
   });
 }
 
@@ -806,28 +811,18 @@ function beginCancellation(
       kind: "checkpoint_cancellation",
       checkpoint: { ...requestedFields(entry.cancellation), state: "uncertain", dispatchAt: now },
     });
-    return yield* dispatchInterrupt(ports, control, entry);
+    return yield* dispatchTermination(ports, control, entry);
   });
 }
 
-function resumeInterrupt(
+function resumeTermination(
   ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "cancellation" }>,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
-  return Effect.gen(function* () {
-    if (entry.worker !== undefined) {
-      const presence = yield* ports.workers.inspect(entry.worker);
-      if (presence === "unknown")
-        return blocked("Exact cancelled worker presence is unknown; no interruption was retried.");
-      if (presence === "idle" || presence === "done" || presence === "absent") {
-        yield* observedCancellation(control, presence);
-        return { kind: "waiting" };
-      }
-      return yield* interruptObserved(ports, control, entry.worker);
-    }
-    return yield* dispatchInterrupt(ports, control, entry);
-  });
+  return entry.worker === undefined
+    ? dispatchTermination(ports, control, entry)
+    : terminateIdentity(ports, control, entry.worker);
 }
 
 /**
@@ -836,13 +831,13 @@ function resumeInterrupt(
  * a proven-absent or proven-unlaunched Attempt records exact absence; anything
  * unknown blocks.
  */
-function dispatchInterrupt(
+function dispatchTermination(
   ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   entry: Extract<FrontierEntry, { kind: "cancellation" }>,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
   return Effect.gen(function* () {
-    if (entry.worker !== undefined) return yield* interruptObserved(ports, control, entry.worker);
+    if (entry.worker !== undefined) return yield* terminateIdentity(ports, control, entry.worker);
     const inspection = yield* inspectRetainedLaunch(
       ports,
       control,
@@ -850,7 +845,7 @@ function dispatchInterrupt(
     );
     if (inspection.kind === "blocked") return blocked(inspection.detail);
     if (inspection.kind !== "live") {
-      yield* observedCancellation(control, "absent");
+      yield* recordTermination(control);
       return { kind: "waiting" };
     }
     const failure = yield* advanceLaunchCheckpoint(control, entry.launch, inspection.identity);
@@ -952,31 +947,51 @@ function advanceLaunchCheckpoint(
   });
 }
 
-function interruptObserved(
+function terminateIdentity(
   ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
   worker: WorkerIdentity,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
   return Effect.gen(function* () {
     yield* control.checkOwnership;
-    const interrupted = yield* Effect.result(ports.workers.interrupt(worker));
-    if (interrupted._tag === "Failure") return blocked(interrupted.failure.detail);
-    yield* observedCancellation(control, "interrupt_submitted");
+    const terminated = yield* Effect.result(ports.workers.terminate(worker));
+    if (terminated._tag === "Failure")
+      return yield* blockTermination(control, terminated.failure.detail);
+    if (terminated.success.state === "blocked")
+      return yield* blockTermination(control, terminated.success.detail);
+    yield* recordTermination(control);
     return { kind: "waiting" };
   });
 }
 
-function observedCancellation(
+function resumeBlockedTermination(
+  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
-  evidence: "interrupt_submitted" | "idle" | "done" | "absent",
-): Effect.Effect<void, Stage, Requirements> {
+  entry: Extract<FrontierEntry, { kind: "cancellation" }>,
+  checkpoint: Extract<CancellationCheckpoint, { state: "blocked" }>,
+): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
   return Effect.gen(function* () {
-    // The committed uncertain checkpoint owns the exact dispatch instant, so it
-    // is read back rather than reconstructed from the entry's stale value.
+    if (entry.worker === undefined)
+      return blocked(`${checkpoint.error} Exact retained Worker identity is unavailable.`);
+    const presence = yield* Effect.result(ports.workers.inspect(entry.worker));
+    if (presence._tag === "Failure")
+      return blocked(`${checkpoint.error} ${presence.failure.detail}`);
+    if (presence.success !== "absent")
+      return blocked(`${checkpoint.error} Exact Worker remains ${presence.success}.`);
+    yield* recordTermination(control);
+    return { kind: "waiting" };
+  });
+}
+
+function blockTermination(
+  control: ReconciliationControl,
+  detail: string,
+): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
+  return Effect.gen(function* () {
     const current = control.context().attempt.execution?.cancellation;
-    if (current === undefined || current.state === "submitted_or_observed")
+    if (current?.state !== "uncertain")
       return yield* new ReconciliationControlError({
-        detail: "Cancellation has no uncertain checkpoint to observe.",
+        detail: "Cancellation has no uncertain termination checkpoint to block.",
       });
     const now = yield* nowIso();
     yield* commit(control, {
@@ -984,24 +999,48 @@ function observedCancellation(
       checkpoint: {
         requestedAt: current.requestedAt,
         reason: current.reason,
-        state: "submitted_or_observed",
+        state: "blocked",
+        dispatchAt: current.dispatchAt,
+        blockedAt: now,
+        error: detail,
+      },
+    });
+    return blocked(detail);
+  });
+}
+
+function recordTermination(
+  control: ReconciliationControl,
+): Effect.Effect<void, Stage, Requirements> {
+  return Effect.gen(function* () {
+    // The committed uncertain checkpoint owns the exact dispatch instant, so it
+    // is read back rather than reconstructed from the entry's stale value.
+    const current = control.context().attempt.execution?.cancellation;
+    if (current === undefined || current.state === "requested" || current.state === "terminated")
+      return yield* new ReconciliationControlError({
+        detail: "Cancellation has no uncertain checkpoint to terminate.",
+      });
+    const now = yield* nowIso();
+    yield* commit(control, {
+      kind: "checkpoint_cancellation",
+      checkpoint: {
+        requestedAt: current.requestedAt,
+        reason: current.reason,
+        state: "terminated",
         dispatchAt: dispatchAt(current),
-        observedAt: now,
-        evidence,
+        terminatedAt: now,
       },
     });
   });
 }
 
-function closeCancelled(
-  ports: WorkstreamReconciliationPorts,
+function settleCancelled(
   control: ReconciliationControl,
-  entry: Extract<FrontierEntry, { kind: "cancellation" }>,
-  checkpoint: Extract<CancellationCheckpoint, { state: "submitted_or_observed" }>,
+  checkpoint: Extract<CancellationCheckpoint, { state: "terminated" }>,
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
   return Effect.gen(function* () {
     yield* ensureCleanupPending(control);
-    const closure = yield* ensureCancellationClosure(ports, control, entry, checkpoint);
+    const closure = yield* ensureCancellationClosure(control);
     if (closure.kind === "blocked") return blocked(closure.detail);
     if (closure.kind === "waiting") return { kind: "waiting" };
     const now = yield* nowIso();
@@ -1020,20 +1059,12 @@ function closeCancelled(
 }
 
 function ensureCancellationClosure(
-  ports: WorkstreamReconciliationPorts,
   control: ReconciliationControl,
-  entry: Extract<FrontierEntry, { kind: "cancellation" }>,
-  checkpoint: Extract<CancellationCheckpoint, { state: "submitted_or_observed" }>,
 ): Effect.Effect<Closure, Stage, Requirements> {
   return Effect.gen(function* () {
     if (control.context().attempt.cleanup?.workerClosed === true) return { kind: "closed" };
-    const closure = yield* ensureClosure(
-      ports,
-      control,
-      retainedLaunchInput(entry, entry.placement.path, checkpoint.evidence === "absent"),
-    );
-    if (closure.kind === "closed") yield* commitCleanup(control, { workerClosed: true });
-    return closure;
+    yield* commitCleanup(control, { workerClosed: true });
+    return { kind: "closed" };
   });
 }
 

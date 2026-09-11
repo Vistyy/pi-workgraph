@@ -199,7 +199,7 @@ function mixedWorkstream(): Workstream {
     ws = terminalizeAttempt(ws, key, reported(), T1);
     ws = checkpointCleanup(ws, key, { state: "completed", workerClosed: true }, T1);
   };
-  const cancel = (key: AttemptKey, state: "requested" | "uncertain" | "submitted_or_observed") => {
+  const cancel = (key: AttemptKey, state: "requested" | "uncertain" | "terminated") => {
     const base = { requestedAt: T1, reason: "Stop." };
     if (state === "requested") {
       ws = checkpointCancellation(ws, key, { ...base, state }, T1);
@@ -210,12 +210,7 @@ function mixedWorkstream(): Workstream {
       ws = checkpointCancellation(ws, key, dispatch, T1);
       return;
     }
-    ws = checkpointCancellation(
-      ws,
-      key,
-      { ...dispatch, state, observedAt: T1, evidence: "idle" },
-      T1,
-    );
+    ws = checkpointCancellation(ws, key, { ...dispatch, state, terminatedAt: T1 }, T1);
   };
 
   add("q");
@@ -225,7 +220,7 @@ function mixedWorkstream(): Workstream {
   start(observed, SHARED, true);
   cancel(observed, "requested");
   cancel(observed, "uncertain");
-  cancel(observed, "submitted_or_observed");
+  cancel(observed, "terminated");
   const immediate = add("di");
   start(immediate, SHARED);
   close(immediate);
@@ -300,7 +295,7 @@ void test("classifies mixed obligations and replaces only affected keys in place
   });
   const cancellation = entryFor(frontier, "co-a");
   assert.ok(cancellation?.kind === "cancellation");
-  assert.equal(cancellation.cancellation.state, "submitted_or_observed");
+  assert.equal(cancellation.cancellation.state, "terminated");
   assert.deepEqual(cancellation.placement, SHARED);
   assert.equal(cancellation.sessionFile, "/worker.json");
   assert.deepEqual(cancellation.worker, READY(SHARED.path));
