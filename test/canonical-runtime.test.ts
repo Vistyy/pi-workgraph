@@ -1737,6 +1737,92 @@ void test("one shutdown boundary owns heartbeat, explicit close, close races, an
   });
 });
 
+void test("lease heartbeat continues while a serialized command waits on its host effect", async () => {
+  await withFixture(async (f) => {
+    const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+    await Effect.runPromise(clock.setTime(START_MILLIS));
+    await runCanonical(
+      Effect.gen(function* () {
+        const steeringStarted = yield* Deferred.make<void>();
+        const releaseSteering = yield* Deferred.make<void>();
+        const commands: CanonicalCommandPorts = {
+          ...COMMANDS,
+          workers: {
+            steer: () =>
+              Deferred.succeed(steeringStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseSteering)),
+              ),
+          },
+        };
+        const { store, runtime } = yield* attached(f, {
+          commands,
+          heartbeatInterval: "5 seconds",
+        });
+        const queued = yield* runtime.enqueue({
+          taskId: "long-steering-command",
+          kind: "research",
+          objective: "Keep the lease while the host is busy.",
+          expectedEvidence: ["renewed lease"],
+        });
+        const attemptId = queued.tasks[0]?.attempts[0]?.id ?? assert.fail("attempt");
+        const key = { taskId: "long-steering-command", attemptId };
+        const lease = yield* store.observeLease();
+        assert.ok(lease !== undefined);
+        const resource = {
+          workspaceId: "workspace",
+          tabId: "tab",
+          paneId: "pane",
+          terminalId: "terminal",
+          agentName: "agent",
+          cwd: f.repository.projectRoot,
+        } as const;
+        yield* store.transition(lease, (state) =>
+          activateAttempt(state, key, T0, {
+            placement: { kind: "shared_project", path: f.repository.projectRoot },
+            submission: "not_sent",
+          }),
+        );
+        yield* store.transition(lease, (state) =>
+          recordWorkerExecution(state, key, { sessionFile: "/sessions/long.jsonl" }, T0),
+        );
+        yield* store.transition(lease, (state) =>
+          recordWorkerExecution(
+            state,
+            key,
+            {
+              launch: { phase: "pane", workspaceId: resource.workspaceId, paneId: resource.paneId },
+            },
+            T0,
+          ),
+        );
+        yield* store.transition(lease, (state) =>
+          recordWorkerExecution(state, key, { launch: { phase: "resource", ...resource } }, T0),
+        );
+        yield* store.transition(lease, (state) =>
+          recordWorkerExecution(state, key, { launch: { phase: "ready", ...resource } }, T0),
+        );
+        yield* runtime.read();
+        const steering = yield* Effect.forkChild(
+          runtime.steer({ attemptId, instruction: "Continue safely." }),
+        );
+        yield* Deferred.await(steeringStarted);
+        const before = yield* store.observeLease();
+        assert.ok(before !== undefined);
+        yield* TestClock.adjust("6 seconds");
+        const after = yield* store.observeLease();
+        assert.ok(after !== undefined);
+        assert.equal(after.token, before.token);
+        assert.ok(after.heartbeatAt > before.heartbeatAt);
+        assert.ok(after.expiresAt > before.expiresAt);
+        yield* Deferred.succeed(releaseSteering, undefined);
+        yield* Fiber.join(steering);
+        yield* runtime.close();
+      }),
+      clock,
+    );
+  });
+});
+
 void test("fatal lease loss reports one typed episode, closes once, and permits reacquisition", async () => {
   await withFixture(async (f) => {
     await runCanonical(

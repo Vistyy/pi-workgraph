@@ -901,8 +901,8 @@ export class CanonicalRuntime {
         while (!this.closed) {
           yield* Effect.sleep(interval);
           if (this.closed) return;
-          // Renewal shares the mutation Semaphore, so it is serialized with every
-          // coordinator command and uses ordinary fiber interruption.
+          // Lease liveness must not wait behind the command it fences. SQLite
+          // transactions serialize the renewal with aggregate writes.
           yield* this.renewLease().pipe(
             Effect.catchCause((cause) =>
               Cause.hasInterruptsOnly(cause) ? Effect.void : this.requestClose(fatalCause(cause)),
@@ -917,7 +917,7 @@ export class CanonicalRuntime {
     return Effect.gen(
       function* (this: CanonicalRuntime) {
         yield* Effect.suspend(() => (this.closed ? Effect.fail(stoppedError()) : Effect.void));
-        yield* this.semaphore.withPermit(this.store.renewLease(this.lease).pipe(Effect.asVoid));
+        yield* this.store.renewLease(this.lease).pipe(Effect.asVoid);
       }.bind(this),
     );
   }
