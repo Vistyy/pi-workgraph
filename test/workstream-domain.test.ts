@@ -22,6 +22,7 @@ import {
   HandoffGrantSchema,
   type Intent,
   IntentSchema,
+  isOperationallyStable,
   issueHandoff,
   LaunchCheckpointSchema,
   outputDisposition,
@@ -1497,6 +1498,46 @@ void test("isolated failed output remains blocked through cleanup until exact re
       ),
     /not monotonic/,
   );
+});
+
+void test("an exact completed release and cleanup is operationally stable", () => {
+  const execution = {
+    placement: { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" },
+    sessionFile: "/worker.json",
+    launch: {
+      phase: "ready" as const,
+      workspaceId: "w",
+      tabId: "tab",
+      paneId: "pane",
+      terminalId: "term",
+      agentName: "agent",
+      cwd: "/repo-work",
+    },
+    submission: "started" as const,
+  };
+  let workstream = deliver(
+    finish(add(), "Attempt A", reported(), "Task opaque", execution),
+    "Attempt A",
+  );
+  workstream = checkpointCleanup(
+    workstream,
+    { taskId: "Task opaque", attemptId: "Attempt A" },
+    { state: "completed", workerClosed: true, expectedHead: changedCommit },
+    "t4",
+  );
+  const imported = structuredClone(workstream);
+  const importedTask = imported.tasks[0];
+  assert.ok(importedTask);
+  const importedAttempt = importedTask.attempts[0];
+  assert.ok(importedAttempt);
+  importedAttempt.outputRelease = {
+    state: "completed",
+    expectedHead: changedCommit,
+    reason: "Legacy exact release checkpoint.",
+  };
+  validateWorkstream(imported);
+  assert.equal(isOperationallyStable(importedTask, importedAttempt), true);
+  assert.deepEqual(deriveCompletionAccounting(imported), []);
 });
 
 void test("shared Worker closure and delivery gate reattempt and accounting", () => {

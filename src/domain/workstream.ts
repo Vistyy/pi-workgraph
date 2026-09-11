@@ -1830,7 +1830,6 @@ export function isOperationallyStable(task: Task, attempt: Attempt): boolean {
   const disposition = outputDispositionBeforeRelease(task, attempt);
   if (attempt.outputRelease?.state === "completed")
     return (
-      ["preserve_checkout", "retain_branch"].includes(disposition.kind) &&
       cleanup.expectedHead !== undefined &&
       cleanup.expectedHead === attempt.outputRelease.expectedHead
     );

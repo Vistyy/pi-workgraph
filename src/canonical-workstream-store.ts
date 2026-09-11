@@ -29,6 +29,15 @@ const STORE_VERSION = 2;
 const STORAGE_DIRECTORY = "pi-workgraph";
 const WORKSTREAM_DIRECTORY = "workstreams";
 const columnList = (value: string) => value.split(" ");
+const MIGRATION_TEMP_SUFFIX = /\.migration-tmp-[0-9a-f]{16}$/;
+
+function isMigrationStagingPath(path: string, publishedPath: string): boolean {
+  return (
+    path === publishedPath ||
+    (path.startsWith(`${publishedPath}.migration-tmp-`) && MIGRATION_TEMP_SUFFIX.test(path))
+  );
+}
+
 /** Complete canonical schema contract: each table must exist with these columns. */
 const CANONICAL_SCHEMA = {
   store_header: columnList("format version"),
@@ -248,6 +257,103 @@ export class CanonicalWorkstreamStore {
       // The persisted aggregate is exactly the validated initial state, so the
       // caller seeds from the already-known value instead of re-reading it.
       return { store, state: structuredClone(initial) };
+    });
+  }
+
+  /**
+   * Create one migration staging database at an explicit private path while
+   * preserving the validated source aggregate revision. This is deliberately
+   * separate from ordinary revision-zero creation and is not an attachment or
+   * cutover operation.
+   */
+  static importStaging(
+    stagingPath: string,
+    imported: Workstream,
+    publishedStagingPath = stagingPath,
+  ): Effect.Effect<
+    CanonicalStoreAttachment,
+    CanonicalStoreError,
+    Scope.Scope | FileSystem.FileSystem | Path.Path
+  > {
+    return Effect.gen(function* () {
+      const paths = yield* Path.Path;
+      const fileSystem = yield* FileSystem.FileSystem;
+      yield* domainInvalid("validate canonical staging import", () => {
+        if (!paths.isAbsolute(stagingPath) || paths.resolve(stagingPath) !== stagingPath)
+          throw new Error("Canonical staging path must be absolute and normalized.");
+        validateIdentitySync(paths, imported.repository, imported.id);
+        const canonical = canonicalPath(paths, imported.repository.gitCommonDir, imported.id);
+        const expectedStaging = paths.join(
+          paths.dirname(canonical),
+          "workstream.canonical-staging.sqlite",
+        );
+        if (
+          publishedStagingPath !== expectedStaging ||
+          !isMigrationStagingPath(stagingPath, publishedStagingPath)
+        )
+          throw new Error("Canonical staging path does not match its Workstream identity.");
+        validateWorkstream(imported);
+      });
+      yield* assertPrivateDirectory(paths.dirname(stagingPath));
+      const existing = yield* inspect(stagingPath);
+      if (existing.exists)
+        return yield* new CanonicalStoreConflictError(
+          `Canonical migration staging path already exists: ${stagingPath}.`,
+        );
+      const store = yield* Effect.acquireUseRelease(
+        createPrivateDatabaseFile(fileSystem, stagingPath),
+        () => CanonicalWorkstreamStore.initialize(stagingPath, imported),
+        (_, exit) =>
+          exit._tag === "Success"
+            ? Effect.void
+            : platform(
+                "remove the incomplete canonical staging database",
+                fileSystem.remove(stagingPath),
+              ).pipe(Effect.ignore),
+      );
+      return { store, state: structuredClone(imported) };
+    });
+  }
+
+  /** Fully validate an exact private migration staging database and imported aggregate. */
+  static validateMigrationStaging(
+    stagingPath: string,
+    expected: Workstream,
+    publishedStagingPath = stagingPath,
+  ): Effect.Effect<
+    Workstream,
+    CanonicalStoreError,
+    Scope.Scope | FileSystem.FileSystem | Path.Path
+  > {
+    return Effect.gen(function* () {
+      const paths = yield* Path.Path;
+      yield* domainInvalid("validate canonical migration staging identity", () => {
+        validateIdentitySync(paths, expected.repository, expected.id);
+        const canonical = canonicalPath(paths, expected.repository.gitCommonDir, expected.id);
+        const expectedStaging = paths.join(
+          paths.dirname(canonical),
+          "workstream.canonical-staging.sqlite",
+        );
+        if (
+          publishedStagingPath !== expectedStaging ||
+          !isMigrationStagingPath(stagingPath, publishedStagingPath)
+        )
+          throw new Error("Canonical staging path does not match its Workstream identity.");
+      });
+      yield* assertPrivateStorage(paths, stagingPath);
+      const database = yield* acquireDatabase(stagingPath, true);
+      const store = new CanonicalWorkstreamStore(
+        stagingPath,
+        expected.id,
+        structuredClone(expected.repository),
+        database,
+      );
+      const actual = yield* store.read();
+      if (!Value.Equal(actual, expected))
+        return yield* new CanonicalStoreConflictError(
+          "Canonical migration staging aggregate differs from the expected import.",
+        );
+      return actual;
     });
   }
 
