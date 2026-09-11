@@ -46,7 +46,7 @@ export function applyMaintainedOutput<E, R>(
     );
     let state = yield* control.state;
     const located = yield* locate(state, input.attemptId);
-    if (state.lifecycle === "active" && located.task.intentIndex !== state.intents.length - 1)
+    if (state.lifecycle !== "completed" && located.task.intentIndex !== state.intents.length - 1)
       return yield* failure(
         "apply candidate",
         `Attempt ${input.attemptId} does not belong to the current Intent.`,
@@ -175,6 +175,11 @@ export function releaseMaintainedOutput<E, R>(
     );
     let state = yield* control.state;
     const located = yield* locate(state, input.attemptId);
+    if (state.lifecycle !== "completed" && located.task.intentIndex !== state.intents.length - 1)
+      return yield* failure(
+        "release output",
+        `Attempt ${input.attemptId} does not belong to the current Intent.`,
+      );
     const attempt = located.attempt;
     const placement = attempt.execution?.placement;
     const expectedHead = attempt.cleanup?.expectedHead;

@@ -1297,6 +1297,8 @@ void test("retained changed output applies with exact checkpoints and releases i
             parentAttemptId: ATTEMPT,
             parentCommit: candidate,
           });
+          const suspended = yield* runtime.suspend({ reason: "Hold automatic work." });
+          assert.equal(suspended.lifecycle, "suspended");
           const blocked = yield* runtime.releaseOutput({
             attemptId: ATTEMPT,
             reason: "Reviewed before application.",
@@ -1453,6 +1455,21 @@ void test("retained candidate integration resolves only the clean current destin
           },
           recordedAt: T0,
         });
+        const suspended = yield* runtime.suspend({ reason: "Keep stale output manual." });
+        const staleRevision = suspended.revision;
+        const staleHead = yield* h.commands.git.head;
+        const staleBranch = yield* Effect.promise(() => branchHead(h, placement.branch));
+        for (const operation of [
+          runtime.apply({ attemptId: ATTEMPT }),
+          runtime.releaseOutput({ attemptId: ATTEMPT, reason: "Do not release stale output." }),
+        ]) {
+          const rejected = yield* Effect.result(operation);
+          assert.equal(rejected._tag, "Failure");
+          assert.equal((yield* runtime.read()).revision, staleRevision);
+          assert.equal(yield* h.commands.git.head, staleHead);
+          assert.equal(yield* Effect.promise(() => branchHead(h, placement.branch)), staleBranch);
+        }
+        yield* runtime.resume({ reason: "Continue with the current Intent." });
         const beforeInvalid = yield* runtime.read();
         const invalid = yield* Effect.result(
           runtime.enqueue({

@@ -635,9 +635,23 @@ void test("suspend waits for dispatched work, removes stale effects, and resume 
         for (let spin = 0; spin < 20; spin += 1) yield* Effect.yieldNow;
         assert.equal(placementDispatches, 0);
 
-        const resumed = yield* runtime.resume({});
+        const suspendedRevision = suspended.revision;
+        for (const invalid of [
+          {},
+          { reason: "" },
+          { reason: "   " },
+          { reason: "Resume.", extra: true },
+        ]) {
+          const rejected = yield* Effect.result(runtime.resume(invalid));
+          assert.equal(rejected._tag, "Failure");
+          assert.equal((yield* runtime.read()).revision, suspendedRevision);
+        }
+        const resumed = yield* runtime.resume({ reason: "Continue dispatch." });
         assert.equal(resumed.lifecycle, "active");
         assert.equal(resumed.suspension, undefined);
+        const repeated = yield* Effect.result(runtime.resume({ reason: "Do not repeat." }));
+        assert.equal(repeated._tag, "Failure");
+        assert.equal((yield* runtime.read()).revision, resumed.revision);
         expectSome(yield* awaitKind(runtime, "placement_recovery", attemptId));
         expectSome(yield* waitFor(Effect.sync(() => placementDispatches === 1)));
         for (let spin = 0; spin < 20; spin += 1) yield* Effect.yieldNow;
@@ -678,6 +692,108 @@ void test("interrupting suspension before the dispatch barrier leaves lifecycle 
         yield* Fiber.interrupt(suspending);
         assert.equal((yield* runtime.read()).lifecycle, "active");
         yield* Deferred.succeed(release, undefined);
+        yield* runtime.close();
+      }),
+    ),
+  );
+});
+
+void test("deferred interruption after suspension transition entry clears stale runnable effects", async () => {
+  await withFixture((f) =>
+    runCanonical(
+      Effect.gen(function* () {
+        const seed = yield* createStore(freshWorkstream(f));
+        const seedLease = yield* seed.acquireLease(COORDINATOR);
+        yield* seed.transition(seedLease, (state) =>
+          createTask(state, taskFor("queued-effect", 0), T0),
+        );
+        yield* seed.transition(seedLease, (state) =>
+          createTask(state, taskFor("placement-effect", 0), T0),
+        );
+        yield* seed.transition(seedLease, (state) =>
+          activate(state, KEY("placement-effect", "placement-effect-a"), SHARED),
+        );
+        yield* seed.transition(seedLease, (state) =>
+          createTask(state, taskFor("delivery-effect", 0), T0),
+        );
+        yield* seed.transition(seedLease, (state) =>
+          activate(state, KEY("delivery-effect", "delivery-effect-a"), SHARED),
+        );
+        yield* seed.transition(seedLease, (state) =>
+          terminalizeAttempt(state, KEY("delivery-effect", "delivery-effect-a"), reported(), T1),
+        );
+        yield* seed.releaseLease(seedLease);
+
+        const dispatches = new Map<string, number>();
+        const driver = driverFrom((entry) =>
+          Effect.sync(() => {
+            dispatches.set(entry.kind, (dispatches.get(entry.kind) ?? 0) + 1);
+            return { kind: "blocked", detail: `Retain ${entry.kind}.` } as const;
+          }),
+        );
+        const commandEntered = yield* Deferred.make<void>();
+        const releaseCommand = yield* Deferred.make<void>();
+        const runtime = yield* acquire(f, driver, {
+          commands: {
+            git: {
+              resolveRevision: () => Effect.die("unused Git port"),
+              head: Deferred.succeed(commandEntered, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseCommand)),
+                Effect.as(BASE),
+              ),
+              cleanHead: Effect.die("unused Git port"),
+              validateCandidate: () => Effect.die("unused Git port"),
+              preflightCandidateApplication: () => Effect.die("unused Git port"),
+              prepareCandidateApplication: () => Effect.die("unused Git port"),
+              recoverCandidateApplication: () => Effect.die("unused Git port"),
+              applyCandidate: () => Effect.die("unused Git port"),
+              releaseOutput: () => Effect.die("unused Git port"),
+            },
+            workers: { steer: () => Effect.die("unused Worker port") },
+          },
+        });
+        expectSome(
+          yield* waitFor(
+            Effect.sync(() =>
+              ["queued", "placement_recovery", "delivery"].every(
+                (kind) => (dispatches.get(kind) ?? 0) > 0,
+              ),
+            ),
+          ),
+        );
+        const command = yield* Effect.forkChild(
+          runtime.enqueue({
+            taskId: "held-command",
+            kind: "experiment",
+            objective: "Hold the serialized transition boundary.",
+            permittedEffects: ["None before release."],
+            stopCondition: "Released.",
+            expectedEvidence: ["Transition ordering."],
+          }),
+        );
+        yield* Deferred.await(commandEntered);
+        const suspending = yield* Effect.forkChild(
+          runtime.suspend({ reason: "Commit despite deferred interruption." }),
+        );
+        for (let spin = 0; spin < 20; spin += 1) yield* Effect.yieldNow;
+        const interrupted = yield* Effect.forkChild(Fiber.interrupt(suspending));
+        yield* Deferred.succeed(releaseCommand, undefined);
+        yield* Fiber.join(command);
+        yield* Fiber.join(interrupted);
+
+        const suspended = yield* runtime.read();
+        assert.equal(suspended.lifecycle, "suspended");
+        assert.equal(suspended.suspension?.reason, "Commit despite deferred interruption.");
+        assert.equal(
+          (yield* runtime.frontierSnapshot()).some((entry) =>
+            ["queued", "placement_recovery", "delivery"].includes(entry.kind),
+          ),
+          false,
+        );
+        const committedCounts = new Map(dispatches);
+        for (let spin = 0; spin < 20; spin += 1) yield* Effect.yieldNow;
+        for (const kind of ["queued", "placement_recovery", "delivery"])
+          assert.equal(dispatches.get(kind), committedCounts.get(kind));
         yield* runtime.close();
       }),
     ),

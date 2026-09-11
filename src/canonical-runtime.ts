@@ -30,6 +30,7 @@ import {
   decodeCommand,
   enqueueFacts,
   exactAttempt,
+  type ResumeCommand,
   ResumeCommandSchema,
   ReviseIntentCommandSchema,
   SteerCommandSchema,
@@ -398,7 +399,7 @@ export class CanonicalRuntime {
           Effect.gen(
             function* (this: CanonicalRuntime) {
               yield* this.try("decode resumption", () =>
-                decodeCommand(ResumeCommandSchema, command, "resumption command"),
+                decodeCommand<ResumeCommand>(ResumeCommandSchema, command, "resumption command"),
               );
               const now = yield* this.now();
               const committed = yield* this.authoritative("resume canonical Workstream", (state) =>
@@ -667,7 +668,7 @@ export class CanonicalRuntime {
         const resolved = yield* this.try("resolve canonical append plan", () => {
           const task = findTask(expected, decoded.taskId);
           if (task === undefined) throw new Error(`Unknown Task ${decoded.taskId}.`);
-          return planAppend(decoded, task.kind, policy);
+          return planAppend(decoded, task, policy);
         });
         const facts = yield* appendFacts(expected, decoded, this.acquisition.commands?.git);
         const now = yield* this.now();

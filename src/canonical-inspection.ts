@@ -220,12 +220,15 @@ export function inspectCanonical(
   return boundary(() => inspect(snapshot, decodeRequest(input)));
 }
 
+interface ActionWorkstreamProjection {
+  readonly id: string;
+  readonly revision: number;
+  readonly lifecycle: Workstream["lifecycle"];
+  readonly suspension?: NonNullable<Workstream["suspension"]>;
+}
+
 export interface CanonicalActionProjection {
-  readonly workstream: {
-    readonly id: string;
-    readonly revision: number;
-    readonly lifecycle: Workstream["lifecycle"];
-  };
+  readonly workstream: ActionWorkstreamProjection;
   readonly action: { readonly name: string; readonly message: string | undefined };
   readonly affected: {
     readonly task: ReturnType<typeof taskPreview> | undefined;
@@ -248,11 +251,7 @@ export function projectCanonicalAction(
     );
     const selected = resolveActionSelection(snapshot.workstream, request);
     return {
-      workstream: {
-        id: snapshot.workstream.id,
-        revision: snapshot.workstream.revision,
-        lifecycle: snapshot.workstream.lifecycle,
-      },
+      workstream: actionWorkstreamProjection(snapshot.workstream),
       action: {
         name: compact(request.action, 120),
         message: request.message === undefined ? undefined : compact(request.message, 280),
@@ -265,6 +264,17 @@ export function projectCanonicalAction(
       blocked: blockedPreview(snapshot.reconciliation),
     };
   });
+}
+
+function actionWorkstreamProjection(workstream: Workstream): ActionWorkstreamProjection {
+  const base = {
+    id: workstream.id,
+    revision: workstream.revision,
+    lifecycle: workstream.lifecycle,
+  };
+  return workstream.suspension === undefined
+    ? base
+    : { ...base, suspension: structuredClone(workstream.suspension) };
 }
 
 export function canonicalOutcomeNotification(

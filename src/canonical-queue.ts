@@ -155,12 +155,12 @@ export function decodeAppend(value: unknown): CanonicalAppendCommand {
 
 export function planAppend(
   command: CanonicalAppendCommand,
-  kind: Task["kind"],
+  task: Task,
   policy: ModelPolicy,
 ): AppendPlan {
   if (command.continuationOf !== undefined && command.candidateOf !== undefined)
     throw new Error("candidateOf and continuationOf cannot be combined.");
-  const selections = appendSelections(command, kind, policy);
+  const selections = appendSelections(command, task, policy);
   return {
     attemptCount: selections.length,
     materialize: (attemptIds, now, facts) => {
@@ -198,9 +198,10 @@ function taskSelections(
 
 function appendSelections(
   command: CanonicalAppendCommand,
-  kind: Task["kind"],
+  task: Task,
   policy: ModelPolicy,
 ): readonly ModelSelection[] {
+  const kind = task.kind;
   switch (kind) {
     case "research":
     case "experiment":
@@ -216,7 +217,7 @@ function appendSelections(
         ["candidateOf", "useEscalationExecutor", "baseRevision", "selection"],
         kind,
       );
-      return [consultationSelection(policy)];
+      return [consultationTaskSelection(task, policy)];
     case "implementation":
       rejectAppendFields(command, ["selection"], kind);
       return [implementationSelection(policy, command.useEscalationExecutor === true)];
@@ -242,6 +243,19 @@ function consultationSelection(policy: ModelPolicy, advisor?: string): ModelSele
     target: configuredTarget(policy, "consultation.advisor", advisor),
     source: "policy",
   };
+}
+
+function consultationTaskSelection(
+  task: Extract<Task, { kind: "consultation" }>,
+  policy: ModelPolicy,
+) {
+  const selection = task.attempts[0]?.selection;
+  if (selection?.role !== "consultation")
+    throw new Error(`Consultation Task ${task.id} has no exact advisor selection.`);
+  const configured = configuredTarget(policy, "consultation.advisor", selection.target.model);
+  if (configured.thinking !== selection.target.thinking)
+    throw new Error(`Consultation Task ${task.id} advisor selection is no longer configured.`);
+  return structuredClone(selection);
 }
 
 function implementationSelection(policy: ModelPolicy, escalated: boolean): ModelSelection {

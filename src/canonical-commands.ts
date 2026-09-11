@@ -43,7 +43,10 @@ export const SuspendCommandSchema = Type.Object(
   { reason: NonEmptyString },
   { additionalProperties: false },
 );
-export const ResumeCommandSchema = Type.Object({}, { additionalProperties: false });
+export const ResumeCommandSchema = Type.Object(
+  { reason: Type.String({ minLength: 1, pattern: "\\S" }) },
+  { additionalProperties: false },
+);
 export const CancelCommandSchema = Type.Object(
   { ...AttemptHandle, reason: NonEmptyString },
   { additionalProperties: false },

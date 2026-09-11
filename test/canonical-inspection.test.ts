@@ -194,6 +194,14 @@ void test("overview and context expose the bounded current suspension fact", asy
   assert.match(context, /"lifecycle": "suspended"/);
   assert.match(context, /"reason": "Await explicit input\."/);
   assert.match(context, /"suspendedAt": "2026-01-01T00:00:01\.000Z"/);
+  const suspendedAction = await Effect.runPromise(
+    projectCanonicalAction(snapshot, { action: "suspend" }),
+  );
+  assert.deepEqual(suspendedAction.workstream.suspension, workstream.suspension);
+  const activeAction = await Effect.runPromise(
+    projectCanonicalAction({ workstream: initial, reconciliation: [] }, { action: "create" }),
+  );
+  assert.equal("suspension" in activeAction.workstream, false);
 });
 
 void test("one complete canonical Workstream projects all sections with one bounded cursor", async () => {

@@ -966,6 +966,8 @@ function validateSelection(task: Task, attempt: Attempt): void {
       task.kind === "experiment" ? "research" : task.kind;
     if (selection.role !== expected)
       throw new Error(`Attempt ${attempt.id} selection does not match Task kind ${task.kind}.`);
+    if (task.kind === "consultation" && !sameValue(selection, task.attempts[0]?.selection))
+      throw new Error(`Attempt ${attempt.id} changes the consultation Task advisor selection.`);
   }
 }
 function validateCandidate(workstream: Workstream, task: Task, attempt: Attempt): void {

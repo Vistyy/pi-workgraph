@@ -54,6 +54,7 @@ import {
   unregisterRuntimeGeneration,
 } from "../src/canonical-runtime-generation.js";
 import {
+  type CanonicalLease,
   CanonicalStoreConflictError,
   type CanonicalStoreError,
   CanonicalStoreInvalidError,
@@ -71,6 +72,7 @@ import {
   type RepositoryIdentity,
   recordDeliverySuccess,
   recordWorkerExecution,
+  type Task,
   type TerminalObservation,
   terminalizeAttempt,
   type Workstream,
@@ -275,6 +277,34 @@ function attached(f: Fixture, extra: Partial<CanonicalRuntimeAcquisition> = {}) 
     const store = yield* canonicalCreate(f);
     const runtime = yield* acquire(f, COORDINATOR, extra);
     return { store, runtime };
+  });
+}
+
+function settleSharedAttempt(
+  store: CanonicalWorkstreamStore,
+  lease: CanonicalLease,
+  key: { readonly taskId: string; readonly attemptId: string },
+  projectRoot: string,
+  sessionFile: string,
+  summary: string,
+) {
+  return Effect.gen(function* () {
+    yield* store.transition(lease, (state) =>
+      activateAttempt(state, key, T0, {
+        placement: { kind: "shared_project", path: projectRoot },
+        submission: "not_sent",
+      }),
+    );
+    yield* store.transition(lease, (state) =>
+      recordWorkerExecution(state, key, { sessionFile }, T0),
+    );
+    yield* store.transition(lease, (state) =>
+      terminalizeAttempt(state, key, reported(summary), T0),
+    );
+    yield* store.transition(lease, (state) =>
+      checkpointCleanup(state, key, { state: "completed", workerClosed: true }, T0),
+    );
+    yield* store.transition(lease, (state) => recordDeliverySuccess(state, key, T0, T0));
   });
 }
 
@@ -1005,11 +1035,59 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
           objective: "Advise exactly",
           advisor: "fixture/advisor-2",
         });
-        assert.deepEqual(selectedAdvisor.tasks[4]?.attempts[0]?.selection, {
+        const consultationTask = selectedAdvisor.tasks[4] ?? assert.fail("consultation Task");
+        const consultationId =
+          consultationTask.attempts[0]?.id ?? assert.fail("consultation Attempt");
+        assert.deepEqual(consultationTask.attempts[0]?.selection, {
           role: "consultation",
           target: { model: "fixture/advisor-2", thinking: "medium" },
           source: "policy",
         });
+        const lease = yield* store.observeLease();
+        assert.ok(lease !== undefined);
+        const consultationKey = { taskId: consultationTask.id, attemptId: consultationId };
+        yield* settleSharedAttempt(
+          store,
+          lease,
+          consultationKey,
+          f.repository.projectRoot,
+          "/sessions/advisor.jsonl",
+          "Advice",
+        );
+        yield* runtime.read();
+        const continuedAdvice = yield* runtime.appendAttempts({
+          taskId: consultationTask.id,
+          continuationOf: consultationId,
+        });
+        const continuedAttempt = continuedAdvice.tasks[4]?.attempts[1];
+        assert.equal(continuedAttempt?.continuationOf, consultationId);
+        assert.deepEqual(continuedAttempt?.selection, consultationTask.attempts[0]?.selection);
+
+        const withoutSecondAdvisor: ModelPolicy = {
+          ...ESCALATED_POLICY,
+          roles: {
+            ...ESCALATED_POLICY.roles,
+            "consultation.advisor": [{ model: "fixture/advisor", thinking: "off" }],
+          },
+        };
+        yield* Effect.promise(() => writePolicy(f.policyPath, withoutSecondAdvisor));
+        const beforeRemovedAdvisor = yield* runtime.read();
+        const removedAdvisor = yield* Effect.flip(
+          runtime.appendAttempts({ taskId: consultationTask.id }),
+        );
+        assert.ok(removedAdvisor instanceof CanonicalRuntimeOperationError);
+        assert.deepEqual(yield* runtime.read(), beforeRemovedAdvisor);
+        yield* Effect.promise(() => writePolicy(f.policyPath, ESCALATED_POLICY));
+        const beforeIncompatibleAppend = yield* runtime.read();
+        const incompatibleAppend = yield* Effect.flip(
+          runtime.appendAttempts({
+            taskId: consultationTask.id,
+            selection: { count: 2, distinctModels: true },
+          }),
+        );
+        assert.ok(incompatibleAppend instanceof CanonicalRuntimeOperationError);
+        assert.deepEqual(yield* runtime.read(), beforeIncompatibleAppend);
+
         const beforeUnknown = yield* runtime.read();
         for (const command of [
           {
@@ -1037,24 +1115,14 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
         const attemptId = task.attempts[0]?.id;
         assert.ok(attemptId !== undefined);
         const key = { taskId: task.id, attemptId };
-        const lease = yield* store.observeLease();
-        assert.ok(lease !== undefined);
-        yield* store.transition(lease, (current) =>
-          activateAttempt(current, key, T0, {
-            placement: { kind: "shared_project", path: f.repository.projectRoot },
-            submission: "not_sent",
-          }),
+        yield* settleSharedAttempt(
+          store,
+          lease,
+          key,
+          f.repository.projectRoot,
+          "/sessions/retained.jsonl",
+          "Continuation",
         );
-        yield* store.transition(lease, (current) =>
-          recordWorkerExecution(current, key, { sessionFile: "/sessions/retained.jsonl" }, T0),
-        );
-        yield* store.transition(lease, (current) =>
-          terminalizeAttempt(current, key, reported("Continuation"), T0),
-        );
-        yield* store.transition(lease, (current) =>
-          checkpointCleanup(current, key, { state: "completed", workerClosed: true }, T0),
-        );
-        yield* store.transition(lease, (current) => recordDeliverySuccess(current, key, T0, T0));
         const batchBase = yield* runtime.read();
         const invalidContinuation = yield* Effect.flip(
           runtime.appendAttempts({ taskId: task.id, continuationOf: "missing-attempt" }),
@@ -1423,16 +1491,41 @@ void test("canonical queue schemas remain the strict kind-owned command owner", 
     }),
     false,
   );
+  const consultationTask = {
+    id: "consultation",
+    kind: "consultation",
+    objective: "Consult",
+    intentIndex: 0,
+    createdAt: T0,
+    attempts: [
+      {
+        id: "advisor-attempt",
+        state: "finished",
+        createdAt: T0,
+        updatedAt: T0,
+        selection: {
+          role: "consultation",
+          target: { model: "fixture/advisor-2", thinking: "medium" },
+          source: "policy",
+        },
+      },
+    ],
+  } satisfies Task;
   assert.throws(
     () =>
       planAppend(
         { taskId: "consultation", selection: { count: 2, distinctModels: true } },
-        "consultation",
+        consultationTask,
         POLICY,
       ),
     /selection/,
   );
-  assert.equal(planAppend({ taskId: "consultation" }, "consultation", POLICY).attemptCount, 1);
+  const appended = planAppend({ taskId: "consultation" }, consultationTask, POLICY).materialize(
+    ["next-advice"],
+    T0,
+    {},
+  );
+  assert.deepEqual(appended[0]?.selection, consultationTask.attempts[0]?.selection);
   for (const command of [
     {
       taskId: "research",
