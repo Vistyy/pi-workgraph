@@ -1,6 +1,7 @@
 import { Data, Effect } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
+import { EvidenceSchema } from "../domain/report.js";
 import {
   type Attempt,
   type AttemptKey,
@@ -22,9 +23,8 @@ import type {
   WorktreeCleanupResult,
   WorktreePlacement,
 } from "../git.js";
+import type { WorkerIdentity } from "../herdr-identity.js";
 import { SelectionRequestSchema } from "../model-policy.js";
-import { EvidenceSchema } from "../report-schema.js";
-import type { WorkerIdentity } from "../types.js";
 
 const NonEmptyString = Type.String({ minLength: 1 });
 export const NonBlankReasonSchema = Type.String({ minLength: 1, pattern: "\\S" });

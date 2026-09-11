@@ -1,7 +1,7 @@
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { EvidenceSchema, WorkerReportSchema } from "../report-schema.js";
 import { ModelTargetSchema } from "./model-target.js";
+import { EvidenceSchema, WorkerReportSchema } from "./report.js";
 import { CommitSchema, InstantSchema, NonEmptyStringSchema } from "./values.js";
 
 const WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;

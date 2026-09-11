@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Value } from "typebox/value";
+import { EvidenceSchema, WorkerReportSchema } from "../src/domain/report.js";
 import {
   ApplicationSchema,
   type Attempt,
@@ -41,7 +42,6 @@ import {
   WorkerExecutionSchema,
   WorkstreamSchema,
 } from "../src/domain/workstream.js";
-import { EvidenceSchema, WorkerReportSchema } from "../src/report-schema.js";
 import { workerAssignment, workerSessionMode } from "../src/worker-context.js";
 
 const repository = { projectRoot: "/repo", gitCommonDir: "/repo/.git" };

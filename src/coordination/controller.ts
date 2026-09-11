@@ -34,7 +34,7 @@ import {
   priorDiscussion,
 } from "../handoff-session.js";
 import { HerdrCliRuntime } from "../herdr.js";
-import type { CoordinatorLaunchResource } from "../herdr-identity.js";
+import type { CoordinatorLaunchResource, WorkerIdentity } from "../herdr-identity.js";
 import { herdrCoordinatorNames } from "../herdr-naming.js";
 import { WorkstreamStore, type WorkstreamStoreAttachment } from "../storage/workstream-store.js";
 import {
@@ -998,7 +998,7 @@ function resourceFrom(
 
 function workspaceCheckpoint(
   checkpoint: Extract<HandoffCheckpoint, { phase: "workspace_submitting" }>,
-  identity: import("../types.js").WorkerIdentity,
+  identity: WorkerIdentity,
 ): Extract<HandoffCheckpoint, { phase: "workspace_ready" }> {
   return {
     ...checkpoint,
@@ -1011,7 +1011,7 @@ function workspaceCheckpoint(
 
 function launchedCheckpoint(
   checkpoint: Extract<HandoffCheckpoint, { phase: "start_submitting" }>,
-  identity: import("../types.js").WorkerIdentity,
+  identity: WorkerIdentity,
   launchedAt: string,
 ): Extract<HandoffCheckpoint, { phase: "launched" }> {
   if (

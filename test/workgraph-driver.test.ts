@@ -30,6 +30,7 @@ import {
   ReconciliationDriverError,
 } from "../src/coordination/reconciliation.js";
 import { WorkstreamRuntime, type WorkstreamRuntimeError } from "../src/coordination/runtime.js";
+import type { WorkerReport } from "../src/domain/report.js";
 import {
   type Attempt,
   type AttemptKey,
@@ -52,12 +53,11 @@ import {
 import { type GitRepository, openRepository } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import type { HerdrAgentStatus } from "../src/herdr-decoder.js";
+import type { WorkerIdentity } from "../src/herdr-identity.js";
 import type { ModelPolicy } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import type { NativeFailureCategory, WorkerSessionResolution } from "../src/pi-process.js";
-import type { WorkerReport } from "../src/report-schema.js";
 import { WorkstreamStore } from "../src/storage/workstream-store.js";
-import type { WorkerIdentity } from "../src/types.js";
 import { git } from "./helpers.js";
 
 const ID = "driver";

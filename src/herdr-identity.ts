@@ -1,10 +1,21 @@
 import { Data } from "effect";
 import type { HerdrAgent, HerdrAgentStatus, HerdrCoordinatorAgent } from "./herdr-decoder.js";
-import type {
-  CoordinatorRuntimeIdentity,
-  WorkerIdentity,
-  WorkerResourceIdentity,
-} from "./types.js";
+
+export interface CoordinatorRuntimeIdentity {
+  workspaceId: string;
+  tabId: string;
+  paneId: string;
+  terminalId: string;
+  agentName?: string;
+  sessionFile: string;
+  cwd: string;
+}
+
+export interface WorkerIdentity extends CoordinatorRuntimeIdentity {
+  agentName: string;
+}
+
+export type WorkerResourceIdentity = Omit<WorkerIdentity, "sessionFile">;
 
 export interface ParsedAgent {
   readonly workspaceId: string;

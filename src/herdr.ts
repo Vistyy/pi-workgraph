@@ -19,12 +19,15 @@ import {
   assertIdentity,
   assertResource,
   type CoordinatorLaunchResource,
+  type CoordinatorRuntimeIdentity,
   type HerdrObservation,
   identityOf,
   type ParsedAgent,
   parseAgent,
   parseCoordinator,
   resourceOf,
+  type WorkerIdentity,
+  type WorkerResourceIdentity,
 } from "./herdr-identity.js";
 import {
   CoordinatorLaunchError,
@@ -47,12 +50,6 @@ import {
   protocolFailure,
   protocolTry,
 } from "./herdr-protocol.js";
-
-import type {
-  CoordinatorRuntimeIdentity,
-  WorkerIdentity,
-  WorkerResourceIdentity,
-} from "./types.js";
 
 interface HerdrAbsentObservation {
   identity: WorkerIdentity;

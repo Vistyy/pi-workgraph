@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Value } from "typebox/value";
-import { reportSchemaForMode, type WorkerMode, WorkerReportSchema } from "../src/report-schema.js";
+import { reportSchemaForMode, type WorkerMode, WorkerReportSchema } from "../src/domain/report.js";
 
 const reportContent = {
   summary: "Bounded result",

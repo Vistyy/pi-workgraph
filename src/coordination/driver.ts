@@ -11,6 +11,7 @@
  */
 import { Clock, DateTime, Effect, type FileSystem, type Path } from "effect";
 import type { Thinking } from "../domain/model-target.js";
+import type { WorkerReport, WorkerSessionMode } from "../domain/report.js";
 import {
   type Attempt,
   type CancellationCheckpoint,
@@ -24,10 +25,9 @@ import {
 import type { WorktreePlacement } from "../git.js";
 import type { WorkerLaunchInspection, WorkerLaunchInspectionRequest } from "../herdr.js";
 import type { HerdrAgentStatus } from "../herdr-decoder.js";
+import type { WorkerIdentity } from "../herdr-identity.js";
 import type { WorkerLaunchEffectRequest } from "../herdr-launch.js";
 import type { NativeFailureCategory, WorkerSessionResolution } from "../pi-process.js";
-import type { WorkerReport, WorkerSessionMode } from "../report-schema.js";
-import type { WorkerIdentity } from "../types.js";
 import {
   type AssignmentInput,
   type WorkerAssignment,

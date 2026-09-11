@@ -2,8 +2,8 @@ import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import type { ResolvedReviewInput } from "./coordination/reconciliation.js";
+import type { WorkerSessionMode } from "./domain/report.js";
 import type { CandidateLineage, Intent, TaskContract } from "./domain/workstream.js";
-import type { WorkerSessionMode } from "./report-schema.js";
 
 export type WorkerPhase = "guide" | "executor";
 export type WorkerPolicyRole = WorkerSessionMode | "consultation" | "experiment";

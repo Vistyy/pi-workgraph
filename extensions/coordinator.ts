@@ -18,6 +18,7 @@ import {
 import { WorkstreamInspectionRequestSchema } from "../src/coordination/inspection.js";
 import type { WorkstreamRuntime } from "../src/coordination/runtime.js";
 import { installCoordinatorSessionState } from "../src/coordinator-notepad.js";
+import { EvidenceSchema } from "../src/domain/report.js";
 import type { HandoffGrant, HumanInputReceiptData } from "../src/domain/workstream.js";
 import {
   deterministicChildSessionId,
@@ -33,7 +34,6 @@ import {
   SelectionRequestSchema,
 } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
-import { EvidenceSchema } from "../src/report-schema.js";
 
 class HandoffKickoffError extends Data.TaggedError("HandoffKickoffError")<{
   readonly message: string;

@@ -9,6 +9,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { Data, Deferred, Effect } from "effect";
 import { HerdrCliRuntime } from "../src/herdr.js";
+import type { WorkerIdentity, WorkerResourceIdentity } from "../src/herdr-identity.js";
 import { WorkerLaunchPlacementError } from "../src/herdr-identity.js";
 import { CoordinatorLaunchError, WorkerLaunchError } from "../src/herdr-launch.js";
 import {
@@ -18,7 +19,6 @@ import {
   type WorkerRole,
 } from "../src/herdr-naming.js";
 import { HERDR_PROTOCOL_OUTPUT_LIMIT, HerdrProtocolError } from "../src/herdr-protocol.js";
-import type { WorkerIdentity, WorkerResourceIdentity } from "../src/types.js";
 
 const runEffect = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
 

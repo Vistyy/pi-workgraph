@@ -12,7 +12,7 @@ import {
   type WorkerReport,
   type WorkerReportInput,
   type WorkerSessionMode,
-} from "../src/report-schema.js";
+} from "../src/domain/report.js";
 import {
   hasActiveObjective,
   hasActivePhase,

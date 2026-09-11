@@ -3,7 +3,7 @@ import { Cause, Data, Effect, Exit, FileSystem, Option, Path } from "effect";
 import { PlatformError } from "effect/PlatformError";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { isWorkerReport, type WorkerReport, type WorkerSessionMode } from "./report-schema.js";
+import { isWorkerReport, type WorkerReport, type WorkerSessionMode } from "./domain/report.js";
 
 type Generation = { runId: string; nodeId: string };
 const GenerationDataSchema = Type.Object({

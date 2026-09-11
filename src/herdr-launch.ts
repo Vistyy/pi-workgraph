@@ -5,7 +5,12 @@ import {
   decodeSuccessResponse,
   decodeTabCreateResponse,
 } from "./herdr-decoder.js";
-import type { CoordinatorLaunchResource, HerdrObservation } from "./herdr-identity.js";
+import type {
+  CoordinatorLaunchResource,
+  HerdrObservation,
+  WorkerIdentity,
+  WorkerResourceIdentity,
+} from "./herdr-identity.js";
 import { assertWorkerLaunchPlacement, parseAgent, resourceOf } from "./herdr-identity.js";
 import { herdrWorkerName, herdrWorkerTabLabel, type WorkerRole } from "./herdr-naming.js";
 import {
@@ -13,7 +18,6 @@ import {
   type HerdrProtocolError,
   protocolTry,
 } from "./herdr-protocol.js";
-import type { WorkerIdentity, WorkerResourceIdentity } from "./types.js";
 
 interface WorkerLaunchBaseRequest {
   workspaceId: string;

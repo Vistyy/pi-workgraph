@@ -1,13 +1,25 @@
-import { StringEnum } from "@earendil-works/pi-ai";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { CommitSchema } from "./domain/values.js";
+import { CommitSchema } from "./values.js";
+
+const ReportStatusSchema = Type.Union([
+  Type.Literal("completed"),
+  Type.Literal("escalated"),
+  Type.Literal("failed"),
+]);
 
 export const EvidenceSchema = Type.Object(
   {
     label: Type.String(),
     observation: Type.String(),
-    class: Type.Optional(StringEnum(["direct", "inference", "conflict", "unknown"] as const)),
+    class: Type.Optional(
+      Type.Union([
+        Type.Literal("direct"),
+        Type.Literal("inference"),
+        Type.Literal("conflict"),
+        Type.Literal("unknown"),
+      ]),
+    ),
     command: Type.Optional(Type.String()),
     artifact: Type.Optional(Type.String()),
   },
@@ -15,7 +27,12 @@ export const EvidenceSchema = Type.Object(
 );
 const FindingSchema = Type.Object(
   {
-    severity: StringEnum(["info", "warning", "error", "blocker"] as const),
+    severity: Type.Union([
+      Type.Literal("info"),
+      Type.Literal("warning"),
+      Type.Literal("error"),
+      Type.Literal("blocker"),
+    ]),
     title: Type.String(),
     detail: Type.String(),
   },
@@ -32,7 +49,7 @@ function readOnlyReportSchema<const Kind extends "research" | "review">(kind: Ki
   return Type.Object(
     {
       kind: Type.Literal(kind),
-      status: StringEnum(["completed", "escalated", "failed"] as const),
+      status: ReportStatusSchema,
       ...ReportContentFields,
     },
     { additionalProperties: false },
@@ -55,7 +72,7 @@ const ImplementationNoChangeReportSchema = Type.Object(
 const ImplementationIncompleteReportSchema = Type.Object(
   {
     kind: Type.Literal("implementation"),
-    status: StringEnum(["escalated", "failed"] as const),
+    status: Type.Union([Type.Literal("escalated"), Type.Literal("failed")]),
     ...ReportContentFields,
   },
   { additionalProperties: false },
