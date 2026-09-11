@@ -503,7 +503,7 @@ function projectSection(
           cancellation: attempt.execution?.cancellation,
           application: attempt.application,
           cleanup: attempt.cleanup,
-          outputRelease: attempt.outputRelease,
+          outputDisposition: attempt.outputDisposition,
           reconciliation,
         }),
       };
@@ -848,7 +848,7 @@ function outputPreview(task: Task, attempt: Attempt) {
 
 function durableBlocker(attempt: Attempt): string | undefined {
   const detail =
-    attempt.outputRelease?.error ?? attempt.application?.error ?? attempt.cleanup?.error;
+    attempt.outputDisposition?.error ?? attempt.application?.error ?? attempt.cleanup?.error;
   return detail === undefined ? undefined : compact(detail, 320);
 }
 

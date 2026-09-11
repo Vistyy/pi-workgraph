@@ -41,7 +41,7 @@ type WorkerContextMessage = Pick<
 const researchPolicy =
   "[WORKGRAPH RESEARCH WORKER POLICY]\nAnswer only the assigned question using read-only evidence from the live project cwd. Tracked and untracked local changes may be present; do not require cleanliness, copy files, or modify them. Supply the requested observations and retain material unknowns. Do not delegate another worker. Finish with workgraph_report.";
 const experimentPolicy =
-  "[WORKGRAPH EXPERIMENT WORKER POLICY]\nAnswer the question within the explicitly permitted effects and stop condition in this disposable worktree. Leave all outputs in the assigned worktree and report direct observations, failures and limits; the coordinator decides when to release the worktree. Do not compose, publish, or delegate another worker. Finish with workgraph_report.";
+  "[WORKGRAPH EXPERIMENT WORKER POLICY]\nAnswer the question within the explicitly permitted effects and stop condition in this disposable worktree. Leave all outputs in the assigned worktree and report direct observations, failures and limits; the coordinator decides whether to apply or irreversibly discard the output. Do not compose, publish, or delegate another worker. Finish with workgraph_report.";
 const consultationPolicy =
   "[WORKGRAPH CONSULTATION ADVISOR POLICY]\nProvide decision-oriented advice only for the assigned question and coordinator-known context. Advice is evidence, not authority, approval, or acceptance. Use read-only project research when useful; do not modify files or delegate another worker. Return one standard research report with material unknowns. Finish with workgraph_report.";
 const reviewPolicy =
@@ -260,7 +260,7 @@ function workerPolicyRole(
 
 const CONTINUATION_INSTRUCTION = "Continue the assigned Workgraph objective now.";
 const EXPERIMENT_NOTES = [
-  "On successful clean isolated output the checkout is compacted and this exact output branch is retained until explicit release.",
+  "On successful clean isolated output the checkout is compacted and this exact maintained output branch remains until explicit apply or irreversible discard_output.",
   "Experimental changes are not maintained product changes and must not be applied to the destination.",
 ];
 

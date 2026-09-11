@@ -39,15 +39,6 @@ export interface CandidateApplicationDestination {
   expectedHead: string;
 }
 
-type CandidateApplicationAction =
-  | { kind: "already-integrated"; revision: string }
-  | { kind: "fast-forward"; target: string };
-
-export interface PreparedCandidateApplication {
-  destination: CandidateApplicationDestination;
-  action: CandidateApplicationAction;
-}
-
 export interface WorktreeCleanupResult {
   state: "completed" | "blocked";
   path: string;
@@ -247,16 +238,10 @@ export class GitRepository {
       return { ...validated, rootCommit, commits };
     });
   };
-  readonly preflightCandidateApplication = (
+  readonly inspectCandidateApplication = (
     source: CandidateApplicationSource,
   ): GitEffect<CandidateApplicationDestination> =>
-    previewCandidateApplication(this.git, this.root, source);
-
-  readonly prepareCandidateApplication = (
-    source: CandidateApplicationSource,
-    destination: CandidateApplicationDestination,
-  ): GitEffect<PreparedCandidateApplication> =>
-    prepareCandidateApplication(this.git, this.root, source, destination);
+    inspectCandidateApplication(this.git, this.root, source);
 
   readonly recoverCandidateApplication = (
     destination: CandidateApplicationDestination,
@@ -264,51 +249,26 @@ export class GitRepository {
   ): GitEffect<{ head: string } | undefined> =>
     classifyApplicationState(this.git, this.root, source, destination);
 
-  readonly applyCandidate = (prepared: PreparedCandidateApplication): GitEffect<string> => {
-    const root = this.root;
-    const git = this.git;
-    return Effect.gen(function* () {
-      let revision: string;
-      if (prepared.action.kind === "already-integrated") revision = prepared.action.revision;
-      else {
-        const target = prepared.action.target;
-        revision = yield* Effect.uninterruptible(
-          Effect.gen(function* () {
-            const result = yield* git.process(
-              root,
-              ["merge", "--ff-only", "--no-edit", target],
-              120_000,
-            );
-            if (!processSucceeded(result))
-              return yield* fail(
-                `Fast-forward application of ${target} failed: ${diagnostic(result)}`,
-              );
-            return target;
-          }),
-        );
-      }
-      yield* assertApplicationDestination(git, root, {
-        expectedRef: prepared.destination.expectedRef,
-        expectedHead: revision,
-      });
-      return revision;
-    });
-  };
+  readonly applyCandidate = (
+    source: CandidateApplicationSource,
+    destination: CandidateApplicationDestination,
+  ): GitEffect<string> => applyCandidate(this.git, this.root, source, destination);
 
-  /** Release only an exact owned output after the worker is already closed. */
-  readonly releaseOutput = (
+  /** Irreversibly discard only an exact owned output after the Worker is closed. */
+  readonly discardOutput = (
     placement: WorktreePlacement,
     expectedHead: string,
   ): GitEffect<WorktreeCleanupResult> => {
     const root = this.root;
+    const commonDir = this.commonDir;
     const git = this.git;
-    const cleanup = (target: WorktreePlacement, head: string) => this.cleanupWorktree(target, head);
     return Effect.gen(function* () {
+      yield* assertRepositoryCommonDir(git, root, commonDir);
       const records = yield* worktreeRecords(git, root);
       const registered = yield* cleanupRegistration(root, records, placement);
       if (registered === undefined && (yield* pathExists(placement.path)))
         return yield* fail(
-          `Refusing release: unregistered worktree path ${placement.path} exists; inspect it before retrying.`,
+          `Refusing discard: unregistered worktree path ${placement.path} exists; inspect it before retrying.`,
         );
       const branchRef = `refs/heads/${placement.branch}`;
       const branch = yield* inspectRef(
@@ -318,8 +278,20 @@ export class GitRepository {
         (result) => `Could not inspect worker branch ${placement.branch}: ${diagnostic(result)}`,
       );
       yield* verifyCleanupBranch(placement, expectedHead, branch, false);
-      if (registered !== undefined) yield* discardOwnedWorktree(git, placement, expectedHead);
-      return yield* cleanup(placement, expectedHead);
+      if (registered !== undefined) {
+        yield* discardOwnedWorktree(git, commonDir, placement, expectedHead);
+        yield* removeRegisteredWorktree(git, root, placement, expectedHead, registered, true);
+      }
+      yield* removeWorkerBranch(git, root, placement.branch, branchRef, expectedHead, branch);
+      yield* requireCleanupComplete(git, root, placement, branchRef);
+      return {
+        state: "completed" as const,
+        path: placement.path,
+        branch: placement.branch,
+        expectedHead,
+        detail:
+          "Irreversibly removed all owned checkout content, including dirty, untracked, and ignored files, and removed the exact branch; both were already absent when applicable.",
+      };
     });
   };
 
@@ -385,6 +357,24 @@ export function openRepository(cwd: string): GitEffect<GitRepository> {
   return Effect.map(inspectRepository(cwd), (info) => new GitRepository(info.root, info.commonDir));
 }
 
+function assertRepositoryCommonDir(
+  git: GitClient,
+  root: string,
+  expectedCommonDir: string,
+): GitEffect<void> {
+  return Effect.gen(function* () {
+    const actualRoot = yield* git.text(root, ["rev-parse", "--show-toplevel"]);
+    const actualCommonDir = resolve(
+      actualRoot,
+      yield* git.text(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+    );
+    if (resolve(actualRoot) !== resolve(root) || actualCommonDir !== resolve(expectedCommonDir))
+      return yield* fail(
+        `Refusing discard: repository root or Git common directory differs from stored identity ${root} at ${expectedCommonDir}.`,
+      );
+  });
+}
+
 function inspectRef(
   git: GitClient,
   root: string,
@@ -405,7 +395,7 @@ function inspectRef(
   });
 }
 
-function previewCandidateApplication(
+function inspectCandidateApplication(
   git: GitClient,
   root: string,
   source: CandidateApplicationSource,
@@ -418,12 +408,12 @@ function previewCandidateApplication(
     return destination;
   });
 }
-function prepareCandidateApplication(
+function applyCandidate(
   git: GitClient,
   root: string,
   source: CandidateApplicationSource,
   expected: CandidateApplicationDestination,
-): GitEffect<PreparedCandidateApplication> {
+): GitEffect<string> {
   return Effect.gen(function* () {
     yield* validateApplicationSourceShape(source);
     const destination = yield* inspectDestinationIdentity(git, root);
@@ -434,7 +424,7 @@ function prepareCandidateApplication(
     const topology = yield* applicationTopology(git, root, source, destination);
     if (topology.kind === "already-integrated") {
       yield* assertApplicationDestination(git, root, destination);
-      return { destination, action: topology };
+      return topology.revision;
     }
     let target = source.commit;
     if (topology.mergeTree !== undefined) {
@@ -452,7 +442,16 @@ function prepareCandidateApplication(
         return yield* fail("Candidate application merge commit was not an exact commit id.");
     }
     yield* assertApplicationDestination(git, root, destination);
-    return { destination, action: { kind: "fast-forward" as const, target } };
+    const result = yield* Effect.uninterruptible(
+      git.process(root, ["merge", "--ff-only", "--no-edit", target], 120_000),
+    );
+    if (!processSucceeded(result))
+      return yield* fail(`Fast-forward application of ${target} failed: ${diagnostic(result)}`);
+    yield* assertApplicationDestination(git, root, {
+      expectedRef: destination.expectedRef,
+      expectedHead: target,
+    });
+    return target;
   });
 }
 type ApplicationTopology =
@@ -866,6 +865,7 @@ function removeRegisteredWorktree(
   placement: WorktreePlacement,
   expectedHead: string,
   registered: WorktreeRecord | undefined,
+  force = false,
 ): GitEffect<void> {
   if (registered === undefined) return Effect.void;
   return Effect.gen(function* () {
@@ -891,7 +891,11 @@ function removeRegisteredWorktree(
     }
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
-        const result = yield* git.process(root, ["worktree", "remove", placement.path], 60_000);
+        const result = yield* git.process(
+          root,
+          ["worktree", "remove", ...(force ? ["--force"] : []), placement.path],
+          60_000,
+        );
         if (!processSucceeded(result)) {
           return yield* fail(
             `Could not remove worktree ${placement.path}: ${diagnostic(result)}; inspect registration before retrying.`,
@@ -910,22 +914,30 @@ function removeRegisteredWorktree(
 
 function discardOwnedWorktree(
   git: GitClient,
+  commonDir: string,
   placement: WorktreePlacement,
   expectedHead: string,
 ): GitEffect<void> {
   return Effect.gen(function* () {
     const actualPath = yield* filesystemPromise(() => realpath(placement.path));
     if (actualPath !== resolve(placement.path))
-      return yield* fail("Refusing release: worktree path was relocated.");
+      return yield* fail("Refusing discard: worktree path was relocated.");
     const branch = yield* git.text(placement.path, ["symbolic-ref", "--short", "HEAD"]);
     const actualRoot = yield* git.text(placement.path, ["rev-parse", "--show-toplevel"]);
+    const actualCommonDir = resolve(
+      placement.path,
+      yield* git.text(placement.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+    );
     const head = yield* git.text(placement.path, ["rev-parse", "HEAD"]);
     if (
       branch !== placement.branch ||
       resolve(actualRoot) !== resolve(placement.path) ||
+      actualCommonDir !== resolve(commonDir) ||
       head !== expectedHead
     )
-      return yield* fail("Refusing release: worktree identity or revision changed.");
+      return yield* fail(
+        "Refusing discard: worktree identity, common directory, or revision changed.",
+      );
     yield* Effect.uninterruptible(
       Effect.gen(function* () {
         for (const args of [
@@ -934,9 +946,9 @@ function discardOwnedWorktree(
         ]) {
           const result = yield* git.process(placement.path, args);
           if (!processSucceeded(result))
-            return yield* fail(`Release cleanup failed: ${diagnostic(result)}`);
+            return yield* fail(`Discard cleanup failed: ${diagnostic(result)}`);
         }
-        yield* assertStableCleanHead(git, placement.path, expectedHead, "Release cleanup");
+        yield* assertStableCleanHead(git, placement.path, expectedHead, "Discard cleanup");
       }),
     );
   });

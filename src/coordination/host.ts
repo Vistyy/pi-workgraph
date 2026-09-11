@@ -144,25 +144,17 @@ export function liveWorkstreamCommandPorts(
           "validate retained candidate",
           git.validateCandidate(placement, root, commit),
         ),
-      preflightCandidateApplication: (source) =>
-        commandHostEffect(
-          "preflight candidate application",
-          git.preflightCandidateApplication(source),
-        ),
-      prepareCandidateApplication: (source, destination) =>
-        commandHostEffect(
-          "prepare candidate application",
-          git.prepareCandidateApplication(source, destination),
-        ),
+      inspectCandidateApplication: (source) =>
+        commandHostEffect("inspect candidate application", git.inspectCandidateApplication(source)),
       recoverCandidateApplication: (destination, source) =>
         commandHostEffect(
           "recover candidate application",
           git.recoverCandidateApplication(destination, source),
         ),
-      applyCandidate: (prepared) =>
-        commandHostEffect("apply candidate", git.applyCandidate(prepared)),
-      releaseOutput: (placement, head) =>
-        commandHostEffect("release output", git.releaseOutput(placement, head)),
+      applyCandidate: (source, destination) =>
+        commandHostEffect("apply candidate", git.applyCandidate(source, destination)),
+      discardOutput: (placement, head) =>
+        commandHostEffect("discard output", git.discardOutput(placement, head)),
     },
     workers: {
       steer: (identity, instruction) =>

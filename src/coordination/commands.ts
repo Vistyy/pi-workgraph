@@ -18,7 +18,6 @@ import {
 import type {
   CandidateApplicationDestination,
   CandidateApplicationSource,
-  PreparedCandidateApplication,
   ValidatedCandidate,
   WorktreeCleanupResult,
   WorktreePlacement,
@@ -137,7 +136,7 @@ export const SteerCommandSchema = Type.Object(
   { additionalProperties: false },
 );
 export const ApplyCommandSchema = Type.Object(AttemptHandle, { additionalProperties: false });
-export const ReleaseOutputCommandSchema = Type.Object(
+export const DiscardOutputCommandSchema = Type.Object(
   { ...AttemptHandle, reason: NonBlankReasonSchema },
   { additionalProperties: false },
 );
@@ -145,7 +144,7 @@ export type CompleteCommand = Static<typeof CompleteCommandSchema>;
 export type SuspendCommand = Static<typeof SuspendCommandSchema>;
 export type ResumeCommand = Static<typeof ResumeCommandSchema>;
 export type ApplyCommand = Static<typeof ApplyCommandSchema>;
-export type ReleaseOutputCommand = Static<typeof ReleaseOutputCommandSchema>;
+export type DiscardOutputCommand = Static<typeof DiscardOutputCommandSchema>;
 
 export class WorkstreamCommandError extends Data.TaggedError("WorkstreamCommandError")<{
   readonly operation: string;
@@ -163,19 +162,18 @@ export interface WorkstreamCommandGitPort {
     rootCommit: string,
     commit: string,
   ) => CommandEffect<ValidatedCandidate>;
-  readonly preflightCandidateApplication: (
+  readonly inspectCandidateApplication: (
     source: CandidateApplicationSource,
   ) => CommandEffect<CandidateApplicationDestination>;
-  readonly prepareCandidateApplication: (
-    source: CandidateApplicationSource,
-    destination: CandidateApplicationDestination,
-  ) => CommandEffect<PreparedCandidateApplication>;
   readonly recoverCandidateApplication: (
     destination: CandidateApplicationDestination,
     source: CandidateApplicationSource,
   ) => CommandEffect<{ head: string } | undefined>;
-  readonly applyCandidate: (prepared: PreparedCandidateApplication) => CommandEffect<string>;
-  readonly releaseOutput: (
+  readonly applyCandidate: (
+    source: CandidateApplicationSource,
+    destination: CandidateApplicationDestination,
+  ) => CommandEffect<string>;
+  readonly discardOutput: (
     placement: WorktreePlacement,
     expectedHead: string,
   ) => CommandEffect<WorktreeCleanupResult>;

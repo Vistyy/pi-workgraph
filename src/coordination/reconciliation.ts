@@ -67,7 +67,7 @@ export interface ReconciliationContext {
 
 /**
  * Closed set of automatic durable stages. Manual application and output
- * release are deliberately absent: they remain coordinator-guarded boundaries.
+ * output disposition are deliberately absent: apply and discard remain coordinator-guarded boundaries.
  */
 export type ReconciliationMutation = Readonly<
   | { kind: "activate"; placement: Placement }

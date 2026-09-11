@@ -158,7 +158,7 @@ const ControlSchema = Type.Union(
       { additionalProperties: false },
     ),
     Type.Object(
-      { action: Type.Literal("release_output"), attempt: NonEmpty, reason: NonBlankReasonSchema },
+      { action: Type.Literal("discard_output"), attempt: NonEmpty, reason: NonBlankReasonSchema },
       { additionalProperties: false },
     ),
   ],
@@ -486,7 +486,7 @@ export default function workstreamCoordinator(
     name: "workgraph_control",
     label: "Workgraph Control",
     description:
-      "Suspend, resume, cancel, steer, apply, or release output through exact Workstream record boundaries.",
+      "Suspend, resume, cancel, steer, apply maintained output, or irreversibly discard all exact-attempt checkout content (including dirty, untracked, and ignored files) through exact Workstream record boundaries.",
     parameters: ControlSchema,
     execute(_id, params, signal) {
       return run(
@@ -551,8 +551,8 @@ function controlOperation(runtime: WorkstreamRuntime, params: Static<typeof Cont
       return runtime.steer({ attemptId: params.attempt, instruction: params.instruction });
     case "apply":
       return runtime.apply({ attemptId: params.attempt });
-    case "release_output":
-      return runtime.releaseOutput({ attemptId: params.attempt, reason: params.reason });
+    case "discard_output":
+      return runtime.discardOutput({ attemptId: params.attempt, reason: params.reason });
   }
 }
 

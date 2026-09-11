@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Effect } from "effect";
-import type { WorkstreamCommandPorts } from "../src/coordination/commands.js";
+import { commandFailure, type WorkstreamCommandPorts } from "../src/coordination/commands.js";
 import {
   makeWorkstreamReconciliationDriver,
   type WorkstreamReconciliationPorts,
@@ -252,11 +252,10 @@ void test("serialized steering uses a direct owner fence and does not re-enter i
       head: unused(),
       cleanHead: unused(),
       validateCandidate: unused,
-      preflightCandidateApplication: unused,
-      prepareCandidateApplication: unused,
+      inspectCandidateApplication: unused,
       recoverCandidateApplication: unused,
       applyCandidate: unused,
-      releaseOutput: unused,
+      discardOutput: unused,
     },
     workers: {
       steer: (_identity, instruction) => Effect.sync(() => steered.push(instruction)),
@@ -303,7 +302,7 @@ void test("serialized steering uses a direct owner fence and does not re-enter i
   }
 });
 
-void test("registered apply and release settle once through direct fences", async () => {
+void test("registered apply and output cleanup settle once through direct fences", async () => {
   const f = await fixture();
   const base = "a".repeat(40);
   const commit = "b".repeat(40);
@@ -374,7 +373,7 @@ void test("registered apply and release settle once through direct fences", asyn
     ],
   };
   let applied = 0;
-  let released = 0;
+  let discarded = 0;
   const commands: WorkstreamCommandPorts = {
     git: {
       resolveRevision: () => Effect.succeed(base),
@@ -387,10 +386,8 @@ void test("registered apply and release settle once through direct fences", asyn
           commits: [commit],
           changedFiles: ["change.txt"],
         }),
-      preflightCandidateApplication: () =>
+      inspectCandidateApplication: () =>
         Effect.succeed({ expectedRef: "refs/heads/main", expectedHead: base }),
-      prepareCandidateApplication: (_source, destination) =>
-        Effect.succeed({ destination, action: { kind: "fast-forward", target: commit } }),
       // oxlint-disable-next-line effecttsgo/effect-succeed-with-void -- This port distinguishes a successful absent recovery result from void.
       recoverCandidateApplication: () => Effect.succeed(undefined),
       applyCandidate: () =>
@@ -398,10 +395,17 @@ void test("registered apply and release settle once through direct fences", asyn
           applied += 1;
           return commit;
         }),
-      releaseOutput: (placement, expectedHead) =>
-        Effect.sync(() => {
-          released += 1;
-          return { state: "completed" as const, ...placement, expectedHead, detail: "released" };
+      discardOutput: (placement, expectedHead) =>
+        Effect.suspend(() => {
+          discarded += 1;
+          return discarded === 1
+            ? Effect.fail(commandFailure("discard output", "simulated interrupted cleanup"))
+            : Effect.succeed({
+                state: "completed" as const,
+                ...placement,
+                expectedHead,
+                detail: "discarded",
+              });
         }),
     },
     workers: { steer: () => Effect.void },
@@ -432,21 +436,28 @@ void test("registered apply and release settle once through direct fences", asyn
           }),
           (runtime) =>
             Effect.gen(function* () {
+              const interrupted = yield* Effect.result(
+                runtime.apply({ attemptId: "candidate-attempt" }),
+              );
+              assert.equal(interrupted._tag, "Failure");
+              const afterInterruption = yield* runtime.snapshot();
+              assert.equal(afterInterruption.tasks[0]?.attempts[0]?.application?.state, "applied");
+              assert.equal(
+                afterInterruption.tasks[0]?.attempts[0]?.outputDisposition?.state,
+                "blocked",
+              );
               yield* runtime.apply({ attemptId: "candidate-attempt" });
-              yield* runtime.releaseOutput({
-                attemptId: "candidate-attempt",
-                reason: "Applied maintained candidate.",
-              });
               const state = yield* runtime.snapshot();
               const attempt = state.tasks[0]?.attempts[0];
               assert.equal(attempt?.application?.state, "applied");
-              assert.equal(attempt?.outputRelease?.state, "completed");
+              assert.equal(attempt?.outputDisposition?.state, "completed");
               assert.equal(applied, 1);
-              assert.equal(released, 1);
+              assert.equal(attempt?.outputDisposition?.kind, "applied");
+              assert.equal(discarded, 2);
             }),
           (runtime) => runtime.close().pipe(Effect.orDie),
         ),
-        { duration: "2 seconds", orElse: () => Effect.die(new Error("apply/release deadlocked")) },
+        { duration: "2 seconds", orElse: () => Effect.die(new Error("apply cleanup deadlocked")) },
       ).pipe(Effect.provide(liveLayer)),
     );
   } finally {

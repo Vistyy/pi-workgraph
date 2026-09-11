@@ -1133,8 +1133,10 @@ function reconcileCleanup(
 ): Effect.Effect<ReconciliationOutcome, Stage, Requirements> {
   return Effect.gen(function* () {
     const context = control.context();
-    if (explicitRelease(context.attempt))
-      return blocked("Retained output is in explicit release; cleanup never overrides it.");
+    if (explicitOutputDisposition(context.attempt))
+      return blocked(
+        "Maintained output has an explicit disposition; automatic cleanup never overrides it.",
+      );
     const placement = context.attempt.execution?.placement;
     if (placement === undefined)
       return blocked("Cleanup requires a durable placement declaration.");
@@ -1146,8 +1148,10 @@ function reconcileCleanup(
   });
 }
 
-function explicitRelease(attempt: Attempt): boolean {
-  return attempt.outputRelease?.state === "pending" || attempt.outputRelease?.state === "blocked";
+function explicitOutputDisposition(attempt: Attempt): boolean {
+  return (
+    attempt.outputDisposition?.state === "pending" || attempt.outputDisposition?.state === "blocked"
+  );
 }
 
 function ensureWorkerClosed(
@@ -1204,7 +1208,11 @@ function applyCleanupDisposition(
 
 function requiresIsolatedCleanup(disposition: OutputDisposition, placement: Placement): boolean {
   if (placement.kind !== "isolated_worktree") return false;
-  return disposition.kind !== "released" && disposition.kind !== "not_applicable";
+  return (
+    disposition.kind !== "applied" &&
+    disposition.kind !== "discarded" &&
+    disposition.kind !== "not_applicable"
+  );
 }
 
 function performIsolatedCleanup(
@@ -1222,7 +1230,7 @@ function performIsolatedCleanup(
     const target: WorktreePlacement = { ...placement, baseCommit: base ?? expectedHead };
     yield* control.checkOwnership;
     const cleaned = yield* Effect.result(
-      ports.git.cleanupWorktree(target, expectedHead, disposition.kind === "retain_branch"),
+      ports.git.cleanupWorktree(target, expectedHead, disposition.kind === "maintained_output"),
     );
     if (cleaned._tag === "Failure") return blocked(cleaned.failure.detail);
     yield* commitCleanup(control, { state: "completed", workerClosed: true, expectedHead }, true);

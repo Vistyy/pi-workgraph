@@ -554,14 +554,14 @@ else console.log(JSON.stringify({result:{}}));
   }
 });
 
-void test("workstream tool schemas expose release_output and every runtime facade returns a Promise without an attachment", async () => {
+void test("workstream tool schemas expose discard_output and every runtime facade returns a Promise without an attachment", async () => {
   const f = await fixture();
   try {
     const control = f.runner.getToolDefinition("workgraph_control");
     assert.ok(control !== undefined);
     assert.equal(
       Value.Check(control.parameters, {
-        action: "release_output",
+        action: "discard_output",
         attempt: "attempt-1",
         reason: "retire exact output",
       }),
@@ -569,7 +569,7 @@ void test("workstream tool schemas expose release_output and every runtime facad
     );
     assert.equal(
       Value.Check(control.parameters, {
-        action: "release",
+        action: "release_output",
         attempt: "attempt-1",
         reason: "retire exact output",
       }),

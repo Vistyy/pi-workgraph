@@ -552,7 +552,7 @@ export class WorkstreamStore {
                       (json_extract(a.operational_json,'$.cleanup.state')!='completed'
                        OR coalesce(json_extract(a.operational_json,'$.cleanup.workerClosed'),0)!=1))
                   OR (json_extract(a.operational_json,'$.execution.placement.kind')='isolated_worktree'
-                      AND coalesce(json_extract(a.operational_json,'$.outputRelease.state'),'')!='completed')
+                      AND coalesce(json_extract(a.operational_json,'$.outputDisposition.state'),'')!='completed')
                ORDER BY a.task_id`,
             )
             .map((row) => stringField(row, "task_id")),

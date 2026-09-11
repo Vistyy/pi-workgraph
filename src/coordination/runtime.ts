@@ -65,7 +65,7 @@ import {
   workerIdentity,
 } from "./commands.js";
 import { classifyActionable, type FrontierEntry } from "./frontier.js";
-import { applyMaintainedOutput, releaseMaintainedOutput } from "./output.js";
+import { applyMaintainedOutput, discardMaintainedOutput } from "./output.js";
 import { decodeAppend, decodeEnqueue, planAppend, planEnqueue } from "./queue.js";
 import {
   type ReconciliationAttention,
@@ -443,10 +443,10 @@ export class WorkstreamRuntime {
     );
 
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
-  readonly releaseOutput = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
+  readonly discardOutput = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
     this.serialized(
       Effect.flatMap(this.commandPorts(), (ports) =>
-        releaseMaintainedOutput(this.outputControl(ports), command),
+        discardMaintainedOutput(this.outputControl(ports), command),
       ),
     );
 

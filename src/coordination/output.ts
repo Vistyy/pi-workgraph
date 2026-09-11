@@ -3,7 +3,7 @@ import {
   changedImplementationCommit,
   checkpointApplication,
   checkpointCleanup,
-  checkpointOutputRelease,
+  checkpointOutputDisposition,
   type Placement,
   type Workstream,
 } from "../domain/workstream.js";
@@ -12,11 +12,11 @@ import {
   type ApplyCommand,
   ApplyCommandSchema,
   commandFailure,
+  type DiscardOutputCommand,
+  DiscardOutputCommandSchema,
   decodeCommandEffect,
   exactAttempt,
   exactAttemptEffect,
-  type ReleaseOutputCommand,
-  ReleaseOutputCommandSchema,
   type WorkstreamCommandError,
   type WorkstreamCommandPorts,
 } from "./commands.js";
@@ -53,13 +53,15 @@ export function applyMaintainedOutput<E, R>(
       );
     let application = located.attempt.application;
     if (application?.state === "applied")
-      return yield* releaseMaintainedOutput(control, {
-        attemptId: input.attemptId,
-        reason: located.attempt.outputRelease?.reason ?? "Applied maintained candidate.",
-      });
+      return yield* disposeMaintainedOutput(
+        control,
+        input.attemptId,
+        "applied",
+        located.attempt.outputDisposition?.reason ?? "Applied maintained candidate.",
+      );
     const source = yield* sourceFor(control, located.attempt);
     if (application === undefined) {
-      const destination = yield* control.ports.git.preflightCandidateApplication(source);
+      const destination = yield* control.ports.git.inspectCandidateApplication(source);
       const now = yield* control.now;
       state = yield* control.commit("checkpoint candidate application", located.key, (current) =>
         checkpointApplication(
@@ -78,7 +80,7 @@ export function applyMaintainedOutput<E, R>(
       );
       application = exactAttempt(state, input.attemptId).attempt.application;
     }
-    if (application === undefined || application.expectedRef === undefined)
+    if (application === undefined)
       return yield* failure(
         "apply candidate",
         "Candidate application has no exact destination checkpoint.",
@@ -89,12 +91,13 @@ export function applyMaintainedOutput<E, R>(
     };
     if (application.state !== "applied")
       state = yield* resumeApplication(control, state, input.attemptId, source, destination);
-    return yield* releaseMaintainedOutput(control, {
-      attemptId: input.attemptId,
-      reason:
-        exactAttempt(state, input.attemptId).attempt.outputRelease?.reason ??
+    return yield* disposeMaintainedOutput(
+      control,
+      input.attemptId,
+      "applied",
+      exactAttempt(state, input.attemptId).attempt.outputDisposition?.reason ??
         "Applied maintained candidate.",
-    });
+    );
   });
 }
 
@@ -120,21 +123,7 @@ function resumeApplication<E, R>(
     state = yield* control.state(attemptId);
     const located = yield* locate(state, attemptId);
     source = yield* sourceFor(control, located.attempt);
-    const prepared = yield* Effect.result(
-      control.ports.git.prepareCandidateApplication(source, destination),
-    );
-    if (prepared._tag === "Failure")
-      return yield* failApplication(
-        control,
-        state,
-        attemptId,
-        source,
-        destination,
-        prepared.failure,
-      );
-
-    yield* control.fence;
-    const applied = yield* Effect.result(control.ports.git.applyCandidate(prepared.success));
+    const applied = yield* Effect.result(control.ports.git.applyCandidate(source, destination));
     return applied._tag === "Success"
       ? yield* appliedCheckpoint(control, state, attemptId, applied.success)
       : yield* failApplication(control, state, attemptId, source, destination, applied.failure);
@@ -161,24 +150,35 @@ function failApplication<E, R>(
   });
 }
 
-export function releaseMaintainedOutput<E, R>(
+export function discardMaintainedOutput<E, R>(
   control: MaintainedOutputControl<E, R>,
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict release schema owns this external command boundary.
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict discard schema owns this external command boundary.
   value: unknown,
 ): Effect.Effect<Workstream, E | WorkstreamCommandError, R> {
-  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: every branch preserves one destructive-release fence or durable checkpoint.
   return Effect.gen(function* () {
-    const input = yield* decodeCommandEffect<ReleaseOutputCommand>(
-      ReleaseOutputCommandSchema,
+    const input = yield* decodeCommandEffect<DiscardOutputCommand>(
+      DiscardOutputCommandSchema,
       value,
-      "output release command",
+      "output discard command",
     );
-    let state = yield* control.state(input.attemptId);
-    const located = yield* locate(state, input.attemptId);
+    return yield* disposeMaintainedOutput(control, input.attemptId, "discarded", input.reason);
+  });
+}
+
+function disposeMaintainedOutput<E, R>(
+  control: MaintainedOutputControl<E, R>,
+  attemptId: string,
+  kind: "applied" | "discarded",
+  requestedReason: string,
+): Effect.Effect<Workstream, E | WorkstreamCommandError, R> {
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: every branch preserves one destructive-disposition fence or durable checkpoint.
+  return Effect.gen(function* () {
+    let state = yield* control.state(attemptId);
+    const located = yield* locate(state, attemptId);
     if (state.lifecycle !== "completed" && located.task.intentIndex !== state.intents.length - 1)
       return yield* failure(
-        "release output",
-        `Attempt ${input.attemptId} does not belong to the current Intent.`,
+        "dispose output",
+        `Attempt ${attemptId} does not belong to the current Intent.`,
       );
     const attempt = located.attempt;
     const placement = attempt.execution?.placement;
@@ -189,73 +189,82 @@ export function releaseMaintainedOutput<E, R>(
       attempt.cleanup?.workerClosed !== true
     )
       return yield* failure(
-        "release output",
-        `Attempt ${input.attemptId} has no exact closed isolated output.`,
+        "dispose output",
+        `Attempt ${attemptId} has no exact closed isolated output.`,
       );
-    const release = attempt.outputRelease;
-    const reason = release?.reason ?? input.reason;
-    if (release !== undefined && reason !== input.reason)
+    const disposition = attempt.outputDisposition;
+    const reason = disposition?.reason ?? requestedReason;
+    if (disposition !== undefined && (reason !== requestedReason || disposition.kind !== kind))
       return yield* failure(
-        "release output",
-        `Attempt ${input.attemptId} has a release checkpoint with another reason.`,
+        "dispose output",
+        `Attempt ${attemptId} already has a different output disposition checkpoint.`,
       );
-    if (release?.state === "completed")
-      return yield* completeReleasedCleanup(control, state, located.key, expectedHead);
-    if (release === undefined) {
+    if (disposition?.state === "completed")
+      return yield* completeDisposedCleanup(control, state, located.key, expectedHead);
+    if (disposition === undefined) {
       const now = yield* control.now;
-      state = yield* control.commit("checkpoint pending output release", located.key, (current) =>
-        checkpointOutputRelease(
-          current,
-          located.key,
-          { state: "pending", expectedHead, reason },
-          now,
-        ),
+      state = yield* control.commit(
+        "checkpoint pending output disposition",
+        located.key,
+        (current) =>
+          checkpointOutputDisposition(
+            current,
+            located.key,
+            { kind, state: "pending", expectedHead, reason },
+            now,
+          ),
       );
     }
     yield* control.fence;
-    const released = yield* Effect.result(
-      control.ports.git.releaseOutput(
+    const discarded = yield* Effect.result(
+      control.ports.git.discardOutput(
         placementFor(placement, attempt.baseRevision ?? expectedHead),
         expectedHead,
       ),
     );
     yield* control.fence;
     const now = yield* control.now;
-    if (released._tag === "Failure") {
-      yield* control.commit("checkpoint blocked output release", located.key, (current) =>
-        checkpointOutputRelease(
+    if (discarded._tag === "Failure") {
+      yield* control.commit("checkpoint blocked output disposition", located.key, (current) =>
+        checkpointOutputDisposition(
           current,
           located.key,
-          { state: "blocked", expectedHead, reason, error: released.failure.message },
+          { kind, state: "blocked", expectedHead, reason, error: discarded.failure.message },
           now,
         ),
       );
-      return yield* released.failure;
+      return yield* discarded.failure;
     }
-    if (released.success.state === "blocked") {
-      state = yield* control.commit("checkpoint blocked output release", located.key, (current) =>
-        checkpointOutputRelease(
-          current,
-          located.key,
-          { state: "blocked", expectedHead, reason, error: released.success.detail },
-          now,
-        ),
+    if (discarded.success.state === "blocked") {
+      state = yield* control.commit(
+        "checkpoint blocked output disposition",
+        located.key,
+        (current) =>
+          checkpointOutputDisposition(
+            current,
+            located.key,
+            { kind, state: "blocked", expectedHead, reason, error: discarded.success.detail },
+            now,
+          ),
       );
       return state;
     }
-    state = yield* control.commit("checkpoint completed output release", located.key, (current) =>
-      checkpointOutputRelease(
-        current,
-        located.key,
-        { state: "completed", expectedHead, reason },
-        now,
-      ),
+    state = yield* control.commit(
+      "checkpoint completed output disposition",
+      located.key,
+      (current) =>
+        checkpointOutputDisposition(
+          current,
+          located.key,
+          { kind, state: "completed", expectedHead, reason },
+          now,
+        ),
     );
-    return yield* completeReleasedCleanup(control, state, located.key, expectedHead, now);
+    return yield* completeDisposedCleanup(control, state, located.key, expectedHead, now);
   });
 }
 
-function completeReleasedCleanup<E, R>(
+function completeDisposedCleanup<E, R>(
   control: MaintainedOutputControl<E, R>,
   state: Workstream,
   key: ReturnType<typeof exactAttempt>["key"],
@@ -265,7 +274,7 @@ function completeReleasedCleanup<E, R>(
   return Effect.gen(function* () {
     if (exactAttempt(state, key.attemptId).attempt.cleanup?.state === "completed") return state;
     const now = completedAt ?? (yield* control.now);
-    return yield* control.commit("complete released output cleanup", key, (current) =>
+    return yield* control.commit("complete disposed output cleanup", key, (current) =>
       checkpointCleanup(
         current,
         key,

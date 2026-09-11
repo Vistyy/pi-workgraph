@@ -188,7 +188,7 @@ function classifyFinished(
   if (lifecycle !== "suspended" && outcome !== undefined && outcome.delivery.state === "pending")
     entries.push(deliveryEntry(key, outcome));
   const execution = attempt.execution;
-  // Blocked cleanup and manual application/output release are never scheduled;
+  // Blocked cleanup and explicit apply/discard output dispositions are never scheduled;
   // only a pending or not-yet-recorded cleanup is retry-safe.
   if (execution?.placement !== undefined && retrySafeCleanup(attempt)) {
     const entry: CleanupEntry = { kind: "cleanup", key };

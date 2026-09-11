@@ -12,7 +12,7 @@ import {
   checkpointApplication,
   checkpointCancellation,
   checkpointCleanup,
-  checkpointOutputRelease,
+  checkpointOutputDisposition,
   completeWorkstream,
   createTask,
   createWorkstream,
@@ -448,6 +448,7 @@ void test("pure aggregate schemas are strict and identifiers are opaque", () => 
     Value.Check(ApplicationSchema, {
       state: "pending",
       commit: baseCommit,
+      expectedRef: "refs/heads/main",
       expectedHead: baseCommit,
       rootCommit: baseCommit,
       commits: [baseCommit],
@@ -486,6 +487,7 @@ void test("pure aggregate schemas are strict and identifiers are opaque", () => 
     Value.Check(ApplicationSchema, {
       state: "pending",
       commit: changedCommit,
+      expectedRef: "refs/heads/main",
       expectedHead: baseCommit,
       rootCommit: baseCommit,
       commits: [commit("d"), changedCommit],
@@ -674,7 +676,7 @@ void test("launch advancement cannot be combined with sent submission", () => {
   );
 });
 
-void test("partial isolated launches preserve output until exact cleanup and release", () => {
+void test("partial isolated launches preserve output until exact cleanup and discard", () => {
   type Execution = NonNullable<Parameters<typeof activateAttempt>[3]>;
   const partials: Array<{ name: string; execution: Execution }> = [
     {
@@ -720,10 +722,15 @@ void test("partial isolated launches preserve output until exact cleanup and rel
     assert.throws(
       () =>
         validateWorkstream(
-          checkpointOutputRelease(
+          checkpointOutputDisposition(
             workstream,
             key,
-            { state: "completed", expectedHead: changedCommit, reason: "Too early." },
+            {
+              kind: "discarded",
+              state: "completed",
+              expectedHead: changedCommit,
+              reason: "Too early.",
+            },
             `2026-01-01T00:00:20.00${index}Z`,
           ),
         ),
@@ -740,17 +747,22 @@ void test("partial isolated launches preserve output until exact cleanup and rel
     attemptValue = findAttempt(task, key.attemptId);
     assert.ok(attemptValue);
     assert.equal(outputDisposition(task, attemptValue).kind, "preserve_checkout");
-    workstream = checkpointOutputRelease(
+    workstream = checkpointOutputDisposition(
       workstream,
       key,
-      { state: "completed", expectedHead: changedCommit, reason: "Release partial output." },
-      `release-${index}`,
+      {
+        kind: "discarded",
+        state: "completed",
+        expectedHead: changedCommit,
+        reason: "Discard partial output.",
+      },
+      `discard-${index}`,
     );
     task = findTask(workstream, key.taskId);
     assert.ok(task);
     attemptValue = findAttempt(task, key.attemptId);
     assert.ok(attemptValue);
-    assert.equal(outputDisposition(task, attemptValue).kind, "released");
+    assert.equal(outputDisposition(task, attemptValue).kind, "discarded");
     assert.deepEqual(deriveCompletionAccounting(workstream), []);
     workstream = completeWorkstream(
       workstream,
@@ -766,7 +778,7 @@ void test("partial isolated launches preserve output until exact cleanup and rel
   }
 });
 
-void test("partial changed implementation release clears accounting without candidate ancestry", () => {
+void test("partial changed implementation discard clears accounting without candidate ancestry", () => {
   const key = { taskId: "Parent Task", attemptId: "Parent Attempt" };
   const parentAttempt = attempt(key.attemptId, {
     baseRevision: baseCommit,
@@ -841,35 +853,40 @@ void test("partial changed implementation release clears accounting without cand
     () =>
       createTask(
         workstream,
-        childTask("Before release", "Before release attempt"),
+        childTask("Before discard", "Before discard attempt"),
         "2026-01-01T00:00:07.000Z",
       ),
     /eligible retained output/,
   );
-  workstream = checkpointOutputRelease(
+  workstream = checkpointOutputDisposition(
     workstream,
     key,
-    { state: "completed", expectedHead: changedCommit, reason: "Release partial output." },
+    {
+      kind: "discarded",
+      state: "completed",
+      expectedHead: changedCommit,
+      reason: "Discard partial output.",
+    },
     "2026-01-01T00:00:08.000Z",
   );
   assert.deepEqual(deriveCompletionAccounting(workstream), []);
-  const releasedTask = findTask(workstream, key.taskId);
-  assert.ok(releasedTask);
-  const releasedAttempt = findAttempt(releasedTask, key.attemptId);
-  assert.ok(releasedAttempt);
-  assert.equal(outputDisposition(releasedTask, releasedAttempt).kind, "released");
+  const discardedTask = findTask(workstream, key.taskId);
+  assert.ok(discardedTask);
+  const discardedAttempt = findAttempt(discardedTask, key.attemptId);
+  assert.ok(discardedAttempt);
+  assert.equal(outputDisposition(discardedTask, discardedAttempt).kind, "discarded");
   assert.throws(
     () =>
       createTask(
         workstream,
-        childTask("After release", "After release attempt"),
+        childTask("After discard", "After discard attempt"),
         "2026-01-01T00:00:09.000Z",
       ),
     /eligible retained output/,
   );
 });
 
-void test("partial shared launches settle after exact closure without output release", () => {
+void test("partial shared launches settle after exact closure without output discard", () => {
   type Execution = NonNullable<Parameters<typeof activateAttempt>[3]>;
   const partials: Execution[] = [
     { placement: { kind: "shared_project", path: "/repo" } },
@@ -903,7 +920,7 @@ void test("partial shared launches settle after exact closure without output rel
     assert.ok(task);
     const attemptValue = findAttempt(task, key.attemptId);
     assert.ok(attemptValue);
-    assert.equal(attemptValue.outputRelease, undefined);
+    assert.equal(attemptValue.outputDisposition, undefined);
     assert.equal(outputDisposition(task, attemptValue).kind, "not_applicable");
   }
 });
@@ -1360,7 +1377,7 @@ void test("appendAttempts is one atomic nonempty batch that preserves order and 
   assert.equal(findTask(unstable, "Task opaque")?.attempts.length, 1);
 });
 
-void test("isolated failed output remains blocked through cleanup until exact release, including after completion", () => {
+void test("isolated failed output remains blocked through cleanup until exact discard, including after completion", () => {
   const execution = {
     placement: { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" },
     sessionFile: "/worker.json",
@@ -1427,10 +1444,15 @@ void test("isolated failed output remains blocked through cleanup until exact re
     () => appendAttempts(workstream, "Task opaque", [attempt("Later")], "2026-01-01T00:00:06.000Z"),
     /completed/,
   );
-  workstream = checkpointOutputRelease(
+  workstream = checkpointOutputDisposition(
     workstream,
     { taskId: "Task opaque", attemptId: "Attempt A" },
-    { state: "completed", expectedHead: changedCommit, reason: "Discard failed checkout." },
+    {
+      kind: "discarded",
+      state: "completed",
+      expectedHead: changedCommit,
+      reason: "Discard failed checkout.",
+    },
     "2026-01-01T00:00:06.000Z",
   );
   assert.notDeepEqual(deriveCompletionAccounting(workstream), []);
@@ -1449,6 +1471,7 @@ void test("isolated failed output remains blocked through cleanup until exact re
         {
           state: "pending",
           commit: changedCommit,
+          expectedRef: "refs/heads/main",
           expectedHead: changedCommit,
           rootCommit: baseCommit,
           commits: [commit("d"), changedCommit],
@@ -1486,7 +1509,7 @@ void test("isolated failed output remains blocked through cleanup until exact re
   );
 });
 
-void test("an exact completed release and cleanup is operationally stable", () => {
+void test("an exact completed discard and cleanup is operationally stable", () => {
   const execution = {
     placement: { kind: "isolated_worktree" as const, path: "/repo-work", branch: "branch" },
     sessionFile: "/worker.json",
@@ -1511,19 +1534,20 @@ void test("an exact completed release and cleanup is operationally stable", () =
     { state: "completed", workerClosed: true, expectedHead: changedCommit },
     "2026-01-01T00:00:04.000Z",
   );
-  const released = structuredClone(workstream);
-  const releasedTask = released.tasks[0];
-  assert.ok(releasedTask);
-  const releasedAttempt = releasedTask.attempts[0];
-  assert.ok(releasedAttempt);
-  releasedAttempt.outputRelease = {
+  const discarded = structuredClone(workstream);
+  const discardedTask = discarded.tasks[0];
+  assert.ok(discardedTask);
+  const discardedAttempt = discardedTask.attempts[0];
+  assert.ok(discardedAttempt);
+  discardedAttempt.outputDisposition = {
+    kind: "discarded",
     state: "completed",
     expectedHead: changedCommit,
-    reason: "Exact release checkpoint.",
+    reason: "Exact discard checkpoint.",
   };
-  validateWorkstream(released);
-  assert.equal(isOperationallyStable(releasedTask, releasedAttempt), true);
-  assert.deepEqual(deriveCompletionAccounting(released), []);
+  validateWorkstream(discarded);
+  assert.equal(isOperationallyStable(discardedTask, discardedAttempt), true);
+  assert.deepEqual(deriveCompletionAccounting(discarded), []);
 });
 
 void test("shared Worker closure and delivery gate reattempt and accounting", () => {
@@ -1633,6 +1657,7 @@ void test("implementation candidate ancestry may cross Intents but application i
     {
       state: "applied",
       commit: changedCommit,
+      expectedRef: "refs/heads/main",
       expectedHead: baseCommit,
       rootCommit: baseCommit,
       commits: [commit("d"), changedCommit],
@@ -1650,7 +1675,10 @@ void test("implementation candidate ancestry may cross Intents but application i
   assert.ok(settledParentTask);
   const settledParentAttempt = findAttempt(settledParentTask, "Parent Attempt");
   assert.ok(settledParentAttempt);
-  assert.equal(outputDisposition(settledParentTask, settledParentAttempt).kind, "retain_branch");
+  assert.equal(
+    outputDisposition(settledParentTask, settledParentAttempt).kind,
+    "maintained_output",
+  );
   const retained = reviseIntent(
     workstream,
     { ...intent, statement: "Revise.", recordedAt: "2026-01-01T00:00:05.000Z" },
@@ -1683,20 +1711,20 @@ void test("implementation candidate ancestry may cross Intents but application i
   workstream = createTask(retained, childTask, "2026-01-01T00:00:06.000Z");
   assert.equal(findTask(workstream, "Child Task")?.intentIndex, 1);
 
-  const released = checkpointOutputRelease(
+  const discarded = checkpointOutputDisposition(
     retained,
     { taskId: "Parent Task", attemptId: "Parent Attempt" },
-    { state: "completed", expectedHead: changedCommit, reason: "Released." },
+    { kind: "discarded", state: "completed", expectedHead: changedCommit, reason: "Discarded." },
     "2026-01-01T00:00:06.002Z",
   );
   assert.throws(
     () =>
       createTask(
-        released,
+        discarded,
         {
           ...childTask,
-          id: "Released Child Task",
-          attempts: [{ ...childAttempt, id: "Released Child Attempt" }],
+          id: "Discarded Child Task",
+          attempts: [{ ...childAttempt, id: "Discarded Child Attempt" }],
         },
         "2026-01-01T00:00:07.000Z",
       ),
