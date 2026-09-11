@@ -50,7 +50,7 @@ async function smokePackage(): Promise<void> {
     tarballPath,
   ]);
   const packageRoot = join(consumer, "node_modules/@vistyy/pi-workgraph");
-  const modules = ["extensions/coordinator.ts", "extensions/worker.ts"].map(
+  const modules = ["extensions/canonical-coordinator.ts", "extensions/worker.ts"].map(
     (path) => pathToFileURL(join(packageRoot, path)).href,
   );
   await command(consumer, "node", [

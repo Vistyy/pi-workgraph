@@ -152,6 +152,7 @@ type Active = {
 export class CanonicalCoordinatorController {
   private active: Active | undefined;
   private pointerBlocked = false;
+  private startupFailure: string | undefined;
   private readonly semaphore = Semaphore.makeUnsafe(1);
 
   constructor(
@@ -178,7 +179,10 @@ export class CanonicalCoordinatorController {
           yield* this.closeOwned(ctx);
           const restoration = retained();
           this.pointerBlocked = restoration !== undefined;
-          if (restoration === undefined) return;
+          if (restoration === undefined) {
+            this.startupFailure = undefined;
+            return;
+          }
           if (restoration === "malformed")
             return yield* Effect.fail(new Error("Canonical Workstream pointer is malformed."));
           const pointer = restoration;
@@ -189,9 +193,16 @@ export class CanonicalCoordinatorController {
           if (pointer.phase === "prepared") yield* this.persistPointer(attachedPointer(pointer));
           else this.pointerBlocked = false;
           this.publish(ctx, yield* next.runtime.snapshot());
+          this.startupFailure = undefined;
         }.bind(this),
       ),
     );
+  }
+
+  /** TEMPORARY: retain the actionable cutover bootstrap failure as an establishment gate. */
+  temporaryBlockEstablishment(diagnostic: string): void {
+    this.pointerBlocked = true;
+    this.startupFailure = diagnostic;
   }
 
   private prepareRestoration(
@@ -271,9 +282,7 @@ export class CanonicalCoordinatorController {
             });
           }
           if (this.pointerBlocked)
-            return yield* Effect.fail(
-              new Error("A retained canonical pointer must be recovered or explicitly adopted."),
-            );
+            return yield* Effect.fail(blockedEstablishmentError(this.startupFailure));
           const inspected = yield* inspectRepository(request.targetRepository ?? ctx.cwd);
           const repository = { projectRoot: inspected.root, gitCommonDir: inspected.commonDir };
           const id = `ws-${randomUUID()}`;
@@ -663,6 +672,55 @@ export class CanonicalCoordinatorController {
     );
   }
 
+  /**
+   * TEMPORARY cutover seam: close and join only the exact pointed owned runtime,
+   * then positively reopen the same canonical store and prove its lease absent.
+   * Remove with the temporary /workgraph-reload cutover mechanism.
+   */
+  temporaryCloseForReload(
+    ctx: ExtensionContext,
+    pointer: Extract<CanonicalWorkstreamPointer, { phase: "attached" }>,
+  ): Effect.Effect<void, unknown, Requirements> {
+    return this.serialize(
+      Effect.gen(
+        function* (this: CanonicalCoordinatorController) {
+          const active = yield* requireActive(this.active);
+          const owner = this.owner(ctx);
+          if (
+            active.path !== pointer.path ||
+            active.id !== pointer.workstreamId ||
+            !Value.Equal(active.repository, pointer.repository) ||
+            !sameOwner(active.owner, owner)
+          )
+            return yield* Effect.fail(
+              new Error("Controlled reload pointer does not identify the exact owned runtime."),
+            );
+          this.temporaryBlockEstablishment(
+            "Controlled reload started but fresh attachment has not completed.",
+          );
+          yield* this.closeOwned(ctx);
+          yield* Effect.scoped(
+            Effect.gen(
+              function* (this: CanonicalCoordinatorController) {
+                const reopened = yield* CanonicalWorkstreamStore.discover(pointer.path);
+                if (!pointerMatches(pointer, reopened.state))
+                  return yield* Effect.fail(
+                    new Error("Controlled reload pointer no longer matches the canonical store."),
+                  );
+                yield* requireExactOwner(reopened.state.coordinator, owner);
+                yield* this.proveRepository(reopened.state.repository);
+                if ((yield* reopened.store.observeLease()) !== undefined)
+                  return yield* Effect.fail(
+                    new Error("Controlled reload canonical lease remains present after close."),
+                  );
+              }.bind(this),
+            ),
+          );
+        }.bind(this),
+      ),
+    );
+  }
+
   close(ctx: ExtensionContext): Effect.Effect<void, unknown, Requirements> {
     return this.serialize(this.closeOwned(ctx));
   }
@@ -838,6 +896,14 @@ export class CanonicalCoordinatorController {
 const nowIso = Clock.clockWith((clock) =>
   Effect.sync(() => DateTime.formatIso(DateTime.makeUnsafe(clock.currentTimeMillisUnsafe()))),
 );
+
+function blockedEstablishmentError(diagnostic: string | undefined): Error {
+  return new Error(
+    diagnostic === undefined
+      ? "A retained canonical pointer must be recovered or explicitly adopted."
+      : `Canonical startup remains blocked by retained state: ${diagnostic}`,
+  );
+}
 
 function requireActive(active: Active | undefined): Effect.Effect<Active, Error> {
   return active === undefined

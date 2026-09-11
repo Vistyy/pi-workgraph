@@ -13,6 +13,7 @@ import { liveLayer } from "../src/node-platform.js";
 import {
   classifyV7MigrationRecovery,
   commitV7Migration,
+  declareV7MigrationSource,
   normalizeV7Workstream,
   preflightV7Migration,
   prepareV7Migration,
@@ -364,6 +365,50 @@ void test("prepared migration archives source, imports its revision, and copies 
     // A crash after rename but before response/record confirmation is recoverable without swapping again.
     await Effect.runPromise(commitV7Migration(preflight, port, T0));
     assert.equal(records.length, 2);
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("read-only declaration and mutate-then-throw breadcrumb recover without duplication", async () => {
+  const f = await fixture();
+  try {
+    const declaration = await Effect.runPromise(
+      declareV7MigrationSource(f.path, f.state.coordinator),
+    );
+    assert.equal(declaration.workstreamId, f.state.id);
+    assert.equal(declaration.expectedRevision, f.state.revision);
+    assert.equal(declaration.expectedSourceSha256, digest(await readFile(f.path)));
+    const records: V7MigrationBreadcrumb[] = [];
+    let interrupt = true;
+    const port: V7MigrationBreadcrumbPort = {
+      append: async (record) => {
+        records.push(structuredClone(record));
+        if (interrupt) {
+          interrupt = false;
+          throw new Error("interrupted after Pi append");
+        }
+      },
+      read: async () => structuredClone(records),
+    };
+    await assert.rejects(
+      Effect.runPromise(
+        Effect.scoped(recoverV7Migration(declaration, port, T0)).pipe(Effect.provide(liveLayer)),
+      ),
+      /host operation failed/,
+    );
+    assert.deepEqual(
+      records.map((record) => record.phase),
+      ["prepared"],
+    );
+    const committed = await Effect.runPromise(
+      Effect.scoped(recoverV7Migration(declaration, port, T0)).pipe(Effect.provide(liveLayer)),
+    );
+    assert.equal(committed.phase, "committed");
+    assert.deepEqual(
+      records.map((record) => record.phase),
+      ["prepared", "committed"],
+    );
   } finally {
     await rm(f.parent, { recursive: true, force: true });
   }

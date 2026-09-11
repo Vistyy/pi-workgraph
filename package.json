@@ -36,7 +36,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/coordinator.ts",
+      "./extensions/canonical-coordinator.ts",
       "./extensions/worker.ts"
     ]
   },

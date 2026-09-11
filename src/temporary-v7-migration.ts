@@ -31,6 +31,7 @@ import {
 import type { ModelTarget } from "./domain/model-target.js";
 import {
   type Attempt,
+  type CoordinatorIdentity,
   type Delivery,
   type Intent,
   isOperationallyStable,
@@ -53,7 +54,8 @@ import { validateState } from "./workstream-validation.js";
 
 const MANIFEST_FORMAT = "pi-workgraph-v7-normalization-manifest" as const;
 const MANIFEST_VERSION = 1 as const;
-const BREADCRUMB_FORMAT = "pi-workgraph-v7-migration" as const;
+export const V7_MIGRATION_BREADCRUMB_ENTRY = "pi-workgraph-v7-migration" as const;
+const BREADCRUMB_FORMAT = V7_MIGRATION_BREADCRUMB_ENTRY;
 const BREADCRUMB_VERSION = 1 as const;
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
@@ -88,7 +90,7 @@ const TimestampRecord = Type.Object(
   { timestamp: Type.String({ minLength: 1 }) },
   { additionalProperties: true },
 );
-const BreadcrumbSchema = Type.Object(
+export const V7MigrationBreadcrumbSchema = Type.Object(
   {
     format: Type.Literal(BREADCRUMB_FORMAT),
     version: Type.Literal(BREADCRUMB_VERSION),
@@ -791,6 +793,71 @@ type MutableLedger = {
     : V7NormalizationLedger[Key];
 };
 
+/**
+ * TEMPORARY: derive the exact immutable declaration from the retained predecessor
+ * pointer without writing either the Pi session or repository storage.
+ */
+export function declareV7MigrationSource(
+  sourcePath: string,
+  expectedOwner: CoordinatorIdentity,
+): Effect.Effect<V7MigrationDeclaration, V7MigrationError> {
+  return Effect.tryPromise({
+    try: async () => {
+      if (!isAbsolute(sourcePath) || resolve(sourcePath) !== sourcePath)
+        throw reject("Retained v7 pointer path must be absolute and normalized.");
+      const before = await fileIdentity(sourcePath);
+      const { state } = readV7Database(sourcePath);
+      const declaration: V7MigrationDeclaration = {
+        repository: { projectRoot: state.projectRoot, gitCommonDir: state.gitCommonDir },
+        workstreamId: state.id,
+        expectedRevision: state.revision,
+        expectedSourceSha256: before.sha256,
+      };
+      validateDeclaration(declaration);
+      if (v7MigrationPaths(declaration.repository, declaration.workstreamId).source !== sourcePath)
+        throw reject("Retained v7 pointer does not match its repository and Workstream identity.");
+      if (!Value.Equal(state.coordinator, expectedOwner))
+        throw reject("Retained v7 source belongs to a different coordinator session.");
+      if (!Value.Equal(before, await fileIdentity(sourcePath)))
+        throw reject("v7 source bytes changed while deriving its declaration.");
+      return declaration;
+    },
+    catch: migrationCause,
+  });
+}
+
+/** TEMPORARY: confirm the predecessor owner from source or immutable archive. */
+export function validateV7MigrationOwner(
+  declaration: V7MigrationDeclaration,
+  expectedOwner: CoordinatorIdentity,
+): Effect.Effect<void, V7MigrationError> {
+  return Effect.tryPromise({
+    try: async () => {
+      validateDeclaration(declaration);
+      const paths = v7MigrationPaths(declaration.repository, declaration.workstreamId);
+      let source: V7DatabaseRead;
+      try {
+        source = readV7Database(paths.source);
+      } catch (cause) {
+        if (!(await exists(paths.archiveDatabase))) throw cause;
+        const archive = await fileIdentity(paths.archiveDatabase);
+        if (archive.sha256 !== declaration.expectedSourceSha256)
+          throw reject("Immutable v7 archive differs from the migration declaration.");
+        source = readV7Database(paths.archiveDatabase);
+      }
+      if (
+        source.state.id !== declaration.workstreamId ||
+        source.state.revision !== declaration.expectedRevision ||
+        source.state.projectRoot !== declaration.repository.projectRoot ||
+        source.state.gitCommonDir !== declaration.repository.gitCommonDir ||
+        !Value.Equal(source.state.coordinator, expectedOwner)
+      )
+        throw reject("v7 migration source identity or coordinator owner conflicts.");
+    },
+    catch: migrationCause,
+  });
+}
+
 export function preflightV7Migration(
   declaration: V7MigrationDeclaration,
   recordedAt: string,
@@ -1088,6 +1155,44 @@ export function classifyV7MigrationRecovery(shape: V7RecoveryShape): V7RecoveryC
     shape.sessions === "exact"
     ? "committed"
     : "ambiguous";
+}
+
+/** TEMPORARY: read-only proof used when an attached canonical pointer already exists. */
+export function confirmCommittedV7Migration(
+  declaration: V7MigrationDeclaration,
+  breadcrumbs: V7MigrationBreadcrumbPort,
+): Effect.Effect<V7MigrationBreadcrumb, V7MigrationError> {
+  return Effect.tryPromise({
+    try: async () => {
+      validateDeclaration(declaration);
+      const paths = v7MigrationPaths(declaration.repository, declaration.workstreamId);
+      const all = await readBreadcrumbs(breadcrumbs);
+      const relevant = all.filter(
+        (record) =>
+          record.declaration.workstreamId === declaration.workstreamId ||
+          record.paths.source === paths.source ||
+          record.paths.target === paths.target,
+      );
+      if (relevant.length !== 2)
+        throw reject(
+          "Attached canonical pointer requires exact prepared and committed breadcrumbs.",
+        );
+      const prepared = requiredValue(relevant[0], "prepared migration breadcrumb");
+      if (
+        prepared.phase !== "prepared" ||
+        !Value.Equal(prepared.declaration, declaration) ||
+        !Value.Equal(prepared.paths, paths)
+      )
+        throw reject("Attached canonical pointer has conflicting migration history.");
+      const history = await migrationBreadcrumbHistory(breadcrumbs, prepared);
+      const recovered = await reconstructRecoveryPreflight(declaration, prepared);
+      const shape = await inspectRecoveryShape(recovered, history);
+      if (classifyV7MigrationRecovery(shape) !== "committed")
+        throw reject("Attached canonical pointer migration is not durably committed.");
+      return requiredValue(history[1], "committed migration breadcrumb");
+    },
+    catch: migrationCause,
+  });
 }
 
 /** Restart-safe public driver. It derives durable state rather than trusting caller-held preflight data. */
@@ -1756,7 +1861,7 @@ async function readBreadcrumbs(
 ): Promise<readonly V7MigrationBreadcrumb[]> {
   const records = await port.read();
   for (const record of records)
-    if (!Value.Check(BreadcrumbSchema, record))
+    if (!Value.Check(V7MigrationBreadcrumbSchema, record))
       throw reject("Migration breadcrumb host returned a malformed record.");
   return records;
 }
