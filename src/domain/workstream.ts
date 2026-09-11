@@ -9,7 +9,10 @@ const CANONICAL_WORKSTREAM_SCHEMA_VERSION = 2 as const;
 
 const NonEmptyString = Type.String({ minLength: 1 });
 const Timestamp = Type.String({ minLength: 1 });
-const TransferTimestamp = Type.String({ format: "date-time" });
+const TransferTimestamp = Type.String({
+  format: "date-time",
+  pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+});
 const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
 const stringLiterals = <const Values extends readonly string[]>(values: Values) =>
   Type.Unsafe<Values[number]>({ type: "string", enum: [...values] });
@@ -24,20 +27,9 @@ const CoordinatorIdentitySchema = Type.Object(
 );
 export const HerdrDeadObservationSchema = Type.Object(
   {
-    kind: Type.Literal("herdr_dead"),
     subject: CoordinatorIdentitySchema,
     observedAt: TransferTimestamp,
-    provenance: Type.Object(
-      {
-        workspaceId: Type.String({ minLength: 1, maxLength: 256 }),
-        tabId: Type.String({ minLength: 1, maxLength: 256 }),
-        paneId: Type.String({ minLength: 1, maxLength: 256 }),
-        terminalId: Type.String({ minLength: 1, maxLength: 256 }),
-        agentName: Type.String({ minLength: 1, maxLength: 256 }),
-        sessionFile: Type.String({ minLength: 1, maxLength: 4096 }),
-      },
-      { additionalProperties: false },
-    ),
+    source: Type.Literal("herdr_api_snapshot_dead"),
   },
   { additionalProperties: false },
 );
@@ -597,10 +589,12 @@ function validateCoordinatorTransfer(
 ): TransferPosition {
   if (!sameValue(transfer.from, prior.owner))
     throw new Error("Coordinator transfer history is not continuous.");
+  if (sameValue(transfer.from, transfer.to))
+    throw new Error("Coordinator transfer must change coordinator identity.");
   if (!sameValue(transfer.deathObservation.subject, transfer.from))
     throw new Error("Coordinator transfer death observation names another subject.");
-  if (transfer.deathObservation.provenance.sessionFile !== transfer.from.sessionFile)
-    throw new Error("Coordinator transfer provenance names another session file.");
+  if (transfer.deathObservation.observedAt > transfer.committedAt)
+    throw new Error("Coordinator transfer death observation is later than its commit.");
   if (
     transfer.committedRevision <= prior.revision ||
     transfer.committedRevision > workstream.revision

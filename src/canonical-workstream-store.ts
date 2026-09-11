@@ -25,7 +25,7 @@ const LEASE_DURATION_MILLIS = 30_000;
 const SQLITE_HEADER = "SQLite format 3\u0000";
 const SQLITE_FILENAME = "workstream.sqlite";
 const STORE_FORMAT = "pi-workgraph-workstream-sqlite";
-const STORE_VERSION = 1;
+const STORE_VERSION = 2;
 const STORAGE_DIRECTORY = "pi-workgraph";
 const WORKSTREAM_DIRECTORY = "workstreams";
 const columnList = (value: string) => value.split(" ");
@@ -454,7 +454,10 @@ export class CanonicalWorkstreamStore {
       this.validateAdoption(current, currentLease, adoption, nowMillis);
       const committedAt = isoFromMillis(nowMillis);
       const previous = current.coordinatorTransfers.at(-1);
-      if (previous !== undefined && previous.committedAt >= committedAt)
+      if (
+        previous !== undefined &&
+        canonicalInstantMillis(previous.committedAt, "coordinator transfer") >= nowMillis
+      )
         throw new CanonicalStoreConflictError(
           "Coordinator adoption time does not advance transfer history.",
         );
@@ -498,7 +501,7 @@ export class CanonicalWorkstreamStore {
     nowMillis: number,
   ): void {
     this.validateAdoptionAggregate(current, adoption);
-    validateAdoptionProof(adoption);
+    validateAdoptionProof(adoption, nowMillis);
     validateAdoptionLease(currentLease, adoption, nowMillis);
   }
 
@@ -953,14 +956,21 @@ function classifyFileHeader(
   });
 }
 
-function validateAdoptionProof(adoption: CanonicalCoordinatorAdoption): void {
+function validateAdoptionProof(adoption: CanonicalCoordinatorAdoption, nowMillis: number): void {
   if (
     !Value.Check(HerdrDeadObservationSchema, adoption.deathObservation) ||
-    !Value.Equal(adoption.deathObservation.subject, adoption.priorCoordinator) ||
-    adoption.deathObservation.provenance.sessionFile !== adoption.priorCoordinator.sessionFile
+    !Value.Equal(adoption.deathObservation.subject, adoption.priorCoordinator)
   )
     throw new CanonicalStoreInvalidError(
-      "Coordinator adoption requires a Herdr-dead observation bound to the exact prior owner.",
+      "Coordinator adoption requires an exact prior-owner Herdr API dead snapshot.",
+    );
+  const observedMillis = canonicalInstantMillis(
+    adoption.deathObservation.observedAt,
+    "Herdr dead observation",
+  );
+  if (observedMillis > nowMillis)
+    throw new CanonicalStoreInvalidError(
+      "Coordinator adoption Herdr dead observation cannot be in the future.",
     );
 }
 
@@ -1001,9 +1011,15 @@ function validateLease(lease: CanonicalLease): void {
 }
 
 function instantMillis(value: string): number {
+  return canonicalInstantMillis(value, "lease");
+}
+
+function canonicalInstantMillis(value: string, subject: string): number {
   const parsed = DateTime.make(value);
   if (Option.isNone(parsed) || DateTime.toDate(parsed.value).toISOString() !== value)
-    throw new CanonicalStoreInvalidError(`Canonical lease contains an invalid instant: ${value}.`);
+    throw new CanonicalStoreInvalidError(
+      `Canonical ${subject} contains an invalid instant: ${value}.`,
+    );
   return DateTime.toDate(parsed.value).getTime();
 }
 

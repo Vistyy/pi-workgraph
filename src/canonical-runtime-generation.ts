@@ -1,4 +1,5 @@
-import { Data, Effect } from "effect";
+import { Data, Effect, type Scope } from "effect";
+import { Value } from "typebox/value";
 import type { CanonicalLease } from "./canonical-workstream-store.js";
 import type { CoordinatorIdentity } from "./domain/workstream.js";
 
@@ -19,9 +20,9 @@ export interface RuntimeGenerationEntry {
   readonly path: string;
   readonly workstreamId: string;
   readonly coordinator: CoordinatorIdentity;
-  readonly token: string;
+  readonly lease: CanonicalLease;
   readonly handle: RuntimeGenerationHandle;
-  status: "active" | "closing" | "failed";
+  status: "active" | "closing" | "quiescent" | "failed";
   closeResult?: Promise<RuntimeGenerationQuiescence>;
 }
 
@@ -29,6 +30,11 @@ interface RuntimeGenerationRegistry {
   readonly protocolVersion: typeof CANONICAL_RUNTIME_GENERATION_PROTOCOL;
   readonly entries: Map<string, RuntimeGenerationEntry>;
   readonly tails: Map<string, Promise<void>>;
+}
+
+interface RuntimeGenerationReservation {
+  readonly prior: Promise<void>;
+  readonly release: () => void;
 }
 
 export class RuntimeGenerationRegistryError extends Data.TaggedError(
@@ -64,35 +70,41 @@ function registry(): RuntimeGenerationRegistry {
 /** Reserve all attachment and replacement decisions for one exact canonical path. */
 export function reserveRuntimeGenerationPath(
   path: string,
-): Effect.Effect<() => void, RuntimeGenerationRegistryError> {
-  return Effect.tryPromise({
-    // oxlint-disable-next-line effecttsgo/async-function -- The stable process-global lock protocol deliberately uses host Promises, not package-generation Effect values.
-    try: async () => {
-      const state = registry();
-      const prior = state.tails.get(path) ?? Promise.resolve();
-      let release!: () => void;
-      // oxlint-disable-next-line effecttsgo/new-promise -- This externally released Promise is the narrow process-global path reservation primitive.
-      const held = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      const tail = prior.catch(() => undefined).then(() => held);
-      state.tails.set(path, tail);
-      await prior.catch(() => undefined);
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        release();
-        void tail.finally(() => {
-          if (state.tails.get(path) === tail) state.tails.delete(path);
-        });
-      };
-    },
-    catch: (cause) =>
-      new RuntimeGenerationRegistryError({
-        message: `Failed to serialize canonical runtime attachment for ${path}: ${String(cause)}`,
-      }),
+): Effect.Effect<void, RuntimeGenerationRegistryError, Scope.Scope> {
+  return Effect.acquireRelease(
+    Effect.try({
+      try: () => enqueueReservation(path),
+      catch: (cause) =>
+        new RuntimeGenerationRegistryError({
+          message: `Failed to serialize canonical runtime attachment for ${path}: ${String(cause)}`,
+        }),
+    }),
+    (reservation) => Effect.sync(reservation.release),
+  ).pipe(Effect.andThen((reservation) => Effect.promise(() => reservation.prior)));
+}
+
+function enqueueReservation(path: string): RuntimeGenerationReservation {
+  const state = registry();
+  const prior = state.tails.get(path) ?? Promise.resolve();
+  let releaseHeld!: () => void;
+  // oxlint-disable-next-line effecttsgo/new-promise -- The externally released Promise is the narrow process-global path reservation protocol.
+  const held = new Promise<void>((resolve) => {
+    releaseHeld = resolve;
   });
+  const tail = prior.catch(() => undefined).then(() => held);
+  state.tails.set(path, tail);
+  let released = false;
+  return {
+    prior: prior.catch(() => undefined),
+    release: () => {
+      if (released) return;
+      released = true;
+      releaseHeld();
+      void tail.finally(() => {
+        if (state.tails.get(path) === tail) state.tails.delete(path);
+      });
+    },
+  };
 }
 
 export function runtimeGeneration(path: string): RuntimeGenerationEntry | undefined {
@@ -110,7 +122,7 @@ export function closeRuntimeGeneration(
   entry.status = "closing";
   const result = entry.handle.close().then(
     (value) => {
-      if (!value.quiescent) entry.status = "failed";
+      entry.status = value.quiescent ? "quiescent" : "failed";
       return value;
     },
     (cause) => {
@@ -122,16 +134,19 @@ export function closeRuntimeGeneration(
   return result;
 }
 
-/** Remove only the exact successfully closed generation; stale finalizers are harmless. */
-export function unregisterRuntimeGeneration(
-  path: string,
-  token: string,
-  handle: RuntimeGenerationHandle,
+export function recordRuntimeGenerationQuiescence(
+  entry: RuntimeGenerationEntry,
+  result: RuntimeGenerationQuiescence,
 ): void {
+  entry.status = result.quiescent ? "quiescent" : "failed";
+  entry.closeResult ??= Promise.resolve(result);
+}
+
+/** Remove only the exact quiescent generation; stale finalizers are harmless. */
+export function unregisterRuntimeGeneration(entry: RuntimeGenerationEntry): void {
   const state = registry();
-  const entry = state.entries.get(path);
-  if (entry?.token === token && entry.handle === handle && entry.status === "active")
-    state.entries.delete(path);
+  if (state.entries.get(entry.path) === entry && entry.status === "quiescent")
+    state.entries.delete(entry.path);
 }
 
 export function compatibleRuntimeGeneration(
@@ -140,19 +155,19 @@ export function compatibleRuntimeGeneration(
     readonly path: string;
     readonly workstreamId: string;
     readonly coordinator: CoordinatorIdentity;
-    readonly lease: CanonicalLease;
+    readonly lease?: CanonicalLease;
   },
 ): boolean {
-  return (
-    entry.protocolVersion === CANONICAL_RUNTIME_GENERATION_PROTOCOL &&
-    entry.path === input.path &&
-    entry.workstreamId === input.workstreamId &&
-    entry.token === input.lease.token &&
-    entry.coordinator.sessionId === input.coordinator.sessionId &&
-    entry.coordinator.sessionFile === input.coordinator.sessionFile &&
-    input.lease.owner.sessionId === input.coordinator.sessionId &&
-    input.lease.owner.sessionFile === input.coordinator.sessionFile
-  );
+  if (
+    entry.protocolVersion !== CANONICAL_RUNTIME_GENERATION_PROTOCOL ||
+    entry.path !== input.path ||
+    entry.workstreamId !== input.workstreamId ||
+    entry.coordinator.sessionId !== input.coordinator.sessionId ||
+    entry.coordinator.sessionFile !== input.coordinator.sessionFile
+  )
+    return false;
+  const lease = input.lease;
+  return lease === undefined || Value.Equal(entry.lease, lease);
 }
 
 /** Deterministic isolation for tests that own all canonical runtimes in this process. */

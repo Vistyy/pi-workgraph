@@ -914,17 +914,9 @@ void test("coordinator transfer history preserves direct receipt ownership inter
     committedAt: "2024-01-02T00:00:00.000Z",
     intentCountBoundary: 1,
     deathObservation: {
-      kind: "herdr_dead",
       subject: coordinator,
       observedAt: "2024-01-01T00:00:00.000Z",
-      provenance: {
-        workspaceId: "workspace",
-        tabId: "tab",
-        paneId: "pane",
-        terminalId: "terminal",
-        agentName: "coordinator",
-        sessionFile: coordinator.sessionFile,
-      },
+      source: "herdr_api_snapshot_dead",
     },
   });
   validateWorkstream(adopted);
@@ -948,6 +940,48 @@ void test("coordinator transfer history preserves direct receipt ownership inter
   );
   validateWorkstream(revised);
 
+  const third = { sessionId: "third", sessionFile: "/third.json" };
+  const twiceAdopted = structuredClone(adopted);
+  twiceAdopted.revision = 2;
+  twiceAdopted.updatedAt = "2024-01-03T00:00:00.000Z";
+  twiceAdopted.coordinator = third;
+  twiceAdopted.coordinatorTransfers.push({
+    from: successor,
+    to: third,
+    committedRevision: 2,
+    committedAt: "2024-01-03T00:00:00.000Z",
+    intentCountBoundary: 1,
+    deathObservation: {
+      subject: successor,
+      observedAt: "2024-01-02T12:00:00.000Z",
+      source: "herdr_api_snapshot_dead",
+    },
+  });
+  validateWorkstream(twiceAdopted);
+  const afterEqualBoundary = reviseIntent(
+    twiceAdopted,
+    {
+      statement: "Third coordinator intent.",
+      constraints: [],
+      grounding: {
+        kind: "human_input_receipt",
+        id: "third receipt",
+        sessionId: third.sessionId,
+        sessionFile: third.sessionFile,
+        source: "interactive",
+        text: "Third coordinator intent.",
+        receivedAt: "t3",
+      },
+      recordedAt: "t3",
+    },
+    "t3",
+  );
+  validateWorkstream(afterEqualBoundary);
+  const originalGrounding = afterEqualBoundary.intents[0]?.grounding;
+  assert.equal(originalGrounding?.kind, "human_input_receipt");
+  assert.ok(originalGrounding?.kind === "human_input_receipt");
+  assert.equal(originalGrounding.sessionId, coordinator.sessionId);
+
   const rewritten = structuredClone(revised);
   const firstIntent = rewritten.intents[0];
   assert.ok(firstIntent !== undefined && firstIntent.grounding.kind === "human_input_receipt");
@@ -965,7 +999,16 @@ void test("coordinator transfer history preserves direct receipt ownership inter
   const firstTransfer = broken.coordinatorTransfers[0];
   assert.ok(firstTransfer !== undefined);
   firstTransfer.from = successor;
-  assert.throws(() => validateWorkstream(broken), /death observation|transfer history/);
+  assert.throws(
+    () => validateWorkstream(broken),
+    /must change coordinator identity|death observation|transfer history/,
+  );
+
+  const noncanonical = structuredClone(adopted);
+  const transfer = noncanonical.coordinatorTransfers[0];
+  assert.ok(transfer !== undefined);
+  transfer.committedAt = "2024-01-02T01:00:00.000+01:00";
+  assert.throws(() => validateWorkstream(noncanonical), /Invalid canonical Workstream/);
 });
 
 void test("report kind follows Task kind and first terminal replay uses structural equality", () => {

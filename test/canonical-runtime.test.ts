@@ -8,7 +8,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
-import { Clock, Effect, Exit, Fiber, type FileSystem, Option, type Path, Scope } from "effect";
+import {
+  Clock,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  type FileSystem,
+  Option,
+  type Path,
+  Scope,
+} from "effect";
 import { TestClock } from "effect/testing";
 import { Value } from "typebox/value";
 import { CanonicalCommandError, type CanonicalCommandPorts } from "../src/canonical-commands.js";
@@ -34,7 +44,13 @@ import {
 } from "../src/canonical-runtime.js";
 import {
   CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+  closeRuntimeGeneration,
+  publishRuntimeGeneration,
+  type RuntimeGenerationEntry,
+  reserveRuntimeGenerationPath,
   resetRuntimeGenerationRegistryForTest,
+  runtimeGeneration,
+  unregisterRuntimeGeneration,
 } from "../src/canonical-runtime-generation.js";
 import {
   CanonicalStoreConflictError,
@@ -72,6 +88,7 @@ const OTHER: CoordinatorIdentity = {
 };
 const T0 = "2024-01-01T00:00:00.000Z";
 const START_MILLIS = 1_700_000_000_000;
+const DEAD_OBSERVED_AT = "2023-11-14T22:13:20.000Z";
 const BASE_REVISION = "a".repeat(40);
 const RESEARCH = { model: "fixture/research", thinking: "high" } as const;
 const POLICY: ModelPolicy = {
@@ -136,17 +153,19 @@ function runCanonical<A, E>(
 
 function deadObservation(subject = COORDINATOR) {
   return {
-    kind: "herdr_dead" as const,
     subject,
-    observedAt: T0,
-    provenance: {
-      workspaceId: "workspace",
-      tabId: "tab",
-      paneId: "pane",
-      terminalId: "terminal",
-      agentName: "coordinator",
-      sessionFile: subject.sessionFile,
-    },
+    observedAt: DEAD_OBSERVED_AT,
+    source: "herdr_api_snapshot_dead" as const,
+  };
+}
+
+function generationLease(token: string, owner = COORDINATOR) {
+  return {
+    token,
+    owner,
+    acquiredAt: DEAD_OBSERVED_AT,
+    heartbeatAt: DEAD_OBSERVED_AT,
+    expiresAt: T0,
   };
 }
 
@@ -343,6 +362,77 @@ void test("runtime generation registry exposes one stable protocol and determini
   resetRuntimeGenerationRegistryForTest();
 });
 
+void test("generation close is shared and stale unregister cannot remove a successor", async () => {
+  let closes = 0;
+  const first: RuntimeGenerationEntry = {
+    protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+    path: "/registry/stale",
+    workstreamId: ID,
+    coordinator: COORDINATOR,
+    lease: generationLease("first"),
+    status: "active",
+    handle: {
+      close: async () => {
+        closes += 1;
+        return { quiescent: true };
+      },
+    },
+  };
+  publishRuntimeGeneration(first);
+  const left = closeRuntimeGeneration(first);
+  const right = closeRuntimeGeneration(first);
+  assert.equal(left, right);
+  assert.deepEqual(await left, { quiescent: true });
+  assert.equal(closes, 1);
+  assert.equal(first.status, "quiescent");
+
+  const successor: RuntimeGenerationEntry = {
+    protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+    path: first.path,
+    workstreamId: first.workstreamId,
+    coordinator: first.coordinator,
+    lease: generationLease("successor"),
+    status: "active",
+    handle: first.handle,
+  };
+  publishRuntimeGeneration(successor);
+  unregisterRuntimeGeneration(first);
+  assert.equal(runtimeGeneration(first.path), successor);
+});
+
+void test("an interrupted queued reservation cannot wedge later runtime acquisition", async () => {
+  await withFixture(async (f) => {
+    await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* canonicalCreate(f);
+        const path = yield* CanonicalWorkstreamStore.pathFor(f.repository, ID);
+        const reserved = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const holder = yield* Effect.forkScoped(
+          Effect.scoped(
+            reserveRuntimeGenerationPath(path).pipe(
+              Effect.tap(() => Deferred.succeed(reserved, undefined)),
+              Effect.andThen(Deferred.await(release)),
+            ),
+          ),
+        );
+        yield* Deferred.await(reserved);
+
+        const interrupted = yield* Effect.forkScoped(Effect.scoped(acquire(f)));
+        yield* Effect.yieldNow;
+        yield* Fiber.interrupt(interrupted);
+        assert.equal(yield* store.observeLease(), undefined);
+
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(holder);
+        const runtime = yield* acquire(f);
+        assert.notEqual(yield* store.observeLease(), undefined);
+        yield* runtime.close();
+      }),
+    );
+  });
+});
+
 void test("acquisition fences exactly one lease and rejects identity or unproven takeover", async () => {
   await withFixture(async (f) => {
     const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
@@ -372,15 +462,16 @@ void test("acquisition fences exactly one lease and rejects identity or unproven
       clock,
     );
     assert.ok(live.failure instanceof CanonicalRuntimeLeaseError);
+    assert.equal(live.failure.code, "generation_proof_missing");
     assert.deepEqual(live.lease, observed);
 
     await Effect.runPromise(clock.setTime(START_MILLIS + 30_001));
-    assert.ok(
-      (await runCanonical(
-        Effect.flip(acquire(f, COORDINATOR, { ownership: { kind: "recover" } })),
-        clock,
-      )) instanceof CanonicalRuntimeLeaseError,
+    const expiredWithoutProof = await runCanonical(
+      Effect.flip(acquire(f, COORDINATOR, { ownership: { kind: "recover" } })),
+      clock,
     );
+    assert.ok(expiredWithoutProof instanceof CanonicalRuntimeLeaseError);
+    assert.equal(expiredWithoutProof.code, "generation_proof_missing");
     // Failed acquisitions left the exact observed lease and aggregate untouched.
     const untouched = await runCanonical(
       Effect.gen(function* () {
@@ -415,6 +506,83 @@ void test("acquisition fences exactly one lease and rejects identity or unproven
     assert.equal(taken.lease?.owner.sessionId, COORDINATOR.sessionId);
     assert.notEqual(taken.lease?.token, observed.token);
     assert.equal(taken.state.revision, 1);
+  });
+});
+
+void test("absent-lease mismatch and uncertain generation fail before runtime effects", async () => {
+  await withFixture(async (f) => {
+    let driverEffects = 0;
+    let closeEffects = 0;
+    const driver: ReconciliationDriver = {
+      reconcile: () =>
+        Effect.sync(() => {
+          driverEffects += 1;
+          return { kind: "waiting" } as const;
+        }),
+    };
+    await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* canonicalCreate(f);
+        const path = yield* CanonicalWorkstreamStore.pathFor(f.repository, ID);
+        const handle = {
+          close: async () => {
+            closeEffects += 1;
+            return { quiescent: true };
+          },
+        };
+        publishRuntimeGeneration({
+          protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+          path,
+          workstreamId: ID,
+          coordinator: OTHER,
+          lease: generationLease("mismatched", OTHER),
+          handle,
+          status: "quiescent",
+          closeResult: Promise.resolve({ quiescent: true }),
+        });
+        const mismatch = yield* Effect.flip(acquire(f, COORDINATOR, { driver }));
+        assert.ok(mismatch instanceof CanonicalRuntimeLeaseError);
+        assert.equal(mismatch.code, "generation_proof_mismatch");
+        assert.equal(yield* store.observeLease(), undefined);
+        assert.equal(driverEffects, 0);
+
+        publishRuntimeGeneration({
+          protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+          path,
+          workstreamId: ID,
+          coordinator: COORDINATOR,
+          lease: generationLease("uncertain"),
+          handle,
+          status: "failed",
+        });
+        const uncertain = yield* Effect.flip(acquire(f, COORDINATOR, { driver }));
+        assert.ok(uncertain instanceof CanonicalRuntimeLeaseError);
+        assert.equal(uncertain.code, "generation_not_quiescent");
+        assert.equal(yield* store.observeLease(), undefined);
+        assert.equal(driverEffects, 0);
+
+        const held = yield* store.acquireLease(COORDINATOR);
+        publishRuntimeGeneration({
+          protocolVersion: CANONICAL_RUNTIME_GENERATION_PROTOCOL,
+          path,
+          workstreamId: ID,
+          coordinator: COORDINATOR,
+          lease: { ...held, heartbeatAt: DEAD_OBSERVED_AT },
+          handle,
+          status: "quiescent",
+          closeResult: Promise.resolve({ quiescent: true }),
+        });
+        const changed = yield* Effect.flip(
+          acquire(f, COORDINATOR, { ownership: { kind: "recover" }, driver }),
+        );
+        assert.ok(changed instanceof CanonicalRuntimeLeaseError);
+        assert.equal(changed.code, "generation_proof_mismatch");
+        assert.deepEqual(yield* store.observeLease(), held);
+        assert.equal(driverEffects, 0);
+        assert.equal(closeEffects, 0);
+        yield* store.releaseLease(held);
+      }),
+    );
   });
 });
 
@@ -519,7 +687,7 @@ void test("concurrent ordinary attachment selects exactly one runtime", async ()
   });
 });
 
-void test("same-process recovery waits for an owned reconciliation operation to join", async () => {
+void test("lease absence still waits for an owned operation to join before replacement", async () => {
   await withFixture(async (f) => {
     let started = false;
     let joined = false;
@@ -538,7 +706,7 @@ void test("same-process recovery waits for an owned reconciliation operation to 
     };
     await runCanonical(
       Effect.gen(function* () {
-        yield* canonicalCreate(f);
+        const store = yield* canonicalCreate(f);
         const first = yield* acquire(f, COORDINATOR, { driver: blocking });
         yield* first.enqueue({
           taskId: "joining-task",
@@ -548,10 +716,11 @@ void test("same-process recovery waits for an owned reconciliation operation to 
         });
         assert.equal(Option.isSome(yield* waitFor(() => started)), true);
         assert.equal(joined, false);
-        const second = yield* acquire(f, COORDINATOR, {
-          ownership: { kind: "recover" },
-          driver: INERT_DRIVER,
-        });
+        const held = yield* store.observeLease();
+        assert.ok(held !== undefined);
+        yield* store.releaseLease(held);
+        assert.equal(yield* store.observeLease(), undefined);
+        const second = yield* acquire(f, COORDINATOR, { driver: INERT_DRIVER });
         assert.equal(joined, true);
         assert.ok((yield* Effect.flip(first.read())) instanceof CanonicalRuntimeStoppedError);
         yield* second.close();
@@ -586,6 +755,49 @@ void test("different-session adoption commits ownership before startup and repla
         });
         assert.equal((yield* replay.read()).coordinatorTransfers.length, 1);
         yield* replay.close();
+      }),
+      clock,
+    );
+  });
+});
+
+void test("local quiescence survives transient adoption failure and permits retry", async () => {
+  await withFixture(async (f) => {
+    const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));
+    await Effect.runPromise(clock.setTime(START_MILLIS));
+    await runCanonical(
+      Effect.gen(function* () {
+        const store = yield* canonicalCreate(f);
+        const prior = yield* acquire(f);
+        const path = yield* CanonicalWorkstreamStore.pathFor(f.repository, ID);
+        const blocker = new DatabaseSync(path);
+        blocker.exec(
+          "CREATE TRIGGER reject_adoption_retry BEFORE UPDATE ON workstream BEGIN SELECT RAISE(FAIL, 'transient adoption failure'); END",
+        );
+        blocker.close();
+
+        const failed = yield* Effect.flip(
+          acquire(f, OTHER, {
+            ownership: { kind: "adopt", deathObservation: deadObservation() },
+          }),
+        );
+        assert.equal(failed._tag, "CanonicalStoreHostError");
+        assert.ok((yield* Effect.flip(prior.read())) instanceof CanonicalRuntimeStoppedError);
+        assert.equal(yield* store.observeLease(), undefined);
+        const unchanged = yield* store.read();
+        assert.equal(unchanged.revision, 0);
+        assert.deepEqual(unchanged.coordinatorTransfers, []);
+
+        const cleanup = new DatabaseSync(path);
+        cleanup.exec("DROP TRIGGER reject_adoption_retry");
+        cleanup.close();
+        const successor = yield* acquire(f, OTHER, {
+          ownership: { kind: "adopt", deathObservation: deadObservation() },
+        });
+        const adopted = yield* successor.read();
+        assert.equal(adopted.coordinatorTransfers.length, 1);
+        assert.deepEqual(adopted.coordinator, OTHER);
+        yield* successor.close();
       }),
       clock,
     );

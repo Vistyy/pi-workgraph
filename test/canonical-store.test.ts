@@ -31,6 +31,7 @@ import {
   type CoordinatorIdentity,
   completeWorkstream,
   createWorkstream,
+  type HerdrDeadObservation,
   type Intent,
   type RepositoryIdentity,
   reviseIntent,
@@ -55,6 +56,7 @@ const OWNER_B: CoordinatorIdentity = {
 };
 const T0 = "2024-01-01T00:00:00.000Z";
 const START_MILLIS = 1_700_000_000_000;
+const DEAD_OBSERVED_AT = "2023-11-14T22:13:20.000Z";
 
 function runCanonical<A, E>(
   program: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path | Scope.Scope>,
@@ -106,20 +108,17 @@ function receipt(id: string, text: string): Intent["grounding"] {
   };
 }
 
-function deadObservation(subject = COORDINATOR) {
+function deadObservation(subject = COORDINATOR, observedAt = DEAD_OBSERVED_AT) {
   return {
-    kind: "herdr_dead" as const,
     subject,
-    observedAt: T0,
-    provenance: {
-      workspaceId: "workspace",
-      tabId: "tab",
-      paneId: "pane",
-      terminalId: "terminal",
-      agentName: "coordinator",
-      sessionFile: subject.sessionFile,
-    },
+    observedAt,
+    source: "herdr_api_snapshot_dead" as const,
   };
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- This test seam represents an untyped external adoption request.
+function externalInput(value: unknown): unknown {
+  return value;
 }
 
 function intent(statement: string, receiptId = "receipt-1"): Intent {
@@ -457,6 +456,48 @@ void test("coordinator adoption atomically transfers ownership and installs one 
       clock,
     );
     const beforeBytes = await readFile(storagePath(fixture));
+    const invalidObservation = externalInput({
+      ...deadObservation(),
+      source: "invented-placement-proof",
+    });
+    await assert.rejects(
+      runCanonical(
+        Effect.gen(function* () {
+          const store = yield* openCanonical(fixture);
+          return yield* store.adoptCoordinator({
+            repository: fixture.repository,
+            workstreamId: ID,
+            expectedRevision: 0,
+            priorCoordinator: COORDINATOR,
+            coordinator: OWNER_B,
+            observedLease: { kind: "present", lease: observed },
+            // SAFETY: This intentionally crosses the typed store boundary to prove invalid external proof rejection.
+            deathObservation: invalidObservation as HerdrDeadObservation,
+          });
+        }),
+        clock,
+      ),
+      /Herdr API dead snapshot/,
+    );
+    await assert.rejects(
+      runCanonical(
+        Effect.gen(function* () {
+          const store = yield* openCanonical(fixture);
+          return yield* store.adoptCoordinator({
+            repository: fixture.repository,
+            workstreamId: ID,
+            expectedRevision: 0,
+            priorCoordinator: COORDINATOR,
+            coordinator: OWNER_B,
+            observedLease: { kind: "present", lease: observed },
+            deathObservation: deadObservation(COORDINATOR, "2023-11-14T22:13:20.001Z"),
+          });
+        }),
+        clock,
+      ),
+      /cannot be in the future/,
+    );
+    assert.deepEqual(await readFile(storagePath(fixture)), beforeBytes);
     await assert.rejects(
       runCanonical(
         Effect.gen(function* () {
@@ -492,7 +533,7 @@ void test("coordinator adoption atomically transfers ownership and installs one 
         }),
         clock,
       ),
-      /exact prior owner|absent lease observation/,
+      /exact prior-owner|absent lease observation/,
     );
     assert.deepEqual(await readFile(storagePath(fixture)), beforeBytes);
 
@@ -619,9 +660,9 @@ void test("canonical create and open reject unsafe, foreign, partial, malformed,
       await rm(symlinkFixture.parent, { recursive: true, force: true });
     }
 
-    rawUpdate(path, "UPDATE store_header SET version=? WHERE singleton=1", 2);
-    await assert.rejects(runCanonical(openCanonical(fixture)), CanonicalStoreUnsupportedError);
     rawUpdate(path, "UPDATE store_header SET version=? WHERE singleton=1", 1);
+    await assert.rejects(runCanonical(openCanonical(fixture)), CanonicalStoreUnsupportedError);
+    rawUpdate(path, "UPDATE store_header SET version=? WHERE singleton=1", 2);
 
     rawUpdate(path, "UPDATE workstream SET revision=? WHERE singleton=1", 5);
     await assert.rejects(runCanonical(openCanonical(fixture)), /diverges/);
