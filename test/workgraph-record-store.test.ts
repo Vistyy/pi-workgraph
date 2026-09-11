@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Native fixture paths identify real temporary repositories.
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Effect } from "effect";
@@ -797,21 +797,31 @@ void test("persisted real-Git apply resumes cleanup without reintegration", asyn
     candidateHead,
     placement,
   );
+  let inspections = 0;
   let integrations = 0;
   let cleanupCalls = 0;
   const discard = (target: WorktreePlacement, expectedHead: string) => {
     cleanupCalls += 1;
+    const cleanup = repository
+      .discardOutput(target, expectedHead)
+      .pipe(Effect.mapError((error) => commandFailure("discard output", error.message, error)));
     return cleanupCalls === 1
-      ? Effect.fail(commandFailure("discard output", "simulated lost cleanup response"))
-      : repository
-          .discardOutput(target, expectedHead)
-          .pipe(Effect.mapError((error) => commandFailure("discard output", error.message, error)));
+      ? cleanup.pipe(
+          Effect.andThen(
+            Effect.fail(commandFailure("discard output", "simulated lost cleanup response")),
+          ),
+        )
+      : cleanup;
   };
   const liveCommands = realCommands(repository, discard);
   const commands: WorkstreamCommandPorts = {
     ...liveCommands,
     git: {
       ...liveCommands.git,
+      inspectCandidateApplication: (source) => {
+        inspections += 1;
+        return liveCommands.git.inspectCandidateApplication(source);
+      },
       applyCandidate: (source, destination) => {
         integrations += 1;
         return liveCommands.git.applyCandidate(source, destination);
@@ -859,8 +869,8 @@ void test("persisted real-Git apply resumes cleanup without reintegration", asyn
       ).pipe(Effect.provide(liveLayer)),
     );
     assert.equal(await git(f.root, "rev-parse", "HEAD"), appliedRevision);
-    assert.equal(await git(placement.path, "rev-parse", "HEAD"), candidateHead);
-    assert.equal(await git(f.root, "rev-parse", `refs/heads/${placement.branch}`), candidateHead);
+    await assert.rejects(readFile(join(placement.path, "candidate.txt"), "utf8"));
+    await assert.rejects(git(f.root, "rev-parse", "--verify", `refs/heads/${placement.branch}`));
 
     await Effect.runPromise(
       Effect.acquireUseRelease(
@@ -869,8 +879,27 @@ void test("persisted real-Git apply resumes cleanup without reintegration", asyn
         (runtime) => runtime.close().pipe(Effect.orDie),
       ).pipe(Effect.provide(liveLayer)),
     );
-    assert.equal(integrations, 1);
-    assert.equal(cleanupCalls, 2);
+    assert.deepEqual(
+      { inspections, integrations, cleanupCalls },
+      {
+        inspections: 1,
+        integrations: 1,
+        cleanupCalls: 2,
+      },
+    );
+    const callsAfterCompletion = { inspections, integrations, cleanupCalls };
+    const completed = await Effect.runPromise(
+      Effect.acquireUseRelease(
+        acquire(),
+        (runtime) => runtime.apply({ attemptId: "real-apply-attempt" }),
+        (runtime) => runtime.close().pipe(Effect.orDie),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    const completedAttempt = completed.tasks[0]?.attempts[0];
+    assert.equal(completedAttempt?.application?.state, "applied");
+    assert.equal(completedAttempt?.outputDisposition?.state, "completed");
+    assert.equal(completedAttempt?.cleanup?.state, "completed");
+    assert.deepEqual({ inspections, integrations, cleanupCalls }, callsAfterCompletion);
     assert.equal(await git(f.root, "rev-parse", "HEAD"), appliedRevision);
     assert.equal(await git(f.root, "rev-parse", "refs/heads/main"), appliedRevision);
     assert.deepEqual((await git(f.root, "show", "-s", "--format=%P", "HEAD")).split(" "), [
@@ -886,6 +915,7 @@ void test("persisted real-Git apply resumes cleanup without reintegration", asyn
     await assert.rejects(git(f.root, "rev-parse", "--verify", `refs/heads/${placement.branch}`));
   } finally {
     await rm(f.root, { recursive: true, force: true });
+    await rm(dirname(placement.path), { recursive: true, force: true });
   }
 });
 
@@ -955,6 +985,7 @@ void test("persisted runtime discard removes dirty, untracked, and ignored owned
     assert.equal(records.includes(placement.path), false);
   } finally {
     await rm(f.root, { recursive: true, force: true });
+    await rm(dirname(placement.path), { recursive: true, force: true });
   }
 });
 
