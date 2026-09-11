@@ -27,7 +27,7 @@ Direct Node APIs are confined to narrow, documented host boundaries whose guaran
 
 Each lint suppression for a Node built-in must identify the concrete host guarantee it owns. Ordinary effectful filesystem and path work should not bypass the existing Effect platform services.
 
-Workgraph will not add Effect Schema or `@effect/sql-sqlite-node` for the canonical redesign. The SQLite decision may be revisited if persistence grows materially beyond the private aggregate, lease, and locator tables, or if the official driver later removes more application code than it introduces.
+Workgraph will not add Effect Schema or `@effect/sql-sqlite-node` for the canonical redesign. The SQLite decision may be revisited if persistence grows materially beyond the private aggregate and lease tables, or if the official driver later removes more application code than it introduces.
 
 ## Consequences
 
