@@ -191,6 +191,8 @@ export class WorkerRuntime {
   }
 
   isToolDisabled(name: string): boolean {
+    // Keep editing tools for implementation and authorized research experiments.
+    // This filters model tool availability; bash remains available and is not sandboxed.
     const readOnly =
       this.environment.mode !== "implementation" &&
       !(this.environment.mode === "research" && this.environment.experiment);
@@ -254,6 +256,8 @@ export class WorkerRuntime {
     this.appendEntry("pi-workgraph-worker-state", state);
   }
 
+  // Session order, not model selection or wall-clock time, proves a later generation.
+  // Pi drains the current assistant message before tool preflight/execution.
   hasExecutorMessage(entries: readonly WorkerEntry[]): boolean {
     const boundary = entries.findIndex((entry) => {
       if (entry.type !== "custom") return false;
@@ -374,8 +378,13 @@ export class WorkerRuntime {
     return Effect.gen(function* () {
       if (!isWorkerReportInput(params) || params.kind !== self.environment.mode)
         return yield* contractFailure(`Report must satisfy the ${self.environment.mode} contract.`);
-      if (params.kind !== "implementation" || params.status !== "completed")
+      if (params.kind !== "implementation" || params.status !== "completed") {
+        // Read-only is an instruction and authority boundary, not a filesystem sandbox.
+        // Shared research and non-revision review deliberately observe the live project cwd,
+        // including tracked and untracked local changes. Exact-revision review is launched in
+        // an owned worktree at its requested SHA; do not confuse either cwd with another revision.
         return terminalReport(params, self.terminalState());
+      }
       if (params.outcome === "no_change")
         return yield* self.noChangeImplementationReport(cwd, params, exec);
       return yield* self.changedImplementationReport(
@@ -403,7 +412,10 @@ export class WorkerRuntime {
           `No-change implementation must report the unchanged base revision ${self.environment.baseCommit}.`,
         );
       return terminalReport(report, {
-        ...self.terminalState(),
+        plan: self.plan.plan,
+        planStatus: self.plan.status,
+        reminderCount: self.reminderCount,
+        switchedAt: self.switchedAt,
         continued: self.environment.continued,
         outcome: "no_change",
         baseCommit: self.environment.baseCommit,
@@ -435,7 +447,14 @@ export class WorkerRuntime {
       const provenance = yield* changedCommitProvenance(exec, cwd, self.environment.baseCommit);
       return terminalReport(
         { ...report, ...provenance },
-        { ...self.terminalState(), continued: self.environment.continued, outcome: "changed" },
+        {
+          plan: self.plan.plan,
+          planStatus: self.plan.status,
+          reminderCount: self.reminderCount,
+          switchedAt: self.switchedAt,
+          continued: self.environment.continued,
+          outcome: "changed",
+        },
       );
     });
   }

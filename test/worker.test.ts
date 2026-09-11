@@ -77,6 +77,9 @@ const noChangeDetailsSchema = Type.Object({
   report: Type.Object({ outcome: Type.Literal("no_change") }),
   state: Type.Object({ switchedAt: Type.Optional(Type.String()) }),
 });
+const readOnlyDetailsSchema = Type.Object({
+  state: Type.Object({ switchError: Type.Optional(Type.String()) }),
+});
 
 function assistant(session: SessionManager, model = "gpt-4o") {
   return session.appendMessage({
@@ -245,6 +248,7 @@ void test("registered worker observes a non-edit mutation, switches locally, rep
     const details = decodeTestValue(reportDetailsSchema, result.details);
     assert.equal(details.state.planStatus, "absent");
     assert.equal(details.state.reminderCount, 0);
+    assert.equal(Object.hasOwn(details.state, "switchError"), false);
     assert.equal(details.report.commit, await git(f.root, "rev-parse", "HEAD"));
     await f.runner.emit({ type: "agent_settled" });
     const markers = f.session
@@ -1327,10 +1331,9 @@ void test("no-change implementation can report from the guide without manufactur
     };
     const result = await f.call("workgraph_report", report);
     assert.equal(result.terminate, true);
-    assert.equal(
-      decodeTestValue(noChangeDetailsSchema, result.details).state.switchedAt,
-      undefined,
-    );
+    const details = decodeTestValue(noChangeDetailsSchema, result.details);
+    assert.equal(details.state.switchedAt, undefined);
+    assert.equal(Object.hasOwn(details.state, "switchError"), false);
     assert.deepEqual(f.selected, []);
     assert.equal(await git(f.root, "rev-parse", "HEAD"), revision);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "before\n");
@@ -1594,7 +1597,12 @@ void test("read-only review reports accept dirty live files without changing the
   try {
     const head = await git(f.root, "rev-parse", "HEAD");
     await writeFile(join(f.root, "value.txt"), "changed\n");
-    assert.equal((await f.call("workgraph_report", report)).terminate, true);
+    const result = await f.call("workgraph_report", report);
+    assert.equal(result.terminate, true);
+    assert.equal(
+      Object.hasOwn(decodeTestValue(readOnlyDetailsSchema, result.details).state, "switchError"),
+      true,
+    );
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "changed\n");
     assert.equal(await git(f.root, "rev-parse", "HEAD"), head);
   } finally {
