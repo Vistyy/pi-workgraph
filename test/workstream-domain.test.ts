@@ -1478,7 +1478,7 @@ void test("isolated failed output remains blocked through cleanup until exact di
         },
         "2026-01-01T00:00:07.000Z",
       ),
-    /no existing application obligation/,
+    /committed to discard, not application/,
   );
   let shared = deliver(finish(add(), "Attempt A", reported()), "Attempt A");
   shared = completeWorkstream(
@@ -1711,8 +1711,38 @@ void test("implementation candidate ancestry may cross Intents but application i
   workstream = createTask(retained, childTask, "2026-01-01T00:00:06.000Z");
   assert.equal(findTask(workstream, "Child Task")?.intentIndex, 1);
 
+  assert.throws(
+    () =>
+      checkpointOutputDisposition(
+        retained,
+        { taskId: "Parent Task", attemptId: "Parent Attempt" },
+        {
+          kind: "discarded",
+          state: "completed",
+          expectedHead: changedCommit,
+          reason: "Discarded.",
+        },
+        "2026-01-01T00:00:06.001Z",
+      ),
+    /committed to application, not discard/,
+  );
+  const invalidPersistedChoice = structuredClone(retained);
+  const invalidAttempt = invalidPersistedChoice.tasks[0]?.attempts[0];
+  assert.ok(invalidAttempt);
+  invalidAttempt.outputDisposition = {
+    kind: "discarded",
+    state: "completed",
+    expectedHead: changedCommit,
+    reason: "Invalid persisted choice.",
+  };
+  assert.throws(() => validateWorkstream(invalidPersistedChoice), /cannot combine application/);
+
+  const discardable = structuredClone(retained);
+  const discardableAttempt = discardable.tasks[0]?.attempts[0];
+  assert.ok(discardableAttempt);
+  delete discardableAttempt.application;
   const discarded = checkpointOutputDisposition(
-    retained,
+    discardable,
     { taskId: "Parent Task", attemptId: "Parent Attempt" },
     { kind: "discarded", state: "completed", expectedHead: changedCommit, reason: "Discarded." },
     "2026-01-01T00:00:06.002Z",

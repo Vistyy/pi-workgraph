@@ -576,6 +576,14 @@ void test("workstream tool schemas expose discard_output and every runtime facad
       false,
     );
     assert.equal(Value.Check(control.parameters, { action: "suspend", reason: "   " }), false);
+    assert.equal(
+      Value.Check(control.parameters, {
+        action: "discard_output",
+        attempt: "attempt-1",
+        reason: "   ",
+      }),
+      false,
+    );
 
     const calls: Array<[string, object]> = [
       ["workgraph_research", { id: "r", question: "q", expectedEvidence: ["e"] }],

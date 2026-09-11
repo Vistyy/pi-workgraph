@@ -21,6 +21,7 @@ import {
   type Intent,
   type Task,
 } from "../src/domain/workstream.js";
+import { GitRepository, type WorktreePlacement } from "../src/git.js";
 import { liveLayer } from "../src/node-platform.js";
 import {
   WorkstreamStore,
@@ -62,6 +63,105 @@ function intent(statement: string, at: string): Intent {
       receivedAt: at,
     },
     recordedAt: at,
+  };
+}
+
+function finishedCandidateTask(
+  taskId: string,
+  attemptId: string,
+  base: string,
+  commit: string,
+  placement: WorktreePlacement,
+): Task {
+  return {
+    kind: "implementation",
+    id: taskId,
+    objective: "Exercise a real maintained candidate",
+    intentIndex: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    acceptance: ["candidate is settled exactly once"],
+    attempts: [
+      {
+        id: attemptId,
+        state: "finished",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+        baseRevision: base,
+        candidate: { kind: "initial", rootCommit: base },
+        selection: {
+          role: "implementation",
+          guide: { model: "provider/guide", thinking: "low" },
+          executor: { model: "provider/executor", thinking: "high" },
+          source: "policy",
+        },
+        execution: {
+          placement: { kind: "isolated_worktree", path: placement.path, branch: placement.branch },
+          sessionFile: `/sessions/${attemptId}.jsonl`,
+          submission: "started",
+          launch: {
+            phase: "ready",
+            workspaceId: "workspace",
+            tabId: `tab-${attemptId}`,
+            paneId: `pane-${attemptId}`,
+            terminalId: `terminal-${attemptId}`,
+            agentName: `agent-${attemptId}`,
+            cwd: placement.path,
+          },
+        },
+        cleanup: { state: "completed", expectedHead: commit, workerClosed: true },
+        outcome: {
+          id: `${attemptId}:outcome`,
+          kind: "reported",
+          observedAt: "2026-01-01T00:00:01.000Z",
+          artifacts: [],
+          report: {
+            kind: "implementation",
+            status: "completed",
+            outcome: "changed",
+            commit,
+            changedFiles: ["candidate.txt"],
+            summary: "Changed",
+            evidence: [],
+            findings: [],
+          },
+          delivery: {
+            state: "delivered",
+            requestedAt: "2026-01-01T00:00:01.000Z",
+            attemptCount: 1,
+            failureHistory: [],
+            deliveredAt: "2026-01-01T00:00:01.000Z",
+          },
+        },
+      },
+    ],
+  };
+}
+
+function realCommands(
+  repository: GitRepository,
+  discardOutput: WorkstreamCommandPorts["git"]["discardOutput"],
+): WorkstreamCommandPorts {
+  const host = <A>(operation: string, effect: Effect.Effect<A, { readonly message: string }>) =>
+    effect.pipe(Effect.mapError((error) => commandFailure(operation, error.message, error)));
+  return {
+    git: {
+      resolveRevision: (revision) => host("resolve revision", repository.resolveRevision(revision)),
+      head: host("inspect head", repository.head()),
+      cleanHead: host(
+        "inspect clean head",
+        repository.assertClean().pipe(Effect.andThen(repository.head())),
+      ),
+      validateCandidate: (placement, root, commit) =>
+        host("validate candidate", repository.validateCandidate(placement, root, commit)),
+      inspectCandidateApplication: (source) =>
+        host("inspect application", repository.inspectCandidateApplication(source)),
+      recoverCandidateApplication: (destination, source) =>
+        host("recover application", repository.recoverCandidateApplication(destination, source)),
+      applyCandidate: (source, destination) =>
+        host("apply candidate", repository.applyCandidate(source, destination)),
+      discardOutput,
+    },
+    workers: { steer: () => Effect.void },
   };
 }
 
@@ -460,6 +560,399 @@ void test("registered apply and output cleanup settle once through direct fences
         { duration: "2 seconds", orElse: () => Effect.die(new Error("apply cleanup deadlocked")) },
       ).pipe(Effect.provide(liveLayer)),
     );
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+void test("runtime makes apply and discard choices mutually exclusive before Git effects", async () => {
+  const f = await fixture();
+  const base = "a".repeat(40);
+  const commit = "b".repeat(40);
+  const candidate = (taskId: string, attemptId: string, workerClosed = true): Task => ({
+    kind: "implementation",
+    id: taskId,
+    objective: "Choose one output disposition",
+    intentIndex: 0,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    acceptance: ["settled"],
+    attempts: [
+      {
+        id: attemptId,
+        state: "finished",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:01.000Z",
+        baseRevision: base,
+        candidate: { kind: "initial", rootCommit: base },
+        selection: {
+          role: "implementation",
+          guide: { model: "provider/guide", thinking: "low" },
+          executor: { model: "provider/executor", thinking: "high" },
+          source: "policy",
+        },
+        execution: {
+          placement: {
+            kind: "isolated_worktree",
+            path: join(f.root, attemptId),
+            branch: attemptId,
+          },
+          sessionFile: `/sessions/${attemptId}.jsonl`,
+          submission: "started",
+          launch: {
+            phase: "ready",
+            workspaceId: "workspace",
+            tabId: `tab-${attemptId}`,
+            paneId: `pane-${attemptId}`,
+            terminalId: `terminal-${attemptId}`,
+            agentName: `agent-${attemptId}`,
+            cwd: join(f.root, attemptId),
+          },
+        },
+        cleanup: workerClosed
+          ? { state: "completed", expectedHead: commit, workerClosed: true }
+          : {
+              state: "blocked",
+              expectedHead: commit,
+              workerClosed: false,
+              error: "Worker is still open.",
+            },
+        outcome: {
+          id: `${attemptId}:outcome`,
+          kind: "reported",
+          observedAt: "2026-01-01T00:00:01.000Z",
+          artifacts: [],
+          report: {
+            kind: "implementation",
+            status: "completed",
+            outcome: "changed",
+            commit,
+            changedFiles: ["change.txt"],
+            summary: "Changed",
+            evidence: [],
+            findings: [],
+          },
+          delivery: {
+            state: "delivered",
+            requestedAt: "2026-01-01T00:00:01.000Z",
+            attemptCount: 1,
+            failureHistory: [],
+            deliveredAt: "2026-01-01T00:00:01.000Z",
+          },
+        },
+      },
+    ],
+  });
+  const discardCalls = new Map<string, number>();
+  let validations = 0;
+  let inspections = 0;
+  let applications = 0;
+  const commands: WorkstreamCommandPorts = {
+    git: {
+      resolveRevision: () => Effect.succeed(base),
+      head: Effect.succeed(base),
+      cleanHead: Effect.succeed(base),
+      validateCandidate: () => {
+        validations += 1;
+        return Effect.succeed({
+          rootCommit: base,
+          commit,
+          commits: [commit],
+          changedFiles: ["change.txt"],
+        });
+      },
+      inspectCandidateApplication: () => {
+        inspections += 1;
+        return Effect.succeed({ expectedRef: "refs/heads/main", expectedHead: base });
+      },
+      // oxlint-disable-next-line effecttsgo/effect-succeed-with-void -- Undefined means structurally unchanged and retryable.
+      recoverCandidateApplication: () => Effect.succeed(undefined),
+      applyCandidate: () => {
+        applications += 1;
+        return Effect.succeed(commit);
+      },
+      discardOutput: (placement, expectedHead) => {
+        const count = (discardCalls.get(placement.branch) ?? 0) + 1;
+        discardCalls.set(placement.branch, count);
+        return count === 1
+          ? Effect.fail(commandFailure("discard output", "simulated cleanup interruption"))
+          : Effect.succeed({
+              state: "completed" as const,
+              ...placement,
+              expectedHead,
+              detail: "discarded",
+            });
+      },
+    },
+    workers: { steer: () => Effect.void },
+  };
+  const driver: ReconciliationDriver = { reconcile: () => Effect.succeed({ kind: "waiting" }) };
+  try {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const attachment = yield* WorkstreamStore.create(f.initial);
+          for (const [revision, task] of [
+            candidate("discard-task", "discard-first"),
+            candidate("apply-task", "apply-first"),
+            candidate("open-task", "worker-open", false),
+          ].entries())
+            yield* attachment.store.mutateRecords(f.initial.coordinator, revision, {
+              kind: "create_task",
+              task,
+              updatedAt: `2026-01-01T00:00:0${revision + 2}.000Z`,
+            });
+        }),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    await Effect.runPromise(
+      Effect.acquireUseRelease(
+        WorkstreamRuntime.acquire({
+          id: f.initial.id,
+          repository: f.initial.repository,
+          coordinator: f.initial.coordinator,
+          driver,
+          commands,
+        }),
+        (runtime) =>
+          Effect.gen(function* () {
+            assert.equal(
+              (yield* Effect.result(
+                runtime.discardOutput({ attemptId: "worker-open", reason: "Cannot yet discard" }),
+              ))._tag,
+              "Failure",
+            );
+            assert.equal(discardCalls.has("worker-open"), false);
+
+            assert.equal(
+              (yield* Effect.result(
+                runtime.discardOutput({
+                  attemptId: "discard-first",
+                  reason: "Discard this output",
+                }),
+              ))._tag,
+              "Failure",
+            );
+            const beforeRejectedApply = { validations, inspections, applications };
+            const rejectedApply = yield* Effect.result(
+              runtime.apply({ attemptId: "discard-first" }),
+            );
+            assert.equal(rejectedApply._tag, "Failure");
+            assert.deepEqual({ validations, inspections, applications }, beforeRejectedApply);
+            yield* runtime.discardOutput({
+              attemptId: "discard-first",
+              reason: "Retry keeps the first recorded reason",
+            });
+            assert.equal(discardCalls.get("discard-first"), 2);
+
+            assert.equal(
+              (yield* Effect.result(runtime.apply({ attemptId: "apply-first" })))._tag,
+              "Failure",
+            );
+            assert.equal(applications, 1);
+            const beforeRejectedDiscard = discardCalls.get("apply-first");
+            const rejectedDiscard = yield* Effect.result(
+              runtime.discardOutput({ attemptId: "apply-first", reason: "Must not discard" }),
+            );
+            assert.equal(rejectedDiscard._tag, "Failure");
+            assert.equal(discardCalls.get("apply-first"), beforeRejectedDiscard);
+            yield* runtime.apply({ attemptId: "apply-first" });
+            assert.equal(applications, 1);
+            assert.equal(discardCalls.get("apply-first"), 2);
+
+            const state = yield* runtime.snapshot();
+            const discarded = state.tasks[0]?.attempts[0];
+            const applied = state.tasks[1]?.attempts[0];
+            assert.equal(discarded?.outputDisposition?.kind, "discarded");
+            assert.equal(discarded?.outputDisposition?.reason, "Discard this output");
+            assert.equal(applied?.application?.state, "applied");
+            assert.equal(applied?.outputDisposition?.kind, "applied");
+          }),
+        (runtime) => runtime.close().pipe(Effect.orDie),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+void test("persisted real-Git apply resumes cleanup without reintegration", async () => {
+  const f = await fixture();
+  const base = await git(f.root, "rev-parse", "HEAD");
+  const repository = new GitRepository(f.root, join(f.root, ".git"));
+  const placement = await Effect.runPromise(
+    repository.createWorktree(f.initial.id, "real-apply", base),
+  );
+  await writeFile(join(placement.path, "candidate.txt"), "candidate bytes\n");
+  await git(placement.path, "add", "candidate.txt");
+  await git(placement.path, "commit", "-m", "candidate change");
+  const candidateHead = await git(placement.path, "rev-parse", "HEAD");
+  await writeFile(join(f.root, "destination.txt"), "destination bytes\n");
+  await git(f.root, "add", "destination.txt");
+  await git(f.root, "commit", "-m", "destination change");
+  const destinationHead = await git(f.root, "rev-parse", "HEAD");
+  const task = finishedCandidateTask(
+    "real-apply-task",
+    "real-apply-attempt",
+    base,
+    candidateHead,
+    placement,
+  );
+  let integrations = 0;
+  let cleanupCalls = 0;
+  const discard = (target: WorktreePlacement, expectedHead: string) => {
+    cleanupCalls += 1;
+    return cleanupCalls === 1
+      ? Effect.fail(commandFailure("discard output", "simulated lost cleanup response"))
+      : repository
+          .discardOutput(target, expectedHead)
+          .pipe(Effect.mapError((error) => commandFailure("discard output", error.message, error)));
+  };
+  const liveCommands = realCommands(repository, discard);
+  const commands: WorkstreamCommandPorts = {
+    ...liveCommands,
+    git: {
+      ...liveCommands.git,
+      applyCandidate: (source, destination) => {
+        integrations += 1;
+        return liveCommands.git.applyCandidate(source, destination);
+      },
+    },
+  };
+  const driver: ReconciliationDriver = { reconcile: () => Effect.succeed({ kind: "waiting" }) };
+  const acquire = () =>
+    WorkstreamRuntime.acquire({
+      id: f.initial.id,
+      repository: f.initial.repository,
+      coordinator: f.initial.coordinator,
+      driver,
+      commands,
+    });
+  try {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const attachment = yield* WorkstreamStore.create(f.initial);
+          yield* attachment.store.mutateRecords(f.initial.coordinator, 0, {
+            kind: "create_task",
+            task,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          });
+        }),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    const appliedRevision = await Effect.runPromise(
+      Effect.acquireUseRelease(
+        acquire(),
+        (runtime) =>
+          Effect.gen(function* () {
+            assert.equal(
+              (yield* Effect.result(runtime.apply({ attemptId: "real-apply-attempt" })))._tag,
+              "Failure",
+            );
+            const attempt = (yield* runtime.snapshot()).tasks[0]?.attempts[0];
+            assert.equal(attempt?.application?.state, "applied");
+            assert.equal(attempt?.outputDisposition?.state, "blocked");
+            assert.ok(attempt?.application?.revision !== undefined);
+            return attempt.application.revision;
+          }),
+        (runtime) => runtime.close().pipe(Effect.orDie),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), appliedRevision);
+    assert.equal(await git(placement.path, "rev-parse", "HEAD"), candidateHead);
+    assert.equal(await git(f.root, "rev-parse", `refs/heads/${placement.branch}`), candidateHead);
+
+    await Effect.runPromise(
+      Effect.acquireUseRelease(
+        acquire(),
+        (runtime) => runtime.apply({ attemptId: "real-apply-attempt" }),
+        (runtime) => runtime.close().pipe(Effect.orDie),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    assert.equal(integrations, 1);
+    assert.equal(cleanupCalls, 2);
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), appliedRevision);
+    assert.equal(await git(f.root, "rev-parse", "refs/heads/main"), appliedRevision);
+    assert.deepEqual((await git(f.root, "show", "-s", "--format=%P", "HEAD")).split(" "), [
+      destinationHead,
+      candidateHead,
+    ]);
+    assert.equal(await git(f.root, "show", "HEAD:candidate.txt"), "candidate bytes");
+    assert.equal(await git(f.root, "show", "HEAD:destination.txt"), "destination bytes");
+    assert.equal(await git(f.root, "rev-parse", "HEAD^{tree}"), await git(f.root, "write-tree"));
+    assert.equal(await git(f.root, "status", "--porcelain", "--untracked-files=all"), "");
+    await assert.rejects(git(f.root, "rev-parse", "--verify", "MERGE_HEAD"));
+    await assert.rejects(readFile(join(placement.path, "candidate.txt"), "utf8"));
+    await assert.rejects(git(f.root, "rev-parse", "--verify", `refs/heads/${placement.branch}`));
+  } finally {
+    await rm(f.root, { recursive: true, force: true });
+  }
+});
+
+void test("persisted runtime discard removes dirty, untracked, and ignored owned output", async () => {
+  const f = await fixture();
+  const base = await git(f.root, "rev-parse", "HEAD");
+  const repository = new GitRepository(f.root, join(f.root, ".git"));
+  const placement = await Effect.runPromise(
+    repository.createWorktree(f.initial.id, "real-discard", base),
+  );
+  await writeFile(join(placement.path, ".gitignore"), "*.ignored\n");
+  await writeFile(join(placement.path, "candidate.txt"), "candidate bytes\n");
+  await git(placement.path, "add", ".gitignore", "candidate.txt");
+  await git(placement.path, "commit", "-m", "discarded candidate");
+  const candidateHead = await git(placement.path, "rev-parse", "HEAD");
+  await writeFile(join(placement.path, "tracked.txt"), "dirty bytes\n");
+  await writeFile(join(placement.path, "untracked.txt"), "untracked bytes\n");
+  await writeFile(join(placement.path, "secret.ignored"), "ignored bytes\n");
+  const task = finishedCandidateTask(
+    "real-discard-task",
+    "real-discard-attempt",
+    base,
+    candidateHead,
+    placement,
+  );
+  const discard = (target: WorktreePlacement, expectedHead: string) =>
+    repository
+      .discardOutput(target, expectedHead)
+      .pipe(Effect.mapError((error) => commandFailure("discard output", error.message, error)));
+  const commands = realCommands(repository, discard);
+  const driver: ReconciliationDriver = { reconcile: () => Effect.succeed({ kind: "waiting" }) };
+  try {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const attachment = yield* WorkstreamStore.create(f.initial);
+          yield* attachment.store.mutateRecords(f.initial.coordinator, 0, {
+            kind: "create_task",
+            task,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          });
+        }),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    await Effect.runPromise(
+      Effect.acquireUseRelease(
+        WorkstreamRuntime.acquire({
+          id: f.initial.id,
+          repository: f.initial.repository,
+          coordinator: f.initial.coordinator,
+          driver,
+          commands,
+        }),
+        (runtime) =>
+          runtime.discardOutput({
+            attemptId: "real-discard-attempt",
+            reason: "Irreversibly remove all exact owned output",
+          }),
+        (runtime) => runtime.close().pipe(Effect.orDie),
+      ).pipe(Effect.provide(liveLayer)),
+    );
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), base);
+    assert.equal(await git(f.root, "status", "--porcelain", "--untracked-files=all"), "");
+    await assert.rejects(readFile(join(placement.path, "tracked.txt"), "utf8"));
+    await assert.rejects(git(f.root, "rev-parse", "--verify", `refs/heads/${placement.branch}`));
+    const records = await git(f.root, "worktree", "list", "--porcelain");
+    assert.equal(records.includes(placement.path), false);
   } finally {
     await rm(f.root, { recursive: true, force: true });
   }

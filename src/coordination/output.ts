@@ -51,6 +51,11 @@ export function applyMaintainedOutput<E, R>(
         "apply candidate",
         `Attempt ${input.attemptId} does not belong to the current Intent.`,
       );
+    if (located.attempt.outputDisposition?.kind === "discarded")
+      return yield* failure(
+        "apply candidate",
+        `Attempt ${input.attemptId} output is committed to discard, not application.`,
+      );
     let application = located.attempt.application;
     if (application?.state === "applied")
       return yield* disposeMaintainedOutput(
@@ -181,6 +186,11 @@ function disposeMaintainedOutput<E, R>(
         `Attempt ${attemptId} does not belong to the current Intent.`,
       );
     const attempt = located.attempt;
+    if (kind === "discarded" && attempt.application !== undefined)
+      return yield* failure(
+        "dispose output",
+        `Attempt ${attemptId} output is committed to application, not discard.`,
+      );
     const placement = attempt.execution?.placement;
     const expectedHead = attempt.cleanup?.expectedHead;
     if (
@@ -194,7 +204,7 @@ function disposeMaintainedOutput<E, R>(
       );
     const disposition = attempt.outputDisposition;
     const reason = disposition?.reason ?? requestedReason;
-    if (disposition !== undefined && (reason !== requestedReason || disposition.kind !== kind))
+    if (disposition !== undefined && disposition.kind !== kind)
       return yield* failure(
         "dispose output",
         `Attempt ${attemptId} already has a different output disposition checkpoint.`,
@@ -234,20 +244,6 @@ function disposeMaintainedOutput<E, R>(
         ),
       );
       return yield* discarded.failure;
-    }
-    if (discarded.success.state === "blocked") {
-      state = yield* control.commit(
-        "checkpoint blocked output disposition",
-        located.key,
-        (current) =>
-          checkpointOutputDisposition(
-            current,
-            located.key,
-            { kind, state: "blocked", expectedHead, reason, error: discarded.success.detail },
-            now,
-          ),
-      );
-      return state;
     }
     state = yield* control.commit(
       "checkpoint completed output disposition",

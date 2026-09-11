@@ -40,7 +40,7 @@ export interface CandidateApplicationDestination {
 }
 
 export interface WorktreeCleanupResult {
-  state: "completed" | "blocked";
+  state: "completed";
   path: string;
   branch: string;
   expectedHead: string;

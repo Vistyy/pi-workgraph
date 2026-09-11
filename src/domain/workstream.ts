@@ -1060,6 +1060,8 @@ function validateOutputDisposition(task: Task, attempt: Attempt): void {
     throw new Error(`Attempt ${attempt.id} output disposition is not required.`);
   if (disposition.kind === "applied" && attempt.application?.state !== "applied")
     throw new Error(`Attempt ${attempt.id} applied output disposition lacks applied Git state.`);
+  if (disposition.kind === "discarded" && attempt.application !== undefined)
+    throw new Error(`Attempt ${attempt.id} cannot combine application with discarded output.`);
   if ((disposition.state === "blocked") !== (disposition.error !== undefined))
     throw new Error(`Attempt ${attempt.id} output disposition blocker does not match its state.`);
 }
@@ -1316,6 +1318,8 @@ export function checkpointApplication(
   const current = requireAttempt(workstream, key).attempt;
   if (current.state !== "finished")
     throw new Error(`Attempt ${key.attemptId} must be finished before application.`);
+  if (current.outputDisposition?.kind === "discarded")
+    throw new Error(`Attempt ${key.attemptId} output is committed to discard, not application.`);
   if (workstream.lifecycle === "completed" && current.application === undefined) {
     assertCompletedObligation(workstream, key, "application");
     if (application.state === "applied")
@@ -1375,6 +1379,8 @@ export function checkpointOutputDisposition(
   const current = located.attempt;
   if (current.state !== "finished")
     throw new Error(`Attempt ${key.attemptId} must be finished before output disposition.`);
+  if (disposition.kind === "discarded" && current.application !== undefined)
+    throw new Error(`Attempt ${key.attemptId} output is committed to application, not discard.`);
   if (workstream.lifecycle === "completed" && current.outputDisposition === undefined)
     assertCompletedObligation(workstream, key, "disposition");
   if (
