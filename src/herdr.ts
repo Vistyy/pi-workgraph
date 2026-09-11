@@ -213,7 +213,7 @@ export class HerdrCliRuntime {
           ? cause
           : new CoordinatorLaunchError(
               undefined,
-              `Coordinator workspace creation is uncertain for session ${request.sessionFile} at ${request.cwd}: ${cause.message} Inspect the deterministic label before retrying; no cleanup was attempted.`,
+              `Coordinator workspace creation is uncertain for session ${request.sessionFile} at ${request.cwd}: ${cause.message} The child session was retained; do not clean up or retry this launch.`,
               cause,
             ),
       ),
@@ -248,14 +248,7 @@ export class HerdrCliRuntime {
         yield* protocolTry(["agent", "start"], () => assertCoordinatorPlacement(resource, started));
         const native = resourceOf(started);
         retained = { ...resource, terminalId: native.terminalId };
-        const identity = yield* this.awaitNativeIdentity(native, resource.sessionFile);
-        const confirmation = yield* this.observe(identity);
-        if (confirmation.status !== "working")
-          return yield* new CoordinatorLaunchError(
-            retained,
-            `Coordinator launch did not confirm a running Pi agent; exact status is ${confirmation.status}.`,
-          );
-        return identity;
+        return yield* this.awaitNativeIdentity(native, resource.sessionFile);
       }.bind(this),
     ).pipe(
       Effect.mapError((cause) =>
@@ -263,7 +256,7 @@ export class HerdrCliRuntime {
           ? cause
           : new CoordinatorLaunchError(
               retained,
-              `Coordinator launch is uncertain in workspace ${resource.workspaceId}, tab ${resource.tabId}, pane ${resource.paneId}, agent ${resource.agentName}, session ${resource.sessionFile}, cwd ${resource.cwd}: ${cause.message} Inspect these exact handles before retrying; the workspace was retained.`,
+              `Coordinator launch is uncertain in workspace ${resource.workspaceId}, tab ${resource.tabId}, pane ${resource.paneId}, agent ${resource.agentName}, session ${resource.sessionFile}, cwd ${resource.cwd}: ${cause.message} The child session and known native resources were retained; do not clean up or retry this launch.`,
               cause,
             ),
       ),

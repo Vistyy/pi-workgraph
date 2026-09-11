@@ -77,7 +77,7 @@ A Handoff is a nonpersisted capability, not parent Workstream state. `workgraph_
 
 Each invocation creates one fresh parentless Pi session using Pi's default model configuration. The child session retains the exact grant needed to bootstrap its independent grant-grounded Workstream and one kickoff through the normal coordinator startup path. Optional context contains only the discussion before the persisted invoking tool call, excludes Workgraph-owned entries, and is explicitly non-authoritative.
 
-The capability submits one Herdr coordinator launch and waits within that call for exact running identity across the session file, repository cwd, workspace, tab, pane, terminal, agent name, and native Pi identity. Success returns only that identity. Failure retains the child session and reports known resource evidence without storing a retryable parent lifecycle or automatically resubmitting; uncertain resources are preserved.
+The capability submits one Herdr coordinator launch and waits within that call for exact identity across the session file, repository cwd, workspace, tab, pane, terminal, agent name, and native Pi identity; either Herdr `working` or `idle` is launch-ready once that identity is exact. Success returns only that identity. The current Herdr adapter has no conclusive prelaunch failure classification, so every launch failure is uncertain: retain the child session and every known native resource, and never speculate cleanup or retry. An interrupted caller may receive no adapter result and therefore no handles; this limitation does not authorize cleanup, resubmission, or parent recovery state.
 
 ### Separate worker, output, and coordination lifetime
 

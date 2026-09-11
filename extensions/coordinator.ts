@@ -166,7 +166,7 @@ const ControlSchema = Type.Union(
 );
 const HandoffSchema = Type.Object(
   {
-    request: NonEmpty,
+    request: Type.String({ minLength: 1, pattern: "\\S" }),
     includeContext: Type.Optional(Type.Boolean({ default: false })),
   },
   { additionalProperties: false },

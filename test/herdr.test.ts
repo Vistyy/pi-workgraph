@@ -409,7 +409,10 @@ else console.log(JSON.stringify({result:{accepted:true}}));
           sessionFile,
           cwd,
         });
-        assert.match(String(error), /Inspect these exact handles before retrying/);
+        assert.match(
+          String(error),
+          /child session and known native resources were retained; do not clean up or retry/i,
+        );
         return true;
       },
     );

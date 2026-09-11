@@ -22,7 +22,9 @@ import {
   HANDOFF_CONTEXT_ENTRY,
   HANDOFF_KICKOFF_CLAIM_ENTRY,
   HANDOFF_KICKOFF_ENTRY,
+  handoffChildWorkstreamId,
   prepareHandoffSession,
+  sealedHandoffGrant,
 } from "../src/handoff-session.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { liveLayer } from "../src/node-platform.js";
@@ -162,9 +164,14 @@ void test("package and staged factory register only the workstream coordinator a
     assert.ok(handoff !== undefined);
     assert.equal(Value.Check(handoff.parameters, { request: "Narrow request" }), true);
     assert.equal(
+      Value.Check(handoff.parameters, { request: "Narrow request", includeContext: false }),
+      true,
+    );
+    assert.equal(
       Value.Check(handoff.parameters, { request: "Narrow request", includeContext: true }),
       true,
     );
+    assert.equal(Value.Check(handoff.parameters, { request: " \t\n" }), false);
     assert.equal(
       Value.Check(handoff.parameters, { request: "Narrow request", forkContext: true }),
       false,
@@ -299,7 +306,7 @@ void test("kickoff host failure leaves a durable uncertain claim and never resen
   }
 });
 
-void test("registered handoff launches fresh context/no-context sessions without parent mutation", async () => {
+void test("registered nested handoff accepts idle identity and leaves parent SQLite unchanged", async () => {
   const native = await mkdtemp(join(tmpdir(), "workstream-handoff-herdr-"));
   const command = join(native, "herdr.mjs");
   const stateFile = join(native, "state.json");
@@ -312,36 +319,66 @@ const args = process.argv.slice(2); appendFileSync(${JSON.stringify(logFile)}, J
 const read = () => existsSync(${JSON.stringify(stateFile)}) ? JSON.parse(readFileSync(${JSON.stringify(stateFile)}, "utf8")) : undefined;
 if (args[0] === "workspace" && args[1] === "create") { const cwd=args[args.indexOf("--cwd")+1]; writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify({cwd})); console.log(JSON.stringify({result:{workspace:{workspace_id:"handoff-workspace"},tab:{tab_id:"handoff-tab"},root_pane:{pane_id:"handoff-pane"}}})); }
 else if (args[0] === "agent" && args[1] === "start") { const prior=read(); const session=args[args.indexOf("--session")+1]; writeFileSync(${JSON.stringify(stateFile)}, JSON.stringify({...prior,name:args[2],session})); console.log(JSON.stringify({result:{agent:{workspace_id:"handoff-workspace",tab_id:"handoff-tab",pane_id:"handoff-pane",terminal_id:"handoff-terminal",agent_status:"working",name:args[2],cwd:prior.cwd}}})); }
-else if (args[0] === "agent" && args[1] === "get") { const value=read(); console.log(JSON.stringify({result:{agent:{workspace_id:"handoff-workspace",tab_id:"handoff-tab",pane_id:"handoff-pane",terminal_id:"handoff-terminal",agent_status:"working",name:value.name,cwd:value.cwd,agent_session:{value:value.session}}}})); }
+else if (args[0] === "agent" && args[1] === "get") { const value=read(); console.log(JSON.stringify({result:{agent:{workspace_id:"handoff-workspace",tab_id:"handoff-tab",pane_id:"handoff-pane",terminal_id:"handoff-terminal",agent_status:"idle",name:value.name,cwd:value.cwd,agent_session:{value:value.session}}}})); }
 else console.log(JSON.stringify({result:{}}));
 `,
   );
   await chmod(command, 0o755);
   const runtime = new HerdrCliRuntime(command, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "parent" });
-  const f = await fixture({}, [(pi) => workstreamCoordinator(pi, { workers: () => runtime })]);
+  const f = await fixture(
+    {},
+    [(pi) => workstreamCoordinator(pi, { workers: () => runtime })],
+    childGrant,
+  );
   const childSessions: string[] = [];
   try {
-    await f.input("Coordinate the parent request");
-    await f.call("workgraph_intent", {
-      statement: "Coordinate the parent request",
-      constraints: ["Keep scope narrow"],
-    });
-    const before = await f.call("workgraph_inspect", { section: "overview" });
+    assert.ok(f.grant !== undefined);
+    await f.runner.emit({ type: "session_start", reason: "new" });
+    const pointer = f.session
+      .getBranch()
+      .findLast(
+        (entry) => entry.type === "custom" && entry.customType === WORKSTREAM_POINTER_ENTRY,
+      );
+    assert.ok(pointer?.type === "custom");
+    const parentStatePath = (pointer.data as { path: string }).path;
+    const parentDatabase = new DatabaseSync(parentStatePath, { readOnly: true });
+    const parentStateBefore = parentDatabase
+      .prepare("SELECT state_json FROM workstream WHERE singleton=1")
+      .get() as { state_json: string };
+    parentDatabase.close();
+
     const clean = await f.callWithId("clean-call", "workgraph_handoff", {
       request: "Perform the clean child part",
     });
     const cleanIdentity = clean.details as { sessionFile: string; cwd: string };
     childSessions.push(cleanIdentity.sessionFile);
     assert.equal(cleanIdentity.cwd, f.root);
+    const cleanSession = SessionManager.open(cleanIdentity.sessionFile);
     assert.equal(
-      SessionManager.open(cleanIdentity.sessionFile)
+      cleanSession
         .getBranch()
         .some(
           (entry) => entry.type === "custom_message" && entry.customType === HANDOFF_CONTEXT_ENTRY,
         ),
       false,
     );
+    const nestedGrant = sealedHandoffGrant(cleanSession);
+    assert.ok(nestedGrant !== undefined);
+    assert.deepEqual(nestedGrant.parentReceipt, f.grant.parentReceipt);
+    assert.equal(
+      nestedGrant.parentWorkstreamId,
+      handoffChildWorkstreamId(f.session.getSessionId()),
+    );
+    assert.deepEqual(nestedGrant.parentRepository, f.grant.targetRepository);
+    assert.equal(nestedGrant.parentIntentIndex, 0);
+    assert.equal(nestedGrant.parentIntentStatement, f.grant.narrowedRequest);
+    assert.deepEqual(nestedGrant.parentIntentConstraints, f.grant.parentIntentConstraints);
 
+    f.session.appendMessage({
+      role: "user",
+      content: "Useful non-authoritative discussion for the nested child",
+      timestamp: 2,
+    });
     appendHandoffInvocation(f.session, "Perform the contextual child part", "context-call");
     const contextual = await f.callWithId("context-call", "workgraph_handoff", {
       request: "Perform the contextual child part",
@@ -358,11 +395,12 @@ else console.log(JSON.stringify({result:{}}));
         ).length,
       1,
     );
-    const after = await f.call("workgraph_inspect", { section: "overview" });
-    assert.equal(
-      (after.details as { revision: number }).revision,
-      (before.details as { revision: number }).revision,
-    );
+    const parentReadback = new DatabaseSync(parentStatePath, { readOnly: true });
+    const parentStateAfter = parentReadback
+      .prepare("SELECT state_json FROM workstream WHERE singleton=1")
+      .get() as { state_json: string };
+    parentReadback.close();
+    assert.equal(parentStateAfter.state_json, parentStateBefore.state_json);
     const calls = (await readFile(logFile, "utf8"))
       .trim()
       .split("\n")
@@ -407,6 +445,14 @@ else console.log(JSON.stringify({result:{}}));
       .map((line) => JSON.parse(line) as string[]);
     assert.equal(calls.filter((args) => args[0] === "workspace" && args[1] === "create").length, 1);
     assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "start").length, 1);
+    assert.equal(
+      calls.some((args) => args[0] === "agent" && args[1] === "get"),
+      false,
+    );
+    assert.equal(
+      calls.some((args) => args[0] === "tab" && args[1] === "close"),
+      false,
+    );
     const after = await f.call("workgraph_inspect", { section: "overview" });
     assert.equal(
       (after.details as { revision: number }).revision,
@@ -449,6 +495,10 @@ else console.log(JSON.stringify({result:{}}));
       .split("\n")
       .map((line) => JSON.parse(line) as string[]);
     assert.equal(calls.filter((args) => args[0] === "agent" && args[1] === "start").length, 1);
+    assert.equal(
+      calls.some((args) => args[0] === "tab" && args[1] === "close"),
+      false,
+    );
   } finally {
     await f.dispose();
     await rm(native, { recursive: true, force: true });

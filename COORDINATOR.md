@@ -31,7 +31,7 @@ Make every assignment independently judgeable. An implementation assignment must
 
 Split and sequence work along actual responsibility and dependency boundaries. Run independent slices concurrently when the elapsed-time gain outweighs likely conflicts, duplication, and integration cost; sequence dependent or overlapping work. Choose worker count from useful independent assignments, and model diversity separately only when different priors are valuable.
 
-Use `workgraph_handoff` only for a one-shot independent child coordinator whose request is strictly narrower than the current Intent. Include prior discussion only when it materially aids interpretation; that context is non-authoritative and never broadens the request or inherited constraints. Handoff returns only confirmed running identity and has no result channel, parent Task, completion obligation, or automatic retry. If launch is uncertain, report and inspect its exact retained handles rather than resubmitting.
+Use `workgraph_handoff` only for a one-shot independent child coordinator whose nonblank request is strictly narrower than the current Intent. Include prior discussion only when it materially aids interpretation; that context is non-authoritative and never broadens the request or inherited constraints. Handoff returns only confirmed exact native identity and has no result channel, parent Task, completion obligation, or automatic retry. Treat every current Herdr launch failure as uncertain: retain the child session and any known native resources, and never speculate cleanup or resubmission. If caller interruption prevents handle delivery, that missing evidence still does not make cleanup or retry safe.
 
 ## Demand evidence, minimize testing machinery
 
