@@ -32,7 +32,6 @@ const WorkerContextDetailsSchema = Type.Intersect([
     phase: Type.Optional(Type.Union([Type.Literal("guide"), Type.Literal("executor")])),
   }),
 ]);
-type ParsedWorkerContextIdentity = Static<typeof WorkerContextIdentitySchema>;
 type WorkerContextDetails = Static<typeof WorkerContextDetailsSchema>;
 type WorkerContextMessage = Pick<
   Parameters<ExtensionAPI["sendMessage"]>[0],
@@ -121,10 +120,8 @@ export function hasActiveObjective(
 ): boolean {
   return entries.some((entry) => {
     if (entry.type !== "custom_message") return false;
-    if (entry.customType === WORKER_OBJECTIVE_MESSAGE_TYPE) {
-      const objective = objectiveIdentity(entry.details);
-      return objective !== undefined && belongsToIdentity(objective, identity);
-    }
+    if (entry.customType === WORKER_OBJECTIVE_MESSAGE_TYPE)
+      return isWorkerIdentityData(entry.details, identity);
     const details = contextDetails(entry.details, identity);
     return entry.customType === WORKER_RECOVERY_MESSAGE_TYPE && details?.kind === "recovery";
   });
@@ -176,22 +173,15 @@ function contextDetails(
 ): WorkerContextDetails | undefined {
   if (!Value.Check(WorkerContextDetailsSchema, data)) return undefined;
   const details = Value.Decode(WorkerContextDetailsSchema, data);
-  return belongsToIdentity(details, identity) ? details : undefined;
+  return isWorkerIdentityData(details, identity) ? details : undefined;
 }
 
-// SAFETY: Session custom-message details are untrusted input decoded before use.
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Explicit Pi session decode boundary.
-function objectiveIdentity(data: unknown): ParsedWorkerContextIdentity | undefined {
-  return Value.Check(WorkerContextIdentitySchema, data)
-    ? Value.Decode(WorkerContextIdentitySchema, data)
-    : undefined;
-}
-
-function belongsToIdentity(
-  data: ParsedWorkerContextIdentity,
-  identity: WorkerContextIdentity,
-): boolean {
-  return data.runId === identity.runId && data.nodeId === identity.nodeId;
+// SAFETY: Pi session custom data is untrusted and decoded before identity comparison.
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Shared strict identity decoding owns this Pi session boundary.
+export function isWorkerIdentityData(data: unknown, identity: WorkerContextIdentity): boolean {
+  if (!Value.Check(WorkerContextIdentitySchema, data)) return false;
+  const decoded = Value.Decode(WorkerContextIdentitySchema, data);
+  return decoded.runId === identity.runId && decoded.nodeId === identity.nodeId;
 }
 
 /** One concrete workstream worker assignment; every launch fact is built once here. */
