@@ -3,7 +3,7 @@ import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import type { ResolvedReviewInput } from "./canonical-reconciliation.js";
 import type { CandidateLineage, Intent, TaskContract } from "./domain/workstream.js";
-import type { WorkerSessionMode } from "./types.js";
+import type { WorkerSessionMode } from "./report-schema.js";
 
 export type WorkerPhase = "guide" | "executor";
 export type WorkerPolicyRole = WorkerSessionMode | "consultation" | "experiment";

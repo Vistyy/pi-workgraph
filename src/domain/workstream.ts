@@ -1,7 +1,7 @@
 import { DateTime, Option } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { EvidenceInputSchema, WorkerReportInputSchema } from "../report-schema.js";
+import { EvidenceSchema, WorkerReportSchema } from "../report-schema.js";
 import { ModelTargetSchema } from "./model-target.js";
 
 const CANONICAL_WORKSTREAM_FORMAT = "pi-workgraph-workstream" as const;
@@ -45,7 +45,7 @@ const CoordinatorTransferSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const HumanInputReceiptSchema = Type.Object(
+export const HumanInputReceiptSchema = Type.Object(
   {
     kind: Type.Literal("human_input_receipt"),
     id: NonEmptyString,
@@ -375,7 +375,7 @@ const OutcomeBase = {
 };
 const OutcomeSchema = Type.Union([
   Type.Object(
-    { ...OutcomeBase, kind: Type.Literal("reported"), report: WorkerReportInputSchema },
+    { ...OutcomeBase, kind: Type.Literal("reported"), report: WorkerReportSchema },
     { additionalProperties: false },
   ),
   Type.Object(
@@ -495,7 +495,7 @@ const CompletionAccountingSchema = Type.Union([
 const CompletionSchema = Type.Object(
   {
     conclusion: NonEmptyString,
-    evidence: Type.Array(EvidenceInputSchema, { minItems: 1 }),
+    evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
     limitations: Type.Array(NonEmptyString),
     accounting: Type.Array(CompletionAccountingSchema),
     completedAt: Timestamp,

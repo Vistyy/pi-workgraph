@@ -1,12 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Value } from "typebox/value";
-import {
-  reportSchemaForMode,
-  WorkerReportInputSchema,
-  WorkerReportSchema,
-} from "../src/report-schema.js";
-import type { WorkerMode } from "../src/types.js";
+import { reportSchemaForMode, type WorkerMode } from "../src/report-schema.js";
 
 const reportContent = {
   summary: "Bounded result",
@@ -62,45 +57,5 @@ void test("live report schemas reject undeclared top-level and nested sensitive 
       false,
       `${mode} superseded finding classification`,
     );
-  }
-});
-
-void test("historical report decoding preserves fields accepted by the legacy schema", () => {
-  const reports = [
-    {
-      kind: "research",
-      status: "completed",
-      ...reportContent,
-      legacyTopLevel: { source: "retained research bytes" },
-      evidence: [{ ...reportContent.evidence[0], legacyEvidence: "retained" }],
-      findings: [
-        { ...reportContent.findings[0], envelopeImpact: "none", legacyFinding: "retained" },
-      ],
-    },
-    {
-      kind: "review",
-      status: "completed",
-      ...reportContent,
-      legacyTopLevel: { source: "retained review bytes" },
-      evidence: [{ ...reportContent.evidence[0], legacyEvidence: "retained" }],
-      findings: [
-        { ...reportContent.findings[0], envelopeImpact: "none", legacyFinding: "retained" },
-      ],
-    },
-    {
-      kind: "implementation",
-      status: "failed",
-      ...reportContent,
-      evidence: [{ ...reportContent.evidence[0], legacyEvidence: "retained" }],
-      findings: [
-        { ...reportContent.findings[0], envelopeImpact: "none", legacyFinding: "retained" },
-      ],
-    },
-  ];
-
-  for (const report of reports) {
-    assert.equal(Value.Check(WorkerReportSchema, report), true, report.kind);
-    assert.deepEqual(Value.Decode(WorkerReportSchema, report), report);
-    assert.equal(Value.Check(WorkerReportInputSchema, report), false, report.kind);
   }
 });

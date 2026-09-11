@@ -4,11 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path"; // oxlint-disable-line effecttsgo/node-builtin-import -- The fixture path is an isolated session/repository identity.
 import test from "node:test";
 import { Type } from "typebox";
-import { Value } from "typebox/value";
-import {
-  CanonicalHumanInputReceiptSchema,
-  HumanInputReceiptSchema,
-} from "../src/coordinator-notepad.js";
 import {
   configureFixtureEnvironment,
   decodeTestValue,
@@ -56,21 +51,6 @@ async function reminderText(f: Awaited<ReturnType<typeof fixture>>): Promise<str
     ? message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
     : message.content;
 }
-
-void test("predecessor and canonical receipt decoders retain their distinct cutover contracts", () => {
-  const historical = {
-    id: "old",
-    sessionId: "session",
-    sessionFile: "/sessions/session.jsonl",
-    source: "interactive",
-    text: "Historical input",
-  };
-  assert.equal(Value.Check(HumanInputReceiptSchema, historical), true);
-  assert.equal(Value.Check(CanonicalHumanInputReceiptSchema, historical), false);
-  const current = { ...historical, receivedAt: "2024-01-01T00:00:00.000Z" };
-  assert.equal(Value.Check(HumanInputReceiptSchema, current), true);
-  assert.equal(Value.Check(CanonicalHumanInputReceiptSchema, current), true);
-});
 
 void test("coordinator exposes only the read/add/update/remove notepad and edits need no receipt", async () => {
   const f = await fixture();
@@ -162,50 +142,6 @@ void test("notepad stays on demand during ordinary turns and restores only nonem
       willRetry: false,
     });
     assert.equal(f.messages.length, 1);
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("legacy pending note substance migrates once without restoring ledger state", async () => {
-  const f = await fixture();
-  try {
-    f.session.appendCustomEntry("pi-workgraph-coordinator-note-state", {
-      version: 1,
-      notes: [
-        {
-          id: "pending",
-          summary: "Keep this pending substance.",
-          status: "pending",
-          presentations: [],
-        },
-        { id: "done", summary: "Do not restore this.", status: "resolved", presentations: [] },
-      ],
-      drafts: [
-        {
-          operation: "record",
-          id: "draft-only",
-          summary: "Not presented; do not restore.",
-          toolCallId: "old-call",
-          supersedes: [],
-        },
-      ],
-    });
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    const response = await f.call("workgraph_notepad", { action: "read" });
-    assert.deepEqual(decodeTestValue(NotepadDetailsSchema, response.details).notepad.items, [
-      { id: "pending", text: "Keep this pending substance." },
-    ]);
-    assert.equal(
-      f.session
-        .getBranch()
-        .filter(
-          (entry) =>
-            entry.type === "custom" &&
-            entry.customType === "pi-workgraph-coordinator-notepad-state",
-        ).length,
-      1,
-    );
   } finally {
     await f.dispose();
   }

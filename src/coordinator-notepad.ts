@@ -2,46 +2,13 @@ import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { DateTime } from "effect";
-import { type Static, Type } from "typebox";
+import { Type } from "typebox";
 import { Value } from "typebox/value";
+import { type HumanInputReceipt, HumanInputReceiptSchema } from "./domain/workstream.js";
 
 const HUMAN_INPUT_ENTRY = "pi-workgraph-human-input";
 const NOTEPAD_STATE_ENTRY = "pi-workgraph-coordinator-notepad-state";
-const LEGACY_NOTE_STATE_ENTRY = "pi-workgraph-coordinator-note-state";
 const NOTEPAD_PREFIX = "[WORKGRAPH PENDING ITEMS]";
-
-export const HumanInputReceiptSchema = Type.Object({
-  id: Type.String(),
-  sessionId: Type.String(),
-  sessionFile: Type.String(),
-  source: StringEnum(["interactive", "rpc"] as const),
-  text: Type.String(),
-});
-
-export type HumanInputReceipt = {
-  id: string;
-  sessionId: string;
-  sessionFile: string;
-  source: "interactive" | "rpc";
-  text: string;
-};
-
-export const CanonicalHumanInputReceiptSchema = Type.Object(
-  {
-    id: Type.String({ minLength: 1 }),
-    sessionId: Type.String({ minLength: 1 }),
-    sessionFile: Type.String({ minLength: 1 }),
-    source: StringEnum(["interactive", "rpc"] as const),
-    text: Type.String({ minLength: 1 }),
-    receivedAt: Type.String({
-      format: "date-time",
-      pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
-    }),
-  },
-  { additionalProperties: false },
-);
-
-export type CanonicalHumanInputReceipt = Static<typeof CanonicalHumanInputReceiptSchema>;
 
 type SessionOwner = Pick<HumanInputReceipt, "sessionId" | "sessionFile">;
 export type PendingItem = { id: string; text: string };
@@ -55,28 +22,6 @@ const CoordinatorNotepadStateSchema = Type.Object(
   { version: Type.Literal(2), items: Type.Array(PendingItemSchema) },
   { additionalProperties: false },
 );
-const LegacyNoteStateSchema = Type.Object({
-  version: Type.Literal(1),
-  notes: Type.Array(
-    Type.Object({
-      id: Type.String(),
-      summary: Type.String(),
-      status: StringEnum(["pending", "resolved", "superseded"] as const),
-      presentations: Type.Array(Type.Unknown()),
-      resolution: Type.Optional(Type.Unknown()),
-      supersededBy: Type.Optional(Type.String()),
-    }),
-  ),
-  drafts: Type.Array(
-    Type.Object({
-      operation: StringEnum(["record", "update", "supersede"] as const),
-      id: Type.String(),
-      summary: Type.String(),
-      toolCallId: Type.String(),
-      supersedes: Type.Array(Type.String()),
-    }),
-  ),
-});
 const NotepadRequestSchema = Type.Object({
   action: StringEnum(["read", "add", "update", "remove"] as const),
   id: Type.Optional(Type.String({ minLength: 1 })),
@@ -90,7 +35,7 @@ type InstallOptions = {
 };
 
 export type CoordinatorSessionState = {
-  getHumanReceipts(): CanonicalHumanInputReceipt[];
+  getHumanReceipts(): HumanInputReceipt[];
   getNotepadState(): CoordinatorNotepadState;
 };
 
@@ -100,49 +45,32 @@ export function installCoordinatorSessionState(
   options: InstallOptions,
 ): CoordinatorSessionState {
   let state = emptyState();
-  let receipts: CanonicalHumanInputReceipt[] = [];
+  let receipts: HumanInputReceipt[] = [];
 
   const persist = (): void => {
     pi.appendEntry(NOTEPAD_STATE_ENTRY, cloneState(state));
   };
 
-  const restore = (ctx: ExtensionContext, persistMigration: boolean): void => {
+  const restore = (ctx: ExtensionContext): void => {
     const owner = options.owner(ctx);
     const branch = ctx.sessionManager.getBranch();
     receipts = branch.flatMap((entry) => receiptFromEntry(entry, owner));
     const current = branch.findLast(
       (entry) => entry.type === "custom" && entry.customType === NOTEPAD_STATE_ENTRY,
     );
-    if (current !== undefined) {
-      if (current.type !== "custom" || !Value.Check(CoordinatorNotepadStateSchema, current.data)) {
-        state = emptyState();
-        ctx.ui.notify(
-          "Coordinator notepad state is malformed on this branch; it was not interpreted or cleared.",
-          "warning",
-        );
-        return;
-      }
-      state = cloneState(Value.Decode(CoordinatorNotepadStateSchema, current.data));
-      return;
-    }
-
-    const legacy = branch.findLast(
-      (entry) => entry.type === "custom" && entry.customType === LEGACY_NOTE_STATE_ENTRY,
-    );
-    if (legacy === undefined) {
+    if (current === undefined) {
       state = emptyState();
       return;
     }
-    if (legacy.type !== "custom" || !Value.Check(LegacyNoteStateSchema, legacy.data)) {
+    if (current.type !== "custom" || !Value.Check(CoordinatorNotepadStateSchema, current.data)) {
       state = emptyState();
       ctx.ui.notify(
-        "Legacy coordinator note state is malformed on this branch; it was not interpreted or cleared.",
+        "Coordinator notepad state is malformed on this branch; it was not interpreted or cleared.",
         "warning",
       );
       return;
     }
-    state = migrateLegacyState(Value.Decode(LegacyNoteStateSchema, legacy.data));
-    if (persistMigration) persist();
+    state = cloneState(Value.Decode(CoordinatorNotepadStateSchema, current.data));
   };
 
   pi.on("input", (event, ctx) => {
@@ -151,7 +79,8 @@ export function installCoordinatorSessionState(
     const source = event.source;
     const receivedAt = DateTime.formatIso(DateTime.nowUnsafe());
     return options.serialize(() => {
-      const receipt: CanonicalHumanInputReceipt = {
+      const receipt: HumanInputReceipt = {
+        kind: "human_input_receipt",
         id: randomUUID(),
         ...options.owner(ctx),
         source,
@@ -164,8 +93,8 @@ export function installCoordinatorSessionState(
     });
   });
 
-  pi.on("session_start", (_event, ctx) => restore(ctx, true));
-  pi.on("session_tree", (_event, ctx) => restore(ctx, false));
+  pi.on("session_start", (_event, ctx) => restore(ctx));
+  pi.on("session_tree", (_event, ctx) => restore(ctx));
 
   // Compaction removes earlier tool results, so restore only current nonempty pending memory.
   pi.on("session_compact", (_event, ctx) => {
@@ -223,16 +152,16 @@ function cloneState(state: CoordinatorNotepadState): CoordinatorNotepadState {
   return structuredClone(state);
 }
 
-function receiptFromEntry(entry: SessionEntry, owner: SessionOwner): CanonicalHumanInputReceipt[] {
+function receiptFromEntry(entry: SessionEntry, owner: SessionOwner): HumanInputReceipt[] {
   if (
     entry.type !== "custom" ||
     entry.customType !== HUMAN_INPUT_ENTRY ||
-    !Value.Check(CanonicalHumanInputReceiptSchema, entry.data) ||
+    !Value.Check(HumanInputReceiptSchema, entry.data) ||
     entry.data.sessionId !== owner.sessionId ||
     entry.data.sessionFile !== owner.sessionFile
   )
     return [];
-  return [Value.Decode(CanonicalHumanInputReceiptSchema, entry.data)];
+  return [Value.Decode(HumanInputReceiptSchema, entry.data)];
 }
 
 function applyNotepadAction(
@@ -277,23 +206,4 @@ function formatNotepad(state: CoordinatorNotepadState): string {
 
 function compactLine(text: string): string {
   return text.replace(/\s+/g, " ").trim();
-}
-
-function migrateLegacyState(legacy: {
-  notes: Array<{ id: string; summary: string; status: "pending" | "resolved" | "superseded" }>;
-  drafts: Array<{
-    operation: "record" | "update" | "supersede";
-    id: string;
-    summary: string;
-    supersedes: string[];
-  }>;
-}): CoordinatorNotepadState {
-  const items = new Map(
-    legacy.notes
-      .filter((note) => note.status === "pending")
-      .map((note) => [note.id, { id: note.id, text: note.summary.trim() }]),
-  );
-  // Drafts were never presentation-grounded and therefore are not current pending substance.
-  // Their schema is decoded for safe migration, but their ledger semantics end here.
-  return { version: 2, items: [...items.values()].filter((item) => item.text !== "") };
 }

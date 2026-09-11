@@ -930,13 +930,17 @@ void test("plan persistence publishes before state and leaves the old plan on ap
   }
 });
 
-void test("legacy plans restore with monotonic IDs; malformed identities and allocators stay rejected", async () => {
+void test("current plans restore with monotonic IDs; malformed identities and allocators stay rejected", async () => {
   const f = await fixture("implementation");
   try {
     f.session.appendCustomEntry("pi-workgraph-worker-plan", {
       runId: "fixture",
       nodeId: "attempt",
-      plan: initialPlan,
+      nextStepNumber: 3,
+      plan: {
+        ...initialPlan,
+        steps: initialPlan.steps.map((step, index) => ({ ...step, id: `step-${index + 1}` })),
+      },
     });
     await f.runner.emit({ type: "session_start", reason: "reload" });
     const restored = decodeTestValue(
@@ -970,14 +974,15 @@ void test("legacy plans restore with monotonic IDs; malformed identities and all
     numbered.session.appendCustomEntry("pi-workgraph-worker-plan", {
       runId: "fixture",
       nodeId: "attempt",
+      nextStepNumber: 10,
       plan: {
         ...initialPlan,
         steps: [
           {
             id: "step-8",
-            text: "A legacy superseded row remains readable.",
+            text: "A superseded row remains part of the mutable plan.",
             status: "superseded",
-            note: "Historical removal reason.",
+            note: "Supported removal reason.",
           },
           { id: "step-9", text: "A valid widened identity.", status: "pending" },
         ],
@@ -996,7 +1001,7 @@ void test("legacy plans restore with monotonic IDs; malformed identities and all
     const removed = await numbered.call("workgraph_plan", {
       action: "remove_step",
       id: "step-8",
-      reason: "Clear the migrated legacy tombstone from current navigation.",
+      reason: "Remove the superseded step from current navigation.",
     });
     assert.deepEqual(
       decodeTestValue(planToolDetailsSchema, removed.details).plan?.steps.map((step) => step.id),
@@ -1508,12 +1513,6 @@ void test("continued implementation requires this attempt's native start and lat
       true,
       { runId: "fixture", nodeId: "attempt", mode: "implementation" },
     );
-    f.session.appendCustomMessageEntry(
-      "pi-workgraph-executor",
-      "[WORKGRAPH EXECUTOR]\nLegacy executor guidance.",
-      false,
-      { runId: "fixture", nodeId: "attempt" },
-    );
     await f.runner.emit({ type: "session_start", reason: "startup" });
     const initial = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
       cwd: f.session.getCwd(),
@@ -1534,15 +1533,6 @@ void test("continued implementation requires this attempt's native start and lat
       cwd: f.session.getCwd(),
     });
     assert.equal(repeated?.messages?.length ?? 0, 0);
-    assert.equal(
-      f.session
-        .getBranch()
-        .filter(
-          (entry) =>
-            entry.type === "custom_message" && entry.customType === "pi-workgraph-executor",
-        ).length,
-      1,
-    );
     await writeFile(join(f.root, "value.txt"), "after\n");
     await git(f.root, "commit", "-am", "Continued change");
     await assert.rejects(f.call("workgraph_report", report), /actual executor assistant message/);

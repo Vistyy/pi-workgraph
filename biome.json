@@ -2,14 +2,6 @@
   "$schema": "https://biomejs.dev/schemas/2.5.12/schema.json",
   "extends": ["@syzom/typescript-quality/biome"],
   "files": {
-    "includes": [
-      "src/**",
-      "extensions/**",
-      "test/**",
-      "scripts/**",
-      "bin/**",
-      "oxlint.config.ts",
-      "*.json"
-    ]
+    "includes": ["src/**", "extensions/**", "test/**", "scripts/**", "oxlint.config.ts", "*.json"]
   }
 }

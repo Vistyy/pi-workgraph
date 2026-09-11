@@ -52,7 +52,8 @@ import { HerdrCliRuntime } from "../src/herdr.js";
 import type { ModelPolicy } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
 import type { NativeFailureCategory, WorkerSessionResolution } from "../src/pi-process.js";
-import type { WorkerIdentity, WorkerObservationStatus, WorkerReport } from "../src/types.js";
+import type { WorkerReport } from "../src/report-schema.js";
+import type { WorkerIdentity, WorkerObservationStatus } from "../src/types.js";
 import { git } from "./helpers.js";
 
 const ID = "driver";

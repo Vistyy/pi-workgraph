@@ -41,7 +41,7 @@ import {
   WorkerExecutionSchema,
   WorkstreamSchema,
 } from "../src/domain/workstream.js";
-import { EvidenceInputSchema, WorkerReportInputSchema } from "../src/report-schema.js";
+import { EvidenceSchema, WorkerReportSchema } from "../src/report-schema.js";
 import { canonicalSessionMode, canonicalWorkerAssignment } from "../src/worker-context.js";
 
 const repository = { projectRoot: "/repo", gitCommonDir: "/repo/.git" };
@@ -374,12 +374,9 @@ void test("pure aggregate schemas are strict and identifiers are opaque", () => 
     }),
     false,
   );
+  assert.equal(Value.Check(EvidenceSchema, { label: "x", observation: "y", extra: true }), false);
   assert.equal(
-    Value.Check(EvidenceInputSchema, { label: "x", observation: "y", extra: true }),
-    false,
-  );
-  assert.equal(
-    Value.Check(WorkerReportInputSchema, {
+    Value.Check(WorkerReportSchema, {
       kind: "research",
       status: "completed",
       summary: "ok",
@@ -1533,19 +1530,19 @@ void test("an exact completed release and cleanup is operationally stable", () =
     { state: "completed", workerClosed: true, expectedHead: changedCommit },
     "t4",
   );
-  const imported = structuredClone(workstream);
-  const importedTask = imported.tasks[0];
-  assert.ok(importedTask);
-  const importedAttempt = importedTask.attempts[0];
-  assert.ok(importedAttempt);
-  importedAttempt.outputRelease = {
+  const released = structuredClone(workstream);
+  const releasedTask = released.tasks[0];
+  assert.ok(releasedTask);
+  const releasedAttempt = releasedTask.attempts[0];
+  assert.ok(releasedAttempt);
+  releasedAttempt.outputRelease = {
     state: "completed",
     expectedHead: changedCommit,
-    reason: "Legacy exact release checkpoint.",
+    reason: "Exact release checkpoint.",
   };
-  validateWorkstream(imported);
-  assert.equal(isOperationallyStable(importedTask, importedAttempt), true);
-  assert.deepEqual(deriveCompletionAccounting(imported), []);
+  validateWorkstream(released);
+  assert.equal(isOperationallyStable(releasedTask, releasedAttempt), true);
+  assert.deepEqual(deriveCompletionAccounting(released), []);
 });
 
 void test("shared Worker closure and delivery gate reattempt and accounting", () => {

@@ -25,7 +25,7 @@ import type {
   WorktreeCleanupResult,
   WorktreePlacement,
 } from "./git.js";
-import { EvidenceInputSchema } from "./report-schema.js";
+import { EvidenceSchema } from "./report-schema.js";
 import type { WorkerIdentity } from "./types.js";
 
 const NonEmptyString = Type.String({ minLength: 1 });
@@ -35,7 +35,7 @@ export const ReviseIntentCommandSchema = IntentSchema;
 export const CompleteCommandSchema = Type.Object(
   {
     conclusion: NonEmptyString,
-    evidence: Type.Array(EvidenceInputSchema, { minItems: 1 }),
+    evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
     limitations: Type.Array(NonEmptyString),
   },
   { additionalProperties: false },

@@ -34,13 +34,8 @@ import type { WorktreePlacement } from "./git.js";
 import type { WorkerLaunchInspection, WorkerLaunchInspectionRequest } from "./herdr.js";
 import type { WorkerLaunchEffectRequest } from "./herdr-launch.js";
 import type { NativeFailureCategory, WorkerSessionResolution } from "./pi-process.js";
-import type {
-  ThinkingLevel,
-  WorkerIdentity,
-  WorkerObservationStatus,
-  WorkerReport,
-  WorkerSessionMode,
-} from "./types.js";
+import type { WorkerReport, WorkerSessionMode } from "./report-schema.js";
+import type { ThinkingLevel, WorkerIdentity, WorkerObservationStatus } from "./types.js";
 import {
   type CanonicalAssignmentInput,
   type CanonicalWorkerAssignment,

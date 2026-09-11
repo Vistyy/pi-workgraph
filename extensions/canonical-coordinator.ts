@@ -17,11 +17,8 @@ import {
 } from "../src/canonical-coordinator-controller.js";
 import { CanonicalInspectionRequestSchema } from "../src/canonical-inspection.js";
 import type { CanonicalRuntime } from "../src/canonical-runtime.js";
-import {
-  type CanonicalHumanInputReceipt,
-  installCoordinatorSessionState,
-} from "../src/coordinator-notepad.js";
-import type { HandoffGrant } from "../src/domain/workstream.js";
+import { installCoordinatorSessionState } from "../src/coordinator-notepad.js";
+import type { HandoffGrant, HumanInputReceipt } from "../src/domain/workstream.js";
 import {
   deterministicChildSessionId,
   HANDOFF_KICKOFF_CLAIM_ENTRY,
@@ -36,7 +33,7 @@ import {
   SelectionRequestSchema,
 } from "../src/model-policy.js";
 import { liveLayer } from "../src/node-platform.js";
-import { EvidenceInputSchema } from "../src/report-schema.js";
+import { EvidenceSchema } from "../src/report-schema.js";
 
 class HandoffKickoffError extends Data.TaggedError("HandoffKickoffError")<{
   readonly message: string;
@@ -179,7 +176,7 @@ const HandoffSchema = Type.Object(
 const CompleteSchema = Type.Object(
   {
     conclusion: NonEmpty,
-    evidence: Type.Array(EvidenceInputSchema, { minItems: 1 }),
+    evidence: Type.Array(EvidenceSchema, { minItems: 1 }),
     limitations: Type.Optional(Type.Array(NonEmpty)),
   },
   { additionalProperties: false },
@@ -234,7 +231,7 @@ export default function canonicalCoordinator(
     >,
     signal?: AbortSignal,
   ) => Effect.runPromise(effect.pipe(Effect.provide(liveLayer)), { signal });
-  const receipt = (ctx: ExtensionContext, id?: string): CanonicalHumanInputReceipt => {
+  const receipt = (ctx: ExtensionContext, id?: string): HumanInputReceipt => {
     const owner = controller.owner(ctx);
     const eligible = session
       .getHumanReceipts()

@@ -3,14 +3,14 @@ import { Config, ConfigProvider, Data, DateTime, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { ThinkingSchema } from "../src/model-policy.js";
-import { isWorkerReport, isWorkerReportInput, reportSchemaForMode } from "../src/report-schema.js";
-import type {
-  ImplementationReport,
-  WorkerMode,
-  WorkerReport,
-  WorkerReportInput,
-  WorkerSessionMode,
-} from "../src/types.js";
+import {
+  type ImplementationReport,
+  isWorkerReport,
+  reportSchemaForMode,
+  type WorkerMode,
+  type WorkerReport,
+  type WorkerSessionMode,
+} from "../src/report-schema.js";
 import {
   hasActiveObjective,
   hasActivePhase,
@@ -90,31 +90,6 @@ const GuidePlanInputSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const LegacyGuidePlanStepSchema = Type.Object(
-  {
-    text: Type.String({ minLength: 3, maxLength: 1000 }),
-    status: PlanStepStatusSchema,
-    note: Type.Optional(Type.String({ maxLength: 1000 })),
-  },
-  { additionalProperties: false },
-);
-const LegacyGuidePlanInputSchema = Type.Object(
-  {
-    approach: Type.String({ minLength: 3, maxLength: 2000 }),
-    rationale: Type.String({ minLength: 3, maxLength: 2000 }),
-    risks: Type.String({ maxLength: 2000 }),
-    steps: Type.Array(LegacyGuidePlanStepSchema, { minItems: 1, maxItems: 8 }),
-  },
-  { additionalProperties: false },
-);
-const LegacyPlanEntrySchema = Type.Object(
-  {
-    runId: Type.String(),
-    nodeId: Type.String(),
-    plan: LegacyGuidePlanInputSchema,
-  },
-  { additionalProperties: false },
-);
 const WorkerPlanGetSchema = Type.Object(
   { action: Type.Literal("get") },
   { additionalProperties: false },
@@ -184,7 +159,7 @@ const WorkerPlanEntrySchema = Type.Object(
     runId: Type.String(),
     nodeId: Type.String(),
     plan: WorkerPlanSchema,
-    nextStepNumber: Type.Optional(Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
+    nextStepNumber: Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
   },
   { additionalProperties: false },
 );
@@ -259,15 +234,11 @@ class WorkerGitError extends Data.TaggedError("WorkerGitError")<{
 type WorkerExpectedError = WorkerContractError | WorkerHostError | WorkerGitError;
 
 type GuidePlanInput = Static<typeof GuidePlanInputSchema>;
-type LegacyGuidePlanInput = Static<typeof LegacyGuidePlanInputSchema>;
 type PlanStep = WorkerPlan["steps"][number];
 type StepPatch = Extract<WorkerPlanToolInput, { readonly action: "update_step" }>["patch"];
 type OverviewPatch = Extract<WorkerPlanToolInput, { readonly action: "update_overview" }>["patch"];
 
-function createGuidePlan(
-  input: GuidePlanInput | LegacyGuidePlanInput,
-  firstStepNumber: number,
-): WorkerPlan | undefined {
+function createGuidePlan(input: GuidePlanInput, firstStepNumber: number): WorkerPlan | undefined {
   if (input.steps.length > Number.MAX_SAFE_INTEGER - firstStepNumber || firstStepNumber < 1)
     return undefined;
   return {
@@ -595,7 +566,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       "Use workgraph_report as the final action. Choose the status that matches the actual outcome; report failures as failed rather than implying completion, and include actual evidence and explicit limitations.",
     ],
     parameters: reportSchemaForMode(mode),
-    execute(_id, params: WorkerReportInput, _signal, _update, ctx) {
+    execute(_id, params: WorkerReport, _signal, _update, ctx) {
       return Effect.runPromise(
         Effect.gen(function* () {
           const result = yield* handleWorkerReport(pi, ctx.cwd, params, {
@@ -726,11 +697,10 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       const decoded = Value.Decode(WorkerPlanEntrySchema, data);
       const ids = decoded.plan.steps.map((step) => step.id);
       const minimumNext = nextNumberAfter(decoded.plan.steps);
-      const restoredNext = decoded.nextStepNumber ?? minimumNext;
+      const restoredNext = decoded.nextStepNumber;
       if (
         new Set(ids).size !== ids.length ||
         minimumNext === undefined ||
-        restoredNext === undefined ||
         restoredNext < minimumNext ||
         planValidationFailure(decoded.plan) !== undefined
       )
@@ -739,17 +709,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
         kind: "valid",
         plan: structuredClone(decoded.plan),
         nextStepNumber: restoredNext,
-      };
-    }
-    if (Value.Check(LegacyPlanEntrySchema, data)) {
-      const decoded = Value.Decode(LegacyPlanEntrySchema, data);
-      const restored = createGuidePlan(decoded.plan, 1);
-      if (restored === undefined || planValidationFailure(restored) !== undefined)
-        return { kind: "malformed", nextStepNumber: 1 };
-      return {
-        kind: "valid",
-        plan: restored,
-        nextStepNumber: restored.steps.length + 1,
       };
     }
     return { kind: "malformed", nextStepNumber: 1 };
@@ -1015,11 +974,11 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
 function handleWorkerReport(
   pi: ExtensionAPI,
   cwd: string,
-  params: WorkerReportInput,
+  params: WorkerReport,
   execution: WorkerReportExecutionState,
 ) {
   return Effect.gen(function* () {
-    if (!isWorkerReportInput(params) || params.kind !== execution.mode)
+    if (!isWorkerReport(params) || params.kind !== execution.mode)
       return yield* contractFailure(`Report must satisfy the ${execution.mode} contract.`);
     if (params.kind !== "implementation" || params.status !== "completed") {
       // Read-only is an instruction and authority boundary, not a filesystem sandbox.
