@@ -159,7 +159,7 @@ export interface CanonicalSessionPort {
 export interface CanonicalDeliveryPort {
   readonly deliver: (
     context: ReconciliationContext,
-  ) => Effect.Effect<void, ReconciliationDriverError>;
+  ) => Effect.Effect<void, ReconciliationDriverError, Requirements>;
 }
 
 export interface CanonicalReconciliationPorts {

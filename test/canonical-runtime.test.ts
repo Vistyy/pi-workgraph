@@ -598,7 +598,7 @@ void test("absent-lease mismatch and uncertain generation fail before runtime ef
           path,
           workstreamId: ID,
           coordinator: COORDINATOR,
-          lease: { ...held, heartbeatAt: DEAD_OBSERVED_AT },
+          lease: { ...held, token: "changed-token" },
           handle,
           status: "quiescent",
           closeResult: Promise.resolve({ quiescent: true }),
@@ -631,6 +631,10 @@ void test("controlled same-process reload quiesces the old runtime before fresh 
         });
         const oldLease = yield* store.observeLease();
         assert.ok(oldLease !== undefined);
+        yield* Effect.sleep("2 millis");
+        const renewedLease = yield* store.renewLease(oldLease);
+        assert.equal(renewedLease.token, oldLease.token);
+        assert.notEqual(renewedLease.heartbeatAt, oldLease.heartbeatAt);
 
         const second = yield* acquire(f, COORDINATOR, { ownership: { kind: "recover" } });
         const newLease = yield* store.observeLease();

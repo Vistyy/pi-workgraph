@@ -1,5 +1,4 @@
 import { Data, Effect, type Scope } from "effect";
-import { Value } from "typebox/value";
 import type { CanonicalLease } from "./canonical-workstream-store.js";
 import type { CoordinatorIdentity } from "./domain/workstream.js";
 
@@ -167,7 +166,12 @@ export function compatibleRuntimeGeneration(
   )
     return false;
   const lease = input.lease;
-  return lease === undefined || Value.Equal(entry.lease, lease);
+  return (
+    lease === undefined ||
+    (entry.lease.token === lease.token &&
+      entry.lease.owner.sessionId === lease.owner.sessionId &&
+      entry.lease.owner.sessionFile === lease.owner.sessionFile)
+  );
 }
 
 /** Deterministic isolation for tests that own all canonical runtimes in this process. */

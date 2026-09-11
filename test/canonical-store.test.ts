@@ -293,6 +293,96 @@ void test("canonical store persists a grounded workstream and attaches a complet
   }
 });
 
+void test("prepared creation resumes only absent or exact empty residue and reuses only an equal aggregate", async () => {
+  const fixture = await canonicalFixture();
+  try {
+    const absent = initialWorkstream(fixture, "resume-absent");
+    const resumed = await runCanonical(CanonicalWorkstreamStore.resumeCreate(absent));
+    assert.deepEqual(resumed.state, absent);
+    const reused = await runCanonical(CanonicalWorkstreamStore.resumeCreate(absent));
+    assert.deepEqual(reused.state, absent);
+
+    for (const [id, residue] of [
+      ["resume-zero", "zero"],
+      ["resume-empty", "sqlite"],
+    ] as const) {
+      const directory = storageDirectory(fixture, id);
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await chmod(join(fixture.gitCommonDir, "pi-workgraph"), 0o700);
+      await chmod(join(fixture.gitCommonDir, "pi-workgraph", "workstreams"), 0o700);
+      await chmod(directory, 0o700);
+      const path = storagePath(fixture, id);
+      if (residue === "zero") await writeFile(path, "", { mode: 0o600 });
+      else rawDatabase(path, () => undefined);
+      await chmod(path, 0o600);
+      const initial = initialWorkstream(fixture, id);
+      assert.deepEqual(
+        (await runCanonical(CanonicalWorkstreamStore.resumeCreate(initial))).state,
+        initial,
+      );
+    }
+
+    const partialId = "resume-partial";
+    const partialDirectory = storageDirectory(fixture, partialId);
+    await mkdir(partialDirectory, { recursive: true, mode: 0o700 });
+    await chmod(partialDirectory, 0o700);
+    const partialPath = storagePath(fixture, partialId);
+    rawDatabase(partialPath, (database) => database.exec("CREATE TABLE foreign_state(value TEXT)"));
+    await chmod(partialPath, 0o600);
+    const before = await readFile(partialPath);
+    await assert.rejects(
+      runCanonical(CanonicalWorkstreamStore.resumeCreate(initialWorkstream(fixture, partialId))),
+      CanonicalStoreIncompleteError,
+    );
+    assert.deepEqual(await readFile(partialPath), before);
+
+    const mismatch = createWorkstream({
+      id: "resume-absent",
+      purpose: "Different declaration",
+      repository: fixture.repository,
+      coordinator: COORDINATOR,
+      intent: intent("Different declaration", "receipt-other"),
+      createdAt: T0,
+    });
+    await assert.rejects(
+      runCanonical(CanonicalWorkstreamStore.resumeCreate(mismatch)),
+      CanonicalStoreConflictError,
+    );
+    assert.deepEqual(
+      (await runCanonical(CanonicalWorkstreamStore.open(absent.id, fixture.repository))).state,
+      absent,
+    );
+  } finally {
+    await rm(fixture.parent, { recursive: true, force: true });
+  }
+});
+
+void test("canonical discovery derives identity from the aggregate and never accepts a relocated store", async () => {
+  const fixture = await canonicalFixture();
+  try {
+    await runCanonical(createCanonical(fixture));
+    const path = await canonicalPath(fixture);
+    const before = await readFile(path);
+    const attachment = await runCanonical(CanonicalWorkstreamStore.discover(path));
+    assert.equal(attachment.state.id, ID);
+    assert.deepEqual(attachment.state.repository, fixture.repository);
+    assert.deepEqual(await readFile(path), before);
+
+    const relocatedDirectory = storageDirectory(fixture, "relocated");
+    const relocated = storagePath(fixture, "relocated");
+    await mkdir(relocatedDirectory, { recursive: true, mode: 0o700 });
+    await chmod(relocatedDirectory, 0o700);
+    await copyFile(path, relocated);
+    await chmod(relocated, 0o600);
+    await assert.rejects(
+      runCanonical(CanonicalWorkstreamStore.discover(relocated)),
+      CanonicalStoreInvalidError,
+    );
+  } finally {
+    await rm(fixture.parent, { recursive: true, force: true });
+  }
+});
+
 void test("canonical lease observation, fencing, and expired takeover stay exact-observed", async () => {
   const fixture = await canonicalFixture();
   const clock = await Effect.runPromise(Effect.scoped(TestClock.make()));

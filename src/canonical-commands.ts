@@ -29,6 +29,7 @@ import { EvidenceInputSchema } from "./report-schema.js";
 import type { WorkerIdentity } from "./types.js";
 
 const NonEmptyString = Type.String({ minLength: 1 });
+export const NonBlankReasonSchema = Type.String({ minLength: 1, pattern: "\\S" });
 const AttemptHandle = { attemptId: NonEmptyString };
 export const ReviseIntentCommandSchema = IntentSchema;
 export const CompleteCommandSchema = Type.Object(
@@ -40,11 +41,11 @@ export const CompleteCommandSchema = Type.Object(
   { additionalProperties: false },
 );
 export const SuspendCommandSchema = Type.Object(
-  { reason: NonEmptyString },
+  { reason: NonBlankReasonSchema },
   { additionalProperties: false },
 );
 export const ResumeCommandSchema = Type.Object(
-  { reason: Type.String({ minLength: 1, pattern: "\\S" }) },
+  { reason: NonBlankReasonSchema },
   { additionalProperties: false },
 );
 export const CancelCommandSchema = Type.Object(
@@ -57,7 +58,7 @@ export const SteerCommandSchema = Type.Object(
 );
 export const ApplyCommandSchema = Type.Object(AttemptHandle, { additionalProperties: false });
 export const ReleaseOutputCommandSchema = Type.Object(
-  { ...AttemptHandle, reason: NonEmptyString },
+  { ...AttemptHandle, reason: NonBlankReasonSchema },
   { additionalProperties: false },
 );
 export type CompleteCommand = Static<typeof CompleteCommandSchema>;

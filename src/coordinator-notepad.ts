@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { DateTime } from "effect";
+import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
 const HUMAN_INPUT_ENTRY = "pi-workgraph-human-input";
@@ -24,6 +25,23 @@ export type HumanInputReceipt = {
   source: "interactive" | "rpc";
   text: string;
 };
+
+export const CanonicalHumanInputReceiptSchema = Type.Object(
+  {
+    id: Type.String({ minLength: 1 }),
+    sessionId: Type.String({ minLength: 1 }),
+    sessionFile: Type.String({ minLength: 1 }),
+    source: StringEnum(["interactive", "rpc"] as const),
+    text: Type.String({ minLength: 1 }),
+    receivedAt: Type.String({
+      format: "date-time",
+      pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+    }),
+  },
+  { additionalProperties: false },
+);
+
+export type CanonicalHumanInputReceipt = Static<typeof CanonicalHumanInputReceiptSchema>;
 
 type SessionOwner = Pick<HumanInputReceipt, "sessionId" | "sessionFile">;
 export type PendingItem = { id: string; text: string };
@@ -72,7 +90,7 @@ type InstallOptions = {
 };
 
 export type CoordinatorSessionState = {
-  getHumanReceipts(): HumanInputReceipt[];
+  getHumanReceipts(): CanonicalHumanInputReceipt[];
   getNotepadState(): CoordinatorNotepadState;
 };
 
@@ -82,7 +100,7 @@ export function installCoordinatorSessionState(
   options: InstallOptions,
 ): CoordinatorSessionState {
   let state = emptyState();
-  let receipts: HumanInputReceipt[] = [];
+  let receipts: CanonicalHumanInputReceipt[] = [];
 
   const persist = (): void => {
     pi.appendEntry(NOTEPAD_STATE_ENTRY, cloneState(state));
@@ -131,12 +149,14 @@ export function installCoordinatorSessionState(
     if ((event.source !== "interactive" && event.source !== "rpc") || event.text.trim() === "")
       return;
     const source = event.source;
+    const receivedAt = DateTime.formatIso(DateTime.nowUnsafe());
     return options.serialize(() => {
-      const receipt: HumanInputReceipt = {
+      const receipt: CanonicalHumanInputReceipt = {
         id: randomUUID(),
         ...options.owner(ctx),
         source,
         text: event.text,
+        receivedAt,
       };
       pi.appendEntry(HUMAN_INPUT_ENTRY, receipt);
       receipts.push(receipt);
@@ -203,16 +223,16 @@ function cloneState(state: CoordinatorNotepadState): CoordinatorNotepadState {
   return structuredClone(state);
 }
 
-function receiptFromEntry(entry: SessionEntry, owner: SessionOwner): HumanInputReceipt[] {
+function receiptFromEntry(entry: SessionEntry, owner: SessionOwner): CanonicalHumanInputReceipt[] {
   if (
     entry.type !== "custom" ||
     entry.customType !== HUMAN_INPUT_ENTRY ||
-    !Value.Check(HumanInputReceiptSchema, entry.data) ||
+    !Value.Check(CanonicalHumanInputReceiptSchema, entry.data) ||
     entry.data.sessionId !== owner.sessionId ||
     entry.data.sessionFile !== owner.sessionFile
   )
     return [];
-  return [Value.Decode(HumanInputReceiptSchema, entry.data)];
+  return [Value.Decode(CanonicalHumanInputReceiptSchema, entry.data)];
 }
 
 function applyNotepadAction(

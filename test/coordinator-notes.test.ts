@@ -4,6 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path"; // oxlint-disable-line effecttsgo/node-builtin-import -- The fixture path is an isolated session/repository identity.
 import test from "node:test";
 import { Type } from "typebox";
+import { Value } from "typebox/value";
+import {
+  CanonicalHumanInputReceiptSchema,
+  HumanInputReceiptSchema,
+} from "../src/coordinator-notepad.js";
 import {
   configureFixtureEnvironment,
   decodeTestValue,
@@ -51,6 +56,21 @@ async function reminderText(f: Awaited<ReturnType<typeof fixture>>): Promise<str
     ? message.content.map((part) => (part.type === "text" ? part.text : "")).join("\n")
     : message.content;
 }
+
+void test("predecessor and canonical receipt decoders retain their distinct cutover contracts", () => {
+  const historical = {
+    id: "old",
+    sessionId: "session",
+    sessionFile: "/sessions/session.jsonl",
+    source: "interactive",
+    text: "Historical input",
+  };
+  assert.equal(Value.Check(HumanInputReceiptSchema, historical), true);
+  assert.equal(Value.Check(CanonicalHumanInputReceiptSchema, historical), false);
+  const current = { ...historical, receivedAt: "2024-01-01T00:00:00.000Z" };
+  assert.equal(Value.Check(HumanInputReceiptSchema, current), true);
+  assert.equal(Value.Check(CanonicalHumanInputReceiptSchema, current), true);
+});
 
 void test("coordinator exposes only the read/add/update/remove notepad and edits need no receipt", async () => {
   const f = await fixture();

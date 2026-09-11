@@ -1,0 +1,573 @@
+/* oxlint-disable effecttsgo/any-unknown-in-error-context -- Pi callbacks are the sole Promise facade over canonical Effects whose independently typed failures converge at this host boundary. */
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- The in-scope factory reads one immutable packaged instruction asset before registering its lifecycle hooks.
+import { readFileSync } from "node:fs";
+import { StringEnum } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
+import { type Static, Type } from "typebox";
+import { Value } from "typebox/value";
+import { installCalmMode, isCoordinatorScope } from "../src/calm.js";
+import { NonBlankReasonSchema } from "../src/canonical-commands.js";
+import {
+  CANONICAL_POINTER_ENTRY,
+  CanonicalCoordinatorController,
+  type CanonicalCoordinatorControllerOptions,
+  type CanonicalPointerRestoration,
+  CanonicalWorkstreamPointerSchema,
+} from "../src/canonical-coordinator-controller.js";
+import { CanonicalInspectionRequestSchema } from "../src/canonical-inspection.js";
+import type { CanonicalRuntime } from "../src/canonical-runtime.js";
+import {
+  type CanonicalHumanInputReceipt,
+  installCoordinatorSessionState,
+} from "../src/coordinator-notepad.js";
+import {
+  loadModelPolicyEffect,
+  MODEL_LIST_ROLES,
+  modelPolicyPath,
+  SelectionRequestSchema,
+} from "../src/model-policy.js";
+import { liveLayer } from "../src/node-platform.js";
+import { EvidenceInputSchema } from "../src/report-schema.js";
+
+const NonEmpty = Type.String({ minLength: 1 });
+const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
+const IntentSchema = Type.Object(
+  {
+    statement: NonEmpty,
+    constraints: Type.Optional(Type.Array(NonEmpty)),
+    targetRepository: Type.Optional(NonEmpty),
+    authorityReceiptId: Type.Optional(NonEmpty),
+  },
+  { additionalProperties: false },
+);
+const ExperimentSchema = Type.Object(
+  { permittedEffects: Type.Array(NonEmpty, { minItems: 1 }), stopCondition: NonEmpty },
+  { additionalProperties: false },
+);
+const ResearchSchema = Type.Union([
+  Type.Object(
+    {
+      id: NonEmpty,
+      question: NonEmpty,
+      expectedEvidence: Type.Array(NonEmpty, { minItems: 1 }),
+      selection: Type.Optional(SelectionRequestSchema),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      id: NonEmpty,
+      question: NonEmpty,
+      expectedEvidence: Type.Array(NonEmpty, { minItems: 1 }),
+      selection: Type.Optional(SelectionRequestSchema),
+      experiment: ExperimentSchema,
+      baseRevision: Type.Optional(Commit),
+    },
+    { additionalProperties: false },
+  ),
+]);
+const ConsultSchema = Type.Object(
+  {
+    id: NonEmpty,
+    question: Type.String({ minLength: 1, maxLength: 20_000 }),
+    context: Type.Optional(Type.String({ maxLength: 20_000 })),
+    advisor: Type.Optional(Type.String({ pattern: "^[^/\\s]+/\\S+$" })),
+  },
+  { additionalProperties: false },
+);
+const ImplementSchema = Type.Object(
+  {
+    id: NonEmpty,
+    objective: NonEmpty,
+    acceptance: Type.Array(NonEmpty, { minItems: 1 }),
+    useEscalationExecutor: Type.Optional(Type.Boolean()),
+    candidateOf: Type.Optional(NonEmpty),
+    baseRevision: Type.Optional(Commit),
+  },
+  { additionalProperties: false },
+);
+const PublicReviewSubjectSchema = Type.Union([
+  Type.Object(
+    { kind: Type.Literal("result"), resultId: NonEmpty },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    { kind: Type.Literal("comparison"), resultIds: Type.Array(NonEmpty, { minItems: 2 }) },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    { kind: Type.Literal("artifact"), resultId: NonEmpty, artifactId: NonEmpty },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    { kind: Type.Literal("revision"), revision: Commit },
+    { additionalProperties: false },
+  ),
+]);
+const ReviewSchema = Type.Object(
+  {
+    id: NonEmpty,
+    objective: NonEmpty,
+    concern: NonEmpty,
+    subject: PublicReviewSubjectSchema,
+    selection: Type.Optional(SelectionRequestSchema),
+  },
+  { additionalProperties: false },
+);
+const AttemptSchema = Type.Object(
+  {
+    task: NonEmpty,
+    continuationOf: Type.Optional(NonEmpty),
+    candidateOf: Type.Optional(NonEmpty),
+    baseRevision: Type.Optional(Commit),
+    selection: Type.Optional(SelectionRequestSchema),
+    useEscalationExecutor: Type.Optional(Type.Boolean()),
+  },
+  { additionalProperties: false },
+);
+const ControlSchema = Type.Union(
+  [
+    Type.Object(
+      { action: Type.Literal("suspend"), reason: NonBlankReasonSchema },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      { action: Type.Literal("resume"), reason: NonBlankReasonSchema },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      { action: Type.Literal("cancel"), attempt: NonEmpty },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      { action: Type.Literal("apply"), attempt: NonEmpty },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      { action: Type.Literal("steer"), attempt: NonEmpty, instruction: NonEmpty },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      { action: Type.Literal("release_output"), attempt: NonEmpty, reason: NonBlankReasonSchema },
+      { additionalProperties: false },
+    ),
+  ],
+  { type: "object" },
+);
+const CompleteSchema = Type.Object(
+  {
+    conclusion: NonEmpty,
+    evidence: Type.Array(EvidenceInputSchema, { minItems: 1 }),
+    limitations: Type.Optional(Type.Array(NonEmpty)),
+  },
+  { additionalProperties: false },
+);
+
+export default function canonicalCoordinator(
+  pi: ExtensionAPI,
+  options: CanonicalCoordinatorControllerOptions = {},
+): void {
+  if (!isCoordinatorScope(process.env)) return;
+  const guidance = readFileSync(new URL("../COORDINATOR.md", import.meta.url), "utf8").trim();
+  const calm = installCalmMode(pi);
+  const publish = (
+    ctx: ExtensionContext,
+    state?: { lifecycle: string; tasks: readonly { attempts: readonly { state: string }[] }[] },
+  ) => {
+    try {
+      if (state === undefined) {
+        ctx.ui.setStatus("workgraph", undefined);
+        calm.setActiveWorkers(0);
+        return;
+      }
+      const active = state.tasks.reduce(
+        (count, task) =>
+          count + task.attempts.filter((attempt) => attempt.state === "active").length,
+        0,
+      );
+      ctx.ui.setStatus("workgraph", `WG ${state.lifecycle} - ${active} active`);
+      calm.setActiveWorkers(active);
+    } catch {
+      // Presentation is best-effort and cannot alter canonical commit or lease state.
+    }
+  };
+  const controller = new CanonicalCoordinatorController(pi, options, publish);
+  let sessionTail = Promise.resolve();
+  const session = installCoordinatorSessionState(pi, {
+    owner: (ctx) => controller.owner(ctx),
+    serialize: (run) => {
+      const result = sessionTail.then(run, run);
+      sessionTail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    },
+  });
+  const run = <A, E>(
+    effect: Effect.Effect<
+      A,
+      E,
+      import("effect").FileSystem.FileSystem | import("effect").Path.Path
+    >,
+    signal?: AbortSignal,
+  ) => Effect.runPromise(effect.pipe(Effect.provide(liveLayer)), { signal });
+  const receipt = (ctx: ExtensionContext, id?: string): CanonicalHumanInputReceipt => {
+    const owner = controller.owner(ctx);
+    const eligible = session
+      .getHumanReceipts()
+      .filter(
+        (item) => item.sessionId === owner.sessionId && item.sessionFile === owner.sessionFile,
+      );
+    const selected = id === undefined ? eligible.at(-1) : eligible.find((item) => item.id === id);
+    if (selected === undefined)
+      throw new Error("Intent requires an eligible current-session human input receipt.");
+    return selected;
+  };
+  const toolResult = <Value extends object>(value: Value) => ({
+    content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
+    details: value,
+  });
+  const pointer = (ctx: ExtensionContext): CanonicalPointerRestoration => {
+    const entry = ctx.sessionManager
+      .getBranch()
+      .findLast((item) => item.type === "custom" && item.customType === CANONICAL_POINTER_ENTRY);
+    if (entry?.type !== "custom") return undefined;
+    return Value.Check(CanonicalWorkstreamPointerSchema, entry.data)
+      ? Value.Decode(CanonicalWorkstreamPointerSchema, entry.data)
+      : "malformed";
+  };
+
+  pi.on("session_start", (_event, ctx) =>
+    run(controller.restore(ctx, () => pointer(ctx))).catch((error) => {
+      ctx.ui.notify(
+        `Canonical Workstream reattachment skipped: ${publicMessage(error)}`,
+        "warning",
+      );
+    }),
+  );
+  pi.on("session_shutdown", (_event, ctx) => run(controller.close(ctx)));
+  pi.on("before_agent_start", (event) => ({
+    systemPrompt: event.systemPrompt.endsWith(guidance)
+      ? event.systemPrompt
+      : `${event.systemPrompt}\n\n${guidance}`,
+  }));
+
+  pi.registerTool({
+    name: "workgraph_models",
+    label: "Workgraph Models",
+    description:
+      "List the exact configured canonical model targets for a selectable read-only role.",
+    promptSnippet: "Inspect configured Workgraph model targets",
+    parameters: Type.Object(
+      { role: StringEnum(MODEL_LIST_ROLES) },
+      { additionalProperties: false },
+    ),
+    execute(_id, params, signal) {
+      return run(
+        Effect.map(loadModelPolicyEffect(options.policyPath), (policy) =>
+          toolResult({
+            path: options.policyPath ?? modelPolicyPath(),
+            role: params.role,
+            targets: policy.roles[params.role],
+          }),
+        ),
+        signal,
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_intent",
+    label: "Workgraph Intent",
+    description:
+      "Create or revise the canonical Intent from an exact genuine current-session receipt; initial creation fixes the repository.",
+    parameters: IntentSchema,
+    execute(_id, params, signal, _update, ctx) {
+      return run(
+        Effect.suspend(() =>
+          Effect.map(
+            controller.establish(
+              ctx,
+              receipt(ctx, params.authorityReceiptId),
+              intentRequest(params),
+            ),
+            toolResult,
+          ),
+        ),
+        signal,
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_research",
+    label: "Workgraph Research",
+    description:
+      "Create one frozen canonical research or bounded disposable-experiment Task and its initial Attempt selection.",
+    promptSnippet: "Delegate research or a bounded experiment",
+    parameters: ResearchSchema,
+    execute(_id, params, signal) {
+      const command = !("experiment" in params)
+        ? {
+            taskId: params.id,
+            objective: params.question,
+            kind: "research" as const,
+            expectedEvidence: params.expectedEvidence,
+            selection: params.selection,
+          }
+        : {
+            taskId: params.id,
+            objective: params.question,
+            kind: "experiment" as const,
+            expectedEvidence: params.expectedEvidence,
+            permittedEffects: params.experiment.permittedEffects,
+            stopCondition: params.experiment.stopCondition,
+            selection: params.selection,
+            baseRevision: params.baseRevision,
+          };
+      return run(
+        action(controller, (runtime) => runtime.enqueue(command), {
+          action: "workgraph_research",
+          taskId: params.id,
+        }),
+        signal,
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_consult",
+    label: "Workgraph Consult",
+    description:
+      "Create one frozen evidence-only consultation Task using the configured default or exact advisor.",
+    promptSnippet: "Consult one evidence advisor",
+    parameters: ConsultSchema,
+    execute(_id, params, signal) {
+      return run(
+        action(
+          controller,
+          (runtime) =>
+            runtime.enqueue({
+              taskId: params.id,
+              objective: params.question,
+              kind: "consultation",
+              context: params.context,
+              advisor: params.advisor,
+            }),
+          { action: "workgraph_consult", taskId: params.id },
+        ),
+        signal,
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_implement",
+    label: "Workgraph Implement",
+    description:
+      "Create one frozen maintained implementation Task and its policy-owned guide/executor Attempt after design is settled.",
+    promptSnippet: "Delegate an authorized maintained change",
+    parameters: ImplementSchema,
+    execute(_id, params, signal) {
+      return run(
+        action(
+          controller,
+          (runtime) =>
+            runtime.enqueue({
+              taskId: params.id,
+              objective: params.objective,
+              kind: "implementation",
+              acceptance: params.acceptance,
+              useEscalationExecutor: params.useEscalationExecutor,
+              candidateOf: params.candidateOf,
+              baseRevision: params.baseRevision,
+            }),
+          { action: "workgraph_implement", taskId: params.id },
+        ),
+        signal,
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_review",
+    label: "Workgraph Review",
+    description:
+      "Create one frozen canonical review Task for exact retained result, artifact, comparison, or revision evidence.",
+    promptSnippet: "Delegate selective review",
+    parameters: ReviewSchema,
+    execute(_id, params, signal) {
+      return run(
+        action(
+          controller,
+          (runtime) =>
+            runtime.enqueue({
+              taskId: params.id,
+              objective: params.objective,
+              kind: "review",
+              concern: params.concern,
+              subject: reviewSubject(params.subject),
+              selection: params.selection,
+            }),
+          { action: "workgraph_review", taskId: params.id },
+        ),
+        signal,
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_attempt",
+    label: "Workgraph Attempt",
+    description:
+      "Append canonical Attempt(s) to one exact frozen current-Intent Task after all prior Attempts are operationally stable.",
+    parameters: AttemptSchema,
+    execute(_id, params, signal) {
+      return run(
+        action(
+          controller,
+          (runtime) =>
+            runtime.appendAttempts({
+              taskId: params.task,
+              continuationOf: params.continuationOf,
+              candidateOf: params.candidateOf,
+              baseRevision: params.baseRevision,
+              selection: params.selection,
+              useEscalationExecutor: params.useEscalationExecutor,
+            }),
+          { action: "workgraph_attempt", taskId: params.task },
+        ),
+        signal,
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_inspect",
+    label: "Workgraph Inspect",
+    description:
+      "Return one bounded typed canonical inspection section using exact handles and an opaque revision-bound cursor.",
+    promptSnippet: "Inspect canonical Workgraph state and retained evidence",
+    parameters: CanonicalInspectionRequestSchema,
+    execute(_id, params, signal) {
+      return run(Effect.map(controller.inspect(params), toolResult), signal);
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_control",
+    label: "Workgraph Control",
+    description:
+      "Suspend, resume, cancel, steer, apply, or release output through exact canonical command and lease boundaries.",
+    parameters: ControlSchema,
+    execute(_id, params, signal) {
+      return run(
+        action(
+          controller,
+          (runtime) => controlOperation(runtime, params),
+          "attempt" in params
+            ? { action: `workgraph_control:${params.action}`, attemptId: params.attempt }
+            : { action: `workgraph_control:${params.action}` },
+        ),
+        signal,
+      );
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_adopt",
+    label: "Workgraph Adopt",
+    description:
+      "Discover an exact canonical state path and attach it, transferring only after exact prior-coordinator Herdr death proof.",
+    parameters: Type.Object({ statePath: NonEmpty }, { additionalProperties: false }),
+    execute(_id, params, signal, _update, ctx) {
+      return run(Effect.map(controller.adopt(ctx, params.statePath), toolResult), signal);
+    },
+  });
+  pi.registerTool({
+    name: "workgraph_complete",
+    label: "Workgraph Complete",
+    description:
+      "Record the coordinator's goal evidence and limitations only after canonical operational accounting permits completion.",
+    parameters: CompleteSchema,
+    execute(_id, params, signal) {
+      return run(
+        action(
+          controller,
+          (runtime) =>
+            runtime.complete({
+              conclusion: params.conclusion,
+              evidence: params.evidence,
+              limitations: params.limitations ?? [],
+            }),
+          { action: "workgraph_complete" },
+        ),
+        signal,
+      );
+    },
+  });
+}
+
+function intentRequest(params: Static<typeof IntentSchema>): {
+  statement: string;
+  constraints: string[];
+  targetRepository?: string;
+} {
+  const base = { statement: params.statement, constraints: params.constraints ?? [] };
+  return params.targetRepository === undefined
+    ? base
+    : { ...base, targetRepository: params.targetRepository };
+}
+
+function controlOperation(runtime: CanonicalRuntime, params: Static<typeof ControlSchema>) {
+  switch (params.action) {
+    case "suspend":
+      return runtime.suspend({ reason: params.reason });
+    case "resume":
+      return runtime.resume({ reason: params.reason });
+    case "cancel":
+      return runtime.cancel({
+        attemptId: params.attempt,
+        reason: "Cancelled by coordinator through workgraph_control.",
+      });
+    case "steer":
+      return runtime.steer({ attemptId: params.attempt, instruction: params.instruction });
+    case "apply":
+      return runtime.apply({ attemptId: params.attempt });
+    case "release_output":
+      return runtime.releaseOutput({ attemptId: params.attempt, reason: params.reason });
+  }
+}
+
+function action<Error>(
+  controller: CanonicalCoordinatorController,
+  operation: (
+    runtime: CanonicalRuntime,
+  ) => Effect.Effect<
+    import("../src/domain/workstream.js").Workstream,
+    Error,
+    import("effect").FileSystem.FileSystem | import("effect").Path.Path
+  >,
+  projection: { action: string; taskId?: string; attemptId?: string },
+) {
+  return Effect.map(controller.action(operation, projection), (value) => ({
+    content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
+    details: value,
+  }));
+}
+
+function reviewSubject(subject: Static<typeof PublicReviewSubjectSchema>) {
+  switch (subject.kind) {
+    case "result":
+      return { kind: "outcome" as const, outcomeId: subject.resultId };
+    case "comparison":
+      return { kind: "comparison" as const, outcomeIds: subject.resultIds };
+    case "artifact":
+      return {
+        kind: "artifact" as const,
+        outcomeId: subject.resultId,
+        artifactId: subject.artifactId,
+      };
+    case "revision":
+      return subject;
+  }
+}
+
+function publicMessage(cause: unknown): string {
+  return (cause instanceof Error ? cause.message : "operation failed")
+    .replace(/\s+/g, " ")
+    .slice(0, 500);
+}

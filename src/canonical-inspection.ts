@@ -20,7 +20,7 @@ const DEFAULT_INSPECTION_ITEMS = 10;
 const MAX_INSPECTION_ITEMS = 20;
 export const MAX_DELIVERY_NOTIFICATION_CHARS = 3_000;
 
-const CURSOR_INTEGRITY_KEY = randomBytes(32);
+let cursorIntegrityKey: Buffer | undefined;
 const NonEmptyString = Type.String({ minLength: 1 });
 const SectionSchema = Type.Union([
   Type.Literal("overview"),
@@ -33,7 +33,7 @@ const SectionSchema = Type.Union([
   Type.Literal("recovery"),
   Type.Literal("report"),
 ]);
-const CanonicalInspectionRequestSchema = Type.Object(
+export const CanonicalInspectionRequestSchema = Type.Object(
   {
     section: SectionSchema,
     taskId: Type.Optional(NonEmptyString),
@@ -666,7 +666,8 @@ function readCursor(cursor: string): CursorPayload {
 }
 
 function digest(encoded: string): string {
-  return createHmac("sha256", CURSOR_INTEGRITY_KEY).update(encoded).digest("base64url");
+  cursorIntegrityKey ??= randomBytes(32);
+  return createHmac("sha256", cursorIntegrityKey).update(encoded).digest("base64url");
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The canonical inspection request schema parses this boundary value.

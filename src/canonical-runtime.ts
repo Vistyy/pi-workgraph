@@ -173,6 +173,7 @@ export interface CanonicalRuntimeAcquisition {
   readonly commands?: CanonicalCommandPorts;
   readonly onReconciliationAttention?: ReconciliationAttention;
   readonly heartbeatInterval?: Duration.Input;
+  readonly onCommitted?: (state: Workstream) => Effect.Effect<void, never>;
   readonly onFatal?: (error: CanonicalRuntimeError) => Effect.Effect<void, never>;
 }
 
@@ -793,6 +794,8 @@ export class CanonicalRuntime {
         });
         if (failure !== undefined) return yield* failure;
         yield* Ref.set(this.committed, committed);
+        if (!Value.Equal(committed, expected) && this.acquisition.onCommitted !== undefined)
+          yield* this.acquisition.onCommitted(structuredClone(committed)).pipe(Effect.ignoreCause);
         return structuredClone(committed);
       }.bind(this),
     );

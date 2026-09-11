@@ -251,6 +251,62 @@ export class CanonicalWorkstreamStore {
     });
   }
 
+  /** Resume only the exact pointer-declared initial creation without deleting retained residue. */
+  static resumeCreate(
+    initial: Workstream,
+  ): Effect.Effect<
+    CanonicalStoreAttachment,
+    CanonicalStoreError,
+    Scope.Scope | FileSystem.FileSystem | Path.Path
+  > {
+    return Effect.gen(function* () {
+      const paths = yield* Path.Path;
+      const fileSystem = yield* FileSystem.FileSystem;
+      yield* validateInitial(paths, initial);
+      const path = canonicalPath(paths, initial.repository.gitCommonDir, initial.id);
+      yield* assertGroundedCommonDirectory(initial.repository.gitCommonDir);
+      yield* claimStorageDirectories(paths, fileSystem, path);
+      const existing = yield* inspect(path);
+      if (!existing.exists) {
+        yield* createPrivateDatabaseFile(fileSystem, path);
+        const store = yield* CanonicalWorkstreamStore.initialize(path, initial);
+        return { store, state: structuredClone(initial) };
+      }
+      if (existing.symbolicLink || !existing.regularFile || existing.mode !== FILE_MODE)
+        return yield* invalid(
+          `Canonical database residue is not an exact private ordinary file: ${path}.`,
+        );
+      if (existing.size === 0) {
+        const store = yield* CanonicalWorkstreamStore.initialize(path, initial);
+        return { store, state: structuredClone(initial) };
+      }
+      yield* classifyFileHeader(fileSystem, path);
+      const database = yield* acquireDatabase(path);
+      if (database.tableNames().length === 0) {
+        const store = new CanonicalWorkstreamStore(
+          path,
+          initial.id,
+          structuredClone(initial.repository),
+          database,
+        );
+        yield* store.initializeEmpty(initial);
+        return { store, state: structuredClone(initial) };
+      }
+      const store = new CanonicalWorkstreamStore(
+        path,
+        initial.id,
+        structuredClone(initial.repository),
+        database,
+      );
+      const state = yield* store.read();
+      if (!Value.Equal(state, initial))
+        return yield* new CanonicalStoreConflictError(
+          `Canonical database does not equal its prepared creation declaration: ${path}.`,
+        );
+      return { store, state };
+    });
+  }
+
   static open(
     id: string,
     repository: RepositoryIdentity,
@@ -270,6 +326,42 @@ export class CanonicalWorkstreamStore {
       const database = yield* acquireDatabase(path);
       const store = new CanonicalWorkstreamStore(path, id, structuredClone(repository), database);
       return { store, state: yield* store.read() };
+    });
+  }
+
+  /** Discover one exact canonical attachment from an explicit untrusted path without writing. */
+  static discover(
+    statePath: string,
+  ): Effect.Effect<
+    CanonicalStoreAttachment,
+    CanonicalStoreError,
+    Scope.Scope | FileSystem.FileSystem | Path.Path
+  > {
+    return Effect.gen(function* () {
+      const paths = yield* Path.Path;
+      const fileSystem = yield* FileSystem.FileSystem;
+      if (!paths.isAbsolute(statePath) || paths.resolve(statePath) !== statePath)
+        return yield* invalid("Canonical statePath must be absolute and normalized.");
+      yield* assertPrivateStorage(paths, statePath);
+      yield* classifyFileHeader(fileSystem, statePath);
+      const database = yield* acquireDatabase(statePath, true);
+      const state = yield* hostEffect("read the discovered canonical Workstream", () =>
+        readCanonicalAggregate(database),
+      );
+      yield* validateIdentity(paths, state.repository, state.id);
+      yield* assertGroundedCommonDirectory(state.repository.gitCommonDir);
+      const expected = canonicalPath(paths, state.repository.gitCommonDir, state.id);
+      if (statePath !== expected)
+        return yield* invalid(
+          "Canonical statePath does not match the aggregate repository and Workstream identity.",
+        );
+      const store = new CanonicalWorkstreamStore(
+        statePath,
+        state.id,
+        structuredClone(state.repository),
+        database,
+      );
+      return { store, state: structuredClone(state) };
     });
   }
 
@@ -338,6 +430,24 @@ export class CanonicalWorkstreamStore {
         );
       });
       return store;
+    });
+  }
+
+  private initializeEmpty(
+    initial: Workstream,
+  ): Effect.Effect<void, CanonicalStoreError, FileSystem.FileSystem> {
+    return this.atomic(() => {
+      this.database.exec(CREATE_SCHEMA);
+      this.database.write(
+        "INSERT INTO store_header(singleton,format,version) VALUES(1,?,?)",
+        STORE_FORMAT,
+        STORE_VERSION,
+      );
+      this.database.write(
+        "INSERT INTO workstream(singleton,state_json,revision) VALUES(1,?,?)",
+        serializeState(initial),
+        initial.revision,
+      );
     });
   }
 
@@ -569,47 +679,8 @@ export class CanonicalWorkstreamStore {
     );
   }
 
-  /** Validate the complete canonical table/column contract before any row query. */
-  private assertCanonicalSchema(): void {
-    const tables = this.database.tableNames();
-    if (tables.includes("workstream_state"))
-      throw new CanonicalStoreUnsupportedError(
-        "The canonical path contains the predecessor-v7 database layout.",
-      );
-    for (const [table, columns] of Object.entries(CANONICAL_SCHEMA)) {
-      if (!tables.includes(table))
-        throw new CanonicalStoreIncompleteError(`Canonical database is missing table: ${table}.`);
-      const present = this.database.columnNames(table);
-      const absent = columns.filter((column) => !present.includes(column));
-      if (absent.length > 0)
-        throw new CanonicalStoreIncompleteError(
-          `Canonical table ${table} lacks: ${absent.join(", ")}.`,
-        );
-    }
-  }
-
   private readAggregate(): Workstream {
-    this.assertCanonicalSchema();
-    const headerValue = this.database.readRow(
-      "SELECT format, version FROM store_header WHERE singleton=1",
-    );
-    if (!Value.Check(HeaderRowSchema, headerValue))
-      throw new CanonicalStoreIncompleteError("Canonical store header is missing or malformed.");
-    const header: HeaderRow = Value.Decode(HeaderRowSchema, headerValue);
-    if (header.format !== STORE_FORMAT || header.version !== STORE_VERSION)
-      throw new CanonicalStoreUnsupportedError("Canonical store header is unsupported.");
-
-    const rowValue = this.database.readRow(
-      "SELECT state_json, revision FROM workstream WHERE singleton=1",
-    );
-    if (!Value.Check(AggregateRowSchema, rowValue))
-      throw new CanonicalStoreIncompleteError("Canonical Workstream row is missing or malformed.");
-    const row: AggregateRow = Value.Decode(AggregateRowSchema, rowValue);
-    const state = parseWorkstream(row.state_json);
-    if (state.revision !== row.revision)
-      throw new CanonicalStoreInvalidError(
-        "Canonical Workstream revision diverges from its aggregate row.",
-      );
+    const state = readCanonicalAggregate(this.database);
     if (state.id !== this.id || !Value.Equal(state.repository, this.repository))
       throw new CanonicalStoreInvalidError(
         "Canonical store belongs to a foreign repository or Workstream identity.",
@@ -618,7 +689,7 @@ export class CanonicalWorkstreamStore {
   }
 
   private readLeaseRow(): CanonicalLease | undefined {
-    this.assertCanonicalSchema();
+    assertCanonicalSchema(this.database);
     const value = this.database.readRow(
       "SELECT token,owner_session_id,owner_session_file,acquired_at,heartbeat_at,expires_at FROM lease WHERE singleton=1",
     );
@@ -698,6 +769,48 @@ export class CanonicalWorkstreamStore {
       ),
     );
   }
+}
+
+function assertCanonicalSchema(database: CanonicalDatabase): void {
+  const tables = database.tableNames();
+  if (tables.includes("workstream_state"))
+    throw new CanonicalStoreUnsupportedError(
+      "The canonical path contains the predecessor-v7 database layout.",
+    );
+  for (const [table, columns] of Object.entries(CANONICAL_SCHEMA)) {
+    if (!tables.includes(table))
+      throw new CanonicalStoreIncompleteError(`Canonical database is missing table: ${table}.`);
+    const present = database.columnNames(table);
+    const absent = columns.filter((column) => !present.includes(column));
+    if (absent.length > 0)
+      throw new CanonicalStoreIncompleteError(
+        `Canonical table ${table} lacks: ${absent.join(", ")}.`,
+      );
+  }
+}
+
+function readCanonicalAggregate(database: CanonicalDatabase): Workstream {
+  assertCanonicalSchema(database);
+  const headerValue = database.readRow(
+    "SELECT format, version FROM store_header WHERE singleton=1",
+  );
+  if (!Value.Check(HeaderRowSchema, headerValue))
+    throw new CanonicalStoreIncompleteError("Canonical store header is missing or malformed.");
+  const header: HeaderRow = Value.Decode(HeaderRowSchema, headerValue);
+  if (header.format !== STORE_FORMAT || header.version !== STORE_VERSION)
+    throw new CanonicalStoreUnsupportedError("Canonical store header is unsupported.");
+  const rowValue = database.readRow(
+    "SELECT state_json, revision FROM workstream WHERE singleton=1",
+  );
+  if (!Value.Check(AggregateRowSchema, rowValue))
+    throw new CanonicalStoreIncompleteError("Canonical Workstream row is missing or malformed.");
+  const row: AggregateRow = Value.Decode(AggregateRowSchema, rowValue);
+  const state = parseWorkstream(row.state_json);
+  if (state.revision !== row.revision)
+    throw new CanonicalStoreInvalidError(
+      "Canonical Workstream revision diverges from its aggregate row.",
+    );
+  return state;
 }
 
 function validateInitial(
