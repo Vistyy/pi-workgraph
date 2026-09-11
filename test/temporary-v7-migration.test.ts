@@ -31,13 +31,23 @@ import {
 
 const T0 = "2024-01-01T00:00:00.000Z";
 const MODEL = { model: "fixture/research", thinking: "high" as const };
+const CUTOVER_WORKSTREAM = "ws-bc12172f-52cb-4829-9d47-4a4ec1c3d782";
+const OMITTED_TASK = "temporary-cutover-bootstrap-final-correction";
+const OMITTED_ATTEMPT = "attempt-fa322b7c-92f7-4ce3-b15c-65af5316dcb5";
+const RECOVERY_ATTEMPT = "attempt-5db9b72a-7703-43fe-ab3c-0b4fc8f8decd";
+const INTEGRATION_ATTEMPT = "attempt-90220471-0c30-4f36-aaad-1d1548a81834";
+const CLEAN = "56d2d3317e0689b77a288b989bceb37dc87156e6";
+const EXPECTED = "3b248d2601cdd7d797e03f05d0c69a504836b95a";
+const RECOVERED = "5812348d826422d3e562e07b87f0c5a41e7dfcb6";
+const APPLIED = "74dd415b878f6312bc67e13aaac9a9fa11122772";
+const TREE = "b2368eb1b9f7e376cb735b3aef61836796828c2e";
 
 function sourceState(
   projectRoot: string,
   gitCommonDir: string,
   sessionFile: string,
 ): WorkstreamState {
-  const id = "migration";
+  const id = CUTOVER_WORKSTREAM;
   const receipt = {
     id: "receipt-1",
     sessionId: "coordinator",
@@ -46,7 +56,7 @@ function sourceState(
     text: "Research exact migration behavior.",
     receivedAt: T0,
   };
-  return {
+  const state: WorkstreamState = {
     format: WORKSTREAM_FORMAT,
     version: WORKSTREAM_STATE_VERSION,
     revision: 17,
@@ -150,6 +160,130 @@ function sourceState(
     createdAt: T0,
     updatedAt: T0,
   };
+  addExactCutoverOmission(state, sessionFile);
+  return state;
+}
+
+function addExactCutoverOmission(state: WorkstreamState, sessionFile: string): void {
+  const implementationModels = { guide: MODEL, executor: MODEL, source: "policy" as const };
+  const assignment = {
+    id: OMITTED_TASK,
+    objective: "Temporary exact cutover correction.",
+    intentVersion: 1,
+    createdAt: T0,
+    capability: "implement" as const,
+    artifactIntent: "maintained_change" as const,
+    authority: { receiptId: "receipt-1", intentVersion: 1 },
+    acceptance: ["Exact correction."],
+  };
+  const recoveryTask = { ...assignment, id: "recovery-task" };
+  const integrationTask = { ...assignment, id: "integration-task" };
+  const result = (id: string, assignmentId: string, commit: string, observation: string) => ({
+    id,
+    assignmentId,
+    assignmentIntentVersion: 1,
+    artifacts: [],
+    observedAt: T0,
+    validity: "typed" as const,
+    report: {
+      kind: "implementation" as const,
+      status: "completed" as const,
+      outcome: "changed" as const,
+      summary: "Exact recovery.",
+      evidence: [{ label: "provenance", observation }],
+      findings: [],
+      commit,
+      changedFiles: ["test/exact.ts"],
+    },
+  });
+  const recoveryResult = result("recovery-result", recoveryTask.id, RECOVERED, RECOVERED);
+  const integrationResult = result(
+    "integration-result",
+    integrationTask.id,
+    APPLIED,
+    `Trees are exactly ${TREE}.`,
+  );
+  const terminal = {
+    models: implementationModels,
+    state: "settled" as const,
+    placement: {
+      kind: "isolated_worktree" as const,
+      path: state.projectRoot,
+      branch: "fixture-branch",
+    },
+    sessionFile,
+    submission: "started" as const,
+    worker: {
+      workspaceId: "workspace",
+      tabId: "tab",
+      paneId: "pane",
+      terminalId: "terminal",
+      agentName: "worker",
+      cwd: state.projectRoot,
+      sessionFile,
+    },
+    cleanup: { state: "completed" as const, workerClosed: true },
+    createdAt: T0,
+    updatedAt: T0,
+  };
+  state.assignments.push(assignment, recoveryTask, integrationTask);
+  state.results.push(recoveryResult, integrationResult);
+  state.attempts.push(
+    {
+      ...terminal,
+      id: OMITTED_ATTEMPT,
+      assignmentId: OMITTED_TASK,
+      state: "cancelled",
+      baseRevision: EXPECTED,
+      candidate: { kind: "initial", rootCommit: EXPECTED },
+      cleanup: { state: "completed", workerClosed: true, expectedHead: EXPECTED },
+      outputRelease: { state: "completed", expectedHead: EXPECTED, reason: "Recovered." },
+      attentionHistory: [
+        {
+          detail: `Refusing cleanup: branch pi-workgraph/ws-bc12172f-52cb-4829-9d47-4a4ec1c3d782/${OMITTED_ATTEMPT} points to ${CLEAN}, expected ${EXPECTED}.`,
+          at: T0,
+        },
+      ],
+    },
+    {
+      ...terminal,
+      id: RECOVERY_ATTEMPT,
+      assignmentId: recoveryTask.id,
+      baseRevision: CLEAN,
+      candidate: { kind: "initial", rootCommit: CLEAN },
+      resultId: recoveryResult.id,
+      cleanup: { state: "completed", workerClosed: true, expectedHead: RECOVERED },
+      effectiveModels: [{ model: MODEL.model, thinking: MODEL.thinking, source: "selection" }],
+    },
+    {
+      ...terminal,
+      id: INTEGRATION_ATTEMPT,
+      assignmentId: integrationTask.id,
+      baseRevision: "d".repeat(40),
+      candidate: {
+        kind: "integration",
+        rootCommit: "d".repeat(40),
+        parentAttemptId: RECOVERY_ATTEMPT,
+        parentCommit: RECOVERED,
+      },
+      resultId: integrationResult.id,
+      effectiveModels: [{ model: MODEL.model, thinking: MODEL.thinking, source: "selection" }],
+      application: {
+        state: "applied",
+        commit: APPLIED,
+        expectedHead: "d".repeat(40),
+        rootCommit: "d".repeat(40),
+        commits: [APPLIED],
+        revision: APPLIED,
+      },
+      outputRelease: { state: "completed", expectedHead: APPLIED, reason: "Applied." },
+      cleanup: { state: "completed", workerClosed: true, expectedHead: APPLIED },
+    },
+  );
+  state.deliveries.push(
+    { resultId: recoveryResult.id, state: "delivered", requestedAt: T0, deliveredAt: T0 },
+    { resultId: integrationResult.id, state: "delivered", requestedAt: T0, deliveredAt: T0 },
+  );
 }
 
 async function fixture(mutate?: (state: WorkstreamState) => void) {
@@ -162,7 +296,7 @@ async function fixture(mutate?: (state: WorkstreamState) => void) {
   const coordinator = { sessionId: "coordinator", sessionFile: "/sessions/coordinator.jsonl" };
   const created = await Effect.runPromise(
     WorkstreamStoreEffects.create({
-      id: "migration",
+      id: CUTOVER_WORKSTREAM,
       purpose: "Research exact migration behavior.",
       projectRoot,
       gitCommonDir,
@@ -199,13 +333,19 @@ async function fixture(mutate?: (state: WorkstreamState) => void) {
     gitCommonDir,
     "pi-workgraph",
     "workstreams",
-    "migration",
+    CUTOVER_WORKSTREAM,
     "sessions",
   );
   await mkdir(legacySessionDirectory, { mode: 0o700 });
   const sessionFile = join(legacySessionDirectory, "legacy-worker.jsonl");
   await writeFile(sessionFile, `${JSON.stringify({ type: "session", timestamp: T0 })}\n`);
   const state = sourceState(projectRoot, gitCommonDir, sessionFile);
+  for (const attempt of state.attempts.filter((item) => item.id !== "research-attempt")) {
+    const exactSession = join(legacySessionDirectory, `${attempt.id}.jsonl`);
+    await writeFile(exactSession, `${JSON.stringify({ type: "session", timestamp: T0 })}\n`);
+    attempt.sessionFile = exactSession;
+    if (attempt.worker) attempt.worker = { ...attempt.worker, sessionFile: exactSession };
+  }
   state.inputs = structuredClone(revised.inputs);
   state.intents = structuredClone(revised.intents);
   mutate?.(state);
@@ -235,6 +375,29 @@ void test("v7 mapping reindexes grounded Intent, preserves models, and ledgers f
     assert.equal(mapped.state.tasks[0]?.attempts[0]?.selection.source, "policy");
     assert.equal(mapped.state.tasks[0]?.attempts[0]?.outcome?.id, "research-attempt:outcome");
     assert.equal(mapped.state.tasks[0]?.attempts[0]?.baseRevision, undefined);
+    assert.equal(mapped.state.tasks.length, 3);
+    assert.equal(
+      mapped.state.tasks.some((task) => task.id === OMITTED_TASK),
+      false,
+    );
+    assert.equal(
+      mapped.state.tasks.some((task) =>
+        task.attempts.some((attempt) => attempt.id === OMITTED_ATTEMPT),
+      ),
+      false,
+    );
+    assert.ok(mapped.ledger.omittedCutoverTask);
+    assert.equal(mapped.ledger.omittedCutoverTask.assignment.id, OMITTED_TASK);
+    assert.equal(mapped.ledger.omittedCutoverTask.attempt.id, OMITTED_ATTEMPT);
+    assert.deepEqual(mapped.ledger.omittedCutoverTask.provenance, {
+      unexpectedCleanCommit: CLEAN,
+      expectedCancelledHead: EXPECTED,
+      recoveredCommit: RECOVERED,
+      appliedCommit: APPLIED,
+      appliedTree: TREE,
+      recoveryAttemptId: RECOVERY_ATTEMPT,
+      integrationAttemptId: INTEGRATION_ATTEMPT,
+    });
     assert.deepEqual(mapped.ledger.omittedBaseRevisions, [
       { attemptId: "research-attempt", baseRevision: "a".repeat(40) },
     ]);
@@ -261,6 +424,71 @@ void test("v7 mapping reindexes grounded Intent, preserves models, and ledgers f
       () => normalizeV7Workstream(steered, new Map([[f.sessionFile, duplicateEvidence]])),
       /steering has 2 exact Pi user-message records/,
     );
+  } finally {
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
+void test("exact cutover omission rejects consequential source mismatches", async () => {
+  const f = await fixture();
+  try {
+    const rejectMutation = (mutate: (state: WorkstreamState) => void, pattern: RegExp) => {
+      const state = structuredClone(f.state);
+      mutate(state);
+      assert.throws(() => normalizeV7Workstream(state, new Map()), pattern);
+    };
+    rejectMutation((state) => {
+      const assignment = state.assignments.find((item) => item.id === OMITTED_TASK);
+      assert.ok(assignment);
+      assignment.id = "different-task";
+      const attempt = state.attempts.find((item) => item.id === OMITTED_ATTEMPT);
+      assert.ok(attempt);
+      attempt.assignmentId = "different-task";
+    }, /exactly one Assignment/);
+    rejectMutation((state) => {
+      const assignment = state.assignments.find((item) => item.id === OMITTED_TASK);
+      assert.ok(assignment?.capability === "implement");
+      Object.assign(assignment, { artifactIntent: "evidence_only" });
+    }, /strictly match schema|maintained-change contract/);
+    rejectMutation((state) => {
+      const attempt = state.attempts.find((item) => item.id === OMITTED_ATTEMPT);
+      assert.ok(attempt);
+      attempt.id = "different-attempt";
+    }, /sole exact Attempt/);
+    rejectMutation((state) => {
+      const attempt = state.attempts.find((item) => item.id === OMITTED_ATTEMPT);
+      assert.ok(attempt);
+      attempt.state = "failed";
+      attempt.error = "Failed.";
+    }, /not cancelled/);
+    rejectMutation((state) => {
+      const attempt = state.attempts.find((item) => item.id === OMITTED_ATTEMPT);
+      assert.ok(attempt?.cleanup);
+      attempt.cleanup.workerClosed = false;
+    }, /cleanup (?:or closed-worker proof|has no closed worker)/);
+    rejectMutation((state) => {
+      const attempt = state.attempts.find((item) => item.id === OMITTED_ATTEMPT);
+      assert.ok(attempt?.outputRelease);
+      attempt.outputRelease.expectedHead = CLEAN;
+    }, /(?:output release or expected head|retained-output release)/);
+    rejectMutation((state) => {
+      const integration = state.attempts.find((item) => item.id === INTEGRATION_ATTEMPT);
+      assert.ok(integration);
+      integration.continuationOf = OMITTED_ATTEMPT;
+    }, /incoming reference/);
+    rejectMutation((state) => {
+      const recovery = state.attempts.find((item) => item.id === RECOVERY_ATTEMPT);
+      const result = state.results.find((item) => item.id === recovery?.resultId);
+      assert.ok(result?.validity === "typed" && result.report.kind === "implementation");
+      assert.equal(result.report.status, "completed");
+      assert.equal(result.report.outcome, "changed");
+      result.report.commit = EXPECTED;
+    }, /(?:recovery Attempt provenance differs|Candidate parent commit does not exactly match)/);
+    rejectMutation((state) => {
+      const integration = state.attempts.find((item) => item.id === INTEGRATION_ATTEMPT);
+      assert.ok(integration?.application);
+      integration.application.revision = RECOVERED;
+    }, /integration\/application provenance differs/);
   } finally {
     await rm(f.parent, { recursive: true, force: true });
   }
@@ -299,7 +527,7 @@ void test("migration rejects non-active, non-settled, unresolved, and non-user s
     };
     assert.throws(
       () => normalizeV7Workstream(release, new Map()),
-      /unresolved output-release obligation/,
+      /(?:unresolved output-release obligation|retained-output release is outside)/,
     );
 
     const steered = structuredClone(f.state);
@@ -340,6 +568,12 @@ void test("prepared migration archives source, imports its revision, and copies 
       Effect.scoped(prepareV7Migration(preflight, port)).pipe(Effect.provide(liveLayer)),
     );
     assert.equal(manifest.source.revision, 17);
+    assert.ok(manifest.ledger.omittedCutoverTask);
+    assert.equal(manifest.ledger.omittedCutoverTask.attempt.id, OMITTED_ATTEMPT);
+    assert.equal(
+      manifest.sessions.some((session) => session.attemptId === OMITTED_ATTEMPT),
+      true,
+    );
     assert.deepEqual(await readFile(preflight.paths.archiveDatabase), sourceBytes);
     assert.deepEqual(
       await readFile(join(preflight.paths.workerSessionDirectory, "research-attempt.jsonl")),

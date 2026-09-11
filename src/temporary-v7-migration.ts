@@ -60,6 +60,16 @@ const BREADCRUMB_VERSION = 1 as const;
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
 const SQLITE_HEADER = "SQLite format 3\u0000";
+const CUTOVER_WORKSTREAM_ID = "ws-bc12172f-52cb-4829-9d47-4a4ec1c3d782";
+const OMITTED_CUTOVER_TASK_ID = "temporary-cutover-bootstrap-final-correction";
+const OMITTED_CUTOVER_ATTEMPT_ID = "attempt-fa322b7c-92f7-4ce3-b15c-65af5316dcb5";
+const RECOVERY_ATTEMPT_ID = "attempt-5db9b72a-7703-43fe-ab3c-0b4fc8f8decd";
+const INTEGRATION_ATTEMPT_ID = "attempt-90220471-0c30-4f36-aaad-1d1548a81834";
+const UNEXPECTED_CLEAN_COMMIT = "56d2d3317e0689b77a288b989bceb37dc87156e6";
+const EXPECTED_CANCELLED_HEAD = "3b248d2601cdd7d797e03f05d0c69a504836b95a";
+const RECOVERED_COMMIT = "5812348d826422d3e562e07b87f0c5a41e7dfcb6";
+const APPLIED_COMMIT = "74dd415b878f6312bc67e13aaac9a9fa11122772";
+const APPLIED_TREE = "b2368eb1b9f7e376cb735b3aef61836796828c2e";
 const StateRow = Type.Object(
   { state_json: Type.String(), revision: Type.Integer({ minimum: 0 }) },
   { additionalProperties: false },
@@ -166,6 +176,20 @@ export interface V7NormalizationLedger {
     readonly oldVersion: 0;
     readonly reason: string;
     readonly exact: WorkstreamState["intents"][number];
+  };
+  readonly omittedCutoverTask?: {
+    readonly reason: string;
+    readonly assignment: WorkAssignment;
+    readonly attempt: WorkAttempt;
+    readonly provenance: {
+      readonly unexpectedCleanCommit: string;
+      readonly expectedCancelledHead: string;
+      readonly recoveredCommit: string;
+      readonly appliedCommit: string;
+      readonly appliedTree: string;
+      readonly recoveryAttemptId: string;
+      readonly integrationAttemptId: string;
+    };
   };
   readonly intentVersions: ReadonlyArray<{
     readonly oldVersion: number;
@@ -297,20 +321,30 @@ export function normalizeV7Workstream(
       `Legacy lifecycle ${source.lifecycle.state} is not the one active migration source.`,
     );
   assertOmittableIntentZero(source);
-  for (const attempt of source.attempts) {
+  validateState(source);
+  const omittedCutoverTask =
+    source.id === CUTOVER_WORKSTREAM_ID ? assertExactCutoverOmission(source) : undefined;
+  const retainedAssignments = source.assignments.filter(
+    (assignment) => omittedCutoverTask === undefined || assignment.id !== OMITTED_CUTOVER_TASK_ID,
+  );
+  const retainedAttempts = source.attempts.filter(
+    (attempt) => omittedCutoverTask === undefined || attempt.id !== OMITTED_CUTOVER_ATTEMPT_ID,
+  );
+  for (const attempt of retainedAttempts) {
     if (!safeSegment(attempt.id))
       throw reject(`Attempt id is not a safe target filename segment: ${attempt.id}.`);
     if (attempt.state !== "settled")
       throw reject(`Attempt ${attempt.id} is not exactly settled (${attempt.state}).`);
     assertNoOutstandingObligation(attempt);
   }
-  validateState(source);
-  const assignments = new Map(source.assignments.map((assignment) => [assignment.id, assignment]));
-  const attemptTask = new Map(source.attempts.map((attempt) => [attempt.id, attempt.assignmentId]));
+  const assignments = new Map(retainedAssignments.map((assignment) => [assignment.id, assignment]));
+  const attemptTask = new Map(
+    retainedAttempts.map((attempt) => [attempt.id, attempt.assignmentId]),
+  );
   const resultMap = new Map(
     source.results.map((result) => [
       result.id,
-      `${attemptForResult(source, result.id).id}:outcome`,
+      `${attemptForResult({ ...source, attempts: retainedAttempts }, result.id).id}:outcome`,
     ]),
   );
   const ledger: MutableLedger = {
@@ -324,11 +358,11 @@ export function normalizeV7Workstream(
       oldVersion: intent.version,
       intentIndex,
     })),
-    assignmentToTask: source.assignments.map((assignment) => ({
+    assignmentToTask: retainedAssignments.map((assignment) => ({
       assignmentId: assignment.id,
       taskId: assignment.id,
     })),
-    attemptIds: source.attempts.map((attempt) => ({
+    attemptIds: retainedAttempts.map((attempt) => ({
       oldAttemptId: attempt.id,
       attemptId: attempt.id,
     })),
@@ -344,6 +378,7 @@ export function normalizeV7Workstream(
       "Legacy Result ids are deterministically rewritten to <Attempt id>:outcome.",
     ],
   };
+  if (omittedCutoverTask !== undefined) ledger.omittedCutoverTask = omittedCutoverTask;
   const intents = source.intents.slice(1).map((legacy): Intent => {
     if (legacy.authorityReceiptIds.length !== 1)
       throw reject(`Intent v${legacy.version} does not have one exact grounding receipt.`);
@@ -357,8 +392,8 @@ export function normalizeV7Workstream(
       recordedAt: legacy.recordedAt,
     };
   });
-  const tasks = source.assignments.map((assignment): Task => {
-    const legacyAttempts = source.attempts.filter(
+  const tasks = retainedAssignments.map((assignment): Task => {
+    const legacyAttempts = retainedAttempts.filter(
       (attempt) => attempt.assignmentId === assignment.id,
     );
     if (legacyAttempts.length === 0) throw reject(`Assignment ${assignment.id} has no Attempt.`);
@@ -768,6 +803,157 @@ function attemptForResult(source: WorkstreamState, resultId: string): WorkAttemp
   if (matches.length !== 1)
     throw reject(`Result ${resultId} is referenced by ${matches.length} Attempts.`);
   return requiredValue(matches[0], `unique Attempt for Result ${resultId}`);
+}
+
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: this one-use cutover predicate deliberately checks every user-approved omission fact together.
+function assertExactCutoverOmission(
+  source: WorkstreamState,
+): NonNullable<V7NormalizationLedger["omittedCutoverTask"]> {
+  const assignments = source.assignments.filter(
+    (assignment) => assignment.id === OMITTED_CUTOVER_TASK_ID,
+  );
+  if (assignments.length !== 1)
+    throw reject(`Cutover omission requires exactly one Assignment ${OMITTED_CUTOVER_TASK_ID}.`);
+  const assignment = requiredValue(assignments[0], "cutover omission Assignment");
+  if (assignment.capability !== "implement" || assignment.artifactIntent !== "maintained_change")
+    throw reject("Cutover omission Assignment is not the exact maintained-change contract.");
+
+  const attempts = source.attempts.filter(
+    (attempt) => attempt.assignmentId === OMITTED_CUTOVER_TASK_ID,
+  );
+  if (attempts.length !== 1 || attempts[0]?.id !== OMITTED_CUTOVER_ATTEMPT_ID)
+    throw reject("Cutover omission Assignment does not have its sole exact Attempt.");
+  const attempt = requiredValue(attempts[0], "cutover omission Attempt");
+  if (attempt.state !== "cancelled")
+    throw reject(`Cutover omission Attempt is not cancelled (${attempt.state}).`);
+  if (attempt.resultId !== undefined)
+    throw reject("Cutover omission Attempt unexpectedly has a Result id.");
+  if (
+    attempt.cleanup?.state !== "completed" ||
+    attempt.cleanup.workerClosed !== true ||
+    attempt.cleanup.expectedHead !== EXPECTED_CANCELLED_HEAD
+  )
+    throw reject("Cutover omission Attempt cleanup or closed-worker proof differs.");
+  if (
+    attempt.outputRelease?.state !== "completed" ||
+    attempt.outputRelease.expectedHead !== EXPECTED_CANCELLED_HEAD
+  )
+    throw reject("Cutover omission Attempt output release or expected head differs.");
+  if (attempt.application !== undefined)
+    throw reject("Cutover omission Attempt unexpectedly has application state.");
+  if (source.results.some((result) => result.assignmentId === OMITTED_CUTOVER_TASK_ID))
+    throw reject("Cutover omission Assignment unexpectedly has a Result.");
+  if (
+    source.deliveries.some(
+      (delivery) =>
+        delivery.attemptedBy === OMITTED_CUTOVER_ATTEMPT_ID ||
+        delivery.attemptedBy === OMITTED_CUTOVER_TASK_ID,
+    )
+  )
+    throw reject("Cutover omission Task or Attempt has an incoming delivery reference.");
+  assertNoIncomingCutoverReference(source);
+
+  const expectedAttention = `Refusing cleanup: branch pi-workgraph/ws-bc12172f-52cb-4829-9d47-4a4ec1c3d782/${OMITTED_CUTOVER_ATTEMPT_ID} points to ${UNEXPECTED_CLEAN_COMMIT}, expected ${EXPECTED_CANCELLED_HEAD}.`;
+  if (attempt.attentionHistory?.some((entry) => entry.detail === expectedAttention) !== true)
+    throw reject(
+      "Cutover omission cancellation attention does not record the exact clean-head mismatch.",
+    );
+
+  const recovery = exactAttempt(source, RECOVERY_ATTEMPT_ID, "recovery");
+  if (
+    recovery.state !== "settled" ||
+    recovery.baseRevision !== UNEXPECTED_CLEAN_COMMIT ||
+    recovery.candidate?.kind !== "initial" ||
+    recovery.candidate.rootCommit !== UNEXPECTED_CLEAN_COMMIT ||
+    reportedCommit(source, recovery) !== RECOVERED_COMMIT
+  )
+    throw reject("Cutover omission recovery Attempt provenance differs.");
+  const integration = exactAttempt(source, INTEGRATION_ATTEMPT_ID, "integration");
+  if (
+    integration.state !== "settled" ||
+    integration.candidate?.kind !== "integration" ||
+    integration.candidate.parentAttemptId !== RECOVERY_ATTEMPT_ID ||
+    integration.candidate.parentCommit !== RECOVERED_COMMIT ||
+    integration.application?.state !== "applied" ||
+    integration.application.revision !== APPLIED_COMMIT ||
+    reportedCommit(source, integration) !== APPLIED_COMMIT
+  )
+    throw reject("Cutover omission integration/application provenance differs.");
+  const integrationResult = exactAttemptResult(source, integration, "integration");
+  const observedAppliedTree = integrationResult.report.evidence.find((evidence) =>
+    evidence.observation.includes(APPLIED_TREE),
+  );
+  if (observedAppliedTree === undefined)
+    throw reject(
+      "Cutover omission durable integration Result lacks the exact applied-tree identity.",
+    );
+
+  return {
+    reason:
+      "Explicit user-chosen omission of one cutover-internal cancelled Task whose clean output was recovered and applied through canonical operational history.",
+    assignment: structuredClone(assignment),
+    attempt: structuredClone(attempt),
+    provenance: {
+      unexpectedCleanCommit: UNEXPECTED_CLEAN_COMMIT,
+      expectedCancelledHead: EXPECTED_CANCELLED_HEAD,
+      recoveredCommit: RECOVERED_COMMIT,
+      appliedCommit: APPLIED_COMMIT,
+      appliedTree: APPLIED_TREE,
+      recoveryAttemptId: RECOVERY_ATTEMPT_ID,
+      integrationAttemptId: INTEGRATION_ATTEMPT_ID,
+    },
+  };
+}
+
+function assertNoIncomingCutoverReference(source: WorkstreamState): void {
+  for (const attempt of source.attempts) {
+    if (attempt.id === OMITTED_CUTOVER_ATTEMPT_ID) continue;
+    if (
+      attempt.continuationOf === OMITTED_CUTOVER_ATTEMPT_ID ||
+      attempt.candidate?.parentAttemptId === OMITTED_CUTOVER_ATTEMPT_ID
+    )
+      throw reject(`Attempt ${attempt.id} has an incoming reference to the omitted Attempt.`);
+  }
+  for (const item of source.completion?.accounting ?? []) {
+    if (
+      (item.kind === "unresolved_assignment" && item.assignmentId === OMITTED_CUTOVER_TASK_ID) ||
+      (item.kind === "unresolved_attempt" && item.attemptId === OMITTED_CUTOVER_ATTEMPT_ID)
+    )
+      throw reject("Completion accounting references the omitted Task or Attempt.");
+  }
+}
+
+function exactAttempt(source: WorkstreamState, id: string, label: string): WorkAttempt {
+  const matches = source.attempts.filter((attempt) => attempt.id === id);
+  if (matches.length !== 1) throw reject(`Cutover omission ${label} Attempt identity differs.`);
+  return requiredValue(matches[0], `${label} Attempt`);
+}
+
+function exactAttemptResult(
+  source: WorkstreamState,
+  attempt: WorkAttempt,
+  label: string,
+): Extract<WorkstreamState["results"][number], { validity: "typed" }> {
+  const result =
+    attempt.resultId === undefined
+      ? undefined
+      : source.results.find((candidate) => candidate.id === attempt.resultId);
+  if (
+    result === undefined ||
+    result.validity !== "typed" ||
+    result.assignmentId !== attempt.assignmentId ||
+    result.report.kind !== "implementation" ||
+    result.report.status !== "completed" ||
+    result.report.outcome !== "changed"
+  )
+    throw reject(`Cutover omission ${label} Attempt lacks its exact typed changed Result.`);
+  return result;
+}
+
+function reportedCommit(source: WorkstreamState, attempt: WorkAttempt): string | undefined {
+  const report = exactAttemptResult(source, attempt, attempt.id).report;
+  if (report.kind !== "implementation" || report.status !== "completed") return undefined;
+  return report.outcome === "changed" ? report.commit : undefined;
 }
 
 function assertOmittableIntentZero(source: WorkstreamState): void {
