@@ -25,6 +25,7 @@ import { CanonicalCommandError, type CanonicalCommandPorts } from "../src/canoni
 import {
   CanonicalAppendCommandSchema,
   CanonicalEnqueueCommandSchema,
+  planAppend,
 } from "../src/canonical-queue.js";
 import type {
   ReconciliationCommit,
@@ -987,7 +988,6 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
           source: "policy",
         });
 
-        // Consultation uses the shared ordered fanout contract.
         const defaultAdvisor = yield* runtime.enqueue({
           taskId: "queued-canonical-runtime.test-10",
           kind: "consultation",
@@ -1002,24 +1002,33 @@ void test("queue planning resolves policy-owned selections, atomic fanout, and c
         const selectedAdvisor = yield* runtime.enqueue({
           taskId: "queued-canonical-runtime.test-11",
           kind: "consultation",
-          objective: "Advise broadly",
-          selection: { count: 2, distinctModels: true },
+          objective: "Advise exactly",
+          advisor: "fixture/advisor-2",
         });
-        assert.deepEqual(models(selectedAdvisor.tasks[4]?.attempts ?? []), [
-          "fixture/advisor",
-          "fixture/advisor-2",
-        ]);
+        assert.deepEqual(selectedAdvisor.tasks[4]?.attempts[0]?.selection, {
+          role: "consultation",
+          target: { model: "fixture/advisor-2", thinking: "medium" },
+          source: "policy",
+        });
         const beforeUnknown = yield* runtime.read();
-        const invalidSelection = yield* Effect.flip(
-          runtime.enqueue({
+        for (const command of [
+          {
             taskId: "queued-canonical-runtime.test-12",
             kind: "consultation",
-            objective: "Too many advisors",
-            selection: { count: 3, distinctModels: true },
-          }),
-        );
-        assert.ok(invalidSelection instanceof CanonicalRuntimeOperationError);
-        assert.deepEqual(yield* runtime.read(), beforeUnknown);
+            objective: "Unknown advisor",
+            advisor: "fixture/unknown",
+          },
+          {
+            taskId: "queued-canonical-runtime.test-13",
+            kind: "consultation",
+            objective: "Fanout is forbidden",
+            selection: { count: 2, distinctModels: true },
+          },
+        ]) {
+          const invalidSelection = yield* Effect.flip(runtime.enqueue(command));
+          assert.ok(invalidSelection instanceof CanonicalRuntimeOperationError);
+          assert.deepEqual(yield* runtime.read(), beforeUnknown);
+        }
 
         // The append batch is atomic: settle the first Attempt, then append N with
         // only the first carrying the requested continuation.
@@ -1405,6 +1414,25 @@ void test("canonical queue schemas remain the strict kind-owned command owner", 
     Value.Check(CanonicalAppendCommandSchema, { taskId: "task", selection: { model: "any" } }),
     false,
   );
+  assert.equal(
+    Value.Check(CanonicalEnqueueCommandSchema, {
+      taskId: "consultation-fanout",
+      kind: "consultation",
+      objective: "Consult",
+      selection: { count: 2, distinctModels: true },
+    }),
+    false,
+  );
+  assert.throws(
+    () =>
+      planAppend(
+        { taskId: "consultation", selection: { count: 2, distinctModels: true } },
+        "consultation",
+        POLICY,
+      ),
+    /selection/,
+  );
+  assert.equal(planAppend({ taskId: "consultation" }, "consultation", POLICY).attemptCount, 1);
   for (const command of [
     {
       taskId: "research",

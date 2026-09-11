@@ -116,7 +116,9 @@ export function classifyWorkstream(workstream: Workstream): FrontierEntry[] {
   const entries: FrontierEntry[] = [];
   for (const task of workstream.tasks)
     for (const attempt of task.attempts)
-      entries.push(...classifyAttempt(task, attempt, currentIntentIndex(workstream)));
+      entries.push(
+        ...classifyAttempt(task, attempt, currentIntentIndex(workstream), workstream.lifecycle),
+      );
   return entries;
 }
 
@@ -141,7 +143,9 @@ export function applyAffectedKeys(
     applied.add(identity);
     const located = locate(workstream, key);
     const replacement =
-      located === undefined ? [] : classifyAttempt(located.task, located.attempt, currentIntent);
+      located === undefined
+        ? []
+        : classifyAttempt(located.task, located.attempt, currentIntent, workstream.lifecycle);
     const firstIndex = next.findIndex((entry) => keyOf(entry.key) === identity);
     const retained = next.filter((entry) => keyOf(entry.key) !== identity);
     const insertAt = firstIndex < 0 ? retained.length : firstIndex;
@@ -154,10 +158,12 @@ function classifyAttempt(
   task: Task,
   attempt: Attempt,
   currentIntentIndex: number,
+  lifecycle: Workstream["lifecycle"],
 ): FrontierEntry[] {
-  if (attempt.state === "queued") return classifyQueued(task, attempt, currentIntentIndex);
-  if (attempt.state === "active") return classifyActive(task, attempt);
-  return classifyFinished(task, attempt);
+  if (attempt.state === "queued")
+    return lifecycle === "active" ? classifyQueued(task, attempt, currentIntentIndex) : [];
+  if (attempt.state === "active") return classifyActive(task, attempt, lifecycle);
+  return classifyFinished(task, attempt, lifecycle);
 }
 
 function classifyQueued(task: Task, attempt: Attempt, currentIntentIndex: number): FrontierEntry[] {
@@ -167,7 +173,11 @@ function classifyQueued(task: Task, attempt: Attempt, currentIntentIndex: number
   return [{ kind: "queued", key: attemptKey(task, attempt), taskKind: task.kind }];
 }
 
-function classifyActive(task: Task, attempt: Attempt): FrontierEntry[] {
+function classifyActive(
+  task: Task,
+  attempt: Attempt,
+  lifecycle: Workstream["lifecycle"],
+): FrontierEntry[] {
   const key = attemptKey(task, attempt);
   const execution = attempt.execution;
   const placement = execution?.placement;
@@ -190,14 +200,22 @@ function classifyActive(task: Task, attempt: Attempt): FrontierEntry[] {
   }
   // A ready Worker identity is the only case that supports repeated exact
   // presence polling; it needs submission confirmation or settlement.
-  if (worker !== undefined) return [{ kind: "worker_poll", key, worker }];
+  if (worker !== undefined) {
+    if (lifecycle === "suspended" && execution?.submission === "not_sent") return [];
+    return [{ kind: "worker_poll", key, worker }];
+  }
+  if (lifecycle === "suspended") return [];
   const entry: PlacementRecoveryEntry = { kind: "placement_recovery", key, placement };
   if (sessionFile !== undefined) entry.sessionFile = sessionFile;
   if (launch !== undefined) entry.launch = launch;
   return [entry];
 }
 
-function classifyFinished(task: Task, attempt: Attempt): FrontierEntry[] {
+function classifyFinished(
+  task: Task,
+  attempt: Attempt,
+  lifecycle: Workstream["lifecycle"],
+): FrontierEntry[] {
   // Finished history: only unsettled obligations are runnable.
   if (isOperationallyStable(task, attempt)) return [];
   const key = attemptKey(task, attempt);
@@ -215,7 +233,7 @@ function classifyFinished(task: Task, attempt: Attempt): FrontierEntry[] {
     entries.push(entry);
   }
   const outcome = attempt.outcome;
-  if (outcome !== undefined && outcome.delivery.state === "pending")
+  if (lifecycle !== "suspended" && outcome !== undefined && outcome.delivery.state === "pending")
     entries.push(deliveryEntry(key, outcome));
   return entries;
 }

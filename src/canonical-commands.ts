@@ -39,6 +39,11 @@ export const CompleteCommandSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+export const SuspendCommandSchema = Type.Object(
+  { reason: NonEmptyString },
+  { additionalProperties: false },
+);
+export const ResumeCommandSchema = Type.Object({}, { additionalProperties: false });
 export const CancelCommandSchema = Type.Object(
   { ...AttemptHandle, reason: NonEmptyString },
   { additionalProperties: false },
@@ -53,6 +58,8 @@ export const ReleaseOutputCommandSchema = Type.Object(
   { additionalProperties: false },
 );
 export type CompleteCommand = Static<typeof CompleteCommandSchema>;
+export type SuspendCommand = Static<typeof SuspendCommandSchema>;
+export type ResumeCommand = Static<typeof ResumeCommandSchema>;
 export type CancelCommand = Static<typeof CancelCommandSchema>;
 export type SteerCommand = Static<typeof SteerCommandSchema>;
 export type ApplyCommand = Static<typeof ApplyCommandSchema>;

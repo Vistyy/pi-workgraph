@@ -24,6 +24,7 @@ import {
   type Path,
   Queue,
   Ref,
+  Semaphore,
 } from "effect";
 import {
   applyAffectedKeys,
@@ -176,6 +177,8 @@ export class ReconciliationScheduler {
     private readonly controls: Ref.Ref<ControlFactory | undefined>,
     private readonly state: Ref.Ref<SchedulerState>,
     private readonly wake: Queue.Queue<void>,
+    private readonly dispatchGate: Semaphore.Semaphore,
+    private readonly dispatchPaused: Ref.Ref<boolean>,
   ) {}
 
   static make(
@@ -186,7 +189,17 @@ export class ReconciliationScheduler {
       const state = yield* Ref.make<SchedulerState>(EMPTY_STATE);
       const wake = yield* Queue.dropping<void>(1);
       const controls = yield* Ref.make<ControlFactory | undefined>(undefined);
-      return new ReconciliationScheduler(driver, attention, controls, state, wake);
+      const dispatchGate = yield* Semaphore.make(1);
+      const dispatchPaused = yield* Ref.make(false);
+      return new ReconciliationScheduler(
+        driver,
+        attention,
+        controls,
+        state,
+        wake,
+        dispatchGate,
+        dispatchPaused,
+      );
     });
   }
 
@@ -253,6 +266,16 @@ export class ReconciliationScheduler {
   /** One wake regardless of how many commits preceded it. */
   private readonly signal = (): Effect.Effect<void> => Queue.offer(this.wake, undefined);
 
+  /** Wait for any dispatched operation, then exclude new dispatch through the supplied effect. */
+  readonly withDispatchBarrier = <A, E, R>(
+    effect: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E, R> =>
+    Effect.acquireUseRelease(
+      Ref.set(this.dispatchPaused, true),
+      () => this.dispatchGate.withPermit(effect),
+      () => Ref.set(this.dispatchPaused, false).pipe(Effect.andThen(this.signal())),
+    );
+
   /** The scheduler fiber body; interrupts and joins with its owning Scope. */
   readonly run = (): Effect.Effect<void, never, FileSystem.FileSystem | Path.Path> =>
     Effect.gen(
@@ -276,12 +299,35 @@ export class ReconciliationScheduler {
             });
             continue;
           }
+          if (yield* Ref.get(this.dispatchPaused)) {
+            yield* Queue.take(this.wake);
+            continue;
+          }
           yield* this.dispatch(candidate.entry, now);
         }
       }.bind(this),
     );
 
   private dispatch(
+    entry: FrontierEntry,
+    now: number,
+  ): Effect.Effect<void, never, FileSystem.FileSystem | Path.Path> {
+    return this.dispatchGate.withPermit(
+      Effect.flatMap(this.dispatchAllowed(entry), (allowed) =>
+        allowed ? this.dispatchEntry(entry, now) : Effect.void,
+      ),
+    );
+  }
+
+  private dispatchAllowed(entry: FrontierEntry): Effect.Effect<boolean> {
+    return Effect.zipWith(
+      Ref.get(this.dispatchPaused),
+      this.contains(entry),
+      (paused, present) => !paused && present,
+    );
+  }
+
+  private dispatchEntry(
     entry: FrontierEntry,
     now: number,
   ): Effect.Effect<void, never, FileSystem.FileSystem | Path.Path> {

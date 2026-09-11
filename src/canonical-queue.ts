@@ -8,6 +8,7 @@ import {
   type Task,
 } from "./domain/workstream.js";
 import {
+  configuredTarget,
   implementationTargets,
   type ModelPolicy,
   resolveSelection,
@@ -73,7 +74,7 @@ export const CanonicalEnqueueCommandSchema = Type.Union([
       ...Objective,
       kind: Type.Literal("consultation"),
       context: Type.Optional(Type.String({ maxLength: 20_000 })),
-      selection: Type.Optional(SelectionRequestSchema),
+      advisor: Type.Optional(NonEmptyString),
     },
     { additionalProperties: false },
   ),
@@ -189,7 +190,7 @@ function taskSelections(
     case "review":
       return listSelections("review", command.selection, policy, "review");
     case "consultation":
-      return listSelections("consultation.advisor", command.selection, policy, "consultation");
+      return [consultationSelection(policy, command.advisor)];
     case "implementation":
       return [implementationSelection(policy, command.useEscalationExecutor === true)];
   }
@@ -210,8 +211,12 @@ function appendSelections(
       rejectAppendFields(command, ["candidateOf", "useEscalationExecutor", "baseRevision"], kind);
       return listSelections("review", command.selection, policy, "review");
     case "consultation":
-      rejectAppendFields(command, ["candidateOf", "useEscalationExecutor", "baseRevision"], kind);
-      return listSelections("consultation.advisor", command.selection, policy, "consultation");
+      rejectAppendFields(
+        command,
+        ["candidateOf", "useEscalationExecutor", "baseRevision", "selection"],
+        kind,
+      );
+      return [consultationSelection(policy)];
     case "implementation":
       rejectAppendFields(command, ["selection"], kind);
       return [implementationSelection(policy, command.useEscalationExecutor === true)];
@@ -229,6 +234,14 @@ function listSelections(
     target,
     source: "policy" as const,
   }));
+}
+
+function consultationSelection(policy: ModelPolicy, advisor?: string): ModelSelection {
+  return {
+    role: "consultation",
+    target: configuredTarget(policy, "consultation.advisor", advisor),
+    source: "policy",
+  };
 }
 
 function implementationSelection(policy: ModelPolicy, escalated: boolean): ModelSelection {

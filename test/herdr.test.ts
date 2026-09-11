@@ -45,6 +45,7 @@ await test("worker tabs use concise task text while native names remain unique a
   assert.doesNotMatch(label, /implement|[a-f0-9]{6}/i);
   assert.equal(herdrWorkerTabLabel({ ...request, attemptId: "attempt-two" }), label);
   const roleMarkers = [
+    ["consultation", "C"],
     ["implement", "I"],
     ["research", "R"],
     ["review", "V"],
@@ -64,6 +65,7 @@ await test("worker tabs use concise task text while native names remain unique a
     }),
     /^↳ \[R\] /,
   );
+  assert.match(herdrWorkerName({ ...request, role: "consultation" }), /consultation/);
   assert.notEqual(first, second);
   const fallback = herdrWorkerTabLabel({
     ...request,

@@ -17,6 +17,7 @@ import {
   createTask,
   createWorkstream,
   recordDeliverySuccess,
+  suspendWorkstream,
   type Task,
   terminalizeAttempt,
 } from "../src/domain/workstream.js";
@@ -166,6 +167,34 @@ async function collectText(
   }
   return assert.fail("text cursor did not finish");
 }
+
+void test("overview and context expose the bounded current suspension fact", async () => {
+  const fixture = completeFixture();
+  const initial = createWorkstream({
+    id: "suspended-inspection",
+    purpose: "Inspect suspension.",
+    repository: fixture.workstream.repository,
+    coordinator: fixture.workstream.coordinator,
+    intent: fixture.workstream.intents[0] ?? assert.fail("intent"),
+    createdAt: T0,
+  });
+  const workstream = suspendWorkstream(
+    initial,
+    { reason: "Await explicit input.", suspendedAt: T1 },
+    T1,
+  );
+  const snapshot = { workstream, reconciliation: [] };
+  const overview = await inspectTyped(snapshot, { section: "overview" });
+  assert.equal(overview.summary.lifecycle, "suspended");
+  assert.deepEqual(overview.summary.suspension, {
+    reason: "Await explicit input.",
+    suspendedAt: T1,
+  });
+  const context = await collectText(snapshot, { section: "context" });
+  assert.match(context, /"lifecycle": "suspended"/);
+  assert.match(context, /"reason": "Await explicit input\."/);
+  assert.match(context, /"suspendedAt": "2026-01-01T00:00:01\.000Z"/);
+});
 
 void test("one complete canonical Workstream projects all sections with one bounded cursor", async () => {
   const snapshot = completeFixture();

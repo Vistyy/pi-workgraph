@@ -30,8 +30,11 @@ import {
   decodeCommand,
   enqueueFacts,
   exactAttempt,
+  ResumeCommandSchema,
   ReviseIntentCommandSchema,
   SteerCommandSchema,
+  type SuspendCommand,
+  SuspendCommandSchema,
   workerIdentity,
 } from "./canonical-commands.js";
 import type { FrontierEntry } from "./canonical-frontier.js";
@@ -89,7 +92,9 @@ import {
   recordDeliverySuccess,
   recordEffectiveModel,
   recordWorkerExecution,
+  resumeWorkstream,
   reviseIntent,
+  suspendWorkstream,
   type Task,
   terminalizeAttempt,
   type Workstream,
@@ -360,6 +365,50 @@ export class CanonicalRuntime {
           const located = yield* this.try("resolve Attempt", () => exactAttempt(state, attemptId));
           return structuredClone(located);
         }.bind(this),
+      ),
+    );
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
+  readonly suspend = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+    this.scheduler.withDispatchBarrier(
+      Effect.uninterruptible(
+        this.serialized(
+          Effect.gen(
+            function* (this: CanonicalRuntime) {
+              const input = yield* this.try("decode suspension", () =>
+                decodeCommand<SuspendCommand>(SuspendCommandSchema, command, "suspension command"),
+              );
+              const now = yield* this.now();
+              const committed = yield* this.authoritative("suspend canonical Workstream", (state) =>
+                suspendWorkstream(state, { reason: input.reason, suspendedAt: now }, now),
+              );
+              yield* this.scheduler.attach(committed);
+              return committed;
+            }.bind(this),
+          ),
+        ),
+      ),
+    );
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Canonical TypeBox schema decodes this external command value.
+  readonly resume = (command: unknown): CanonicalRuntimeEffect<Workstream> =>
+    this.scheduler.withDispatchBarrier(
+      Effect.uninterruptible(
+        this.serialized(
+          Effect.gen(
+            function* (this: CanonicalRuntime) {
+              yield* this.try("decode resumption", () =>
+                decodeCommand(ResumeCommandSchema, command, "resumption command"),
+              );
+              const now = yield* this.now();
+              const committed = yield* this.authoritative("resume canonical Workstream", (state) =>
+                resumeWorkstream(state, now),
+              );
+              yield* this.scheduler.attach(committed);
+              return committed;
+            }.bind(this),
+          ),
+        ),
       ),
     );
 

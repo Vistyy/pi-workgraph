@@ -434,6 +434,8 @@ function projectSection(
         text: json({
           purpose: state.purpose,
           repository: state.repository,
+          lifecycle: state.lifecycle,
+          suspension: state.suspension,
           intents: state.intents,
         }),
       };
@@ -714,6 +716,7 @@ function overviewSummary(snapshot: CanonicalRuntimeInspectionSnapshot) {
   const state = snapshot.workstream;
   return {
     lifecycle: state.lifecycle,
+    suspension: state.suspension,
     purpose: compact(state.purpose),
     intentIndex: state.intents.length - 1,
     taskCount: state.tasks.length,
@@ -732,6 +735,8 @@ function overviewSummary(snapshot: CanonicalRuntimeInspectionSnapshot) {
 
 function contextSummary(workstream: Workstream) {
   return {
+    lifecycle: workstream.lifecycle,
+    suspension: workstream.suspension,
     intentCount: workstream.intents.length,
     currentIntentIndex: workstream.intents.length - 1,
   };

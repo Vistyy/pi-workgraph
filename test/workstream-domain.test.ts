@@ -27,7 +27,9 @@ import {
   recordDeliverySuccess,
   recordEffectiveModel,
   recordWorkerExecution,
+  resumeWorkstream,
   reviseIntent,
+  suspendWorkstream,
   type Task,
   TaskSchema,
   type TerminalObservation,
@@ -37,6 +39,7 @@ import {
   WorkstreamSchema,
 } from "../src/domain/workstream.js";
 import { EvidenceInputSchema, WorkerReportInputSchema } from "../src/report-schema.js";
+import { canonicalSessionMode, canonicalWorkerAssignment } from "../src/worker-context.js";
 
 const repository = { projectRoot: "/repo", gitCommonDir: "/repo/.git" };
 const coordinator = { sessionId: "session", sessionFile: "/session.json" };
@@ -236,6 +239,123 @@ function finish(
 function deliver(workstream: ReturnType<typeof add>, id: string, taskId = "Task opaque") {
   return recordDeliverySuccess(workstream, { taskId, attemptId: id }, "t4", "t4");
 }
+
+void test("consultation is a presentation role over the research session contract", () => {
+  const task = {
+    kind: "consultation" as const,
+    id: "consultation-task",
+    objective: "Advise on ownership.",
+    intentIndex: 0,
+    createdAt: "t0",
+    context: "Known context.",
+  };
+  const assignment = canonicalWorkerAssignment({
+    task,
+    intent,
+    intentIndex: 0,
+    repositoryRoot: repository.projectRoot,
+    workerCwd: repository.projectRoot,
+    runId: "workstream",
+    attemptId: "attempt",
+  });
+  assert.equal(canonicalSessionMode(task), "research");
+  assert.equal(assignment.mode, "research");
+  assert.equal(assignment.role, "consultation");
+  const { PI_WORKGRAPH_MODE: mode, PI_WORKGRAPH_POLICY_ROLE: policyRole } = assignment.environment;
+  assert.equal(mode, "research");
+  assert.equal(policyRole, "consultation");
+  assert.match(assignment.objective, /Coordinator-known context: Known context/);
+});
+
+void test("suspension is an exact lifecycle fact with active-only creation and resumption", () => {
+  const active = add();
+  const suspendedAt = "2026-01-02T03:04:05.000Z";
+  const suspended = suspendWorkstream(
+    active,
+    { reason: "Await coordinator decision.", suspendedAt },
+    suspendedAt,
+  );
+  assert.equal(suspended.lifecycle, "suspended");
+  assert.deepEqual(suspended.suspension, {
+    reason: "Await coordinator decision.",
+    suspendedAt,
+  });
+  assert.equal(suspended.revision, active.revision + 1);
+  assert.equal(suspended.updatedAt, suspendedAt);
+  assert.deepEqual(suspended.tasks, active.tasks);
+  assert.deepEqual(suspended.intents, active.intents);
+  assert.throws(
+    () =>
+      suspendWorkstream(suspended, suspended.suspension ?? assert.fail("suspension"), suspendedAt),
+    /active/,
+  );
+  assert.throws(() => createTask(suspended, researchTask("later"), suspendedAt), /active/);
+  assert.throws(
+    () =>
+      completeWorkstream(
+        suspended,
+        {
+          conclusion: "Not while suspended.",
+          evidence: [{ label: "state", observation: "Suspended." }],
+          limitations: [],
+          completedAt: suspendedAt,
+        },
+        suspendedAt,
+      ),
+    /active/,
+  );
+  const key = { taskId: "Task opaque", attemptId: "Attempt A" };
+  const running = activateAttempt(
+    active,
+    key,
+    suspendedAt,
+    declare({ kind: "shared_project", path: "/repo" }),
+  );
+  const suspendedRunning = suspendWorkstream(
+    running,
+    { reason: "Keep settling.", suspendedAt },
+    suspendedAt,
+  );
+  const settled = terminalizeAttempt(suspendedRunning, key, reported(), suspendedAt);
+  assert.equal(
+    findAttempt(findTask(settled, key.taskId) ?? assert.fail("task"), key.attemptId)?.state,
+    "finished",
+  );
+  assert.throws(
+    () => suspendWorkstream(active, { reason: " ", suspendedAt }, suspendedAt),
+    /reason/,
+  );
+  assert.throws(
+    () =>
+      suspendWorkstream(
+        active,
+        { reason: "Wait.", suspendedAt: "2026-01-02T03:04:05Z" },
+        suspendedAt,
+      ),
+    /suspendedAt|canonical UTC instant/,
+  );
+  assert.throws(
+    () => validateWorkstream({ ...structuredClone(active), lifecycle: "suspended" }),
+    /Suspension/,
+  );
+  assert.throws(
+    () =>
+      validateWorkstream({
+        ...structuredClone(active),
+        suspension: { reason: "Wait.", suspendedAt },
+      }),
+    /Suspension/,
+  );
+
+  const resumedAt = "2026-01-02T04:00:00.000Z";
+  const resumed = resumeWorkstream(suspended, resumedAt);
+  assert.equal(resumed.lifecycle, "active");
+  assert.equal(resumed.suspension, undefined);
+  assert.equal(resumed.revision, suspended.revision + 1);
+  assert.equal(resumed.updatedAt, resumedAt);
+  assert.deepEqual(resumed.tasks, active.tasks);
+  assert.throws(() => resumeWorkstream(resumed, resumedAt), /not suspended/);
+});
 
 void test("pure aggregate schemas are strict and identifiers are opaque", () => {
   const workstream = base();

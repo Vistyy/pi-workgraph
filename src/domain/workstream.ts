@@ -1,3 +1,4 @@
+import { DateTime, Option } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 import { EvidenceInputSchema, WorkerReportInputSchema } from "../report-schema.js";
@@ -447,6 +448,10 @@ const CompletionSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+const SuspensionSchema = Type.Object(
+  { reason: NonEmptyString, suspendedAt: TransferTimestamp },
+  { additionalProperties: false },
+);
 export const WorkstreamSchema = Type.Object(
   {
     format: Type.Literal(CANONICAL_WORKSTREAM_FORMAT),
@@ -458,7 +463,8 @@ export const WorkstreamSchema = Type.Object(
     repository: RepositoryIdentitySchema,
     coordinator: CoordinatorIdentitySchema,
     coordinatorTransfers: Type.Array(CoordinatorTransferSchema),
-    lifecycle: stringLiterals(["active", "completed"] as const),
+    lifecycle: stringLiterals(["active", "suspended", "completed"] as const),
+    suspension: Type.Optional(SuspensionSchema),
     intents: Type.Array(IntentSchema, { minItems: 1 }),
     tasks: Type.Array(TaskSchema),
     completion: Type.Optional(CompletionSchema),
@@ -494,6 +500,7 @@ export type TaskContract = Task extends infer Item
   : never;
 export type CompletionAccounting = Static<typeof CompletionAccountingSchema>;
 export type Completion = Static<typeof CompletionSchema>;
+export type Suspension = Static<typeof SuspensionSchema>;
 export type Workstream = Static<typeof WorkstreamSchema>;
 export type AttemptKey = Readonly<{ taskId: string; attemptId: string }>;
 export type TerminalObservation =
@@ -1137,6 +1144,7 @@ function validateOutputRelease(task: Task, attempt: Attempt): void {
     throw new Error(`Attempt ${attempt.id} output release blocker does not match its state.`);
 }
 function validateLifecycle(workstream: Workstream): void {
+  validateSuspension(workstream);
   if ((workstream.lifecycle === "completed") !== (workstream.completion !== undefined))
     throw new Error("Completed lifecycle and Completion must appear together.");
   if (workstream.lifecycle === "completed") {
@@ -1152,6 +1160,19 @@ function validateLifecycle(workstream: Workstream): void {
   const expected = deriveCompletionAccounting(workstream);
   if (!sameValue(expected, workstream.completion.accounting))
     throw new Error("Completion accounting must be the exact derived set.");
+}
+
+function validateSuspension(workstream: Workstream): void {
+  if ((workstream.lifecycle === "suspended") !== (workstream.suspension !== undefined))
+    throw new Error("Suspended lifecycle and current Suspension must appear together.");
+  if (workstream.suspension === undefined) return;
+  if (!workstream.suspension.reason.trim()) throw new Error("Suspension reason is required.");
+  const suspendedAt = DateTime.make(workstream.suspension.suspendedAt);
+  if (
+    Option.isNone(suspendedAt) ||
+    DateTime.toDate(suspendedAt.value).toISOString() !== workstream.suspension.suspendedAt
+  )
+    throw new Error("Suspension timestamp must be a canonical UTC instant.");
 }
 
 export function findTask(workstream: Workstream, taskId: string): Task | undefined {
@@ -1212,6 +1233,25 @@ export function createWorkstream(input: {
   };
   validateWorkstream(workstream);
   return workstream;
+}
+export function suspendWorkstream(
+  workstream: Workstream,
+  suspension: Suspension,
+  updatedAt: string,
+): Workstream {
+  assertActive(workstream, "suspend Workstream");
+  return mutate(workstream, updatedAt, (draft) => {
+    draft.lifecycle = "suspended";
+    draft.suspension = clone(suspension);
+  });
+}
+export function resumeWorkstream(workstream: Workstream, updatedAt: string): Workstream {
+  if (workstream.lifecycle !== "suspended")
+    throw new Error("Cannot resume a Workstream that is not suspended.");
+  return mutate(workstream, updatedAt, (draft) => {
+    draft.lifecycle = "active";
+    delete draft.suspension;
+  });
 }
 export function reviseIntent(
   workstream: Workstream,
@@ -1325,7 +1365,7 @@ export function recordEffectiveModel(
   const current = requireAttempt(workstream, key).attempt;
   if (current.state === "queued")
     throw new Error(`Attempt ${key.attemptId} is not active or finished.`);
-  assertActive(workstream, "record effective model");
+  assertNotCompleted(workstream, "record effective model");
   if (current.effectiveModels?.some((item) => sameValue(item, observation)) === true)
     return workstream;
   return mutate(workstream, updatedAt, (draft) => {
@@ -1341,7 +1381,7 @@ export function recordWorkerExecution(
   execution: WorkerExecution,
   updatedAt: string,
 ): Workstream {
-  assertActive(workstream, "record Worker execution");
+  assertNotCompleted(workstream, "record Worker execution");
   const current = requireAttempt(workstream, key).attempt;
   if (current.state === "queued")
     throw new Error(`Attempt ${key.attemptId} is not active or finished.`);
@@ -1483,7 +1523,7 @@ export function checkpointCancellation(
   checkpoint: CancellationCheckpoint,
   updatedAt: string,
 ): Workstream {
-  assertActive(workstream, "checkpoint cancellation");
+  assertNotCompleted(workstream, "checkpoint cancellation");
   const attempt = requireAttempt(workstream, key).attempt;
   if (attempt.state !== "active") throw new Error(`Attempt ${key.attemptId} is not active.`);
   const current = attempt.execution?.cancellation;
@@ -1521,7 +1561,7 @@ export function terminalizeAttempt(
     if (sameTerminalSubstance(current.outcome, expected)) return workstream;
     throw new Error(`Attempt ${key.attemptId} already has a conflicting terminal Outcome.`);
   }
-  assertActive(workstream, "terminalize Attempt");
+  assertNotCompleted(workstream, "terminalize Attempt");
   if (current.state !== "active" && current.state !== "queued")
     throw new Error(`Attempt ${key.attemptId} cannot be terminalized from ${current.state}.`);
   if (observation.kind === "cancelled" && current.state === "active") {
@@ -1820,6 +1860,12 @@ function mutate(
 }
 function assertActive(workstream: Workstream, operation: string): void {
   if (workstream.lifecycle !== "active")
+    throw new Error(
+      `Cannot ${operation} unless the Workstream is active; completed Workstreams are terminal.`,
+    );
+}
+function assertNotCompleted(workstream: Workstream, operation: string): void {
+  if (workstream.lifecycle === "completed")
     throw new Error(`Cannot ${operation} on a completed Workstream.`);
 }
 function assertObligation(workstream: Workstream): void {

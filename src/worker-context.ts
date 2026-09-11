@@ -197,7 +197,7 @@ function belongsToIdentity(
 /** One concrete canonical worker assignment; every launch fact is built once here. */
 export interface CanonicalWorkerAssignment {
   readonly mode: WorkerSessionMode;
-  readonly role: "implement" | "research" | "review";
+  readonly role: "consultation" | "implement" | "research" | "review";
   readonly objective: string;
   readonly prompt: string;
   readonly environment: Record<string, string>;
@@ -257,6 +257,7 @@ function workerMode(capability: WorkerCapability): WorkerSessionMode {
 function workerRole(capability: WorkerCapability): CanonicalWorkerAssignment["role"] {
   if (capability === "implement") return "implement";
   if (capability === "review") return "review";
+  if (capability === "consultation") return "consultation";
   return "research";
 }
 

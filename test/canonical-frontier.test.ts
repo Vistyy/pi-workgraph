@@ -5,7 +5,16 @@ import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths are real host repository identities.
 import { join } from "node:path";
 import test from "node:test";
-import { Clock, Deferred, Effect, type FileSystem, Option, type Path, type Scope } from "effect";
+import {
+  Clock,
+  Deferred,
+  Effect,
+  Fiber,
+  type FileSystem,
+  Option,
+  type Path,
+  type Scope,
+} from "effect";
 import { TestClock } from "effect/testing";
 import {
   applyAffectedKeys,
@@ -45,6 +54,7 @@ import {
   recordDeliverySuccess,
   recordWorkerExecution,
   reviseIntent,
+  suspendWorkstream,
   type Task,
   type TerminalObservation,
   terminalizeAttempt,
@@ -325,6 +335,26 @@ void test("classifies mixed obligations and replaces only affected keys in place
   assert.deepEqual(applyAffectedKeys(frontier, ws, [KEY("missing", "missing-a")]), frontier);
 });
 
+void test("suspended classification retains settlement and cleanup but suppresses new effects", () => {
+  const active = mixedWorkstream();
+  const suspended = suspendWorkstream(active, { reason: "Wait.", suspendedAt: T1 }, T1);
+  assert.deepEqual(kinds(classifyWorkstream(suspended)), [
+    "worker_poll:wp-a",
+    "cancellation:co-a",
+    "cleanup:cw-a",
+    "cleanup:cp-a",
+  ]);
+  const activeFrontier = classifyWorkstream(active);
+  assert.equal(
+    entryFor(applyAffectedKeys(activeFrontier, suspended, [KEY("q", "q-a")]), "q-a"),
+    undefined,
+  );
+  assert.equal(
+    entryFor(applyAffectedKeys(activeFrontier, suspended, [KEY("di", "di-a")]), "di-a"),
+    undefined,
+  );
+});
+
 void test("delivery retry timing is transient 1s/2s/4s doubling to a 30s cap", () => {
   assert.deepEqual(
     [0, 1, 2, 3, 4, 5, 6, 7].map(deliveryRetryDelayMillis),
@@ -553,6 +583,102 @@ void test("a control commit is exact-key and runtime-owned, while unchanged wait
         );
         cleared.workstream.tasks.length = 0;
         assert.notEqual((yield* runtime.inspectionSnapshot()).workstream.tasks.length, 0);
+      }),
+    ),
+  );
+});
+
+void test("suspend waits for dispatched work, removes stale effects, and resume dispatches once", async () => {
+  await withFixture((f) => {
+    let queuedDispatches = 0;
+    let placementDispatches = 0;
+    return runCanonical(
+      Effect.gen(function* () {
+        yield* createStore(freshWorkstream(f));
+        const dispatched = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const driver = driverFrom((entry, control) =>
+          Effect.gen(function* () {
+            if (entry.kind === "queued") {
+              queuedDispatches += 1;
+              yield* Deferred.succeed(dispatched, undefined);
+              yield* Deferred.await(release);
+              yield* control.commit({ kind: "activate", placement: SHARED });
+              return { kind: "waiting" } as const;
+            }
+            if (entry.kind === "placement_recovery") {
+              placementDispatches += 1;
+              return { kind: "blocked", detail: "observed resumed placement" } as const;
+            }
+            return { kind: "waiting" } as const;
+          }),
+        );
+        const runtime = yield* acquire(f, driver);
+        const queued = yield* runtime.enqueue({
+          taskId: "suspension-race",
+          kind: "research",
+          objective: "Race suspension",
+          expectedEvidence: ["effects"],
+        });
+        const attemptId = queued.tasks[0]?.attempts[0]?.id ?? assert.fail("attempt");
+        yield* Deferred.await(dispatched);
+        const suspending = yield* Effect.forkChild(runtime.suspend({ reason: "Pause dispatch." }));
+        for (let spin = 0; spin < 10; spin += 1) yield* Effect.yieldNow;
+        assert.equal((yield* runtime.snapshot()).lifecycle, "active");
+        yield* Deferred.succeed(release, undefined);
+        const suspended = yield* Fiber.join(suspending);
+        assert.equal(suspended.lifecycle, "suspended");
+        assert.equal(suspended.suspension?.reason, "Pause dispatch.");
+        assert.equal(queuedDispatches, 1);
+        assert.equal(placementDispatches, 0);
+        assert.equal((yield* runtime.frontierSnapshot()).length, 0);
+        for (let spin = 0; spin < 20; spin += 1) yield* Effect.yieldNow;
+        assert.equal(placementDispatches, 0);
+
+        const resumed = yield* runtime.resume({});
+        assert.equal(resumed.lifecycle, "active");
+        assert.equal(resumed.suspension, undefined);
+        expectSome(yield* awaitKind(runtime, "placement_recovery", attemptId));
+        expectSome(yield* waitFor(Effect.sync(() => placementDispatches === 1)));
+        for (let spin = 0; spin < 20; spin += 1) yield* Effect.yieldNow;
+        assert.equal(placementDispatches, 1);
+        yield* runtime.close();
+      }),
+    );
+  });
+});
+
+void test("interrupting suspension before the dispatch barrier leaves lifecycle active", async () => {
+  await withFixture((f) =>
+    runCanonical(
+      Effect.gen(function* () {
+        yield* createStore(freshWorkstream(f));
+        const dispatched = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const driver = driverFrom((entry, control) =>
+          entry.kind !== "queued"
+            ? Effect.succeed({ kind: "waiting" } as const)
+            : Effect.gen(function* () {
+                yield* Deferred.succeed(dispatched, undefined);
+                yield* Deferred.await(release);
+                yield* control.commit({ kind: "activate", placement: SHARED });
+                return { kind: "waiting" } as const;
+              }),
+        );
+        const runtime = yield* acquire(f, driver);
+        yield* runtime.enqueue({
+          taskId: "interrupted-suspension",
+          kind: "research",
+          objective: "Interrupt suspension",
+          expectedEvidence: ["lifecycle"],
+        });
+        yield* Deferred.await(dispatched);
+        const suspending = yield* Effect.forkChild(runtime.suspend({ reason: "Do not commit." }));
+        for (let spin = 0; spin < 10; spin += 1) yield* Effect.yieldNow;
+        yield* Fiber.interrupt(suspending);
+        assert.equal((yield* runtime.read()).lifecycle, "active");
+        yield* Deferred.succeed(release, undefined);
+        yield* runtime.close();
       }),
     ),
   );
