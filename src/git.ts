@@ -102,7 +102,7 @@ export function validateRetainedCandidate(
     const output = operation.output;
     if (output?.kind !== "retained")
       return yield* fail("extend candidate", "Candidate parent has no retained output.");
-    yield* requireCompactedCandidate(operation, output.tip);
+    yield* requireCompactedCandidate(operation);
     yield* requireExactRef(operation.target.commonDir, operation.outputRef, output.tip);
   }).pipe(Effect.provide(childProcessLayer));
 }
@@ -262,7 +262,7 @@ function prepareRetainedApplication(
     const output = operation.output;
     if (output?.kind !== "retained")
       return yield* fail("apply output", "Attempt has no retained output.");
-    yield* requireCompactedCandidate(operation, output.tip);
+    yield* requireCompactedCandidate(operation);
     const source = yield* requireExactRef(
       operation.target.commonDir,
       operation.outputRef,
@@ -297,7 +297,7 @@ export function applyOutput(
     const output = operation.output;
     if (output?.kind !== "applying")
       return yield* fail("apply output", "Application has no durable preparation checkpoint.");
-    yield* requireCompactedCandidate(operation, output.sourceTip);
+    yield* requireCompactedCandidate(operation);
     yield* requireExactRef(operation.target.commonDir, operation.outputRef, output.sourceTip);
     const destination = yield* destinationState(operation.target);
     if (destination.ref !== output.destinationRef)
@@ -358,7 +358,7 @@ export function cleanupAppliedOutput(
       return yield* fail("cleanup applied output", "Attempt has no applied output to clean up.");
     if (output.cleanupTip === undefined) return output;
     yield* revalidate(operation.target);
-    yield* requireCompactedCandidate(operation, output.cleanupTip);
+    yield* requireCompactedCandidate(operation);
     yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.cleanupTip);
     const { cleanupTip: _cleanupTip, ...cleaned } = output;
     return cleaned;
@@ -452,10 +452,7 @@ function validateCandidate(
   );
 }
 
-function requireCompactedCandidate(
-  operation: RepositoryOperation,
-  _tip: string,
-): Effect.Effect<void, GitError> {
+function requireCompactedCandidate(operation: RepositoryOperation): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
     const registration = yield* registeredWorktree(
       operation.target.commonDir,
