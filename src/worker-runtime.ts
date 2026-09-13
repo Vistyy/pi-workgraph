@@ -5,7 +5,6 @@ import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { ThinkingSchema } from "./domain/model-target.js";
 import {
-  type ImplementationReportInput,
   isWorkerReport,
   isWorkerReportInput,
   reportSchemaForMode,
@@ -38,7 +37,6 @@ const WorkerEnvironmentConfig = Config.all({
   executorThinking: Config.string("PI_WORKGRAPH_EXECUTOR_THINKING").pipe(
     Config.withDefault("high"),
   ),
-  baseCommit: Config.string("PI_WORKGRAPH_BASE_COMMIT").pipe(Config.withDefault("")),
   implementationStart: Config.string("PI_WORKGRAPH_IMPLEMENTATION_START").pipe(
     Config.withDefault(""),
   ),
@@ -58,7 +56,6 @@ export interface WorkerEnvironment {
   readonly nodeId: string;
   readonly executorModel: string;
   readonly executorThinking: string;
-  readonly baseCommit: string;
   readonly continued: boolean;
   readonly experiment: boolean;
   readonly policyRole: WorkerPolicyRole;
@@ -66,22 +63,13 @@ export interface WorkerEnvironment {
 
 export interface WorkerTerminalState {
   readonly continued?: boolean | undefined;
-  readonly outcome?: "changed" | "no_change" | undefined;
-  readonly baseCommit?: string | undefined;
-  readonly revision?: string | undefined;
 }
 
 class WorkerHostError extends Data.TaggedError("WorkerHostError")<{
   readonly message: string;
-  readonly operation: "exec" | "setModel";
+  readonly operation: "setModel";
 }> {}
-class WorkerGitError extends Data.TaggedError("WorkerGitError")<{ readonly message: string }> {}
-type WorkerExpectedError = WorkerContractError | WorkerHostError | WorkerGitError;
-
-export type WorkerExec = (
-  cwd: string,
-  args: string[],
-) => Promise<{ code: number; stdout: string; stderr: string }>;
+type WorkerExpectedError = WorkerContractError | WorkerHostError;
 export interface WorkerModelHost {
   isSelected(model: string, thinking: string): boolean;
   selectModel(provider: string, model: string): Promise<"selected" | "missing" | "no_credentials">;
@@ -106,7 +94,6 @@ export const WorkerEnvironmentEffect = Effect.gen(function* () {
     nodeId: raw.nodeId,
     executorModel: raw.executorModel,
     executorThinking: raw.executorThinking,
-    baseCommit: raw.baseCommit,
     continued: raw.implementationStart === "executor",
     experiment,
     policyRole,
@@ -334,26 +321,26 @@ export class WorkerRuntime {
       : recoveryMessage(recovery);
   }
 
-  completeReport(
-    cwd: string,
-    params: WorkerReportInput,
-    branch: readonly WorkerEntry[],
-    exec: WorkerExec,
-  ) {
+  completeReport(params: WorkerReportInput, branch: readonly WorkerEntry[]) {
     const self = this;
     return Effect.gen(function* () {
       if (!isWorkerReportInput(params) || params.kind !== self.environment.mode)
         return yield* contractFailure(`Report must satisfy the ${self.environment.mode} contract.`);
-      if (params.kind !== "implementation" || params.status !== "completed")
-        return terminalReport(params, self.terminalState());
-      if (params.outcome === "no_change")
-        return yield* self.noChangeImplementationReport(cwd, params, exec);
-      return yield* self.changedImplementationReport(
-        cwd,
-        params,
-        self.hasExecutorMessage(branch),
-        exec,
-      );
+      if (
+        params.kind === "implementation" &&
+        params.status === "completed" &&
+        params.outcome === "changed"
+      ) {
+        if (self.phase !== "executor")
+          return yield* contractFailure(
+            "Completed changed implementation requires guide-to-executor cutover.",
+          );
+        if (!self.hasExecutorMessage(branch))
+          return yield* contractFailure(
+            "Completed changed implementation requires an actual executor assistant message after this attempt's executor start.",
+          );
+      }
+      return terminalReport(params, self.terminalState());
     }).pipe(
       Effect.tap(() =>
         Effect.sync(() => {
@@ -361,53 +348,6 @@ export class WorkerRuntime {
         }),
       ),
     );
-  }
-
-  private noChangeImplementationReport(
-    cwd: string,
-    report: Extract<ImplementationReportInput, { outcome: "no_change" }>,
-    exec: WorkerExec,
-  ) {
-    const self = this;
-    return Effect.gen(function* () {
-      if (self.environment.baseCommit.length === 0)
-        return yield* contractFailure("PI_WORKGRAPH_BASE_COMMIT is required.");
-      yield* requireCleanWorktree(exec, cwd, "No-change implementation requires a clean worktree:");
-      const revision = yield* gitEffect(exec, cwd, ["rev-parse", "HEAD"]);
-      if (report.revision !== revision || revision !== self.environment.baseCommit)
-        return yield* contractFailure(
-          `No-change implementation must report the unchanged base revision ${self.environment.baseCommit}.`,
-        );
-      return terminalReport(report, {
-        continued: self.environment.continued,
-        outcome: "no_change",
-        baseCommit: self.environment.baseCommit,
-        revision,
-      });
-    });
-  }
-
-  private changedImplementationReport(
-    cwd: string,
-    report: Extract<ImplementationReportInput, { outcome: "changed" }>,
-    hasExecutorMessage: boolean,
-    exec: WorkerExec,
-  ) {
-    const self = this;
-    return Effect.gen(function* () {
-      if (self.phase !== "executor")
-        return yield* contractFailure(
-          "Completed changed implementation requires guide-to-executor cutover.",
-        );
-      if (!hasExecutorMessage)
-        return yield* contractFailure(
-          "Completed changed implementation requires an actual executor assistant message after this attempt's executor start.",
-        );
-      if (self.environment.baseCommit.length === 0)
-        return yield* contractFailure("PI_WORKGRAPH_BASE_COMMIT is required.");
-      const provenance = yield* changedCommitProvenance(exec, cwd, self.environment.baseCommit);
-      return terminalReport({ ...report, ...provenance }, self.terminalState());
-    });
   }
 
   private terminalState(): WorkerTerminalState {
@@ -518,74 +458,6 @@ function terminalReport(report: WorkerReport, state: WorkerTerminalState) {
     details: { report, state },
     terminate: true,
   };
-}
-
-function changedCommitProvenance(exec: WorkerExec, cwd: string, baseCommit: string) {
-  return Effect.gen(function* () {
-    yield* requireCleanWorktree(exec, cwd, "Commit and leave a clean worktree before reporting:");
-    const [commit, parent, ...extraParents] = (yield* gitEffect(exec, cwd, [
-      "rev-list",
-      "--parents",
-      "-n",
-      "1",
-      "HEAD",
-    ])).split(" ");
-    if (
-      commit === undefined ||
-      commit.length === 0 ||
-      parent !== baseCommit ||
-      extraParents.length > 0
-    )
-      return yield* contractFailure(
-        "A completed changed implementation requires exactly one direct commit on the supplied base.",
-      );
-    const changedText = yield* gitEffect(
-      exec,
-      cwd,
-      ["diff", "--name-only", "--no-renames", baseCommit, commit],
-      true,
-    );
-    return {
-      commit,
-      changedFiles: changedText
-        .split("\n")
-        .filter((path) => path.length > 0)
-        .sort(),
-    };
-  });
-}
-
-function requireCleanWorktree(exec: WorkerExec, cwd: string, errorPrefix: string) {
-  return Effect.gen(function* () {
-    const status = yield* gitEffect(
-      exec,
-      cwd,
-      ["status", "--porcelain", "--untracked-files=all"],
-      true,
-    );
-    if (status.length > 0) return yield* contractFailure(`${errorPrefix}\n${status}`);
-  });
-}
-
-function gitEffect(exec: WorkerExec, cwd: string, args: string[], allowEmpty = false) {
-  return Effect.gen(function* () {
-    const result = yield* Effect.tryPromise({
-      try: () => exec(cwd, args),
-      catch: () =>
-        new WorkerHostError({
-          operation: "exec",
-          message: `Pi could not execute git ${args.join(" ")}.`,
-        }),
-    });
-    if (result.code !== 0)
-      return yield* new WorkerGitError({
-        message: `git ${args.join(" ")} failed: ${result.stderr || result.stdout}`,
-      });
-    const output = result.stdout.trim();
-    if (!allowEmpty && output.length === 0)
-      return yield* new WorkerGitError({ message: `git ${args.join(" ")} returned no output.` });
-    return output;
-  });
 }
 
 function contractFailure(message: string) {

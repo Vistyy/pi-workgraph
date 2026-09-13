@@ -20,7 +20,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   const branch = (ctx: ExtensionContext): SessionEntry[] => ctx.sessionManager.getBranch();
   const active = (ctx: ExtensionContext): SessionEntry[] =>
     ctx.sessionManager.buildContextEntries();
-  const execGit = (cwd: string, args: string[]) => pi.exec("git", ["-C", cwd, ...args]);
   const modelHost = (ctx: ExtensionContext): WorkerModelHost => ({
     isSelected(model, thinking) {
       return (
@@ -74,7 +73,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     ],
     parameters: runtime.reportParameters(),
     execute(_id, params: WorkerReportInput, _signal: AbortSignal, _update, ctx) {
-      return Effect.runPromise(runtime.completeReport(ctx.cwd, params, branch(ctx), execGit));
+      return Effect.runPromise(runtime.completeReport(params, branch(ctx)));
     },
   });
 

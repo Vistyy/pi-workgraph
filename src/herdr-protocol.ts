@@ -26,14 +26,6 @@ export class HerdrProtocolError extends Data.TaggedError("HerdrProtocolError")<{
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Each supplied decoder validates this raw Herdr protocol value.
 export type HerdrResponseDecoder<Decoded> = (value: unknown) => Decoded;
 
-class InvalidInspection extends Data.TaggedClass("InvalidInspection")<{
-  readonly message: string;
-}> {}
-
-export type InspectionDecode<Decoded> =
-  | { readonly _tag: "DecodedInspection"; readonly value: Decoded }
-  | InvalidInspection;
-
 /** Owns Herdr command execution and protocol-envelope decoding. */
 export class HerdrCommandTransport {
   constructor(private readonly command: string) {}
@@ -105,24 +97,6 @@ function operationName(args: readonly string[]): string {
   return args.slice(0, 2).join(" ") || "availability";
 }
 
-export function protocolFailure(
-  args: readonly string[],
-  reason: HerdrProtocolError["reason"],
-  detail: string,
-  cause?: unknown,
-): Effect.Effect<never, HerdrProtocolError> {
-  return Effect.fail(protocolError(args, reason, detail, cause));
-}
-
-export function protocolError(
-  args: readonly string[],
-  reason: HerdrProtocolError["reason"],
-  detail: string,
-  cause?: unknown,
-): HerdrProtocolError {
-  return new HerdrProtocolError({ operation: operationName(args), reason, detail, cause });
-}
-
 export function protocolTry<A>(
   args: readonly string[],
   evaluate: () => A,
@@ -155,25 +129,6 @@ export function protocolDecode<Decoded>(
             detail: cause instanceof Error ? cause.message : String(cause),
             cause,
           }),
-  });
-}
-
-export function decodeInspection<Decoded>(
-  result: HerdrCommandResult,
-  args: string[],
-  decode: HerdrResponseDecoder<Decoded>,
-): Effect.Effect<InspectionDecode<Decoded>> {
-  return Effect.sync(() => {
-    try {
-      return {
-        _tag: "DecodedInspection" as const,
-        value: decodeCommandResponse(result, args, decode),
-      };
-    } catch (cause) {
-      return new InvalidInspection({
-        message: cause instanceof Error ? cause.message : String(cause),
-      });
-    }
   });
 }
 

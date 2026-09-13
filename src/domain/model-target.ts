@@ -9,7 +9,6 @@ export const ThinkingSchema = Type.Union([
   Type.Literal("xhigh"),
   Type.Literal("max"),
 ]);
-export type Thinking = Static<typeof ThinkingSchema>;
 
 export const ModelTargetSchema = Type.Object(
   {

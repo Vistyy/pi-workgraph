@@ -1,873 +1,351 @@
-import { Clock, Data, DateTime, Effect, Schedule } from "effect";
+/* oxlint-disable effecttsgo/process-env -- This concrete host adapter snapshots the Herdr process environment at construction. */
+import { DateTime, Effect, Schedule } from "effect";
 import {
-  decodeAgent,
   decodeAgentResponse,
-  decodeCoordinatorAgentResponse,
-  decodeCoordinatorSnapshotResponse,
-  decodePaneResponse,
-  decodeProcessInfoResponse,
   decodeSnapshotResponse,
   decodeSuccessResponse,
+  decodeTabCreateResponse,
   decodeWorkspaceCreateResponse,
   type HerdrAgentStatus,
 } from "./herdr-decoder.js";
 import {
   assertCoordinatorPlacement,
   assertIdentity,
-  assertResource,
-  type CoordinatorLaunchResource,
-  type CoordinatorRuntimeIdentity,
-  type HerdrObservation,
+  assertWorkerLaunchPlacement,
   identityOf,
-  type ParsedAgent,
   parseAgent,
-  parseCoordinator,
   resourceOf,
   type WorkerIdentity,
   type WorkerResourceIdentity,
 } from "./herdr-identity.js";
 import {
-  CoordinatorLaunchError,
-  type CoordinatorLaunchRequest,
-  HerdrWorkerLauncher,
-  type WorkerLaunchEffectRequest,
-  type WorkerLaunchError,
-  WorkerLaunchReadinessError,
-} from "./herdr-launch.js";
-import { herdrCoordinatorNames } from "./herdr-naming.js";
+  herdrCoordinatorNames,
+  herdrWorkerName,
+  herdrWorkerTabLabel,
+  type WorkerRole,
+} from "./herdr-naming.js";
 import {
-  decodeInspection,
-  type HerdrCommandResult,
   HerdrCommandTransport,
-  type HerdrProtocolError,
+  HerdrProtocolError,
   isNotFound,
   protocolCommandError,
   protocolDecode,
-  protocolError,
-  protocolFailure,
   protocolTry,
 } from "./herdr-protocol.js";
 
-interface HerdrAbsentObservation {
-  identity: WorkerIdentity;
-  status: "absent";
-  observedAt: string;
-  detail: string;
+export interface HerdrLaunchRequest {
+  readonly workspaceId: string;
+  readonly runId: string;
+  readonly nodeId: string;
+  readonly attemptId: string;
+  readonly assignmentId?: string;
+  readonly objective?: string;
+  readonly role?: WorkerRole;
+  readonly cwd: string;
+  readonly sessionFile: string;
+  readonly model?: string;
+  readonly thinking?: string;
+  readonly env: Record<string, string>;
 }
-
-export type HerdrInspection = HerdrObservation | HerdrAbsentObservation;
-
-export interface WorkerRecoveryRequest {
-  workspaceId: string;
-  agentName: string;
-  sessionFile: string;
-  cwd: string;
-  resource?: WorkerResourceIdentity;
+interface HerdrObservation {
+  readonly identity: WorkerIdentity;
+  readonly status: HerdrAgentStatus;
+  readonly observedAt: string;
 }
+export type HerdrInspection =
+  | HerdrObservation
+  | { readonly identity: WorkerIdentity; readonly status: "absent"; readonly observedAt: string };
 
-/** Exact retained handles for startup inspection before a native agent identity exists. */
-export interface WorkerLaunchInspectionRequest {
-  workspaceId: string;
-  /** Present when startup advanced far enough to retain the full native resource. */
-  tabId?: string;
-  paneId: string;
-  /** Present when startup advanced far enough to retain the full native resource. */
-  terminalId?: string;
-  sessionFile: string;
-  cwd: string;
-}
-
-export interface WorkerPaneObservation {
-  workspaceId: string;
-  tabId: string;
-  paneId: string;
-  terminalId: string;
-  cwd: string;
-}
-
-interface WorkerProcessObservation {
-  shellPid: number;
-  foregroundProcessGroupId: number;
-  foregroundProcesses: readonly WorkerForegroundProcess[];
-}
-
-type WorkerForegroundProcess = string | { readonly name?: string; readonly pid?: number };
-
-type WorkerLaunchAgentEvidence =
-  | { state: "present"; identity: WorkerIdentity; status: HerdrAgentStatus }
-  | { state: "absent"; detail: string }
-  | { state: "unknown"; detail: string };
-
-export type WorkerLaunchProcessEvidence =
-  | { state: "observed"; process: WorkerProcessObservation }
-  | { state: "unknown"; detail: string };
-
-export interface WorkerLaunchInspectionEvidence {
-  resource: WorkerLaunchInspectionRequest;
-  pane: WorkerPaneObservation | { state: "absent" | "unknown"; detail: string };
-  process: WorkerLaunchProcessEvidence;
-  agent: WorkerLaunchAgentEvidence;
-}
-
-export type WorkerLaunchInspection =
-  | {
-      state: "live";
-      identity: WorkerIdentity;
-      evidence: WorkerLaunchInspectionEvidence;
-      detail: string;
-    }
-  | {
-      state: "absent" | "unknown";
-      evidence: WorkerLaunchInspectionEvidence;
-      detail: string;
-    };
-
-export interface CoordinatorObservationRequest {
-  paneId: string;
-  sessionFile: string;
-  cwd: string;
-}
-
-export interface WorkerCleanupResult {
-  state: "pending" | "completed" | "blocked";
-  identity: WorkerIdentity;
-  observedAt: string;
-  detail: string;
-}
-
-export interface WorkerTerminationResult {
-  state: "completed" | "blocked";
-  identity: WorkerIdentity;
-  observedAt: string;
-  detail: string;
-}
-
-interface HerdrProcessEnvironment extends NodeJS.ProcessEnv {
-  HERDR_ENV?: string;
-  HERDR_WORKSPACE_ID?: string;
-  PI_CODING_AGENT_DIR?: string;
-  PI_WORKGRAPH_HERDR_BIN?: string;
-}
-
-interface CoordinatorEnvironment extends Record<string, string> {
-  PI_CODING_AGENT_DIR?: string;
-}
-
-const hostEnvironment: HerdrProcessEnvironment = process.env;
-
+/** One strict Herdr resource owner: launch, inspect, prompt, and close exact identities. */
 export class HerdrCliRuntime {
   readonly available: boolean;
-  private readonly coordinatorEnvironment: Record<string, string>;
   private readonly transport: HerdrCommandTransport;
-  private readonly workerLauncher: HerdrWorkerLauncher;
+  private readonly environment: Record<string, string>;
 
   constructor(
-    command = hostEnvironment.PI_WORKGRAPH_HERDR_BIN ?? "herdr",
-    env: NodeJS.ProcessEnv = hostEnvironment,
+    command = process.env["PI_WORKGRAPH_HERDR_BIN"] ?? "herdr",
+    env: NodeJS.ProcessEnv = process.env,
   ) {
-    const herdrEnvironment: HerdrProcessEnvironment = env;
-    this.available =
-      herdrEnvironment.HERDR_ENV === "1" && herdrEnvironment.HERDR_WORKSPACE_ID !== undefined;
-    this.coordinatorEnvironment = coordinatorEnvironment(herdrEnvironment);
+    this.available = env["HERDR_ENV"] === "1" && env["HERDR_WORKSPACE_ID"] !== undefined;
     this.transport = new HerdrCommandTransport(command);
-    this.workerLauncher = new HerdrWorkerLauncher({
-      transport: this.transport,
-      awaitNativeIdentity: (resource, sessionFile) =>
-        this.awaitNativeIdentity(resource, sessionFile),
-      observe: (identity) => this.observe(identity),
-    });
+    this.environment =
+      env["PI_CODING_AGENT_DIR"] === undefined
+        ? {}
+        : { PI_CODING_AGENT_DIR: env["PI_CODING_AGENT_DIR"] };
   }
 
-  readonly createCoordinatorWorkspace = (
-    request: CoordinatorLaunchRequest,
-  ): Effect.Effect<CoordinatorLaunchResource, CoordinatorLaunchError | HerdrProtocolError> =>
-    Effect.gen(
+  launch(request: HerdrLaunchRequest): Effect.Effect<HerdrObservation, HerdrProtocolError> {
+    return Effect.gen(
       function* (this: HerdrCliRuntime) {
-        yield* this.requireAvailable("coordinator");
-        const { agentName, label } = herdrCoordinatorNames(request);
-        const created = yield* this.transport.call(
+        yield* this.requireAvailable();
+        const agentName = herdrWorkerName(request);
+        const paneId = yield* this.transport.call(
+          [
+            "tab",
+            "create",
+            "--workspace",
+            request.workspaceId,
+            "--cwd",
+            request.cwd,
+            "--label",
+            herdrWorkerTabLabel(request),
+            "--no-focus",
+            ...envArgs(request.env),
+          ],
+          decodeTabCreateResponse,
+        );
+        const args = [
+          "agent",
+          "start",
+          agentName,
+          "--kind",
+          "pi",
+          "--pane",
+          paneId,
+          "--",
+          "--session",
+          request.sessionFile,
+        ];
+        if (request.model !== undefined) args.push("--model", request.model);
+        if (request.thinking !== undefined) args.push("--thinking", request.thinking);
+        const started = yield* this.transport
+          .call(args, decodeAgentResponse, 45_000)
+          .pipe(Effect.flatMap((decoded) => protocolTry(args, () => parseAgent(decoded))));
+        yield* protocolTry(args, () =>
+          assertWorkerLaunchPlacement(
+            { workspaceId: request.workspaceId, paneId, agentName, cwd: request.cwd },
+            started,
+          ),
+        );
+        const resource = resourceOf(started);
+        const identity = yield* this.awaitIdentity(resource, request.sessionFile);
+        const observation = yield* this.inspect(identity);
+        if (observation.status === "absent")
+          return yield* new HerdrProtocolError({
+            operation: "agent start",
+            reason: "identity",
+            detail: "Launched Worker disappeared before exact observation.",
+          });
+        return observation;
+      }.bind(this),
+    );
+  }
+
+  launchCoordinator(request: {
+    cwd: string;
+    sessionFile: string;
+  }): Effect.Effect<WorkerIdentity, HerdrProtocolError> {
+    return Effect.gen(
+      function* (this: HerdrCliRuntime) {
+        yield* this.requireAvailable();
+        const names = herdrCoordinatorNames(request);
+        const workspace = yield* this.transport.call(
           [
             "workspace",
             "create",
             "--cwd",
             request.cwd,
             "--label",
-            label,
+            names.label,
             "--no-focus",
-            ...envArgs(this.coordinatorEnvironment),
+            ...envArgs(this.environment),
           ],
           decodeWorkspaceCreateResponse,
         );
-        return {
-          workspaceId: created.workspaceId,
-          tabId: created.tabId,
-          paneId: created.paneId,
-          agentName,
-          sessionFile: request.sessionFile,
-          cwd: request.cwd,
-        };
-      }.bind(this),
-    ).pipe(
-      Effect.mapError((cause) =>
-        cause instanceof CoordinatorLaunchError
-          ? cause
-          : new CoordinatorLaunchError(
-              undefined,
-              `Coordinator workspace creation is uncertain for session ${request.sessionFile} at ${request.cwd}: ${cause.message} The child session was retained; do not clean up or retry this launch.`,
-              cause,
-            ),
-      ),
-    );
-
-  readonly startCoordinatorAgent = (
-    resource: CoordinatorLaunchResource,
-  ): Effect.Effect<WorkerIdentity, CoordinatorLaunchError | HerdrProtocolError> => {
-    let retained = resource;
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
+        const args = [
+          "agent",
+          "start",
+          names.agentName,
+          "--kind",
+          "pi",
+          "--pane",
+          workspace.paneId,
+          "--",
+          "--session",
+          request.sessionFile,
+        ];
         const started = yield* this.transport
-          .call(
-            [
-              "agent",
-              "start",
-              resource.agentName,
-              "--kind",
-              "pi",
-              "--pane",
-              resource.paneId,
-              "--",
-              "--session",
-              resource.sessionFile,
-            ],
-            decodeAgentResponse,
-            45_000,
-          )
-          .pipe(
-            Effect.flatMap((agent) => protocolTry(["agent", "start"], () => parseAgent(agent))),
-          );
-        yield* protocolTry(["agent", "start"], () => assertCoordinatorPlacement(resource, started));
-        const native = resourceOf(started);
-        retained = { ...resource, terminalId: native.terminalId };
-        return yield* this.awaitNativeIdentity(native, resource.sessionFile);
-      }.bind(this),
-    ).pipe(
-      Effect.mapError((cause) =>
-        cause instanceof CoordinatorLaunchError
-          ? cause
-          : new CoordinatorLaunchError(
-              retained,
-              `Coordinator launch is uncertain in workspace ${resource.workspaceId}, tab ${resource.tabId}, pane ${resource.paneId}, agent ${resource.agentName}, session ${resource.sessionFile}, cwd ${resource.cwd}: ${cause.message} The child session and known native resources were retained; do not clean up or retry this launch.`,
-              cause,
-            ),
-      ),
-    );
-  };
-
-  readonly launchCoordinator = (
-    request: CoordinatorLaunchRequest,
-  ): Effect.Effect<WorkerIdentity, CoordinatorLaunchError | HerdrProtocolError> =>
-    Effect.flatMap(this.createCoordinatorWorkspace(request), this.startCoordinatorAgent);
-
-  readonly coordinatorLiveness = (
-    sessionFile: string,
-  ): Effect.Effect<"alive" | "dead" | "unknown", HerdrProtocolError> => {
-    if (!this.available) return Effect.succeed("unknown");
-    return this.transport.call(["api", "snapshot"], decodeCoordinatorSnapshotResponse).pipe(
-      Effect.map((sessionFiles) => {
-        let unknown = false;
-        for (const sessionFileValue of sessionFiles) {
-          if (sessionFileValue === undefined) unknown = true;
-          else if (sessionFileValue === sessionFile) return "alive" as const;
-        }
-        return unknown ? ("unknown" as const) : ("dead" as const);
-      }),
-    );
-  };
-
-  readonly observeCurrentCoordinator = (
-    request: CoordinatorObservationRequest,
-  ): Effect.Effect<CoordinatorRuntimeIdentity, HerdrProtocolError> => {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        yield* this.requireAvailable("coordinator");
-        const decoded = yield* this.transport.call(
-          ["agent", "get", request.paneId],
-          decodeCoordinatorAgentResponse,
-        );
-        const current = yield* protocolTry(["agent", "get"], () => parseCoordinator(decoded));
-        yield* protocolTry(["agent", "get"], () => {
-          if (current.sessionFile !== request.sessionFile)
-            throw new Error("Current Herdr pane does not own the requested Pi session.");
-          if (current.cwd !== request.cwd)
-            throw new Error("Current Herdr pane cwd does not match the repository.");
-        });
-        return current;
-      }.bind(this),
-    );
-  };
-
-  readonly launch = <E, R>(
-    request: WorkerLaunchEffectRequest<E, R>,
-  ): Effect.Effect<
-    HerdrObservation,
-    HerdrProtocolError | WorkerLaunchReadinessError | WorkerLaunchError<E>,
-    R
-  > => {
-    return this.requireAvailable("worker").pipe(
-      Effect.andThen(this.workerLauncher.launch(request)),
-    );
-  };
-
-  readonly recover = (
-    request: WorkerRecoveryRequest,
-  ): Effect.Effect<
-    HerdrObservation | undefined,
-    HerdrProtocolError | WorkerLaunchReadinessError
-  > => {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        const agents = yield* this.transport.call(["api", "snapshot"], decodeSnapshotResponse);
-        const matches = agents.filter((candidate) => {
-          if (candidate.name === undefined) return false;
-          const sessionFile = candidate.agent_session?.value;
-          const resource = request.resource;
-          const resourceMatches = resource
-            ? candidate.workspace_id === resource.workspaceId &&
-              candidate.tab_id === resource.tabId &&
-              candidate.pane_id === resource.paneId &&
-              candidate.terminal_id === resource.terminalId &&
-              candidate.name === resource.agentName &&
-              candidate.cwd === resource.cwd
-            : candidate.workspace_id === request.workspaceId &&
-              candidate.name === request.agentName &&
-              candidate.cwd === request.cwd;
-          return (
-            resourceMatches &&
-            (resource
-              ? sessionFile === undefined || sessionFile === request.sessionFile
-              : sessionFile === request.sessionFile)
-          );
-        });
-        if (matches.length === 0) return undefined;
-        if (matches.length !== 1)
-          return yield* protocolFailure(
-            ["api", "snapshot"],
-            "identity",
-            `Herdr recovery found ${matches.length} workers for ${request.agentName}.`,
-          );
-        const match = matches[0];
-        if (match === undefined) return undefined;
-        const current = yield* protocolTry(["api", "snapshot"], () =>
-          parseAgent(decodeAgent(match)),
-        );
-        const resource = request.resource ?? resourceOf(current);
-        yield* protocolTry(["api", "snapshot"], () => assertResource(resource, current));
-        if (current.sessionFile === undefined)
-          return yield* new WorkerLaunchReadinessError(
-            resource,
-            "Recovered Herdr resource still has no native Pi session identity; operator action is required before assignment submission.",
-          );
-        const identity = identityOf(resource, current);
-        yield* protocolTry(["api", "snapshot"], () => assertIdentity(identity, current));
-        return { identity, status: current.status, observedAt: yield* observedAt };
-      }.bind(this),
-    );
-  };
-
-  readonly inspectLaunch = (
-    request: WorkerLaunchInspectionRequest,
-  ): Effect.Effect<WorkerLaunchInspection, HerdrProtocolError> => {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        const paneResult = yield* this.spawnCommand(["pane", "get", request.paneId], 30_000);
-        if (paneResult.code !== 0) return unavailablePaneInspection(request, paneResult);
-        const decoded = yield* decodeInspection(paneResult, ["pane", "get"], decodePaneResponse);
-        if (decoded._tag === "InvalidInspection")
-          return invalidPaneInspection(request, decoded.message);
-        const pane: WorkerPaneObservation = decoded.value;
-        const evidence = initialLaunchEvidence(request, pane);
-        if (!samePaneResource(request, pane)) {
-          const detail = "Retained Herdr pane identity or cwd does not match startup state.";
-          return { state: "unknown" as const, evidence, detail };
-        }
-        evidence.process = yield* this.inspectLaunchProcess(request.paneId);
-        return yield* this.inspectLaunchAgent(request, pane, evidence);
-      }.bind(this),
-    );
-  };
-
-  private inspectLaunchProcess(
-    paneId: string,
-  ): Effect.Effect<WorkerLaunchProcessEvidence, HerdrProtocolError> {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        const result = yield* this.spawnCommand(["pane", "process-info", "--pane", paneId], 30_000);
-        if (result.code !== 0)
-          return {
-            state: "unknown" as const,
-            detail:
-              "Herdr pane process information was unavailable; no process conclusion was made.",
-          };
-        const decoded = yield* decodeInspection(
-          result,
-          ["pane", "process-info"],
-          decodeProcessInfoResponse,
-        );
-        if (decoded._tag === "InvalidInspection")
-          return {
-            state: "unknown" as const,
-            detail: `Herdr pane process information had an invalid shape: ${decoded.message}`,
-          };
-        return { state: "observed" as const, process: decoded.value };
-      }.bind(this),
-    );
-  }
-
-  private inspectLaunchAgent(
-    request: WorkerLaunchInspectionRequest,
-    pane: WorkerPaneObservation,
-    evidence: WorkerLaunchInspectionEvidence,
-  ): Effect.Effect<WorkerLaunchInspection, HerdrProtocolError> {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        const result = yield* this.spawnCommand(["agent", "get", request.paneId], 30_000);
-        if (result.code !== 0) return unavailableLaunchAgent(result, evidence);
-        const decoded = yield* decodeInspection(result, ["agent", "get"], decodeAgentResponse);
-        if (decoded._tag === "InvalidInspection") {
-          evidence.agent = {
-            state: "unknown",
-            detail: `Herdr native agent response was invalid: ${decoded.message}`,
-          };
-          return { state: "unknown" as const, evidence, detail: evidence.agent.detail };
-        }
-        const current = parseAgent(decoded.value);
-        if (!sameLaunchAgent(request, pane, current)) {
-          evidence.agent = {
-            state: "unknown",
-            detail: "Herdr native agent identity does not match the retained startup resource.",
-          };
-          return { state: "unknown" as const, evidence, detail: evidence.agent.detail };
-        }
-        const identity: WorkerIdentity = {
-          workspaceId: current.workspaceId,
-          tabId: current.tabId,
-          paneId: current.paneId,
-          terminalId: current.terminalId,
-          agentName: current.name,
-          sessionFile: request.sessionFile,
-          cwd: request.cwd,
-        };
-        evidence.agent = { state: "present", identity, status: current.status };
-        return {
-          state: "live" as const,
-          identity,
-          evidence,
-          detail: "Exact retained pane and native Pi session identity are live.",
-        };
-      }.bind(this),
-    );
-  }
-
-  private awaitNativeIdentity(
-    resource: WorkerResourceIdentity,
-    expectedSessionFile: string,
-    timeoutMs = 15_000,
-  ): Effect.Effect<WorkerIdentity, HerdrProtocolError | WorkerLaunchReadinessError> {
-    let last = "Native Pi session identity is not available yet.";
-    const poll = Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        const decoded = yield* this.transport.call(
-          ["agent", "get", resource.paneId],
-          decodeAgentResponse,
-        );
-        const current = yield* protocolTry(["agent", "get"], () => parseAgent(decoded));
-        yield* protocolTry(["agent", "get"], () => assertResource(resource, current));
-        if (current.sessionFile !== undefined) {
-          const identity = identityOf(resource, current);
-          yield* protocolTry(["agent", "get"], () =>
-            assertIdentity({ ...identity, sessionFile: expectedSessionFile }, current),
-          );
-          if (current.status !== "working" && current.status !== "idle")
-            return yield* new WorkerLaunchReadinessError(
-              resource,
-              `Exact native Pi identity is ${current.status}, not launch-ready working or idle.`,
-            );
-          return identity;
-        }
-        if (current.status === "blocked")
-          return yield* new WorkerLaunchReadinessError(
-            resource,
-            "Worker is blocked at a Pi trust or approval prompt; operator action is required before assignment submission.",
-          );
-        last = `Worker is ${current.status}, but Herdr has not exposed its native Pi session identity.`;
-        return yield* new NativeIdentityPending();
-      }.bind(this),
-    );
-    return poll.pipe(
-      Effect.retry({
-        schedule: Schedule.spaced(250),
-        while: (error) => error instanceof NativeIdentityPending,
-      }),
-      Effect.timeoutOrElse({
-        duration: timeoutMs,
-        orElse: () =>
-          Effect.fail(
-            new WorkerLaunchReadinessError(
-              resource,
-              `${last} Launch readiness timed out after ${timeoutMs}ms. No assignment prompt was submitted.`,
-            ),
+          .call(args, decodeAgentResponse, 45_000)
+          .pipe(Effect.flatMap((decoded) => protocolTry(args, () => parseAgent(decoded))));
+        yield* protocolTry(args, () =>
+          assertCoordinatorPlacement(
+            {
+              workspaceId: workspace.workspaceId,
+              tabId: workspace.tabId,
+              paneId: workspace.paneId,
+              agentName: names.agentName,
+              sessionFile: request.sessionFile,
+              cwd: request.cwd,
+            },
+            started,
           ),
-      }),
-      Effect.catchTag("NativeIdentityPending", () =>
-        Effect.fail(
-          new WorkerLaunchReadinessError(
-            resource,
-            `${last} Launch readiness timed out after ${timeoutMs}ms. No assignment prompt was submitted.`,
-          ),
-        ),
-      ),
+        );
+        return yield* this.awaitIdentity(resourceOf(started), request.sessionFile);
+      }.bind(this),
     );
   }
 
-  readonly inspect = (
-    identity: WorkerIdentity,
-  ): Effect.Effect<HerdrInspection, HerdrProtocolError> => {
+  inspect(identity: WorkerIdentity): Effect.Effect<HerdrInspection, HerdrProtocolError> {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
-        const result = yield* this.spawnCommand(["agent", "get", identity.paneId], 30_000);
+        const args = ["agent", "get", identity.paneId];
+        const result = yield* this.transport.spawn(args, 30_000);
         if (result.code !== 0) {
           if (
             (isNotFound(result, "agent_not_found") || isNotFound(result, "pane_not_found")) &&
             (yield* this.tabAbsent(identity.tabId))
           )
-            return {
-              identity,
-              status: "absent" as const,
-              observedAt: yield* observedAt,
-              detail: `Exact Herdr tab ${identity.tabId} is absent.`,
-            };
-          return yield* protocolCommandError(["agent", "get", identity.paneId], result);
+            return { identity, status: "absent" as const, observedAt: now() };
+          return yield* protocolCommandError(args, result);
         }
-        const decoded = yield* protocolDecode(
-          result,
-          ["agent", "get", identity.paneId],
-          decodeAgentResponse,
-        );
-        const current = parseAgent(decoded);
-        yield* protocolTry(["agent", "get"], () => assertIdentity(identity, current));
-        return { identity, status: current.status, observedAt: yield* observedAt };
+        const decoded = yield* protocolDecode(result, args, decodeAgentResponse);
+        const current = yield* protocolTry(args, () => parseAgent(decoded));
+        yield* protocolTry(args, () => assertIdentity(identity, current));
+        return { identity, status: current.status, observedAt: now() };
       }.bind(this),
     );
-  };
+  }
 
-  readonly observe = (
-    identity: WorkerIdentity,
-  ): Effect.Effect<HerdrObservation, HerdrProtocolError> => {
+  prompt(identity: WorkerIdentity, text: string): Effect.Effect<void, HerdrProtocolError> {
+    if (text.trim().length === 0)
+      return Effect.fail(
+        new HerdrProtocolError({
+          operation: "agent prompt",
+          reason: "identity",
+          detail: "Worker prompt cannot be blank.",
+        }),
+      );
     return this.inspect(identity).pipe(
       Effect.filterOrFail(
-        (inspection): inspection is HerdrObservation => inspection.status !== "absent",
-        (inspection) =>
-          protocolError(
-            ["agent", "get"],
-            "identity",
-            inspection.status === "absent" ? inspection.detail : "Herdr worker is absent.",
-          ),
+        (value) =>
+          value.status !== "absent" && value.status !== "blocked" && value.status !== "unknown",
+        () =>
+          new HerdrProtocolError({
+            operation: "agent prompt",
+            reason: "identity",
+            detail: "Exact Worker cannot receive a prompt.",
+          }),
+      ),
+      Effect.andThen(
+        this.transport.call(
+          ["agent", "prompt", identity.agentName, text.trim()],
+          decodeSuccessResponse,
+          15_000,
+        ),
       ),
     );
-  };
+  }
 
-  readonly steer = (
+  close(
     identity: WorkerIdentity,
-    instruction: string,
-  ): Effect.Effect<void, HerdrProtocolError> => {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        const trimmed = instruction.trim();
-        if (!trimmed)
-          return yield* protocolFailure(
-            ["agent", "prompt"],
-            "identity",
-            "Worker steering requires an instruction.",
-          );
-        const current = yield* this.observe(identity);
-        if (current.status === "blocked")
-          return yield* protocolFailure(
-            ["agent", "prompt"],
-            "identity",
-            "Worker is blocked and cannot receive steering.",
-          );
-        yield* this.transport.call(
-          ["agent", "prompt", identity.agentName, trimmed],
-          decodeSuccessResponse,
-        );
-      }.bind(this),
-    );
-  };
-
-  /** Close a cancelled Worker regardless of status and prove its exact agent and tab are absent. */
-  readonly terminate = (
-    identity: WorkerIdentity,
-  ): Effect.Effect<WorkerTerminationResult, HerdrProtocolError> => {
+  ): Effect.Effect<"absent" | "present" | "unknown", HerdrProtocolError> {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
         const before = yield* this.inspect(identity);
-        if (before.status === "absent")
-          return {
-            state: "completed" as const,
-            identity,
-            observedAt: before.observedAt,
-            detail: before.detail,
-          };
-
-        const close = yield* Effect.result(
+        if (before.status === "absent") return "absent" as const;
+        yield* Effect.result(
           this.transport.call(["tab", "close", identity.tabId], decodeSuccessResponse),
         );
         const after = yield* Effect.result(this.inspect(identity));
-        if (after._tag === "Success" && after.success.status === "absent")
-          return {
-            state: "completed" as const,
-            identity,
-            observedAt: after.success.observedAt,
-            detail: `Closed and verified exact Herdr agent ${identity.agentName} and tab ${identity.tabId} are absent.`,
-          };
-        if (after._tag === "Success")
-          return {
-            state: "blocked" as const,
-            identity,
-            observedAt: after.success.observedAt,
-            detail:
-              close._tag === "Failure"
-                ? `Herdr tab close was uncertain and the exact Worker remains ${after.success.status}: ${close.failure.detail}`
-                : `Exact Worker remains ${after.success.status} after Herdr closed tab ${identity.tabId}.`,
-          };
-        return yield* protocolFailure(
-          ["tab", "close", identity.tabId],
-          "identity",
-          close._tag === "Failure"
-            ? `Herdr tab close was uncertain and exact post-close absence could not be verified. Close error: ${close.failure.detail} Inspection error: ${after.failure.detail}`
-            : `Herdr accepted tab close, but exact post-close absence could not be verified: ${after.failure.detail}`,
-        );
+        if (after._tag === "Failure") return "unknown" as const;
+        return after.success.status === "absent" ? ("absent" as const) : ("present" as const);
       }.bind(this),
     );
-  };
+  }
 
-  readonly cleanup = (
-    identity: WorkerIdentity,
-  ): Effect.Effect<WorkerCleanupResult, HerdrProtocolError> => {
-    return Effect.gen(
+  coordinatorAbsent(identity: {
+    sessionFile: string;
+    tabId: string;
+  }): Effect.Effect<boolean, HerdrProtocolError> {
+    if (!this.available) return Effect.succeed(false);
+    return this.transport
+      .call(["api", "snapshot"], decodeSnapshotResponse)
+      .pipe(
+        Effect.map((agents) =>
+          agents.every(
+            (agent) =>
+              agent.tab_id !== identity.tabId &&
+              agent.agent_session?.value !== identity.sessionFile,
+          ),
+        ),
+      );
+  }
+
+  private awaitIdentity(
+    resource: WorkerResourceIdentity,
+    sessionFile: string,
+  ): Effect.Effect<WorkerIdentity, HerdrProtocolError> {
+    const poll: Effect.Effect<WorkerIdentity, HerdrProtocolError> = Effect.gen(
       function* (this: HerdrCliRuntime) {
-        const observation = yield* this.inspect(identity);
-        if (observation.status === "absent")
-          return {
-            state: "completed" as const,
-            identity,
-            observedAt: observation.observedAt,
-            detail: observation.detail,
-          };
-        if (observation.status === "working")
-          return {
-            state: "pending" as const,
-            identity,
-            observedAt: observation.observedAt,
-            detail: "Worker is still working; exact cleanup remains pending.",
-          };
-        if (observation.status === "blocked" || observation.status === "unknown")
-          return {
-            state: "blocked" as const,
-            identity,
-            observedAt: observation.observedAt,
-            detail: `Worker is ${observation.status}; cleanup requires a verified idle or done worker.`,
-          };
-        yield* this.transport.call(["tab", "close", identity.tabId], decodeSuccessResponse);
-        if (!(yield* this.tabAbsent(identity.tabId)))
-          return yield* protocolFailure(
-            ["tab", "get"],
-            "identity",
-            `Herdr tab ${identity.tabId} still exists after cleanup.`,
-          );
-        return {
-          state: "completed" as const,
-          identity,
-          observedAt: yield* observedAt,
-          detail: `Closed and verified exact Herdr tab ${identity.tabId}.`,
-        };
+        const decoded = yield* this.transport.call(
+          ["agent", "get", resource.paneId],
+          decodeAgentResponse,
+        );
+        const actual = yield* protocolTry(["agent", "get"], () => parseAgent(decoded));
+        if (actual.sessionFile === undefined)
+          return yield* new HerdrProtocolError({
+            operation: "agent get",
+            reason: "identity",
+            detail: "Exact native Pi session identity is not available yet.",
+          });
+        return yield* protocolTry(["agent", "get"], () => {
+          if (actual.sessionFile !== sessionFile)
+            throw new Error("Native Pi session identity does not match the requested session.");
+          return identityOf(resource, actual);
+        });
       }.bind(this),
     );
-  };
+    return poll.pipe(
+      Effect.retry({
+        schedule: Schedule.spaced("250 millis"),
+        times: 60,
+        while: (error) => error.reason === "identity",
+      }),
+      Effect.timeoutOrElse({
+        duration: 15_000,
+        orElse: () =>
+          Effect.fail(
+            new HerdrProtocolError({
+              operation: "agent get",
+              reason: "identity",
+              detail: "Exact native Pi session identity was not observed before timeout.",
+            }),
+          ),
+      }),
+    );
+  }
 
   private tabAbsent(tabId: string): Effect.Effect<boolean, HerdrProtocolError> {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        const result = yield* this.spawnCommand(["tab", "get", tabId], 30_000);
-        if (result.code === 0) return false;
-        if (isNotFound(result, "tab_not_found")) return true;
-        return yield* protocolCommandError(["tab", "get", tabId], result);
-      }.bind(this),
-    );
+    return this.transport
+      .spawn(["tab", "get", tabId], 30_000)
+      .pipe(
+        Effect.flatMap((result) =>
+          result.code === 0
+            ? Effect.succeed(false)
+            : isNotFound(result, "tab_not_found")
+              ? Effect.succeed(true)
+              : Effect.fail(protocolCommandError(["tab", "get", tabId], result)),
+        ),
+      );
   }
-
-  private spawnCommand(
-    args: string[],
-    timeoutMs: number,
-  ): Effect.Effect<HerdrCommandResult, HerdrProtocolError> {
-    return this.transport.spawn(args, timeoutMs);
-  }
-
-  private requireAvailable(
-    kind: "coordinator" | "worker",
-  ): Effect.Effect<void, HerdrProtocolError> {
+  private requireAvailable(): Effect.Effect<void, HerdrProtocolError> {
     return this.available
       ? Effect.void
-      : protocolFailure([], "unavailable", `Herdr ${kind} runtime is unavailable.`);
+      : Effect.fail(
+          new HerdrProtocolError({
+            operation: "availability",
+            reason: "unavailable",
+            detail: "Herdr runtime is unavailable.",
+          }),
+        );
   }
 }
 
-function initialLaunchEvidence(
-  request: WorkerLaunchInspectionRequest,
-  pane: WorkerPaneObservation,
-): WorkerLaunchInspectionEvidence {
-  return {
-    resource: request,
-    pane,
-    process: {
-      state: "unknown",
-      detail: "Herdr pane process information was not observed.",
-    },
-    agent: {
-      state: "unknown",
-      detail: "Herdr agent identity was not observed.",
-    },
-  };
-}
-
-function unavailablePaneInspection(
-  request: WorkerLaunchInspectionRequest,
-  result: HerdrCommandResult,
-): WorkerLaunchInspection {
-  const state = isNotFound(result, "pane_not_found") ? "absent" : "unknown";
-  const detail =
-    state === "absent"
-      ? `Exact Herdr pane ${request.paneId} is absent.`
-      : "Herdr pane inspection failed; retained startup state is unknown.";
-  return {
-    state,
-    evidence: {
-      resource: request,
-      pane: { state, detail },
-      process: {
-        state: "unknown",
-        detail: "Herdr pane process information was not observed.",
-      },
-      agent: {
-        state: "unknown",
-        detail: "Herdr agent identity was not observed.",
-      },
-    },
-    detail,
-  };
-}
-
-function invalidPaneInspection(
-  request: WorkerLaunchInspectionRequest,
-  error: string,
-): WorkerLaunchInspection {
-  const detail = `Herdr pane inspection returned an invalid retained-resource shape: ${error}`;
-  return {
-    state: "unknown",
-    evidence: {
-      resource: request,
-      pane: { state: "unknown", detail },
-      process: {
-        state: "unknown",
-        detail: "Herdr pane process information was not observed.",
-      },
-      agent: {
-        state: "unknown",
-        detail: "Herdr agent identity was not observed.",
-      },
-    },
-    detail,
-  };
-}
-
-function unavailableLaunchAgent(
-  result: HerdrCommandResult,
-  evidence: WorkerLaunchInspectionEvidence,
-): WorkerLaunchInspection {
-  evidence.agent = isNotFound(result, "agent_not_found")
-    ? {
-        state: "absent",
-        detail:
-          "Herdr reports no agent identity for this pane. This is not proof that the pane has no process.",
-      }
-    : {
-        state: "unknown",
-        detail: "Herdr agent inspection failed; no identity conclusion was made.",
-      };
-  return {
-    state: "unknown",
-    evidence,
-    detail:
-      "The exact retained pane is live, but native agent identity is absent or unknown; no relaunch or cleanup is authorized.",
-  };
-}
-
-function sameLaunchAgent(
-  request: WorkerLaunchInspectionRequest,
-  pane: WorkerPaneObservation,
-  current: ParsedAgent,
-): boolean {
-  return (
-    current.workspaceId === pane.workspaceId &&
-    current.tabId === pane.tabId &&
-    current.paneId === pane.paneId &&
-    current.terminalId === pane.terminalId &&
-    current.cwd === pane.cwd &&
-    current.sessionFile === request.sessionFile
-  );
-}
-
-function samePaneResource(
-  request: WorkerLaunchInspectionRequest,
-  pane: WorkerPaneObservation,
-): boolean {
-  return (
-    pane.workspaceId === request.workspaceId &&
-    (request.tabId === undefined || pane.tabId === request.tabId) &&
-    pane.paneId === request.paneId &&
-    (request.terminalId === undefined || pane.terminalId === request.terminalId) &&
-    pane.cwd === request.cwd
-  );
-}
-
-function coordinatorEnvironment(env: HerdrProcessEnvironment) {
-  const result: CoordinatorEnvironment = {};
-  const agentDirectory = env.PI_CODING_AGENT_DIR;
-  if (agentDirectory !== undefined && agentDirectory !== "")
-    result.PI_CODING_AGENT_DIR = agentDirectory;
-  for (const key of [
-    "PI_WORKGRAPH_MODE",
-    "PI_WORKGRAPH_POLICY_ROLE",
-    "PI_WORKGRAPH_RUN_ID",
-    "PI_WORKGRAPH_NODE_ID",
-    "PI_WORKGRAPH_BASE_COMMIT",
-    "PI_WORKGRAPH_EXPERIMENT",
-    "PI_WORKGRAPH_IMPLEMENTATION_START",
-    "PI_WORKGRAPH_EXECUTOR_MODEL",
-    "PI_WORKGRAPH_EXECUTOR_THINKING",
-  ])
-    result[key] = "";
-  return result;
-}
-
-function envArgs(env: Record<string, string>): string[] {
-  return Object.entries(env)
+function envArgs(environment: Record<string, string>): string[] {
+  return Object.entries(environment)
     .sort(([left], [right]) => left.localeCompare(right))
     .flatMap(([key, value]) => ["--env", `${key}=${value}`]);
 }
-
-class NativeIdentityPending extends Data.TaggedError("NativeIdentityPending") {}
-
-const observedAt = Clock.currentTimeMillis.pipe(
-  Effect.map((timestamp) => DateTime.formatIso(DateTime.makeUnsafe(timestamp))),
-);
+function now(): string {
+  return DateTime.formatIso(DateTime.nowUnsafe());
+}

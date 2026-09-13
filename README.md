@@ -56,13 +56,13 @@ Research, review, and consultation advisors are ordered lists; the first target 
 
 ## Use Workgraph
 
-Describe the outcome you want and any important constraints. Workgraph fixes one repository for that effort, delegates only when useful, and retains evidence and implementation output for the coordinator to inspect.
+Describe the outcome you want and any important constraints. A Workstream owns that initiative rather than a repository. Each immutable Task records its resolved directory or repository target, so one Workstream may coordinate several repositories without claiming cross-repository transactions, rollback, or all-or-nothing application.
 
-Research and ordinary review can inspect the live repository, including uncommitted files. Implementation and authorized disposable experiments use isolated worktrees; these are ownership boundaries, not security sandboxes. Results remain unapplied until the coordinator has inspected them and deliberately integrates the selected output.
+Directory Tasks run at their recorded path and produce no Git output. Repository Tasks record their checkout root and Git common directory. Their Attempts use detached worktrees below the Pi agent data directory; useful clean output is retained at a private `refs/pi-workgraph/outputs/<workstream>/<attempt>` ref until deliberately applied or discarded. These are ownership boundaries, not security sandboxes.
 
-Workgraph stores each operational Workstream in a private SQLite database below the repository's Git common directory. Delegated Pi session history is retained separately under `pi-workgraph/worker-sessions/<workstreamId>/`; operational Workstream cleanup does not imply deleting or relocating that session history.
+Each Workstream has one private SQLite database at `<agentDir>/workgraph/workstreams/<workstreamId>/workstream.sqlite`. Worker session history is retained separately below the agent data directory. An Outcome is recorded from semantic Worker-session evidence before ordinary Worker closure; delivery and retained-output settlement remain independent of Workstream completion.
 
-`workgraph_handoff(request, includeContext?)` launches one independent child coordinator for a nonblank request narrowed beneath the current Intent. It always uses the current Workstream repository, creates a fresh parentless Pi session with the default model configuration, and returns only exact Herdr/Pi identity; both `working` and `idle` are ready once that identity matches. `includeContext` defaults to `false`; when true, only discussion before the invoking call is copied as non-authoritative context. A Handoff has no parent Task, persisted launch lifecycle, result channel, automatic retry, or completion obligation. The current Herdr adapter cannot conclusively classify any launch failure as prelaunch, so retain the child session and all known native resources and do not clean up or retry. A caller interruption may prevent delivery of otherwise known handles and does not make cleanup or retry safe.
+`workgraph_handoff(request, includeContext?)` launches one independent child coordinator from the current coordinator cwd. It creates a fresh parentless Pi session with the default model configuration and has no parent Task, persisted launch lifecycle, result channel, automatic retry, or completion obligation. Treat an interrupted or failed launch as uncertain: retain the child session and known native resources rather than cleaning up or retrying.
 
 ## Calm presentation
 

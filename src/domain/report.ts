@@ -1,6 +1,5 @@
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { CommitSchema } from "./values.js";
 
 const ReportStatusSchema = Type.Union([
   Type.Literal("completed"),
@@ -8,7 +7,7 @@ const ReportStatusSchema = Type.Union([
   Type.Literal("failed"),
 ]);
 
-export const EvidenceSchema = Type.Object(
+const EvidenceSchema = Type.Object(
   {
     label: Type.String(),
     observation: Type.String(),
@@ -86,17 +85,7 @@ const ImplementationChangedInputSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const ImplementationChangedReportSchema = Type.Object(
-  {
-    kind: Type.Literal("implementation"),
-    status: Type.Literal("completed"),
-    outcome: Type.Literal("changed"),
-    ...ReportContentFields,
-    commit: CommitSchema,
-    changedFiles: Type.Array(Type.String()),
-  },
-  { additionalProperties: false },
-);
+const ImplementationChangedReportSchema = ImplementationChangedInputSchema;
 const ImplementationReportInputSchema = Type.Union(
   [
     ImplementationChangedInputSchema,
@@ -126,7 +115,6 @@ export const WorkerReportSchema = Type.Union([
 
 export type WorkerReportInput = Static<typeof WorkerReportInputSchema>;
 export type WorkerReport = Static<typeof WorkerReportSchema>;
-export type ImplementationReportInput = Static<typeof ImplementationReportInputSchema>;
 export type WorkerMode = WorkerReportInput["kind"];
 export type WorkerSessionMode = WorkerMode;
 

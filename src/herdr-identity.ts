@@ -1,18 +1,14 @@
 import { Data } from "effect";
-import type { HerdrAgent, HerdrAgentStatus, HerdrCoordinatorAgent } from "./herdr-decoder.js";
+import type { HerdrAgent, HerdrAgentStatus } from "./herdr-decoder.js";
 
-export interface CoordinatorRuntimeIdentity {
+export interface WorkerIdentity {
   workspaceId: string;
   tabId: string;
   paneId: string;
   terminalId: string;
-  agentName?: string;
+  agentName: string;
   sessionFile: string;
   cwd: string;
-}
-
-export interface WorkerIdentity extends CoordinatorRuntimeIdentity {
-  agentName: string;
 }
 
 export type WorkerResourceIdentity = Omit<WorkerIdentity, "sessionFile">;
@@ -28,14 +24,14 @@ export interface ParsedAgent {
   readonly cwd: string;
 }
 
-export interface WorkerLaunchPlacement {
+interface WorkerLaunchPlacement {
   readonly workspaceId: string;
   readonly paneId: string;
   readonly agentName: string;
   readonly cwd: string;
 }
 
-export interface CoordinatorLaunchResource {
+interface CoordinatorLaunchResource {
   workspaceId: string;
   tabId: string;
   paneId: string;
@@ -45,32 +41,13 @@ export interface CoordinatorLaunchResource {
   cwd: string;
 }
 
-export interface HerdrObservation {
-  identity: WorkerIdentity;
-  status: HerdrAgentStatus;
-  observedAt: string;
-}
-
-export class WorkerLaunchPlacementError extends Data.TaggedError("WorkerLaunchPlacementError")<{
+class WorkerLaunchPlacementError extends Data.TaggedError("WorkerLaunchPlacementError")<{
   readonly expected: WorkerLaunchPlacement;
   readonly observed: WorkerResourceIdentity;
 }> {
   override get message(): string {
     return "Herdr agent start returned a conflicting resource identity; the observed resource was not adopted or cleaned up. Inspect the requested pane and observed handles before retrying.";
   }
-}
-
-export function parseCoordinator(decoded: HerdrCoordinatorAgent): CoordinatorRuntimeIdentity {
-  const identity: CoordinatorRuntimeIdentity = {
-    workspaceId: decoded.workspace_id,
-    tabId: decoded.tab_id,
-    paneId: decoded.pane_id,
-    terminalId: decoded.terminal_id,
-    sessionFile: decoded.agent_session.value,
-    cwd: decoded.cwd,
-  };
-  if (decoded.name !== undefined) identity.agentName = decoded.name;
-  return identity;
 }
 
 export function parseAgent(decoded: HerdrAgent): ParsedAgent {
@@ -112,7 +89,7 @@ export function assertWorkerLaunchPlacement(
     throw new WorkerLaunchPlacementError({ expected, observed: resourceOf(actual) });
 }
 
-export function assertResource(expected: WorkerResourceIdentity, actual: ParsedAgent): void {
+function assertResource(expected: WorkerResourceIdentity, actual: ParsedAgent): void {
   if (
     expected.workspaceId !== actual.workspaceId ||
     expected.tabId !== actual.tabId ||

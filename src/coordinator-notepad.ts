@@ -4,7 +4,7 @@ import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-wor
 import { DateTime } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { type HumanInputReceiptData, HumanInputReceiptDataSchema } from "./domain/workstream.js";
+import { type HumanInputReceiptData, HumanInputReceiptDataSchema } from "./domain/records.js";
 
 const HUMAN_INPUT_ENTRY = "pi-workgraph-human-input";
 const NOTEPAD_STATE_ENTRY = "pi-workgraph-coordinator-notepad-state";

@@ -56,7 +56,22 @@ void test("coordinator exposes only the read/add/update/remove notepad and edits
   const f = await fixture();
   try {
     await f.runner.emit({ type: "session_start", reason: "startup" });
-    assert.ok(f.runner.getToolDefinition("workgraph_notepad"));
+    for (const name of [
+      "workgraph_models",
+      "workgraph_intent",
+      "workgraph_handoff",
+      "workgraph_research",
+      "workgraph_consult",
+      "workgraph_implement",
+      "workgraph_review",
+      "workgraph_attempt",
+      "workgraph_inspect",
+      "workgraph_control",
+      "workgraph_complete",
+      "workgraph_adopt",
+      "workgraph_notepad",
+    ])
+      assert.ok(f.runner.getToolDefinition(name), name);
     assert.equal(f.runner.getToolDefinition("workgraph_note"), undefined);
 
     let response = await f.call("workgraph_notepad", { action: "read" });
