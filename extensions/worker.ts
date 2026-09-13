@@ -11,9 +11,11 @@ import {
 import { loadWorkerDisabledTools } from "../src/workgraph-settings.js";
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
-  const role = configuredWorkerRole(process.env["PI_WORKGRAPH_ROLE"]);
-  if (role === null) return;
-  const runtime = new WorkerRuntime(role, (customType, data) => pi.appendEntry(customType, data));
+  const configuredRole = configuredWorkerRole(process.env["PI_WORKGRAPH_ROLE"]);
+  if (!configuredRole.ok || configuredRole.value === null) return;
+  const runtime = new WorkerRuntime(configuredRole.value, (customType, data) =>
+    pi.appendEntry(customType, data),
+  );
   const branch = (ctx: ExtensionContext): SessionEntry[] => ctx.sessionManager.getBranch();
   const modelHost = (ctx: ExtensionContext): WorkerModelHost => ({
     current() {
@@ -74,9 +76,20 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     try {
       const disabled = await loadWorkerDisabledTools();
-      runtime.restoreSession(branch(ctx), disabled);
-      const diagnostic = await Effect.runPromise(runtime.recoverModel(branch(ctx), modelHost(ctx)));
-      if (diagnostic !== undefined) pi.sendMessage(diagnostic);
+      const restored = runtime.restoreSession(branch(ctx), disabled);
+      if (!restored.ok) {
+        runtime.failClosed(branch(ctx), restored.error);
+        pi.sendMessage({
+          customType: "pi-workgraph-worker-diagnostic",
+          content: `[WORKGRAPH WORKER STARTUP FAILED]\n${restored.error}\nOnly a truthful failed report is permitted.`,
+          display: false,
+        });
+      } else {
+        const diagnostic = await Effect.runPromise(
+          runtime.recoverModel(branch(ctx), modelHost(ctx)),
+        );
+        if (diagnostic !== undefined) pi.sendMessage(diagnostic);
+      }
     } catch (cause) {
       const diagnostic =
         cause instanceof Error ? cause.message : "Worker startup state is unreadable.";

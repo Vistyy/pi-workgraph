@@ -80,23 +80,15 @@ void test("Worker session readback derives ordered actual models, settlement, an
       createWorkerSessionEffect({ cwd, sessionDir, objective }),
     );
     const session = SessionManager.open(file);
-    const identity = {
-      workstreamId: objective.details.workstreamId,
-      taskId: objective.details.taskId,
-      attemptId: objective.details.attemptId,
-    };
     session.appendCustomEntry("pi-workgraph-effective-model", {
-      ...identity,
       model: "fixture/guide",
       thinking: "medium",
     });
     session.appendCustomEntry("pi-workgraph-effective-model", {
-      ...identity,
       model: "fixture/executor",
       thinking: "high",
     });
     session.appendCustomEntry("pi-workgraph-effective-model", {
-      ...identity,
       model: "fixture/guide",
       thinking: "medium",
     });
@@ -118,7 +110,7 @@ void test("Worker session readback derives ordered actual models, settlement, an
       isError: false,
       timestamp: Date.now(),
     });
-    session.appendCustomEntry("pi-workgraph-agent-settled", identity);
+    session.appendCustomEntry("pi-workgraph-agent-settled", {});
 
     const read = readWorkerSession(file, cwd, objective);
     assert.equal(read.unreadable, false);
@@ -132,7 +124,7 @@ void test("Worker session readback derives ordered actual models, settlement, an
 
     const wrong = readWorkerSession(file, join(parent, "wrong"), objective);
     assert.equal(wrong.unreadable, true);
-    assert.match(wrong.unreadable ? wrong.error : "", /header or objective/);
+    assert.match(wrong.unreadable ? wrong.error : "", /header/);
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -145,14 +137,26 @@ void test("settled readable sessions expose bounded report errors", async () => 
     const file = await runNodePlatformPromise(
       createWorkerSessionEffect({ cwd, sessionDir: join(parent, "sessions"), objective }),
     );
-    SessionManager.open(file).appendCustomEntry("pi-workgraph-agent-settled", {
-      workstreamId: objective.details.workstreamId,
-      taskId: objective.details.taskId,
-      attemptId: objective.details.attemptId,
+    const session = SessionManager.open(file);
+    session.appendCustomEntry("pi-workgraph-effective-model", {
+      model: "fixture/guide",
+      thinking: "medium",
     });
+    session.appendCustomEntry("pi-workgraph-agent-settled", {});
     const read = readWorkerSession(file, cwd, objective);
     assert.equal(read.unreadable, false);
     if (!read.unreadable) assert.match(read.reportError ?? "", /no successful terminal report/);
+
+    const mismatched = readWorkerSession(file, cwd, {
+      ...objective,
+      content: `${objective.content}\nDifferent acceptance`,
+    });
+    assert.equal(mismatched.unreadable, false);
+    if (!mismatched.unreadable) {
+      assert.equal(mismatched.started, true);
+      assert.equal(mismatched.settled, true);
+      assert.match(mismatched.reportError ?? "", /objective.*mismatched/i);
+    }
   } finally {
     await rm(parent, { recursive: true, force: true });
   }

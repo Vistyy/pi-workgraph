@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/global-date, anti-slop/no-unknown-parameters -- Pi requires an epoch timestamp and session entries are decoded at this boundary. */
+/* oxlint-disable effecttsgo/global-date -- Pi requires an epoch timestamp for the synthetic persistence marker. */
 import { type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Data, Effect, FileSystem } from "effect";
 import type { PlatformError } from "effect/PlatformError";
@@ -34,7 +34,6 @@ const ReportDetailsSchema = Type.Object(
 );
 const EffectiveModelSchema = Type.Object(
   {
-    ...WorkerIdentitySchema.properties,
     model: ModelTargetSchema.properties.model,
     thinking: ModelTargetSchema.properties.thinking,
   },
@@ -51,7 +50,6 @@ export interface WorkerObjective {
 export class PiSessionError extends Data.TaggedError("PiSessionError")<{
   readonly operation: "create" | "recover" | "append-objective" | "persist" | "resolve";
   readonly message: string;
-  readonly cause?: unknown;
 }> {}
 
 /** Create or recover the one exact Pi session owned by an Attempt. */
@@ -164,70 +162,81 @@ export function readWorkerSession(
   expectedCwd: string,
   expected: WorkerObjective,
 ): WorkerSessionRead {
+  let session: SessionManager;
+  let entries: SessionEntry[];
   try {
-    const session = SessionManager.open(sessionFile);
-    if (!exactSession(session, { cwd: expectedCwd, objective: expected }))
-      throw new Error("Worker session header or objective does not match the exact Attempt.");
-    const branch = attemptBranch(session.getBranch(), expected);
-    const effectiveModels = orderedEffectiveModels(branch, expected.details);
-    const started = effectiveModels.length > 0;
-    const settled = branch.some(
-      (entry) =>
-        entry.type === "custom" &&
-        entry.customType === "pi-workgraph-agent-settled" &&
-        sameAttempt(entry.data, expected.details),
-    );
-    let reportDetails: unknown;
-    let reportFound = false;
-    for (const entry of [...branch].reverse()) {
-      if (
-        entry.type === "message" &&
-        entry.message.role === "toolResult" &&
-        entry.message.toolName === "workgraph_report" &&
-        entry.message.isError !== true
-      ) {
-        reportDetails = entry.message.details;
-        reportFound = true;
-        break;
-      }
+    session = SessionManager.open(sessionFile);
+    const header = session.getHeader();
+    if (
+      header === null ||
+      header.id !== expected.details.attemptId ||
+      header.cwd !== expectedCwd ||
+      header.parentSession !== undefined
+    )
+      return unreadable("Worker session header does not match the exact Attempt.");
+    entries = session.getBranch();
+  } catch {
+    return unreadable("Worker session file or header is unreadable.");
+  }
+
+  const objective = attemptBranch(entries, expected);
+  const branch = objective.ok ? objective.value : entries;
+  const effectiveModels = orderedEffectiveModels(branch);
+  const started = effectiveModels.length > 0;
+  const settled = branch.some(
+    (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-agent-settled",
+  );
+  if (!objective.ok)
+    return {
+      unreadable: false,
+      started,
+      settled,
+      reportError: bounded(objective.error),
+      effectiveModels,
+    };
+
+  let reportDetails: unknown;
+  let reportFound = false;
+  for (const entry of [...branch].reverse()) {
+    if (
+      entry.type === "message" &&
+      entry.message.role === "toolResult" &&
+      entry.message.toolName === "workgraph_report" &&
+      entry.message.isError !== true
+    ) {
+      reportDetails = entry.message.details;
+      reportFound = true;
+      break;
     }
-    if (!reportFound)
-      return settled
-        ? {
-            unreadable: false,
-            started,
-            settled,
-            reportError: "Settled Worker session has no successful terminal report.",
-            effectiveModels,
-          }
-        : { unreadable: false, started, settled, effectiveModels };
-    if (!Value.Check(ReportDetailsSchema, reportDetails))
-      return {
-        unreadable: false,
-        started,
-        settled,
-        reportError: "Worker terminal report details are malformed.",
-        effectiveModels,
-      };
-    const report = Value.Decode(ReportDetailsSchema, reportDetails).report;
-    return isWorkerReport(report)
-      ? { unreadable: false, started, settled, report, effectiveModels }
-      : {
+  }
+  if (!reportFound)
+    return settled
+      ? {
           unreadable: false,
           started,
           settled,
-          reportError: "Worker terminal report is malformed.",
+          reportError: "Settled Worker session has no successful terminal report.",
           effectiveModels,
-        };
-  } catch (cause) {
+        }
+      : { unreadable: false, started, settled, effectiveModels };
+  if (!Value.Check(ReportDetailsSchema, reportDetails))
     return {
-      unreadable: true,
-      error: bounded(cause instanceof Error ? cause.message : "Worker session is unreadable."),
-      started: false,
-      settled: false,
-      effectiveModels: [],
+      unreadable: false,
+      started,
+      settled,
+      reportError: "Worker terminal report details are malformed.",
+      effectiveModels,
     };
-  }
+  const report = Value.Decode(ReportDetailsSchema, reportDetails).report;
+  return isWorkerReport(report)
+    ? { unreadable: false, started, settled, report, effectiveModels }
+    : {
+        unreadable: false,
+        started,
+        settled,
+        reportError: "Worker terminal report is malformed.",
+        effectiveModels,
+      };
 }
 
 function validObjective(objective: WorkerObjective): boolean {
@@ -245,25 +254,23 @@ function exactSession(
   request: { readonly cwd: string; readonly objective: WorkerObjective },
 ): boolean {
   const header = session.getHeader();
-  if (
-    header === null ||
-    header.id !== request.objective.details.attemptId ||
-    header.cwd !== request.cwd ||
-    header.parentSession !== undefined
-  )
-    return false;
-  try {
-    attemptBranch(session.getBranch(), request.objective);
-    return true;
-  } catch {
-    return false;
-  }
+  return (
+    header !== null &&
+    header.id === request.objective.details.attemptId &&
+    header.cwd === request.cwd &&
+    header.parentSession === undefined &&
+    attemptBranch(session.getBranch(), request.objective).ok
+  );
 }
+
+type SessionDecision<A> =
+  | { readonly ok: true; readonly value: A }
+  | { readonly ok: false; readonly error: string };
 
 function attemptBranch(
   entries: readonly SessionEntry[],
   objective: WorkerObjective,
-): SessionEntry[] {
+): SessionDecision<SessionEntry[]> {
   const objectiveEntries = entries.filter(
     (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
   );
@@ -278,15 +285,11 @@ function attemptBranch(
       objective.details,
     )
   )
-    throw new Error("Exact Worker objective is absent or ambiguous.");
-  const start = entries.indexOf(match);
-  return entries.slice(start);
+    return { ok: false, error: "Exact Worker objective is absent, malformed, or mismatched." };
+  return { ok: true, value: entries.slice(entries.indexOf(match)) };
 }
 
-function orderedEffectiveModels(
-  entries: readonly SessionEntry[],
-  expected: WorkerObjectiveDetails,
-): ModelTarget[] {
+function orderedEffectiveModels(entries: readonly SessionEntry[]): ModelTarget[] {
   const result: ModelTarget[] = [];
   const seen = new Set<string>();
   for (const entry of entries) {
@@ -297,7 +300,6 @@ function orderedEffectiveModels(
     )
       continue;
     const marker = Value.Decode(EffectiveModelSchema, entry.data);
-    if (!sameAttempt(marker, expected)) continue;
     const key = `${marker.model}\0${marker.thinking}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -319,14 +321,14 @@ function sameObjectiveDetails(
     actual.executor?.thinking === expected.executor?.thinking
   );
 }
-function sameAttempt(value: unknown, expected: WorkerObjectiveDetails): boolean {
-  if (!Value.Check(WorkerIdentitySchema, value)) return false;
-  const decoded = Value.Decode(WorkerIdentitySchema, value);
-  return (
-    decoded.workstreamId === expected.workstreamId &&
-    decoded.taskId === expected.taskId &&
-    decoded.attemptId === expected.attemptId
-  );
+function unreadable(error: string): WorkerSessionRead {
+  return {
+    unreadable: true,
+    error: bounded(error),
+    started: false,
+    settled: false,
+    effectiveModels: [],
+  };
 }
 function bounded(message: string): string {
   return message.replace(/\s+/g, " ").slice(0, 300);
@@ -337,8 +339,8 @@ function native<A>(
 ): Effect.Effect<A, PiSessionError> {
   return Effect.try({
     try: run,
-    catch: (cause) =>
-      new PiSessionError({ operation, message: `Pi SessionManager ${operation} failed.`, cause }),
+    catch: () =>
+      new PiSessionError({ operation, message: `Pi SessionManager ${operation} failed.` }),
   });
 }
 function nativePromise<A>(
@@ -347,7 +349,7 @@ function nativePromise<A>(
 ): Effect.Effect<A, PiSessionError> {
   return Effect.tryPromise({
     try: run,
-    catch: (cause) =>
-      new PiSessionError({ operation, message: `Pi SessionManager ${operation} failed.`, cause }),
+    catch: () =>
+      new PiSessionError({ operation, message: `Pi SessionManager ${operation} failed.` }),
   });
 }

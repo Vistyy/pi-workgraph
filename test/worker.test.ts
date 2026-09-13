@@ -4,10 +4,10 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { ExtensionActions, SessionManager } from "@earendil-works/pi-coding-agent";
+import { type ExtensionActions, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import type { WorkerObjective } from "../src/pi-session.js";
+import { readWorkerSession, type WorkerObjective } from "../src/pi-session.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "./decoders.js";
 import { extensionFixture, persistentSession, usage } from "./helpers.js";
 
@@ -197,15 +197,21 @@ void test("TODO and successful direct edit trigger one executor cutover in eithe
       assert.deepEqual(f.selected, ["openai/gpt-4o"]);
       await endTool(f, "edit");
       assert.deepEqual(f.selected, ["openai/gpt-4o"]);
-      assert.equal(
-        f.session
-          .getBranch()
-          .filter(
-            (entry) =>
-              entry.type === "custom" && entry.customType === "pi-workgraph-executor-start",
-          ).length,
-        1,
+      const executorStarts = f.session
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-executor-start",
+        );
+      assert.equal(executorStarts.length, 1);
+      assert.deepEqual(
+        executorStarts[0]?.type === "custom" ? executorStarts[0].data : undefined,
+        {},
       );
+      await f.runner.emit({ type: "agent_settled" });
+      const reminder = f.messages.find(
+        (message) => message.customType === "pi-workgraph-todo-reminder",
+      );
+      assert.deepEqual(reminder?.details, { ordinal: 1, limit: 2 });
     } finally {
       await f.dispose();
     }
@@ -360,6 +366,90 @@ void test("guide terminal paths and role-owned edit gates are independent", asyn
     assert.equal(experiment.activeTools().includes("write"), true);
   } finally {
     await experiment.dispose();
+  }
+});
+
+void test("malformed objective fails closed but retains actual-model and settled readback", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-objective-"));
+  const root = join(parent, "repo");
+  await mkdir(root);
+  const previous = configureFixtureEnvironment({
+    PI_CODING_AGENT_DIR: join(parent, "agent"),
+    PI_WORKGRAPH_ROLE: "implementation",
+  });
+  const session = SessionManager.create(root, join(parent, "sessions"), { id: "attempt" });
+  session.appendCustomMessageEntry("pi-workgraph-objective", objective.content, true, {
+    ...objective.details,
+    role: "research",
+    executor: undefined,
+  });
+  session.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "Workgraph assignment loaded." }],
+    api: "test",
+    provider: "test",
+    model: "fixture",
+    usage,
+    stopReason: "stop",
+    timestamp: Date.now(),
+  });
+  try {
+    let activeTools = ["read", "bash", "edit", "write", "workgraph_plan", "workgraph_report"];
+    const loaded = await extensionFixture(
+      "worker",
+      root,
+      parent,
+      {
+        getActiveTools: () => [...activeTools],
+        setActiveTools: (names) => {
+          activeTools = [...names];
+        },
+      },
+      [],
+      session,
+    );
+    await loaded.runner.emit({ type: "session_start", reason: "startup" });
+    await loaded.runner.emit({ type: "agent_start" });
+    await loaded.runner.emit({ type: "agent_settled" });
+    const report = await loaded.call("workgraph_report", {
+      kind: "implementation",
+      status: "failed",
+      summary: "The authoritative objective was malformed.",
+      evidence: [],
+      findings: [],
+    });
+    assert.equal(report.terminate, true);
+    const file = session.getSessionFile();
+    if (file === undefined) assert.fail("Worker session was not persisted.");
+    const read = readWorkerSession(file, root, objective);
+    assert.equal(read.unreadable, false, read.unreadable ? read.error : "");
+    if (!read.unreadable) {
+      assert.equal(read.started, true);
+      assert.equal(read.settled, true);
+      assert.match(read.reportError ?? "", /objective.*mismatched/i);
+    }
+    await loaded.close();
+  } finally {
+    restoreFixtureEnvironment(previous);
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("invalid Worker role does not crash extension loading", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-role-"));
+  const root = join(parent, "repo");
+  await mkdir(root);
+  const previous = configureFixtureEnvironment({
+    PI_CODING_AGENT_DIR: join(parent, "agent"),
+    PI_WORKGRAPH_ROLE: "invalid-role",
+  });
+  try {
+    const loaded = await extensionFixture("worker", root, parent);
+    assert.equal(loaded.runner.getToolDefinition("workgraph_report"), undefined);
+    await loaded.close();
+  } finally {
+    restoreFixtureEnvironment(previous);
+    await rm(parent, { recursive: true, force: true });
   }
 });
 

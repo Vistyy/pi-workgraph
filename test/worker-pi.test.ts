@@ -168,20 +168,8 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
         )
         .map((entry) => (entry.type === "custom" ? entry.data : undefined)),
       [
-        {
-          workstreamId: "fixture",
-          taskId: "worker",
-          attemptId: "attempt",
-          model: "fixture/guide",
-          thinking: "off",
-        },
-        {
-          workstreamId: "fixture",
-          taskId: "worker",
-          attemptId: "attempt",
-          model: "fixture/executor",
-          thinking: "off",
-        },
+        { model: "fixture/guide", thinking: "off" },
+        { model: "fixture/executor", thinking: "off" },
       ],
     );
     const report = branch.findLast(
@@ -193,6 +181,137 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
     assert.ok(report?.type === "message" && report.message.role === "toolResult");
     // SAFETY: The preceding role assertion narrows this to the tool-result details boundary.
     assert.deepEqual(Object.keys(report.message.details as object), ["report"]);
+  } finally {
+    await session?.abort();
+    session?.dispose();
+    await provider.close();
+    restoreFixtureEnvironment(previous);
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+void test("real Pi restores the exact guide before continuing after executor selection failure", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-pi-failure-"));
+  const cwd = join(parent, "repo");
+  await mkdir(cwd);
+  const previous = configureFixtureEnvironment({
+    PI_CODING_AGENT_DIR: join(parent, "agent"),
+    PI_WORKGRAPH_ROLE: "implementation",
+  });
+  const provider = await startControlledProvider([
+    () => ({
+      tool: {
+        id: "plan",
+        name: "workgraph_plan",
+        arguments: {
+          action: "set",
+          todos: [
+            {
+              id: "change",
+              text: "Change value.txt.",
+              validation: "value.txt contains after.",
+              status: "in_progress",
+            },
+          ],
+        },
+      },
+    }),
+    () => ({
+      tool: { id: "write", name: "write", arguments: { path: "value.txt", content: "after\n" } },
+    }),
+    (request) => {
+      assert.equal(request.model, "guide");
+      assert.match(request.raw, /IMPLEMENTATION GUIDE POLICY/);
+      assert.doesNotMatch(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
+      assert.match(request.raw, /EXECUTOR SELECTION FAILED/);
+      return {
+        tool: {
+          id: "report",
+          name: "workgraph_report",
+          arguments: {
+            kind: "implementation",
+            status: "failed",
+            summary: "The frozen executor target was unavailable.",
+            evidence: [],
+            findings: [],
+          },
+        },
+      };
+    },
+  ]);
+  let session: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
+  try {
+    const agentDir = join(parent, "agent");
+    const models = await ModelRuntime.create({
+      authPath: join(parent, "auth.json"),
+      modelsPath: null,
+      modelsStorePath: join(parent, "models.json"),
+      refreshOnCreate: false,
+      allowModelNetwork: false,
+    });
+    models.registerProvider("fixture", {
+      name: "fixture",
+      api: "openai-completions",
+      apiKey: "fixture",
+      baseUrl: provider.baseUrl,
+      models: [model("guide"), model("executor")],
+    });
+    const settings = SettingsManager.inMemory({
+      compaction: { enabled: false },
+      retry: { enabled: false },
+    });
+    const manager = SessionManager.create(cwd, join(parent, "sessions"), { id: "attempt" });
+    manager.appendCustomMessageEntry(
+      "pi-workgraph-objective",
+      "[WORKGRAPH WORKER OBJECTIVE]\nIntent: exercise failed cutover\nObjective: change value.txt",
+      true,
+      {
+        workstreamId: "fixture",
+        taskId: "worker",
+        attemptId: "attempt",
+        role: "implementation",
+        executor: { model: "fixture/executor", thinking: "high" },
+      },
+    );
+    const loader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager: settings,
+      additionalExtensionPaths: [resolve("extensions/worker.ts")],
+      noContextFiles: true,
+      noPromptTemplates: true,
+      noSkills: true,
+      noThemes: true,
+      systemPrompt: "Controlled Worker.",
+    });
+    await loader.reload();
+    const guide = models.getModel("fixture", "guide");
+    assert.ok(guide);
+    const created = await createAgentSession({
+      cwd,
+      agentDir,
+      modelRuntime: models,
+      model: guide,
+      thinkingLevel: "off",
+      tools: ["write", "workgraph_plan", "workgraph_report"],
+      resourceLoader: loader,
+      sessionManager: manager,
+      settingsManager: settings,
+    });
+    session = created.session;
+    await session.bindExtensions({});
+    await session.prompt("Begin the assigned Workgraph task", { source: "rpc" });
+    await session.agent.waitForIdle();
+    provider.assertComplete();
+    assert.equal(session.model?.id, "guide");
+    assert.equal(
+      manager
+        .getBranch()
+        .some(
+          (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-executor-start",
+        ),
+      false,
+    );
   } finally {
     await session?.abort();
     session?.dispose();

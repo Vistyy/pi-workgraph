@@ -9,13 +9,14 @@ import {
   type WorkerReportInput,
   type WorkerSessionMode,
 } from "./domain/report.js";
-import { WorkerIdentitySchema, type WorkerRole } from "./pi-session.js";
+import type { WorkerRole } from "./pi-session.js";
 import {
   EXECUTOR_FAILURE_MESSAGE,
   EXECUTOR_START_ENTRY,
   readWorkerAssignment,
   sameAttempt,
   type WorkerAssignment,
+  type WorkerDecision,
   type WorkerPhase,
   workerSystemPolicy,
 } from "./worker-context.js";
@@ -25,11 +26,13 @@ const MAX_PLAN_REMINDERS = 2;
 const REMINDER = "pi-workgraph-todo-reminder";
 const MODEL_MARKER = "pi-workgraph-effective-model";
 const SETTLED_MARKER = "pi-workgraph-agent-settled";
-const ActualModelSchema = Type.Object({
-  ...WorkerIdentitySchema.properties,
-  model: Type.String({ minLength: 1 }),
-  thinking: Type.String({ minLength: 1 }),
-});
+const ActualModelSchema = Type.Object(
+  {
+    model: Type.String({ minLength: 1 }),
+    thinking: Type.String({ minLength: 1 }),
+  },
+  { additionalProperties: false },
+);
 
 type WorkerEntry = SessionEntry;
 type ContextMessage = {
@@ -52,8 +55,8 @@ type MessageSink = (message: {
 
 class WorkerHostError extends Data.TaggedError("WorkerHostError")<{ readonly message: string }> {}
 
-export function configuredWorkerRole(value: string | undefined): WorkerRole | null {
-  if (value === undefined || value === "") return null;
+export function configuredWorkerRole(value: string | undefined): WorkerDecision<WorkerRole | null> {
+  if (value === undefined || value === "") return { ok: true, value: null };
   if (
     value === "research" ||
     value === "experiment" ||
@@ -61,8 +64,8 @@ export function configuredWorkerRole(value: string | undefined): WorkerRole | nu
     value === "review" ||
     value === "implementation"
   )
-    return value;
-  throw new Error(`Invalid PI_WORKGRAPH_ROLE: ${value}`);
+    return { ok: true, value };
+  return { ok: false, error: `Invalid PI_WORKGRAPH_ROLE: ${bounded(value)}` };
 }
 
 export class WorkerRuntime {
@@ -81,37 +84,41 @@ export class WorkerRuntime {
     private readonly appendEntry: (customType: string, data: unknown) => void,
   ) {}
 
-  restoreSession(branch: readonly WorkerEntry[], configuredDisabledTools: readonly string[]): void {
-    this.assignment = readWorkerAssignment(branch, this.role);
-    this.plan = new WorkerPlanState(this.identity());
+  restoreSession(
+    branch: readonly WorkerEntry[],
+    configuredDisabledTools: readonly string[],
+  ): WorkerDecision<void> {
+    const assignment = readWorkerAssignment(branch, this.role);
+    if (!assignment.ok) return assignment;
+    const protectedNames = new Set(["workgraph_report", "workgraph_plan"]);
+    const invalid = configuredDisabledTools.find((name) => protectedNames.has(name));
+    if (invalid !== undefined)
+      return {
+        ok: false,
+        error: `Worker setting cannot disable protected tool ${invalid}.`,
+      };
+    this.assignment = assignment.value;
+    this.plan = new WorkerPlanState(identityOf(assignment.value.details));
     this.plan.restore(this.attemptBranch(branch));
     this.directEditSeen = hasSuccessfulDirectEdit(this.attemptBranch(branch));
     this.executorMarkerSeen = this.hasMarker(branch, EXECUTOR_START_ENTRY);
     this.phase = this.executorMarkerSeen ? "executor" : "guide";
     this.cutoverFailed = this.hasMessage(branch, EXECUTOR_FAILURE_MESSAGE);
-    this.configureDisabledTools(configuredDisabledTools);
+    this.disabledTools = new Set(configuredDisabledTools);
+    return { ok: true, value: undefined };
   }
 
   failClosed(branch: readonly WorkerEntry[], diagnostic: string): void {
     this.settingsError = bounded(diagnostic);
     this.disabledTools.clear();
     if (this.assignment === undefined) {
-      try {
-        this.assignment = readWorkerAssignment(branch, this.role);
-        this.plan = new WorkerPlanState(this.identity());
+      const assignment = readWorkerAssignment(branch, this.role);
+      if (assignment.ok) {
+        this.assignment = assignment.value;
+        this.plan = new WorkerPlanState(identityOf(assignment.value.details));
         this.plan.restore(this.attemptBranch(branch));
-      } catch {
-        // The report tool remains available so the Worker can truthfully fail.
       }
     }
-  }
-
-  private configureDisabledTools(names: readonly string[]): void {
-    const protectedNames = new Set(["workgraph_report", "workgraph_plan"]);
-    const invalid = names.find((name) => protectedNames.has(name));
-    if (invalid !== undefined)
-      throw new Error(`Worker setting cannot disable protected tool ${invalid}.`);
-    this.disabledTools = new Set(names);
   }
 
   hasPlanTool(): boolean {
@@ -159,7 +166,7 @@ export class WorkerRuntime {
       if (executor === undefined) return undefined;
       const evidence = self.directEditSeen && self.plan?.todos !== undefined;
       const exactExecutor = selected(host, executor.model, executor.thinking);
-      if (exactExecutor && evidence) {
+      if (!self.cutoverFailed && exactExecutor && evidence) {
         self.promoteExecutor();
         return undefined;
       }
@@ -188,20 +195,19 @@ export class WorkerRuntime {
         self.assignment?.details.executor === undefined
       )
         return undefined;
-      const executor = self.assignment.details.executor;
-      yield* selectTarget(executor.model, executor.thinking, host);
+      const guide = host.current();
+      if (guide === undefined)
+        return self.selectionFailure("Pi has no current guide model to preserve.");
+      const failure = yield* selectWithRestore(self.assignment.details.executor, guide, host);
+      if (failure !== undefined) return self.selectionFailure(failure);
       self.promoteExecutor();
       return undefined;
-    }).pipe(
-      Effect.catch((error: WorkerHostError | WorkerContractError) =>
-        Effect.succeed(self.selectionFailure(error.message)),
-      ),
-    );
+    });
   }
 
   private promoteExecutor(): void {
     if (!this.executorMarkerSeen) {
-      this.appendIdentity(EXECUTOR_START_ENTRY);
+      this.appendEntry(EXECUTOR_START_ENTRY, {});
       this.executorMarkerSeen = true;
     }
     this.phase = "executor";
@@ -214,17 +220,16 @@ export class WorkerRuntime {
       customType: EXECUTOR_FAILURE_MESSAGE,
       content: `[WORKGRAPH EXECUTOR SELECTION FAILED]\n${bounded(message)}\nRemain on the guide, do not make further direct edits or retry selection automatically, and report failed unless a decision or authority is genuinely missing.`,
       display: false as const,
-      details: this.identity(),
+      details: {},
     };
   }
 
   recordAgentStarted(model: string | undefined, thinking: string): void {
-    if (model !== undefined)
-      this.appendEntry(MODEL_MARKER, { ...this.identity(), model, thinking });
+    if (model !== undefined) this.appendEntry(MODEL_MARKER, { model, thinking });
   }
   settleAgent(branch: readonly WorkerEntry[], send: MessageSink): void {
     if (this.hasMarker(branch, SETTLED_MARKER) || this.scheduleReminder(branch, send)) return;
-    this.appendIdentity(SETTLED_MARKER);
+    this.appendEntry(SETTLED_MARKER, {});
   }
   systemPolicy(): string {
     return workerSystemPolicy(this.role, this.phase);
@@ -251,8 +256,7 @@ export class WorkerRuntime {
           entry.customType === "pi-workgraph-objective" &&
           sameAttempt(entry.details, assignment.details)) ||
         (entry.type === "custom_message" &&
-          entry.customType === "pi-workgraph-compaction-recovery" &&
-          sameAttempt(entry.details, assignment.details)),
+          entry.customType === "pi-workgraph-compaction-recovery"),
     );
     if (visible) return undefined;
     return {
@@ -261,7 +265,7 @@ export class WorkerRuntime {
         .filter((line): line is string => line !== undefined)
         .join("\n"),
       display: false as const,
-      details: this.identity(),
+      details: {},
     };
   }
 
@@ -312,24 +316,11 @@ export class WorkerRuntime {
       customType: REMINDER,
       content: `[WORKGRAPH TODO SETTLE REMINDER ${count + 1}/${MAX_PLAN_REMINDERS}]\nThe executor settled without a report while TODO items remain actionable. Continue useful work or report truthfully; TODO status is not a completion gate.`,
       display: false,
-      details: this.identity(),
+      details: { ordinal: count + 1, limit: MAX_PLAN_REMINDERS },
     });
     return true;
   }
 
-  private identity() {
-    const details = this.assignment?.details;
-    if (details === undefined)
-      return { workstreamId: "unknown", taskId: "unknown", attemptId: "unknown" };
-    return {
-      workstreamId: details.workstreamId,
-      taskId: details.taskId,
-      attemptId: details.attemptId,
-    };
-  }
-  private appendIdentity(type: string): void {
-    this.appendEntry(type, this.identity());
-  }
   private attemptBranch(entries: readonly WorkerEntry[]): WorkerEntry[] {
     const details = this.assignment?.details;
     if (details === undefined) return [];
@@ -342,25 +333,13 @@ export class WorkerRuntime {
     return start < 0 ? [] : entries.slice(start);
   }
   private hasMarker(entries: readonly WorkerEntry[], type: string): boolean {
-    const details = this.assignment?.details;
-    return (
-      details !== undefined &&
-      this.attemptBranch(entries).some(
-        (entry) =>
-          entry.type === "custom" && entry.customType === type && sameAttempt(entry.data, details),
-      )
+    return this.attemptBranch(entries).some(
+      (entry) => entry.type === "custom" && entry.customType === type,
     );
   }
   private hasMessage(entries: readonly WorkerEntry[], type: string): boolean {
-    const details = this.assignment?.details;
-    return (
-      details !== undefined &&
-      this.attemptBranch(entries).some(
-        (entry) =>
-          entry.type === "custom_message" &&
-          entry.customType === type &&
-          sameAttempt(entry.details, details),
-      )
+    return this.attemptBranch(entries).some(
+      (entry) => entry.type === "custom_message" && entry.customType === type,
     );
   }
 }
@@ -426,7 +405,25 @@ function selected(host: WorkerModelHost, model: string, thinking: string): boole
   const current = host.current();
   return current?.model === model && current.thinking === thinking;
 }
-function selectTarget(model: string, thinking: string, host: WorkerModelHost) {
+function selectWithRestore(
+  target: { readonly model: string; readonly thinking: string },
+  guide: { readonly model: string; readonly thinking: string },
+  host: WorkerModelHost,
+) {
+  return Effect.gen(function* () {
+    const transition = yield* Effect.result(selectTarget(target.model, target.thinking, host));
+    if (transition._tag === "Success") return undefined;
+    const restoration = yield* Effect.result(selectTarget(guide.model, guide.thinking, host));
+    return restoration._tag === "Success"
+      ? transition.failure.message
+      : `${transition.failure.message} Guide restoration also failed: ${restoration.failure.message}`;
+  });
+}
+function selectTarget(
+  model: string,
+  thinking: string,
+  host: WorkerModelHost,
+): Effect.Effect<void, WorkerHostError | WorkerContractError> {
   const slash = model.indexOf("/");
   if (slash <= 0) return contractFailure(`Invalid Worker model: ${model}`);
   const self = { model, thinking };
@@ -457,6 +454,13 @@ function selectTarget(model: string, thinking: string, host: WorkerModelHost) {
 }
 function contractFailure(message: string) {
   return Effect.fail(new WorkerContractError({ message }));
+}
+function identityOf(details: WorkerAssignment["details"]) {
+  return {
+    workstreamId: details.workstreamId,
+    taskId: details.taskId,
+    attemptId: details.attemptId,
+  };
 }
 function bounded(message: string): string {
   return message.replace(/\s+/g, " ").slice(0, 300);
