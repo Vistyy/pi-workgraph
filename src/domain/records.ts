@@ -134,7 +134,6 @@ const AttemptExecutionSchema = strict({
     strict({
       reason: NonBlankText,
       requestedAt: Instant,
-      closeAttemptedAt: Type.Optional(Instant),
     }),
   ),
   closedAt: Type.Optional(Instant),

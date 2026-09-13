@@ -1,6 +1,5 @@
 /* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/async-function, effecttsgo/global-date, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are the Promise boundary; registered TypeBox schemas validate tool values before these typed callbacks. */
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   buildContextEntries,
@@ -14,7 +13,7 @@ import { Effect, Exit, Scope } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import { installCalmMode, isCoordinatorScope } from "../src/calm.js";
-import { WorkstreamRuntime } from "../src/coordination/runtime.js";
+import { RuntimeError, WorkstreamRuntime } from "../src/coordination/runtime.js";
 import { installCoordinatorSessionState } from "../src/coordinator-notepad.js";
 import {
   type AttemptLineage,
@@ -30,7 +29,6 @@ import {
 } from "../src/domain/records.js";
 import { resolveTaskTarget } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
-import { herdrWorkerName } from "../src/herdr-naming.js";
 import {
   configuredTarget,
   implementationTargets,
@@ -39,8 +37,6 @@ import {
   modelPolicyPath,
   resolveSelection,
 } from "../src/model-policy.js";
-import { runNodePlatformPromise } from "../src/node-platform.js";
-import { createWorkerSessionEffect, readWorkerSession } from "../src/pi-session.js";
 import { WorkstreamStore } from "../src/storage/workstream-store.js";
 
 const POINTER = "pi-workgraph-record-pointer";
@@ -83,12 +79,9 @@ const ResultSubject = Type.Union([
   Type.Object({ kind: Type.Literal("revision"), revision: Text }, { additionalProperties: false }),
 ]);
 
-type RuntimePorts = Parameters<typeof WorkstreamRuntime.acquire>[0]["ports"];
-
 export interface CoordinatorOptions {
   readonly agentDir?: string;
   readonly policyPath?: string;
-  readonly ports?: RuntimePorts;
   readonly priorCoordinatorAbsent?: (owner: CoordinatorOwner) => Promise<boolean>;
 }
 
@@ -96,7 +89,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   if (!isCoordinatorScope(process.env)) return;
   const guidance = readFileSync(new URL("../COORDINATOR.md", import.meta.url), "utf8").trim();
   const agentDir = options.agentDir ?? getAgentDir();
-  const ports = options.ports ?? nativePorts(agentDir, pi);
   const calm = installCalmMode(pi);
   let attached: WorkstreamRuntime | undefined;
   let scope: Scope.Scope | undefined;
@@ -155,7 +147,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     await close();
     const nextScope = await Effect.runPromise(Scope.make());
     const result = await Effect.runPromise(
-      WorkstreamRuntime.acquire({ store, owner: exactOwner, agentDir, ports }).pipe(
+      WorkstreamRuntime.acquire({ store, owner: exactOwner, agentDir, pi }).pipe(
         Scope.provide(nextScope),
       ),
     );
@@ -349,7 +341,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     async (params, ctx) =>
-      createAndLaunch(
+      createAndQueue(
         runtime(),
         ctx.cwd,
         options,
@@ -390,7 +382,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     async (params, ctx) => {
       const policy = await loadModelPolicy(options.policyPath);
       const model = configuredTarget(policy, "consultation.advisor", params.advisor);
-      return createAndLaunch(
+      return createAndQueue(
         runtime(),
         ctx.cwd,
         options,
@@ -427,7 +419,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     async (params, ctx) => {
       const policy = await loadModelPolicy(options.policyPath);
       const models = implementationTargets(policy, params.useEscalationExecutor ?? false);
-      return createAndLaunch(
+      return createAndQueue(
         runtime(),
         ctx.cwd,
         options,
@@ -463,7 +455,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     async (params, ctx) =>
-      createAndLaunch(
+      createAndQueue(
         runtime(),
         ctx.cwd,
         options,
@@ -493,7 +485,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   pi.registerTool({
     name: "workgraph_attempt",
     label: "Workgraph Attempt",
-    description: "Create and launch one fresh Attempt for an immutable Task.",
+    description: "Create one fresh queued Attempt for an immutable Task.",
     parameters: Type.Object(
       {
         task: Text,
@@ -755,7 +747,7 @@ async function appendFreshAttempt(
           ),
         };
   const candidate = lineage(runtime, params.candidateOf, params.integrate);
-  const attempt = await Effect.runPromise(
+  return Effect.runPromise(
     runtime.createAttempt({
       taskId: params.task,
       selection,
@@ -763,10 +755,9 @@ async function appendFreshAttempt(
       ...(params.baseRevision === undefined ? {} : { baseCommit: params.baseRevision }),
     }),
   );
-  return Effect.runPromise(runtime.launch(attempt.id));
 }
 
-async function createAndLaunch(
+async function createAndQueue(
   runtime: WorkstreamRuntime,
   cwd: string,
   options: CoordinatorOptions,
@@ -806,12 +797,11 @@ async function createAndLaunch(
       ...(baseRevision === undefined ? {} : { baseCommit: baseRevision }),
     }),
   );
-  const attempts = [await Effect.runPromise(runtime.launch(initial.id))];
+  const attempts = [initial];
   for (const selected of selections.slice(1)) {
-    const attempt = await Effect.runPromise(
-      runtime.createAttempt({ taskId: input.id, selection: selected }),
+    attempts.push(
+      await Effect.runPromise(runtime.createAttempt({ taskId: input.id, selection: selected })),
     );
-    attempts.push(await Effect.runPromise(runtime.launch(attempt.id)));
   }
   return attempts;
 }
@@ -836,143 +826,14 @@ function lineage(
         : { kind: "extend", attemptId: parentId },
   };
 }
-function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
-  const herdr = new HerdrCliRuntime();
-  const exactWorker = (
-    identity: Parameters<RuntimePorts["worker"]["inspect"]>[0],
-  ): import("../src/herdr.js").WorkerIdentity => ({
-    workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "",
-    tabId: identity.tabId,
-    paneId: identity.paneId,
-    terminalId: identity.terminalId,
-    agentName: herdrWorkerName({
-      runId: identity.workstreamId,
-      nodeId: identity.attemptId,
-      attemptId: identity.attemptId,
-      assignmentId: identity.taskId,
-      objective: identity.objective.content,
-      role:
-        identity.role === "implementation"
-          ? "implement"
-          : identity.role === "experiment"
-            ? "research"
-            : identity.role,
-    }),
-    sessionFile: identity.sessionFile,
-    cwd: identity.cwd,
-  });
-  const launchFacts = new Map<
-    string,
-    {
-      workstreamId: string;
-      attemptId: string;
-      role: Parameters<RuntimePorts["worker"]["createSession"]>[0]["role"];
-      target: Parameters<RuntimePorts["worker"]["createSession"]>[0]["target"];
-      objective: Parameters<RuntimePorts["worker"]["createSession"]>[0]["objective"];
-    }
-  >();
-  return {
-    worker: {
-      async createSession(input) {
-        launchFacts.set(input.attemptId, input);
-        const file = await runNodePlatformPromise(
-          createWorkerSessionEffect({
-            cwd: input.cwd,
-            sessionDir: join(agentDir, "workgraph", "worker-sessions", input.workstreamId),
-            objective: input.objective,
-          }),
-        );
-        launchFacts.set(file, input);
-        return file;
-      },
-      async launch(input) {
-        const fact = launchFacts.get(input.sessionFile);
-        if (fact === undefined) throw new Error("Missing Worker launch facts.");
-        const slash = fact.target.model.indexOf("/");
-        if (slash <= 0) throw new Error("Worker target model is malformed.");
-        const observation = await Effect.runPromise(
-          herdr.launch({
-            workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "",
-            runId: input.workstreamId,
-            nodeId: input.attemptId,
-            attemptId: input.attemptId,
-            assignmentId: input.taskId,
-            objective: input.objective.content,
-            role:
-              input.role === "implementation"
-                ? "implement"
-                : input.role === "experiment"
-                  ? "research"
-                  : input.role,
-            cwd: input.cwd,
-            sessionFile: input.sessionFile,
-            environment: {
-              PI_WORKGRAPH_ROLE: fact.role,
-              ...(process.env["PI_CODING_AGENT_DIR"] === undefined
-                ? {}
-                : { PI_CODING_AGENT_DIR: agentDir }),
-            },
-            model: fact.target.model,
-            thinking: fact.target.thinking,
-          }),
-        );
-        return {
-          paneId: observation.identity.paneId,
-          tabId: observation.identity.tabId,
-          terminalId: observation.identity.terminalId,
-        };
-      },
-      async inspect(identity) {
-        const value = await Effect.runPromise(herdr.inspect(exactWorker(identity)));
-        if (value.status !== "done") return { state: value.status };
-        return this.readSession(identity.sessionFile, identity.cwd, identity.objective);
-      },
-      async prompt(identity, text) {
-        await Effect.runPromise(herdr.prompt(exactWorker(identity), text));
-      },
-      async close(identity) {
-        return Effect.runPromise(herdr.close(exactWorker(identity)));
-      },
-      async readSession(sessionFile, cwd, objective) {
-        const read = readWorkerSession(sessionFile, cwd, objective);
-        if (read.unreadable) return { state: "blocked" };
-        if (!read.settled) return { state: "working" };
-        if (read.report === undefined)
-          return {
-            state: "done",
-            outcome: {
-              kind: "failed",
-              result: read.reportError ?? "Worker settled without a report.",
-              effectiveModels: read.effectiveModels,
-            },
-          };
-        return {
-          state: "done",
-          outcome: {
-            kind: "reported",
-            result: read.report,
-            effectiveModels: read.effectiveModels,
-          },
-        };
-      },
-    },
-    delivery: {
-      async deliver(outcome) {
-        pi.sendMessage(
-          {
-            customType: "pi-workgraph-outcome",
-            content: JSON.stringify(outcome),
-            display: true,
-            details: { outcomeId: outcome.id },
-          },
-          { deliverAs: "followUp", triggerTurn: true },
-        );
-      },
-    },
-  };
-}
 function publicMessage(cause: unknown): string {
-  return (cause instanceof Error ? cause.message : "operation failed")
+  return (
+    cause instanceof RuntimeError
+      ? `${cause.operation}: ${cause.message}`
+      : cause instanceof Error
+        ? cause.message
+        : "operation failed"
+  )
     .replace(/\s+/g, " ")
     .slice(0, 500);
 }

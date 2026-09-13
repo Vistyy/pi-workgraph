@@ -1,10 +1,13 @@
-/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion -- Behavioral tests exercise typed records returned by native temporary SQLite storage. */
+/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion -- Behavioral tests exercise typed records returned by native temporary SQLite storage. */
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
+import { Effect, Exit, Scope } from "effect";
 import { Value } from "typebox/value";
+import { WorkstreamRuntime } from "../src/coordination/runtime.js";
 import type {
   Attempt,
   CoordinatorOwner,
@@ -183,6 +186,122 @@ void test("Task and initial Attempt insert atomically and pages preserve SQL ord
   }
 });
 
+void test("the concrete runtime settles and delivers prelaunch cancellation", async () => {
+  const root = temporary();
+  const records = initial("ws-cancel");
+  const store = WorkstreamStore.create(root, records.metadata, records.intent);
+  const created = store.createTaskWithAttempt(
+    owner,
+    0,
+    "queued",
+    task("queued"),
+    "queued-1",
+    attempt(),
+  );
+  store.checkpointAttempt(owner, created.attempt.id, {
+    ...created.attempt.attempt,
+    execution: {
+      submission: "absent",
+      cancellation: { reason: "No longer needed", requestedAt: later },
+    },
+  });
+  const delivered: unknown[] = [];
+  const pi: Pick<ExtensionAPI, "sendMessage"> = {
+    sendMessage(message) {
+      delivered.push(message);
+    },
+  };
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    const attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({ store, owner, agentDir: root, pi }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    for (
+      let count = 0;
+      count < 50 && (store.readOutcome("queued-1") === undefined || delivered.length === 0);
+      count += 1
+    )
+      await Effect.runPromise(Effect.sleep(10));
+    const outcomeRecord = store.readOutcome("queued-1");
+    assert.equal(outcomeRecord?.outcome.result.kind, "cancelled");
+    assert.notEqual(store.readAttempt("queued-1").attempt.execution?.closedAt, undefined);
+    assert.equal(delivered.length, 1);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("review objectives retain cited Outcome summaries and exact source facts", async () => {
+  const root = temporary();
+  const records = initial("ws-review-source");
+  const store = WorkstreamStore.create(root, records.metadata, records.intent);
+  const source = store.createTaskWithAttempt(owner, 0, "source", task("source"), "source-1", {
+    ...attempt(),
+    execution: {
+      sessionFile: "/sessions/source.jsonl",
+      paneId: "source-pane",
+      tabId: "source-tab",
+      terminalId: "source-terminal",
+      submission: "confirmed",
+      closedAt: later,
+    },
+  });
+  store.insertOutcome(owner, "source-outcome", source.attempt.id, {
+    ...outcome("Exact source summary"),
+    delivery: { requestedAt: later, failures: [], deliveredAt: later },
+  });
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    const attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: { sendMessage() {} },
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    if (attachment.state !== "attached") return;
+    const review = await Effect.runPromise(
+      attachment.runtime.createTask({
+        id: "review",
+        target: { kind: "directory", path: root },
+        contract: {
+          kind: "review",
+          objective: "Review source result",
+          concern: "Evidence quality",
+          subject: { kind: "outcome", outcomeId: "source-outcome" },
+        },
+        selection: { kind: "target", target },
+      }),
+    );
+    let sessionFile: string | undefined;
+    for (let count = 0; count < 50 && sessionFile === undefined; count += 1) {
+      sessionFile = store.readAttempt(review.id).attempt.execution?.sessionFile;
+      if (sessionFile === undefined) await Effect.runPromise(Effect.sleep(10));
+    }
+    assert.notEqual(sessionFile, undefined);
+    if (sessionFile === undefined) return;
+    const objectiveEntry = SessionManager.open(sessionFile)
+      .getBranch()
+      .find(
+        (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
+      );
+    assert.equal(objectiveEntry?.type, "custom_message");
+    if (objectiveEntry?.type !== "custom_message" || typeof objectiveEntry.content !== "string")
+      return;
+    assert.match(objectiveEntry.content, /Exact source summary/);
+    assert.match(objectiveEntry.content, /source-outcome/);
+    assert.match(objectiveEntry.content, /\/targets\/source/);
+    assert.match(objectiveEntry.content, /\/sessions\/source\.jsonl/);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 void test("Outcomes are independent, only delivery mutates, and Outcomes alone gate completion", () => {
   const root = temporary();
   try {
@@ -226,6 +345,12 @@ void test("Outcomes are independent, only delivery mutates, and Outcomes alone g
     const completion = metadata.completion;
     assert.ok(completion);
     assert.throws(() => store.complete(owner, completion), StoreError);
+    assert.throws(
+      () => store.createTaskWithAttempt(owner, 0, "late", task("late"), "late-1", attempt()),
+      StoreError,
+    );
+    assert.throws(() => store.appendAttempt(owner, "one", "one-late", attempt()), StoreError);
+    assert.throws(() => store.appendIntent(owner, records.intent), StoreError);
     store.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

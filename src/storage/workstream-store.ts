@@ -261,6 +261,8 @@ export class WorkstreamStore {
   appendIntent(owner: CoordinatorOwner, intent: Intent): IntentRecord {
     return this.transaction("append Intent", () => {
       this.requireOwner(owner);
+      if (this.readMetadata().lifecycle !== "active")
+        throw failure("append Intent", "Completed Workstreams reject new work.");
       decode(IntentSchema, intent, "Intent");
       const index = this.readLatestIntent().index + 1;
       this.database
@@ -281,9 +283,12 @@ export class WorkstreamStore {
   ): { task: TaskRecord; attempt: AttemptRecord } {
     return this.transaction("create Task and Attempt", () => {
       this.requireOwner(owner);
+      if (this.readMetadata().lifecycle !== "active")
+        throw failure("create Task and Attempt", "Completed Workstreams reject new work.");
       decode(TaskSchema, task, "Task");
       decode(AttemptSchema, attempt, "Attempt");
-      this.readIntent(intentIndex);
+      if (this.readLatestIntent().index !== intentIndex)
+        throw failure("create Task and Attempt", "Task must bind to the latest Intent.");
       const taskIndex = this.nextIndex("tasks", "task_index");
       const attemptIndex = this.nextIndex("attempts", "attempt_index");
       this.database
@@ -310,8 +315,12 @@ export class WorkstreamStore {
   ): AttemptRecord {
     return this.transaction("append Attempt", () => {
       this.requireOwner(owner);
+      if (this.readMetadata().lifecycle !== "active")
+        throw failure("append Attempt", "Completed Workstreams reject new work.");
       decode(AttemptSchema, attempt, "Attempt");
-      this.readTask(taskId);
+      const task = this.readTask(taskId);
+      if (task.intentIndex !== this.readLatestIntent().index)
+        throw failure("append Attempt", "Attempt Task does not belong to the latest Intent.");
       const index = this.nextIndex("attempts", "attempt_index");
       const sequence = number(
         this.database.prepare("SELECT count(*) AS value FROM attempts WHERE task_id=?").get(taskId),
@@ -423,7 +432,7 @@ export class WorkstreamStore {
     return host("read unsettled records", () => {
       const rows = this.database
         .prepare(
-          `SELECT a.attempt_id FROM attempts a LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id WHERE o.attempt_id IS NULL OR json_extract(o.outcome_json,'$.delivery.deliveredAt') IS NULL OR json_extract(a.attempt_json,'$.execution.closedAt') IS NULL ORDER BY a.attempt_index`,
+          `SELECT a.attempt_id FROM attempts a LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id WHERE o.attempt_id IS NULL OR json_extract(o.outcome_json,'$.delivery.deliveredAt') IS NULL OR json_extract(a.attempt_json,'$.execution.closedAt') IS NULL OR (json_extract(a.attempt_json,'$.base.kind')='repository' AND (json_extract(a.attempt_json,'$.output.kind') IS NULL OR json_extract(a.attempt_json,'$.output.kind') IN ('applying','discarding') OR (json_extract(a.attempt_json,'$.output.kind')='applied' AND json_extract(a.attempt_json,'$.output.cleanupTip') IS NOT NULL))) ORDER BY a.attempt_index`,
         )
         .all() as Row[];
       return rows.map((row) => {
@@ -436,6 +445,15 @@ export class WorkstreamStore {
         };
       });
     });
+  }
+
+  hasUnclassifiedIntegrationChild(parentAttemptId: string): boolean {
+    const row = this.database
+      .prepare(
+        `SELECT count(*) AS value FROM attempts WHERE json_extract(attempt_json,'$.lineage.candidateOf.kind')='integrate' AND json_extract(attempt_json,'$.lineage.candidateOf.attemptId')=? AND json_extract(attempt_json,'$.output.kind') IS NULL`,
+      )
+      .get(parentAttemptId) as Row | undefined;
+    return number(row, "value") > 0;
   }
 
   page(

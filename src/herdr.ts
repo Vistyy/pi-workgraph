@@ -55,6 +55,7 @@ const ListedAgentSchema = Type.Object({
   terminal_id: NonBlank,
   agent_status: AgentStatusSchema,
   cwd: NonBlank,
+  name: Type.Optional(NonBlank),
   agent_session: Type.Optional(AgentSessionSchema),
 });
 const AgentListResponseSchema = Type.Object({
@@ -277,6 +278,62 @@ export class HerdrCliRuntime {
               `Herdr start did not prove a ready Worker (status=${observation.status}); exact resources workspace=${observation.identity.workspaceId} tab=${observation.identity.tabId} pane=${observation.identity.paneId} terminal=${observation.identity.terminalId} were retained.`,
             );
       }),
+    );
+  }
+
+  /** Recover an exact agent after its pane was durably checkpointed. */
+  recoverWorker(
+    pane: WorkerPane,
+    sessionFile: string,
+  ): Effect.Effect<HerdrInspection | undefined, HerdrError> {
+    return Effect.gen(
+      function* (this: HerdrCliRuntime) {
+        const response = yield* this.command(["agent", "list"], AgentListResponseSchema);
+        if (response === NOT_FOUND)
+          return yield* this.failure(
+            "agent list",
+            "Herdr reported an impossible not-found result.",
+          );
+        const inPane = response.result.agents.filter((agent) => agent.pane_id === pane.paneId);
+        if (inPane.length === 0) return undefined;
+        if (inPane.length !== 1)
+          return yield* this.failure(
+            "agent list",
+            "Checkpointed Worker pane has ambiguous agents.",
+          );
+        const agent = inPane[0];
+        if (
+          agent === undefined ||
+          agent.name !== pane.agentName ||
+          agent.cwd !== pane.cwd ||
+          agent.agent_session?.value !== sessionFile
+        )
+          return yield* this.failure(
+            "agent list",
+            "Checkpointed Worker pane contains a foreign or incomplete agent identity.",
+          );
+        const observation = exactObservation(
+          { ...pane, sessionFile },
+          { ...agent, name: agent.name, agent_session: agent.agent_session },
+        );
+        return observation instanceof HerdrError ? yield* observation : observation;
+      }.bind(this),
+    );
+  }
+
+  /** Close a checkpointed owned tab before an agent terminal identity exists. */
+  closeWorkerPane(pane: WorkerPane): Effect.Effect<"absent" | "present" | "unknown", HerdrError> {
+    return Effect.gen(
+      function* (this: HerdrCliRuntime) {
+        yield* Effect.result(this.command(["tab", "close", pane.tabId], SuccessResponseSchema));
+        const after = yield* Effect.result(
+          this.command(["tab", "get", pane.tabId], SuccessResponseSchema, {
+            notFound: ["tab_not_found"],
+          }),
+        );
+        if (after._tag === "Failure") return "unknown" as const;
+        return after.success === NOT_FOUND ? ("absent" as const) : ("present" as const);
+      }.bind(this),
     );
   }
 
