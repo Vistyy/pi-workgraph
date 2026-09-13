@@ -9,12 +9,9 @@ import { Effect, Exit, Scope } from "effect";
 import { RuntimeError, SessionRuntime } from "../src/coordination/runtime.js";
 import type { AttemptSpec, Task } from "../src/domain/records.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
+import { herdrWorkerName, herdrWorkerTabLabel } from "../src/herdr-naming.js";
 import { runNodePlatformPromise } from "../src/node-platform.js";
-import {
-  createWorkerSessionEffect,
-  WORKER_KICKOFF,
-  type WorkerObjective,
-} from "../src/pi-session.js";
+import { createWorkerSessionEffect, type WorkerObjective } from "../src/pi-session.js";
 import { RecordStore } from "../src/storage/record-store.js";
 
 const target = { model: "test/model", thinking: "high" as const };
@@ -52,8 +49,8 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 const args=process.argv.slice(2); appendFileSync(${JSON.stringify(log)},JSON.stringify(args)+"\\n");
 const path=${JSON.stringify(statePath)}; const state=JSON.parse(readFileSync(path,"utf8")); const save=()=>writeFileSync(path,JSON.stringify(state)); const ok=(result)=>console.log(JSON.stringify({result}));
 if(args[0]==="tab"&&args[1]==="create"){state.present=true;state.partial=true;state.workspace=args[args.indexOf("--workspace")+1];state.cwd=args[args.indexOf("--cwd")+1];state.label=args[args.indexOf("--label")+1];save();ok({tab:{workspace_id:state.workspace,tab_id:"tab-1"},root_pane:{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",cwd:state.cwd}})}
-else if(args[0]==="agent"&&args[1]==="start"){state.partial=false;state.session=args[args.indexOf("--session")+1];save();ok({agent:{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",agent_status:"working",cwd:state.cwd,name:args[2],agent_session:{value:state.session},interactive_ready:true}})}
-else if(args[0]==="agent"&&args[1]==="list")ok({agents:state.present&&!state.partial?[{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",agent_status:"working",cwd:state.cwd,agent_session:{value:state.session}}]:[]})
+else if(args[0]==="agent"&&args[1]==="start"){state.partial=false;state.session=args[args.indexOf("--session")+1];state.name=args[2];save();ok({agent:{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",agent_status:state.status??"working",cwd:state.cwd,name:state.name,agent_session:{value:state.session},interactive_ready:true}})}
+else if(args[0]==="agent"&&args[1]==="list")ok({agents:state.present&&!state.partial?[{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",agent_status:state.status??"working",cwd:state.cwd,name:state.name,agent_session:{value:state.session}}]:[]})
 else if(args[0]==="tab"&&args[1]==="list")ok({tabs:state.present?[{workspace_id:state.workspace,tab_id:"tab-1",label:state.label}]:[]})
 else if(args[0]==="pane"&&args[1]==="list")ok({panes:state.present?[{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",cwd:state.cwd}]:[]})
 else if(args[0]==="agent"&&args[1]==="prompt")ok({})
@@ -85,6 +82,9 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   }
   assert.fail("timed out");
 }
+function workerName(taskId: string, attemptId: string): string {
+  return herdrWorkerName({ taskId, attemptId, role: "research" });
+}
 async function session(root: string, taskId: string, attemptId: string, value: Task) {
   return runNodePlatformPromise(
     createWorkerSessionEffect({
@@ -103,7 +103,7 @@ void test("staged launch persists original workspace and shutdown never closes t
   const native = fixture(root);
   const scope = await Effect.runPromise(Scope.make());
   try {
-    await Effect.runPromise(
+    const runtime = await Effect.runPromise(
       SessionRuntime.acquire({
         store,
         agentDir: root,
@@ -112,7 +112,20 @@ void test("staged launch persists original workspace and shutdown never closes t
         herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
-    await waitFor(() => store.readAttempt(attempt.id).worker?.kickoff === "confirmed");
+    await waitFor(
+      () =>
+        store.readAttempt(attempt.id).worker?.kickoff === "confirmed" ||
+        runtime.inspectionStatus().blocker !== undefined,
+    );
+    assert.equal(
+      store.readAttempt(attempt.id).worker?.kickoff,
+      "confirmed",
+      runtime.inspectionStatus().blocker,
+    );
+    const start = commands(native.log).find(
+      (entry) => entry[0] === "agent" && entry[1] === "start",
+    );
+    assert.match(start?.[2] ?? "", /^wg-research-[0-9a-f]{6}$/);
     assert.equal(store.readAttempt(attempt.id).worker?.workspaceId, "workspace-old");
     await Effect.runPromise(Scope.close(scope, Exit.void));
     assert.equal(
@@ -139,12 +152,12 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
       cwd: value.target.kind === "directory" ? value.target.path : "",
       label: "",
       session: created.sessionFile,
+      name: workerName(stage, attempt.id),
     };
     const native = fixture(root, state);
-    const requestLabel = (await import("../src/herdr-naming.js")).herdrWorkerTabLabel({
+    const requestLabel = herdrWorkerTabLabel({
       taskId: stage,
       attemptId: attempt.id,
-      objective: objective(stage, attempt.id, value).content,
       role: "research",
     });
     state.label = requestLabel;
@@ -162,12 +175,7 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
         tab: { state: "ready", tabId: "tab-1", paneId: "pane-1" },
         agent: "uncertain",
       });
-    if (stage === "kickoff") {
-      SessionManager.open(created.sessionFile).appendMessage({
-        role: "user",
-        content: WORKER_KICKOFF,
-        timestamp: Date.now(),
-      });
+    if (stage === "kickoff")
       store.checkpointWorker(attempt.id, {
         sessionFile: created.sessionFile,
         workspaceId: "workspace-owner",
@@ -175,10 +183,9 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
         agent: "ready",
         kickoff: "uncertain",
       });
-    }
     const scope = await Effect.runPromise(Scope.make());
     try {
-      await Effect.runPromise(
+      const runtime = await Effect.runPromise(
         SessionRuntime.acquire({
           store,
           agentDir: root,
@@ -187,7 +194,12 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
           herdr: native.herdr,
         }).pipe(Scope.provide(scope)),
       );
-      await waitFor(() => store.readAttempt(attempt.id).worker?.kickoff === "confirmed");
+      if (stage === "kickoff") {
+        await waitFor(() => /Kickoff is uncertain/.test(runtime.inspectionStatus().blocker ?? ""));
+        assert.equal(store.readAttempt(attempt.id).worker?.kickoff, "uncertain");
+        const cancelled = await Effect.runPromise(runtime.cancel(attempt.id, "stop"));
+        assert.equal(cancelled.outcome?.result.kind, "cancelled");
+      } else await waitFor(() => store.readAttempt(attempt.id).worker?.kickoff === "confirmed");
       const log = commands(native.log);
       assert.equal(log.filter((entry) => entry.slice(0, 2).join(" ") === "tab create").length, 0);
       assert.equal(
@@ -241,11 +253,14 @@ void test("Outcome is written before one close and reload duplicates neither clo
   const native = fixture(root, {
     present: true,
     partial: false,
+    status: "done",
     workspace: "workspace-owner",
     cwd: value.target.kind === "directory" ? value.target.path : "",
     session: created.sessionFile,
+    name: workerName("settle", attempt.id),
   });
   let notifications = 0;
+  let outcomeWasDurableAtNotification = false;
   let scope = await Effect.runPromise(Scope.make());
   try {
     await Effect.runPromise(
@@ -256,7 +271,7 @@ void test("Outcome is written before one close and reload duplicates neither clo
         pi: {
           sendMessage() {
             notifications += 1;
-            assert.notEqual(store.readAttempt(attempt.id).outcome, undefined);
+            outcomeWasDurableAtNotification = store.readAttempt(attempt.id).outcome !== undefined;
           },
         },
         herdr: native.herdr,
@@ -281,6 +296,7 @@ void test("Outcome is written before one close and reload duplicates neither clo
     );
     await Effect.runPromise(Effect.sleep(400));
     assert.equal(notifications, 1);
+    assert.equal(outcomeWasDurableAtNotification, true);
     assert.equal(
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
       1,
@@ -303,6 +319,11 @@ void test("queued cancellation makes no Herdr call and active cancellation close
   const activeValue = task(root, "active");
   const active = store.createTaskWithAttempt("active", activeValue, "attempt-active", spec).attempt;
   const created = await session(root, "active", active.id, activeValue);
+  const actualTarget = { model: "observed/model", thinking: "medium" as const };
+  SessionManager.open(created.sessionFile).appendCustomEntry(
+    "pi-workgraph-effective-model",
+    actualTarget,
+  );
   store.checkpointWorker(active.id, {
     sessionFile: created.sessionFile,
     workspaceId: "workspace-owner",
@@ -313,33 +334,48 @@ void test("queued cancellation makes no Herdr call and active cancellation close
   const native = fixture(root, {
     present: true,
     partial: false,
+    status: "blocked",
     workspace: "workspace-owner",
     cwd: activeValue.target.kind === "directory" ? activeValue.target.path : "",
     session: created.sessionFile,
+    name: workerName("active", active.id),
   });
   const scope = await Effect.runPromise(Scope.make());
+  let notifications = 0;
   try {
     const runtime = await Effect.runPromise(
       SessionRuntime.acquire({
         store,
         agentDir: root,
         workspaceId: "workspace-new",
-        pi: { sendMessage() {} },
+        pi: {
+          sendMessage() {
+            notifications += 1;
+          },
+        },
         herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
-    const before = commands(native.log).length;
+    await assert.rejects(Effect.runPromise(runtime.steer(active.id, "continue")), RuntimeError);
     assert.equal(
-      (await Effect.runPromise(runtime.cancel(queued.id, "not needed"))).outcome?.result.kind,
-      "cancelled",
+      commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "agent prompt").length,
+      0,
     );
+    const before = commands(native.log).length;
+    const queuedCancelled = await Effect.runPromise(runtime.cancel(queued.id, "not needed"));
+    assert.equal(queuedCancelled.outcome?.result.kind, "cancelled");
+    assert.deepEqual(queuedCancelled.outcome?.effectiveModels, []);
     assert.equal(commands(native.log).length, before);
-    assert.equal((await Effect.runPromise(runtime.cancel(active.id, "stop"))).worker?.closed, true);
+    const activeCancelled = await Effect.runPromise(runtime.cancel(active.id, "stop"));
+    assert.equal(activeCancelled.worker?.closed, true);
+    assert.deepEqual(activeCancelled.outcome?.effectiveModels, [actualTarget]);
     assert.equal(
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
       1,
     );
+    assert.equal(notifications, 2);
     await assert.rejects(Effect.runPromise(runtime.cancel(active.id, "again")), RuntimeError);
+    assert.equal(notifications, 2);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });
@@ -418,6 +454,7 @@ void test("a close-present blocker never repeats the close effect", async () => 
     workspace: "workspace-owner",
     cwd: value.target.kind === "directory" ? value.target.path : "",
     session: created.sessionFile,
+    name: workerName("blocked", attempt.id),
   });
   const scope = await Effect.runPromise(Scope.make());
   try {

@@ -71,14 +71,17 @@ export interface WorkerTab {
   readonly tabId: string;
   readonly paneId: string;
 }
-export interface ReadyWorker extends WorkerTab {
-  readonly state: "ready";
+export interface ExactWorker extends WorkerTab {
+  readonly state: "agent";
+  readonly status: "idle" | "working" | "blocked" | "done" | "unknown";
+}
+export interface ReadyWorker extends ExactWorker {
   readonly status: "idle" | "working";
 }
 export interface PartialWorker extends WorkerTab {
   readonly state: "partial";
 }
-export type WorkerObservation = ReadyWorker | PartialWorker | { readonly state: "absent" };
+export type WorkerObservation = ExactWorker | PartialWorker | { readonly state: "absent" };
 export type WorkerLocator =
   | { readonly state: "uncertain"; readonly workspaceId: string }
   | ({ readonly state: "ready" } & WorkerTab);
@@ -191,7 +194,7 @@ export class HerdrCliRuntime {
                   tabId: sessionAgent.tab_id,
                   paneId: sessionAgent.pane_id,
                 };
-          return yield* exactReady(request, tab, sessionAgent, "observe Worker");
+          return yield* exactWorker(request, tab, sessionAgent, "observe Worker");
         }
 
         const tabs = (yield* this.command(
@@ -245,7 +248,9 @@ export class HerdrCliRuntime {
     );
   }
 
-  prompt(worker: ReadyWorker, text: string): Effect.Effect<void, HerdrError> {
+  prompt(worker: ExactWorker, text: string): Effect.Effect<void, HerdrError> {
+    if (worker.status !== "idle" && worker.status !== "working")
+      return this.fail("agent prompt", `Worker is not ready (status=${worker.status}).`);
     const prompt = text.trim();
     if (prompt.length === 0) return this.fail("agent prompt", "Worker prompt cannot be blank.");
     return this.command(["agent", "prompt", worker.paneId, prompt], SuccessEnvelope, 15_000).pipe(
@@ -255,7 +260,7 @@ export class HerdrCliRuntime {
 
   closeObservedWorker(
     request: WorkerRequest,
-    worker: ReadyWorker | PartialWorker,
+    worker: ExactWorker | PartialWorker,
   ): Effect.Effect<"absent" | "present", HerdrError> {
     const locator: WorkerLocator = {
       state: "ready",
@@ -318,19 +323,19 @@ export class HerdrCliRuntime {
   }
 }
 
-function exactReady(
+function exactWorker(
   request: WorkerRequest,
   expected: WorkerTab,
   agent: Static<typeof Agent>,
   operation: string,
-): Effect.Effect<ReadyWorker, HerdrError> {
+): Effect.Effect<ExactWorker, HerdrError> {
   if (
     agent.workspace_id !== expected.workspaceId ||
     agent.tab_id !== expected.tabId ||
     agent.pane_id !== expected.paneId ||
     agent.cwd !== request.cwd ||
     agent.agent_session?.value !== request.sessionFile ||
-    (agent.name !== undefined && agent.name !== herdrWorkerName(request))
+    agent.name !== herdrWorkerName(request)
   )
     return Effect.fail(
       new HerdrError({
@@ -338,11 +343,22 @@ function exactReady(
         message: "Worker native identity is foreign or mismatched; no mutation was issued.",
       }),
     );
-  if (agent.agent_status !== "idle" && agent.agent_status !== "working")
-    return Effect.fail(
-      new HerdrError({ operation, message: `Worker is not ready (status=${agent.agent_status}).` }),
-    );
-  return Effect.succeed({ state: "ready", status: agent.agent_status, ...expected });
+  return Effect.succeed({ ...expected, state: "agent", status: agent.agent_status });
+}
+
+function exactReady(
+  request: WorkerRequest,
+  expected: WorkerTab,
+  agent: Static<typeof Agent>,
+  operation: string,
+): Effect.Effect<ReadyWorker, HerdrError> {
+  return exactWorker(request, expected, agent, operation).pipe(
+    Effect.filterOrFail(
+      (worker): worker is ReadyWorker => worker.status === "idle" || worker.status === "working",
+      (worker) =>
+        new HerdrError({ operation, message: `Worker is not ready (status=${worker.status}).` }),
+    ),
+  );
 }
 
 function decode<const S extends TSchema>(

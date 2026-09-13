@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/node-builtin-import, typescript/no-this-alias, anti-slop/no-conditional-empty-object-spread, effecttsgo/flat-map-conditional-to-filter-or-fail, effecttsgo/prefer-schema-over-json -- Effect owns serialization; omission and host presentation stay explicit at their narrow boundaries. */
+/* oxlint-disable effecttsgo/node-builtin-import, typescript/no-this-alias, anti-slop/no-conditional-empty-object-spread, effecttsgo/prefer-schema-over-json -- Effect owns serialization; omission and host presentation stay explicit at their narrow boundaries. */
 /* biome-ignore-all lint/complexity/noExcessiveCognitiveComplexity: lifecycle ordering is intentionally visible in cohesive flow owners. */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -7,6 +7,7 @@ import { Clock, Data, Effect, Queue, type Scope, Semaphore } from "effect";
 import type { ModelTarget } from "../domain/model-target.js";
 import type {
   AttemptLineage,
+  AttemptOutput,
   AttemptRecord,
   AttemptSelection,
   AttemptSpec,
@@ -182,7 +183,7 @@ export class SessionRuntime {
         if (attempt.outcome !== undefined || attempt.worker?.closing !== undefined)
           return yield* fail("steer Worker", "Attempt is settling or already has an Outcome.");
         const observed = yield* self.observe(attempt);
-        if (observed.state !== "ready")
+        if (observed.state !== "agent")
           return yield* fail(
             "steer Worker",
             `Exact Worker is ${observed.state}; no prompt was issued.`,
@@ -205,8 +206,12 @@ export class SessionRuntime {
         let attempt = self.store.readAttempt(attemptId);
         if (attempt.outcome !== undefined)
           return yield* fail("cancel Attempt", "Attempt already has an Outcome.");
-        if (attempt.worker === undefined)
-          return self.store.recordOutcome(attemptId, cancelled(trimmed));
+        if (attempt.worker === undefined) {
+          const saved = self.store.recordOutcome(attemptId, cancelled(trimmed, []));
+          self.blockers.delete(attemptId);
+          yield* self.notify(saved);
+          return saved;
+        }
         if (attempt.worker.closing !== undefined)
           return yield* fail(
             "cancel Attempt",
@@ -218,7 +223,14 @@ export class SessionRuntime {
             closing: { kind: "cancelled" as const, reason: trimmed },
             closed: true as const,
           };
-          return self.store.settleCancellation(attemptId, closed, cancelled(trimmed));
+          const saved = self.store.settleCancellation(
+            attemptId,
+            closed,
+            cancelled(trimmed, self.models(attempt)),
+          );
+          self.blockers.delete(attemptId);
+          yield* self.notify(saved);
+          return saved;
         }
         const closing = {
           ...attempt.worker,
@@ -236,11 +248,14 @@ export class SessionRuntime {
               "Worker remains present; close will not be repeated.",
             );
         }
-        return self.store.settleCancellation(
+        const saved = self.store.settleCancellation(
           attemptId,
           { ...closing, closed: true },
-          cancelled(trimmed),
+          cancelled(trimmed, self.models(attempt)),
         );
+        self.blockers.delete(attemptId);
+        yield* self.notify(saved);
+        return saved;
       }),
     );
   }
@@ -268,11 +283,16 @@ export class SessionRuntime {
           Effect.mapError((cause) => runtimeError("apply output", cause)),
         );
         attempt = self.store.checkpointOutput(attemptId, applied);
-        if (self.store.hasUnclassifiedIntegrationChild(attemptId)) return attempt;
+        if (self.store.hasUnclassifiedIntegrationChild(attemptId)) {
+          self.blockers.delete(attemptId);
+          return attempt;
+        }
         const cleaned = yield* cleanupAppliedOutput(self.repositoryOperation(attempt)).pipe(
           Effect.mapError((cause) => runtimeError("apply output", cause)),
         );
-        return self.store.checkpointOutput(attemptId, cleaned);
+        const saved = self.store.checkpointOutput(attemptId, cleaned);
+        self.blockers.delete(attemptId);
+        return saved;
       }),
     );
   }
@@ -295,7 +315,9 @@ export class SessionRuntime {
         const discarded = yield* discardOutput(self.repositoryOperation(attempt)).pipe(
           Effect.mapError((cause) => runtimeError("discard output", cause)),
         );
-        return self.store.checkpointOutput(attemptId, discarded);
+        const saved = self.store.checkpointOutput(attemptId, discarded);
+        self.blockers.delete(attemptId);
+        return saved;
       }),
     );
   }
@@ -466,7 +488,7 @@ export class SessionRuntime {
             attempt,
             "Worker disappeared after uncertain tab creation.",
           );
-        if (observed.state === "ready")
+        if (observed.state === "agent")
           return yield* fail(
             "recover Worker tab",
             "An agent exists although agent start was never checkpointed.",
@@ -489,7 +511,7 @@ export class SessionRuntime {
         attempt = self.store.checkpointWorker(attempt.id, worker);
       } else if (worker.agent === "uncertain") {
         const observed = yield* self.observe(attempt);
-        if (observed.state !== "ready")
+        if (observed.state !== "agent")
           return yield* self.recordUnreported(
             attempt,
             `Worker is ${observed.state} after uncertain agent start.`,
@@ -517,7 +539,7 @@ export class SessionRuntime {
           return;
         }
         const observed = yield* self.observe(attempt);
-        if (observed.state === "ready")
+        if (observed.state === "agent")
           return yield* fail(
             "recover kickoff",
             "Kickoff is uncertain and not yet persisted; it will not be replayed.",
@@ -623,23 +645,25 @@ export class SessionRuntime {
   }
 
   private reconcileCancellation(attempt: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    const self = this;
     const worker = attempt.worker;
     if (worker?.closing?.kind !== "cancelled") return Effect.void;
-    return this.observe(attempt).pipe(
-      Effect.flatMap((observed) =>
-        observed.state === "absent"
-          ? Effect.sync(() => {
-              this.store.settleCancellation(
-                attempt.id,
-                { ...worker, closed: true },
-                cancelled(
-                  worker.closing?.kind === "cancelled" ? worker.closing.reason : "Cancelled",
-                ),
-              );
-            })
-          : fail("cancel Worker", `Worker remains ${observed.state}; close will not be repeated.`),
-      ),
-    );
+    const reason = worker.closing.reason;
+    return Effect.gen(function* () {
+      const observed = yield* self.observe(attempt);
+      if (observed.state !== "absent")
+        return yield* fail(
+          "cancel Worker",
+          `Worker remains ${observed.state}; close will not be repeated.`,
+        );
+      const saved = self.store.settleCancellation(
+        attempt.id,
+        { ...worker, closed: true },
+        cancelled(reason, self.models(attempt)),
+      );
+      self.blockers.delete(attempt.id);
+      yield* self.notify(saved);
+    });
   }
 
   private finishClosure(
@@ -658,23 +682,20 @@ export class SessionRuntime {
     )
       return Effect.void;
     const operation = this.repositoryOperation(attempt);
-    const action =
-      attempt.output?.kind === "applying"
-        ? prepareApplication(operation).pipe(
-            Effect.flatMap((output) =>
-              Effect.sync(() => this.store.checkpointOutput(attempt.id, output)),
-            ),
-            Effect.flatMap((saved) => applyOutput(this.repositoryOperation(saved))),
-          )
-        : attempt.output?.kind === "discarding"
-          ? discardOutput(operation)
-          : attempt.output?.kind === "applied" &&
-              attempt.output.cleanupTip !== undefined &&
-              !this.store.hasUnclassifiedIntegrationChild(attempt.id)
-            ? cleanupAppliedOutput(operation)
-            : attempt.output === undefined
-              ? classifyOutput(operation)
-              : Effect.succeed(attempt.output);
+    let action: Effect.Effect<AttemptOutput, GitError>;
+    if (attempt.output?.kind === "applying")
+      action = prepareApplication(operation).pipe(
+        Effect.flatMap((output) =>
+          Effect.sync(() => this.store.checkpointOutput(attempt.id, output)),
+        ),
+        Effect.flatMap((saved) => applyOutput(this.repositoryOperation(saved))),
+      );
+    else if (attempt.output?.kind === "discarding") action = discardOutput(operation);
+    else if (attempt.output?.kind === "applied" && attempt.output.cleanupTip !== undefined) {
+      if (this.store.hasUnclassifiedIntegrationChild(attempt.id)) return Effect.void;
+      action = cleanupAppliedOutput(operation);
+    } else if (attempt.output === undefined) action = classifyOutput(operation);
+    else return Effect.void;
     return action.pipe(
       Effect.flatMap((output) =>
         Effect.sync(() => {
@@ -796,7 +817,6 @@ export class SessionRuntime {
     return {
       taskId: attempt.taskId,
       attemptId: attempt.id,
-      objective: context.objective.content,
       role: context.objective.details.role,
       workspaceId: worker.workspaceId,
       cwd: context.cwd,
@@ -832,9 +852,9 @@ export class SessionRuntime {
   ): Effect.Effect<ReadyWorker, RuntimeError> {
     return this.observe(attempt).pipe(
       Effect.flatMap((observed) =>
-        observed.state === "ready"
-          ? Effect.succeed(observed)
-          : fail(operation, `Exact Worker is ${observed.state}.`),
+        observed.state === "agent" && (observed.status === "idle" || observed.status === "working")
+          ? Effect.succeed({ ...observed, status: observed.status })
+          : fail(operation, `Exact Worker is not ready (${observed.state}).`),
       ),
     );
   }
@@ -874,8 +894,22 @@ export class SessionRuntime {
   private reconciliation(): Effect.Effect<never, never> {
     const tick = Effect.gen(
       function* (this: SessionRuntime) {
-        const records = yield* this.serialized("read unsettled", () => this.store.unsettled());
         const at = yield* Clock.currentTimeMillis;
+        const read = yield* Effect.result(
+          this.serialized("read unsettled", () => this.store.unsettled()),
+        );
+        if (read._tag === "Failure") {
+          const prior = this.blockers.get("runtime");
+          const failures = (prior?.failures ?? 0) + 1;
+          this.blockers.set("runtime", {
+            detail: read.failure.message,
+            failures,
+            retryAt: at + Math.min(30_000, 250 * 2 ** Math.min(failures, 7)),
+          });
+          return yield* Effect.sleep(1000);
+        }
+        this.blockers.delete("runtime");
+        const records = read.success;
         for (const record of records) {
           const prior = this.blockers.get(record.id);
           if (prior !== undefined && prior.retryAt > at) continue;
@@ -895,10 +929,10 @@ export class SessionRuntime {
           }
         }
         yield* Queue.take(this.wakeSignal).pipe(
-          Effect.timeoutOrElse({ duration: "250 millis", orElse: () => Effect.void }),
+          Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.void }),
         );
       }.bind(this),
-    ).pipe(Effect.catch(() => Effect.sleep(250)));
+    );
     return Effect.forever(tick);
   }
   private wake(): Effect.Effect<void> {
@@ -933,8 +967,8 @@ function tabOf(worker: WorkerState): WorkerTab {
 function newAttemptId(): string {
   return `attempt-${randomUUID()}`;
 }
-function cancelled(reason: string): Outcome {
-  return { result: { kind: "cancelled", reason }, effectiveModels: [] };
+function cancelled(reason: string, effectiveModels: ModelTarget[]): Outcome {
+  return { result: { kind: "cancelled", reason }, effectiveModels };
 }
 function bounded(value: string): string {
   return value.replace(/\s+/g, " ").slice(0, 300) || "Worker ended without a report.";
