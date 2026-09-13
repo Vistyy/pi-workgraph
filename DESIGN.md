@@ -38,11 +38,10 @@ The guide exposes only planning policy and may report no change, failure, or esc
 Optimize for total tokens, calls, and correct decisions across the task rather than minimizing or maximizing tool use in isolation.
 A direct answer can be better than delegation, and one well-bounded delegation can be better than repeated coordinator work.
 
-### Select one repository, derive all mechanics
+### Let Tasks own exact targets
 
-A workstream's explicit intent selects one target repository. Its root and Git common directory are inspected when the workstream is created and retained in state. Assignments inherit that identity and the current intent's authority rather than selecting them again; a scope revision cannot silently retarget the repository.
-Coordinator cwd is only the default when no target is supplied; it is not an authority or placement identity. Adoption and runtime construction use the retained project root, so a coordinator may live in another directory.
-Base revisions, isolated worktrees, shared placements, exact-revision review instructions, worker working directories, commit requirements, and recovery checks are generated from that fixed repository and persisted attempt state rather than task-prose parsing. Exact-revision reviews use owned worktrees at the requested existing SHA, without requiring a prior Workgraph result to make that revision reviewable; ordinary shared research and non-revision review keep their live-project behavior.
+A Workstream owns one repository-neutral initiative. Each immutable Task records one resolved directory or repository target, and its Attempts inherit that target. Coordinator cwd is only the default when no target is supplied; it is not authority or placement identity.
+A Workstream may therefore coordinate Tasks in several repositories without distributed transactions, rollback, dependencies, or all-or-nothing application claims. Base revisions, isolated worktrees, exact-revision review instructions, Worker cwd, and Git recovery derive from each exact Task and Attempt rather than task-prose parsing. Apply, discard, and recovery remain per exact Attempt and repository.
 
 ### Present outcomes, retain substance
 
@@ -108,8 +107,8 @@ These boundaries keep resource lifetime and persistence responsibility with the 
 
 ### Evolve one cohesive system
 
-Prefer the smallest maintainable design with cohesive ownership boundaries. Coordination flow lives under `src/coordination/`, durable SQLite ownership under `src/storage/`, and cohesive Calm, Herdr, Git, process, settings, notepad, and Pi adapters remain flat. Delegated Pi session JSONLs remain separately retained under `<gitCommonDir>/pi-workgraph/worker-sessions/<workstreamId>/`; retiring operational Workstream state must not delete or relocate them.
-Worker report input and persisted report facts are separate strict trust boundaries: the model never supplies host-owned changed-implementation Git metadata, while the host-enriched changed report requires the exact commit and computed changed-file list before it can enter an Outcome.
+Prefer the smallest maintainable design with cohesive ownership boundaries. Coordination flow lives under `src/coordination/`, durable SQLite ownership under `src/storage/`, and cohesive Calm, Herdr, Git, process, settings, notepad, and Pi adapters remain flat. Delegated Pi session JSONLs remain separately retained under `<agentDir>/workgraph/worker-sessions/<workstreamId>/`; retiring operational Workstream state must not delete or relocate them.
+Worker reports contain semantic results only. Git revision, changed-file, status, cleanliness, and commit evidence belong to the runtime and exact Attempt output boundaries rather than the Worker report.
 When a design is superseded, simplify or delete the old path and its incidental machinery rather than preserving scars.
 Do not create parallel interfaces, frameworks, or compatibility layers without a concrete current need.
 Keep rationale, interface reference, runtime behavior, and verification guidance with their respective owners instead of duplicating them.

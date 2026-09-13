@@ -29,7 +29,7 @@ import {
   type WorkstreamMetadata,
 } from "../src/domain/records.js";
 import { resolveTaskTarget } from "../src/git.js";
-import { HerdrCliRuntime, type HerdrLaunchRequest } from "../src/herdr.js";
+import { HerdrCliRuntime } from "../src/herdr.js";
 import { herdrWorkerName } from "../src/herdr-naming.js";
 import {
   configuredTarget,
@@ -40,11 +40,7 @@ import {
   resolveSelection,
 } from "../src/model-policy.js";
 import { runNodePlatformPromise } from "../src/node-platform.js";
-import {
-  createWorkerSessionEffect,
-  hasNativeAgentSettled,
-  readWorkgraphReportResult,
-} from "../src/pi-process.js";
+import { createWorkerSessionEffect, readWorkerSession } from "../src/pi-session.js";
 import { WorkstreamStore } from "../src/storage/workstream-store.js";
 
 const POINTER = "pi-workgraph-record-pointer";
@@ -840,34 +836,6 @@ function lineage(
         : { kind: "extend", attemptId: parentId },
   };
 }
-function herdrWorkerEnvironment(
-  environment: Record<string, string>,
-): HerdrLaunchRequest["environment"] {
-  const mode = environment["PI_WORKGRAPH_MODE"];
-  const policyRole = environment["PI_WORKGRAPH_POLICY_ROLE"];
-  if (mode === undefined || policyRole === undefined)
-    throw new Error("Worker launch environment is incomplete.");
-  return {
-    PI_WORKGRAPH_MODE: mode,
-    PI_WORKGRAPH_POLICY_ROLE: policyRole,
-    ...(environment["PI_WORKGRAPH_INITIAL_MODEL"] === undefined
-      ? {}
-      : { PI_WORKGRAPH_INITIAL_MODEL: environment["PI_WORKGRAPH_INITIAL_MODEL"] }),
-    ...(environment["PI_WORKGRAPH_INITIAL_THINKING"] === undefined
-      ? {}
-      : { PI_WORKGRAPH_INITIAL_THINKING: environment["PI_WORKGRAPH_INITIAL_THINKING"] }),
-    ...(environment["PI_WORKGRAPH_BASE_COMMIT"] === undefined
-      ? {}
-      : { PI_WORKGRAPH_BASE_COMMIT: environment["PI_WORKGRAPH_BASE_COMMIT"] }),
-    ...(environment["PI_WORKGRAPH_EXECUTOR_MODEL"] === undefined
-      ? {}
-      : { PI_WORKGRAPH_EXECUTOR_MODEL: environment["PI_WORKGRAPH_EXECUTOR_MODEL"] }),
-    ...(environment["PI_WORKGRAPH_EXECUTOR_THINKING"] === undefined
-      ? {}
-      : { PI_WORKGRAPH_EXECUTOR_THINKING: environment["PI_WORKGRAPH_EXECUTOR_THINKING"] }),
-  };
-}
-
 function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
   const herdr = new HerdrCliRuntime();
   const exactWorker = (
@@ -882,8 +850,13 @@ function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
       nodeId: identity.attemptId,
       attemptId: identity.attemptId,
       assignmentId: identity.taskId,
-      objective: identity.objective,
-      role: identity.role,
+      objective: identity.objective.content,
+      role:
+        identity.role === "implementation"
+          ? "implement"
+          : identity.role === "experiment"
+            ? "research"
+            : identity.role,
     }),
     sessionFile: identity.sessionFile,
     cwd: identity.cwd,
@@ -893,25 +866,20 @@ function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
     {
       workstreamId: string;
       attemptId: string;
-      objective: string;
-      environment: Record<string, string>;
+      role: Parameters<RuntimePorts["worker"]["createSession"]>[0]["role"];
+      target: Parameters<RuntimePorts["worker"]["createSession"]>[0]["target"];
+      objective: Parameters<RuntimePorts["worker"]["createSession"]>[0]["objective"];
     }
   >();
   return {
     worker: {
       async createSession(input) {
         launchFacts.set(input.attemptId, input);
-        const mode = input.environment["PI_WORKGRAPH_MODE"];
-        if (mode !== "implementation" && mode !== "review" && mode !== "research")
-          throw new Error("Invalid Worker mode.");
         const file = await runNodePlatformPromise(
           createWorkerSessionEffect({
-            runId: input.workstreamId,
-            nodeId: input.attemptId,
-            targetCwd: input.cwd,
+            cwd: input.cwd,
             sessionDir: join(agentDir, "workgraph", "worker-sessions", input.workstreamId),
             objective: input.objective,
-            mode,
           }),
         );
         launchFacts.set(file, input);
@@ -920,8 +888,8 @@ function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
       async launch(input) {
         const fact = launchFacts.get(input.sessionFile);
         if (fact === undefined) throw new Error("Missing Worker launch facts.");
-        const selected = fact.environment["PI_WORKGRAPH_INITIAL_MODEL"];
-        const thinking = fact.environment["PI_WORKGRAPH_INITIAL_THINKING"];
+        const slash = fact.target.model.indexOf("/");
+        if (slash <= 0) throw new Error("Worker target model is malformed.");
         const observation = await Effect.runPromise(
           herdr.launch({
             workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "",
@@ -929,13 +897,23 @@ function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
             nodeId: input.attemptId,
             attemptId: input.attemptId,
             assignmentId: input.taskId,
-            objective: input.objective,
-            role: input.role,
+            objective: input.objective.content,
+            role:
+              input.role === "implementation"
+                ? "implement"
+                : input.role === "experiment"
+                  ? "research"
+                  : input.role,
             cwd: input.cwd,
             sessionFile: input.sessionFile,
-            environment: herdrWorkerEnvironment(fact.environment),
-            ...(selected === undefined ? {} : { model: selected }),
-            ...(thinking === undefined ? {} : { thinking }),
+            environment: {
+              PI_WORKGRAPH_ROLE: fact.role,
+              ...(process.env["PI_CODING_AGENT_DIR"] === undefined
+                ? {}
+                : { PI_CODING_AGENT_DIR: agentDir }),
+            },
+            model: fact.target.model,
+            thinking: fact.target.thinking,
           }),
         );
         return {
@@ -947,7 +925,7 @@ function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
       async inspect(identity) {
         const value = await Effect.runPromise(herdr.inspect(exactWorker(identity)));
         if (value.status !== "done") return { state: value.status };
-        return this.readSession(identity.sessionFile, identity.workstreamId, identity.attemptId);
+        return this.readSession(identity.sessionFile, identity.cwd, identity.objective);
       },
       async prompt(identity, text) {
         await Effect.runPromise(herdr.prompt(exactWorker(identity), text));
@@ -955,23 +933,27 @@ function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
       async close(identity) {
         return Effect.runPromise(herdr.close(exactWorker(identity)));
       },
-      async readSession(sessionFile, workstreamId, attemptId) {
-        if (!hasNativeAgentSettled(sessionFile, workstreamId, attemptId))
-          return { state: "working" };
-        const report = readWorkgraphReportResult(sessionFile, {
-          runId: workstreamId,
-          nodeId: attemptId,
-        });
-        return report.report === undefined
-          ? { state: "done" }
-          : {
-              state: "done",
-              outcome: {
-                kind: "reported",
-                result: report.report,
-                effectiveModels: report.effectiveModels,
-              },
-            };
+      async readSession(sessionFile, cwd, objective) {
+        const read = readWorkerSession(sessionFile, cwd, objective);
+        if (read.unreadable) return { state: "blocked" };
+        if (!read.settled) return { state: "working" };
+        if (read.report === undefined)
+          return {
+            state: "done",
+            outcome: {
+              kind: "failed",
+              result: read.reportError ?? "Worker settled without a report.",
+              effectiveModels: read.effectiveModels,
+            },
+          };
+        return {
+          state: "done",
+          outcome: {
+            kind: "reported",
+            result: read.report,
+            effectiveModels: read.effectiveModels,
+          },
+        };
       },
     },
     delivery: {

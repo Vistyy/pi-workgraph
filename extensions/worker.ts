@@ -1,50 +1,44 @@
+/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env -- Pi owns these Promise callbacks and supplies the Worker process environment. */
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import type { WorkerReportInput } from "../src/domain/report.js";
 import { type WorkerPlanToolInput, WorkerPlanToolSchema } from "../src/worker-plan.js";
 import {
-  WorkerEnvironmentEffect,
+  configuredWorkerRole,
   type WorkerModelHost,
   WorkerRuntime,
 } from "../src/worker-runtime.js";
 import { loadWorkerDisabledTools } from "../src/workgraph-settings.js";
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
-  const environment = Effect.runSync(WorkerEnvironmentEffect);
-  if (environment === null) return;
-
-  const runtime = new WorkerRuntime(environment, (customType, data) =>
-    pi.appendEntry(customType, data),
-  );
-
+  const role = configuredWorkerRole(process.env["PI_WORKGRAPH_ROLE"]);
+  if (role === null) return;
+  const runtime = new WorkerRuntime(role, (customType, data) => pi.appendEntry(customType, data));
   const branch = (ctx: ExtensionContext): SessionEntry[] => ctx.sessionManager.getBranch();
-  const active = (ctx: ExtensionContext): SessionEntry[] =>
-    ctx.sessionManager.buildContextEntries();
   const modelHost = (ctx: ExtensionContext): WorkerModelHost => ({
-    isSelected(model, thinking) {
-      return (
-        ctx.model !== undefined &&
-        `${ctx.model.provider}/${ctx.model.id}` === model &&
-        pi.getThinkingLevel() === thinking
-      );
+    current() {
+      return ctx.model === undefined
+        ? undefined
+        : {
+            model: `${ctx.model.provider}/${ctx.model.id}`,
+            thinking: pi.getThinkingLevel(),
+          };
     },
-    // oxlint-disable-next-line effecttsgo/async-function -- Pi's native model-selection Promise is adapted at this host boundary.
     async selectModel(provider, modelId) {
       const model = ctx.modelRegistry.find(provider, modelId);
       if (model === undefined) return "missing";
       return (await pi.setModel(model)) ? "selected" : "no_credentials";
     },
     setThinking(level) {
-      // SAFETY: WorkerRuntime validates this value against ThinkingSchema before invoking the host callback.
+      // SAFETY: The objective's thinking value passed TypeBox ModelTarget decoding.
       pi.setThinkingLevel(level as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
     },
   });
-
-  function reconcileWorkerTools(): void {
+  const reconcileTools = (): void => {
     const current = pi.getActiveTools();
     const allowed = runtime.allowedTools(current);
     if (allowed.length !== current.length) pi.setActiveTools(allowed);
-  }
+  };
 
   if (runtime.hasPlanTool()) {
     pi.registerTool({
@@ -69,85 +63,91 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     description: "Return the terminal report for this bounded assignment.",
     promptSnippet: "Finish assigned work with a typed report",
     promptGuidelines: [
-      "Use workgraph_report as the final action. Choose the status that matches the actual outcome; report failures as failed rather than implying completion, and include actual evidence and explicit limitations.",
+      "Use workgraph_report as the final action. Report actual evidence and limitations; use escalated only for missing decisions or authority.",
     ],
     parameters: runtime.reportParameters(),
-    execute(_id, params: WorkerReportInput, _signal: AbortSignal, _update, ctx) {
+    execute(_id, params: WorkerReportInput, _signal, _update, ctx) {
       return Effect.runPromise(runtime.completeReport(params, branch(ctx)));
     },
   });
 
-  pi.on("tool_execution_end", (event, ctx) =>
-    Effect.runPromise(
-      runtime
-        .observeToolExecution({ toolName: event.toolName, isError: event.isError }, modelHost(ctx))
-        .pipe(
-          Effect.tap((message) =>
-            message === undefined ? Effect.void : Effect.sync(() => pi.sendMessage(message)),
-          ),
-          Effect.asVoid,
-        ),
-    ),
-  );
-
-  pi.on("model_select", (event) => {
-    runtime.recordEffectiveModel(
-      `${event.model.provider}/${event.model.id}`,
-      pi.getThinkingLevel(),
-    );
-  });
-  pi.on("thinking_level_select", (_event, ctx) => {
-    if (ctx.model)
-      runtime.recordEffectiveModel(`${ctx.model.provider}/${ctx.model.id}`, pi.getThinkingLevel());
-  });
-
-  // oxlint-disable-next-line effecttsgo/async-function -- Pi awaits session restoration before allowing the next model request.
   pi.on("session_start", async (_event, ctx) => {
-    const configuredTools = await loadWorkerDisabledTools().catch(() => {
-      ctx.ui.notify(
-        "Could not load worker tool settings; configured tools remain available.",
-        "warning",
-      );
-      return [];
-    });
-    runtime.restoreSession(branch(ctx), configuredTools);
-    const message = await Effect.runPromise(runtime.recoverCutover(modelHost(ctx)));
-    if (message !== undefined) pi.sendMessage(message);
-    reconcileWorkerTools();
+    try {
+      const disabled = await loadWorkerDisabledTools();
+      runtime.restoreSession(branch(ctx), disabled);
+      const diagnostic = await Effect.runPromise(runtime.recoverModel(branch(ctx), modelHost(ctx)));
+      if (diagnostic !== undefined) pi.sendMessage(diagnostic);
+    } catch (cause) {
+      const diagnostic =
+        cause instanceof Error ? cause.message : "Worker startup state is unreadable.";
+      runtime.failClosed(branch(ctx), diagnostic);
+      pi.sendMessage({
+        customType: "pi-workgraph-worker-diagnostic",
+        content: `[WORKGRAPH WORKER STARTUP FAILED]\n${diagnostic}\nOnly a truthful failed report is permitted.`,
+        display: false,
+      });
+    }
+    reconcileTools();
   });
-  pi.on("tool_call", (event) => {
-    if (!runtime.isToolDisabled(event.toolName)) return;
-    return {
-      block: true,
-      reason: `Tool ${event.toolName} is unavailable to this Workgraph worker.`,
-    };
+  pi.on("tool_call", (event) =>
+    runtime.isToolDisabled(event.toolName)
+      ? { block: true, reason: `Tool ${event.toolName} is unavailable to this Workgraph worker.` }
+      : undefined,
+  );
+  pi.on("tool_execution_end", async (event, ctx) => {
+    const result = await Effect.runPromise(runtime.observeToolExecution(event, modelHost(ctx)));
+    if (result !== undefined) pi.sendMessage(result);
+    reconcileTools();
   });
-  // A tool may register or activate another tool while executing. turn_end is
-  // the last extension boundary before Pi snapshots tools for the next request.
-  pi.on("turn_end", () => reconcileWorkerTools());
+  pi.on("turn_end", () => reconcileTools());
   pi.on("agent_start", (_event, ctx) => {
     runtime.recordAgentStarted(
       ctx.model === undefined ? undefined : `${ctx.model.provider}/${ctx.model.id}`,
       pi.getThinkingLevel(),
     );
   });
-  pi.on("agent_settled", () => {
-    runtime.settleAgent((message) =>
+  pi.on("agent_settled", (_event, ctx) => {
+    runtime.settleAgent(branch(ctx), (message) =>
       pi.sendMessage(message, { deliverAs: "followUp", triggerTurn: true }),
     );
   });
-
   pi.on("session_compact", (_event, ctx) => {
-    const snapshot = runtime.workerContext(active(ctx), branch(ctx), runtime.hasPlanTool()).message;
-    if (snapshot !== undefined) pi.sendMessage(snapshot);
+    const recovery = runtime.compactionRecovery(ctx.sessionManager.buildContextEntries());
+    if (recovery !== undefined) pi.sendMessage(recovery);
   });
-  pi.on("before_provider_request", (event) => runtime.rewriteProviderPayload(event.payload));
-  pi.on("before_agent_start", (event, ctx) => {
-    reconcileWorkerTools();
-    const prompt = runtime.workerContext(active(ctx), branch(ctx), false);
-    const systemPrompt = `${event.systemPrompt}\n\n${prompt.systemPolicy}`;
-    return prompt.message === undefined
-      ? { systemPrompt }
-      : { systemPrompt, message: prompt.message };
+  pi.on("context", (event) => {
+    const checklist = runtime.completionChecklist(event.messages);
+    return {
+      messages: [
+        {
+          role: "custom" as const,
+          customType: "pi-workgraph-policy",
+          content: runtime.systemPolicy(),
+          display: false,
+          timestamp: 0,
+        },
+        ...(checklist === undefined
+          ? []
+          : [
+              {
+                role: "custom" as const,
+                customType: "pi-workgraph-executor-checklist",
+                content: checklist,
+                display: false,
+                timestamp: 0,
+              },
+            ]),
+        ...event.messages.filter(
+          (message) =>
+            message.role !== "custom" ||
+            (message.customType !== "pi-workgraph-policy" &&
+              message.customType !== "pi-workgraph-executor-checklist"),
+        ),
+      ],
+    };
+  });
+  pi.on("before_agent_start", (event) => {
+    reconcileTools();
+    return { systemPrompt: event.systemPrompt };
   });
 }

@@ -82,4 +82,4 @@ Configure tools unavailable to every worker in `~/.pi/agent/settings.json`:
 }
 ```
 
-`disabledTools` changes model tool availability for workers; it does not prevent extensions, hooks, commands, skills, or context from loading.
+`disabledTools` is deduplicated and preserves unknown future tool names. `workgraph_report` and the implementation-only `workgraph_plan` are protected and cannot be configured here. Missing settings disable nothing; unreadable or malformed settings fail closed before the first request and leave only truthful failed reporting available. Role gates remain independent: research, review, and consultation cannot edit; experiments and implementations can edit; bash remains role-eligible.

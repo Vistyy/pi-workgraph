@@ -1,0 +1,353 @@
+/* oxlint-disable effecttsgo/global-date, anti-slop/no-unknown-parameters -- Pi requires an epoch timestamp and session entries are decoded at this boundary. */
+import { type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
+import { Data, Effect, FileSystem } from "effect";
+import type { PlatformError } from "effect/PlatformError";
+import { type Static, Type } from "typebox";
+import { Value } from "typebox/value";
+import { type ModelTarget, ModelTargetSchema } from "./domain/model-target.js";
+import { isWorkerReport, type WorkerReport } from "./domain/report.js";
+
+const Text = Type.String({ minLength: 1, pattern: "\\S" });
+const RoleSchema = Type.Union([
+  Type.Literal("research"),
+  Type.Literal("experiment"),
+  Type.Literal("consultation"),
+  Type.Literal("review"),
+  Type.Literal("implementation"),
+]);
+export const WorkerIdentitySchema = Type.Object({
+  workstreamId: Text,
+  taskId: Text,
+  attemptId: Text,
+});
+export const WorkerObjectiveDetailsSchema = Type.Object(
+  {
+    ...WorkerIdentitySchema.properties,
+    role: RoleSchema,
+    executor: Type.Optional(ModelTargetSchema),
+  },
+  { additionalProperties: false },
+);
+const ReportDetailsSchema = Type.Object(
+  { report: Type.Unknown() },
+  { additionalProperties: false },
+);
+const EffectiveModelSchema = Type.Object(
+  {
+    ...WorkerIdentitySchema.properties,
+    model: ModelTargetSchema.properties.model,
+    thinking: ModelTargetSchema.properties.thinking,
+  },
+  { additionalProperties: false },
+);
+
+export type WorkerRole = Static<typeof RoleSchema>;
+export type WorkerObjectiveDetails = Static<typeof WorkerObjectiveDetailsSchema>;
+export interface WorkerObjective {
+  readonly content: string;
+  readonly details: WorkerObjectiveDetails;
+}
+
+export class PiSessionError extends Data.TaggedError("PiSessionError")<{
+  readonly operation: "create" | "recover" | "append-objective" | "persist" | "resolve";
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+/** Create or recover the one exact Pi session owned by an Attempt. */
+export function createWorkerSessionEffect(request: {
+  readonly cwd: string;
+  readonly sessionDir: string;
+  readonly objective: WorkerObjective;
+}): Effect.Effect<string, PiSessionError | PlatformError, FileSystem.FileSystem> {
+  return Effect.gen(function* () {
+    if (!validObjective(request.objective))
+      return yield* new PiSessionError({
+        operation: "create",
+        message: "Worker objective is malformed.",
+      });
+    const fileSystem = yield* FileSystem.FileSystem;
+    yield* fileSystem.makeDirectory(request.sessionDir, { recursive: true });
+    const files = yield* fileSystem.readDirectory(request.sessionDir);
+    const residue = files.filter((name) =>
+      name.endsWith(`_${request.objective.details.attemptId}.jsonl`),
+    );
+    const matches = yield* nativePromise("recover", () =>
+      SessionManager.listAll(request.sessionDir),
+    );
+    const sameId = matches.filter((entry) => entry.id === request.objective.details.attemptId);
+    if (residue.length !== sameId.length)
+      return yield* new PiSessionError({
+        operation: "recover",
+        message:
+          "Worker session creation residue is unreadable or does not expose the exact Attempt id.",
+      });
+    if (sameId.length > 1)
+      return yield* new PiSessionError({
+        operation: "recover",
+        message: "Multiple Worker sessions claim the exact Attempt session id.",
+      });
+    const existing = sameId[0];
+    if (existing !== undefined) {
+      const session = yield* native("recover", () => SessionManager.open(existing.path));
+      if (!exactSession(session, request))
+        return yield* new PiSessionError({
+          operation: "recover",
+          message: "Existing Worker session does not match its exact header and objective.",
+        });
+      return existing.path;
+    }
+
+    const session = yield* native("create", () =>
+      SessionManager.create(request.cwd, request.sessionDir, {
+        id: request.objective.details.attemptId,
+      }),
+    );
+    yield* native("append-objective", () =>
+      session.appendCustomMessageEntry(
+        "pi-workgraph-objective",
+        request.objective.content,
+        true,
+        request.objective.details,
+      ),
+    );
+    // Pi otherwise defers the new file until provider activity.
+    yield* native("persist", () =>
+      session.appendMessage({
+        role: "assistant",
+        content: [{ type: "text", text: "Workgraph assignment loaded." }],
+        api: "openai-responses",
+        provider: "workgraph",
+        model: "workgraph",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "stop",
+        timestamp: Date.now(),
+      }),
+    );
+    const file = session.getSessionFile();
+    if (file === undefined)
+      return yield* new PiSessionError({
+        operation: "resolve",
+        message: "Worker session did not produce a session file.",
+      });
+    return file;
+  });
+}
+
+export type WorkerSessionRead =
+  | {
+      readonly unreadable: true;
+      readonly error: string;
+      readonly started: false;
+      readonly settled: false;
+      readonly effectiveModels: readonly [];
+    }
+  | {
+      readonly unreadable: false;
+      readonly started: boolean;
+      readonly settled: boolean;
+      readonly report?: WorkerReport;
+      readonly reportError?: string;
+      readonly effectiveModels: readonly ModelTarget[];
+    };
+
+/** Decode exact current-branch Worker evidence without transcript duplication. */
+export function readWorkerSession(
+  sessionFile: string,
+  expectedCwd: string,
+  expected: WorkerObjective,
+): WorkerSessionRead {
+  try {
+    const session = SessionManager.open(sessionFile);
+    if (!exactSession(session, { cwd: expectedCwd, objective: expected }))
+      throw new Error("Worker session header or objective does not match the exact Attempt.");
+    const branch = attemptBranch(session.getBranch(), expected);
+    const effectiveModels = orderedEffectiveModels(branch, expected.details);
+    const started = effectiveModels.length > 0;
+    const settled = branch.some(
+      (entry) =>
+        entry.type === "custom" &&
+        entry.customType === "pi-workgraph-agent-settled" &&
+        sameAttempt(entry.data, expected.details),
+    );
+    let reportDetails: unknown;
+    let reportFound = false;
+    for (const entry of [...branch].reverse()) {
+      if (
+        entry.type === "message" &&
+        entry.message.role === "toolResult" &&
+        entry.message.toolName === "workgraph_report" &&
+        entry.message.isError !== true
+      ) {
+        reportDetails = entry.message.details;
+        reportFound = true;
+        break;
+      }
+    }
+    if (!reportFound)
+      return settled
+        ? {
+            unreadable: false,
+            started,
+            settled,
+            reportError: "Settled Worker session has no successful terminal report.",
+            effectiveModels,
+          }
+        : { unreadable: false, started, settled, effectiveModels };
+    if (!Value.Check(ReportDetailsSchema, reportDetails))
+      return {
+        unreadable: false,
+        started,
+        settled,
+        reportError: "Worker terminal report details are malformed.",
+        effectiveModels,
+      };
+    const report = Value.Decode(ReportDetailsSchema, reportDetails).report;
+    return isWorkerReport(report)
+      ? { unreadable: false, started, settled, report, effectiveModels }
+      : {
+          unreadable: false,
+          started,
+          settled,
+          reportError: "Worker terminal report is malformed.",
+          effectiveModels,
+        };
+  } catch (cause) {
+    return {
+      unreadable: true,
+      error: bounded(cause instanceof Error ? cause.message : "Worker session is unreadable."),
+      started: false,
+      settled: false,
+      effectiveModels: [],
+    };
+  }
+}
+
+function validObjective(objective: WorkerObjective): boolean {
+  return (
+    objective.content.trim().length > 0 &&
+    Value.Check(WorkerObjectiveDetailsSchema, objective.details) &&
+    (objective.details.role === "implementation"
+      ? objective.details.executor !== undefined
+      : objective.details.executor === undefined)
+  );
+}
+
+function exactSession(
+  session: SessionManager,
+  request: { readonly cwd: string; readonly objective: WorkerObjective },
+): boolean {
+  const header = session.getHeader();
+  if (
+    header === null ||
+    header.id !== request.objective.details.attemptId ||
+    header.cwd !== request.cwd ||
+    header.parentSession !== undefined
+  )
+    return false;
+  try {
+    attemptBranch(session.getBranch(), request.objective);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function attemptBranch(
+  entries: readonly SessionEntry[],
+  objective: WorkerObjective,
+): SessionEntry[] {
+  const objectiveEntries = entries.filter(
+    (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
+  );
+  const match = objectiveEntries[0];
+  if (
+    objectiveEntries.length !== 1 ||
+    match?.type !== "custom_message" ||
+    match.content !== objective.content ||
+    !Value.Check(WorkerObjectiveDetailsSchema, match.details) ||
+    !sameObjectiveDetails(
+      Value.Decode(WorkerObjectiveDetailsSchema, match.details),
+      objective.details,
+    )
+  )
+    throw new Error("Exact Worker objective is absent or ambiguous.");
+  const start = entries.indexOf(match);
+  return entries.slice(start);
+}
+
+function orderedEffectiveModels(
+  entries: readonly SessionEntry[],
+  expected: WorkerObjectiveDetails,
+): ModelTarget[] {
+  const result: ModelTarget[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (
+      entry.type !== "custom" ||
+      entry.customType !== "pi-workgraph-effective-model" ||
+      !Value.Check(EffectiveModelSchema, entry.data)
+    )
+      continue;
+    const marker = Value.Decode(EffectiveModelSchema, entry.data);
+    if (!sameAttempt(marker, expected)) continue;
+    const key = `${marker.model}\0${marker.thinking}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push({ model: marker.model, thinking: marker.thinking });
+  }
+  return result;
+}
+
+function sameObjectiveDetails(
+  actual: WorkerObjectiveDetails,
+  expected: WorkerObjectiveDetails,
+): boolean {
+  return (
+    actual.workstreamId === expected.workstreamId &&
+    actual.taskId === expected.taskId &&
+    actual.attemptId === expected.attemptId &&
+    actual.role === expected.role &&
+    actual.executor?.model === expected.executor?.model &&
+    actual.executor?.thinking === expected.executor?.thinking
+  );
+}
+function sameAttempt(value: unknown, expected: WorkerObjectiveDetails): boolean {
+  if (!Value.Check(WorkerIdentitySchema, value)) return false;
+  const decoded = Value.Decode(WorkerIdentitySchema, value);
+  return (
+    decoded.workstreamId === expected.workstreamId &&
+    decoded.taskId === expected.taskId &&
+    decoded.attemptId === expected.attemptId
+  );
+}
+function bounded(message: string): string {
+  return message.replace(/\s+/g, " ").slice(0, 300);
+}
+function native<A>(
+  operation: PiSessionError["operation"],
+  run: () => A,
+): Effect.Effect<A, PiSessionError> {
+  return Effect.try({
+    try: run,
+    catch: (cause) =>
+      new PiSessionError({ operation, message: `Pi SessionManager ${operation} failed.`, cause }),
+  });
+}
+function nativePromise<A>(
+  operation: PiSessionError["operation"],
+  run: () => Promise<A>,
+): Effect.Effect<A, PiSessionError> {
+  return Effect.tryPromise({
+    try: run,
+    catch: (cause) =>
+      new PiSessionError({ operation, message: `Pi SessionManager ${operation} failed.`, cause }),
+  });
+}

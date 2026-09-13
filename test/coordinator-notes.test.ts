@@ -17,7 +17,7 @@ async function fixture() {
   await mkdir(root);
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
-    PI_WORKGRAPH_MODE: null,
+    PI_WORKGRAPH_ROLE: null,
     HERDR_ENV: null,
     HERDR_WORKSPACE_ID: null,
   });

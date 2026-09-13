@@ -63,7 +63,6 @@ const ImplementationNoChangeReportSchema = Type.Object(
     status: Type.Literal("completed"),
     outcome: Type.Literal("no_change"),
     ...ReportContentFields,
-    revision: Type.String({ pattern: "^[0-9a-f]{40,64}$" }),
     reason: Type.String({ minLength: 1 }),
   },
   { additionalProperties: false },

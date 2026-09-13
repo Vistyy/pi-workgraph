@@ -1,4 +1,4 @@
-/* oxlint-disable typescript/no-this-alias, effecttsgo/try-catch-in-effect-gen, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, anti-slop/no-known-value-widening -- Effect owns runtime serialization; store pages and reports are decoded before use, while exact optional runtime facts remain omitted. */
+/* oxlint-disable typescript/no-this-alias, effecttsgo/try-catch-in-effect-gen, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Effect owns runtime serialization; store pages and reports are decoded before use, while exact optional runtime facts remain omitted. */
 import { randomUUID } from "node:crypto";
 import { Data, DateTime, Effect, Schedule, type Scope, Semaphore } from "effect";
 import { Value } from "typebox/value";
@@ -9,6 +9,7 @@ import type {
   AttemptRecord,
   AttemptSelection,
   CoordinatorOwner,
+  Intent,
   Outcome,
   OutcomeRecord,
   Task,
@@ -33,6 +34,7 @@ import {
   resolveRevision,
   validateRetainedCandidate,
 } from "../git.js";
+import type { WorkerObjective, WorkerRole } from "../pi-session.js";
 import { StoreError, type WorkstreamStore } from "../storage/workstream-store.js";
 
 interface WorkerIdentity {
@@ -54,13 +56,12 @@ type WorkerOperation = WorkerIdentity & {
   readonly attemptId: string;
   readonly taskId: string;
   readonly cwd: string;
-  readonly objective: string;
-  readonly role: "consultation" | "implement" | "research" | "review";
+  readonly objective: WorkerObjective;
+  readonly role: WorkerRole;
+  readonly target: ModelTarget;
 };
 interface WorkerPort {
-  createSession(
-    input: Omit<WorkerOperation, keyof WorkerIdentity> & { environment: Record<string, string> },
-  ): Promise<string>;
+  createSession(input: Omit<WorkerOperation, keyof WorkerIdentity>): Promise<string>;
   launch(
     input: Omit<WorkerOperation, keyof WorkerIdentity> & Pick<WorkerIdentity, "sessionFile">,
   ): Promise<Omit<WorkerIdentity, "sessionFile">>;
@@ -69,8 +70,8 @@ interface WorkerPort {
   close(identity: WorkerOperation): Promise<"absent" | "present" | "unknown">;
   readSession(
     sessionFile: string,
-    workstreamId: string,
-    attemptId: string,
+    cwd: string,
+    objective: WorkerObjective,
   ): Promise<WorkerEvidence>;
 }
 interface DeliveryPort {
@@ -218,10 +219,7 @@ export class WorkstreamRuntime {
           .pipe(Effect.mapError((cause) => runtimeError("launch Worker", cause)));
         const context = self.workerContext(record, task);
         const sessionFile = yield* promise("create Worker session", () =>
-          self.ports.worker.createSession({
-            ...context,
-            environment: workerEnvironment(attempt, task.task),
-          }),
+          self.ports.worker.createSession(context),
         );
         attempt = { ...attempt, execution: { sessionFile, submission: "absent" } };
         record = self.store.checkpointAttempt(self.owner, attemptId, attempt);
@@ -233,7 +231,7 @@ export class WorkstreamRuntime {
         yield* promise("submit Worker assignment", () =>
           self.ports.worker.prompt(
             { ...context, sessionFile, ...launched },
-            "Continue the assigned Workgraph objective now.",
+            "Begin the assigned Workgraph task",
           ),
         );
         attempt = { ...attempt, execution: { sessionFile, ...launched, submission: "confirmed" } };
@@ -333,7 +331,7 @@ export class WorkstreamRuntime {
         const evidence =
           observed.outcome ??
           (yield* promise("read Worker session", () =>
-            self.ports.worker.readSession(identity.sessionFile, self.store.id, attemptId),
+            self.ports.worker.readSession(identity.sessionFile, identity.cwd, identity.objective),
           )).outcome;
         if (evidence === undefined)
           return yield* new RuntimeError({
@@ -663,21 +661,28 @@ export class WorkstreamRuntime {
     const target = task.task.target;
     const cwd =
       target.kind === "directory" ? target.path : this.repositoryOperation(attempt).worktreePath;
-    const kind = task.task.contract.kind;
+    const role = task.task.contract.kind;
+    const intent = this.store.readIntent(task.intentIndex);
+    const modelTarget =
+      attempt.attempt.selection.kind === "implementation"
+        ? attempt.attempt.selection.guide
+        : attempt.attempt.selection.target;
     return {
       workstreamId: this.store.id,
       attemptId: attempt.id,
       taskId: task.id,
       cwd,
-      objective: objective(task.task.contract),
-      role:
-        kind === "implementation"
-          ? ("implement" as const)
-          : kind === "review"
-            ? ("review" as const)
-            : kind === "consultation"
-              ? ("consultation" as const)
-              : ("research" as const),
+      target: modelTarget,
+      role,
+      objective: workerObjective(
+        this.store.id,
+        task.id,
+        attempt.id,
+        role,
+        intent.intent,
+        task.task.contract,
+        attempt.attempt,
+      ),
     };
   }
   private reconciliation(): Effect.Effect<never, never> {
@@ -751,12 +756,53 @@ function semanticResult(evidence: NonNullable<WorkerEvidence["outcome"]>): Outco
         : "Worker report was malformed.",
   };
 }
-function objective(contract: TaskContract): string {
-  return contract.kind === "research" ||
-    contract.kind === "experiment" ||
-    contract.kind === "consultation"
-    ? contract.question
-    : contract.objective;
+function workerObjective(
+  workstreamId: string,
+  taskId: string,
+  attemptId: string,
+  role: WorkerRole,
+  intent: Intent,
+  contract: TaskContract,
+  attempt: Attempt,
+): WorkerObjective {
+  const lines = [
+    "[WORKGRAPH WORKER OBJECTIVE]",
+    `Intent: ${intent.statement}`,
+    ...intent.constraints.map((constraint) => `Constraint: ${constraint}`),
+  ];
+  if (contract.kind === "research") {
+    lines.push(`Question: ${contract.question}`);
+    lines.push(...contract.expectedEvidence.map((item) => `Expected evidence: ${item}`));
+  } else if (contract.kind === "experiment") {
+    lines.push(`Question: ${contract.question}`);
+    lines.push(...contract.expectedEvidence.map((item) => `Expected evidence: ${item}`));
+    lines.push(...contract.permittedEffects.map((item) => `Permitted effect: ${item}`));
+    lines.push(`Stop condition: ${contract.stopCondition}`);
+  } else if (contract.kind === "consultation") {
+    lines.push(`Question: ${contract.question}`);
+    if (contract.context !== undefined) lines.push(`Context: ${contract.context}`);
+  } else if (contract.kind === "implementation") {
+    lines.push(`Objective: ${contract.objective}`);
+    lines.push(...contract.acceptance.map((item) => `Acceptance: ${item}`));
+  } else {
+    lines.push(`Objective: ${contract.objective}`, `Concern: ${contract.concern}`);
+    lines.push(`Review subject: ${JSON.stringify(contract.subject)}`);
+  }
+  if (attempt.base.kind === "repository") lines.push(`Base revision: ${attempt.base.baseCommit}`);
+  if (attempt.lineage !== undefined)
+    lines.push(`Candidate facts: ${JSON.stringify(attempt.lineage)}`);
+  return {
+    content: lines.join("\n"),
+    details: {
+      workstreamId,
+      taskId,
+      attemptId,
+      role,
+      ...(attempt.selection.kind === "implementation"
+        ? { executor: attempt.selection.executor }
+        : {}),
+    },
+  };
 }
 function selectedModels(attempt: Attempt) {
   return attempt.selection.kind === "target"
@@ -778,38 +824,6 @@ function outcomeFor(
     effectiveModels: [...effectiveModels],
     delivery: { requestedAt: observedAt, failures: [] },
     observedAt,
-  };
-}
-function workerEnvironment(attempt: Attempt, task: Task): Record<string, string> {
-  const mode =
-    task.contract.kind === "implementation"
-      ? "implementation"
-      : task.contract.kind === "review"
-        ? "review"
-        : "research";
-  const models = selectedModels(attempt);
-  const initial = models[0];
-  const executor =
-    attempt.selection.kind === "implementation" ? attempt.selection.executor : undefined;
-  return {
-    PI_WORKGRAPH_MODE: mode,
-    PI_WORKGRAPH_POLICY_ROLE:
-      task.contract.kind === "consultation" ? "consultation" : task.contract.kind,
-    ...(initial === undefined
-      ? {}
-      : {
-          PI_WORKGRAPH_INITIAL_MODEL: initial.model,
-          PI_WORKGRAPH_INITIAL_THINKING: initial.thinking,
-        }),
-    ...(attempt.base.kind === "repository"
-      ? { PI_WORKGRAPH_BASE_COMMIT: attempt.base.baseCommit }
-      : {}),
-    ...(executor === undefined
-      ? {}
-      : {
-          PI_WORKGRAPH_EXECUTOR_MODEL: executor.model,
-          PI_WORKGRAPH_EXECUTOR_THINKING: executor.thinking,
-        }),
   };
 }
 function runtimeError(operation: string, cause: unknown): RuntimeError {

@@ -127,13 +127,8 @@ export interface HerdrLaunchRequest {
   readonly model?: string;
   readonly thinking?: string;
   readonly environment: {
-    readonly PI_WORKGRAPH_MODE: string;
-    readonly PI_WORKGRAPH_POLICY_ROLE: string;
-    readonly PI_WORKGRAPH_INITIAL_MODEL?: string;
-    readonly PI_WORKGRAPH_INITIAL_THINKING?: string;
-    readonly PI_WORKGRAPH_BASE_COMMIT?: string;
-    readonly PI_WORKGRAPH_EXECUTOR_MODEL?: string;
-    readonly PI_WORKGRAPH_EXECUTOR_THINKING?: string;
+    readonly PI_WORKGRAPH_ROLE: string;
+    readonly PI_CODING_AGENT_DIR?: string;
   };
 }
 

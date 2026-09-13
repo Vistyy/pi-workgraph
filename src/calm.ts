@@ -31,8 +31,8 @@ export interface CalmMode {
 
 type Diagnostic = (message: string) => void;
 
-export function isCoordinatorScope(env: { readonly PI_WORKGRAPH_MODE?: string }): boolean {
-  return env.PI_WORKGRAPH_MODE === undefined || env.PI_WORKGRAPH_MODE === "";
+export function isCoordinatorScope(env: { readonly PI_WORKGRAPH_ROLE?: string }): boolean {
+  return env.PI_WORKGRAPH_ROLE === undefined || env.PI_WORKGRAPH_ROLE === "";
 }
 
 interface CalmSessionEntryLike {

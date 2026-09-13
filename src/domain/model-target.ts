@@ -1,6 +1,6 @@
 import { type Static, Type } from "typebox";
 
-export const ThinkingSchema = Type.Union([
+const ThinkingSchema = Type.Union([
   Type.Literal("off"),
   Type.Literal("minimal"),
   Type.Literal("low"),
