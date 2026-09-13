@@ -286,7 +286,7 @@ function assignmentObjective(input: AssignmentInput): string {
   if (task.kind === "implementation")
     lines.push(
       `Acceptance: ${task.acceptance.join("; ")}`,
-      "If a change is needed, create one clean maintained commit and report its exact commit for application. If the requirement already holds, verify it and report no_change with the inspected base revision and reason.",
+      "If a change is needed, create one clean commit containing the assigned result and report its exact revision as a retained candidate. The Coordinator decides whether that candidate is a final result or an explicitly planned intermediate. If the requirement already holds, verify it and report no_change with the inspected base revision and reason.",
     );
   if (task.kind === "review")
     lines.push(

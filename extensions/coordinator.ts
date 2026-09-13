@@ -397,8 +397,8 @@ export default function workstreamCoordinator(
     name: "workgraph_implement",
     label: "Workgraph Implement",
     description:
-      "Create one frozen maintained implementation Task and its policy-owned guide/executor Attempt after design is settled.",
-    promptSnippet: "Delegate an authorized maintained change",
+      "Create one frozen implementation assignment and its policy-owned guide/executor Attempt after that assignment's solution shape is settled.",
+    promptSnippet: "Delegate an authorized implementation assignment",
     parameters: ImplementSchema,
     execute(_id, params, signal) {
       return run(
