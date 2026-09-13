@@ -328,13 +328,33 @@ else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process
     assert.equal(attachment.state, "attached");
     if (attachment.state !== "attached") return;
 
+    session.appendMessage({
+      role: "user",
+      content: [
+        { type: "text", text: WORKER_KICKOFF },
+        { type: "text", text: "extra" },
+      ],
+      timestamp: Date.now(),
+    });
+    session.appendMessage({
+      role: "user",
+      content: [
+        { type: "text", text: WORKER_KICKOFF },
+        { type: "image", data: "AA==", mimeType: "image/png" },
+      ],
+      timestamp: Date.now(),
+    });
     await assert.rejects(
       Effect.runPromise(attachment.runtime.observe("kickoff-proof-1")),
       /does not prove the exact persisted kickoff/,
     );
     assert.equal(store.readAttempt("kickoff-proof-1").attempt.execution?.submission, "uncertain");
 
-    session.appendMessage({ role: "user", content: WORKER_KICKOFF, timestamp: Date.now() });
+    session.appendMessage({
+      role: "user",
+      content: [{ type: "text", text: WORKER_KICKOFF }],
+      timestamp: Date.now(),
+    });
     await Effect.runPromise(attachment.runtime.observe("kickoff-proof-1"));
     assert.equal(store.readAttempt("kickoff-proof-1").attempt.execution?.submission, "confirmed");
     assert.equal(

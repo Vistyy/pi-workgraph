@@ -9,6 +9,7 @@ import { runNodePlatformPromise } from "../src/node-platform.js";
 import {
   createWorkerSessionEffect,
   readWorkerSession,
+  WORKER_KICKOFF,
   type WorkerObjective,
 } from "../src/pi-session.js";
 
@@ -86,6 +87,7 @@ void test("Worker session readback derives ordered actual models, settlement, an
       model: "fixture/guide",
       thinking: "medium",
     });
+    session.appendMessage({ role: "user", content: WORKER_KICKOFF, timestamp: Date.now() });
     session.appendCustomEntry("pi-workgraph-effective-model", {
       model: "fixture/executor",
       thinking: "high",
@@ -117,6 +119,7 @@ void test("Worker session readback derives ordered actual models, settlement, an
     const read = readWorkerSession(file, cwd, objective);
     assert.equal(read.unreadable, false);
     assert.equal(read.started, true);
+    assert.equal(read.kickoffPersisted, true);
     assert.equal(read.settled, true);
     assert.deepEqual(read.effectiveModels, [
       { model: "fixture/guide", thinking: "medium" },

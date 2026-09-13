@@ -195,12 +195,17 @@ export function readWorkerSession(
   const started = effectiveModels.length > 0;
   const kickoffPersisted =
     Result.isSuccess(objective) &&
-    branch.some(
-      (entry) =>
-        entry.type === "message" &&
-        entry.message.role === "user" &&
-        entry.message.content === WORKER_KICKOFF,
-    );
+    branch.some((entry) => {
+      if (entry.type !== "message" || entry.message.role !== "user") return false;
+      const { content } = entry.message;
+      return (
+        content === WORKER_KICKOFF ||
+        (Array.isArray(content) &&
+          content.length === 1 &&
+          content[0]?.type === "text" &&
+          content[0].text === WORKER_KICKOFF)
+      );
+    });
   const settled = branch.some(
     (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-agent-settled",
   );
