@@ -2,9 +2,21 @@ import { randomUUID } from "node:crypto";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { DateTime } from "effect";
-import { Type } from "typebox";
+import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { type HumanInputReceiptData, HumanInputReceiptDataSchema } from "./domain/records.js";
+
+const HumanInputReceiptDataSchema = Type.Object(
+  {
+    id: Type.String({ minLength: 1 }),
+    sessionId: Type.String({ minLength: 1 }),
+    sessionFile: Type.String({ minLength: 1 }),
+    source: Type.Union([Type.Literal("interactive"), Type.Literal("rpc")]),
+    text: Type.String({ minLength: 1 }),
+    receivedAt: Type.String({ format: "date-time" }),
+  },
+  { additionalProperties: false },
+);
+type HumanInputReceiptData = Static<typeof HumanInputReceiptDataSchema>;
 
 const HUMAN_INPUT_ENTRY = "pi-workgraph-human-input";
 const NOTEPAD_STATE_ENTRY = "pi-workgraph-coordinator-notepad-state";

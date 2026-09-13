@@ -1,13 +1,23 @@
-/* oxlint-disable typescript/no-this-alias, anti-slop/no-unsafe-dictionary-type, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, effecttsgo/try-catch-in-effect-gen -- Effect generators retain the runtime owner; report payloads are schema-decoded at the Worker session boundary. */
+/* oxlint-disable typescript/no-this-alias, effecttsgo/try-catch-in-effect-gen, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, anti-slop/no-known-value-widening -- Effect owns runtime serialization; store pages and reports are decoded before use, while exact optional runtime facts remain omitted. */
+import { randomUUID } from "node:crypto";
 import { Data, DateTime, Effect, Schedule, type Scope, Semaphore } from "effect";
+import { Value } from "typebox/value";
+import type { ModelTarget } from "../domain/model-target.js";
 import type {
+  Attempt,
+  AttemptLineage,
   AttemptRecord,
+  AttemptSelection,
   CoordinatorOwner,
+  Outcome,
   OutcomeRecord,
+  Task,
+  TaskContract,
   TaskRecord,
   TaskTarget,
   WorkstreamMetadata,
 } from "../domain/records.js";
+import { WorkerReportSchema } from "../domain/report.js";
 import {
   applyOutput,
   classifyOutput,
@@ -17,6 +27,7 @@ import {
   ensureDetachedWorktree,
   isAncestor,
   prepareApplication,
+  type RepositoryOperation,
 } from "../git.js";
 import { StoreError, type WorkstreamStore } from "../storage/workstream-store.js";
 
@@ -30,7 +41,8 @@ interface WorkerEvidence {
   readonly state: "working" | "idle" | "done" | "blocked" | "absent" | "unknown";
   readonly outcome?: {
     readonly kind: "reported" | "failed";
-    readonly result: Record<string, unknown>;
+    readonly result: unknown;
+    readonly effectiveModels: readonly ModelTarget[];
   };
 }
 type WorkerOperation = WorkerIdentity & {
@@ -42,15 +54,9 @@ type WorkerOperation = WorkerIdentity & {
   readonly role: "consultation" | "implement" | "research" | "review";
 };
 interface WorkerPort {
-  createSession(input: {
-    workstreamId: string;
-    attemptId: string;
-    taskId: string;
-    role: WorkerOperation["role"];
-    cwd: string;
-    objective: string;
-    environment: Record<string, string>;
-  }): Promise<string>;
+  createSession(
+    input: Omit<WorkerOperation, keyof WorkerIdentity> & { environment: Record<string, string> },
+  ): Promise<string>;
   launch(
     input: Omit<WorkerOperation, keyof WorkerIdentity> & Pick<WorkerIdentity, "sessionFile">,
   ): Promise<Omit<WorkerIdentity, "sessionFile">>;
@@ -75,11 +81,7 @@ export class RuntimeError extends Data.TaggedError("RuntimeError")<{
   readonly operation: string;
   readonly message: string;
   readonly cause?: unknown;
-}> {
-  constructor(operation: string, message: string, cause?: unknown) {
-    super(cause === undefined ? { operation, message } : { operation, message, cause });
-  }
-}
+}> {}
 export type Attachment =
   | { readonly state: "detached" }
   | { readonly state: "blocked"; readonly reason: string }
@@ -88,7 +90,6 @@ export type Attachment =
 export class WorkstreamRuntime {
   private blocker: string | undefined;
   private closed = false;
-
   private constructor(
     readonly store: WorkstreamStore,
     readonly owner: CoordinatorOwner,
@@ -106,7 +107,7 @@ export class WorkstreamRuntime {
     return Effect.gen(function* () {
       let metadata: WorkstreamMetadata;
       try {
-        metadata = input.store.metadata();
+        metadata = input.store.readMetadata();
       } catch (cause) {
         return { state: "blocked" as const, reason: message(cause) };
       }
@@ -132,140 +133,101 @@ export class WorkstreamRuntime {
   }
 
   status(): { lifecycle: WorkstreamMetadata["lifecycle"]; blocker?: string } {
-    const status = { lifecycle: this.store.metadata().lifecycle };
+    const status = { lifecycle: this.store.readMetadata().lifecycle };
     return this.blocker === undefined ? status : { ...status, blocker: this.blocker };
   }
 
   createTask(input: {
     id: string;
-    kind: TaskRecord["kind"];
-    objective: string;
     target: TaskTarget;
-    contract?: Record<string, unknown>;
-  }): Effect.Effect<TaskRecord, RuntimeError> {
-    return this.serialized("create task", () => {
-      const task: TaskRecord = {
-        id: input.id,
-        workstreamId: this.store.id,
-        intentIndex: this.store.currentIntent().index,
-        kind: input.kind,
-        objective: input.objective,
+    contract: TaskContract;
+    selection: AttemptSelection;
+    lineage?: AttemptLineage;
+    baseCommit?: string;
+  }): Effect.Effect<AttemptRecord, RuntimeError> {
+    return this.serialized("create Task", () => {
+      const at = now();
+      const task: Task = {
         target: input.target,
-        contract: input.contract ?? {},
-        createdAt: now(),
+        contract: input.contract,
+        createdAt: at,
       };
-      this.store.createTask(this.owner, task);
-      return task;
+      const attemptId = `${input.id}-1`;
+      const attempt = this.newAttempt(task, input.selection, input.lineage, input.baseCommit);
+      const records = this.store.createTaskWithAttempt(
+        this.owner,
+        this.store.readLatestIntent().index,
+        input.id,
+        task,
+        attemptId,
+        attempt,
+      );
+      this.ensureRepository(records.task, records.attempt);
+      return records.attempt;
     });
   }
 
   createAttempt(input: {
     taskId: string;
-    models: AttemptRecord["models"];
-    lineage?: AttemptRecord["lineage"];
-    baseRevision?: string;
-    experiment?: boolean;
+    selection: AttemptSelection;
+    lineage?: AttemptLineage;
+    baseCommit?: string;
   }): Effect.Effect<AttemptRecord, RuntimeError> {
-    return this.serialized("create attempt", () => {
-      const task = this.store.task(input.taskId);
-      const attempts = this.store.page("attempts", 0, 100) as AttemptRecord[];
-      const sequence = attempts.filter((item) => item.taskId === task.id).length;
-      const id = `${task.id}-${sequence + 1}`;
-      const createdAt = now();
-      const immutable = {
-        id,
-        workstreamId: this.store.id,
-        taskId: task.id,
-        sequence,
-        createdAt,
-        models: input.models,
-        ...(input.lineage === undefined ? {} : { lineage: input.lineage }),
-      };
-      let attempt: AttemptRecord;
-      if (task.target.kind === "directory") {
-        if (input.lineage !== undefined || input.baseRevision !== undefined)
-          throw new RuntimeError("create attempt", "Directory Tasks cannot carry Git lineage.");
-        attempt = immutable;
-      } else {
-        const baseRevision = input.baseRevision ?? currentRevision(task.target);
-        this.validateLineage(input.lineage, baseRevision);
-        const placement = detachedPlacement({
-          agentDir: this.agentDir,
-          workstreamId: this.store.id,
-          attemptId: id,
-        });
-        attempt = {
-          ...immutable,
-          repository: {
-            checkoutRoot: task.target.checkoutRoot,
-            commonDir: task.target.commonDir,
-            baseRevision,
-            ...placement,
-            experiment: input.experiment ?? task.kind === "experiment",
-          },
-        };
-      }
-      this.store.createAttempt(this.owner, attempt);
-      if (attempt.repository !== undefined) ensureDetachedWorktree(attempt.repository);
-      return attempt;
+    return this.serialized("create Attempt", () => {
+      const task = this.store.readTask(input.taskId);
+      const attemptId = `${task.id}-${randomUUID()}`;
+      const attempt = this.newAttempt(task.task, input.selection, input.lineage, input.baseCommit);
+      const record = this.store.appendAttempt(this.owner, task.id, attemptId, attempt);
+      this.ensureRepository(task, record);
+      return record;
     });
   }
 
   launch(attemptId: string): Effect.Effect<AttemptRecord, RuntimeError> {
     const self = this;
     return this.serializedEffect(
-      "launch worker",
+      "launch Worker",
       Effect.gen(function* () {
-        let attempt = self.store.attempt(attemptId);
-        if (attempt.worker !== undefined)
-          throw new RuntimeError("launch worker", "Attempt already owns a Worker session.");
-        const task = self.store.task(attempt.taskId);
-        if (attempt.repository !== undefined) ensureDetachedWorktree(attempt.repository);
-        const cwd =
-          attempt.repository?.worktreePath ??
-          (task.target.kind === "directory" ? task.target.path : task.target.checkoutRoot);
-        const context = workerContext(attempt, task, cwd);
+        let record = self.store.readAttempt(attemptId);
+        let attempt = record.attempt;
+        if (attempt.execution !== undefined)
+          return yield* new RuntimeError({
+            operation: "launch Worker",
+            message: "Attempt already owns a Worker session.",
+          });
+        const task = self.store.readTask(record.taskId);
+        self.ensureRepository(task, record);
+        const context = self.workerContext(record, task);
         const sessionFile = yield* promise("create Worker session", () =>
           self.ports.worker.createSession({
             ...context,
-            environment: workerEnvironment(attempt, task),
+            environment: workerEnvironment(attempt, task.task),
           }),
         );
-        attempt = {
-          ...attempt,
-          worker: { sessionFile, submission: "absent" },
-        };
-        self.store.checkpointAttempt(self.owner, attempt);
+        attempt = { ...attempt, execution: { sessionFile, submission: "absent" } };
+        record = self.store.checkpointAttempt(self.owner, attemptId, attempt);
         const launched = yield* promise("launch Worker", () =>
           self.ports.worker.launch({ ...context, sessionFile }),
         );
-        const worker = { sessionFile, ...launched, submission: "absent" as const };
-        attempt = { ...attempt, worker };
-        self.store.checkpointAttempt(self.owner, attempt);
-        // Uncertain is the durable pre-effect checkpoint. A lost prompt response is never replayed.
-        attempt = { ...attempt, worker: { ...worker, submission: "uncertain" } };
-        self.store.checkpointAttempt(self.owner, attempt);
+        attempt = { ...attempt, execution: { sessionFile, ...launched, submission: "uncertain" } };
+        record = self.store.checkpointAttempt(self.owner, attemptId, attempt);
         yield* promise("submit Worker assignment", () =>
           self.ports.worker.prompt(
             { ...context, sessionFile, ...launched },
             "Continue the assigned Workgraph objective now.",
           ),
         );
-        attempt = { ...attempt, worker: { ...worker, submission: "confirmed" } };
-        self.store.checkpointAttempt(self.owner, attempt);
-        return attempt;
+        attempt = { ...attempt, execution: { sessionFile, ...launched, submission: "confirmed" } };
+        return self.store.checkpointAttempt(self.owner, attemptId, attempt);
       }),
     );
   }
 
   steer(attemptId: string, instruction: string): Effect.Effect<void, RuntimeError> {
     return this.serializedEffect(
-      "steer worker",
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          const identity = this.workerOperation(this.store.attempt(attemptId));
-          yield* promise("steer Worker", () => this.ports.worker.prompt(identity, instruction));
-        }.bind(this),
+      "steer Worker",
+      promise("steer Worker", () =>
+        this.ports.worker.prompt(this.workerOperation(attemptId), instruction),
       ),
     );
   }
@@ -273,31 +235,60 @@ export class WorkstreamRuntime {
   cancel(attemptId: string, reason: string): Effect.Effect<OutcomeRecord, RuntimeError> {
     const self = this;
     return this.serializedEffect(
-      "cancel worker",
+      "cancel Worker",
       Effect.gen(function* () {
-        let attempt = self.store.attempt(attemptId);
-        const identity = self.workerOperation(attempt);
-        const persistedWorker = attempt.worker;
-        if (persistedWorker === undefined)
-          throw new RuntimeError("cancel worker", "Attempt has no Worker checkpoint.");
-        if (self.store.outcomeForAttempt(attemptId) !== undefined)
-          throw new RuntimeError("cancel worker", "Attempt already has an Outcome.");
-        const cancellingWorker = {
-          ...persistedWorker,
-          cancellation: { reason, requestedAt: now() },
-        };
-        attempt = { ...attempt, worker: cancellingWorker };
-        self.store.checkpointAttempt(self.owner, attempt);
-        const closed = yield* promise("close Worker", () => self.ports.worker.close(identity));
+        let record = self.store.readAttempt(attemptId);
+        if (self.store.readOutcome(attemptId) !== undefined)
+          return yield* new RuntimeError({
+            operation: "cancel Worker",
+            message: "Attempt already has an Outcome.",
+          });
+        const execution = record.attempt.execution;
+        if (execution === undefined)
+          return yield* new RuntimeError({
+            operation: "cancel Worker",
+            message: "Attempt has no Worker checkpoint.",
+          });
+        const requestedAt = now();
+        record = self.store.checkpointAttempt(self.owner, attemptId, {
+          ...record.attempt,
+          execution: {
+            ...execution,
+            cancellation: { reason, requestedAt, closeAttemptedAt: requestedAt },
+          },
+        });
+        const closed = yield* promise("close Worker", () =>
+          self.ports.worker.close(self.workerOperation(attemptId)),
+        );
         if (closed !== "absent")
-          throw new RuntimeError("cancel worker", "Exact Worker absence was not established.");
-        const closedAt = now();
-        attempt = { ...attempt, worker: { ...cancellingWorker, closedAt } };
-        self.store.checkpointAttempt(self.owner, attempt);
-        const outcome = outcomeFor(attempt, "cancelled", { reason }, closedAt);
-        self.store.recordOutcome(self.owner, outcome);
-        yield* self.classify(attempt, false);
-        return outcome;
+          return yield* new RuntimeError({
+            operation: "cancel Worker",
+            message: "Exact Worker absence was not established.",
+          });
+        const observedAt = now();
+        const closingExecution = record.attempt.execution;
+        if (closingExecution === undefined)
+          return yield* new RuntimeError({
+            operation: "cancel Worker",
+            message: "Attempt lost its Worker checkpoint.",
+          });
+        record = self.store.checkpointAttempt(self.owner, attemptId, {
+          ...record.attempt,
+          execution: { ...closingExecution, closedAt: observedAt },
+        });
+        const outcome = outcomeFor(
+          { kind: "cancelled", reason },
+          selectedModels(record.attempt),
+          observedAt,
+        );
+        const saved = self.store.insertOutcome(
+          self.owner,
+          `${attemptId}-outcome`,
+          attemptId,
+          outcome,
+        );
+        yield* self.classify(record, false);
+        return saved;
       }),
     );
   }
@@ -305,79 +296,87 @@ export class WorkstreamRuntime {
   observe(attemptId: string): Effect.Effect<OutcomeRecord | undefined, RuntimeError> {
     const self = this;
     return this.serializedEffect(
-      "observe worker",
+      "observe Worker",
       Effect.gen(function* () {
-        const attempt = self.store.attempt(attemptId);
-        const existing = self.store.outcomeForAttempt(attemptId);
-        if (existing !== undefined) return yield* self.settleRecordedOutcome(attempt, existing);
-        const identity = self.workerOperation(attempt);
+        const record = self.store.readAttempt(attemptId);
+        const existing = self.store.readOutcome(attemptId);
+        if (existing !== undefined) return yield* self.settleRecordedOutcome(record, existing);
+        const identity = self.workerOperation(attemptId);
         const observed = yield* promise("inspect Worker", () =>
           self.ports.worker.inspect(identity),
         );
         if (observed.state === "working" || observed.state === "idle") return undefined;
         if (observed.state !== "done")
-          throw new RuntimeError("observe worker", `Worker observation is ${observed.state}.`);
+          return yield* new RuntimeError({
+            operation: "observe Worker",
+            message: `Worker observation is ${observed.state}.`,
+          });
         const evidence =
           observed.outcome ??
           (yield* promise("read Worker session", () =>
-            self.ports.worker.readSession(identity.sessionFile, attempt.workstreamId, attemptId),
+            self.ports.worker.readSession(identity.sessionFile, self.store.id, attemptId),
           )).outcome;
         if (evidence === undefined)
-          throw new RuntimeError(
-            "observe worker",
-            "Worker settled without semantic session evidence.",
-          );
+          return yield* new RuntimeError({
+            operation: "observe Worker",
+            message: "Worker settled without semantic session evidence.",
+          });
         const observedAt = now();
-        const outcome = outcomeFor(attempt, evidence.kind, evidence.result, observedAt);
-        self.store.recordOutcome(self.owner, outcome);
-        return yield* self.settleRecordedOutcome(attempt, outcome);
+        const result = semanticResult(evidence);
+        const saved = self.store.insertOutcome(
+          self.owner,
+          `${attemptId}-outcome`,
+          attemptId,
+          outcomeFor(result, evidence.effectiveModels, observedAt),
+        );
+        return yield* self.settleRecordedOutcome(record, saved);
       }),
     );
   }
 
   apply(attemptId: string): Effect.Effect<AttemptRecord, RuntimeError> {
     return this.serialized("apply output", () => {
-      let attempt = prepareApplication(this.store.attempt(attemptId));
-      this.store.checkpointAttempt(this.owner, attempt);
-      // One same-ref replan is permitted between declaration and mutation.
-      attempt = prepareApplication(attempt);
-      this.store.checkpointAttempt(this.owner, attempt);
-      const applied = applyOutput(attempt);
-      this.store.checkpointAttempt(this.owner, applied);
-      return applied;
+      let record = this.store.readAttempt(attemptId);
+      let operation = this.repositoryOperation(record);
+      record = this.store.checkpointAttempt(this.owner, attemptId, prepareApplication(operation));
+      operation = this.repositoryOperation(record);
+      return this.store.checkpointAttempt(this.owner, attemptId, applyOutput(operation, now()));
     });
   }
-
   discard(attemptId: string, reason: string): Effect.Effect<AttemptRecord, RuntimeError> {
     return this.serialized("discard output", () => {
-      const attempt = this.store.attempt(attemptId);
-      if (attempt.worker?.closedAt === undefined)
-        throw new RuntimeError("discard output", "Worker must be definitively closed first.");
-      const discarded = discardOutput(attempt, reason);
-      this.store.checkpointAttempt(this.owner, discarded);
-      return discarded;
+      const record = this.store.readAttempt(attemptId);
+      if (record.attempt.execution?.closedAt === undefined)
+        throw new RuntimeError({
+          operation: "discard output",
+          message: "Worker must be definitively closed first.",
+        });
+      return this.store.checkpointAttempt(
+        this.owner,
+        attemptId,
+        discardOutput(this.repositoryOperation(record), reason, now()),
+      );
     });
   }
-
   inspect(
     section: "intents" | "tasks" | "attempts" | "outcomes",
-    offset = 0,
+    after = -1,
     limit = 20,
-  ): Effect.Effect<{ records: unknown[]; nextOffset?: number }, RuntimeError> {
+  ): Effect.Effect<{ records: unknown[]; nextAfter?: number }, RuntimeError> {
     return this.serialized("inspect records", () => {
-      const records = this.store.page(section, offset, limit);
-      return records.length < limit
+      const records = this.store.page(section, after, limit);
+      const last = records.at(-1) as { index?: number } | undefined;
+      return records.length < limit || last?.index === undefined
         ? { records }
-        : { records, nextOffset: offset + records.length };
+        : { records, nextAfter: last.index };
     });
   }
-
   complete(input: {
     conclusion: string;
     evidence: string[];
     limitations?: string[];
   }): Effect.Effect<WorkstreamMetadata, RuntimeError> {
-    return this.serialized("complete workstream", () =>
+    return this.serialized("complete Workstream", () =>
       this.store.complete(this.owner, {
         ...input,
         limitations: input.limitations ?? [],
@@ -386,63 +385,150 @@ export class WorkstreamRuntime {
     );
   }
 
+  private newAttempt(
+    task: Task,
+    selection: AttemptSelection,
+    lineage?: AttemptLineage,
+    requestedBase?: string,
+  ): Attempt {
+    if (task.target.kind === "directory") {
+      if (lineage !== undefined || requestedBase !== undefined)
+        throw new RuntimeError({
+          operation: "create Attempt",
+          message: "Directory Tasks cannot carry candidate lineage.",
+        });
+      return { selection, base: { kind: "directory" } };
+    }
+    const baseCommit = requestedBase ?? currentRevision(task.target);
+    if (lineage?.candidateOf !== undefined) {
+      const parent = this.store.readAttempt(lineage.candidateOf.attemptId).attempt;
+      if (parent.output?.kind !== "retained")
+        throw new RuntimeError({
+          operation: "create Attempt",
+          message: "Candidate parent has no retained output.",
+        });
+      if (lineage.candidateOf.kind === "extend" && baseCommit !== parent.output.tip)
+        throw new RuntimeError({
+          operation: "create Attempt",
+          message: "Extend must start at the parent candidate.",
+        });
+      if (!isAncestor(task.target.commonDir, lineage.candidateRoot, parent.output.tip))
+        throw new RuntimeError({
+          operation: "create Attempt",
+          message: "Candidate lineage is not present in the Task repository.",
+        });
+    }
+    return {
+      selection,
+      base: { kind: "repository", baseCommit },
+      ...(lineage === undefined ? {} : { lineage }),
+    };
+  }
+  private ensureRepository(task: TaskRecord, attempt: AttemptRecord): void {
+    if (task.task.target.kind === "repository")
+      ensureDetachedWorktree(this.repositoryOperation(attempt));
+  }
+  private repositoryOperation(record: AttemptRecord): RepositoryOperation {
+    const task = this.store.readTask(record.taskId).task;
+    if (task.target.kind !== "repository")
+      throw new RuntimeError({
+        operation: "inspect output",
+        message: "Attempt Task has no repository target.",
+      });
+    return {
+      attemptId: record.id,
+      attempt: record.attempt,
+      target: task.target,
+      ...detachedPlacement({
+        agentDir: this.agentDir,
+        workstreamId: this.store.id,
+        attemptId: record.id,
+      }),
+      experiment: task.contract.kind === "experiment",
+    };
+  }
   private settleRecordedOutcome(
-    attempt: AttemptRecord,
+    record: AttemptRecord,
     outcome: OutcomeRecord,
   ): Effect.Effect<OutcomeRecord, RuntimeError> {
-    if (attempt.worker?.closedAt !== undefined) return Effect.succeed(outcome);
+    if (record.attempt.execution?.closedAt !== undefined) return Effect.succeed(outcome);
     const self = this;
     return Effect.gen(function* () {
-      const worker = attempt.worker;
-      if (worker === undefined)
-        return yield* new RuntimeError("observe worker", "Attempt has no Worker checkpoint.");
       const closed = yield* promise("close Worker", () =>
-        self.ports.worker.close(self.workerOperation(attempt)),
+        self.ports.worker.close(self.workerOperation(record.id)),
       );
       if (closed !== "absent")
-        return yield* new RuntimeError(
-          "observe worker",
-          "Outcome is durable, but exact Worker closure is unresolved.",
-        );
-      const checkpoint = { ...attempt, worker: { ...worker, closedAt: now() } };
-      self.store.checkpointAttempt(self.owner, checkpoint);
-      yield* self.classify(checkpoint, outcome.kind === "reported");
+        return yield* new RuntimeError({
+          operation: "observe Worker",
+          message: "Outcome is durable, but exact Worker closure is unresolved.",
+        });
+      const execution = record.attempt.execution;
+      if (execution === undefined)
+        return yield* new RuntimeError({
+          operation: "observe Worker",
+          message: "Attempt has no Worker checkpoint.",
+        });
+      const closedRecord = self.store.checkpointAttempt(self.owner, record.id, {
+        ...record.attempt,
+        execution: { ...execution, closedAt: now() },
+      });
+      yield* self.classify(closedRecord, outcome.outcome.result.kind === "reported");
       return outcome;
     });
   }
-
-  private workerOperation(attempt: AttemptRecord): WorkerOperation {
-    const identity = workerIdentity(attempt);
-    const task = this.store.task(attempt.taskId);
-    const cwd =
-      attempt.repository?.worktreePath ??
-      (task.target.kind === "directory" ? task.target.path : task.target.checkoutRoot);
-    return { ...identity, ...workerContext(attempt, task, cwd) };
-  }
-
-  private validateLineage(lineage: AttemptRecord["lineage"], baseRevision: string): void {
-    if (lineage === undefined) return;
-    const parent = this.store.attempt(lineage.parentAttemptId);
-    const repository = parent.repository;
-    if (repository?.candidateRevision !== lineage.parentCommit)
-      throw new RuntimeError(
-        "create attempt",
-        "Parent output is not retained at the stated commit.",
-      );
-    if (!isAncestor(repository.commonDir, repository.baseRevision, lineage.parentCommit))
-      throw new RuntimeError("create attempt", "Parent candidate ancestry is not accepted.");
-    if (lineage.kind === "extend" && baseRevision !== lineage.parentCommit)
-      throw new RuntimeError("create attempt", "Extend must start at the parent candidate.");
-  }
-
-  private classify(attempt: AttemptRecord, successful: boolean): Effect.Effect<void, RuntimeError> {
-    if (attempt.repository === undefined) return Effect.void;
+  private classify(record: AttemptRecord, successful: boolean): Effect.Effect<void, RuntimeError> {
+    if (record.attempt.base.kind !== "repository") return Effect.void;
     return effect("classify repository output", () => {
-      const classified = classifyOutput(attempt, successful);
-      this.store.checkpointAttempt(this.owner, classified);
+      this.store.checkpointAttempt(
+        this.owner,
+        record.id,
+        classifyOutput(this.repositoryOperation(record), successful, now()),
+      );
     });
   }
-
+  private workerOperation(attemptId: string): WorkerOperation {
+    const attempt = this.store.readAttempt(attemptId);
+    const task = this.store.readTask(attempt.taskId);
+    const execution = attempt.attempt.execution;
+    if (
+      execution?.sessionFile === undefined ||
+      execution.paneId === undefined ||
+      execution.tabId === undefined ||
+      execution.terminalId === undefined
+    )
+      throw new RuntimeError({
+        operation: "inspect Worker",
+        message: "Attempt has no exact Worker identity.",
+      });
+    return {
+      sessionFile: execution.sessionFile,
+      paneId: execution.paneId,
+      tabId: execution.tabId,
+      terminalId: execution.terminalId,
+      ...this.workerContext(attempt, task),
+    };
+  }
+  private workerContext(attempt: AttemptRecord, task: TaskRecord) {
+    const target = task.task.target;
+    const cwd =
+      target.kind === "directory" ? target.path : this.repositoryOperation(attempt).worktreePath;
+    const kind = task.task.contract.kind;
+    return {
+      workstreamId: this.store.id,
+      attemptId: attempt.id,
+      taskId: task.id,
+      cwd,
+      objective: objective(task.task.contract),
+      role:
+        kind === "implementation"
+          ? ("implement" as const)
+          : kind === "review"
+            ? ("review" as const)
+            : kind === "consultation"
+              ? ("consultation" as const)
+              : ("research" as const),
+    };
+  }
   private reconciliation(): Effect.Effect<never, never> {
     const tick = Effect.gen(
       function* (this: WorkstreamRuntime) {
@@ -450,45 +536,46 @@ export class WorkstreamRuntime {
           this.store.unsettled(),
         );
         for (const item of unsettled) {
-          if (item.attempt.worker?.submission === "uncertain") {
+          if (item.attempt.attempt.execution?.submission === "uncertain") {
             this.blocker = `Attempt ${item.attempt.id} has uncertain submission; inspect before retrying.`;
             continue;
           }
-          if (item.outcome === undefined && item.attempt.worker?.submission === "confirmed")
+          if (
+            item.outcome === undefined &&
+            item.attempt.attempt.execution?.submission === "confirmed"
+          )
             yield* this.observe(item.attempt.id).pipe(Effect.ignore);
-          if (item.outcome?.delivery.state === "pending")
+          if (item.outcome !== undefined && item.outcome.outcome.delivery.deliveredAt === undefined)
             yield* this.deliver(item.outcome).pipe(Effect.ignore);
         }
       }.bind(this),
     ).pipe(Effect.ignore);
     return Effect.repeat(tick, Schedule.spaced("1 second")) as Effect.Effect<never, never>;
   }
-
-  private deliver(outcome: OutcomeRecord): Effect.Effect<void, RuntimeError> {
+  private deliver(record: OutcomeRecord): Effect.Effect<void, RuntimeError> {
     const self = this;
     return this.serializedEffect(
       "deliver Outcome",
       Effect.gen(function* () {
-        const delivery: OutcomeRecord = {
-          ...outcome,
-          delivery: { ...outcome.delivery, attempts: outcome.delivery.attempts + 1 },
-        };
-        self.store.updateDelivery(self.owner, delivery);
+        const requested = { ...record.outcome.delivery, requestedAt: now() };
+        let current = self.store.updateDelivery(self.owner, record.attemptId, requested);
         const delivered = yield* Effect.result(
-          promise("deliver Outcome", () => self.ports.delivery.deliver(delivery)),
+          promise("deliver Outcome", () => self.ports.delivery.deliver(current)),
         );
-        const next: OutcomeRecord =
+        const delivery =
           delivered._tag === "Success"
-            ? {
-                ...delivery,
-                delivery: { ...delivery.delivery, state: "delivered", deliveredAt: now() },
-              }
-            : delivery;
-        self.store.updateDelivery(self.owner, next);
+            ? { ...current.outcome.delivery, deliveredAt: now() }
+            : {
+                ...current.outcome.delivery,
+                failures: [
+                  ...current.outcome.delivery.failures,
+                  { at: now(), detail: message(delivered.failure) },
+                ],
+              };
+        current = self.store.updateDelivery(self.owner, record.attemptId, delivery);
       }),
     );
   }
-
   private serialized<A>(operation: string, run: () => A): Effect.Effect<A, RuntimeError> {
     return this.serializedEffect(operation, effect(operation, run));
   }
@@ -496,104 +583,104 @@ export class WorkstreamRuntime {
     operation: string,
     value: Effect.Effect<A, RuntimeError>,
   ): Effect.Effect<A, RuntimeError> {
-    if (this.closed) return Effect.fail(new RuntimeError(operation, "Runtime is closed."));
+    if (this.closed)
+      return Effect.fail(new RuntimeError({ operation, message: "Runtime is closed." }));
     return this.semaphore.withPermit(value);
   }
 }
 
+function semanticResult(evidence: NonNullable<WorkerEvidence["outcome"]>): Outcome["result"] {
+  if (evidence.kind === "reported" && Value.Check(WorkerReportSchema, evidence.result))
+    return { kind: "reported", report: Value.Decode(WorkerReportSchema, evidence.result) };
+  return {
+    kind: "unreported",
+    reason:
+      evidence.kind === "failed"
+        ? "Worker reported execution failure."
+        : "Worker report was malformed.",
+  };
+}
+function objective(contract: TaskContract): string {
+  return contract.kind === "research" ||
+    contract.kind === "experiment" ||
+    contract.kind === "consultation"
+    ? contract.question
+    : contract.objective;
+}
+function selectedModels(attempt: Attempt) {
+  return attempt.selection.kind === "target"
+    ? [attempt.selection.target]
+    : [attempt.selection.guide, attempt.selection.executor];
+}
+function outcomeFor(
+  result: Outcome["result"],
+  effectiveModels: readonly ModelTarget[],
+  observedAt: string,
+): Outcome {
+  if (effectiveModels.length === 0)
+    throw new RuntimeError({
+      operation: "record Outcome",
+      message: "No exact effective Worker model was observed.",
+    });
+  return {
+    result,
+    effectiveModels: [...effectiveModels],
+    delivery: { requestedAt: observedAt, failures: [] },
+    observedAt,
+  };
+}
+function workerEnvironment(attempt: Attempt, task: Task): Record<string, string> {
+  const mode =
+    task.contract.kind === "implementation"
+      ? "implementation"
+      : task.contract.kind === "review"
+        ? "review"
+        : "research";
+  const models = selectedModels(attempt);
+  const initial = models[0];
+  const executor =
+    attempt.selection.kind === "implementation" ? attempt.selection.executor : undefined;
+  return {
+    PI_WORKGRAPH_MODE: mode,
+    PI_WORKGRAPH_POLICY_ROLE:
+      task.contract.kind === "consultation" ? "consultation" : task.contract.kind,
+    ...(initial === undefined
+      ? {}
+      : {
+          PI_WORKGRAPH_INITIAL_MODEL: initial.model,
+          PI_WORKGRAPH_INITIAL_THINKING: initial.thinking,
+        }),
+    ...(attempt.base.kind === "repository"
+      ? { PI_WORKGRAPH_BASE_COMMIT: attempt.base.baseCommit }
+      : {}),
+    ...(executor === undefined
+      ? {}
+      : {
+          PI_WORKGRAPH_EXECUTOR_MODEL: executor.model,
+          PI_WORKGRAPH_EXECUTOR_THINKING: executor.thinking,
+        }),
+  };
+}
 function effect<A>(operation: string, run: () => A): Effect.Effect<A, RuntimeError> {
   return Effect.try({
     try: run,
     catch: (cause) =>
-      cause instanceof RuntimeError ? cause : new RuntimeError(operation, message(cause), cause),
+      cause instanceof RuntimeError
+        ? cause
+        : new RuntimeError({ operation, message: message(cause), cause }),
   });
 }
 function promise<A>(operation: string, run: () => Promise<A>): Effect.Effect<A, RuntimeError> {
   return Effect.tryPromise({
     try: run,
-    catch: (cause) => new RuntimeError(operation, message(cause), cause),
+    catch: (cause) => new RuntimeError({ operation, message: message(cause), cause }),
   });
-}
-function outcomeFor(
-  attempt: AttemptRecord,
-  kind: OutcomeRecord["kind"],
-  result: Record<string, unknown>,
-  observedAt: string,
-): OutcomeRecord {
-  return {
-    id: `${attempt.id}-outcome`,
-    workstreamId: attempt.workstreamId,
-    attemptId: attempt.id,
-    kind,
-    result,
-    observedAt,
-    delivery: { state: "pending", attempts: 0 },
-  };
-}
-function workerIdentity(attempt: AttemptRecord): WorkerIdentity {
-  const worker = attempt.worker;
-  if (worker?.paneId === undefined || worker.tabId === undefined || worker.terminalId === undefined)
-    throw new RuntimeError("inspect Worker", "Attempt has no exact Worker identity.");
-  return {
-    sessionFile: worker.sessionFile,
-    paneId: worker.paneId,
-    tabId: worker.tabId,
-    terminalId: worker.terminalId,
-  };
-}
-function workerContext(attempt: AttemptRecord, task: TaskRecord, cwd: string) {
-  const role: WorkerOperation["role"] =
-    task.kind === "implementation"
-      ? "implement"
-      : task.kind === "review"
-        ? "review"
-        : task.kind === "consultation"
-          ? "consultation"
-          : "research";
-  return {
-    workstreamId: attempt.workstreamId,
-    attemptId: attempt.id,
-    taskId: task.id,
-    cwd,
-    objective: task.objective,
-    role,
-  };
-}
-function workerEnvironment(attempt: AttemptRecord, task: TaskRecord): Record<string, string> {
-  const mode =
-    task.kind === "implementation"
-      ? "implementation"
-      : task.kind === "review"
-        ? "review"
-        : "research";
-  const initial = attempt.models[0];
-  const executor = attempt.models.find((model) => model.role === "executor");
-  return {
-    PI_WORKGRAPH_MODE: mode,
-    PI_WORKGRAPH_POLICY_ROLE: task.kind === "consultation" ? "consultation" : task.kind,
-    PI_WORKGRAPH_RUN_ID: attempt.workstreamId,
-    PI_WORKGRAPH_NODE_ID: attempt.id,
-    ...(initial === undefined
-      ? {}
-      : {
-          PI_WORKGRAPH_INITIAL_MODEL: initial.model,
-          PI_WORKGRAPH_INITIAL_THINKING: initial.thinking ?? "high",
-        }),
-    ...(attempt.repository === undefined
-      ? {}
-      : { PI_WORKGRAPH_BASE_COMMIT: attempt.repository.baseRevision }),
-    ...(executor === undefined
-      ? {}
-      : {
-          PI_WORKGRAPH_EXECUTOR_MODEL: executor.model,
-          PI_WORKGRAPH_EXECUTOR_THINKING: executor.thinking ?? "high",
-        }),
-  };
 }
 function sameOwner(left: CoordinatorOwner, right: CoordinatorOwner): boolean {
   return (
     left.sessionId === right.sessionId &&
     left.sessionFile === right.sessionFile &&
+    left.workspaceId === right.workspaceId &&
     left.tabId === right.tabId
   );
 }

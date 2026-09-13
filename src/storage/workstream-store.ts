@@ -1,36 +1,79 @@
-/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-unsafe-dictionary-type, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, typescript/no-unsafe-return -- node:sqlite exposes unknown host rows; every behavior-authorizing payload is strictly decoded below. */
-import { chmodSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, typescript/no-unsafe-return -- node:sqlite rows and TypeBox outputs are decoded at this private host boundary; absent optional persisted facts remain omitted. */
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { Data } from "effect";
 import type { Static, TSchema } from "typebox";
 import { Value } from "typebox/value";
 import {
+  type Attempt,
   type AttemptRecord,
-  AttemptRecordSchema,
+  AttemptSchema,
+  type Completion,
   type CoordinatorOwner,
   CoordinatorOwnerSchema,
+  type Intent,
   type IntentRecord,
-  IntentRecordSchema,
+  IntentSchema,
+  type Outcome,
+  type OutcomeDelivery,
+  OutcomeDeliverySchema,
   type OutcomeRecord,
-  OutcomeRecordSchema,
+  OutcomeSchema,
+  type Task,
   type TaskRecord,
-  TaskRecordSchema,
+  TaskSchema,
+  WORKSTREAM_FORMAT,
+  WORKSTREAM_SCHEMA_VERSION,
   type WorkstreamMetadata,
   WorkstreamMetadataSchema,
 } from "../domain/records.js";
 
+const MAX_PAGE = 100;
+const safeId = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const SCHEMA = `
 PRAGMA foreign_keys=ON;
-CREATE TABLE metadata (id TEXT PRIMARY KEY, payload TEXT NOT NULL) STRICT;
-CREATE TABLE intents (workstream_id TEXT NOT NULL REFERENCES metadata(id), intent_index INTEGER NOT NULL CHECK(intent_index>=0), payload TEXT NOT NULL, PRIMARY KEY(workstream_id,intent_index)) STRICT;
-CREATE TABLE tasks (id TEXT PRIMARY KEY, workstream_id TEXT NOT NULL REFERENCES metadata(id), intent_index INTEGER NOT NULL, payload TEXT NOT NULL, FOREIGN KEY(workstream_id,intent_index) REFERENCES intents(workstream_id,intent_index)) STRICT;
-CREATE TABLE attempts (id TEXT PRIMARY KEY, workstream_id TEXT NOT NULL REFERENCES metadata(id), task_id TEXT NOT NULL REFERENCES tasks(id), sequence INTEGER NOT NULL CHECK(sequence>=0), payload TEXT NOT NULL, UNIQUE(task_id,sequence)) STRICT;
-CREATE TABLE outcomes (id TEXT PRIMARY KEY, workstream_id TEXT NOT NULL REFERENCES metadata(id), attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id), payload TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS metadata (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  format TEXT NOT NULL,
+  schema_version INTEGER NOT NULL,
+  workstream_id TEXT NOT NULL UNIQUE,
+  owner_session_id TEXT NOT NULL,
+  owner_session_file TEXT NOT NULL,
+  owner_workspace_id TEXT NOT NULL,
+  owner_tab_id TEXT NOT NULL,
+  lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active','completed')),
+  completion_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS intents (
+  intent_index INTEGER PRIMARY KEY CHECK(intent_index>=0),
+  intent_json TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS tasks (
+  task_index INTEGER NOT NULL UNIQUE CHECK(task_index>=0),
+  task_id TEXT PRIMARY KEY,
+  intent_index INTEGER NOT NULL REFERENCES intents(intent_index),
+  task_json TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS attempts (
+  attempt_index INTEGER NOT NULL UNIQUE CHECK(attempt_index>=0),
+  attempt_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(task_id),
+  sequence INTEGER NOT NULL CHECK(sequence>=0),
+  attempt_json TEXT NOT NULL,
+  UNIQUE(task_id,sequence)
+) STRICT;
+CREATE TABLE IF NOT EXISTS outcomes (
+  outcome_index INTEGER NOT NULL UNIQUE CHECK(outcome_index>=0),
+  outcome_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id),
+  outcome_json TEXT NOT NULL
+) STRICT;
 `;
-const safeId = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-type Row = Record<string, unknown>;
+type Row = Record<string, SQLOutputValue>;
 
 export class StoreError extends Data.TaggedError("StoreError")<{
   readonly operation: string;
@@ -40,47 +83,79 @@ export class StoreError extends Data.TaggedError("StoreError")<{
 
 export class WorkstreamStore {
   readonly path: string;
+
   private constructor(
     readonly id: string,
     private readonly database: DatabaseSync,
     path: string,
+    private readonly readOnly: boolean,
   ) {
     this.path = path;
   }
 
   static pathFor(agentDir: string, id: string): string {
-    if (!safeId.test(id))
-      throw failure("resolve path", "Workstream id is not a safe path segment.");
+    if (!safeId.test(id)) throw failure("locate", "Workstream id is not a safe path segment.");
     return join(agentDir, "workgraph", "workstreams", id, "workstream.sqlite");
   }
 
-  static create(
-    agentDir: string,
-    metadata: WorkstreamMetadata,
-    intent: IntentRecord,
-  ): WorkstreamStore {
+  static create(agentDir: string, metadata: WorkstreamMetadata, intent: Intent): WorkstreamStore {
     return host("create workstream", () => {
-      if (metadata.id !== intent.workstreamId || intent.index !== 0)
-        throw failure("create workstream", "Initial records disagree.");
       decode(WorkstreamMetadataSchema, metadata, "metadata");
-      decode(IntentRecordSchema, intent, "intent");
+      decode(IntentSchema, intent, "Intent");
+      if (metadata.lifecycle !== "active" || metadata.completion !== undefined)
+        throw failure("create workstream", "A new Workstream must be active and incomplete.");
       const path = WorkstreamStore.pathFor(agentDir, metadata.id);
-      const directory = join(agentDir, "workgraph", "workstreams", metadata.id);
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
-      chmodSync(join(agentDir, "workgraph"), 0o700);
-      chmodSync(join(agentDir, "workgraph", "workstreams"), 0o700);
-      chmodSync(directory, 0o700);
+      privateParents(path);
       const database = new DatabaseSync(path);
+      const store = new WorkstreamStore(metadata.id, database, path, false);
       try {
         database.exec(SCHEMA);
-        database
-          .prepare("INSERT INTO metadata(id,payload) VALUES(?,?)")
-          .run(metadata.id, json(metadata));
-        database
-          .prepare("INSERT INTO intents(workstream_id,intent_index,payload) VALUES(?,?,?)")
-          .run(metadata.id, 0, json(intent));
         chmodSync(path, 0o600);
-        return new WorkstreamStore(metadata.id, database, path);
+        store.transaction("create workstream", () => {
+          const existing = database
+            .prepare("SELECT workstream_id FROM metadata WHERE singleton=1")
+            .get() as Row | undefined;
+          if (existing !== undefined) {
+            store.readMetadata();
+            store.requireOwner(metadata.owner);
+            return;
+          }
+          const residue = number(
+            database
+              .prepare(
+                "SELECT (SELECT count(*) FROM intents)+(SELECT count(*) FROM tasks)+(SELECT count(*) FROM attempts)+(SELECT count(*) FROM outcomes) AS value",
+              )
+              .get(),
+            "value",
+          );
+          if (residue !== 0)
+            throw failure(
+              "create workstream",
+              "Creation residue contains records without metadata.",
+            );
+          database
+            .prepare(
+              `INSERT INTO metadata(singleton,format,schema_version,workstream_id,owner_session_id,owner_session_file,owner_workspace_id,owner_tab_id,lifecycle,completion_json,created_at,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?)`,
+            )
+            .run(
+              metadata.format,
+              metadata.schemaVersion,
+              metadata.id,
+              metadata.owner.sessionId,
+              metadata.owner.sessionFile,
+              metadata.owner.workspaceId,
+              metadata.owner.tabId,
+              metadata.lifecycle,
+              null,
+              metadata.createdAt,
+              metadata.updatedAt,
+            );
+          database
+            .prepare("INSERT INTO intents(intent_index,intent_json) VALUES(0,?)")
+            .run(json(intent));
+        });
+        store.readLatestIntent();
+        return store;
       } catch (cause) {
         database.close();
         throw cause;
@@ -88,15 +163,36 @@ export class WorkstreamStore {
     });
   }
 
-  static open(agentDir: string, id: string): WorkstreamStore {
-    return host("open workstream", () => {
-      const path = WorkstreamStore.pathFor(agentDir, id);
-      const database = new DatabaseSync(path);
-      database.exec("PRAGMA foreign_keys=ON");
-      const store = new WorkstreamStore(id, database, path);
-      if (store.metadata().id !== id)
-        throw failure("open workstream", "Foreign metadata identity.");
+  static openOwned(agentDir: string, id: string, owner: CoordinatorOwner): WorkstreamStore {
+    const store = WorkstreamStore.openExact(agentDir, id, false);
+    try {
+      store.requireOwner(owner);
       return store;
+    } catch (cause) {
+      store.close();
+      throw cause;
+    }
+  }
+
+  static openReadOnly(agentDir: string, id: string): WorkstreamStore {
+    return WorkstreamStore.openExact(agentDir, id, true);
+  }
+
+  private static openExact(agentDir: string, id: string, readOnly: boolean): WorkstreamStore {
+    return host(readOnly ? "open read-only workstream" : "open owned workstream", () => {
+      const path = WorkstreamStore.pathFor(agentDir, id);
+      if (!existsSync(path)) throw failure("open workstream", "Workstream store is absent.");
+      const database = new DatabaseSync(path, { readOnly });
+      const store = new WorkstreamStore(id, database, path, readOnly);
+      try {
+        database.exec("PRAGMA foreign_keys=ON");
+        store.readMetadata();
+        store.readLatestIntent();
+        return store;
+      } catch (cause) {
+        database.close();
+        throw cause;
+      }
     });
   }
 
@@ -104,140 +200,222 @@ export class WorkstreamStore {
     host("close workstream", () => this.database.close());
   }
 
-  metadata(): WorkstreamMetadata {
-    const row = this.one("SELECT payload FROM metadata WHERE id=?", this.id);
-    return payload(WorkstreamMetadataSchema, row, "metadata");
-  }
-
-  currentIntent(): IntentRecord {
-    const row = this.one(
-      "SELECT payload FROM intents WHERE workstream_id=? ORDER BY intent_index DESC LIMIT 1",
-      this.id,
-    );
-    return payload(IntentRecordSchema, row, "intent");
-  }
-
-  appendIntent(owner: CoordinatorOwner, intent: IntentRecord): void {
-    this.transaction("append intent", () => {
-      this.requireOwner(owner);
-      const current = this.currentIntent();
-      if (intent.workstreamId !== this.id || intent.index !== current.index + 1)
-        throw failure("append intent", "Intent order is not contiguous.");
-      decode(IntentRecordSchema, intent, "intent");
-      this.database
-        .prepare("INSERT INTO intents(workstream_id,intent_index,payload) VALUES(?,?,?)")
-        .run(this.id, intent.index, json(intent));
-      this.touch(intent.recordedAt);
-    });
-  }
-
-  createTask(owner: CoordinatorOwner, task: TaskRecord): void {
-    this.transaction("create task", () => {
-      this.requireOwner(owner);
-      if (task.workstreamId !== this.id || task.intentIndex !== this.currentIntent().index)
-        throw failure("create task", "Task must belong to the current Intent.");
-      decode(TaskRecordSchema, task, "task");
-      this.database
-        .prepare("INSERT INTO tasks(id,workstream_id,intent_index,payload) VALUES(?,?,?,?)")
-        .run(task.id, this.id, task.intentIndex, json(task));
-      this.touch(task.createdAt);
-    });
-  }
-
-  task(id: string): TaskRecord {
-    return payload(
-      TaskRecordSchema,
-      this.one("SELECT payload FROM tasks WHERE id=? AND workstream_id=?", id, this.id),
-      "task",
-    );
-  }
-
-  createAttempt(owner: CoordinatorOwner, attempt: AttemptRecord): void {
-    this.transaction("create attempt", () => {
-      this.requireOwner(owner);
-      const task = this.task(attempt.taskId);
-      if (attempt.workstreamId !== this.id)
-        throw failure("create attempt", "Attempt has a foreign Workstream.");
-      const next = numberValue(
-        this.database
-          .prepare("SELECT count(*) AS value FROM attempts WHERE task_id=?")
-          .get(task.id),
-        "value",
+  readMetadata(): WorkstreamMetadata {
+    return host("read metadata", () => {
+      const row = this.one("SELECT * FROM metadata WHERE singleton=1");
+      const metadata = decode(
+        WorkstreamMetadataSchema,
+        {
+          format: text(row, "format"),
+          schemaVersion: number(row, "schema_version"),
+          id: text(row, "workstream_id"),
+          owner: {
+            sessionId: text(row, "owner_session_id"),
+            sessionFile: text(row, "owner_session_file"),
+            workspaceId: text(row, "owner_workspace_id"),
+            tabId: text(row, "owner_tab_id"),
+          },
+          lifecycle: text(row, "lifecycle"),
+          ...(row["completion_json"] === null
+            ? {}
+            : {
+                completion: parse(
+                  WorkstreamMetadataSchema.properties.completion,
+                  row["completion_json"],
+                  "completion",
+                ),
+              }),
+          createdAt: text(row, "created_at"),
+          updatedAt: text(row, "updated_at"),
+        },
+        "metadata",
       );
-      if (attempt.sequence !== next)
-        throw failure("create attempt", "Attempt sequence is not contiguous.");
-      if (attempt.lineage !== undefined) this.requireLineage(task, attempt);
-      decode(AttemptRecordSchema, attempt, "attempt");
+      if (metadata.id !== this.id) throw failure("read metadata", "Foreign Workstream identity.");
+      if (metadata.format !== WORKSTREAM_FORMAT)
+        throw failure("read metadata", "Unsupported Workstream format.");
+      if (metadata.schemaVersion !== WORKSTREAM_SCHEMA_VERSION)
+        throw failure("read metadata", "Unsupported Workstream schema version.");
+      if ((metadata.lifecycle === "completed") !== (metadata.completion !== undefined))
+        throw failure("read metadata", "Lifecycle and completion disagree.");
+      return metadata;
+    });
+  }
+
+  title(): string {
+    return this.readLatestIntent().intent.statement;
+  }
+
+  readLatestIntent(): IntentRecord {
+    const row = this.one(
+      "SELECT intent_index,intent_json FROM intents ORDER BY intent_index DESC LIMIT 1",
+    );
+    return intentRecord(row);
+  }
+
+  readIntent(index: number): IntentRecord {
+    return intentRecord(
+      this.one("SELECT intent_index,intent_json FROM intents WHERE intent_index=?", index),
+    );
+  }
+
+  appendIntent(owner: CoordinatorOwner, intent: Intent): IntentRecord {
+    return this.transaction("append Intent", () => {
+      this.requireOwner(owner);
+      decode(IntentSchema, intent, "Intent");
+      const index = this.readLatestIntent().index + 1;
+      this.database
+        .prepare("INSERT INTO intents(intent_index,intent_json) VALUES(?,?)")
+        .run(index, json(intent));
+      this.touch(intent.recordedAt);
+      return { index, intent };
+    });
+  }
+
+  createTaskWithAttempt(
+    owner: CoordinatorOwner,
+    intentIndex: number,
+    taskId: string,
+    task: Task,
+    attemptId: string,
+    attempt: Attempt,
+  ): { task: TaskRecord; attempt: AttemptRecord } {
+    return this.transaction("create Task and Attempt", () => {
+      this.requireOwner(owner);
+      decode(TaskSchema, task, "Task");
+      decode(AttemptSchema, attempt, "Attempt");
+      this.readIntent(intentIndex);
+      const taskIndex = this.nextIndex("tasks", "task_index");
+      const attemptIndex = this.nextIndex("attempts", "attempt_index");
+      this.database
+        .prepare("INSERT INTO tasks(task_index,task_id,intent_index,task_json) VALUES(?,?,?,?)")
+        .run(taskIndex, taskId, intentIndex, json(task));
       this.database
         .prepare(
-          "INSERT INTO attempts(id,workstream_id,task_id,sequence,payload) VALUES(?,?,?,?,?)",
+          "INSERT INTO attempts(attempt_index,attempt_id,task_id,sequence,attempt_json) VALUES(?,?,?,?,?)",
         )
-        .run(attempt.id, this.id, task.id, attempt.sequence, json(attempt));
-      this.touch(attempt.createdAt);
+        .run(attemptIndex, attemptId, taskId, 0, json(attempt));
+      this.touch(task.createdAt);
+      return {
+        task: { index: taskIndex, id: taskId, intentIndex, task },
+        attempt: { index: attemptIndex, id: attemptId, taskId, sequence: 0, attempt },
+      };
     });
   }
 
-  attempt(id: string): AttemptRecord {
-    return payload(
-      AttemptRecordSchema,
-      this.one("SELECT payload FROM attempts WHERE id=? AND workstream_id=?", id, this.id),
-      "attempt",
+  appendAttempt(
+    owner: CoordinatorOwner,
+    taskId: string,
+    attemptId: string,
+    attempt: Attempt,
+  ): AttemptRecord {
+    return this.transaction("append Attempt", () => {
+      this.requireOwner(owner);
+      decode(AttemptSchema, attempt, "Attempt");
+      this.readTask(taskId);
+      const index = this.nextIndex("attempts", "attempt_index");
+      const sequence = number(
+        this.database.prepare("SELECT count(*) AS value FROM attempts WHERE task_id=?").get(taskId),
+        "value",
+      );
+      this.database
+        .prepare(
+          "INSERT INTO attempts(attempt_index,attempt_id,task_id,sequence,attempt_json) VALUES(?,?,?,?,?)",
+        )
+        .run(index, attemptId, taskId, sequence, json(attempt));
+      return { index, id: attemptId, taskId, sequence, attempt };
+    });
+  }
+
+  readTask(id: string): TaskRecord {
+    return taskRecord(
+      this.one("SELECT task_index,task_id,intent_index,task_json FROM tasks WHERE task_id=?", id),
     );
   }
 
-  checkpointAttempt(owner: CoordinatorOwner, attempt: AttemptRecord): void {
-    this.transaction("checkpoint attempt", () => {
+  readAttempt(id: string): AttemptRecord {
+    return attemptRecord(
+      this.one(
+        "SELECT attempt_index,attempt_id,task_id,sequence,attempt_json FROM attempts WHERE attempt_id=?",
+        id,
+      ),
+    );
+  }
+
+  checkpointAttempt(owner: CoordinatorOwner, attemptId: string, attempt: Attempt): AttemptRecord {
+    return this.transaction("checkpoint Attempt", () => {
       this.requireOwner(owner);
-      const prior = this.attempt(attempt.id);
+      decode(AttemptSchema, attempt, "Attempt");
+      const prior = this.readAttempt(attemptId);
       if (
-        prior.workstreamId !== attempt.workstreamId ||
-        prior.taskId !== attempt.taskId ||
-        prior.sequence !== attempt.sequence ||
-        json(prior.models) !== json(attempt.models) ||
-        json(prior.lineage) !== json(attempt.lineage)
+        json({ ...prior.attempt, execution: undefined, output: undefined }) !==
+        json({ ...attempt, execution: undefined, output: undefined })
       )
-        throw failure("checkpoint attempt", "Immutable Attempt facts changed.");
-      decode(AttemptRecordSchema, attempt, "attempt");
+        throw failure("checkpoint Attempt", "Immutable Attempt facts changed.");
       this.database
-        .prepare("UPDATE attempts SET payload=? WHERE id=? AND workstream_id=?")
-        .run(json(attempt), attempt.id, this.id);
+        .prepare("UPDATE attempts SET attempt_json=? WHERE attempt_id=?")
+        .run(json(attempt), attemptId);
+      return { ...prior, attempt };
     });
   }
 
-  recordOutcome(owner: CoordinatorOwner, outcome: OutcomeRecord): void {
-    this.transaction("record outcome", () => {
+  insertOutcome(
+    owner: CoordinatorOwner,
+    id: string,
+    attemptId: string,
+    outcome: Outcome,
+  ): OutcomeRecord {
+    return this.transaction("insert Outcome", () => {
       this.requireOwner(owner);
-      const attempt = this.attempt(outcome.attemptId);
-      if (attempt.workstreamId !== outcome.workstreamId)
-        throw failure("record outcome", "Outcome has a foreign Attempt.");
-      decode(OutcomeRecordSchema, outcome, "outcome");
+      const attempt = this.readAttempt(attemptId);
+      const task = this.readTask(attempt.taskId);
+      decodeOutcome(outcome, task.task);
+      const index = this.nextIndex("outcomes", "outcome_index");
       this.database
-        .prepare("INSERT INTO outcomes(id,workstream_id,attempt_id,payload) VALUES(?,?,?,?)")
-        .run(outcome.id, this.id, attempt.id, json(outcome));
+        .prepare(
+          "INSERT INTO outcomes(outcome_index,outcome_id,attempt_id,outcome_json) VALUES(?,?,?,?)",
+        )
+        .run(index, id, attemptId, json(outcome));
       this.touch(outcome.observedAt);
+      return { index, id, attemptId, outcome };
     });
   }
 
-  outcomeForAttempt(attemptId: string): OutcomeRecord | undefined {
-    const row = this.database
-      .prepare("SELECT payload FROM outcomes WHERE attempt_id=? AND workstream_id=?")
-      .get(attemptId, this.id) as Row | undefined;
-    return row === undefined ? undefined : payload(OutcomeRecordSchema, row, "outcome");
+  readOutcomeById(id: string): OutcomeRecord {
+    const row = this.one(
+      "SELECT outcome_index,outcome_id,attempt_id,outcome_json FROM outcomes WHERE outcome_id=?",
+      id,
+    );
+    const attempt = this.readAttempt(text(row, "attempt_id"));
+    return outcomeRecord(row, this.readTask(attempt.taskId).task);
   }
 
-  updateDelivery(owner: CoordinatorOwner, outcome: OutcomeRecord): void {
-    this.transaction("update delivery", () => {
-      this.requireOwner(owner);
-      const prior = this.outcomeForAttempt(outcome.attemptId);
-      if (
-        prior === undefined ||
-        json({ ...prior, delivery: undefined }) !== json({ ...outcome, delivery: undefined })
+  readOutcome(attemptId: string): OutcomeRecord | undefined {
+    const row = this.database
+      .prepare(
+        "SELECT outcome_index,outcome_id,attempt_id,outcome_json FROM outcomes WHERE attempt_id=?",
       )
-        throw failure("update delivery", "Only Outcome delivery facts are mutable.");
-      decode(OutcomeRecordSchema, outcome, "outcome");
+      .get(attemptId) as Row | undefined;
+    return row === undefined
+      ? undefined
+      : outcomeRecord(row, this.readTask(this.readAttempt(attemptId).taskId).task);
+  }
+
+  updateDelivery(
+    owner: CoordinatorOwner,
+    attemptId: string,
+    delivery: OutcomeDelivery,
+  ): OutcomeRecord {
+    return this.transaction("update Outcome delivery", () => {
+      this.requireOwner(owner);
+      decode(OutcomeDeliverySchema, delivery, "Outcome delivery");
+      const record = this.readOutcome(attemptId);
+      if (record === undefined) throw failure("update Outcome delivery", "Outcome is absent.");
+      const outcome = { ...record.outcome, delivery };
+      decodeOutcome(outcome, this.readTask(this.readAttempt(attemptId).taskId).task);
       this.database
-        .prepare("UPDATE outcomes SET payload=? WHERE id=? AND workstream_id=?")
-        .run(json(outcome), outcome.id, this.id);
+        .prepare("UPDATE outcomes SET outcome_json=? WHERE attempt_id=?")
+        .run(json(outcome), attemptId);
+      return { ...record, outcome };
     });
   }
 
@@ -245,76 +423,92 @@ export class WorkstreamStore {
     return host("read unsettled records", () => {
       const rows = this.database
         .prepare(
-          `SELECT t.payload AS task,a.payload AS attempt,o.payload AS outcome FROM attempts a JOIN tasks t ON t.id=a.task_id LEFT JOIN outcomes o ON o.attempt_id=a.id WHERE a.workstream_id=? AND (o.id IS NULL OR json_extract(o.payload,'$.delivery.state')='pending' OR json_extract(a.payload,'$.worker.closedAt') IS NULL) ORDER BY a.rowid`,
+          `SELECT a.attempt_id FROM attempts a LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id WHERE o.attempt_id IS NULL OR json_extract(o.outcome_json,'$.delivery.deliveredAt') IS NULL OR json_extract(a.attempt_json,'$.execution.closedAt') IS NULL ORDER BY a.attempt_index`,
         )
-        .all(this.id) as Row[];
-      return rows.map((row) => ({
-        task: jsonField(TaskRecordSchema, row["task"], "task"),
-        attempt: jsonField(AttemptRecordSchema, row["attempt"], "attempt"),
-        ...(row["outcome"] === null
-          ? {}
-          : { outcome: jsonField(OutcomeRecordSchema, row["outcome"], "outcome") }),
-      }));
+        .all() as Row[];
+      return rows.map((row) => {
+        const attempt = this.readAttempt(text(row, "attempt_id"));
+        const outcome = this.readOutcome(attempt.id);
+        return {
+          task: this.readTask(attempt.taskId),
+          attempt,
+          ...(outcome === undefined ? {} : { outcome }),
+        };
+      });
     });
   }
 
   page(
     section: "intents" | "tasks" | "attempts" | "outcomes",
-    offset: number,
+    after: number,
     limit: number,
   ): unknown[] {
     if (
-      !Number.isSafeInteger(offset) ||
-      offset < 0 ||
+      !Number.isSafeInteger(after) ||
+      after < -1 ||
       !Number.isSafeInteger(limit) ||
       limit < 1 ||
-      limit > 100
+      limit > MAX_PAGE
     )
-      throw failure("inspect records", "Offset or limit is outside the supported range.");
-    const schemas = {
-      intents: IntentRecordSchema,
-      tasks: TaskRecordSchema,
-      attempts: AttemptRecordSchema,
-      outcomes: OutcomeRecordSchema,
-    } as const;
-    return host("inspect records", () =>
-      (
+      throw failure("page records", "Page boundary is outside the supported range.");
+    if (section === "intents")
+      return (
         this.database
           .prepare(
-            `SELECT payload FROM ${section} WHERE workstream_id=? ORDER BY rowid LIMIT ? OFFSET ?`,
+            "SELECT intent_index,intent_json FROM intents WHERE intent_index>? ORDER BY intent_index LIMIT ?",
           )
-          .all(this.id, limit, offset) as Row[]
-      ).map((row) => payload(schemas[section], row, section)),
-    );
+          .all(after, limit) as Row[]
+      ).map(intentRecord);
+    if (section === "tasks")
+      return (
+        this.database
+          .prepare(
+            "SELECT task_index,task_id,intent_index,task_json FROM tasks WHERE task_index>? ORDER BY task_index LIMIT ?",
+          )
+          .all(after, limit) as Row[]
+      ).map(taskRecord);
+    if (section === "attempts")
+      return (
+        this.database
+          .prepare(
+            "SELECT attempt_index,attempt_id,task_id,sequence,attempt_json FROM attempts WHERE attempt_index>? ORDER BY attempt_index LIMIT ?",
+          )
+          .all(after, limit) as Row[]
+      ).map(attemptRecord);
+    return (
+      this.database
+        .prepare(
+          "SELECT outcome_index,outcome_id,attempt_id,outcome_json FROM outcomes WHERE outcome_index>? ORDER BY outcome_index LIMIT ?",
+        )
+        .all(after, limit) as Row[]
+    ).map((row) => {
+      const attempt = this.readAttempt(text(row, "attempt_id"));
+      return outcomeRecord(row, this.readTask(attempt.taskId).task);
+    });
   }
 
-  complete(
-    owner: CoordinatorOwner,
-    completion: NonNullable<WorkstreamMetadata["completion"]>,
-  ): WorkstreamMetadata {
-    return this.transaction("complete workstream", () => {
+  complete(owner: CoordinatorOwner, completion: Completion): WorkstreamMetadata {
+    return this.transaction("complete Workstream", () => {
       this.requireOwner(owner);
-      const missing = numberValue(
+      decode(WorkstreamMetadataSchema.properties.completion, completion, "completion");
+      if (this.readMetadata().lifecycle === "completed")
+        throw failure("complete Workstream", "Workstream is already complete.");
+      const missing = number(
         this.database
           .prepare(
-            "SELECT count(*) AS value FROM attempts a LEFT JOIN outcomes o ON o.attempt_id=a.id WHERE a.workstream_id=? AND o.id IS NULL",
+            "SELECT count(*) AS value FROM attempts a LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id WHERE o.attempt_id IS NULL",
           )
-          .get(this.id),
+          .get(),
         "value",
       );
       if (missing !== 0)
-        throw failure("complete workstream", "Every Attempt must have an Outcome.");
-      const metadata = {
-        ...this.metadata(),
-        lifecycle: "completed" as const,
-        completion,
-        updatedAt: completion.completedAt,
-      };
-      decode(WorkstreamMetadataSchema, metadata, "metadata");
+        throw failure("complete Workstream", "Every Attempt must have an Outcome.");
       this.database
-        .prepare("UPDATE metadata SET payload=? WHERE id=?")
-        .run(json(metadata), this.id);
-      return metadata;
+        .prepare(
+          "UPDATE metadata SET lifecycle='completed',completion_json=?,updated_at=? WHERE singleton=1",
+        )
+        .run(json(completion), completion.completedAt);
+      return this.readMetadata();
     });
   }
 
@@ -324,57 +518,50 @@ export class WorkstreamStore {
     exactPriorAbsent: boolean,
     at: string,
   ): WorkstreamMetadata {
-    return this.transaction("adopt workstream", () => {
+    return this.transaction("adopt Workstream", () => {
       if (!exactPriorAbsent)
-        throw failure("adopt workstream", "Exact prior Coordinator absence was not established.");
+        throw failure("adopt Workstream", "Exact prior Coordinator absence was not established.");
       this.requireOwner(expected);
       decode(CoordinatorOwnerSchema, successor, "successor owner");
-      const metadata = { ...this.metadata(), owner: successor, updatedAt: at };
-      decode(WorkstreamMetadataSchema, metadata, "metadata");
       this.database
-        .prepare("UPDATE metadata SET payload=? WHERE id=?")
-        .run(json(metadata), this.id);
-      return metadata;
+        .prepare(
+          "UPDATE metadata SET owner_session_id=?,owner_session_file=?,owner_workspace_id=?,owner_tab_id=?,updated_at=? WHERE singleton=1",
+        )
+        .run(
+          successor.sessionId,
+          successor.sessionFile,
+          successor.workspaceId,
+          successor.tabId,
+          at,
+        );
+      return this.readMetadata();
     });
   }
 
-  private requireLineage(task: TaskRecord, attempt: AttemptRecord): void {
-    const lineage = attempt.lineage;
-    if (
-      lineage === undefined ||
-      task.target.kind !== "repository" ||
-      attempt.repository === undefined
-    )
-      throw failure("create attempt", "Candidate lineage requires a repository Attempt.");
-    const parent = this.attempt(lineage.parentAttemptId);
-    if (
-      parent.repository === undefined ||
-      parent.repository.commonDir !== task.target.commonDir ||
-      parent.repository.candidateRevision !== lineage.parentCommit
-    )
-      throw failure(
-        "create attempt",
-        "Candidate lineage does not match retained parent output in the same repository.",
-      );
-  }
-
   private requireOwner(owner: CoordinatorOwner): void {
-    if (!Value.Equal(this.metadata().owner, owner))
-      throw failure("mutate workstream", "Coordinator is not the exact owner.");
+    if (!Value.Equal(this.readMetadata().owner, owner))
+      throw failure("write Workstream", "Coordinator is not the exact owner.");
   }
 
   private touch(at: string): void {
-    const metadata = { ...this.metadata(), updatedAt: at };
-    this.database.prepare("UPDATE metadata SET payload=? WHERE id=?").run(json(metadata), this.id);
+    this.database.prepare("UPDATE metadata SET updated_at=? WHERE singleton=1").run(at);
   }
 
-  private one(sql: string, ...params: Array<string | number>): Row {
-    const row = this.database.prepare(sql).get(...params) as Row | undefined;
+  private nextIndex(table: "tasks" | "attempts" | "outcomes", column: string): number {
+    return number(
+      this.database.prepare(`SELECT coalesce(max(${column}),-1)+1 AS value FROM ${table}`).get(),
+      "value",
+    );
+  }
+
+  private one(sql: string, ...parameters: Array<string | number>): Row {
+    const row = this.database.prepare(sql).get(...parameters) as Row | undefined;
     if (row === undefined) throw failure("read record", "Required record is absent.");
     return row;
   }
 
   private transaction<A>(operation: string, run: () => A): A {
+    if (this.readOnly) throw failure(operation, "Store is read-only.");
     return host(operation, () => {
       this.database.exec("BEGIN IMMEDIATE");
       try {
@@ -389,26 +576,84 @@ export class WorkstreamStore {
   }
 }
 
-function payload<S extends TSchema>(schema: S, row: Row, name: string): Static<S> {
-  return jsonField(schema, row["payload"], name);
+function privateParents(path: string): void {
+  const workstreams = dirname(dirname(path));
+  const workgraph = dirname(workstreams);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  chmodSync(workgraph, 0o700);
+  chmodSync(workstreams, 0o700);
+  chmodSync(dirname(path), 0o700);
 }
-function jsonField<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
-  if (typeof value !== "string") throw failure("decode record", `${name} payload is not text.`);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value);
-  } catch (cause) {
-    throw failure("decode record", `${name} payload is not JSON.`, cause);
+function intentRecord(row: Row): IntentRecord {
+  return {
+    index: number(row, "intent_index"),
+    intent: parse(IntentSchema, row["intent_json"], "Intent"),
+  };
+}
+function taskRecord(row: Row): TaskRecord {
+  return {
+    index: number(row, "task_index"),
+    id: text(row, "task_id"),
+    intentIndex: number(row, "intent_index"),
+    task: parse(TaskSchema, row["task_json"], "Task"),
+  };
+}
+function attemptRecord(row: Row): AttemptRecord {
+  return {
+    index: number(row, "attempt_index"),
+    id: text(row, "attempt_id"),
+    taskId: text(row, "task_id"),
+    sequence: number(row, "sequence"),
+    attempt: parse(AttemptSchema, row["attempt_json"], "Attempt"),
+  };
+}
+function outcomeRecord(row: Row, task: Task): OutcomeRecord {
+  const outcome = parse(OutcomeSchema, row["outcome_json"], "Outcome");
+  decodeOutcome(outcome, task);
+  return {
+    index: number(row, "outcome_index"),
+    id: text(row, "outcome_id"),
+    attemptId: text(row, "attempt_id"),
+    outcome,
+  };
+}
+function decodeOutcome(outcome: Outcome, task: Task): void {
+  decode(OutcomeSchema, outcome, "Outcome");
+  const keys = outcome.effectiveModels.map((target) => `${target.model}\0${target.thinking}`);
+  if (new Set(keys).size !== keys.length)
+    throw failure("decode Outcome", "Effective models are not ordered-distinct.");
+  if (outcome.result.kind === "reported") {
+    const expected =
+      task.contract.kind === "implementation"
+        ? "implementation"
+        : task.contract.kind === "review"
+          ? "review"
+          : "research";
+    if (outcome.result.report.kind !== expected)
+      throw failure("decode Outcome", "Report kind does not match its Task.");
   }
-  return decode(schema, parsed, name);
+}
+function parse<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
+  if (typeof value !== "string") throw failure(`decode ${name}`, `${name} JSON is not text.`);
+  try {
+    return decode(schema, JSON.parse(value), name);
+  } catch (cause) {
+    if (cause instanceof StoreError) throw cause;
+    throw failure(`decode ${name}`, `${name} JSON is malformed.`, cause);
+  }
 }
 function decode<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
-  if (!Value.Check(schema, value)) throw failure("decode record", `${name} payload is malformed.`);
+  if (!Value.Check(schema, value)) throw failure(`decode ${name}`, `${name} is malformed.`);
   return Value.Decode(schema, value) as Static<S>;
 }
-function numberValue(row: unknown, field: string): number {
-  const value = (row as Row | undefined)?.[field];
-  if (typeof value !== "number") throw failure("read record", `${field} is malformed.`);
+function text(row: Row, field: string): string {
+  const value = row[field];
+  if (typeof value !== "string") throw failure("decode row", `${field} is malformed.`);
+  return value;
+}
+function number(row: Row | undefined, field: string): number {
+  const value = row?.[field];
+  if (typeof value !== "number") throw failure("decode row", `${field} is malformed.`);
   return value;
 }
 function json(value: unknown): string {

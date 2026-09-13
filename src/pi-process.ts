@@ -4,6 +4,7 @@ import { Data, Effect, FileSystem } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
+import { type ModelTarget, ModelTargetSchema } from "./domain/model-target.js";
 import { isWorkerReport, type WorkerReport, type WorkerSessionMode } from "./domain/report.js";
 
 type Generation = { runId: string; nodeId: string };
@@ -12,6 +13,13 @@ const IdentitySchema = Type.Object({
   nodeId: Type.String({ minLength: 1 }),
 });
 const ReportDetailsSchema = Type.Object({ report: Type.Unknown() });
+const EffectiveModelSchema = Type.Intersect([
+  IdentitySchema,
+  Type.Object({
+    model: ModelTargetSchema.properties.model,
+    thinking: ModelTargetSchema.properties.thinking,
+  }),
+]);
 
 export class PiSessionError extends Data.TaggedError("PiSessionError")<{
   readonly operation: "create" | "append-objective" | "persist" | "resolve";
@@ -80,6 +88,7 @@ export function createWorkerSessionEffect(
 
 export interface WorkgraphReportRead {
   readonly report?: WorkerReport;
+  readonly effectiveModels: readonly ModelTarget[];
   readonly invalid: boolean;
   readonly unreadable: boolean;
   readonly error?: string;
@@ -92,6 +101,7 @@ export function readWorkgraphReportResult(
 ): WorkgraphReportRead {
   try {
     const entries = attemptEntries(sessionFile, generation);
+    const effectiveModels = orderedEffectiveModels(entries, generation);
     for (const entry of [...entries].reverse()) {
       if (
         entry.type !== "message" ||
@@ -101,15 +111,16 @@ export function readWorkgraphReportResult(
       )
         continue;
       if (!Value.Check(ReportDetailsSchema, entry.message.details))
-        return { invalid: true, unreadable: false };
+        return { effectiveModels, invalid: true, unreadable: false };
       const report = Value.Decode(ReportDetailsSchema, entry.message.details).report;
       return isWorkerReport(report)
-        ? { report, invalid: false, unreadable: false }
-        : { invalid: true, unreadable: false };
+        ? { report, effectiveModels, invalid: false, unreadable: false }
+        : { effectiveModels, invalid: true, unreadable: false };
     }
-    return { invalid: false, unreadable: false };
+    return { effectiveModels, invalid: false, unreadable: false };
   } catch (cause) {
     return {
+      effectiveModels: [],
       invalid: false,
       unreadable: true,
       error: cause instanceof Error ? cause.message.slice(0, 300) : "Worker session is unreadable.",
@@ -140,6 +151,28 @@ function attemptEntries(sessionFile: string, generation: Generation) {
   );
   if (start < 0) throw new Error("Exact Attempt objective is absent.");
   return entries.slice(start);
+}
+function orderedEffectiveModels(
+  entries: ReturnType<typeof attemptEntries>,
+  generation: Generation,
+): ModelTarget[] {
+  const targets: ModelTarget[] = [];
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (
+      entry.type !== "custom" ||
+      entry.customType !== "pi-workgraph-effective-model" ||
+      !Value.Check(EffectiveModelSchema, entry.data)
+    )
+      continue;
+    const fact = Value.Decode(EffectiveModelSchema, entry.data);
+    if (!sameIdentity(fact, generation)) continue;
+    const key = `${fact.model}\0${fact.thinking}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    targets.push({ model: fact.model, thinking: fact.thinking });
+  }
+  return targets;
 }
 function sameIdentity(value: unknown, expected: Generation): boolean {
   if (!Value.Check(IdentitySchema, value)) return false;

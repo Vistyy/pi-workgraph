@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/async-function, effecttsgo/global-date, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are the Promise boundary; registered TypeBox schemas validate tool values before these typed callbacks. */
+/* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/async-function, effecttsgo/global-date, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are the Promise boundary; registered TypeBox schemas validate tool values before these typed callbacks. */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -16,12 +16,16 @@ import { Value } from "typebox/value";
 import { installCalmMode, isCoordinatorScope } from "../src/calm.js";
 import { WorkstreamRuntime } from "../src/coordination/runtime.js";
 import { installCoordinatorSessionState } from "../src/coordinator-notepad.js";
-import type {
-  AttemptRecord,
-  CoordinatorOwner,
-  IntentRecord,
-  TaskRecord,
-  WorkstreamMetadata,
+import {
+  type AttemptLineage,
+  type AttemptRecord,
+  type AttemptSelection,
+  type CoordinatorOwner,
+  type Intent,
+  type TaskContract,
+  WORKSTREAM_FORMAT,
+  WORKSTREAM_SCHEMA_VERSION,
+  type WorkstreamMetadata,
 } from "../src/domain/records.js";
 import { resolveTaskTarget } from "../src/git.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
@@ -107,6 +111,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     return {
       sessionId: ctx.sessionManager.getSessionId(),
       sessionFile,
+      workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? ctx.sessionManager.getSessionId(),
       tabId: process.env["HERDR_TAB_ID"] ?? ctx.sessionManager.getSessionId(),
     };
   };
@@ -186,7 +191,11 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           )
         ) {
           await attach(
-            WorkstreamStore.open(agentDir, (pointer.data as { workstreamId: string }).workstreamId),
+            WorkstreamStore.openOwned(
+              agentDir,
+              (pointer.data as { workstreamId: string }).workstreamId,
+              owner(ctx),
+            ),
             owner(ctx),
           );
           return;
@@ -205,16 +214,15 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         const store = WorkstreamStore.create(
           agentDir,
           {
+            format: WORKSTREAM_FORMAT,
+            schemaVersion: WORKSTREAM_SCHEMA_VERSION,
             id,
-            purpose: grant.request,
             owner: exactOwner,
             lifecycle: "active",
             createdAt: at,
             updatedAt: at,
           },
           {
-            workstreamId: id,
-            index: 0,
             statement: grant.request,
             constraints: grant.constraints,
             authority: {
@@ -283,16 +291,15 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         if (attached === undefined) {
           const id = `ws-${ctx.sessionManager.getSessionId()}`;
           const metadata: WorkstreamMetadata = {
+            format: WORKSTREAM_FORMAT,
+            schemaVersion: WORKSTREAM_SCHEMA_VERSION,
             id,
-            purpose: params.statement,
             owner: exactOwner,
             lifecycle: "active",
             createdAt: at,
             updatedAt: at,
           };
-          const intent: IntentRecord = {
-            workstreamId: id,
-            index: 0,
+          const intent: Intent = {
             statement: params.statement,
             constraints: params.constraints ?? [],
             authority: {
@@ -306,10 +313,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           await attach(store, exactOwner);
           pi.appendEntry(POINTER, { workstreamId: id });
         } else {
-          const index = attached.store.currentIntent().index + 1;
           attached.store.appendIntent(exactOwner, {
-            workstreamId: attached.store.id,
-            index,
             statement: params.statement,
             constraints: params.constraints ?? [],
             authority: {
@@ -322,7 +326,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         }
         return toolResult({
           workstreamId: runtime().store.id,
-          intent: runtime().store.currentIntent(),
+          intent: runtime().store.readLatestIntent(),
         });
       });
     },
@@ -347,25 +351,30 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
-    async (params, ctx) => {
-      const kind = params.experiment === undefined ? "research" : "experiment";
-      return createAndLaunch(
+    async (params, ctx) =>
+      createAndLaunch(
         runtime(),
         ctx.cwd,
         options,
         {
           id: params.id,
-          kind,
-          objective: params.question,
           target: params.target,
           contract:
             params.experiment === undefined
-              ? { expectedEvidence: params.expectedEvidence }
-              : { expectedEvidence: params.expectedEvidence, ...params.experiment },
+              ? {
+                  kind: "research",
+                  question: params.question,
+                  expectedEvidence: params.expectedEvidence,
+                }
+              : {
+                  kind: "experiment",
+                  question: params.question,
+                  expectedEvidence: params.expectedEvidence,
+                  ...params.experiment,
+                },
         },
         params.selection,
-      );
-    },
+      ),
     serialize,
   );
   registerTask(
@@ -390,13 +399,14 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         options,
         {
           id: params.id,
-          kind: "consultation",
-          objective: params.question,
           target: params.target,
-          contract: params.context === undefined ? {} : { context: params.context },
+          contract:
+            params.context === undefined
+              ? { kind: "consultation", question: params.question }
+              : { kind: "consultation", question: params.question, context: params.context },
         },
         undefined,
-        [modelFact("consultation", model)],
+        { kind: "target", target: model },
       );
     },
     serialize,
@@ -426,13 +436,15 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         options,
         {
           id: params.id,
-          kind: "implementation",
-          objective: params.objective,
           target: params.target,
-          contract: { acceptance: params.acceptance },
+          contract: {
+            kind: "implementation",
+            objective: params.objective,
+            acceptance: params.acceptance,
+          },
         },
         undefined,
-        [modelFact("guide", models.guide), modelFact("executor", models.executor)],
+        { kind: "implementation", guide: models.guide, executor: models.executor },
         lineage(runtime(), params.candidateOf, params.integrate),
         params.baseRevision,
       );
@@ -460,10 +472,18 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         options,
         {
           id: params.id,
-          kind: "review",
-          objective: params.objective,
           target: params.target,
-          contract: { concern: params.concern, subject: params.subject },
+          contract: {
+            kind: "review",
+            objective: params.objective,
+            concern: params.concern,
+            subject:
+              params.subject.kind === "result"
+                ? { kind: "outcome", outcomeId: params.subject.resultId }
+                : params.subject.kind === "comparison"
+                  ? { kind: "comparison", outcomeIds: params.subject.resultIds }
+                  : params.subject,
+          },
         },
         params.selection,
         undefined,
@@ -505,7 +525,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     async execute(_id, params) {
-      if (params.section === "metadata") return toolResult(runtime().store.metadata());
+      if (params.section === "metadata") return toolResult(runtime().store.readMetadata());
       return toolResult(
         await Effect.runPromise(
           runtime().inspect(
@@ -585,7 +605,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       {
         workstreamId: Text,
         prior: Type.Object(
-          { sessionId: Text, sessionFile: Text, tabId: Text },
+          { sessionId: Text, sessionFile: Text, workspaceId: Text, tabId: Text },
           { additionalProperties: false },
         ),
       },
@@ -593,12 +613,14 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     ),
     execute(_id, params, _signal, _update, ctx) {
       return serialize(async () => {
-        const store = WorkstreamStore.open(agentDir, params.workstreamId);
+        const store = WorkstreamStore.openReadOnly(agentDir, params.workstreamId);
         const absent = await (options.priorCoordinatorAbsent?.(params.prior) ??
           Effect.runPromise(new HerdrCliRuntime().coordinatorAbsent(params.prior)));
         const successor = owner(ctx);
-        store.adopt(params.prior, successor, absent, new Date().toISOString());
-        await attach(store, successor);
+        store.close();
+        const ownedStore = WorkstreamStore.openOwned(agentDir, params.workstreamId, params.prior);
+        ownedStore.adopt(params.prior, successor, absent, new Date().toISOString());
+        await attach(ownedStore, successor);
         pi.appendEntry(POINTER, { workstreamId: params.workstreamId });
         return toolResult({ adopted: params.workstreamId, owner: successor });
       });
@@ -616,13 +638,13 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     execute(id, params, _signal, _update, ctx) {
       return serialize(async () => {
         const child = SessionManager.create(ctx.cwd);
-        const intent = runtime().store.currentIntent();
+        const intent = runtime().store.readLatestIntent();
         child.appendCustomMessageEntry("pi-workgraph-handoff-grant", params.request, true, {
           grantId: `grant-${id}`,
           parentWorkstreamId: runtime().store.id,
           parentIntentIndex: intent.index,
           request: params.request,
-          constraints: intent.constraints,
+          constraints: intent.intent.constraints,
         });
         if (params.includeContext === true)
           child.appendCustomMessageEntry(
@@ -640,7 +662,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         await Effect.runPromise(
           herdr.prompt(
             identity,
-            `[WORKGRAPH HANDOFF KICKOFF]\n${params.request}\nInherited constraints:\n${intent.constraints.map((item) => `- ${item}`).join("\n")}`,
+            `[WORKGRAPH HANDOFF KICKOFF]\n${params.request}\nInherited constraints:\n${intent.intent.constraints.map((item) => `- ${item}`).join("\n")}`,
           ),
         );
         return toolResult(identity);
@@ -683,10 +705,8 @@ function handoffContext(ctx: ExtensionContext, toolCallId: string): string {
 
 type ToolTask = {
   id: string;
-  kind: TaskRecord["kind"];
-  objective: string;
   target: { kind?: "directory" | "repository"; path?: string } | undefined;
-  contract: Record<string, unknown>;
+  contract: TaskContract;
 };
 function registerTask<S extends TSchema>(
   pi: ExtensionAPI,
@@ -714,36 +734,34 @@ function registerTask<S extends TSchema>(
 async function appendFreshAttempt(
   runtime: WorkstreamRuntime,
   options: CoordinatorOptions,
-  params: {
-    task: string;
-    candidateOf?: string;
-    integrate?: boolean;
-    baseRevision?: string;
-  },
+  params: { task: string; candidateOf?: string; integrate?: boolean; baseRevision?: string },
 ): Promise<AttemptRecord> {
-  const task = runtime.store.task(params.task);
+  const task = runtime.store.readTask(params.task).task;
   const policy = await loadModelPolicy(options.policyPath);
-  let models: AttemptRecord["models"];
-  if (task.kind === "implementation") {
-    const selected = implementationTargets(policy, false);
-    models = [modelFact("guide", selected.guide), modelFact("executor", selected.executor)];
-  } else {
-    const role =
-      task.kind === "review"
-        ? "review"
-        : task.kind === "consultation"
-          ? "consultation.advisor"
-          : "research";
-    models = [modelFact(task.kind, configuredTarget(policy, role))];
-  }
+  const selection: AttemptSelection =
+    task.contract.kind === "implementation"
+      ? (() => {
+          const selected = implementationTargets(policy, false);
+          return { kind: "implementation", guide: selected.guide, executor: selected.executor };
+        })()
+      : {
+          kind: "target",
+          target: configuredTarget(
+            policy,
+            task.contract.kind === "review"
+              ? "review"
+              : task.contract.kind === "consultation"
+                ? "consultation.advisor"
+                : "research",
+          ),
+        };
   const candidate = lineage(runtime, params.candidateOf, params.integrate);
   const attempt = await Effect.runPromise(
     runtime.createAttempt({
-      taskId: task.id,
-      models,
+      taskId: params.task,
+      selection,
       ...(candidate === undefined ? {} : { lineage: candidate }),
-      ...(params.baseRevision === undefined ? {} : { baseRevision: params.baseRevision }),
-      experiment: task.kind === "experiment",
+      ...(params.baseRevision === undefined ? {} : { baseCommit: params.baseRevision }),
     }),
   );
   return Effect.runPromise(runtime.launch(attempt.id));
@@ -755,8 +773,8 @@ async function createAndLaunch(
   options: CoordinatorOptions,
   input: ToolTask,
   selection?: { count?: number; distinctModels?: boolean },
-  fixedModels?: AttemptRecord["models"],
-  candidate?: AttemptRecord["lineage"],
+  fixedSelection?: AttemptSelection,
+  candidate?: AttemptLineage,
   baseRevision?: string,
 ): Promise<AttemptRecord[]> {
   const target = resolveTaskTarget({
@@ -764,52 +782,56 @@ async function createAndLaunch(
     ...(input.target?.path === undefined ? {} : { path: input.target.path }),
     ...(input.target?.kind === undefined ? {} : { kind: input.target.kind }),
   });
-  await Effect.runPromise(runtime.createTask({ ...input, target }));
-  let models = fixedModels;
-  if (models === undefined) {
+  let selections: AttemptSelection[];
+  if (fixedSelection !== undefined) selections = [fixedSelection];
+  else {
     const policy = await loadModelPolicy(options.policyPath);
-    const role = input.kind === "review" ? "review" : "research";
-    models = resolveSelection(role, selection, policy).selected.map((model) =>
-      modelFact(input.kind, model),
-    );
+    const role = input.contract.kind === "review" ? "review" : "research";
+    selections = resolveSelection(role, selection, policy).selected.map((target) => ({
+      kind: "target" as const,
+      target,
+    }));
   }
-  const attempts: AttemptRecord[] = [];
-  for (const model of models) {
+  const first = selections[0];
+  if (first === undefined) throw new Error("Task requires at least one selected model target.");
+  const initial = await Effect.runPromise(
+    runtime.createTask({
+      id: input.id,
+      target,
+      contract: input.contract,
+      selection: first,
+      ...(candidate === undefined ? {} : { lineage: candidate }),
+      ...(baseRevision === undefined ? {} : { baseCommit: baseRevision }),
+    }),
+  );
+  const attempts = [await Effect.runPromise(runtime.launch(initial.id))];
+  for (const selected of selections.slice(1)) {
     const attempt = await Effect.runPromise(
-      runtime.createAttempt({
-        taskId: input.id,
-        models: fixedModels === undefined ? [model] : models,
-        ...(candidate === undefined ? {} : { lineage: candidate }),
-        ...(baseRevision === undefined ? {} : { baseRevision }),
-        experiment: input.kind === "experiment",
-      }),
+      runtime.createAttempt({ taskId: input.id, selection: selected }),
     );
     attempts.push(await Effect.runPromise(runtime.launch(attempt.id)));
-    if (fixedModels !== undefined) break;
   }
   return attempts;
-}
-function modelFact(
-  role: string,
-  target: { model: string; thinking?: string },
-): AttemptRecord["models"][number] {
-  return target.thinking === undefined
-    ? { role, model: target.model }
-    : { role, model: target.model, thinking: target.thinking };
 }
 function lineage(
   runtime: WorkstreamRuntime,
   parentId?: string,
   integrate?: boolean,
-): AttemptRecord["lineage"] | undefined {
+): AttemptLineage | undefined {
   if (parentId === undefined) return undefined;
-  const parent = runtime.store.attempt(parentId);
-  if (parent.repository?.candidateRevision === undefined)
+  const parent = runtime.store.readAttempt(parentId).attempt;
+  if (parent.output?.kind !== "retained")
     throw new Error("Candidate parent has no retained commit.");
+  const candidateRoot =
+    parent.lineage?.candidateRoot ??
+    (parent.base.kind === "repository" ? parent.base.baseCommit : undefined);
+  if (candidateRoot === undefined) throw new Error("Candidate parent has no repository root.");
   return {
-    kind: integrate === true ? "integrate" : "extend",
-    parentAttemptId: parentId,
-    parentCommit: parent.repository.candidateRevision,
+    candidateRoot,
+    candidateOf:
+      integrate === true
+        ? { kind: "integrate", attemptId: parentId, sourceTip: parent.output.tip }
+        : { kind: "extend", attemptId: parentId },
   };
 }
 function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
@@ -908,7 +930,14 @@ function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
         });
         return report.report === undefined
           ? { state: "done" }
-          : { state: "done", outcome: { kind: "reported", result: { report: report.report } } };
+          : {
+              state: "done",
+              outcome: {
+                kind: "reported",
+                result: report.report,
+                effectiveModels: report.effectiveModels,
+              },
+            };
       },
     },
     delivery: {

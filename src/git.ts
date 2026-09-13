@@ -3,16 +3,22 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Data } from "effect";
-import type { AttemptRecord, TaskTarget } from "./domain/records.js";
+import type { Attempt, TaskTarget } from "./domain/records.js";
 
 class GitError extends Data.TaggedError("GitError")<{
   readonly operation: string;
   readonly message: string;
   readonly cause?: unknown;
-}> {
-  constructor(operation: string, message: string, cause?: unknown) {
-    super(cause === undefined ? { operation, message } : { operation, message, cause });
-  }
+}> {}
+
+type RepositoryTarget = Extract<TaskTarget, { kind: "repository" }>;
+export interface RepositoryOperation {
+  readonly attemptId: string;
+  readonly attempt: Attempt;
+  readonly target: RepositoryTarget;
+  readonly worktreePath: string;
+  readonly outputRef: string;
+  readonly experiment: boolean;
 }
 
 export function resolveTaskTarget(input: {
@@ -31,11 +37,9 @@ export function resolveTaskTarget(input: {
     return { kind: "directory", path };
   }
 }
-
-export function currentRevision(target: Extract<TaskTarget, { kind: "repository" }>): string {
+export function currentRevision(target: RepositoryTarget): string {
   return git(target.checkoutRoot, ["rev-parse", "HEAD"]);
 }
-
 export function isAncestor(commonDir: string, parent: string, child: string): boolean {
   try {
     gitDir(commonDir, ["merge-base", "--is-ancestor", parent, child], true);
@@ -44,7 +48,6 @@ export function isAncestor(commonDir: string, parent: string, child: string): bo
     return false;
   }
 }
-
 export function detachedPlacement(input: {
   agentDir: string;
   workstreamId: string;
@@ -61,137 +64,127 @@ export function detachedPlacement(input: {
     outputRef: `refs/pi-workgraph/outputs/${input.workstreamId}/${input.attemptId}`,
   };
 }
-
-/** Ensure only the exact predeclared detached worktree, including lost-response recovery. */
-export function ensureDetachedWorktree(repository: NonNullable<AttemptRecord["repository"]>): void {
-  if (!isCommit(repository.commonDir, repository.baseRevision))
-    throw new GitError("create worktree", "Base revision is not a commit in the Task repository.");
-  if (existsSync(repository.worktreePath)) {
+export function ensureDetachedWorktree(operation: RepositoryOperation): void {
+  const base = baseCommit(operation.attempt);
+  if (!isCommit(operation.target.commonDir, base))
+    throw error("create worktree", "Base commit is not in the Task repository.");
+  if (existsSync(operation.worktreePath)) {
     const commonDir = resolve(
-      repository.worktreePath,
-      git(repository.worktreePath, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+      operation.worktreePath,
+      git(operation.worktreePath, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
     );
-    const head = git(repository.worktreePath, ["rev-parse", "HEAD"]);
-    if (commonDir !== repository.commonDir || head !== repository.baseRevision)
-      throw new GitError(
-        "create worktree",
-        "Existing worktree does not match the Attempt declaration.",
-      );
+    const head = git(operation.worktreePath, ["rev-parse", "HEAD"]);
+    if (commonDir !== operation.target.commonDir || head !== base)
+      throw error("create worktree", "Existing worktree does not match the Attempt declaration.");
     return;
   }
-  mkdirSync(dirname(repository.worktreePath), { recursive: true, mode: 0o700 });
-  git(repository.checkoutRoot, [
-    "worktree",
-    "add",
-    "--detach",
-    repository.worktreePath,
-    repository.baseRevision,
-  ]);
+  mkdirSync(dirname(operation.worktreePath), { recursive: true, mode: 0o700 });
+  git(operation.target.checkoutRoot, ["worktree", "add", "--detach", operation.worktreePath, base]);
 }
-
-export function classifyOutput(attempt: AttemptRecord, successful: boolean): AttemptRecord {
-  const repository = requiredRepository(attempt);
-  const head = git(repository.worktreePath, ["rev-parse", "HEAD"]);
+export function classifyOutput(
+  operation: RepositoryOperation,
+  successful: boolean,
+  at: string,
+): Attempt {
+  const head = git(operation.worktreePath, ["rev-parse", "HEAD"]);
   const dirty =
-    git(repository.worktreePath, ["status", "--porcelain", "--untracked-files=all"], true).length >
+    git(operation.worktreePath, ["status", "--porcelain", "--untracked-files=all"], true).length >
     0;
-  if (!dirty && head === repository.baseRevision) {
-    removeWorktree(repository.checkoutRoot, repository.worktreePath);
-    return { ...attempt, repository: { ...repository, output: "unchanged" } };
+  if (!dirty && head === baseCommit(operation.attempt)) {
+    removeWorktree(operation.target.checkoutRoot, operation.worktreePath);
+    return { ...operation.attempt, output: { kind: "no_output", completedAt: at } };
   }
-  if (!dirty && successful && isAncestor(repository.commonDir, repository.baseRevision, head)) {
-    gitDir(repository.commonDir, ["update-ref", repository.outputRef, head], true);
-    removeWorktree(repository.checkoutRoot, repository.worktreePath);
+  if (
+    !dirty &&
+    successful &&
+    isAncestor(operation.target.commonDir, baseCommit(operation.attempt), head)
+  ) {
+    gitDir(operation.target.commonDir, ["update-ref", operation.outputRef, head], true);
+    removeWorktree(operation.target.checkoutRoot, operation.worktreePath);
     return {
-      ...attempt,
-      repository: { ...repository, candidateRevision: head, output: "retained" },
+      ...operation.attempt,
+      output: { kind: "retained", tip: head, reason: "Successful candidate output." },
     };
   }
   return {
-    ...attempt,
-    repository: { ...repository, candidateRevision: head, output: dirty ? "dirty" : "retained" },
-  };
-}
-
-export function prepareApplication(attempt: AttemptRecord): AttemptRecord {
-  const { repository, source, symbolic, before } = applicationContext(attempt);
-  const prior = repository.application;
-  if (prior !== undefined && (before === prior.expectedHead || before === prior.expectedResult))
-    return attempt;
-  if (prior?.replanCount === 1)
-    throw new GitError("apply output", "Destination changed after the bounded application replan.");
-  assertDestinationAncestry(repository, before);
-  const expectedResult = isAncestor(repository.commonDir, source, before)
-    ? before
-    : mergeResult(repository.commonDir, before, source, attempt.id);
-  return {
-    ...attempt,
-    repository: {
-      ...repository,
-      application: {
-        expectedRef: symbolic,
-        expectedHead: before,
-        expectedResult,
-        replanCount: prior === undefined ? 0 : 1,
-      },
+    ...operation.attempt,
+    output: {
+      kind: "retained",
+      tip: head,
+      reason: dirty
+        ? "Dirty output requires explicit disposition."
+        : "Output retained after unsuccessful execution.",
     },
   };
 }
-
-export function applyOutput(attempt: AttemptRecord): AttemptRecord {
-  if (attempt.repository?.output === "applied") return attempt;
-  const { repository, source, symbolic, before } = applicationContext(attempt);
-  const application = repository.application;
-  if (application === undefined)
-    throw new GitError("apply output", "Application has no durable pre-effect checkpoint.");
-  if (symbolic !== application.expectedRef)
-    throw new GitError("apply output", "Destination ref changed after the application checkpoint.");
-  if (before === application.expectedResult) return releaseApplied(attempt);
-  if (before !== application.expectedHead)
-    throw new GitError("apply output", "Destination changed after the application checkpoint.");
-  git(repository.checkoutRoot, ["merge", "--ff-only", application.expectedResult]);
+export function prepareApplication(operation: RepositoryOperation): Attempt {
+  const output = operation.attempt.output;
+  if (output?.kind === "applying") return operation.attempt;
+  if (operation.experiment) throw error("apply output", "Experiment output cannot be applied.");
+  if (output?.kind !== "retained") throw error("apply output", "Attempt has no retained output.");
+  const source = gitDir(operation.target.commonDir, ["rev-parse", operation.outputRef]);
+  if (source !== output.tip) throw error("apply output", "Private output ref was repointed.");
+  const destinationRef = git(operation.target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]);
+  const destinationHead = git(operation.target.checkoutRoot, ["rev-parse", "HEAD"]);
   if (
-    gitDir(repository.commonDir, ["rev-parse", symbolic]) !== application.expectedResult ||
-    git(repository.checkoutRoot, ["rev-parse", "HEAD"]) !== application.expectedResult
+    git(operation.target.checkoutRoot, ["status", "--porcelain", "--untracked-files=all"], true)
+      .length > 0
   )
-    throw new GitError("apply output", "Git application result is structurally ambiguous.");
-  return releaseApplied({ ...attempt, repository: { ...repository, candidateRevision: source } });
-}
-
-function applicationContext(attempt: AttemptRecord) {
-  const repository = requiredRepository(attempt);
-  if (repository.experiment)
-    throw new GitError("apply output", "Experiment output cannot be applied.");
-  if (repository.output !== "retained" || repository.candidateRevision === undefined)
-    throw new GitError("apply output", "Attempt has no clean retained candidate.");
-  const source = gitDir(repository.commonDir, ["rev-parse", repository.outputRef]);
-  if (source !== repository.candidateRevision)
-    throw new GitError("apply output", "Private output ref was repointed.");
-  const status = git(
-    repository.checkoutRoot,
-    ["status", "--porcelain", "--untracked-files=all"],
-    true,
-  );
-  if (status.length > 0) throw new GitError("apply output", "Destination checkout is dirty.");
+    throw error("apply output", "Destination checkout is dirty.");
+  const root = candidateRoot(operation.attempt);
+  if (!isAncestor(operation.target.commonDir, baseCommit(operation.attempt), destinationHead))
+    throw error("apply output", "Destination no longer descends from the exact Attempt base.");
+  const preparedRevision = isAncestor(operation.target.commonDir, source, destinationHead)
+    ? destinationHead
+    : mergeResult(operation.target.commonDir, destinationHead, source, operation.attemptId);
   return {
-    repository,
-    source,
-    symbolic: git(repository.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]),
-    before: git(repository.checkoutRoot, ["rev-parse", "HEAD"]),
+    ...operation.attempt,
+    output: {
+      kind: "applying",
+      sourceRoot: root,
+      sourceTip: source,
+      destinationRef,
+      destinationHead,
+      preparedRevision,
+    },
   };
 }
-
-function assertDestinationAncestry(
-  repository: NonNullable<AttemptRecord["repository"]>,
-  revision: string,
-): void {
-  if (!isAncestor(repository.commonDir, repository.baseRevision, revision))
-    throw new GitError(
-      "apply output",
-      "Destination no longer descends from the exact Attempt base.",
-    );
+export function applyOutput(operation: RepositoryOperation, at: string): Attempt {
+  const output = operation.attempt.output;
+  if (output?.kind === "applied") return operation.attempt;
+  if (output?.kind !== "applying" || output.preparedRevision === undefined)
+    throw error("apply output", "Application has no durable preparation checkpoint.");
+  const ref = git(operation.target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]);
+  const head = git(operation.target.checkoutRoot, ["rev-parse", "HEAD"]);
+  if (ref !== output.destinationRef) throw error("apply output", "Destination ref changed.");
+  if (head !== output.preparedRevision) {
+    if (head !== output.destinationHead)
+      throw error("apply output", "Destination changed after preparation.");
+    git(operation.target.checkoutRoot, ["merge", "--ff-only", output.preparedRevision]);
+  }
+  gitDir(operation.target.commonDir, ["update-ref", "-d", operation.outputRef], true);
+  return {
+    ...operation.attempt,
+    output: { kind: "applied", revision: output.preparedRevision, completedAt: at },
+  };
 }
-
+export function discardOutput(operation: RepositoryOperation, reason: string, at: string): Attempt {
+  if (reason.trim().length === 0)
+    throw error("discard output", "Discard requires an explicit reason.");
+  if (operation.attempt.output?.kind === "applied")
+    throw error("discard output", "Applied output cannot be discarded.");
+  removeWorktree(operation.target.checkoutRoot, operation.worktreePath, true);
+  gitDir(operation.target.commonDir, ["update-ref", "-d", operation.outputRef], true);
+  return { ...operation.attempt, output: { kind: "discarded", reason, completedAt: at } };
+}
+function baseCommit(attempt: Attempt): string {
+  if (attempt.base.kind !== "repository")
+    throw error("inspect output", "Attempt has no repository base.");
+  return attempt.base.baseCommit;
+}
+function candidateRoot(attempt: Attempt): string {
+  return attempt.lineage?.candidateRoot ?? baseCommit(attempt);
+}
 function mergeResult(
   commonDir: string,
   destination: string,
@@ -210,38 +203,6 @@ function mergeResult(
     "-m",
     `Integrate Workgraph output ${attemptId}`,
   ]);
-}
-
-export function discardOutput(attempt: AttemptRecord, reason: string): AttemptRecord {
-  if (reason.trim().length === 0)
-    throw new GitError("discard output", "Discard requires an explicit reason.");
-  const repository = requiredRepository(attempt);
-  if (repository.output === "discarded") return attempt;
-  if (repository.output === "applied")
-    throw new GitError("discard output", "Applied output cannot be discarded.");
-  if (repository.outputRef.length > 0) {
-    const current = optionalGitDir(repository.commonDir, [
-      "rev-parse",
-      "--verify",
-      repository.outputRef,
-    ]);
-    if (current !== undefined && repository.candidateRevision !== current)
-      throw new GitError("discard output", "Private output ref does not match the Attempt.");
-  }
-  removeWorktree(repository.checkoutRoot, repository.worktreePath, true);
-  gitDir(repository.commonDir, ["update-ref", "-d", repository.outputRef], true);
-  return { ...attempt, repository: { ...repository, output: "discarded" } };
-}
-
-function releaseApplied(attempt: AttemptRecord): AttemptRecord {
-  const repository = requiredRepository(attempt);
-  gitDir(repository.commonDir, ["update-ref", "-d", repository.outputRef], true);
-  return { ...attempt, repository: { ...repository, output: "applied" } };
-}
-function requiredRepository(attempt: AttemptRecord): NonNullable<AttemptRecord["repository"]> {
-  if (attempt.repository === undefined)
-    throw new GitError("inspect output", "Attempt has no repository output.");
-  return attempt.repository;
 }
 function removeWorktree(checkoutRoot: string, path: string, force = false): void {
   try {
@@ -266,13 +227,6 @@ function git(cwd: string, args: string[], allowEmpty = false): string {
 function gitDir(commonDir: string, args: string[], allowEmpty = false): string {
   return command([`--git-dir=${commonDir}`, ...args], allowEmpty);
 }
-function optionalGitDir(commonDir: string, args: string[]): string | undefined {
-  try {
-    return gitDir(commonDir, args);
-  } catch {
-    return undefined;
-  }
-}
 function command(args: string[], allowEmpty = false): string {
   try {
     const output = execFileSync("git", args, {
@@ -282,6 +236,9 @@ function command(args: string[], allowEmpty = false): string {
     if (!allowEmpty && output.length === 0) throw new Error("Git returned no output.");
     return output;
   } catch (cause) {
-    throw new GitError(args.join(" "), "Git operation failed.", cause);
+    throw error(args.join(" "), "Git operation failed.", cause);
   }
+}
+function error(operation: string, message: string, cause?: unknown): GitError {
+  return new GitError({ operation, message, cause });
 }
