@@ -1,6 +1,6 @@
 /* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion, typescript/no-floating-promises, typescript/require-array-sort-compare -- focused tests inspect native SQLite row shapes through node:sqlite's open row type. */
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -82,6 +82,7 @@ test("record schemas reject superseded mutable and chronological fields", () => 
 test("RecordStore creates one exact database lazily", () => {
   const { root, cleanup } = fixture();
   try {
+    chmodSync(root, 0o751);
     const store = new RecordStore(root, "session-a");
     assert.equal(existsSync(store.path), false);
     assert.deepEqual(store.listTasks(0, 10), []);
@@ -92,6 +93,7 @@ test("RecordStore creates one exact database lazily", () => {
     store.createTaskWithAttempt("task", directoryTask, "attempt-a", directorySpec);
     assert.equal(store.path, join(root, "workgraph", "workgraph.sqlite"));
     assert.equal(existsSync(store.path), true);
+    assert.equal(statSync(root).mode & 0o777, 0o751);
     store.close();
 
     const database = new DatabaseSync(join(root, "workgraph", "workgraph.sqlite"), {
@@ -201,10 +203,6 @@ test("Task and initial Attempt are atomic and focused checkpoints preserve the s
       worker: worker({ agent: "ready", kickoff: "confirmed" }),
       output: { kind: "no_output" },
     });
-    assert.throws(
-      () => store.checkpointWorker("global-attempt", worker({ agent: "uncertain" })),
-      StoreError,
-    );
     store.close();
   } finally {
     cleanup();

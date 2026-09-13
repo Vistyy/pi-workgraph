@@ -132,7 +132,6 @@ export class RecordStore {
     decode(WorkerStateSchema, worker, "Worker state");
     return this.transaction("checkpoint Worker", false, (database) => {
       const prior = this.readAttemptFrom(database, attemptId);
-      if (prior.worker !== undefined) requireMonotonicWorker(prior.worker, worker);
       database
         .prepare("UPDATE attempts SET worker_json=? WHERE attempt_id=? AND session_id=?")
         .run(json(worker), attemptId, this.sessionId);
@@ -181,7 +180,6 @@ export class RecordStore {
       throw failure("settle cancellation", "Outcome is not cancelled.");
     return this.transaction("settle cancellation", false, (database) => {
       const prior = this.readAttemptFrom(database, attemptId);
-      if (prior.worker !== undefined) requireMonotonicWorker(prior.worker, closedWorker);
       validateOutcome(outcome, this.readTaskFrom(database, prior.taskId).task);
       if (prior.outcome !== undefined)
         throw failure("settle cancellation", "Outcome is already recorded.");
@@ -381,13 +379,6 @@ function initializeOrValidate(database: DatabaseSync): void {
   const version = userVersion(database);
   if (version === 1) return;
   if (version !== 0) throw failure("initialize Store", "Unsupported database schema version.");
-  const count = integer(
-    database.prepare("SELECT count(*) AS value FROM sqlite_schema WHERE type='table'").get() as
-      | Row
-      | undefined,
-    "value",
-  );
-  if (count !== 0) throw failure("initialize Store", "Unversioned database is not empty.");
   database.exec(SCHEMA);
 }
 
@@ -401,7 +392,6 @@ function userVersion(database: DatabaseSync): number {
 
 function privateParent(path: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  chmodSync(dirname(dirname(path)), 0o700);
   chmodSync(dirname(path), 0o700);
 }
 
@@ -414,9 +404,6 @@ function taskRecord(row: Row): TaskRecord {
 
 function validateOutcome(outcome: Outcome, task: Task): void {
   decode(OutcomeSchema, outcome, "Outcome");
-  const keys = outcome.effectiveModels.map((target) => `${target.model}\0${target.thinking}`);
-  if (new Set(keys).size !== keys.length)
-    throw failure("decode Outcome", "Effective models are not ordered-distinct.");
   if (outcome.result.kind !== "reported") return;
   const expected =
     task.contract.kind === "implementation"
@@ -426,38 +413,6 @@ function validateOutcome(outcome: Outcome, task: Task): void {
         : "research";
   if (outcome.result.report.kind !== expected)
     throw failure("decode Outcome", "Report kind does not match its Task.");
-}
-
-function requireMonotonicWorker(prior: WorkerState, next: WorkerState): void {
-  if (prior.sessionFile !== next.sessionFile || prior.workspaceId !== next.workspaceId)
-    throw failure("checkpoint Worker", "Worker identity changed.");
-  if (
-    !advances(
-      prior.tab,
-      next.tab,
-      (left, right) => left.state === "uncertain" || Value.Equal(left, right),
-    )
-  )
-    throw failure("checkpoint Worker", "Worker tab state regressed or changed identity.");
-  if (!advances(prior.agent, next.agent, (left, right) => left === "uncertain" || left === right))
-    throw failure("checkpoint Worker", "Worker agent state regressed.");
-  if (
-    !advances(prior.kickoff, next.kickoff, (left, right) => left === "uncertain" || left === right)
-  )
-    throw failure("checkpoint Worker", "Worker kickoff state regressed.");
-  if (!advances(prior.closing, next.closing, Value.Equal))
-    throw failure("checkpoint Worker", "Worker closing state changed.");
-  if (prior.closed === true && next.closed !== true)
-    throw failure("checkpoint Worker", "Worker closure regressed.");
-}
-
-function advances<A>(
-  prior: A | undefined,
-  next: A | undefined,
-  valid: (left: A, right: A) => boolean,
-): boolean {
-  if (prior === undefined) return true;
-  return next !== undefined && valid(prior, next);
 }
 
 function validateAttemptId(attemptId: string): void {
