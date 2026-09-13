@@ -45,10 +45,10 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       name: "workgraph_plan",
       label: "Workgraph Plan",
       description:
-        "Inspect one current implementation plan or apply one atomic targeted edit. The plan guides work but is not proof of correctness or completion.",
-      promptSnippet: "Inspect or apply one atomic targeted edit to the current plan",
+        "Get, initialize, or update the current 1–9 item implementation TODO. TODO status guides work but is not proof of completion.",
+      promptSnippet: "Get, set, or update the current implementation TODO",
       promptGuidelines: [
-        "Use workgraph_plan to inspect the current plan or apply one atomic targeted edit with stable step IDs; keep local implementation knowledge, steps, and notes current within the inherited assignment, plan statuses are navigation only, not evidence.",
+        "Use workgraph_plan set once to initialize a concise TODO with explicit validation, then get or update it as evidence changes.",
       ],
       parameters: WorkerPlanToolSchema,
       execute(_id, params: WorkerPlanToolInput) {
@@ -74,16 +74,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   pi.on("tool_execution_end", (event, ctx) =>
     Effect.runPromise(
       runtime
-        .observeToolExecution(
-          {
-            toolName: event.toolName,
-            isError: event.isError,
-            cwd: ctx.cwd,
-            active: active(ctx),
-          },
-          modelHost(ctx),
-          execGit,
-        )
+        .observeToolExecution({ toolName: event.toolName, isError: event.isError }, modelHost(ctx))
         .pipe(
           Effect.tap((message) =>
             message === undefined ? Effect.void : Effect.sync(() => pi.sendMessage(message)),
@@ -144,6 +135,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     const snapshot = runtime.workerContext(active(ctx), branch(ctx), runtime.hasPlanTool()).message;
     if (snapshot !== undefined) pi.sendMessage(snapshot);
   });
+  pi.on("before_provider_request", (event) => runtime.rewriteProviderPayload(event.payload));
   pi.on("before_agent_start", (event, ctx) => {
     reconcileWorkerTools();
     const prompt = runtime.workerContext(active(ctx), branch(ctx), false);

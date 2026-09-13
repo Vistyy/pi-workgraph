@@ -17,20 +17,16 @@ export interface WorkerContextIdentity {
   readonly nodeId: string;
 }
 
-const WORKER_PHASE_MESSAGE_TYPE = "pi-workgraph-worker-phase";
+export const EXECUTOR_START_ENTRY = "pi-workgraph-executor-start";
+const EXECUTOR_FAILURE_MESSAGE = "pi-workgraph-executor-failure";
 const WORKER_RECOVERY_MESSAGE_TYPE = "pi-workgraph-worker-recovery";
 const WORKER_OBJECTIVE_MESSAGE_TYPE = "pi-workgraph-objective";
 
-const WorkerContextIdentitySchema = Type.Object({
-  runId: Type.String(),
-  nodeId: Type.String(),
-});
+const WorkerContextIdentitySchema = Type.Object({ runId: Type.String(), nodeId: Type.String() });
+const WorkerMessageContentSchema = Type.String();
 const WorkerContextDetailsSchema = Type.Intersect([
   WorkerContextIdentitySchema,
-  Type.Object({
-    kind: Type.Union([Type.Literal("phase"), Type.Literal("recovery")]),
-    phase: Type.Optional(Type.Union([Type.Literal("guide"), Type.Literal("executor")])),
-  }),
+  Type.Object({ kind: Type.Literal("recovery") }),
 ]);
 type WorkerContextDetails = Static<typeof WorkerContextDetailsSchema>;
 type WorkerContextMessage = Pick<
@@ -45,42 +41,32 @@ const experimentPolicy =
 const consultationPolicy =
   "[WORKGRAPH CONSULTATION ADVISOR POLICY]\nProvide decision-oriented advice only for the assigned question and coordinator-known context. Advice is evidence, not authority, approval, or acceptance. Use read-only project research when useful; do not modify files or delegate another worker. Return one standard research report with material unknowns. Finish with workgraph_report.";
 const reviewPolicy =
-  "[WORKGRAPH REVIEW WORKER POLICY]\nReview only the identified subject and concern. Ordinary result, artifact, and comparison reviews may observe the live project cwd. An exact revision review runs in an owned worktree checked out at the requested SHA; inspect that exact commit with Git (for example git show, git diff, and git ls-tree) and cite that revision in evidence. Do not silently treat live working files as that commit or claim tests against another revision. Execute verification only when it genuinely targets the requested subject. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
+  "[WORKGRAPH REVIEW WORKER POLICY]\nReview only the identified subject and concern. Ordinary result, artifact, and comparison reviews may observe the live project cwd. An exact revision review runs in an owned worktree checked out at the requested SHA; inspect that exact commit with Git and cite that revision in evidence. Do not edit files or delegate another worker. Return evidence and actionable findings; zero findings is valid. Finish with workgraph_report.";
 const guidePolicy =
-  "Inspect the assignment and current isolated worktree. Treat its settled decisions as constraints; ground the local plan in code without replacing the intended solution. If implementation requires choosing an unsettled responsibility owner, retained or removed mechanism, interaction contract, consumer or integration change, end-to-end flow, or failure, ordering, precedence, concurrency, or lifetime behavior, escalate before editing. Return specific contradictions or consequential decisions outside the stated discretion to the coordinator rather than silently resolving them. If the requirement already holds, verify it and report no_change with the inspected base revision and reason; no edit or executor turn is required. If a change is needed, use workgraph_plan with action update to record one concise plan grounded in inspected code. Prefer 5-9 meaningful implementation or verification steps, use fewer for genuinely small work, and retain every explicitly required task. Record the local approach and rationale, concrete risks or unknowns, and meaningful verification. The update assigns stable step IDs. Then make the first useful implementation edit yourself. Recording or revising the plan does not switch models. The first successful edit or observed Git change triggers the executor switch; do not stop or wait for a handoff after planning. Changed work must complete through the executor. Missing plan state does not block truthful implementation, failure, or escalation. If required work crosses the authorized scope, report escalation without editing.";
+  "[WORKGRAPH IMPLEMENTATION GUIDE POLICY]\nInspect the assignment and worktree, treating settled boundaries as constraints. If a change is needed, initialize one concise 1–9 item TODO with workgraph_plan set; each item must state its validation. Make the first useful edit yourself. Executor cutover occurs only after both a valid TODO and a successful direct edit or write, in either order. Failed edits, bash, and Git dirtiness do not count. If no change is needed, report no_change from the guide. Report failure or escalation without editing when appropriate; do not invent consequential design decisions.";
 const executorPolicy =
-  "Continue this same worker trajectory in the isolated worktree and preserve the inherited assignment. Adjust local implementation knowledge and execution steps within its stated discretion; return conflicts with settled decisions or missing consequential decisions to the coordinator rather than redesigning the solution. If later evidence exposes an unsettled responsibility owner, retained or removed mechanism, interaction contract, consumer or integration change, end-to-end flow, or failure, ordering, precedence, concurrency, or lifetime behavior, stop editing and escalate. Inspect the current plan with stable step IDs and independently reconcile it against the worktree. Use workgraph_plan targeted actions only (get, update_overview, update_step, add_step, remove_step): keep the local approach, rationale, risks, step text, statuses, and notes current as evidence changes, but never replace the full plan. Escalate consequential conflicts to the coordinator instead of inferring new scope; the immutable assignment remains authoritative and no schema verifies semantic conformity. When the plan is absent or malformed, do not author replacement direction; continue only with truthful work, report, or escalation and explain that no scope was inferred. Plan statuses are not correctness evidence and unfinished steps do not block a truthful failure or escalation. Complete the bounded assignment and run meaningful verification. For changed code, create exactly one direct commit on the supplied base and leave the worktree clean. If verification establishes no change is needed and the worktree is clean at the supplied base, report no_change with that revision and reason instead. Return workgraph_report with evidence and explicit limitations. Escalate required work beyond the authorized scope.";
+  "[WORKGRAPH IMPLEMENTATION EXECUTOR POLICY]\nContinue the same assignment and worktree. Use workgraph_plan get or update to keep the current TODO accurate; status is navigation, not completion evidence. Do not expand scope or infer consequential design decisions. Complete and verify the bounded change, create exactly one direct commit on the supplied base, leave the worktree clean, and finish with workgraph_report. A changed completion requires a later executor assistant message. Truthful failure or escalation remains valid.";
 
-export function workerSystemPolicy(role: WorkerPolicyRole): string {
+export function workerSystemPolicy(
+  role: WorkerPolicyRole,
+  phase: WorkerPhase = "executor",
+): string {
   if (role === "research") return researchPolicy;
   if (role === "experiment") return experimentPolicy;
   if (role === "consultation") return consultationPolicy;
   if (role === "review") return reviewPolicy;
-  return [
-    "[WORKGRAPH IMPLEMENTATION WORKER POLICY]",
-    "The latest model-visible phase announcement or current-attempt recovery for this exact attempt selects one phase below. Apply only that phase's rules. A later executor announcement or recovery makes earlier guide state historical; phase never replaces or expands the assigned objective.",
-    "[GUIDE PHASE RULES]",
-    guidePolicy,
-    "[EXECUTOR PHASE RULES]",
-    executorPolicy,
-  ].join("\n");
+  return phase === "guide" ? guidePolicy : executorPolicy;
 }
 
-export function phaseActivationMessage(
+export function executorFailureMessage(
   identity: WorkerContextIdentity,
-  phase: WorkerPhase,
+  diagnostic: string,
 ): WorkerContextMessage {
-  const details: WorkerContextDetails = { ...identity, kind: "phase", phase };
   return {
-    customType: WORKER_PHASE_MESSAGE_TYPE,
-    content: [
-      "[WORKGRAPH IMPLEMENTATION PHASE]",
-      `Attempt identity: ${identity.runId}/${identity.nodeId}.`,
-      `Current phase: ${phase}.`,
-      "This exact current-attempt phase announcement supersedes earlier phase announcements for this attempt. It does not replace or expand the assigned objective.",
-    ].join("\n"),
+    customType: EXECUTOR_FAILURE_MESSAGE,
+    content: `[WORKGRAPH EXECUTOR SELECTION FAILED]\n${diagnostic}\nRemain on the guide. Do not make further changed implementation attempts or retry selection automatically. A truthful failed or escalated report remains available.`,
     display: false,
-    details,
+    details: identity,
   };
 }
 
@@ -94,7 +80,6 @@ export function recoveryMessage(input: {
 }): WorkerContextMessage {
   const { identity, mode, phase, objective, planText, warnings } = input;
   const details: WorkerContextDetails = { ...identity, kind: "recovery" };
-  if (mode === "implementation") details.phase = phase;
   return {
     customType: WORKER_RECOVERY_MESSAGE_TYPE,
     content: [
@@ -102,7 +87,6 @@ export function recoveryMessage(input: {
       `Attempt identity: ${identity.runId}/${identity.nodeId}.`,
       `Worker mode: ${mode}.`,
       mode === "implementation" ? `Current phase: ${phase}.` : "",
-      "This bounded snapshot restores operational context that may have left the active transcript. The exact assigned objective remains authoritative; plan state is navigation only and later workgraph_plan tool results supersede it.",
       objectiveText(objective),
       planText ?? "",
       ...warnings,
@@ -118,56 +102,68 @@ export function hasActiveObjective(
   entries: readonly SessionEntry[],
   identity: WorkerContextIdentity,
 ): boolean {
-  return entries.some((entry) => {
-    if (entry.type !== "custom_message") return false;
-    if (entry.customType === WORKER_OBJECTIVE_MESSAGE_TYPE)
-      return isWorkerIdentityData(entry.details, identity);
-    const details = contextDetails(entry.details, identity);
-    return entry.customType === WORKER_RECOVERY_MESSAGE_TYPE && details?.kind === "recovery";
-  });
-}
-
-export function hasActivePhase(
-  entries: readonly SessionEntry[],
-  identity: WorkerContextIdentity,
-  phase: WorkerPhase,
-): boolean {
-  return entries.some((entry) => {
-    if (entry.type !== "custom_message") return false;
-    if (
-      entry.customType !== WORKER_PHASE_MESSAGE_TYPE &&
-      entry.customType !== WORKER_RECOVERY_MESSAGE_TYPE
-    )
-      return false;
-    const details = contextDetails(entry.details, identity);
-    return details?.phase === phase;
-  });
+  return entries.some(
+    (entry) =>
+      entry.type === "custom_message" &&
+      ((entry.customType === WORKER_OBJECTIVE_MESSAGE_TYPE &&
+        isWorkerIdentityData(entry.details, identity)) ||
+        (entry.customType === WORKER_RECOVERY_MESSAGE_TYPE &&
+          contextDetails(entry.details, identity) !== undefined)),
+  );
 }
 
 export function hasActiveRecovery(
   entries: readonly SessionEntry[],
   identity: WorkerContextIdentity,
-  phase: WorkerPhase,
 ): boolean {
-  return entries.some((entry) => {
-    if (entry.type !== "custom_message" || entry.customType !== WORKER_RECOVERY_MESSAGE_TYPE)
-      return false;
-    const details = contextDetails(entry.details, identity);
-    return details?.kind === "recovery" && (details.phase === undefined || details.phase === phase);
-  });
+  return entries.some(
+    (entry) =>
+      entry.type === "custom_message" &&
+      entry.customType === WORKER_RECOVERY_MESSAGE_TYPE &&
+      contextDetails(entry.details, identity) !== undefined,
+  );
+}
+
+export function hasExecutorStart(
+  entries: readonly SessionEntry[],
+  identity: WorkerContextIdentity,
+): boolean {
+  return entries.some(
+    (entry) =>
+      entry.type === "custom" &&
+      entry.customType === EXECUTOR_START_ENTRY &&
+      isWorkerIdentityData(entry.data, identity),
+  );
+}
+
+export function executorFailure(
+  entries: readonly SessionEntry[],
+  identity: WorkerContextIdentity,
+): string | undefined {
+  for (const entry of [...entries].reverse()) {
+    if (
+      entry.type !== "custom_message" ||
+      entry.customType !== EXECUTOR_FAILURE_MESSAGE ||
+      !isWorkerIdentityData(entry.details, identity)
+    )
+      continue;
+    return Value.Check(WorkerMessageContentSchema, entry.content)
+      ? Value.Decode(WorkerMessageContentSchema, entry.content)
+      : "Executor selection failed.";
+  }
+  return undefined;
 }
 
 function objectiveText(objective: WorkerObjectiveRestore): string {
   if (objective.kind === "valid")
-    return ["[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]", objective.content].join("\n");
+    return `[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]\n${objective.content}`;
   if (objective.kind === "malformed")
-    return "[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]\nThe exact current-attempt objective snapshot was malformed and was ignored; do not guess its acceptance or constraints.";
-  return "[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]\nNo exact current-attempt objective snapshot was found; do not infer acceptance, constraints, or authority from mutable operational state.";
+    return "[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]\nThe exact objective snapshot was malformed; do not guess its constraints.";
+  return "[WORKGRAPH CURRENT-ATTEMPT OBJECTIVE]\nNo exact objective snapshot was found; do not infer authority.";
 }
 
 function contextDetails(
-  // SAFETY: Session custom-message details are untrusted input decoded before use.
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Explicit Pi session decode boundary.
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Session custom-message details are decoded here at their external boundary.
   data: unknown,
   identity: WorkerContextIdentity,
 ): WorkerContextDetails | undefined {
@@ -176,8 +172,7 @@ function contextDetails(
   return isWorkerIdentityData(details, identity) ? details : undefined;
 }
 
-// SAFETY: Pi session custom data is untrusted and decoded before identity comparison.
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Shared strict identity decoding owns this Pi session boundary.
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Shared session-entry identity data is decoded here at its external boundary.
 export function isWorkerIdentityData(data: unknown, identity: WorkerContextIdentity): boolean {
   if (!Value.Check(WorkerContextIdentitySchema, data)) return false;
   const decoded = Value.Decode(WorkerContextIdentitySchema, data);

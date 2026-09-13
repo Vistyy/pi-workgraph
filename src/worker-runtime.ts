@@ -1,7 +1,7 @@
 /* oxlint-disable typescript/no-this-alias -- Effect generators retain the runtime owner while yielding host and contract failures. */
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Config, ConfigProvider, Data, DateTime, Effect } from "effect";
-import { type Static, Type } from "typebox";
+import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { ThinkingSchema } from "./domain/model-target.js";
 import {
@@ -14,24 +14,21 @@ import {
   type WorkerSessionMode,
 } from "./domain/report.js";
 import {
+  EXECUTOR_START_ENTRY,
+  executorFailure,
+  executorFailureMessage,
   hasActiveObjective,
-  hasActivePhase,
   hasActiveRecovery,
+  hasExecutorStart,
   isWorkerIdentityData,
-  phaseActivationMessage,
   recoveryMessage,
   type WorkerContextIdentity,
   type WorkerObjectiveRestore,
+  type WorkerPhase,
   type WorkerPolicyRole,
   workerSystemPolicy,
 } from "./worker-context.js";
-import {
-  type PlanRestoreKind,
-  WorkerContractError,
-  type WorkerPlan,
-  WorkerPlanState,
-  type WorkerPlanToolInput,
-} from "./worker-plan.js";
+import { WorkerContractError, WorkerPlanState, type WorkerPlanToolInput } from "./worker-plan.js";
 
 const WorkerEnvironmentConfig = Config.all({
   mode: Config.string("PI_WORKGRAPH_MODE").pipe(Config.withDefault("")),
@@ -53,16 +50,6 @@ const ObjectiveContentSchema = Type.String();
 const ReportToolDetailsSchema = Type.Object({ report: Type.Unknown() });
 const MAX_PLAN_REMINDERS = 2;
 const RECONCILIATION_MESSAGE_TYPE = "pi-workgraph-reconciliation";
-const AttemptStateSchema = Type.Object({
-  runId: Type.String(),
-  nodeId: Type.String(),
-  phase: Type.Optional(Type.Union([Type.Literal("guide"), Type.Literal("executor")])),
-  reminderCount: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_PLAN_REMINDERS })),
-  switchedAt: Type.Optional(Type.String()),
-  switchError: Type.Optional(Type.String()),
-});
-type AttemptState = Static<typeof AttemptStateSchema>;
-
 type WorkerEntry = SessionEntry;
 
 export interface WorkerEnvironment {
@@ -78,11 +65,6 @@ export interface WorkerEnvironment {
 }
 
 export interface WorkerTerminalState {
-  readonly plan?: WorkerPlan | undefined;
-  readonly planStatus: PlanRestoreKind;
-  readonly reminderCount: number;
-  readonly switchedAt?: string | undefined;
-  readonly switchError?: string | undefined;
   readonly continued?: boolean | undefined;
   readonly outcome?: "changed" | "no_change" | undefined;
   readonly baseCommit?: string | undefined;
@@ -93,9 +75,7 @@ class WorkerHostError extends Data.TaggedError("WorkerHostError")<{
   readonly message: string;
   readonly operation: "exec" | "setModel";
 }> {}
-class WorkerGitError extends Data.TaggedError("WorkerGitError")<{
-  readonly message: string;
-}> {}
+class WorkerGitError extends Data.TaggedError("WorkerGitError")<{ readonly message: string }> {}
 type WorkerExpectedError = WorkerContractError | WorkerHostError | WorkerGitError;
 
 export type WorkerExec = (
@@ -106,7 +86,7 @@ export interface WorkerModelHost {
   selectModel(provider: string, model: string): Promise<"selected" | "missing" | "no_credentials">;
   setThinking(level: string): void;
 }
-type ReconciliationSink = (message: {
+type MessageSink = (message: {
   customType: string;
   content: string;
   display: false;
@@ -134,56 +114,52 @@ export const WorkerEnvironmentEffect = Effect.gen(function* () {
 
 export class WorkerRuntime {
   private readonly identity: WorkerContextIdentity;
-  private readonly systemPolicy: string;
   private readonly plan: WorkerPlanState;
-  private phase: "guide" | "executor";
+  private phase: WorkerPhase;
+  private directEditSeen = false;
   private reminderCount = 0;
   private terminal = false;
-  private switchError: string | undefined;
-  private switchedAt: string | undefined;
-  private stateWarning: string | undefined;
+  private cutoverFailure: string | undefined;
   private disabledTools = new Set<string>();
 
   constructor(
     private readonly environment: WorkerEnvironment,
-    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Pi owns the custom-entry sink; runtime methods supply schema-owned records.
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Pi custom-entry data is the external persistence sink.
     private readonly appendEntry: (customType: string, data: unknown) => void,
   ) {
     this.identity = { runId: environment.runId, nodeId: environment.nodeId };
-    this.systemPolicy = workerSystemPolicy(environment.policyRole);
     this.phase =
       environment.mode === "implementation" && !environment.continued ? "guide" : "executor";
-    this.plan = new WorkerPlanState(this.identity, appendEntry);
+    this.plan = new WorkerPlanState(this.identity);
   }
 
   hasPlanTool(): boolean {
     return this.environment.mode === "implementation";
   }
-
   reportParameters() {
     return reportSchemaForMode(this.environment.mode);
   }
-
   executePlan(input: WorkerPlanToolInput) {
-    return this.plan.execute(input, this.phase);
+    return this.plan.execute(input);
   }
 
   restoreSession(branch: readonly WorkerEntry[], configuredDisabledTools: readonly string[]): void {
     this.disabledTools = new Set(configuredDisabledTools);
+    this.plan.restore(branch);
     this.phase =
       this.environment.mode === "implementation" && !this.environment.continued
         ? "guide"
         : "executor";
-    this.reminderCount = 0;
-    this.switchError = undefined;
-    this.switchedAt = undefined;
+    if (hasExecutorStart(branch, this.identity)) this.phase = "executor";
+    this.cutoverFailure = executorFailure(branch, this.identity);
+    this.directEditSeen = hasSuccessfulDirectEdit(branch, this.identity);
+    this.reminderCount = branch.filter(
+      (entry) =>
+        entry.type === "custom_message" &&
+        entry.customType === RECONCILIATION_MESSAGE_TYPE &&
+        isWorkerIdentityData(entry.details, this.identity),
+    ).length;
     this.terminal = this.hasTerminalReport(branch);
-    const attempt = this.latestAttemptState(branch);
-    this.stateWarning = attempt.malformed
-      ? "The latest current-attempt worker state was malformed and was ignored; continue conservatively and report the limitation."
-      : undefined;
-    if (attempt.state !== undefined) this.reattachAttemptState(attempt.state);
-    this.plan.restore(branch);
   }
 
   allowedTools(activeTools: readonly string[]): string[] {
@@ -191,118 +167,92 @@ export class WorkerRuntime {
   }
 
   isToolDisabled(name: string): boolean {
-    // Keep editing tools for implementation and authorized research experiments.
-    // This filters model tool availability; bash remains available and is not sandboxed.
     const readOnly =
       this.environment.mode !== "implementation" &&
       !(this.environment.mode === "research" && this.environment.experiment);
-    return this.disabledTools.has(name) || (readOnly && (name === "edit" || name === "write"));
+    const cutoverBlocked =
+      this.cutoverFailure !== undefined && (name === "edit" || name === "write");
+    return (
+      this.disabledTools.has(name) ||
+      cutoverBlocked ||
+      (readOnly && (name === "edit" || name === "write"))
+    );
   }
 
   observeToolExecution(
-    input: {
-      readonly toolName: string;
-      readonly isError: boolean;
-      readonly cwd: string;
-      readonly active: readonly SessionEntry[];
-    },
+    input: { readonly toolName: string; readonly isError: boolean },
     host: WorkerModelHost,
-    exec: WorkerExec,
   ) {
     const self = this;
     return Effect.gen(function* () {
-      if (self.environment.mode !== "implementation" || self.phase !== "guide") return undefined;
-      const directEdit =
-        !input.isError && (input.toolName === "edit" || input.toolName === "write");
-      if (!directEdit) {
-        if (self.environment.baseCommit.length === 0) return undefined;
-        const status = yield* gitEffect(
-          exec,
-          input.cwd,
-          ["status", "--porcelain", "--untracked-files=all"],
-          true,
-        );
-        if (
-          status.length === 0 &&
-          (yield* gitEffect(exec, input.cwd, ["rev-parse", "HEAD"])) === self.environment.baseCommit
-        )
-          return undefined;
-      }
+      if (
+        self.environment.mode !== "implementation" ||
+        self.phase !== "guide" ||
+        self.cutoverFailure !== undefined
+      )
+        return undefined;
+      if (!input.isError && (input.toolName === "edit" || input.toolName === "write"))
+        self.directEditSeen = true;
+      if (!self.directEditSeen || self.plan.todos === undefined) return undefined;
       yield* selectExecutor(self.environment, host);
+      yield* Effect.try({
+        try: () => self.appendEntry(EXECUTOR_START_ENTRY, self.identity),
+        catch: () =>
+          new WorkerHostError({
+            operation: "setModel",
+            message: "Pi could not persist executor start.",
+          }),
+      });
       self.phase = "executor";
-      self.switchError = undefined;
-      self.switchedAt = DateTime.formatIso(yield* DateTime.now);
-      self.appendWorkerState();
-      return self.currentPhaseActivation(input.active);
+      return undefined;
     }).pipe(
       Effect.catch((error: WorkerExpectedError) =>
         Effect.sync(() => {
-          self.switchError = error.message;
-          self.appendWorkerState();
-          return undefined;
+          self.cutoverFailure = error.message;
+          return executorFailureMessage(self.identity, error.message);
         }),
       ),
     );
   }
 
-  private appendWorkerState(): void {
-    const state: AttemptState = {
-      ...this.identity,
-      phase: this.phase,
-      reminderCount: this.reminderCount,
-    };
-    if (this.switchedAt !== undefined) state.switchedAt = this.switchedAt;
-    if (this.switchError !== undefined) state.switchError = this.switchError;
-    this.appendEntry("pi-workgraph-worker-state", state);
-  }
-
-  // Session order, not model selection or wall-clock time, proves a later generation.
-  // Pi drains the current assistant message before tool preflight/execution.
   hasExecutorMessage(entries: readonly WorkerEntry[]): boolean {
-    const boundary = entries.findIndex((entry) => {
-      if (entry.type !== "custom") return false;
-      const data = this.decodeAttemptState(entry.data);
-      if (data === undefined || !this.isCurrentAttemptData(data)) return false;
-      return this.environment.continued
-        ? entry.customType === "pi-workgraph-agent-running"
-        : entry.customType === "pi-workgraph-worker-state" &&
-            data.phase === "executor" &&
-            data.switchedAt !== undefined;
-    });
+    const boundary = entries.findIndex(
+      (entry) =>
+        entry.type === "custom" &&
+        (this.environment.continued
+          ? entry.customType === "pi-workgraph-agent-running"
+          : entry.customType === EXECUTOR_START_ENTRY) &&
+        isWorkerIdentityData(entry.data, this.identity),
+    );
     return (
       boundary >= 0 &&
-      entries.slice(boundary + 1).some((entry) => {
-        if (entry.type !== "message") return false;
-        const message = entry.message;
-        return (
-          message.role === "assistant" &&
-          `${message.provider}/${message.model}` === this.environment.executorModel &&
-          !["error", "aborted", "pending"].includes(message.stopReason ?? "")
-        );
-      })
+      entries
+        .slice(boundary + 1)
+        .some(
+          (entry) =>
+            entry.type === "message" &&
+            entry.message.role === "assistant" &&
+            `${entry.message.provider}/${entry.message.model}` === this.environment.executorModel &&
+            !["error", "aborted", "pending"].includes(entry.message.stopReason ?? ""),
+        )
     );
   }
 
-  private scheduleReconciliation(send: ReconciliationSink): boolean {
+  private scheduleReconciliation(send: MessageSink): boolean {
     if (
       this.environment.mode !== "implementation" ||
       this.phase !== "executor" ||
       this.terminal ||
-      !this.plan.hasActionableSteps() ||
+      !this.plan.hasActionableItems() ||
       this.reminderCount >= MAX_PLAN_REMINDERS
     )
       return false;
     this.reminderCount += 1;
-    this.appendWorkerState();
     send({
       customType: RECONCILIATION_MESSAGE_TYPE,
-      content: [
-        `[WORKGRAPH RECONCILIATION REMINDER ${this.reminderCount}/${MAX_PLAN_REMINDERS}]`,
-        "The executor settled without a terminal report while the current plan still has actionable steps.",
-        "Inspect the worktree and current-attempt snapshot, then continue useful work or report truthful failure or escalation. Do not treat plan status as evidence or a completion gate.",
-      ].join("\n"),
+      content: `[WORKGRAPH TODO SETTLE REMINDER ${this.reminderCount}/${MAX_PLAN_REMINDERS}]\nThe executor settled without a terminal report while the TODO remains actionable. Continue useful work or report truthfully; TODO status is not a completion gate.`,
       display: false,
-      details: { ...this.identity, reminderCount: this.reminderCount },
+      details: this.identity,
     });
     return true;
   }
@@ -319,7 +269,7 @@ export class WorkerRuntime {
     });
   }
 
-  settleAgent(send: ReconciliationSink): void {
+  settleAgent(send: MessageSink): void {
     if (this.scheduleReconciliation(send)) return;
     this.appendEntry("pi-workgraph-agent-settled", {
       ...this.identity,
@@ -332,40 +282,50 @@ export class WorkerRuntime {
     branch: readonly WorkerEntry[],
     afterCompaction: boolean,
   ) {
-    const recovery = this.currentRecovery(active, branch, afterCompaction);
     return {
-      systemPolicy: this.systemPolicy,
-      message: afterCompaction ? recovery : (recovery ?? this.currentPhaseActivation(active)),
+      systemPolicy: workerSystemPolicy(this.environment.policyRole, this.phase),
+      message: afterCompaction ? this.currentRecovery(active, branch) : undefined,
     };
   }
 
-  private currentRecovery(
-    active: readonly SessionEntry[],
-    branch: readonly WorkerEntry[],
-    restorePlan: boolean,
-  ) {
-    if (hasActiveRecovery(active, this.identity, this.phase)) return undefined;
+  // Provider payloads represent system instructions differently. Replace only the
+  // package-owned exact policy string wherever that boundary serialized it.
+  /* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-runtime-typeof -- Provider payload traversal is the external provider-shape boundary. */
+  rewriteProviderPayload(payload: unknown): unknown {
+    if (this.environment.mode !== "implementation") return payload;
+    const current = workerSystemPolicy(this.environment.policyRole, this.phase);
+    const guide = workerSystemPolicy(this.environment.policyRole, "guide");
+    const executor = workerSystemPolicy(this.environment.policyRole, "executor");
+    const visit = (value: unknown): unknown => {
+      if (typeof value === "string")
+        return value.replace(guide, current).replace(executor, current);
+      if (Array.isArray(value)) return value.map(visit);
+      if (typeof value !== "object" || value === null) return value;
+      return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, visit(child)]));
+    };
+    return visit(payload);
+  }
+  /* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-runtime-typeof */
+
+  private currentRecovery(active: readonly SessionEntry[], branch: readonly WorkerEntry[]) {
+    if (hasActiveRecovery(active, this.identity)) return undefined;
     const objective = this.latestAttemptObjective(branch);
-    const needsObjective = !hasActiveObjective(active, this.identity) || objective.kind !== "valid";
-    const hasWarning = this.plan.warning !== undefined || this.stateWarning !== undefined;
-    if (!restorePlan && !needsObjective && !hasWarning) return undefined;
+    if (
+      hasActiveObjective(active, this.identity) &&
+      objective.kind === "valid" &&
+      this.environment.mode !== "implementation"
+    )
+      return undefined;
     const recovery = {
       identity: this.identity,
       mode: this.environment.mode,
       phase: this.phase,
       objective,
-      warnings: [this.plan.warning, this.stateWarning],
+      warnings: [this.cutoverFailure],
     };
     return this.environment.mode === "implementation"
-      ? recoveryMessage({ ...recovery, planText: this.plan.text(this.phase) })
+      ? recoveryMessage({ ...recovery, planText: this.plan.text() })
       : recoveryMessage(recovery);
-  }
-
-  private currentPhaseActivation(active: readonly SessionEntry[]) {
-    if (this.environment.mode !== "implementation") return undefined;
-    return hasActivePhase(active, this.identity, this.phase)
-      ? undefined
-      : phaseActivationMessage(this.identity, this.phase);
   }
 
   completeReport(
@@ -378,13 +338,8 @@ export class WorkerRuntime {
     return Effect.gen(function* () {
       if (!isWorkerReportInput(params) || params.kind !== self.environment.mode)
         return yield* contractFailure(`Report must satisfy the ${self.environment.mode} contract.`);
-      if (params.kind !== "implementation" || params.status !== "completed") {
-        // Read-only is an instruction and authority boundary, not a filesystem sandbox.
-        // Shared research and non-revision review deliberately observe the live project cwd,
-        // including tracked and untracked local changes. Exact-revision review is launched in
-        // an owned worktree at its requested SHA; do not confuse either cwd with another revision.
+      if (params.kind !== "implementation" || params.status !== "completed")
         return terminalReport(params, self.terminalState());
-      }
       if (params.outcome === "no_change")
         return yield* self.noChangeImplementationReport(cwd, params, exec);
       return yield* self.changedImplementationReport(
@@ -393,7 +348,13 @@ export class WorkerRuntime {
         self.hasExecutorMessage(branch),
         exec,
       );
-    }).pipe(Effect.tap(() => Effect.sync(() => (self.terminal = true))));
+    }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          self.terminal = true;
+        }),
+      ),
+    );
   }
 
   private noChangeImplementationReport(
@@ -412,10 +373,6 @@ export class WorkerRuntime {
           `No-change implementation must report the unchanged base revision ${self.environment.baseCommit}.`,
         );
       return terminalReport(report, {
-        plan: self.plan.plan,
-        planStatus: self.plan.status,
-        reminderCount: self.reminderCount,
-        switchedAt: self.switchedAt,
         continued: self.environment.continued,
         outcome: "no_change",
         baseCommit: self.environment.baseCommit,
@@ -434,62 +391,31 @@ export class WorkerRuntime {
     return Effect.gen(function* () {
       if (self.phase !== "executor")
         return yield* contractFailure(
-          "Completed changed implementation requires the first-edit model transition.",
+          "Completed changed implementation requires guide-to-executor cutover.",
         );
-      if (self.switchError !== undefined)
-        return yield* contractFailure(`Executor model transition failed: ${self.switchError}`);
       if (!hasExecutorMessage)
         return yield* contractFailure(
-          "Completed changed implementation requires an actual executor assistant message after this attempt's transition/start. Continue with the executor before reporting.",
+          "Completed changed implementation requires an actual executor assistant message after this attempt's executor start.",
         );
       if (self.environment.baseCommit.length === 0)
         return yield* contractFailure("PI_WORKGRAPH_BASE_COMMIT is required.");
       const provenance = yield* changedCommitProvenance(exec, cwd, self.environment.baseCommit);
-      return terminalReport(
-        { ...report, ...provenance },
-        {
-          plan: self.plan.plan,
-          planStatus: self.plan.status,
-          reminderCount: self.reminderCount,
-          switchedAt: self.switchedAt,
-          continued: self.environment.continued,
-          outcome: "changed",
-        },
-      );
+      return terminalReport({ ...report, ...provenance }, self.terminalState());
     });
   }
 
   private terminalState(): WorkerTerminalState {
-    return {
-      plan: this.plan.plan,
-      planStatus: this.plan.status,
-      reminderCount: this.reminderCount,
-      switchedAt: this.switchedAt,
-      switchError: this.switchError,
-    };
-  }
-
-  private latestAttemptState(
-    entries: readonly WorkerEntry[],
-  ):
-    | { readonly state: AttemptState; readonly malformed: false }
-    | { readonly state: undefined; readonly malformed: boolean } {
-    for (const entry of [...entries].reverse()) {
-      if (entry.type !== "custom" || entry.customType !== "pi-workgraph-worker-state") continue;
-      if (!this.isCurrentAttemptData(entry.data)) continue;
-      const attempt = this.decodeAttemptState(entry.data);
-      return attempt === undefined
-        ? { state: undefined, malformed: true }
-        : { state: attempt, malformed: false };
-    }
-    return { state: undefined, malformed: false };
+    return { continued: this.environment.continued };
   }
 
   private latestAttemptObjective(entries: readonly WorkerEntry[]): WorkerObjectiveRestore {
     for (const entry of [...entries].reverse()) {
-      if (entry.type !== "custom_message" || entry.customType !== "pi-workgraph-objective")
+      if (
+        entry.type !== "custom_message" ||
+        entry.customType !== "pi-workgraph-objective" ||
+        !isWorkerIdentityData(entry.details, this.identity)
+      )
         continue;
-      if (!this.isCurrentAttemptData(entry.details)) continue;
       if (!Value.Check(ObjectiveContentSchema, entry.content)) return { kind: "malformed" };
       return { kind: "valid", content: Value.Decode(ObjectiveContentSchema, entry.content) };
     }
@@ -501,37 +427,44 @@ export class WorkerRuntime {
       (entry) =>
         entry.type === "custom_message" &&
         entry.customType === "pi-workgraph-objective" &&
-        this.isCurrentAttemptData(entry.details),
+        isWorkerIdentityData(entry.details, this.identity),
     );
     if (boundary < 0) return false;
     return entries.slice(boundary + 1).some((entry) => {
-      if (entry.type !== "message") return false;
-      const message = entry.message;
-      if (message.role !== "toolResult") return false;
-      if (message.toolName !== "workgraph_report" || message.isError === true) return false;
-      if (!Value.Check(ReportToolDetailsSchema, message.details)) return false;
-      return isWorkerReport(Value.Decode(ReportToolDetailsSchema, message.details).report);
+      if (
+        entry.type !== "message" ||
+        entry.message.role !== "toolResult" ||
+        entry.message.toolName !== "workgraph_report" ||
+        entry.message.isError === true
+      )
+        return false;
+      return (
+        Value.Check(ReportToolDetailsSchema, entry.message.details) &&
+        isWorkerReport(Value.Decode(ReportToolDetailsSchema, entry.message.details).report)
+      );
     });
   }
+}
 
-  private reattachAttemptState(attempt: AttemptState): void {
-    if (attempt.reminderCount !== undefined) this.reminderCount = attempt.reminderCount;
-    if (attempt.switchedAt !== undefined) this.switchedAt = attempt.switchedAt;
-    if (attempt.phase === "executor") this.phase = "executor";
-    if (attempt.switchError !== undefined) this.switchError = attempt.switchError;
-  }
-
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The strict attempt-state schema decodes this Pi session boundary.
-  private decodeAttemptState(data: unknown): AttemptState | undefined {
-    return Value.Check(AttemptStateSchema, data)
-      ? Value.Decode(AttemptStateSchema, data)
-      : undefined;
-  }
-
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Shared strict identity decoding owns this Pi session boundary.
-  private isCurrentAttemptData(data: unknown): boolean {
-    return isWorkerIdentityData(data, this.identity);
-  }
+function hasSuccessfulDirectEdit(
+  entries: readonly WorkerEntry[],
+  identity: WorkerContextIdentity,
+): boolean {
+  const objective = entries.findLastIndex(
+    (entry) =>
+      entry.type === "custom_message" &&
+      entry.customType === "pi-workgraph-objective" &&
+      isWorkerIdentityData(entry.details, identity),
+  );
+  return entries
+    .slice(objective + 1)
+    .some(
+      (entry) =>
+        entry.type === "message" &&
+        entry.message.role === "toolResult" &&
+        (entry.message.toolName === "edit" || entry.message.toolName === "write") &&
+        entry.message.isError !== true,
+    );
 }
 
 function selectExecutor(environment: WorkerEnvironment, host: WorkerModelHost) {
@@ -539,6 +472,8 @@ function selectExecutor(environment: WorkerEnvironment, host: WorkerModelHost) {
     const slash = environment.executorModel.indexOf("/");
     if (slash <= 0)
       return yield* contractFailure(`Invalid executor model: ${environment.executorModel}`);
+    if (!Value.Check(ThinkingSchema, environment.executorThinking))
+      return yield* contractFailure(`Invalid executor thinking: ${environment.executorThinking}`);
     const selected = yield* Effect.tryPromise({
       try: () =>
         host.selectModel(
@@ -557,9 +492,14 @@ function selectExecutor(environment: WorkerEnvironment, host: WorkerModelHost) {
           ? `Executor model is unavailable: ${environment.executorModel}`
           : `Executor model has no usable credentials: ${environment.executorModel}`,
       );
-    if (!Value.Check(ThinkingSchema, environment.executorThinking))
-      return yield* contractFailure(`Invalid executor thinking: ${environment.executorThinking}`);
-    host.setThinking(environment.executorThinking);
+    yield* Effect.try({
+      try: () => host.setThinking(environment.executorThinking),
+      catch: () =>
+        new WorkerHostError({
+          operation: "setModel",
+          message: `Pi could not select executor thinking: ${environment.executorThinking}`,
+        }),
+    });
   });
 }
 
@@ -636,9 +576,7 @@ function gitEffect(exec: WorkerExec, cwd: string, args: string[], allowEmpty = f
       });
     const output = result.stdout.trim();
     if (!allowEmpty && output.length === 0)
-      return yield* new WorkerGitError({
-        message: `git ${args.join(" ")} returned no output.`,
-      });
+      return yield* new WorkerGitError({ message: `git ${args.join(" ")} returned no output.` });
     return output;
   });
 }

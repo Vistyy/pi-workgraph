@@ -95,64 +95,34 @@ function assertPrefix(requests: readonly ControlledRequest[]): void {
   }
 }
 
-void test("real Pi worker preserves provider prefix and performs guide-to-executor handoff", async () => {
+void test("real Pi worker performs the TODO-gated guide-to-executor handoff", async () => {
   const f = await fixture();
   const provider = await startControlledProvider([
     (request) => {
       assert.equal(request.model, "guide");
-      assert.match(request.raw, /\[WORKGRAPH IMPLEMENTATION WORKER POLICY\]/);
-      assert.ok(
-        request.messages.some((message) =>
-          JSON.stringify(message).includes("Current phase: guide."),
-        ),
-      );
+      assert.match(request.raw, /IMPLEMENTATION GUIDE POLICY/);
+      assert.doesNotMatch(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
       return {
         tool: {
           id: "plan-call",
           name: "workgraph_plan",
           arguments: {
-            action: "update",
-            plan: {
-              approach: "Make the one authorized fixture edit.",
-              rationale: "Exercise the real worker handoff.",
-              risks: "The provider must not receive a second synthetic prefix.",
-              steps: [{ text: "Write and commit value.txt.", status: "pending" }],
-            },
+            action: "set",
+            todos: [
+              {
+                id: "change",
+                text: "Make the authorized fixture edit.",
+                validation: "value.txt contains after followed by one newline.",
+                status: "pending",
+              },
+            ],
           },
         },
       };
     },
     (request) => {
       assert.equal(request.model, "guide");
-      const result = request.messages.find((message) =>
-        JSON.stringify(message).includes('"tool_call_id":"plan-call"'),
-      );
-      if (result === undefined)
-        throw new Error("Initial plan tool result did not reach the next request.");
-      assert.match(JSON.stringify(result), /Make the one authorized fixture edit/);
-      return {
-        tool: {
-          id: "targeted-plan-call",
-          name: "workgraph_plan",
-          arguments: {
-            action: "update_step",
-            id: "step-1",
-            patch: {
-              status: "in_progress",
-              note: "Targeted update crossed a real tool-result boundary.",
-            },
-          },
-        },
-      };
-    },
-    (request) => {
-      assert.equal(request.model, "guide");
-      const result = request.messages.find((message) =>
-        JSON.stringify(message).includes('"tool_call_id":"targeted-plan-call"'),
-      );
-      if (result === undefined)
-        throw new Error("Targeted plan result did not reach the next request.");
-      assert.match(JSON.stringify(result), /Targeted update crossed a real tool-result boundary/);
+      assert.match(JSON.stringify(request.messages), /value\.txt contains after/);
       return {
         tool: {
           id: "write-call",
@@ -163,75 +133,8 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
     },
     (request) => {
       assert.equal(request.model, "executor");
-      assert.ok(
-        request.messages.some((message) =>
-          JSON.stringify(message).includes("Current phase: executor."),
-        ),
-      );
-      return {
-        tool: {
-          id: "overview-call",
-          name: "workgraph_plan",
-          arguments: {
-            action: "update_overview",
-            patch: {
-              approach: "Commit the observed authorized edit and report its direct evidence.",
-              rationale:
-                "The first edit confirmed the fixture path without changing assignment scope.",
-              risks: "Mutable implementation knowledge must append without rewriting the prefix.",
-            },
-          },
-        },
-      };
-    },
-    (request) => {
-      assert.equal(request.model, "executor");
-      const result = request.messages.find((message) =>
-        JSON.stringify(message).includes('"tool_call_id":"overview-call"'),
-      );
-      if (result === undefined)
-        throw new Error("Executor overview result did not reach the next request.");
-      assert.match(JSON.stringify(result), /without rewriting the prefix/);
-      return {
-        tool: {
-          id: "add-step-call",
-          name: "workgraph_plan",
-          arguments: {
-            action: "add_step",
-            text: "Confirm the committed fixture bytes.",
-          },
-        },
-      };
-    },
-    (request) => {
-      assert.equal(request.model, "executor");
-      const result = request.messages.find((message) =>
-        JSON.stringify(message).includes('"tool_call_id":"add-step-call"'),
-      );
-      if (result === undefined)
-        throw new Error("Added step result did not reach the next request.");
-      assert.match(JSON.stringify(result), /step-2 pending/);
-      return {
-        tool: {
-          id: "remove-step-call",
-          name: "workgraph_plan",
-          arguments: {
-            action: "remove_step",
-            id: "step-2",
-            reason:
-              "The existing verification evidence already covers this separate navigation row.",
-          },
-        },
-      };
-    },
-    (request) => {
-      assert.equal(request.model, "executor");
-      const result = request.messages.find((message) =>
-        JSON.stringify(message).includes('"tool_call_id":"remove-step-call"'),
-      );
-      if (result === undefined)
-        throw new Error("Removed step result did not reach the next request.");
-      assert.doesNotMatch(JSON.stringify(result), /step-2 pending/);
+      assert.match(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
+      assert.doesNotMatch(request.raw, /IMPLEMENTATION GUIDE POLICY/);
       return {
         tool: {
           id: "commit-call",
@@ -240,23 +143,20 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
         },
       };
     },
-    (request) => {
-      assert.equal(request.model, "executor");
-      return {
-        tool: {
-          id: "report-call",
-          name: "workgraph_report",
-          arguments: {
-            kind: "implementation",
-            status: "completed",
-            outcome: "changed",
-            summary: "Changed value.txt through the executor.",
-            evidence: [{ label: "bytes", observation: "value.txt contains after newline." }],
-            findings: [],
-          },
+    () => ({
+      tool: {
+        id: "report-call",
+        name: "workgraph_report",
+        arguments: {
+          kind: "implementation",
+          status: "completed",
+          outcome: "changed",
+          summary: "Changed value.txt through the executor.",
+          evidence: [{ label: "bytes", observation: "value.txt contains after newline." }],
+          findings: [],
         },
-      };
-    },
+      },
+    }),
   ]);
   let session: ReturnType<typeof SessionManager.create> | undefined;
   let agent: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
@@ -290,10 +190,7 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
       cwd: f.root,
       agentDir: join(f.parent, "agent"),
       settingsManager: settings,
-      additionalExtensionPaths: [
-        resolve("extensions/coordinator.ts"),
-        resolve("extensions/worker.ts"),
-      ],
+      additionalExtensionPaths: [resolve("extensions/worker.ts")],
       noContextFiles: true,
       noPromptTemplates: true,
       noSkills: true,
@@ -317,51 +214,18 @@ void test("real Pi worker preserves provider prefix and performs guide-to-execut
     agent = created.session;
     await agent.bindExtensions({});
     await promptWithDeadline(agent, "Make the authorized fixture edit.");
-
     provider.assertComplete();
-    assertPrefix(provider.requests);
-    for (const request of provider.requests) {
-      const messages = JSON.stringify(request.messages);
-      assert.doesNotMatch(request.raw, /# Workgraph coordinator/);
-      assert.equal(request.raw.split("[WORKGRAPH IMPLEMENTATION WORKER POLICY]").length - 1, 1);
-      assert.equal(messages.split("Current phase: guide.").length - 1, 1);
-      assert.equal(messages.split("Authorized: change only value.txt").length - 1, 1);
-      assert.equal(
-        messages.split("Current phase: executor.").length - 1,
-        request.model === "executor" ? 1 : 0,
-      );
-      assert.doesNotMatch(messages, /\[WORKGRAPH LOCAL PREWALK - GUIDE\]|\[WORKGRAPH EXECUTOR\]/);
-    }
-    assert.ok(
-      provider.requests.some((request) =>
-        request.messages.some((message) =>
-          JSON.stringify(message).includes("Mutable implementation knowledge must append"),
-        ),
-      ),
-    );
+    assert.equal(provider.requests.length, 4);
     assert.equal(await readFile(join(f.root, "value.txt"), "utf8"), "after\n");
     assert.equal(await git(f.root, "status", "--porcelain"), "");
     assert.equal(await git(f.root, "rev-parse", "HEAD^"), f.base);
-    const report = session
-      .getBranch()
-      .findLast(
-        (entry) =>
-          entry.type === "message" &&
-          entry.message.role === "toolResult" &&
-          entry.message.toolName === "workgraph_report" &&
-          !entry.message.isError,
-      );
-    assert.ok(report?.type === "message");
-    assert.match(JSON.stringify(report), /Changed value\.txt through the executor/);
-    assert.ok(
+    assert.equal(
       session
         .getBranch()
-        .some(
-          (entry) =>
-            entry.type === "custom" &&
-            entry.customType === "pi-workgraph-worker-state" &&
-            JSON.stringify(entry.data).includes('"phase":"executor"'),
-        ),
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-executor-start",
+        ).length,
+      1,
     );
   } finally {
     await agent?.abort();
