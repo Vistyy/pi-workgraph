@@ -83,6 +83,7 @@ export type WorkerExec = (
   args: string[],
 ) => Promise<{ code: number; stdout: string; stderr: string }>;
 export interface WorkerModelHost {
+  isSelected(model: string, thinking: string): boolean;
   selectModel(provider: string, model: string): Promise<"selected" | "missing" | "no_credentials">;
   setThinking(level: string): void;
 }
@@ -183,17 +184,26 @@ export class WorkerRuntime {
     input: { readonly toolName: string; readonly isError: boolean },
     host: WorkerModelHost,
   ) {
+    if (!input.isError && (input.toolName === "edit" || input.toolName === "write"))
+      this.directEditSeen = true;
+    return this.cutover(host);
+  }
+
+  recoverCutover(host: WorkerModelHost) {
+    return this.cutover(host);
+  }
+
+  private cutover(host: WorkerModelHost) {
     const self = this;
     return Effect.gen(function* () {
       if (
         self.environment.mode !== "implementation" ||
         self.phase !== "guide" ||
-        self.cutoverFailure !== undefined
+        self.cutoverFailure !== undefined ||
+        !self.directEditSeen ||
+        self.plan.todos === undefined
       )
         return undefined;
-      if (!input.isError && (input.toolName === "edit" || input.toolName === "write"))
-        self.directEditSeen = true;
-      if (!self.directEditSeen || self.plan.todos === undefined) return undefined;
       yield* selectExecutor(self.environment, host);
       yield* Effect.try({
         try: () => self.appendEntry(EXECUTOR_START_ENTRY, self.identity),
@@ -288,24 +298,20 @@ export class WorkerRuntime {
     };
   }
 
-  // Provider payloads represent system instructions differently. Replace only the
-  // package-owned exact policy string wherever that boundary serialized it.
-  /* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-runtime-typeof -- Provider payload traversal is the external provider-shape boundary. */
+  // Pi's provider boundary is a JSON request body. Replace only the exact
+  // package-owned policy after provider serialization has chosen its shape.
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- The provider request body is the external unknown boundary.
   rewriteProviderPayload(payload: unknown): unknown {
     if (this.environment.mode !== "implementation") return payload;
-    const current = workerSystemPolicy(this.environment.policyRole, this.phase);
-    const guide = workerSystemPolicy(this.environment.policyRole, "guide");
-    const executor = workerSystemPolicy(this.environment.policyRole, "executor");
-    const visit = (value: unknown): unknown => {
-      if (typeof value === "string")
-        return value.replace(guide, current).replace(executor, current);
-      if (Array.isArray(value)) return value.map(visit);
-      if (typeof value !== "object" || value === null) return value;
-      return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, visit(child)]));
-    };
-    return visit(payload);
+    const serialized = JSON.stringify(payload);
+    if (serialized === undefined) return payload;
+    const quoted = (policy: string) => JSON.stringify(policy).slice(1, -1);
+    const current = quoted(workerSystemPolicy(this.environment.policyRole, this.phase));
+    const rewritten = serialized
+      .replace(quoted(workerSystemPolicy(this.environment.policyRole, "guide")), current)
+      .replace(quoted(workerSystemPolicy(this.environment.policyRole, "executor")), current);
+    return rewritten === serialized ? payload : JSON.parse(rewritten);
   }
-  /* oxlint-enable anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-runtime-typeof */
 
   private currentRecovery(active: readonly SessionEntry[], branch: readonly WorkerEntry[]) {
     if (hasActiveRecovery(active, this.identity)) return undefined;
@@ -474,6 +480,7 @@ function selectExecutor(environment: WorkerEnvironment, host: WorkerModelHost) {
       return yield* contractFailure(`Invalid executor model: ${environment.executorModel}`);
     if (!Value.Check(ThinkingSchema, environment.executorThinking))
       return yield* contractFailure(`Invalid executor thinking: ${environment.executorThinking}`);
+    if (host.isSelected(environment.executorModel, environment.executorThinking)) return;
     const selected = yield* Effect.tryPromise({
       try: () =>
         host.selectModel(

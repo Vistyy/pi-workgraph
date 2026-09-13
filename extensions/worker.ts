@@ -22,6 +22,13 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     ctx.sessionManager.buildContextEntries();
   const execGit = (cwd: string, args: string[]) => pi.exec("git", ["-C", cwd, ...args]);
   const modelHost = (ctx: ExtensionContext): WorkerModelHost => ({
+    isSelected(model, thinking) {
+      return (
+        ctx.model !== undefined &&
+        `${ctx.model.provider}/${ctx.model.id}` === model &&
+        pi.getThinkingLevel() === thinking
+      );
+    },
     // oxlint-disable-next-line effecttsgo/async-function -- Pi's native model-selection Promise is adapted at this host boundary.
     async selectModel(provider, modelId) {
       const model = ctx.modelRegistry.find(provider, modelId);
@@ -95,20 +102,20 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       runtime.recordEffectiveModel(`${ctx.model.provider}/${ctx.model.id}`, pi.getThinkingLevel());
   });
 
-  pi.on("session_start", (_event, ctx) =>
-    loadWorkerDisabledTools()
-      .catch(() => {
-        ctx.ui.notify(
-          "Could not load worker tool settings; configured tools remain available.",
-          "warning",
-        );
-        return [];
-      })
-      .then((configuredTools) => {
-        runtime.restoreSession(branch(ctx), configuredTools);
-        reconcileWorkerTools();
-      }),
-  );
+  // oxlint-disable-next-line effecttsgo/async-function -- Pi awaits session restoration before allowing the next model request.
+  pi.on("session_start", async (_event, ctx) => {
+    const configuredTools = await loadWorkerDisabledTools().catch(() => {
+      ctx.ui.notify(
+        "Could not load worker tool settings; configured tools remain available.",
+        "warning",
+      );
+      return [];
+    });
+    runtime.restoreSession(branch(ctx), configuredTools);
+    const message = await Effect.runPromise(runtime.recoverCutover(modelHost(ctx)));
+    if (message !== undefined) pi.sendMessage(message);
+    reconcileWorkerTools();
+  });
   pi.on("tool_call", (event) => {
     if (!runtime.isToolDisabled(event.toolName)) return;
     return {

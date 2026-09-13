@@ -9,24 +9,24 @@ const TodoStatusSchema = Type.Union([
   Type.Literal("done"),
   Type.Literal("blocked"),
 ]);
-const TodoIdSchema = Type.String({ minLength: 1, maxLength: 64 });
+const TodoIdSchema = Type.String();
 const TodoSchema = Type.Object(
   {
     id: TodoIdSchema,
-    text: Type.String({ minLength: 3, maxLength: 1000 }),
-    validation: Type.String({ minLength: 3, maxLength: 1000 }),
+    text: Type.String(),
+    validation: Type.String(),
     status: TodoStatusSchema,
-    note: Type.Optional(Type.String({ maxLength: 1000 })),
+    note: Type.Optional(Type.String()),
   },
   { additionalProperties: false },
 );
 const TodoListSchema = Type.Array(TodoSchema, { minItems: 1, maxItems: 9 });
 const TodoPatchSchema = Type.Object(
   {
-    text: Type.Optional(Type.String({ minLength: 3, maxLength: 1000 })),
-    validation: Type.Optional(Type.String({ minLength: 3, maxLength: 1000 })),
+    text: Type.Optional(Type.String()),
+    validation: Type.Optional(Type.String()),
     status: Type.Optional(TodoStatusSchema),
-    note: Type.Optional(Type.String({ maxLength: 1000 })),
+    note: Type.Optional(Type.String()),
   },
   { additionalProperties: false },
 );
@@ -131,8 +131,6 @@ export class WorkerPlanState {
       );
     const index = this.todos.findIndex((todo) => todo.id === input.id);
     if (index < 0) return contractFailure(`Unknown TODO id: ${input.id}. No changes were made.`);
-    const current = this.todos[index];
-    if (current === undefined) return contractFailure(`Unknown TODO id: ${input.id}.`);
     const next = this.todos.map((todo, todoIndex) =>
       todoIndex === index ? { ...todo, ...input.patch } : { ...todo },
     );

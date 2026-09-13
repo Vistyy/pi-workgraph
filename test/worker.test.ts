@@ -126,6 +126,21 @@ void test("plan tool supports only strict get, set, and item update snapshots", 
       false,
     );
     assert.equal(Value.Check(tool.parameters, { action: "add_step", text: "obsolete" }), false);
+    assert.equal(
+      Value.Check(tool.parameters, {
+        action: "set",
+        todos: [
+          {
+            id: "i".repeat(65),
+            text: "t".repeat(1001),
+            validation: "v".repeat(1001),
+            status: "pending",
+            note: "n".repeat(1001),
+          },
+        ],
+      }),
+      true,
+    );
 
     const initial = await f.call("workgraph_plan", { action: "get" });
     assert.deepEqual(initial.details, {
@@ -279,36 +294,32 @@ void test("recovery derives TODO, edit, and executor phase from persisted trajec
   }
 });
 
-void test("recovery rejects a malformed latest current-attempt TODO snapshot", async () => {
+void test("reattach resolves durable TODO and edit evidence before the next model request", async () => {
   const f = await fixture();
   try {
     appendPlanResult(f.session);
-    f.session.appendMessage({
-      role: "toolResult",
-      toolCallId: "malformed",
-      toolName: "workgraph_plan",
-      content: [],
-      details: {
-        action: "set",
-        todos: [],
-        attempt: { runId: "fixture", nodeId: "attempt" },
-        unexpected: true,
-      },
-      isError: false,
-      timestamp,
-    });
+    appendToolResult(f.session, "write");
     await f.runner.emit({ type: "session_start", reason: "reload" });
-    const restored = await f.call("workgraph_plan", { action: "get" });
-    assert.deepEqual(restored.details, {
-      action: "get",
-      attempt: { runId: "fixture", nodeId: "attempt" },
+    assert.deepEqual(f.selected, ["openai/gpt-4o"]);
+    assert.equal(
+      f.session
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-executor-start",
+        ).length,
+      1,
+    );
+    const context = await f.runner.emitBeforeAgentStart("continue", undefined, "Fixture", {
+      cwd: f.root,
     });
+    assert.match(context?.systemPrompt ?? "", /IMPLEMENTATION EXECUTOR POLICY/);
+    assert.doesNotMatch(context?.systemPrompt ?? "", /GUIDE POLICY/);
   } finally {
     await f.dispose();
   }
 });
 
-void test("executor selection failure remains guide, emits one diagnostic, and disables further edits", async () => {
+void test("recovered executor selection failure emits one diagnostic and is never retried", async () => {
   let session: SessionManager | undefined;
   let selectionCalls = 0;
   const f = await fixture("implementation", {
@@ -327,14 +338,9 @@ void test("executor selection failure remains guide, emits one diagnostic, and d
   });
   session = f.session;
   try {
-    await f.call("workgraph_plan", { action: "set", todos: todo });
-    await f.runner.emit({
-      type: "tool_execution_end",
-      toolCallId: "edit",
-      toolName: "edit",
-      result: {},
-      isError: false,
-    });
+    appendPlanResult(f.session);
+    appendToolResult(f.session, "edit");
+    await f.runner.emit({ type: "session_start", reason: "reload" });
     assert.equal(selectionCalls, 1);
     assert.equal(
       f.session
@@ -346,6 +352,7 @@ void test("executor selection failure remains guide, emits one diagnostic, and d
       1,
     );
     await f.runner.emit({ type: "session_start", reason: "reload" });
+    assert.equal(selectionCalls, 1);
     assert.equal(f.activeTools().includes("edit"), false);
     assert.equal(f.activeTools().includes("write"), false);
     await f.runner.emit({

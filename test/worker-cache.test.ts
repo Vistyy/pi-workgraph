@@ -236,6 +236,131 @@ void test("real Pi worker performs the TODO-gated guide-to-executor handoff", as
   }
 });
 
+void test("real Pi reattach recognizes an already-selected executor before its next request", async () => {
+  const f = await fixture();
+  const provider = await startControlledProvider([
+    (request) => {
+      assert.equal(request.model, "executor");
+      assert.match(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
+      assert.doesNotMatch(request.raw, /IMPLEMENTATION GUIDE POLICY/);
+      return {
+        tool: {
+          id: "report-call",
+          name: "workgraph_report",
+          arguments: {
+            kind: "implementation",
+            status: "failed",
+            summary: "Bounded recovery observation complete.",
+            evidence: [],
+            findings: [],
+          },
+        },
+      };
+    },
+  ]);
+  let agent: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
+  try {
+    const modelRuntime = await ModelRuntime.create({
+      authPath: join(f.parent, "auth.json"),
+      modelsPath: null,
+      modelsStorePath: join(f.parent, "models.json"),
+      refreshOnCreate: false,
+      allowModelNetwork: false,
+    });
+    modelRuntime.registerProvider("fixture", {
+      name: "Loopback fixture",
+      api: "openai-completions",
+      apiKey: "fixture-only",
+      baseUrl: provider.baseUrl,
+      models: [modelConfig("guide"), modelConfig("executor")],
+    });
+    const settings = SettingsManager.inMemory({
+      compaction: { enabled: false },
+      retry: { enabled: false },
+    });
+    const session = SessionManager.create(f.root, join(f.parent, "sessions"));
+    session.appendCustomMessageEntry(
+      "pi-workgraph-objective",
+      "[WORKGRAPH IMPLEMENTATION OBJECTIVE]\nResume the exact current attempt.",
+      false,
+      { runId: "fixture", nodeId: "attempt", mode: "implementation" },
+    );
+    session.appendMessage({
+      role: "toolResult",
+      toolCallId: "plan-call",
+      toolName: "workgraph_plan",
+      content: [{ type: "text", text: "TODO initialized" }],
+      details: {
+        action: "set",
+        todos: [
+          {
+            id: "recover",
+            text: "Resume the supported edit trajectory.",
+            validation: "The next request uses the executor.",
+            status: "pending",
+          },
+        ],
+        attempt: { runId: "fixture", nodeId: "attempt" },
+      },
+      isError: false,
+      timestamp: 1_788_235_200_000,
+    });
+    session.appendMessage({
+      role: "toolResult",
+      toolCallId: "write-call",
+      toolName: "write",
+      content: [{ type: "text", text: "Wrote value.txt" }],
+      details: {},
+      isError: false,
+      timestamp: 1_788_235_200_000,
+    });
+    const loader = new DefaultResourceLoader({
+      cwd: f.root,
+      agentDir: join(f.parent, "agent"),
+      settingsManager: settings,
+      additionalExtensionPaths: [resolve("extensions/worker.ts")],
+      noContextFiles: true,
+      noPromptTemplates: true,
+      noSkills: true,
+      noThemes: true,
+      systemPrompt: "Controlled worker recovery integration.",
+    });
+    await loader.reload();
+    const executor = modelRuntime.getModel("fixture", "executor");
+    assert.ok(executor);
+    const created = await createAgentSession({
+      cwd: f.root,
+      agentDir: join(f.parent, "agent"),
+      modelRuntime,
+      model: executor,
+      thinkingLevel: "off",
+      tools: ["workgraph_report"],
+      resourceLoader: loader,
+      sessionManager: session,
+      settingsManager: settings,
+    });
+    agent = created.session;
+    await agent.bindExtensions({});
+    assert.equal(
+      session
+        .getBranch()
+        .filter(
+          (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-executor-start",
+        ).length,
+      1,
+    );
+    await promptWithDeadline(agent, "Continue the recovered attempt.");
+    provider.assertComplete();
+    assert.equal(provider.requests.length, 1);
+  } finally {
+    await agent?.abort();
+    agent?.dispose();
+    await provider.close();
+    restoreFixtureEnvironment(f.previous);
+    await rm(f.parent, { recursive: true, force: true });
+  }
+});
+
 void test("real Pi research worker keeps stable policy and tool filtering across agent starts", async () => {
   const f = await fixture();
   const previous = configureFixtureEnvironment({
