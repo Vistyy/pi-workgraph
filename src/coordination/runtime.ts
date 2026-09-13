@@ -21,13 +21,17 @@ import { WorkerReportSchema } from "../domain/report.js";
 import {
   applyOutput,
   classifyOutput,
+  cleanupAppliedOutput,
   currentRevision,
   detachedPlacement,
   discardOutput,
   ensureDetachedWorktree,
   isAncestor,
   prepareApplication,
+  prepareDiscard,
   type RepositoryOperation,
+  resolveRevision,
+  validateRetainedCandidate,
 } from "../git.js";
 import { StoreError, type WorkstreamStore } from "../storage/workstream-store.js";
 
@@ -145,26 +149,30 @@ export class WorkstreamRuntime {
     lineage?: AttemptLineage;
     baseCommit?: string;
   }): Effect.Effect<AttemptRecord, RuntimeError> {
-    return this.serialized("create Task", () => {
-      const at = now();
-      const task: Task = {
-        target: input.target,
-        contract: input.contract,
-        createdAt: at,
-      };
-      const attemptId = `${input.id}-1`;
-      const attempt = this.newAttempt(task, input.selection, input.lineage, input.baseCommit);
-      const records = this.store.createTaskWithAttempt(
-        this.owner,
-        this.store.readLatestIntent().index,
-        input.id,
-        task,
-        attemptId,
-        attempt,
-      );
-      this.ensureRepository(records.task, records.attempt);
-      return records.attempt;
-    });
+    const self = this;
+    return this.serializedEffect(
+      "create Task",
+      Effect.gen(function* () {
+        const task: Task = { target: input.target, contract: input.contract, createdAt: now() };
+        const attemptId = `${input.id}-1`;
+        const attempt = yield* self.newAttempt(
+          task,
+          input.selection,
+          input.lineage,
+          input.baseCommit,
+        );
+        const records = self.store.createTaskWithAttempt(
+          self.owner,
+          self.store.readLatestIntent().index,
+          input.id,
+          task,
+          attemptId,
+          attempt,
+        );
+        yield* self.ensureRepository(records.task, records.attempt);
+        return records.attempt;
+      }).pipe(Effect.mapError((cause) => runtimeError("create Task", cause))),
+    );
   }
 
   createAttempt(input: {
@@ -173,14 +181,23 @@ export class WorkstreamRuntime {
     lineage?: AttemptLineage;
     baseCommit?: string;
   }): Effect.Effect<AttemptRecord, RuntimeError> {
-    return this.serialized("create Attempt", () => {
-      const task = this.store.readTask(input.taskId);
-      const attemptId = `${task.id}-${randomUUID()}`;
-      const attempt = this.newAttempt(task.task, input.selection, input.lineage, input.baseCommit);
-      const record = this.store.appendAttempt(this.owner, task.id, attemptId, attempt);
-      this.ensureRepository(task, record);
-      return record;
-    });
+    const self = this;
+    return this.serializedEffect(
+      "create Attempt",
+      Effect.gen(function* () {
+        const task = self.store.readTask(input.taskId);
+        const attemptId = `${task.id}-${randomUUID()}`;
+        const attempt = yield* self.newAttempt(
+          task.task,
+          input.selection,
+          input.lineage,
+          input.baseCommit,
+        );
+        const record = self.store.appendAttempt(self.owner, task.id, attemptId, attempt);
+        yield* self.ensureRepository(task, record);
+        return record;
+      }).pipe(Effect.mapError((cause) => runtimeError("create Attempt", cause))),
+    );
   }
 
   launch(attemptId: string): Effect.Effect<AttemptRecord, RuntimeError> {
@@ -196,7 +213,9 @@ export class WorkstreamRuntime {
             message: "Attempt already owns a Worker session.",
           });
         const task = self.store.readTask(record.taskId);
-        self.ensureRepository(task, record);
+        yield* self
+          .ensureRepository(task, record)
+          .pipe(Effect.mapError((cause) => runtimeError("launch Worker", cause)));
         const context = self.workerContext(record, task);
         const sessionFile = yield* promise("create Worker session", () =>
           self.ports.worker.createSession({
@@ -335,28 +354,39 @@ export class WorkstreamRuntime {
   }
 
   apply(attemptId: string): Effect.Effect<AttemptRecord, RuntimeError> {
-    return this.serialized("apply output", () => {
-      let record = this.store.readAttempt(attemptId);
-      let operation = this.repositoryOperation(record);
-      record = this.store.checkpointAttempt(this.owner, attemptId, prepareApplication(operation));
-      operation = this.repositoryOperation(record);
-      return this.store.checkpointAttempt(this.owner, attemptId, applyOutput(operation, now()));
-    });
+    const self = this;
+    return this.serializedEffect(
+      "apply output",
+      Effect.gen(function* () {
+        let record = self.store.readAttempt(attemptId);
+        let prepared = yield* prepareApplication(self.repositoryOperation(record));
+        record = self.store.checkpointAttempt(self.owner, attemptId, prepared);
+        prepared = yield* prepareApplication(self.repositoryOperation(record));
+        record = self.store.checkpointAttempt(self.owner, attemptId, prepared);
+        const applied = yield* applyOutput(self.repositoryOperation(record), now());
+        record = self.store.checkpointAttempt(self.owner, attemptId, applied);
+        const cleaned = yield* cleanupAppliedOutput(self.repositoryOperation(record));
+        return self.store.checkpointAttempt(self.owner, attemptId, cleaned);
+      }).pipe(Effect.mapError((cause) => runtimeError("apply output", cause))),
+    );
   }
   discard(attemptId: string, reason: string): Effect.Effect<AttemptRecord, RuntimeError> {
-    return this.serialized("discard output", () => {
-      const record = this.store.readAttempt(attemptId);
-      if (record.attempt.execution?.closedAt === undefined)
-        throw new RuntimeError({
-          operation: "discard output",
-          message: "Worker must be definitively closed first.",
-        });
-      return this.store.checkpointAttempt(
-        this.owner,
-        attemptId,
-        discardOutput(this.repositoryOperation(record), reason, now()),
-      );
-    });
+    const self = this;
+    return this.serializedEffect(
+      "discard output",
+      Effect.gen(function* () {
+        let record = self.store.readAttempt(attemptId);
+        if (record.attempt.execution?.closedAt === undefined)
+          return yield* new RuntimeError({
+            operation: "discard output",
+            message: "Worker must be definitively closed first.",
+          });
+        const checkpoint = prepareDiscard(self.repositoryOperation(record), reason);
+        record = self.store.checkpointAttempt(self.owner, attemptId, checkpoint);
+        const discarded = yield* discardOutput(self.repositoryOperation(record), now());
+        return self.store.checkpointAttempt(self.owner, attemptId, discarded);
+      }).pipe(Effect.mapError((cause) => runtimeError("discard output", cause))),
+    );
   }
   inspect(
     section: "intents" | "tasks" | "attempts" | "outcomes",
@@ -390,43 +420,163 @@ export class WorkstreamRuntime {
     selection: AttemptSelection,
     lineage?: AttemptLineage,
     requestedBase?: string,
-  ): Attempt {
+  ): Effect.Effect<Attempt, RuntimeError> {
     if (task.target.kind === "directory") {
       if (lineage !== undefined || requestedBase !== undefined)
         throw new RuntimeError({
           operation: "create Attempt",
           message: "Directory Tasks cannot carry candidate lineage.",
         });
-      return { selection, base: { kind: "directory" } };
+      return Effect.succeed({ selection, base: { kind: "directory" } });
     }
-    const baseCommit = requestedBase ?? currentRevision(task.target);
-    if (lineage?.candidateOf !== undefined) {
-      const parent = this.store.readAttempt(lineage.candidateOf.attemptId).attempt;
-      if (parent.output?.kind !== "retained")
-        throw new RuntimeError({
+    return this.repositoryAttempt(task.target, selection, lineage, requestedBase).pipe(
+      Effect.mapError((cause) => runtimeError("create Attempt", cause)),
+    );
+  }
+  private repositoryAttempt(
+    target: Extract<TaskTarget, { kind: "repository" }>,
+    selection: AttemptSelection,
+    lineage?: AttemptLineage,
+    requestedBase?: string,
+  ): Effect.Effect<Attempt, RuntimeError | import("../git.js").GitError> {
+    const self = this;
+    return Effect.gen(function* () {
+      const baseCommit =
+        requestedBase === undefined
+          ? yield* currentRevision(target)
+          : yield* resolveRevision(target, requestedBase);
+      if (lineage?.candidateOf === undefined)
+        return { selection, base: { kind: "repository" as const, baseCommit } };
+      const facts = yield* self.candidateFacts(
+        target,
+        { ...lineage, candidateOf: lineage.candidateOf },
+        baseCommit,
+        requestedBase,
+      );
+      return {
+        selection,
+        base: { kind: "repository" as const, baseCommit: facts.baseCommit },
+        lineage: facts.lineage,
+      };
+    });
+  }
+  private candidateFacts(
+    target: Extract<TaskTarget, { kind: "repository" }>,
+    lineage: AttemptLineage & { candidateOf: NonNullable<AttemptLineage["candidateOf"]> },
+    baseCommit: string,
+    requestedBase?: string,
+  ): Effect.Effect<
+    { baseCommit: string; lineage: AttemptLineage },
+    RuntimeError | import("../git.js").GitError
+  > {
+    const parentRecord = this.store.readAttempt(lineage.candidateOf.attemptId);
+    const parent = parentRecord.attempt;
+    if (parent.output?.kind !== "retained")
+      return Effect.fail(
+        new RuntimeError({
           operation: "create Attempt",
           message: "Candidate parent has no retained output.",
-        });
-      if (lineage.candidateOf.kind === "extend" && baseCommit !== parent.output.tip)
-        throw new RuntimeError({
+        }),
+      );
+    const parentOperation = this.repositoryOperation(parentRecord);
+    if (parentOperation.target.commonDir !== target.commonDir)
+      return Effect.fail(
+        new RuntimeError({
           operation: "create Attempt",
-          message: "Extend must start at the parent candidate.",
-        });
-      if (!isAncestor(task.target.commonDir, lineage.candidateRoot, parent.output.tip))
-        throw new RuntimeError({
-          operation: "create Attempt",
-          message: "Candidate lineage is not present in the Task repository.",
-        });
-    }
-    return {
-      selection,
-      base: { kind: "repository", baseCommit },
-      ...(lineage === undefined ? {} : { lineage }),
-    };
+          message: "Candidate parent belongs to another Task repository.",
+        }),
+      );
+    return validateRetainedCandidate(parentOperation).pipe(
+      Effect.flatMap(() =>
+        lineage.candidateOf.kind === "extend"
+          ? this.extendFacts(target, parentRecord, baseCommit, requestedBase)
+          : this.integrateFacts(lineage, parentRecord, baseCommit),
+      ),
+    );
   }
-  private ensureRepository(task: TaskRecord, attempt: AttemptRecord): void {
-    if (task.task.target.kind === "repository")
-      ensureDetachedWorktree(this.repositoryOperation(attempt));
+  private extendFacts(
+    target: Extract<TaskTarget, { kind: "repository" }>,
+    parentRecord: AttemptRecord,
+    requestedCommit: string,
+    requestedBase?: string,
+  ): Effect.Effect<
+    { baseCommit: string; lineage: AttemptLineage },
+    RuntimeError | import("../git.js").GitError
+  > {
+    const parent = parentRecord.attempt;
+    if (parent.output?.kind !== "retained")
+      return Effect.fail(
+        new RuntimeError({
+          operation: "create Attempt",
+          message: "Candidate parent is not retained.",
+        }),
+      );
+    const parentTip = parent.output.tip;
+    if (requestedBase !== undefined && requestedCommit !== parentTip)
+      return Effect.fail(
+        new RuntimeError({
+          operation: "create Attempt",
+          message: "Extend must start at the parent candidate tip.",
+        }),
+      );
+    const inheritedRoot =
+      parent.lineage?.candidateRoot ??
+      (parent.base.kind === "repository" ? parent.base.baseCommit : parentTip);
+    return isAncestor(target, inheritedRoot, parentTip).pipe(
+      Effect.flatMap((present) =>
+        present
+          ? Effect.succeed({
+              baseCommit: parentTip,
+              lineage: {
+                candidateRoot: inheritedRoot,
+                candidateOf: { kind: "extend", attemptId: parentRecord.id },
+              },
+            })
+          : Effect.fail(
+              new RuntimeError({
+                operation: "create Attempt",
+                message: "Candidate lineage is not present in the Task repository.",
+              }),
+            ),
+      ),
+    );
+  }
+  private integrateFacts(
+    lineage: AttemptLineage & { candidateOf: NonNullable<AttemptLineage["candidateOf"]> },
+    parentRecord: AttemptRecord,
+    baseCommit: string,
+  ): Effect.Effect<{ baseCommit: string; lineage: AttemptLineage }, RuntimeError> {
+    const parent = parentRecord.attempt;
+    if (
+      parent.output?.kind !== "retained" ||
+      lineage.candidateOf.kind !== "integrate" ||
+      lineage.candidateOf.sourceTip !== parent.output.tip
+    )
+      return Effect.fail(
+        new RuntimeError({
+          operation: "create Attempt",
+          message: "Integration source tip no longer matches its retained parent.",
+        }),
+      );
+    return Effect.succeed({
+      baseCommit,
+      lineage: {
+        candidateRoot: baseCommit,
+        candidateOf: {
+          kind: "integrate",
+          attemptId: parentRecord.id,
+          sourceTip: parent.output.tip,
+        },
+      },
+    });
+  }
+  private ensureRepository(
+    task: TaskRecord,
+    attempt: AttemptRecord,
+  ): Effect.Effect<void, import("../git.js").GitError> {
+    return task.task.target.kind === "repository"
+      ? ensureDetachedWorktree(this.repositoryOperation(attempt))
+      : Effect.void;
   }
   private repositoryOperation(record: AttemptRecord): RepositoryOperation {
     const task = this.store.readTask(record.taskId).task;
@@ -444,7 +594,7 @@ export class WorkstreamRuntime {
         workstreamId: this.store.id,
         attemptId: record.id,
       }),
-      experiment: task.contract.kind === "experiment",
+      applicable: task.contract.kind === "implementation",
     };
   }
   private settleRecordedOutcome(
@@ -476,15 +626,16 @@ export class WorkstreamRuntime {
       return outcome;
     });
   }
-  private classify(record: AttemptRecord, successful: boolean): Effect.Effect<void, RuntimeError> {
+  private classify(record: AttemptRecord, _successful: boolean): Effect.Effect<void, RuntimeError> {
     if (record.attempt.base.kind !== "repository") return Effect.void;
-    return effect("classify repository output", () => {
-      this.store.checkpointAttempt(
-        this.owner,
-        record.id,
-        classifyOutput(this.repositoryOperation(record), successful, now()),
-      );
-    });
+    return classifyOutput(this.repositoryOperation(record), now()).pipe(
+      Effect.flatMap((attempt) =>
+        effect("classify repository output", () => {
+          this.store.checkpointAttempt(this.owner, record.id, attempt);
+        }),
+      ),
+      Effect.mapError((cause) => runtimeError("classify repository output", cause)),
+    );
   }
   private workerOperation(attemptId: string): WorkerOperation {
     const attempt = this.store.readAttempt(attemptId);
@@ -661,13 +812,15 @@ function workerEnvironment(attempt: Attempt, task: Task): Record<string, string>
         }),
   };
 }
+function runtimeError(operation: string, cause: unknown): RuntimeError {
+  return cause instanceof RuntimeError
+    ? cause
+    : new RuntimeError({ operation, message: message(cause), cause });
+}
 function effect<A>(operation: string, run: () => A): Effect.Effect<A, RuntimeError> {
   return Effect.try({
     try: run,
-    catch: (cause) =>
-      cause instanceof RuntimeError
-        ? cause
-        : new RuntimeError({ operation, message: message(cause), cause }),
+    catch: (cause) => runtimeError(operation, cause),
   });
 }
 function promise<A>(operation: string, run: () => Promise<A>): Effect.Effect<A, RuntimeError> {

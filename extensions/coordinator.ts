@@ -777,11 +777,14 @@ async function createAndLaunch(
   candidate?: AttemptLineage,
   baseRevision?: string,
 ): Promise<AttemptRecord[]> {
-  const target = resolveTaskTarget({
-    cwd,
-    ...(input.target?.path === undefined ? {} : { path: input.target.path }),
-    ...(input.target?.kind === undefined ? {} : { kind: input.target.kind }),
-  });
+  const target = await Effect.runPromise(
+    resolveTaskTarget({
+      cwd,
+      ...(input.target?.path === undefined ? {} : { path: input.target.path }),
+      ...(input.target?.kind === undefined ? {} : { kind: input.target.kind }),
+      ...(baseRevision === undefined ? {} : { revision: baseRevision }),
+    }),
+  );
   let selections: AttemptSelection[];
   if (fixedSelection !== undefined) selections = [fixedSelection];
   else {

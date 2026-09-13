@@ -142,17 +142,23 @@ const AttemptOutputSchema = Type.Union([
     sourceTip: Commit,
     destinationRef: Text,
     destinationHead: Commit,
-    preparedRevision: Type.Optional(Commit),
-    error: Type.Optional(NonBlankText),
+    replanned: Type.Optional(Type.Literal(true)),
   }),
   strict({
     kind: Type.Literal("discarding"),
     tip: Commit,
     reason: NonBlankText,
+    applied: Type.Optional(strict({ revision: Commit, completedAt: Instant })),
     error: Type.Optional(NonBlankText),
   }),
   strict({ kind: Type.Literal("no_output"), completedAt: Instant }),
-  strict({ kind: Type.Literal("applied"), revision: Commit, completedAt: Instant }),
+  strict({
+    kind: Type.Literal("applied"),
+    revision: Commit,
+    completedAt: Instant,
+    cleanupTip: Type.Optional(Commit),
+    cleanupReason: Type.Optional(NonBlankText),
+  }),
   strict({ kind: Type.Literal("discarded"), reason: NonBlankText, completedAt: Instant }),
 ]);
 export const AttemptSchema = strict({
