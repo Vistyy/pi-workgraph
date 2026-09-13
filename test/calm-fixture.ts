@@ -16,7 +16,7 @@ import type { CalmChatRuntime } from "../src/pi-chat-runtime.js";
 
 // SAFETY: These fixtures intentionally brand and inspect presentation instances to exercise the
 // guarded compatibility boundary without Pi's public class identities.
-// oxlint-disable anti-slop/no-object-parameters, anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, typescript/unbound-method
+// oxlint-disable anti-slop/no-object-parameters, anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, typescript/unbound-method
 
 export type ContentPart = AssistantMessage["content"][number];
 export type FakeMouseEvent = {
@@ -313,13 +313,11 @@ export function projected(
   chat: Container,
   runtime: CalmChatRuntime = fixtureRuntime,
   onIncompatible: (message: string) => void = () => {},
-  onWarning?: (message: string) => void,
 ): CalmProjection {
   const projection = attachCalmProjection(chat, {
     runtime,
     styleSeparator: (text) => text,
     onIncompatible,
-    ...(onWarning === undefined ? {} : { onWarning }),
   });
   projection.setEnabled(true);
   return projection;

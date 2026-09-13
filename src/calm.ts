@@ -232,8 +232,7 @@ export function installCalmMode(
     syncWidget();
     syncTimer();
   };
-  // Calm becomes unavailable only for a real incompatibility that disables the projection; a
-  // non-fatal compatibility warning must not. Both are deduplicated and reported once.
+  // Calm becomes unavailable only for a real incompatibility that disables the projection.
   const diagnose: Diagnostic = (message) => {
     if (diagnosed.get(message) === generation) return;
     diagnosed.set(message, generation);
@@ -249,11 +248,6 @@ export function installCalmMode(
       syncChrome();
       ui?.notify(`Calm unavailable: ${message} Native rows remain visible.`, "warning");
     });
-  };
-  const warn: Diagnostic = (message) => {
-    if (diagnosed.get(message) === generation) return;
-    diagnosed.set(message, generation);
-    ui?.notify(`Calm compatibility warning: ${message}`, "warning");
   };
   const shutdown = (): void => {
     generation += 1;
@@ -294,7 +288,6 @@ export function installCalmMode(
       runtime: chatRuntime,
       styleSeparator: (text) => ui?.theme.fg("dim", text) ?? text,
       onIncompatible: diagnose,
-      onWarning: warn,
     });
   };
 
