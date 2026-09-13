@@ -29,7 +29,7 @@ import {
   type WorkstreamMetadata,
 } from "../src/domain/records.js";
 import { resolveTaskTarget } from "../src/git.js";
-import { HerdrCliRuntime } from "../src/herdr.js";
+import { HerdrCliRuntime, type HerdrLaunchRequest } from "../src/herdr.js";
 import { herdrWorkerName } from "../src/herdr-naming.js";
 import {
   configuredTarget,
@@ -616,7 +616,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       return serialize(async () => {
         const store = WorkstreamStore.openReadOnly(agentDir, params.workstreamId);
         const absent = await (options.priorCoordinatorAbsent?.(params.prior) ??
-          Effect.runPromise(new HerdrCliRuntime().coordinatorAbsent(params.prior)));
+          Effect.runPromise(new HerdrCliRuntime().observeCoordinator(params.prior)).then(
+            (observation) => observation.state === "absent",
+          ));
         const successor = owner(ctx);
         store.close();
         const ownedStore = WorkstreamStore.openOwned(agentDir, params.workstreamId, params.prior);
@@ -838,11 +840,39 @@ function lineage(
         : { kind: "extend", attemptId: parentId },
   };
 }
+function herdrWorkerEnvironment(
+  environment: Record<string, string>,
+): HerdrLaunchRequest["environment"] {
+  const mode = environment["PI_WORKGRAPH_MODE"];
+  const policyRole = environment["PI_WORKGRAPH_POLICY_ROLE"];
+  if (mode === undefined || policyRole === undefined)
+    throw new Error("Worker launch environment is incomplete.");
+  return {
+    PI_WORKGRAPH_MODE: mode,
+    PI_WORKGRAPH_POLICY_ROLE: policyRole,
+    ...(environment["PI_WORKGRAPH_INITIAL_MODEL"] === undefined
+      ? {}
+      : { PI_WORKGRAPH_INITIAL_MODEL: environment["PI_WORKGRAPH_INITIAL_MODEL"] }),
+    ...(environment["PI_WORKGRAPH_INITIAL_THINKING"] === undefined
+      ? {}
+      : { PI_WORKGRAPH_INITIAL_THINKING: environment["PI_WORKGRAPH_INITIAL_THINKING"] }),
+    ...(environment["PI_WORKGRAPH_BASE_COMMIT"] === undefined
+      ? {}
+      : { PI_WORKGRAPH_BASE_COMMIT: environment["PI_WORKGRAPH_BASE_COMMIT"] }),
+    ...(environment["PI_WORKGRAPH_EXECUTOR_MODEL"] === undefined
+      ? {}
+      : { PI_WORKGRAPH_EXECUTOR_MODEL: environment["PI_WORKGRAPH_EXECUTOR_MODEL"] }),
+    ...(environment["PI_WORKGRAPH_EXECUTOR_THINKING"] === undefined
+      ? {}
+      : { PI_WORKGRAPH_EXECUTOR_THINKING: environment["PI_WORKGRAPH_EXECUTOR_THINKING"] }),
+  };
+}
+
 function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
   const herdr = new HerdrCliRuntime();
   const exactWorker = (
     identity: Parameters<RuntimePorts["worker"]["inspect"]>[0],
-  ): import("../src/herdr-identity.js").WorkerIdentity => ({
+  ): import("../src/herdr.js").WorkerIdentity => ({
     workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "",
     tabId: identity.tabId,
     paneId: identity.paneId,
@@ -903,7 +933,7 @@ function nativePorts(agentDir: string, pi: ExtensionAPI): RuntimePorts {
             role: input.role,
             cwd: input.cwd,
             sessionFile: input.sessionFile,
-            env: fact.environment,
+            environment: herdrWorkerEnvironment(fact.environment),
             ...(selected === undefined ? {} : { model: selected }),
             ...(thinking === undefined ? {} : { thinking }),
           }),
