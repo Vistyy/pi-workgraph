@@ -113,7 +113,6 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
       "[WORKGRAPH WORKER OBJECTIVE]\nIntent: exercise real Pi\nObjective: change value.txt",
       true,
       {
-        workstreamId: "fixture",
         taskId: "worker",
         attemptId: "attempt",
         role: "implementation",
@@ -266,7 +265,6 @@ void test("real Pi restores the exact guide before continuing after executor sel
       "[WORKGRAPH WORKER OBJECTIVE]\nIntent: exercise failed cutover\nObjective: change value.txt",
       true,
       {
-        workstreamId: "fixture",
         taskId: "worker",
         attemptId: "attempt",
         role: "implementation",

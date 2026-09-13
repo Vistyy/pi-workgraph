@@ -3,7 +3,6 @@ import { Result } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
-  WorkerIdentitySchema,
   type WorkerObjectiveDetails,
   WorkerObjectiveDetailsSchema,
   type WorkerRole,
@@ -70,18 +69,4 @@ export function readWorkerAssignment(
   )
     return Result.fail("Worker objective has invalid executor details for its role.");
   return Result.succeed({ content: objective.content, details });
-}
-
-export function sameAttempt(
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Session marker data is decoded against WorkerIdentitySchema here.
-  value: unknown,
-  expected: Pick<WorkerObjectiveDetails, "workstreamId" | "taskId" | "attemptId">,
-): boolean {
-  if (!Value.Check(WorkerIdentitySchema, value)) return false;
-  const decoded = Value.Decode(WorkerIdentitySchema, value);
-  return (
-    decoded.workstreamId === expected.workstreamId &&
-    decoded.taskId === expected.taskId &&
-    decoded.attemptId === expected.attemptId
-  );
 }

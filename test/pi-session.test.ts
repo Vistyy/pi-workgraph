@@ -5,19 +5,20 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { Value } from "typebox/value";
 import { runNodePlatformPromise } from "../src/node-platform.js";
 import {
   createWorkerSessionEffect,
   readWorkerSession,
   WORKER_KICKOFF,
   type WorkerObjective,
+  WorkerObjectiveDetailsSchema,
 } from "../src/pi-session.js";
 
 const objective: WorkerObjective = {
   content:
     "[WORKGRAPH WORKER OBJECTIVE]\nIntent: verify exact session ownership\nObjective: exercise readback",
   details: {
-    workstreamId: "ws-session",
     taskId: "session",
     attemptId: "session-1",
     role: "implementation",
@@ -28,8 +29,13 @@ const objective: WorkerObjective = {
 void test("Worker session creation uses the Attempt id and recovers only the exact header/objective", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-session-"));
   const cwd = join(parent, "cwd");
-  const sessionDir = join(parent, "agent", "workgraph", "worker-sessions", "ws-session");
+  const sessionDir = join(parent, "agent", "workgraph", "worker-sessions");
   try {
+    assert.equal(Value.Check(WorkerObjectiveDetailsSchema, objective.details), true);
+    assert.equal(
+      Value.Check(WorkerObjectiveDetailsSchema, { ...objective.details, workstreamId: "removed" }),
+      false,
+    );
     const first = await runNodePlatformPromise(
       createWorkerSessionEffect({ cwd, sessionDir, objective }),
     );
