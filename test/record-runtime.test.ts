@@ -1,515 +1,219 @@
-/* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/global-date, anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion -- Behavioral tests exercise typed records returned by native temporary SQLite storage. */
+/* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/global-date, anti-slop/no-object-parameters, typescript/no-unsafe-member-access, anti-slop/require-safety-comment-for-type-assertion -- Flow tests inspect deterministic native transport logs and real Pi session files. */
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Effect, Exit, Scope } from "effect";
-import { Value } from "typebox/value";
-import { RuntimeError, WorkstreamRuntime } from "../src/coordination/runtime.js";
-import type {
-  Attempt,
-  CoordinatorOwner,
-  Intent,
-  Outcome,
-  Task,
-  WorkstreamMetadata,
-} from "../src/domain/records.js";
-import {
-  AttemptSchema,
-  TaskIdSchema,
-  WORKSTREAM_FORMAT,
-  WORKSTREAM_SCHEMA_VERSION,
-} from "../src/domain/records.js";
+import { RuntimeError, SessionRuntime } from "../src/coordination/runtime.js";
+import type { AttemptSpec, Task } from "../src/domain/records.js";
 import { HerdrCliRuntime } from "../src/herdr.js";
-import { herdrWorkerTabLabel } from "../src/herdr-naming.js";
 import { runNodePlatformPromise } from "../src/node-platform.js";
-import { createWorkerSessionEffect, WORKER_KICKOFF } from "../src/pi-session.js";
-import { StoreError, WorkstreamStore } from "../src/storage/workstream-store.js";
+import {
+  createWorkerSessionEffect,
+  WORKER_KICKOFF,
+  type WorkerObjective,
+} from "../src/pi-session.js";
+import { RecordStore } from "../src/storage/record-store.js";
 
-const at = "2026-03-20T12:00:00.000Z";
-const later = "2026-03-20T12:01:00.000Z";
-const owner: CoordinatorOwner = {
-  sessionId: "coordinator",
-  sessionFile: "/sessions/coordinator.jsonl",
-  workspaceId: "workspace-1",
-  tabId: "tab-1",
-};
 const target = { model: "test/model", thinking: "high" as const };
-
+const selection = { kind: "target" as const, target };
+const spec: AttemptSpec = { selection, base: { kind: "directory" } };
+const task = (root: string, id: string): Task => ({
+  target: { kind: "directory", path: join(root, id) },
+  contract: {
+    kind: "research",
+    question: `Research ${id}`,
+    expectedEvidence: ["Direct observation"],
+  },
+});
+const objective = (taskId: string, attemptId: string, value: Task): WorkerObjective => ({
+  content: [
+    "[WORKGRAPH WORKER OBJECTIVE]",
+    `Task ${taskId} target: ${JSON.stringify(value.target)}`,
+    `Question: Research ${taskId}`,
+    "Expected evidence: Direct observation",
+  ].join("\n"),
+  details: { taskId, attemptId, role: "research" },
+});
 function temporary(): string {
-  return mkdtempSync(join(tmpdir(), "workgraph-records-"));
+  return mkdtempSync(join(tmpdir(), "session-runtime-"));
 }
-function initial(id: string): { metadata: WorkstreamMetadata; intent: Intent } {
-  return {
-    metadata: {
-      format: WORKSTREAM_FORMAT,
-      schemaVersion: WORKSTREAM_SCHEMA_VERSION,
-      id,
-      owner,
-      lifecycle: "active",
-      createdAt: at,
-      updatedAt: at,
-    },
-    intent: {
-      statement: "Coordinate several independent targets",
-      constraints: ["Keep each target independent"],
-      authority: {
-        receiptId: "receipt-1",
-        sessionId: owner.sessionId,
-        sessionFile: owner.sessionFile,
-      },
-      recordedAt: at,
-    },
-  };
-}
-function task(id: string): Task {
-  return {
-    target: { kind: "directory", path: `/targets/${id}` },
-    contract: {
-      kind: "research",
-      question: `Research ${id}`,
-      expectedEvidence: ["Direct observation"],
-    },
-    createdAt: at,
-  };
-}
-function attempt(): Attempt {
-  return { selection: { kind: "target", target }, base: { kind: "directory" } };
-}
-function fakeHerdr(root: string, body: string): { runtime: HerdrCliRuntime; log: string } {
-  const executable = join(root, "herdr-fixture.mjs");
-  const log = join(root, "herdr.log");
+function fixture(root: string, initial: object = {}) {
+  const executable = join(root, "herdr.mjs");
+  const statePath = join(root, "native.json");
+  const log = join(root, "commands.log");
+  writeFileSync(statePath, JSON.stringify(initial));
   writeFileSync(
     executable,
-    `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";\nconst args = process.argv.slice(2);\nappendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");\n${body}\n`,
+    `#!/usr/bin/env node
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+const args=process.argv.slice(2); appendFileSync(${JSON.stringify(log)},JSON.stringify(args)+"\\n");
+const path=${JSON.stringify(statePath)}; const state=JSON.parse(readFileSync(path,"utf8")); const save=()=>writeFileSync(path,JSON.stringify(state)); const ok=(result)=>console.log(JSON.stringify({result}));
+if(args[0]==="tab"&&args[1]==="create"){state.present=true;state.partial=true;state.workspace=args[args.indexOf("--workspace")+1];state.cwd=args[args.indexOf("--cwd")+1];state.label=args[args.indexOf("--label")+1];save();ok({tab:{workspace_id:state.workspace,tab_id:"tab-1"},root_pane:{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",cwd:state.cwd}})}
+else if(args[0]==="agent"&&args[1]==="start"){state.partial=false;state.session=args[args.indexOf("--session")+1];save();ok({agent:{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",agent_status:"working",cwd:state.cwd,name:args[2],agent_session:{value:state.session},interactive_ready:true}})}
+else if(args[0]==="agent"&&args[1]==="list")ok({agents:state.present&&!state.partial?[{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",agent_status:"working",cwd:state.cwd,agent_session:{value:state.session}}]:[]})
+else if(args[0]==="tab"&&args[1]==="list")ok({tabs:state.present?[{workspace_id:state.workspace,tab_id:"tab-1",label:state.label}]:[]})
+else if(args[0]==="pane"&&args[1]==="list")ok({panes:state.present?[{workspace_id:state.workspace,tab_id:"tab-1",pane_id:"pane-1",cwd:state.cwd}]:[]})
+else if(args[0]==="agent"&&args[1]==="prompt")ok({})
+else if(args[0]==="tab"&&args[1]==="close"){if(!state.ignoreClose)state.present=false;save();ok({})}
+else{console.error(JSON.stringify({error:{code:"unexpected"}}));process.exitCode=1}`,
   );
   chmodSync(executable, 0o700);
   return {
-    runtime: new HerdrCliRuntime(executable, {
-      HERDR_ENV: "1",
-      HERDR_WORKSPACE_ID: owner.workspaceId,
-    }),
+    herdr: new HerdrCliRuntime(executable, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "coordinator" }),
+    statePath,
     log,
   };
 }
-function commands(log: string): string[][] {
-  return readFileSync(log, "utf8")
-    .trim()
-    .split("\n")
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as string[]);
+function commands(path: string): string[][] {
+  try {
+    return readFileSync(path, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as string[]);
+  } catch {
+    return [];
+  }
 }
-async function waitFor(predicate: () => boolean, attempts = 120): Promise<void> {
-  for (let count = 0; count < attempts; count += 1) {
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let index = 0; index < 160; index += 1) {
     if (predicate()) return;
     await Effect.runPromise(Effect.sleep(25));
   }
-  assert.fail("Timed out waiting for runtime settlement.");
+  assert.fail("timed out");
 }
-function outcome(summary: string): Outcome {
-  return {
-    result: {
-      kind: "reported",
-      report: { kind: "research", status: "completed", summary, evidence: [], findings: [] },
-    },
-    effectiveModels: [target],
-    delivery: { requestedAt: later, failures: [] },
-    observedAt: at,
-  };
-}
-
-void test("public Task IDs and persisted execution have strict bounded identity", () => {
-  assert.equal(Value.Check(TaskIdSchema, "git-output-correction"), true);
-  assert.equal(
-    Value.Check(AttemptSchema, {
-      ...attempt(),
-      execution: { sessionFile: "/session.jsonl", submission: "confirmed", paneId: "native" },
-    }),
-    false,
-  );
-  const firstLabel = herdrWorkerTabLabel({ runId: "ws", attemptId: "attempt-one" });
-  const secondLabel = herdrWorkerTabLabel({ runId: "ws", attemptId: "attempt-two" });
-  assert.notEqual(firstLabel, secondLabel);
-  assert.ok(firstLabel.length <= 18);
-  for (const unsafe of ["../foreign", "nested/task", ".hidden", "task.lock", "x".repeat(65)])
-    assert.equal(Value.Check(TaskIdSchema, unsafe), false, unsafe);
-});
-
-void test("creation is private and retries attach without replaying an advanced store", () => {
-  const root = temporary();
-  try {
-    const records = initial("ws-create");
-    const first = WorkstreamStore.create(root, records.metadata, records.intent);
-    const appended = first.appendIntent(owner, {
-      ...records.intent,
-      statement: "Refined intent",
-      recordedAt: later,
-    });
-    assert.equal(appended.index, 1);
-    first.close();
-
-    const retry = WorkstreamStore.create(root, records.metadata, records.intent);
-    assert.equal(retry.readLatestIntent().index, 1);
-    assert.equal(retry.readLatestIntent().intent.statement, "Refined intent");
-    assert.equal(retry.title(), "Refined intent");
-    assert.equal(retry.path, WorkstreamStore.pathFor(root, "ws-create"));
-    assert.equal(statSync(retry.path).mode & 0o777, 0o600);
-    assert.equal(statSync(join(root, "workgraph", "workstreams", "ws-create")).mode & 0o777, 0o700);
-    retry.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-void test("owned writes require the exact owner and adoption is one owner CAS", () => {
-  const root = temporary();
-  try {
-    const records = initial("ws-owner");
-    const store = WorkstreamStore.create(root, records.metadata, records.intent);
-    const successor: CoordinatorOwner = {
-      sessionId: "next",
-      sessionFile: "/sessions/next.jsonl",
-      workspaceId: "workspace-2",
-      tabId: "tab-2",
-    };
-    assert.throws(
-      () => store.appendIntent({ ...owner, workspaceId: "foreign" }, records.intent),
-      StoreError,
-    );
-    assert.throws(() => store.adopt(owner, successor, false, later), StoreError);
-    assert.deepEqual(store.readMetadata().owner, owner);
-    assert.deepEqual(store.adopt(owner, successor, true, later).owner, successor);
-    assert.throws(() => store.appendIntent(owner, records.intent), StoreError);
-    store.close();
-    assert.throws(() => WorkstreamStore.openOwned(root, "ws-owner", owner), StoreError);
-    WorkstreamStore.openOwned(root, "ws-owner", successor).close();
-    WorkstreamStore.openReadOnly(root, "ws-owner").close();
-    assert.throws(() => WorkstreamStore.openReadOnly(root, "other"), StoreError);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-void test("Task and initial Attempt insert atomically and pages preserve SQL order", () => {
-  const root = temporary();
-  try {
-    const records = initial("ws-pages");
-    const store = WorkstreamStore.create(root, records.metadata, records.intent);
-    assert.throws(
-      () =>
-        store.createTaskWithAttempt(owner, 0, "bad", task("bad"), "bad-1", {
-          ...attempt(),
-          selection: { kind: "target", target: { ...target, model: "invalid" } },
-        }),
-      StoreError,
-    );
-    assert.equal(store.page("tasks", -1, 10).length, 0);
-    assert.equal(store.page("attempts", -1, 10).length, 0);
-
-    const first = store.createTaskWithAttempt(owner, 0, "one", task("one"), "one-1", attempt());
-    const second = store.createTaskWithAttempt(owner, 0, "two", task("two"), "two-1", attempt());
-    const retry = store.appendAttempt(owner, "one", "one-2", attempt());
-    assert.equal(first.task.index, 0);
-    assert.equal(second.task.index, 1);
-    assert.equal(retry.index, 2);
-    assert.deepEqual(
-      (store.page("tasks", -1, 1) as Array<{ id: string }>).map((record) => record.id),
-      ["one"],
-    );
-    assert.deepEqual(
-      (store.page("tasks", 0, 10) as Array<{ id: string }>).map((record) => record.id),
-      ["two"],
-    );
-    assert.deepEqual(
-      (store.page("attempts", -1, 10) as Array<{ id: string }>).map((record) => record.id),
-      ["one-1", "two-1", "one-2"],
-    );
-    store.close();
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-void test("the concrete runtime settles and delivers prelaunch cancellation", async () => {
-  const root = temporary();
-  const records = initial("ws-cancel");
-  const store = WorkstreamStore.create(root, records.metadata, records.intent);
-  const created = store.createTaskWithAttempt(owner, 0, "queued", task("queued"), "queued-1", {
-    ...attempt(),
-    selection: { kind: "implementation", guide: target, executor: target },
-  });
-  store.checkpointAttempt(owner, created.attempt.id, {
-    ...created.attempt.attempt,
-    execution: {
-      submission: "absent",
-      cancellation: { reason: "No longer needed", requestedAt: later },
-    },
-  });
-  const delivered: unknown[] = [];
-  const pi: Pick<ExtensionAPI, "sendMessage"> = {
-    sendMessage(message) {
-      delivered.push(message);
-    },
-  };
-  const scope = await Effect.runPromise(Scope.make());
-  try {
-    const attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({ store, owner, agentDir: root, pi }).pipe(Scope.provide(scope)),
-    );
-    assert.equal(attachment.state, "attached");
-    for (
-      let count = 0;
-      count < 50 && (store.readOutcome("queued-1") === undefined || delivered.length === 0);
-      count += 1
-    )
-      await Effect.runPromise(Effect.sleep(10));
-    const outcomeRecord = store.readOutcome("queued-1");
-    assert.equal(outcomeRecord?.outcome.result.kind, "cancelled");
-    assert.deepEqual(outcomeRecord?.outcome.effectiveModels, [target]);
-    assert.notEqual(store.readAttempt("queued-1").attempt.execution?.closedAt, undefined);
-    assert.equal(delivered.length, 1);
-  } finally {
-    await Effect.runPromise(Scope.close(scope, Exit.void));
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-void test("uncertain submission recovery requires the exact persisted kickoff, not a model marker", async () => {
-  const root = temporary();
-  const records = initial("ws-kickoff-proof");
-  const store = WorkstreamStore.create(root, records.metadata, records.intent);
-  const objective = {
-    content: [
-      "[WORKGRAPH WORKER OBJECTIVE]",
-      `Intent: ${records.intent.statement}`,
-      ...records.intent.constraints.map((constraint) => `Constraint: ${constraint}`),
-      "Question: Research kickoff-proof",
-      "Expected evidence: Direct observation",
-    ].join("\n"),
-    details: {
-      workstreamId: records.metadata.id,
-      taskId: "kickoff-proof",
-      attemptId: "kickoff-proof-1",
-      role: "research" as const,
-    },
-  };
-  const createdSession = await runNodePlatformPromise(
+async function session(root: string, taskId: string, attemptId: string, value: Task) {
+  return runNodePlatformPromise(
     createWorkerSessionEffect({
-      cwd: "/targets/kickoff-proof",
+      cwd: value.target.kind === "directory" ? value.target.path : value.target.checkoutRoot,
       sessionDir: join(root, "sessions"),
-      objective,
+      objective: objective(taskId, attemptId, value),
     }),
   );
-  const session = SessionManager.open(createdSession.sessionFile);
-  session.appendCustomEntry("pi-workgraph-effective-model", target);
-  store.createTaskWithAttempt(owner, 0, "kickoff-proof", task("kickoff-proof"), "kickoff-proof-1", {
-    ...attempt(),
-    execution: { sessionFile: createdSession.sessionFile, submission: "uncertain" },
-  });
-  const { runtime: herdr, log } = fakeHerdr(
-    root,
-    `const ok = (result) => console.log(JSON.stringify({ result }));
-if (args[0] === "agent" && args[1] === "list") ok({ agents: [{ workspace_id: "workspace-1", tab_id: "tab-proof", pane_id: "pane-proof", terminal_id: "terminal-proof", agent_status: "working", cwd: "/targets/kickoff-proof", agent_session: { value: ${JSON.stringify(createdSession.sessionFile)} } }] });
-else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process.exitCode = 1; }`,
-  );
+}
+
+void test("staged launch persists original workspace and shutdown never closes the Worker", async () => {
+  const root = temporary();
+  const store = new RecordStore(root, "session-a");
+  const value = task(root, "launch");
+  const attempt = store.createTaskWithAttempt("launch", value, "attempt-launch", spec).attempt;
+  const native = fixture(root);
   const scope = await Effect.runPromise(Scope.make());
   try {
-    const attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
+    await Effect.runPromise(
+      SessionRuntime.acquire({
         store,
-        owner,
         agentDir: root,
+        workspaceId: "workspace-old",
         pi: { sendMessage() {} },
-        herdr,
+        herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
-    assert.equal(attachment.state, "attached");
-    if (attachment.state !== "attached") return;
-
-    session.appendMessage({
-      role: "user",
-      content: [
-        { type: "text", text: WORKER_KICKOFF },
-        { type: "text", text: "extra" },
-      ],
-      timestamp: Date.now(),
-    });
-    session.appendMessage({
-      role: "user",
-      content: [
-        { type: "text", text: WORKER_KICKOFF },
-        { type: "image", data: "AA==", mimeType: "image/png" },
-      ],
-      timestamp: Date.now(),
-    });
-    await waitFor(() =>
-      (attachment.runtime.inspectionStatus().blocker ?? "").includes(
-        "does not prove the exact persisted kickoff",
-      ),
-    );
-    assert.equal(store.readAttempt("kickoff-proof-1").attempt.execution?.submission, "uncertain");
-
-    session.appendMessage({
-      role: "user",
-      content: [{ type: "text", text: WORKER_KICKOFF }],
-      timestamp: Date.now(),
-    });
-    await waitFor(
-      () => store.readAttempt("kickoff-proof-1").attempt.execution?.submission === "confirmed",
-    );
+    await waitFor(() => store.readAttempt(attempt.id).worker?.kickoff === "confirmed");
+    assert.equal(store.readAttempt(attempt.id).worker?.workspaceId, "workspace-old");
+    await Effect.runPromise(Scope.close(scope, Exit.void));
     assert.equal(
-      commands(log).filter((args) => args.slice(0, 2).join(" ") === "agent prompt").length,
+      commands(native.log).filter((entry) => entry[0] === "tab" && entry[1] === "close").length,
       0,
     );
+    assert.equal(JSON.parse(readFileSync(native.statePath, "utf8")).present, true);
   } finally {
-    await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-void test("fresh sessions launch once, recover by sessionFile, and cancellation closes once", async () => {
-  const root = temporary();
-  const records = initial("ws-native-ready");
-  let store = WorkstreamStore.create(root, records.metadata, records.intent);
-  const created = store.createTaskWithAttempt(
-    owner,
-    0,
-    "ready",
-    task("ready"),
-    "ready-1",
-    attempt(),
-  );
-  const statePath = join(root, "native-state.json");
-  const { runtime: herdr, log } = fakeHerdr(
-    root,
-    `const statePath = ${JSON.stringify(statePath)};
-const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { present: false };
-const save = () => writeFileSync(statePath, JSON.stringify(state));
-const ok = (result) => console.log(JSON.stringify({ result }));
-if (args[0] === "tab" && args[1] === "create") {
-  state.present = true; save();
-  ok({ tab: { tab_id: "tab-ready", workspace_id: "workspace-1" }, root_pane: { pane_id: "pane-ready", workspace_id: "workspace-1", tab_id: "tab-ready", cwd: "/targets/ready" } });
-} else if (args[0] === "agent" && args[1] === "start") {
-  state.sessionFile = args[args.indexOf("--session") + 1]; state.name = args[2]; save();
-  ok({ agent: { workspace_id: "workspace-1", tab_id: "tab-ready", pane_id: "pane-ready", terminal_id: "terminal-ready", agent_status: "working", cwd: "/targets/ready", name: state.name, agent_session: { value: state.sessionFile }, interactive_ready: true } });
-} else if (args[0] === "agent" && args[1] === "list") {
-  ok({ agents: state.present && state.sessionFile ? [{ workspace_id: "workspace-1", tab_id: "tab-ready", pane_id: "pane-ready", terminal_id: "terminal-ready", agent_status: "working", cwd: "/targets/ready", agent_session: { value: state.sessionFile } }] : [] });
-} else if (args[0] === "agent" && args[1] === "get") {
-  ok({ agent: { workspace_id: "workspace-1", tab_id: "tab-ready", pane_id: "pane-ready", terminal_id: "terminal-ready", agent_status: "working", cwd: "/targets/ready", agent_session: { value: state.sessionFile } } });
-} else if (args[0] === "tab" && args[1] === "list") ok({ tabs: [] });
-else if (args[0] === "agent" && args[1] === "prompt") ok({});
-else if (args[0] === "tab" && args[1] === "close") { state.present = false; save(); ok({}); }
-else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process.exitCode = 1; }`,
-  );
-  let scope = await Effect.runPromise(Scope.make());
-  try {
-    let attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
-        store,
-        owner,
-        agentDir: root,
-        pi: { sendMessage() {} },
-        herdr,
-      }).pipe(Scope.provide(scope)),
-    );
-    assert.equal(attachment.state, "attached");
-    if (attachment.state !== "attached") return;
-    await waitFor(
-      () => store.readAttempt(created.attempt.id).attempt.execution?.submission === "confirmed",
-    );
-    const execution = store.readAttempt(created.attempt.id).attempt.execution;
-    assert.notEqual(execution?.sessionFile, undefined);
-    assert.deepEqual(Object.keys(execution ?? {}).sort(), ["sessionFile", "submission"]);
-    const observationsBeforeReload = commands(log).filter(
-      (args) => args.slice(0, 2).join(" ") === "agent list",
-    ).length;
-    await Effect.runPromise(Scope.close(scope, Exit.void));
-
-    store = WorkstreamStore.openOwned(root, records.metadata.id, owner);
-    scope = await Effect.runPromise(Scope.make());
-    attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
-        store,
-        owner,
-        agentDir: root,
-        pi: { sendMessage() {} },
-        herdr,
-      }).pipe(Scope.provide(scope)),
-    );
-    assert.equal(attachment.state, "attached");
-    if (attachment.state !== "attached") return;
-    await waitFor(
-      () =>
-        commands(log).filter((args) => args.slice(0, 2).join(" ") === "agent list").length >
-        observationsBeforeReload,
-    );
-    await Effect.runPromise(attachment.runtime.cancel(created.attempt.id, "Stop exact Worker"));
-    assert.equal(store.readOutcome(created.attempt.id)?.outcome.result.kind, "cancelled");
-    assert.notEqual(store.readAttempt(created.attempt.id).attempt.execution?.closedAt, undefined);
-    await Effect.runPromise(Scope.close(scope, Exit.void));
-
-    store = WorkstreamStore.openOwned(root, records.metadata.id, owner);
-    scope = await Effect.runPromise(Scope.make());
-    attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
-        store,
-        owner,
-        agentDir: root,
-        pi: { sendMessage() {} },
-        herdr,
-      }).pipe(Scope.provide(scope)),
-    );
-    assert.equal(attachment.state, "attached");
-    await Effect.runPromise(Effect.sleep(1_200));
-    const nativeCommands = commands(log);
-    assert.equal(
-      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "tab create").length,
-      1,
-    );
-    assert.equal(
-      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "agent start").length,
-      1,
-    );
-    assert.equal(
-      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "agent prompt").length,
-      1,
-    );
-    assert.equal(
-      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "tab close").length,
-      1,
-    );
-  } finally {
-    await Effect.runPromise(Scope.close(scope, Exit.void));
-    rmSync(root, { recursive: true, force: true });
+void test("uncertain tab, agent, and kickoff recover from persisted facts without replay", async () => {
+  for (const stage of ["tab", "agent", "kickoff"] as const) {
+    const root = temporary();
+    const store = new RecordStore(root, `session-${stage}`);
+    const value = task(root, stage);
+    const attempt = store.createTaskWithAttempt(stage, value, `attempt-${stage}`, spec).attempt;
+    const created = await session(root, stage, attempt.id, value);
+    const state = {
+      present: true,
+      partial: stage === "tab",
+      workspace: "workspace-owner",
+      cwd: value.target.kind === "directory" ? value.target.path : "",
+      label: "",
+      session: created.sessionFile,
+    };
+    const native = fixture(root, state);
+    const requestLabel = (await import("../src/herdr-naming.js")).herdrWorkerTabLabel({
+      taskId: stage,
+      attemptId: attempt.id,
+      objective: objective(stage, attempt.id, value).content,
+      role: "research",
+    });
+    state.label = requestLabel;
+    writeFileSync(native.statePath, JSON.stringify(state));
+    if (stage === "tab")
+      store.checkpointWorker(attempt.id, {
+        sessionFile: created.sessionFile,
+        workspaceId: "workspace-owner",
+        tab: { state: "uncertain" },
+      });
+    if (stage === "agent")
+      store.checkpointWorker(attempt.id, {
+        sessionFile: created.sessionFile,
+        workspaceId: "workspace-owner",
+        tab: { state: "ready", tabId: "tab-1", paneId: "pane-1" },
+        agent: "uncertain",
+      });
+    if (stage === "kickoff") {
+      SessionManager.open(created.sessionFile).appendMessage({
+        role: "user",
+        content: WORKER_KICKOFF,
+        timestamp: Date.now(),
+      });
+      store.checkpointWorker(attempt.id, {
+        sessionFile: created.sessionFile,
+        workspaceId: "workspace-owner",
+        tab: { state: "ready", tabId: "tab-1", paneId: "pane-1" },
+        agent: "ready",
+        kickoff: "uncertain",
+      });
+    }
+    const scope = await Effect.runPromise(Scope.make());
+    try {
+      await Effect.runPromise(
+        SessionRuntime.acquire({
+          store,
+          agentDir: root,
+          workspaceId: "workspace-new",
+          pi: { sendMessage() {} },
+          herdr: native.herdr,
+        }).pipe(Scope.provide(scope)),
+      );
+      await waitFor(() => store.readAttempt(attempt.id).worker?.kickoff === "confirmed");
+      const log = commands(native.log);
+      assert.equal(log.filter((entry) => entry.slice(0, 2).join(" ") === "tab create").length, 0);
+      assert.equal(
+        log.filter((entry) => entry.slice(0, 2).join(" ") === "agent start").length,
+        stage === "tab" ? 1 : 0,
+      );
+      assert.equal(
+        log.filter((entry) => entry.slice(0, 2).join(" ") === "agent prompt").length,
+        stage === "kickoff" ? 0 : 1,
+      );
+    } finally {
+      await Effect.runPromise(Scope.close(scope, Exit.void));
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 
-void test("normal Outcome insertion closes once and reload only observes settled closure", async () => {
+void test("Outcome is written before one close and reload duplicates neither close nor notification", async () => {
   const root = temporary();
-  const records = initial("ws-normal-close");
-  let store = WorkstreamStore.create(root, records.metadata, records.intent);
-  const objective = {
-    content:
-      "[WORKGRAPH WORKER OBJECTIVE]\nIntent: Coordinate several independent targets\nConstraint: Keep each target independent\nQuestion: Research normal\nExpected evidence: Direct observation",
-    details: {
-      workstreamId: records.metadata.id,
-      taskId: "normal",
-      attemptId: "normal-1",
-      role: "research" as const,
-    },
-  };
-  const createdSession = await runNodePlatformPromise(
-    createWorkerSessionEffect({
-      cwd: "/targets/normal",
-      sessionDir: join(root, "sessions"),
-      objective,
-    }),
-  );
-  const session = SessionManager.open(createdSession.sessionFile);
-  session.appendCustomEntry("pi-workgraph-effective-model", target);
-  session.appendMessage({
+  let store = new RecordStore(root, "session-settle");
+  const value = task(root, "settle");
+  const attempt = store.createTaskWithAttempt("settle", value, "attempt-settle", spec).attempt;
+  const created = await session(root, "settle", attempt.id, value);
+  const manager = SessionManager.open(created.sessionFile);
+  manager.appendCustomEntry("pi-workgraph-effective-model", target);
+  manager.appendMessage({
     role: "toolResult",
     toolCallId: "report",
     toolName: "workgraph_report",
@@ -518,7 +222,7 @@ void test("normal Outcome insertion closes once and reload only observes settled
       report: {
         kind: "research",
         status: "completed",
-        summary: "Normal completion",
+        summary: "settled",
         evidence: [],
         findings: [],
       },
@@ -526,57 +230,59 @@ void test("normal Outcome insertion closes once and reload only observes settled
     isError: false,
     timestamp: Date.now(),
   });
-  session.appendCustomEntry("pi-workgraph-agent-settled", {});
-  const sessionFile = createdSession.sessionFile;
-  store.createTaskWithAttempt(owner, 0, "normal", task("normal"), "normal-1", {
-    ...attempt(),
-    execution: { sessionFile, submission: "confirmed" },
+  manager.appendCustomEntry("pi-workgraph-agent-settled", {});
+  store.checkpointWorker(attempt.id, {
+    sessionFile: created.sessionFile,
+    workspaceId: "workspace-owner",
+    tab: { state: "ready", tabId: "tab-1", paneId: "pane-1" },
+    agent: "ready",
+    kickoff: "confirmed",
   });
-  const statePath = join(root, "normal-native.json");
-  writeFileSync(statePath, JSON.stringify({ present: true }));
-  const { runtime: herdr, log } = fakeHerdr(
-    root,
-    `const statePath = ${JSON.stringify(statePath)};
-const state = JSON.parse(readFileSync(statePath, "utf8"));
-const ok = (result) => console.log(JSON.stringify({ result }));
-if (args[0] === "agent" && args[1] === "list") ok({ agents: state.present ? [{ workspace_id: "workspace-1", tab_id: "tab-normal", pane_id: "pane-normal", terminal_id: "terminal-normal", agent_status: "idle", cwd: "/targets/normal", agent_session: { value: ${JSON.stringify(sessionFile)} } }] : [] });
-else if (args[0] === "tab" && args[1] === "list") ok({ tabs: [] });
-else if (args[0] === "tab" && args[1] === "close") { state.present = false; writeFileSync(statePath, JSON.stringify(state)); ok({}); }
-else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process.exitCode = 1; }`,
-  );
+  const native = fixture(root, {
+    present: true,
+    partial: false,
+    workspace: "workspace-owner",
+    cwd: value.target.kind === "directory" ? value.target.path : "",
+    session: created.sessionFile,
+  });
+  let notifications = 0;
   let scope = await Effect.runPromise(Scope.make());
   try {
-    let attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
+    await Effect.runPromise(
+      SessionRuntime.acquire({
         store,
-        owner,
         agentDir: root,
-        pi: { sendMessage() {} },
-        herdr,
+        workspaceId: "workspace-new",
+        pi: {
+          sendMessage() {
+            notifications += 1;
+            assert.notEqual(store.readAttempt(attempt.id).outcome, undefined);
+          },
+        },
+        herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
-    assert.equal(attachment.state, "attached");
-    await waitFor(
-      () =>
-        store.readOutcome("normal-1") !== undefined &&
-        store.readAttempt("normal-1").attempt.execution?.closedAt !== undefined,
-    );
+    await waitFor(() => store.readAttempt(attempt.id).worker?.closed === true);
     await Effect.runPromise(Scope.close(scope, Exit.void));
-    store = WorkstreamStore.openOwned(root, records.metadata.id, owner);
+    store = new RecordStore(root, "session-settle");
     scope = await Effect.runPromise(Scope.make());
-    attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
+    await Effect.runPromise(
+      SessionRuntime.acquire({
         store,
-        owner,
         agentDir: root,
-        pi: { sendMessage() {} },
-        herdr,
+        workspaceId: "other",
+        pi: {
+          sendMessage() {
+            notifications += 1;
+          },
+        },
+        herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
-    assert.equal(attachment.state, "attached");
-    await Effect.runPromise(Effect.sleep(1_200));
+    await Effect.runPromise(Effect.sleep(400));
+    assert.equal(notifications, 1);
     assert.equal(
-      commands(log).filter((args) => args.slice(0, 2).join(" ") === "tab close").length,
+      commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
       1,
     );
   } finally {
@@ -585,280 +291,202 @@ else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process
   }
 });
 
-void test("a failed fresh start recovers a labelled partial tab without relaunch", async () => {
+void test("queued cancellation makes no Herdr call and active cancellation closes exactly once", async () => {
   const root = temporary();
-  const records = initial("ws-native-partial");
-  let store = WorkstreamStore.create(root, records.metadata, records.intent);
-  store.createTaskWithAttempt(owner, 0, "partial", task("partial"), "partial-1", attempt());
-  const label = herdrWorkerTabLabel({
-    runId: records.metadata.id,
-    attemptId: "partial-1",
-    assignmentId: "partial",
-    role: "research",
+  const store = new RecordStore(root, "session-cancel");
+  const queued = store.createTaskWithAttempt(
+    "queued",
+    task(root, "queued"),
+    "attempt-queued",
+    spec,
+  ).attempt;
+  const activeValue = task(root, "active");
+  const active = store.createTaskWithAttempt("active", activeValue, "attempt-active", spec).attempt;
+  const created = await session(root, "active", active.id, activeValue);
+  store.checkpointWorker(active.id, {
+    sessionFile: created.sessionFile,
+    workspaceId: "workspace-owner",
+    tab: { state: "ready", tabId: "tab-1", paneId: "pane-1" },
+    agent: "ready",
+    kickoff: "confirmed",
   });
-  const { runtime: herdr, log } = fakeHerdr(
-    root,
-    `const ok = (result) => console.log(JSON.stringify({ result }));
-if (args[0] === "tab" && args[1] === "create") ok({ tab: { tab_id: "tab-partial", workspace_id: "workspace-1" }, root_pane: { pane_id: "pane-partial", workspace_id: "workspace-1", tab_id: "tab-partial", cwd: "/targets/partial" } });
-else if (args[0] === "agent" && args[1] === "start") { console.error(JSON.stringify({ error: { code: "start_failed" } })); process.exitCode = 1; }
-else if (args[0] === "agent" && args[1] === "list") ok({ agents: [] });
-else if (args[0] === "tab" && args[1] === "list") ok({ tabs: [{ tab_id: "tab-partial", workspace_id: "workspace-1", label: ${JSON.stringify(label)} }] });
-else if (args[0] === "pane" && args[1] === "list") ok({ panes: [{ workspace_id: "workspace-1", tab_id: "tab-partial", pane_id: "pane-partial", terminal_id: "terminal-partial", cwd: "/targets/partial" }] });
-else { console.error(JSON.stringify({ error: { code: "unexpected_write" } })); process.exitCode = 1; }`,
-  );
-  let scope = await Effect.runPromise(Scope.make());
-  try {
-    let attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
-        store,
-        owner,
-        agentDir: root,
-        pi: { sendMessage() {} },
-        herdr,
-      }).pipe(Scope.provide(scope)),
-    );
-    assert.equal(attachment.state, "attached");
-    if (attachment.state !== "attached") return;
-    const firstRuntime = attachment.runtime;
-    await waitFor(() => (firstRuntime.inspectionStatus().blocker ?? "").includes("partial"));
-    await Effect.runPromise(Effect.sleep(1_200));
-    await Effect.runPromise(Scope.close(scope, Exit.void));
-    store = WorkstreamStore.openOwned(root, records.metadata.id, owner);
-    scope = await Effect.runPromise(Scope.make());
-    attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
-        store,
-        owner,
-        agentDir: root,
-        pi: { sendMessage() {} },
-        herdr,
-      }).pipe(Scope.provide(scope)),
-    );
-    assert.equal(attachment.state, "attached");
-    await Effect.runPromise(Effect.sleep(1_200));
-    const nativeCommands = commands(log);
-    assert.equal(
-      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "tab create").length,
-      1,
-    );
-    assert.equal(
-      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "agent start").length,
-      1,
-    );
-    assert.ok(nativeCommands.some((args) => args.slice(0, 2).join(" ") === "pane list"));
-  } finally {
-    await Effect.runPromise(Scope.close(scope, Exit.void));
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-void test("review objectives retain cited Outcome summaries and exact source facts", async () => {
-  const root = temporary();
-  const records = initial("ws-review-source");
-  const store = WorkstreamStore.create(root, records.metadata, records.intent);
-  const source = store.createTaskWithAttempt(owner, 0, "source", task("source"), "source-1", {
-    ...attempt(),
-    execution: {
-      sessionFile: "/sessions/source.jsonl",
-      submission: "confirmed",
-      closedAt: later,
-    },
-  });
-  store.insertOutcome(owner, "source-outcome", source.attempt.id, {
-    ...outcome("Exact source summary"),
-    delivery: { requestedAt: later, failures: [], deliveredAt: later },
+  const native = fixture(root, {
+    present: true,
+    partial: false,
+    workspace: "workspace-owner",
+    cwd: activeValue.target.kind === "directory" ? activeValue.target.path : "",
+    session: created.sessionFile,
   });
   const scope = await Effect.runPromise(Scope.make());
   try {
-    const attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
+    const runtime = await Effect.runPromise(
+      SessionRuntime.acquire({
         store,
-        owner,
         agentDir: root,
+        workspaceId: "workspace-new",
         pi: { sendMessage() {} },
+        herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
-    assert.equal(attachment.state, "attached");
-    if (attachment.state !== "attached") return;
+    const before = commands(native.log).length;
+    assert.equal(
+      (await Effect.runPromise(runtime.cancel(queued.id, "not needed"))).outcome?.result.kind,
+      "cancelled",
+    );
+    assert.equal(commands(native.log).length, before);
+    assert.equal((await Effect.runPromise(runtime.cancel(active.id, "stop"))).worker?.closed, true);
+    assert.equal(
+      commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
+      1,
+    );
+    await assert.rejects(Effect.runPromise(runtime.cancel(active.id, "again")), RuntimeError);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("creation uses global Attempt IDs and rejects unsettled review sources before mutation", async () => {
+  const root = temporary();
+  const store = new RecordStore(root, "session-create");
+  const native = fixture(root);
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    const runtime = await Effect.runPromise(
+      SessionRuntime.acquire({
+        store,
+        agentDir: root,
+        workspaceId: "workspace-owner",
+        pi: { sendMessage() {} },
+        herdr: native.herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    const first = await Effect.runPromise(
+      runtime.createTask({
+        id: "source",
+        target: task(root, "source").target,
+        contract: task(root, "source").contract,
+        selection,
+      }),
+    );
+    const second = await Effect.runPromise(runtime.createAttempt({ taskId: "source", selection }));
+    assert.match(first.id, /^attempt-[0-9a-f-]{36}$/);
+    assert.match(second.id, /^attempt-[0-9a-f-]{36}$/);
+    assert.notEqual(first.id, second.id);
     await assert.rejects(
       Effect.runPromise(
-        attachment.runtime.createTask({
-          id: "missing-review",
-          target: { kind: "directory", path: root },
+        runtime.createTask({
+          id: "review",
+          target: task(root, "review").target,
           contract: {
             kind: "review",
-            objective: "Review missing source",
-            concern: "Evidence quality",
-            subject: { kind: "outcome", outcomeId: "missing-outcome" },
+            objective: "Review source",
+            concern: "Evidence",
+            subject: { kind: "attempt", attemptId: first.id },
           },
-          selection: { kind: "target", target },
+          selection,
         }),
       ),
       RuntimeError,
     );
-    assert.equal(store.page("tasks", -1, 10).length, 1);
-    const review = await Effect.runPromise(
-      attachment.runtime.createTask({
-        id: "review",
-        target: { kind: "directory", path: root },
-        contract: {
-          kind: "review",
-          objective: "Review source result",
-          concern: "Evidence quality",
-          subject: { kind: "outcome", outcomeId: "source-outcome" },
-        },
-        selection: { kind: "target", target },
-      }),
-    );
-    let sessionFile: string | undefined;
-    for (let count = 0; count < 50 && sessionFile === undefined; count += 1) {
-      sessionFile = store.readAttempt(review.id).attempt.execution?.sessionFile;
-      if (sessionFile === undefined) await Effect.runPromise(Effect.sleep(10));
-    }
-    assert.notEqual(sessionFile, undefined);
-    if (sessionFile === undefined) return;
-    const objectiveEntry = SessionManager.open(sessionFile)
-      .getBranch()
-      .find(
-        (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
-      );
-    assert.equal(objectiveEntry?.type, "custom_message");
-    if (objectiveEntry?.type !== "custom_message" || typeof objectiveEntry.content !== "string")
-      return;
-    assert.match(objectiveEntry.content, /Exact source summary/);
-    assert.match(objectiveEntry.content, /source-outcome/);
-    assert.match(objectiveEntry.content, /\/targets\/source/);
-    assert.match(objectiveEntry.content, /\/sessions\/source\.jsonl/);
+    assert.equal(store.counts().tasks, 1);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-void test("output and delivery failures remain visible with bounded independent backoff", async () => {
+void test("a close-present blocker never repeats the close effect", async () => {
   const root = temporary();
-  const records = initial("ws-visible-failures");
-  const store = WorkstreamStore.create(root, records.metadata, records.intent);
-  const broken = store.createTaskWithAttempt(
-    owner,
-    0,
-    "broken-output",
-    {
-      target: {
-        kind: "repository",
-        checkoutRoot: join(root, "absent-checkout"),
-        commonDir: join(root, "absent-git"),
-      },
-      contract: {
-        kind: "implementation",
-        objective: "Classify output",
-        acceptance: ["Surface failure"],
-      },
-      createdAt: at,
-    },
-    "broken-output-1",
-    {
-      selection: { kind: "implementation", guide: target, executor: target },
-      base: { kind: "repository", baseCommit: "f".repeat(40) },
-      execution: { submission: "confirmed", closedAt: later },
-    },
-  );
-  store.insertOutcome(owner, "broken-outcome", broken.attempt.id, {
-    result: { kind: "cancelled", reason: "Fixture is already closed" },
-    effectiveModels: [target],
-    delivery: { requestedAt: later, failures: [], deliveredAt: later },
-    observedAt: later,
+  const store = new RecordStore(root, "session-close-blocked");
+  const value = task(root, "blocked");
+  const attempt = store.createTaskWithAttempt("blocked", value, "attempt-blocked", spec).attempt;
+  const created = await session(root, "blocked", attempt.id, value);
+  const manager = SessionManager.open(created.sessionFile);
+  manager.appendCustomEntry("pi-workgraph-agent-settled", {});
+  store.checkpointWorker(attempt.id, {
+    sessionFile: created.sessionFile,
+    workspaceId: "workspace-owner",
+    tab: { state: "ready", tabId: "tab-1", paneId: "pane-1" },
+    agent: "ready",
+    kickoff: "confirmed",
   });
-  const queued = store.createTaskWithAttempt(owner, 0, "delivery", task("delivery"), "delivery-1", {
-    ...attempt(),
-    execution: {
-      submission: "absent",
-      cancellation: { reason: "No work", requestedAt: later },
-    },
+  const native = fixture(root, {
+    present: true,
+    partial: false,
+    ignoreClose: true,
+    workspace: "workspace-owner",
+    cwd: value.target.kind === "directory" ? value.target.path : "",
+    session: created.sessionFile,
   });
-  let deliveries = 0;
   const scope = await Effect.runPromise(Scope.make());
   try {
-    const attachment = await Effect.runPromise(
-      WorkstreamRuntime.acquire({
+    const runtime = await Effect.runPromise(
+      SessionRuntime.acquire({
         store,
-        owner,
         agentDir: root,
-        pi: {
-          sendMessage() {
-            deliveries += 1;
-            throw new Error("delivery unavailable");
-          },
-        },
+        workspaceId: "new",
+        pi: { sendMessage() {} },
+        herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
-    assert.equal(attachment.state, "attached");
-    if (attachment.state !== "attached") return;
-    await waitFor(() => {
-      const blocker = attachment.runtime.inspectionStatus().blocker ?? "";
-      return blocker.includes("broken-output-1") && blocker.includes("delivery unavailable");
-    });
-    await Effect.runPromise(Effect.sleep(2_400));
-    assert.ok(deliveries <= 2, `expected bounded delivery retries, observed ${deliveries}`);
-    assert.ok((store.readOutcome(queued.attempt.id)?.outcome.delivery.failures.length ?? 0) <= 2);
-    assert.match(attachment.runtime.inspectionStatus().blocker ?? "", /broken-output-1/);
+    await waitFor(() => store.readAttempt(attempt.id).worker?.closing?.kind === "settled");
+    await Effect.runPromise(Effect.sleep(800));
+    assert.equal(
+      commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
+      1,
+    );
+    assert.match(runtime.inspectionStatus().blocker ?? "", /close will not be repeated/);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });
   }
 });
 
-void test("Outcomes are independent, only delivery mutates, and Outcomes alone gate completion", () => {
+void test("steering and repository classification reject inexact or open Workers without mutation", async () => {
   const root = temporary();
+  const store = new RecordStore(root, "session-guard");
+  const value = task(root, "guard");
+  const attempt = store.createTaskWithAttempt("guard", value, "attempt-guard", spec).attempt;
+  const created = await session(root, "guard", attempt.id, value);
+  store.checkpointWorker(attempt.id, {
+    sessionFile: created.sessionFile,
+    workspaceId: "workspace-owner",
+    tab: { state: "ready", tabId: "tab-1", paneId: "pane-1" },
+    agent: "ready",
+    kickoff: "confirmed",
+  });
+  const native = fixture(root, {
+    present: false,
+    partial: false,
+    workspace: "workspace-owner",
+    cwd: value.target.kind === "directory" ? value.target.path : "",
+    session: created.sessionFile,
+  });
+  const scope = await Effect.runPromise(Scope.make());
   try {
-    const records = initial("ws-outcomes");
-    const store = WorkstreamStore.create(root, records.metadata, records.intent);
-    store.createTaskWithAttempt(owner, 0, "one", task("one"), "one-1", attempt());
-    store.createTaskWithAttempt(owner, 0, "two", task("two"), "two-1", attempt());
-    store.insertOutcome(owner, "outcome-one", "one-1", outcome("one complete"));
-    assert.throws(
+    const runtime = await Effect.runPromise(
+      SessionRuntime.acquire({
+        store,
+        agentDir: root,
+        workspaceId: "new",
+        pi: { sendMessage() {} },
+        herdr: native.herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    await assert.rejects(Effect.runPromise(runtime.steer(attempt.id, "continue")), RuntimeError);
+    assert.equal(
+      commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "agent prompt").length,
+      0,
+    );
+    await assert.rejects(Effect.runPromise(runtime.apply(attempt.id)), RuntimeError);
+    await waitFor(
       () =>
-        store.complete(owner, {
-          conclusion: "Too early",
-          evidence: [],
-          limitations: [],
-          completedAt: later,
-        }),
-      StoreError,
+        store.readAttempt(attempt.id).outcome?.result.kind === "unreported" &&
+        store.readAttempt(attempt.id).worker?.closed === true,
     );
-    store.insertOutcome(owner, "outcome-two", "two-1", outcome("two complete"));
-
-    const failed = store.updateDelivery(owner, "one-1", {
-      requestedAt: later,
-      failures: [{ at: later, detail: "Coordinator unavailable" }],
-    });
-    assert.equal(failed.outcome.result.kind, "reported");
-    const delivered = store.updateDelivery(owner, "one-1", {
-      ...failed.outcome.delivery,
-      deliveredAt: later,
-    });
-    assert.equal(delivered.outcome.delivery.failures.length, 1);
-    assert.equal(store.readOutcome("two-1")?.outcome.delivery.deliveredAt, undefined);
-
-    const metadata = store.complete(owner, {
-      conclusion: "All semantic work settled",
-      evidence: ["Both Outcomes exist"],
-      limitations: [],
-      completedAt: later,
-    });
-    assert.equal(metadata.lifecycle, "completed");
-    assert.equal(store.readOutcome("two-1")?.outcome.delivery.deliveredAt, undefined);
-    const completion = metadata.completion;
-    assert.ok(completion);
-    assert.throws(() => store.complete(owner, completion), StoreError);
-    assert.throws(
-      () => store.createTaskWithAttempt(owner, 0, "late", task("late"), "late-1", attempt()),
-      StoreError,
-    );
-    assert.throws(() => store.appendAttempt(owner, "one", "one-late", attempt()), StoreError);
-    assert.throws(() => store.appendIntent(owner, records.intent), StoreError);
-    store.close();
   } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });
   }
 });
