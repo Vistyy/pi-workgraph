@@ -14,7 +14,6 @@ import {
   EXECUTOR_FAILURE_MESSAGE,
   EXECUTOR_START_ENTRY,
   readWorkerAssignment,
-  sameAttempt,
   type WorkerAssignment,
   type WorkerPhase,
   workerSystemPolicy,
@@ -96,7 +95,7 @@ export class WorkerRuntime {
     if (invalid !== undefined)
       return Result.fail(`Worker setting cannot disable protected tool ${invalid}.`);
     this.assignment = assignment.success;
-    this.plan = new WorkerPlanState(identityOf(assignment.success.details));
+    this.plan = new WorkerPlanState();
     this.plan.restore(this.attemptBranch(branch));
     this.directEditSeen = hasSuccessfulDirectEdit(this.attemptBranch(branch));
     this.executorMarkerSeen = this.hasMarker(branch, EXECUTOR_START_ENTRY);
@@ -113,7 +112,7 @@ export class WorkerRuntime {
       const assignment = readWorkerAssignment(branch, this.role);
       if (Result.isSuccess(assignment)) {
         this.assignment = assignment.success;
-        this.plan = new WorkerPlanState(identityOf(assignment.success.details));
+        this.plan = new WorkerPlanState();
         this.plan.restore(this.attemptBranch(branch));
       }
     }
@@ -250,10 +249,8 @@ export class WorkerRuntime {
     if (assignment === undefined) return undefined;
     const visible = active.some(
       (entry) =>
-        (entry.type === "custom_message" &&
-          entry.customType === "pi-workgraph-objective" &&
-          sameAttempt(entry.details, assignment.details)) ||
-        (entry.type === "custom_message" &&
+        entry.type === "custom_message" &&
+        (entry.customType === "pi-workgraph-objective" ||
           entry.customType === "pi-workgraph-compaction-recovery"),
     );
     if (visible) return undefined;
@@ -314,19 +311,15 @@ export class WorkerRuntime {
       customType: REMINDER,
       content: `[WORKGRAPH TODO SETTLE REMINDER ${count + 1}/${MAX_PLAN_REMINDERS}]\nThe executor settled without a report while TODO items remain actionable. Continue useful work or report truthfully; TODO status is not a completion gate.`,
       display: false,
-      details: { ordinal: count + 1, limit: MAX_PLAN_REMINDERS },
+      details: {},
     });
     return true;
   }
 
   private attemptBranch(entries: readonly WorkerEntry[]): WorkerEntry[] {
-    const details = this.assignment?.details;
-    if (details === undefined) return [];
+    if (this.assignment === undefined) return [];
     const start = entries.findIndex(
-      (entry) =>
-        entry.type === "custom_message" &&
-        entry.customType === "pi-workgraph-objective" &&
-        sameAttempt(entry.details, details),
+      (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
     );
     return start < 0 ? [] : entries.slice(start);
   }
@@ -452,13 +445,6 @@ function selectTarget(
 }
 function contractFailure(message: string) {
   return Effect.fail(new WorkerContractError({ message }));
-}
-function identityOf(details: WorkerAssignment["details"]) {
-  return {
-    workstreamId: details.workstreamId,
-    taskId: details.taskId,
-    attemptId: details.attemptId,
-  };
 }
 function bounded(message: string): string {
   return message.replace(/\s+/g, " ").slice(0, 300);

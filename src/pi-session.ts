@@ -15,14 +15,10 @@ const RoleSchema = Type.Union([
   Type.Literal("review"),
   Type.Literal("implementation"),
 ]);
-export const WorkerIdentitySchema = Type.Object({
-  workstreamId: Text,
-  taskId: Text,
-  attemptId: Text,
-});
 export const WorkerObjectiveDetailsSchema = Type.Object(
   {
-    ...WorkerIdentitySchema.properties,
+    taskId: Text,
+    attemptId: Text,
     role: RoleSchema,
     executor: Type.Optional(ModelTargetSchema),
   },
@@ -74,20 +70,10 @@ export function createWorkerSessionEffect(request: {
       });
     const fileSystem = yield* FileSystem.FileSystem;
     yield* fileSystem.makeDirectory(request.sessionDir, { recursive: true });
-    const files = yield* fileSystem.readDirectory(request.sessionDir);
-    const residue = files.filter((name) =>
-      name.endsWith(`_${request.objective.details.attemptId}.jsonl`),
-    );
     const matches = yield* nativePromise("recover", () =>
       SessionManager.listAll(request.sessionDir),
     );
     const sameId = matches.filter((entry) => entry.id === request.objective.details.attemptId);
-    if (residue.length !== sameId.length)
-      return yield* new PiSessionError({
-        operation: "recover",
-        message:
-          "Worker session creation residue is unreadable or does not expose the exact Attempt id.",
-      });
     if (sameId.length > 1)
       return yield* new PiSessionError({
         operation: "recover",
@@ -336,7 +322,6 @@ function sameObjectiveDetails(
   expected: WorkerObjectiveDetails,
 ): boolean {
   return (
-    actual.workstreamId === expected.workstreamId &&
     actual.taskId === expected.taskId &&
     actual.attemptId === expected.attemptId &&
     actual.role === expected.role &&

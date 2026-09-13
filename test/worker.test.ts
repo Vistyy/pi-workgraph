@@ -8,6 +8,7 @@ import { type ExtensionActions, SessionManager } from "@earendil-works/pi-coding
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { readWorkerSession, type WorkerObjective } from "../src/pi-session.js";
+import { WorkerPlanState } from "../src/worker-plan.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "./decoders.js";
 import { extensionFixture, persistentSession, usage } from "./helpers.js";
 
@@ -16,7 +17,6 @@ const objective: WorkerObjective = {
   content:
     "[WORKGRAPH WORKER OBJECTIVE]\nIntent: exercise the Worker\nObjective: change only the fixture",
   details: {
-    workstreamId: "fixture",
     taskId: "worker",
     attemptId: "attempt",
     role: "implementation",
@@ -56,7 +56,6 @@ async function fixture(
       role === "implementation"
         ? { ...objective.details, role, executor }
         : {
-            workstreamId: objective.details.workstreamId,
             taskId: objective.details.taskId,
             attemptId: objective.details.attemptId,
             role,
@@ -110,11 +109,7 @@ function appendPlan(session: SessionManager) {
     toolCallId: "plan",
     toolName: "workgraph_plan",
     content: [{ type: "text", text: "set" }],
-    details: {
-      action: "set",
-      todos: todo,
-      attempt: { workstreamId: "fixture", taskId: "worker", attemptId: "attempt" },
-    },
+    details: { action: "set", todos: todo },
     isError: false,
     timestamp: Date.now(),
   });
@@ -144,6 +139,23 @@ function assistant(session: SessionManager, model = "gpt-4o") {
 }
 
 void test("plan tool keeps one strict nonblank 1–9 item current snapshot", async () => {
+  const legacy = new WorkerPlanState();
+  legacy.restore([
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "workgraph_plan",
+        details: {
+          action: "set",
+          todos: todo,
+          attempt: { workstreamId: "fixture", taskId: "worker", attemptId: "attempt" },
+        },
+      },
+    },
+  ]);
+  assert.equal(legacy.todos, undefined);
+
   const f = await fixture();
   try {
     const tool = f.runner.getToolDefinition("workgraph_plan");
@@ -156,11 +168,7 @@ void test("plan tool keeps one strict nonblank 1–9 item current snapshot", asy
     assert.equal(Value.Check(tool.parameters, { action: "set", todos: [] }), false);
     assert.equal(Value.Check(tool.parameters, { action: "add", todo: todo[0] }), false);
     const set = await f.call("workgraph_plan", { action: "set", todos: todo });
-    assert.deepEqual(set.details, {
-      action: "set",
-      todos: todo,
-      attempt: { workstreamId: "fixture", taskId: "worker", attemptId: "attempt" },
-    });
+    assert.deepEqual(set.details, { action: "set", todos: todo });
     const update = await f.call("workgraph_plan", {
       action: "update",
       id: "implement",
@@ -211,7 +219,7 @@ void test("TODO and successful direct edit trigger one executor cutover in eithe
       const reminder = f.messages.find(
         (message) => message.customType === "pi-workgraph-todo-reminder",
       );
-      assert.deepEqual(reminder?.details, { ordinal: 1, limit: 2 });
+      assert.deepEqual(reminder?.details, {});
     } finally {
       await f.dispose();
     }
