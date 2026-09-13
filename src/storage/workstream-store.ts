@@ -1,5 +1,5 @@
 /* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, typescript/no-unsafe-return -- node:sqlite rows and TypeBox outputs are decoded at this private host boundary; absent optional persisted facts remain omitted. */
-import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { Data } from "effect";
@@ -75,6 +75,19 @@ CREATE TABLE IF NOT EXISTS outcomes (
 
 type Row = Record<string, SQLOutputValue>;
 
+interface WorkstreamDiscoveryItem {
+  workstreamId: string;
+  title: string;
+  lifecycle: WorkstreamMetadata["lifecycle"];
+  operationallySettled: boolean;
+  updatedAt: string;
+}
+interface WorkstreamDiscovery {
+  items: WorkstreamDiscoveryItem[];
+  errors: Array<{ workstreamId: string; error: string }>;
+  nextOffset?: number;
+}
+
 export class StoreError extends Data.TaggedError("StoreError")<{
   readonly operation: string;
   readonly message: string;
@@ -96,6 +109,63 @@ export class WorkstreamStore {
   static pathFor(agentDir: string, id: string): string {
     if (!safeId.test(id)) throw failure("locate", "Workstream id is not a safe path segment.");
     return join(agentDir, "workgraph", "workstreams", id, "workstream.sqlite");
+  }
+
+  static discover(
+    agentDir: string,
+    includeSettled: boolean,
+    offset: number,
+    limit: number,
+  ): WorkstreamDiscovery {
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > MAX_PAGE
+    )
+      throw failure("discover Workstreams", "Page boundary is outside the supported range.");
+    const root = join(agentDir, "workgraph", "workstreams");
+    if (!existsSync(root)) return { items: [], errors: [] };
+    const candidates = readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && safeId.test(entry.name))
+      .flatMap((entry) => {
+        const path = join(root, entry.name, "workstream.sqlite");
+        if (!existsSync(path)) return [];
+        return [{ id: entry.name, mtime: statSync(path).mtimeMs }];
+      })
+      .sort((left, right) => right.mtime - left.mtime || left.id.localeCompare(right.id));
+    const items: WorkstreamDiscoveryItem[] = [];
+    const errors: Array<{ workstreamId: string; error: string }> = [];
+    for (const candidate of candidates) {
+      let store: WorkstreamStore | undefined;
+      try {
+        store = WorkstreamStore.openReadOnly(agentDir, candidate.id);
+        const metadata = store.readMetadata();
+        const operationallySettled = store.unsettled().length === 0;
+        if (includeSettled || metadata.lifecycle === "active" || !operationallySettled)
+          items.push({
+            workstreamId: metadata.id,
+            title: store.title(),
+            lifecycle: metadata.lifecycle,
+            operationallySettled,
+            updatedAt: metadata.updatedAt,
+          });
+      } catch (cause) {
+        errors.push({
+          workstreamId: candidate.id,
+          error: cause instanceof StoreError ? cause.message : "Invalid Workstream store.",
+        });
+      } finally {
+        store?.close();
+      }
+    }
+    const page = items.slice(offset, offset + limit);
+    return {
+      items: page,
+      errors: errors.slice(0, MAX_PAGE),
+      ...(offset + page.length < items.length ? { nextOffset: offset + page.length } : {}),
+    };
   }
 
   static create(agentDir: string, metadata: WorkstreamMetadata, intent: Intent): WorkstreamStore {

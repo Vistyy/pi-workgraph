@@ -26,6 +26,7 @@ export function required<Value>(value: Value | null | undefined, description: st
 type FixtureVariable =
   | "HERDR_ENV"
   | "HERDR_WORKSPACE_ID"
+  | "HERDR_TAB_ID"
   | "PI_CODING_AGENT_DIR"
   | "PI_WORKGRAPH_ROLE"
   | "PI_WORKGRAPH_HERDR_BIN"

@@ -39,6 +39,14 @@ const selection = {
 };
 type RepositoryTarget = Extract<TaskTarget, { kind: "repository" }>;
 
+async function waitFor(predicate: () => Promise<boolean>, attempts = 120): Promise<void> {
+  for (let count = 0; count < attempts; count += 1) {
+    if (await predicate()) return;
+    await Effect.runPromise(Effect.sleep(25));
+  }
+  assert.fail("Timed out waiting for Git settlement.");
+}
+
 async function repository() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-git-"));
   const root = join(parent, "repository");
@@ -350,7 +358,14 @@ void test("an integration parent source ref stays pinned until child classificat
       childOperation = { ...childOperation, attempt: store.readAttempt(child.attempt.id).attempt };
       const classified = await Effect.runPromise(classifyOutput(childOperation, at));
       store.checkpointAttempt(owner, child.attempt.id, classified);
-      await Effect.runPromise(attachment.runtime.observe(source.attempt.id));
+      await waitFor(async () => {
+        try {
+          await git(fixture.root, "rev-parse", sourceOperation.outputRef);
+          return false;
+        } catch {
+          return true;
+        }
+      });
       await assert.rejects(git(fixture.root, "rev-parse", sourceOperation.outputRef));
     } finally {
       await Effect.runPromise(Scope.close(scope, Exit.void));

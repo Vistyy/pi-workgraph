@@ -40,10 +40,13 @@ export const WorkstreamMetadataSchema = strict({
   updatedAt: Instant,
 });
 
+const HumanIntentAuthoritySchema = strict({ receiptId: Text, sessionId: Text, sessionFile: Text });
 const IntentAuthoritySchema = Type.Union([
-  strict({ receiptId: Text, sessionId: Text, sessionFile: Text }),
+  HumanIntentAuthoritySchema,
   strict({
     grantId: Text,
+    rootHumanReceipt: HumanIntentAuthoritySchema,
+    parentCoordinator: CoordinatorOwnerSchema,
     parentWorkstreamId: Text,
     parentIntentIndex: Type.Integer({ minimum: 0 }),
   }),

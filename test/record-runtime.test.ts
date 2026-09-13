@@ -344,9 +344,10 @@ else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process
       ],
       timestamp: Date.now(),
     });
-    await assert.rejects(
-      Effect.runPromise(attachment.runtime.observe("kickoff-proof-1")),
-      /does not prove the exact persisted kickoff/,
+    await waitFor(() =>
+      (attachment.runtime.inspectionStatus().blocker ?? "").includes(
+        "does not prove the exact persisted kickoff",
+      ),
     );
     assert.equal(store.readAttempt("kickoff-proof-1").attempt.execution?.submission, "uncertain");
 
@@ -355,8 +356,9 @@ else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process
       content: [{ type: "text", text: WORKER_KICKOFF }],
       timestamp: Date.now(),
     });
-    await Effect.runPromise(attachment.runtime.observe("kickoff-proof-1"));
-    assert.equal(store.readAttempt("kickoff-proof-1").attempt.execution?.submission, "confirmed");
+    await waitFor(
+      () => store.readAttempt("kickoff-proof-1").attempt.execution?.submission === "confirmed",
+    );
     assert.equal(
       commands(log).filter((args) => args.slice(0, 2).join(" ") === "agent prompt").length,
       0,
@@ -618,7 +620,7 @@ else { console.error(JSON.stringify({ error: { code: "unexpected_write" } })); p
     assert.equal(attachment.state, "attached");
     if (attachment.state !== "attached") return;
     const firstRuntime = attachment.runtime;
-    await waitFor(() => (firstRuntime.status().blocker ?? "").includes("partial"));
+    await waitFor(() => (firstRuntime.inspectionStatus().blocker ?? "").includes("partial"));
     await Effect.runPromise(Effect.sleep(1_200));
     await Effect.runPromise(Scope.close(scope, Exit.void));
     store = WorkstreamStore.openOwned(root, records.metadata.id, owner);
@@ -793,13 +795,13 @@ void test("output and delivery failures remain visible with bounded independent 
     assert.equal(attachment.state, "attached");
     if (attachment.state !== "attached") return;
     await waitFor(() => {
-      const blocker = attachment.runtime.status().blocker ?? "";
+      const blocker = attachment.runtime.inspectionStatus().blocker ?? "";
       return blocker.includes("broken-output-1") && blocker.includes("delivery unavailable");
     });
     await Effect.runPromise(Effect.sleep(2_400));
     assert.ok(deliveries <= 2, `expected bounded delivery retries, observed ${deliveries}`);
     assert.ok((store.readOutcome(queued.attempt.id)?.outcome.delivery.failures.length ?? 0) <= 2);
-    assert.match(attachment.runtime.status().blocker ?? "", /broken-output-1/);
+    assert.match(attachment.runtime.inspectionStatus().blocker ?? "", /broken-output-1/);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });

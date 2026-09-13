@@ -133,7 +133,7 @@ export class WorkstreamRuntime {
     });
   }
 
-  status(): { lifecycle: WorkstreamMetadata["lifecycle"]; blocker?: string } {
+  inspectionStatus(): { lifecycle: WorkstreamMetadata["lifecycle"]; blocker?: string } {
     const status = { lifecycle: this.store.readMetadata().lifecycle };
     const blocker = [...this.blockers.entries()]
       .map(([attemptId, blocked]) => `${attemptId}: ${blocked.detail}`)
@@ -252,17 +252,6 @@ export class WorkstreamRuntime {
         yield* self.closeNewCancellation(saved);
         yield* self.wake();
         return self.store.readAttempt(attemptId);
-      }),
-    );
-  }
-
-  observe(attemptId: string): Effect.Effect<OutcomeRecord | undefined, RuntimeError> {
-    const self = this;
-    return this.serializedEffect(
-      "reconcile Attempt",
-      Effect.gen(function* () {
-        yield* self.reconcileAttempt(attemptId);
-        return self.store.readOutcome(attemptId);
       }),
     );
   }
