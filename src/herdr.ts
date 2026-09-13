@@ -12,8 +12,6 @@ import {
 } from "./herdr-naming.js";
 import { liveLayer } from "./node-platform.js";
 
-const strict = <const Fields extends Parameters<typeof Type.Object>[0]>(fields: Fields) =>
-  Type.Object(fields, { additionalProperties: false });
 const NonBlank = Type.String({ minLength: 1 });
 const AgentStatusSchema = Type.Union([
   Type.Literal("idle"),
@@ -22,7 +20,18 @@ const AgentStatusSchema = Type.Union([
   Type.Literal("done"),
   Type.Literal("unknown"),
 ]);
-const AgentSchema = strict({
+const AgentSessionSchema = Type.Object({ value: NonBlank });
+const AgentSchema = Type.Object({
+  workspace_id: NonBlank,
+  tab_id: NonBlank,
+  pane_id: NonBlank,
+  terminal_id: NonBlank,
+  agent_status: AgentStatusSchema,
+  cwd: NonBlank,
+  name: Type.Optional(NonBlank),
+  agent_session: AgentSessionSchema,
+});
+const StartedAgentSchema = Type.Object({
   workspace_id: NonBlank,
   tab_id: NonBlank,
   pane_id: NonBlank,
@@ -30,29 +39,35 @@ const AgentSchema = strict({
   agent_status: AgentStatusSchema,
   cwd: NonBlank,
   name: NonBlank,
-  agent_session: strict({ value: NonBlank }),
+  agent_session: AgentSessionSchema,
+  interactive_ready: Type.Literal(true),
 });
-const AgentResponseSchema = strict({
-  result: strict({ type: Type.Optional(Type.String()), agent: AgentSchema }),
+const AgentResponseSchema = Type.Object({
+  result: Type.Object({ type: Type.Optional(Type.String()), agent: AgentSchema }),
 });
-const ListedAgentSchema = strict({
+const AgentStartResponseSchema = Type.Object({
+  result: Type.Object({ type: Type.Optional(Type.String()), agent: StartedAgentSchema }),
+});
+const ListedAgentSchema = Type.Object({
   workspace_id: NonBlank,
   tab_id: NonBlank,
   pane_id: NonBlank,
   terminal_id: NonBlank,
   agent_status: AgentStatusSchema,
   cwd: NonBlank,
-  name: NonBlank,
-  agent_session: Type.Optional(strict({ value: NonBlank })),
+  agent_session: Type.Optional(AgentSessionSchema),
 });
-const AgentListResponseSchema = strict({
-  result: strict({ type: Type.Optional(Type.String()), agents: Type.Array(ListedAgentSchema) }),
-});
-const TabCreateResponseSchema = strict({
-  result: strict({
+const AgentListResponseSchema = Type.Object({
+  result: Type.Object({
     type: Type.Optional(Type.String()),
-    tab: strict({ tab_id: NonBlank, workspace_id: NonBlank }),
-    root_pane: strict({
+    agents: Type.Array(ListedAgentSchema),
+  }),
+});
+const TabCreateResponseSchema = Type.Object({
+  result: Type.Object({
+    type: Type.Optional(Type.String()),
+    tab: Type.Object({ tab_id: NonBlank, workspace_id: NonBlank }),
+    root_pane: Type.Object({
       pane_id: NonBlank,
       workspace_id: NonBlank,
       tab_id: NonBlank,
@@ -60,12 +75,12 @@ const TabCreateResponseSchema = strict({
     }),
   }),
 });
-const WorkspaceCreateResponseSchema = strict({
-  result: strict({
+const WorkspaceCreateResponseSchema = Type.Object({
+  result: Type.Object({
     type: Type.Optional(Type.String()),
-    workspace: strict({ workspace_id: NonBlank }),
-    tab: strict({ tab_id: NonBlank, workspace_id: NonBlank }),
-    root_pane: strict({
+    workspace: Type.Object({ workspace_id: NonBlank }),
+    tab: Type.Object({ tab_id: NonBlank, workspace_id: NonBlank }),
+    root_pane: Type.Object({
       pane_id: NonBlank,
       workspace_id: NonBlank,
       tab_id: NonBlank,
@@ -73,14 +88,9 @@ const WorkspaceCreateResponseSchema = strict({
     }),
   }),
 });
-const SuccessResponseSchema = strict({
-  result: Type.Object({}, { additionalProperties: true }),
-});
-const ErrorResponseSchema = strict({
-  error: Type.Object(
-    { code: NonBlank, message: Type.Optional(Type.String()) },
-    { additionalProperties: true },
-  ),
+const SuccessResponseSchema = Type.Object({ result: Type.Object({}) });
+const ErrorResponseSchema = Type.Object({
+  error: Type.Object({ code: NonBlank, message: Type.Optional(Type.String()) }),
 });
 const childProcessLayer = NodeChildProcessSpawner.layer.pipe(Layer.provide(liveLayer));
 const NOT_FOUND = Symbol("HerdrNotFound");
@@ -249,7 +259,7 @@ export class HerdrCliRuntime {
       request.sessionFile,
       ...agentSelectionArgs(request.model, request.thinking),
     ];
-    return this.command(args, AgentResponseSchema, { timeout: 45_000 }).pipe(
+    return this.command(args, AgentStartResponseSchema, { timeout: 45_000 }).pipe(
       Effect.mapError(
         (error) =>
           new HerdrError({
@@ -337,7 +347,7 @@ export class HerdrCliRuntime {
             "--session",
             request.sessionFile,
           ],
-          AgentResponseSchema,
+          AgentStartResponseSchema,
           { timeout: 45_000 },
         ).pipe(
           Effect.mapError(
@@ -413,7 +423,7 @@ export class HerdrCliRuntime {
             `Exact Worker is not ready for a prompt (status=${observed.status}).`,
           );
         const response = yield* this.command(
-          ["agent", "prompt", identity.agentName, prompt],
+          ["agent", "prompt", identity.paneId, prompt],
           SuccessResponseSchema,
           { timeout: 15_000 },
         );
@@ -610,7 +620,7 @@ function exactObservation(
     actual.pane_id !== expected.paneId ||
     (expected.terminalId !== undefined && actual.terminal_id !== expected.terminalId) ||
     actual.cwd !== expected.cwd ||
-    actual.name !== expected.agentName ||
+    (actual.name !== undefined && actual.name !== expected.agentName) ||
     actual.agent_session.value !== expected.sessionFile
   )
     return new HerdrError({
@@ -623,7 +633,7 @@ function exactObservation(
       tabId: actual.tab_id,
       paneId: actual.pane_id,
       terminalId: actual.terminal_id,
-      agentName: actual.name,
+      agentName: expected.agentName,
       sessionFile: actual.agent_session.value,
       cwd: actual.cwd,
     },
