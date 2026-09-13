@@ -1,6 +1,6 @@
 # Pi Workgraph
 
-Pi Workgraph lets Pi coordinate repository work through workers in visible Herdr tabs. It can gather evidence, seek a second opinion, implement changes in isolated Git worktrees, and review retained results without applying them automatically.
+Pi Workgraph lets a Pi coordinator delegate repository and directory work to visible Workers in Herdr tabs. It can gather evidence, consult another model, implement in isolated Git worktrees, review exact results, and retain useful repository output for a deliberate local decision.
 
 ## Install
 
@@ -23,54 +23,75 @@ Pi packages execute code with your user permissions. Review third-party source b
 
 ## Configure models
 
-Before using Workgraph, create `~/.pi/agent/workgraph/models.json`. It must be a complete version 6 policy. Workgraph supplies no model defaults and never rewrites this file.
+Before using Workgraph, create `~/.pi/agent/workgraph/models.json`. Workgraph supplies no model defaults and never rewrites this file.
 
 ```json
 {
-  "version": 6,
-  "roles": {
-    "research": [
-      { "model": "provider/research-model", "thinking": "high" }
-    ],
-    "implementation.guide": {
-      "model": "provider/guide-model",
-      "thinking": "medium"
-    },
-    "implementation.executor": {
-      "model": "provider/executor-model",
-      "thinking": "high"
-    },
-    "review": [
-      { "model": "provider/review-model", "thinking": "high" }
-    ],
-    "consultation.advisor": [
-      { "model": "provider/advisor-model", "thinking": "medium" }
-    ]
-  }
+  "research": [
+    { "model": "provider/research-model", "thinking": "high" }
+  ],
+  "implementation.guide": {
+    "model": "provider/guide-model",
+    "thinking": "medium"
+  },
+  "implementation.executor": {
+    "model": "provider/executor-model",
+    "thinking": "high"
+  },
+  "implementation.escalationExecutor": {
+    "model": "provider/escalation-model",
+    "thinking": "max"
+  },
+  "review": [
+    { "model": "provider/review-model", "thinking": "high" }
+  ],
+  "consultation.advisor": [
+    { "model": "provider/advisor-model", "thinking": "medium" }
+  ]
 }
 ```
 
 Replace every example ID with a model configured in Pi. Thinking may be `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`.
 
-Research, review, and consultation advisors are ordered lists; the first target is the default. Implementation guide and executor are single targets. Additional list entries let the coordinator choose another configured model when a task benefits from it. Thinking levels always come from this policy.
+Research, review, and consultation roles are ordered nonempty lists; their first target is the default. The implementation guide and executor are single targets. `implementation.escalationExecutor` may be omitted; it is used only when the coordinator explicitly requests it, and such a request fails before Task creation when the role is absent. Additional list entries let the coordinator request model diversity. Model and thinking choices are frozen into each Attempt, while its Outcome records the models Pi actually used.
 
-## Use Workgraph
+## Coordinator tools
 
-Describe the outcome you want and any important constraints. A Workstream owns that initiative rather than a repository. Each immutable Task records its resolved directory or repository target, so one Workstream may coordinate several repositories without claiming cross-repository transactions, rollback, or all-or-nothing application.
+Workgraph exposes exactly nine coordinator tools:
 
-Directory Tasks run at their recorded path and produce no Git output. Repository Tasks record their checkout root and Git common directory. Their Attempts use detached worktrees below the Pi agent data directory; useful clean output is retained at a private `refs/pi-workgraph/outputs/<workstream>/<attempt>` ref until deliberately applied or discarded. These are ownership boundaries, not security sandboxes.
+| Tool | Purpose |
+| --- | --- |
+| `workgraph_models` | List configured targets for a selectable role. |
+| `workgraph_research` | Create evidence-seeking research or a bounded repository experiment. |
+| `workgraph_consult` | Ask one configured advisor a precise, evidence-only question. |
+| `workgraph_implement` | Create an implementation Task and its first Attempt. |
+| `workgraph_review` | Review an exact Attempt, comparison, or repository revision. |
+| `workgraph_attempt` | Create another fresh Attempt for an existing Task. |
+| `workgraph_inspect` | Inspect this Pi session's Task, Attempt, Outcome, and operational records. |
+| `workgraph_control` | Steer or cancel a Worker, or apply or discard exact repository output. |
+| `workgraph_notepad` | Read, replace, or clear the current branch's bounded coordinator memo. |
 
-Each Workstream has one private SQLite database at `<agentDir>/workgraph/workstreams/<workstreamId>/workstream.sqlite`. Worker session history is retained separately below the agent data directory. An Attempt persists its Pi `sessionFile`, while Herdr remains authoritative for current tab, pane, and terminal identity. Only the uninterrupted call that creates and checkpoints a fresh session launches it; later recovery observes the exact session or uniquely labelled partial tab and never relaunches it. An Outcome is recorded from semantic Worker-session evidence before ordinary Worker closure; delivery and retained-output settlement remain independent of Workstream completion. Cancellation and normal settlement each issue close at most once. If the process stops between the durable cancellation/Outcome record and that close, the user must deliberately close the retained resource before Workgraph can observe absence and finish closure.
+Each coordinator Pi session owns its own records. All sessions share one private SQLite database under the Pi agent data directory, partitioned by exact session identity; records are not globally discoverable from other sessions.
 
-`workgraph_handoff(request, includeContext?)` launches one independent child coordinator from the current coordinator cwd. It creates a fresh parentless Pi session with the default model configuration and has no parent Task, persisted launch lifecycle, result channel, automatic retry, or completion obligation. Treat an interrupted or failed launch as uncertain: retain the child session and known native resources rather than cleaning up or retrying.
+A Task has one immutable resolved target. Directory targets record an exact path. Repository targets record the checkout root and Git common directory, so Tasks in one session may safely address different repositories without implying a transaction across them. Every Attempt inherits its Task target and starts one fresh Worker Pi session.
+
+Repository Attempts execute in detached worktrees under the Pi agent data directory. Clean changed output is retained at `refs/pi-workgraph/outputs/<attemptId>` after the worktree is removed. Applying output is an explicit local operation against the exact destination repository; discarding it is a separate explicit destructive operation. Workgraph does not push or otherwise publish commits. Dirty, foreign, ambiguous, or partially handled resources are preserved rather than guessed away.
+
+Stopping or reloading the coordinator stops only coordinator-owned activity. Independent Worker sessions, Herdr tabs, retained refs, and uncertain resources remain available for inspection or deliberate action.
+
+The notepad stores at most 4,000 characters in the current Pi branch and restores that memo after genuine context compaction. It is pending-memory only: it grants no authority and does not establish acceptance or correctness.
 
 ## Calm presentation
 
-`/calm` hides model tool executions and the Workgraph workstream/attention rows, then shows your messages, assistant prose, and compact skill invocations. Rows Pi adds through the chat lifecycle that Calm observes stay visible by default, including native Pi warnings and errors, cache/status/summary feedback, user-entered bash output, and unknown or future components. Assistant prose drops thinking and tool-call parts but keeps Pi's abort, error, and truncation notices. Pi currently inserts its streaming custom-entry row by splicing the chat directly, bypassing that lifecycle, so such a row stays in the native transcript while Calm is on. A subdued separator appears between adjacent assistant answers, and any visible native row breaks that adjacency. Coordinator activity stays in a bounded rail above the editor. `/calm default on` saves that preference for new coordinator sessions.
+Calm is coordinator-only and is on by default; `/calm default on` preserves that default for new coordinator sessions. It projects the live Pi chat children on every render while leaving Pi's source transcript untouched.
+
+The projection hides exact `pi-workgraph-outcome` rows and model tool-execution components. Assistant copies exclude thinking and tool-call parts but retain Pi's abort, error, and truncation notices. An unpaired skill invocation appears as compact `/skill:name` shorthand; paired skill metadata yields the accompanying user message instead. A subdued separator appears between adjacent assistant answers, while any visible native row breaks adjacency.
+
+Because membership comes from the live child list at render time, rows inserted by direct child splices are observed and visible by default. Native warnings, status feedback, bash output, and unknown or future rows therefore remain visible unless they match an exact exclusion. Mouse events are routed through the projected layout. If discovery, classification, rendering, invalidation, or mouse seams are incompatible, Calm restores native rendering rather than applying a partial filter.
 
 ## Disable worker tools
 
-Configure tools unavailable to every worker in `~/.pi/agent/settings.json`:
+Configure tools unavailable to every Worker in `~/.pi/agent/settings.json`:
 
 ```json
 {
