@@ -131,6 +131,11 @@ void test("classification removes unchanged output, compacts every clean descend
       ),
       "absent",
     );
+    const unchangedRecovery = operation(fixture, "unchanged-recovery", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(unchangedRecovery));
+    await git(fixture.root, "worktree", "remove", unchangedRecovery.worktreePath);
+    const recoveredNoOutput = await Effect.runPromise(classifyOutput(unchangedRecovery, at));
+    assert.equal(recoveredNoOutput.output?.kind, "no_output");
 
     const clean = operation(fixture, "clean", initial(fixture.base));
     await Effect.runPromise(ensureDetachedWorktree(clean));
@@ -140,6 +145,16 @@ void test("classification removes unchanged output, compacts every clean descend
     assert.equal(retained.output?.kind === "retained" ? retained.output.tip : "", cleanTip);
     assert.equal(await git(fixture.root, "rev-parse", clean.outputRef), cleanTip);
     await assert.rejects(readFile(join(clean.worktreePath, "file.txt")));
+    const cleanRecovery = operation(fixture, "clean-recovery", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(cleanRecovery));
+    const recoveryTip = await commit(cleanRecovery.worktreePath, "recovered candidate");
+    await git(fixture.root, "update-ref", cleanRecovery.outputRef, recoveryTip);
+    await git(fixture.root, "worktree", "remove", cleanRecovery.worktreePath);
+    const recoveredRetained = await Effect.runPromise(classifyOutput(cleanRecovery, at));
+    assert.equal(
+      recoveredRetained.output?.kind === "retained" ? recoveredRetained.output.tip : "",
+      recoveryTip,
+    );
 
     const dirty = operation(fixture, "dirty", initial(fixture.base));
     await Effect.runPromise(ensureDetachedWorktree(dirty));
@@ -198,6 +213,16 @@ void test("fast-forward and divergent application recover structurally and clean
     const recovered = await Effect.runPromise(applyOutput(divergent, at));
     assert.equal(recovered.output?.kind === "applied" ? recovered.output.revision : "", merge);
     assert.equal(await git(fixture.root, "status", "--porcelain"), "");
+
+    await git(fixture.root, "reset", "--hard", divergentBase);
+    await writeFile(join(fixture.root, "file.txt"), "source\n");
+    await git(fixture.root, "commit", "-am", "equivalent destination");
+    await git(fixture.root, "merge", "--no-commit", sourceTip);
+    assert.equal(await git(fixture.root, "status", "--porcelain"), "");
+    assert.equal(await git(fixture.root, "rev-parse", "--verify", "MERGE_HEAD"), sourceTip);
+    await assert.rejects(Effect.runPromise(prepareApplication(divergent)), GitError);
+    assert.equal(await git(fixture.root, "rev-parse", "--verify", "MERGE_HEAD"), sourceTip);
+    await git(fixture.root, "merge", "--abort");
   } finally {
     await rm(fixture.parent, { recursive: true, force: true });
   }
@@ -269,6 +294,25 @@ void test("integration ancestry, conflicts, and reasoned discard preserve foreig
       "preserve me\n",
     );
     assert.equal(await git(fixture.root, "rev-parse", foreign.outputRef), before);
+
+    let missingRef = operation(fixture, "missing-ref", initial(before));
+    await Effect.runPromise(ensureDetachedWorktree(missingRef));
+    await writeFile(join(missingRef.worktreePath, "ignored.bin"), "must survive\n");
+    missingRef = {
+      ...missingRef,
+      attempt: await Effect.runPromise(classifyOutput(missingRef, at)),
+    };
+    await git(fixture.root, "update-ref", "-d", missingRef.outputRef);
+    const missingCheckpoint = prepareDiscard(missingRef, "Discard only with exact ref ownership");
+    await assert.rejects(
+      Effect.runPromise(discardOutput({ ...missingRef, attempt: missingCheckpoint }, at)),
+      GitError,
+    );
+    assert.equal(
+      await readFile(join(missingRef.worktreePath, "ignored.bin"), "utf8"),
+      "must survive\n",
+    );
+    assert.equal(await git(missingRef.worktreePath, "rev-parse", "HEAD"), before);
   } finally {
     await rm(fixture.parent, { recursive: true, force: true });
   }

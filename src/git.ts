@@ -23,7 +23,6 @@ export interface RepositoryOperation {
 export class GitError extends Data.TaggedError("GitError")<{
   readonly operation: string;
   readonly message: string;
-  readonly cause?: unknown;
 }> {}
 
 interface CommandResult {
@@ -55,11 +54,7 @@ export function resolveTaskTarget(input: {
     const discovery = yield* gitResult(path, ["rev-parse", "--git-dir"]);
     if (discovery.code !== 0) {
       if (input.kind === "repository")
-        return yield* fail(
-          "resolve target",
-          "Target is not an initialized Git work tree.",
-          discovery,
-        );
+        return yield* fail("resolve target", "Target is not an initialized Git work tree.");
       return { kind: "directory" as const, path };
     }
     const inside = yield* git(path, ["rev-parse", "--is-inside-work-tree"]);
@@ -188,8 +183,17 @@ export function classifyOutput(
 ): Effect.Effect<Attempt, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(operation.target);
-    const state = yield* ownedCheckout(operation, true);
+    const registration = yield* registeredWorktree(
+      operation.target.commonDir,
+      operation.worktreePath,
+    );
+    const exists = yield* pathExists(operation.worktreePath);
     const base = baseCommit(operation.attempt);
+    if (registration === undefined && !exists)
+      return yield* classifyAbsentOutput(operation, base, at);
+    if (registration === undefined || !exists)
+      return yield* fail("classify output", "Attempt placement is foreign or incomplete.");
+    const state = yield* ownedCheckout(operation, true);
     if (!(yield* ancestry(operation.target.commonDir, base, state.head)))
       return yield* fail("classify output", "Attempt HEAD is unrelated to its exact base.");
     yield* validateCandidate(operation, state.head);
@@ -210,6 +214,29 @@ export function classifyOutput(
       },
     };
   }).pipe(Effect.provide(childProcessLayer));
+}
+
+function classifyAbsentOutput(
+  operation: RepositoryOperation,
+  base: string,
+  at: string,
+): Effect.Effect<Attempt, GitError> {
+  return Effect.gen(function* () {
+    const tip = yield* readRef(operation.target.commonDir, operation.outputRef);
+    if (tip === undefined)
+      return { ...operation.attempt, output: { kind: "no_output" as const, completedAt: at } };
+    if (!(yield* ancestry(operation.target.commonDir, base, tip)))
+      return yield* fail("classify output", "Attempt output ref is unrelated to its exact base.");
+    yield* validateCandidate(operation, tip);
+    return {
+      ...operation.attempt,
+      output: {
+        kind: "retained" as const,
+        tip,
+        reason: "Candidate output is retained.",
+      },
+    };
+  });
 }
 
 /** Validate application facts and, at most once, checkpoint a clean same-ref advancement. */
@@ -412,9 +439,12 @@ export function discardOutput(
       operation.worktreePath,
     );
     const exists = yield* pathExists(operation.worktreePath);
-    if (registration !== undefined || exists) {
+    if (registration === undefined && !exists) {
+      yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.tip);
+    } else {
       if (registration === undefined || !exists)
         return yield* fail("discard output", "Attempt placement is foreign or incomplete.");
+      yield* requireExactRef(operation.target.commonDir, operation.outputRef, output.tip);
       const state = yield* ownedCheckout(operation, true);
       if (state.head !== output.tip)
         return yield* fail(
@@ -424,8 +454,8 @@ export function discardOutput(
       yield* git(operation.worktreePath, ["reset", "--hard", output.tip]);
       yield* git(operation.worktreePath, ["clean", "-fdx"], true);
       yield* removeCleanWorktree(operation);
+      yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.tip);
     }
-    yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.tip);
     return output.applied === undefined
       ? {
           ...operation.attempt,
@@ -493,11 +523,7 @@ function destinationState(
   return Effect.gen(function* () {
     const refResult = yield* gitResult(target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]);
     if (refResult.code !== 0 || !refResult.stdout.startsWith("refs/heads/"))
-      return yield* fail(
-        "apply output",
-        "Destination must be an attached branch checkout.",
-        refResult,
-      );
+      return yield* fail("apply output", "Destination must be an attached branch checkout.");
     return {
       ref: refResult.stdout,
       head: yield* exactCommit(target.commonDir, "HEAD", "apply output", target.checkoutRoot),
@@ -537,12 +563,8 @@ function proveMergeable(
   source: string,
 ): Effect.Effect<string, GitError> {
   return gitDir(commonDir, ["merge-tree", "--write-tree", destination, source]).pipe(
-    Effect.mapError((cause) =>
-      error(
-        "apply output",
-        "Candidate conflicts with the destination; nothing was mutated.",
-        cause,
-      ),
+    Effect.mapError(() =>
+      error("apply output", "Candidate conflicts with the destination; nothing was mutated."),
     ),
   );
 }
@@ -642,11 +664,16 @@ function registeredWorktree(
 }
 
 function dirty(cwd: string): Effect.Effect<boolean, GitError> {
-  return git(
-    cwd,
-    ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"],
-    true,
-  ).pipe(Effect.map((output) => output.length > 0));
+  return Effect.all([
+    git(cwd, ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], true),
+    gitResult(cwd, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]),
+  ]).pipe(
+    Effect.flatMap(([status, mergeHead]) => {
+      if (mergeHead.code !== 0 && mergeHead.code !== 1)
+        return fail("inspect checkout", "Git could not inspect merge state.");
+      return Effect.succeed(status.length > 0 || mergeHead.code === 0);
+    }),
+  );
 }
 
 function ancestry(
@@ -658,7 +685,7 @@ function ancestry(
     Effect.flatMap((result) => {
       if (result.code === 0) return Effect.succeed(true);
       if (result.code === 1) return Effect.succeed(false);
-      return fail("inspect ancestry", "Git could not inspect candidate ancestry.", result);
+      return fail("inspect ancestry", "Git could not inspect candidate ancestry.");
     }),
   );
 }
@@ -681,7 +708,7 @@ function exactCommit(
     Effect.mapError((cause) =>
       cause.operation === operation
         ? cause
-        : error(operation, "Revision did not resolve to one exact commit.", cause),
+        : error(operation, "Revision did not resolve to one exact commit."),
     ),
   );
 }
@@ -692,7 +719,7 @@ function readRef(commonDir: string, ref: string): Effect.Effect<string | undefin
       if (result.code === 0) return Effect.succeed(result.stdout);
       // oxlint-disable-next-line effecttsgo/effect-succeed-with-void -- This branch inhabits the explicit optional-ref result.
       if (result.code === 1) return Effect.succeed<string | undefined>(undefined);
-      return fail("inspect output ref", "Private output ref could not be inspected.", result);
+      return fail("inspect output ref", "Private output ref could not be inspected.");
     }),
   );
 }
@@ -749,7 +776,7 @@ function pathExists(path: string): Effect.Effect<boolean, GitError> {
           throw cause;
         },
       ),
-    catch: (cause) => error("inspect path", "Attempt placement could not be inspected.", cause),
+    catch: () => error("inspect path", "Attempt placement could not be inspected."),
   });
 }
 function isErrno(cause: unknown, code: string): boolean {
@@ -758,7 +785,7 @@ function isErrno(cause: unknown, code: string): boolean {
 function filesystem<A>(operation: string, run: () => Promise<A>): Effect.Effect<A, GitError> {
   return Effect.tryPromise({
     try: run,
-    catch: (cause) => error(operation, "Filesystem operation failed.", cause),
+    catch: () => error(operation, "Filesystem operation failed."),
   });
 }
 function git(cwd: string, args: string[], allowEmpty = false): Effect.Effect<string, GitError> {
@@ -800,7 +827,7 @@ function command(args: string[]): Effect.Effect<CommandResult, GitError> {
       };
     }),
   ).pipe(
-    Effect.mapError((cause) => error(args.join(" "), "Git process failed.", cause)),
+    Effect.mapError(() => error(args.join(" "), "Git process failed.")),
     Effect.provide(childProcessLayer),
   );
 }
@@ -810,16 +837,16 @@ function checked(
   allowEmpty: boolean,
 ): Effect.Effect<string, GitError> {
   if (result.code !== 0)
-    return fail(args.join(" "), result.stderr || result.stdout || "Git command failed.", result);
+    return fail(args.join(" "), result.stderr || result.stdout || "Git command failed.");
   if (!allowEmpty && result.stdout.length === 0)
-    return fail(args.join(" "), "Git returned no output.", result);
+    return fail(args.join(" "), "Git returned no output.");
   return Effect.succeed(result.stdout);
 }
-function fail(operation: string, message: string, cause?: unknown): Effect.Effect<never, GitError> {
-  return Effect.fail(error(operation, message, cause));
+function fail(operation: string, message: string): Effect.Effect<never, GitError> {
+  return Effect.fail(error(operation, message));
 }
-function error(operation: string, message: string, cause?: unknown): GitError {
-  return new GitError({ operation, message, cause });
+function error(operation: string, message: string): GitError {
+  return new GitError({ operation, message });
 }
 function processCwd(): string {
   return globalThis.process.cwd();
