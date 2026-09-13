@@ -5,7 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import * as NodeChildProcessSpawner from "@effect/platform-node-shared/NodeChildProcessSpawner";
 import { Data, Effect, Layer, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import type { Attempt, TaskTarget } from "./domain/records.js";
+import type { AttemptOutput, AttemptSpec, TaskTarget } from "./domain/records.js";
 import { liveLayer } from "./node-platform.js";
 
 const childProcessLayer = NodeChildProcessSpawner.layer.pipe(Layer.provide(liveLayer));
@@ -13,11 +13,11 @@ const childProcessLayer = NodeChildProcessSpawner.layer.pipe(Layer.provide(liveL
 type RepositoryTarget = Extract<TaskTarget, { kind: "repository" }>;
 export interface RepositoryOperation {
   readonly attemptId: string;
-  readonly attempt: Attempt;
+  readonly spec: AttemptSpec;
+  readonly output?: AttemptOutput;
   readonly target: RepositoryTarget;
   readonly worktreePath: string;
   readonly outputRef: string;
-  readonly applicable: boolean;
 }
 
 export class GitError extends Data.TaggedError("GitError")<{
@@ -36,12 +36,16 @@ interface CheckoutState {
 }
 
 /** Resolve one immutable Task target from its real filesystem and Git identity. */
-export function resolveTaskTarget(input: {
-  cwd: string;
-  path?: string;
-  kind?: "directory" | "repository";
-  revision?: string;
-}): Effect.Effect<TaskTarget, GitError> {
+export function resolveTaskTarget(
+  input:
+    | { readonly cwd: string; readonly path?: string; readonly kind: "directory" }
+    | {
+        readonly cwd: string;
+        readonly path?: string;
+        readonly kind: "repository";
+        readonly revision?: string;
+      },
+): Effect.Effect<TaskTarget, GitError> {
   return Effect.gen(function* () {
     const path = yield* filesystem("resolve target", () =>
       realpath(resolve(input.cwd, input.path ?? ".")),
@@ -52,11 +56,8 @@ export function resolveTaskTarget(input: {
     if (input.kind === "directory") return { kind: "directory" as const, path };
 
     const discovery = yield* gitResult(path, ["rev-parse", "--git-dir"]);
-    if (discovery.code !== 0) {
-      if (input.kind === "repository")
-        return yield* fail("resolve target", "Target is not an initialized Git work tree.");
-      return { kind: "directory" as const, path };
-    }
+    if (discovery.code !== 0)
+      return yield* fail("resolve target", "Target is not an initialized Git work tree.");
     const inside = yield* git(path, ["rev-parse", "--is-inside-work-tree"]);
     const bare = yield* git(path, ["rev-parse", "--is-bare-repository"]);
     if (inside !== "true" || bare !== "false")
@@ -98,7 +99,7 @@ export function validateRetainedCandidate(
 ): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(operation.target);
-    const output = operation.attempt.output;
+    const output = operation.output;
     if (output?.kind !== "retained")
       return yield* fail("extend candidate", "Candidate parent has no retained output.");
     yield* requireCompactedCandidate(operation, output.tip);
@@ -114,20 +115,10 @@ export function isAncestor(
   return ancestry(target.commonDir, parent, child).pipe(Effect.provide(childProcessLayer));
 }
 
-export function detachedPlacement(input: {
-  agentDir: string;
-  workstreamId: string;
-  attemptId: string;
-}) {
+export function detachedPlacement(input: { agentDir: string; attemptId: string }) {
   return {
-    worktreePath: join(
-      input.agentDir,
-      "workgraph",
-      "worktrees",
-      input.workstreamId,
-      input.attemptId,
-    ),
-    outputRef: `refs/pi-workgraph/outputs/${input.workstreamId}/${input.attemptId}`,
+    worktreePath: join(input.agentDir, "workgraph", "worktrees", input.attemptId),
+    outputRef: `refs/pi-workgraph/outputs/${input.attemptId}`,
   };
 }
 
@@ -137,7 +128,7 @@ export function ensureDetachedWorktree(
 ): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(operation.target);
-    const base = baseCommit(operation.attempt);
+    const base = baseCommit(operation.spec);
     yield* exactCommit(operation.target.commonDir, base, "create worktree");
     if ((yield* readRef(operation.target.commonDir, operation.outputRef)) !== undefined)
       return yield* fail("create worktree", "The Attempt private output ref already exists.");
@@ -179,8 +170,7 @@ function recoverPlacement(
 /** Classify repository bytes only after Worker closure, independent of semantic outcome. */
 export function classifyOutput(
   operation: RepositoryOperation,
-  at: string,
-): Effect.Effect<Attempt, GitError> {
+): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(operation.target);
     const registration = yield* registeredWorktree(
@@ -188,9 +178,8 @@ export function classifyOutput(
       operation.worktreePath,
     );
     const exists = yield* pathExists(operation.worktreePath);
-    const base = baseCommit(operation.attempt);
-    if (registration === undefined && !exists)
-      return yield* classifyAbsentOutput(operation, base, at);
+    const base = baseCommit(operation.spec);
+    if (registration === undefined && !exists) return yield* classifyAbsentOutput(operation, base);
     if (registration === undefined || !exists)
       return yield* fail("classify output", "Attempt placement is foreign or incomplete.");
     const state = yield* ownedCheckout(operation, true);
@@ -199,19 +188,16 @@ export function classifyOutput(
     yield* validateCandidate(operation, state.head);
     if (!state.dirty && state.head === base) {
       yield* removeCleanWorktree(operation);
-      return { ...operation.attempt, output: { kind: "no_output" as const, completedAt: at } };
+      return { kind: "no_output" as const };
     }
     yield* createExactRef(operation.target.commonDir, operation.outputRef, state.head);
     if (!state.dirty) yield* removeCleanWorktree(operation);
     return {
-      ...operation.attempt,
-      output: {
-        kind: "retained" as const,
-        tip: state.head,
-        reason: state.dirty
-          ? "Dirty output is preserved for explicit disposition."
-          : "Candidate output is retained.",
-      },
+      kind: "retained" as const,
+      tip: state.head,
+      reason: state.dirty
+        ? "Dirty output is preserved for explicit disposition."
+        : "Candidate output is retained.",
     };
   }).pipe(Effect.provide(childProcessLayer));
 }
@@ -219,35 +205,24 @@ export function classifyOutput(
 function classifyAbsentOutput(
   operation: RepositoryOperation,
   base: string,
-  at: string,
-): Effect.Effect<Attempt, GitError> {
+): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
     const tip = yield* readRef(operation.target.commonDir, operation.outputRef);
-    if (tip === undefined)
-      return { ...operation.attempt, output: { kind: "no_output" as const, completedAt: at } };
+    if (tip === undefined) return { kind: "no_output" as const };
     if (!(yield* ancestry(operation.target.commonDir, base, tip)))
       return yield* fail("classify output", "Attempt output ref is unrelated to its exact base.");
     yield* validateCandidate(operation, tip);
-    return {
-      ...operation.attempt,
-      output: {
-        kind: "retained" as const,
-        tip,
-        reason: "Candidate output is retained.",
-      },
-    };
+    return { kind: "retained" as const, tip, reason: "Candidate output is retained." };
   });
 }
 
 /** Validate application facts and, at most once, checkpoint a clean same-ref advancement. */
 export function prepareApplication(
   operation: RepositoryOperation,
-): Effect.Effect<Attempt, GitError> {
+): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
-    if (!operation.applicable)
-      return yield* fail("apply output", "Only implementation output can be applied.");
     yield* revalidate(operation.target);
-    const output = operation.attempt.output;
+    const output = operation.output;
     return yield* output?.kind === "applying"
       ? prepareApplicationRetry(operation, output)
       : prepareRetainedApplication(operation);
@@ -256,8 +231,8 @@ export function prepareApplication(
 
 function prepareApplicationRetry(
   operation: RepositoryOperation,
-  output: Extract<NonNullable<Attempt["output"]>, { kind: "applying" }>,
-): Effect.Effect<Attempt, GitError> {
+  output: Extract<AttemptOutput, { kind: "applying" }>,
+): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
     const destination = yield* destinationState(operation.target);
     if (destination.ref !== output.destinationRef)
@@ -267,7 +242,7 @@ function prepareApplicationRetry(
       destination.head === output.destinationHead ||
       (yield* isAppliedStructure(operation.target.commonDir, output, destination.head))
     )
-      return operation.attempt;
+      return output;
     if (yield* ancestry(operation.target.commonDir, output.sourceTip, destination.head))
       return yield* fail("apply output", "Destination advanced beyond the exact candidate result.");
     if (
@@ -276,18 +251,15 @@ function prepareApplicationRetry(
     )
       return yield* fail("apply output", "Destination changed after application preparation.");
     yield* proveMergeable(operation.target.commonDir, destination.head, output.sourceTip);
-    return {
-      ...operation.attempt,
-      output: { ...output, destinationHead: destination.head, replanned: true as const },
-    };
+    return { ...output, destinationHead: destination.head, replanned: true as const };
   });
 }
 
 function prepareRetainedApplication(
   operation: RepositoryOperation,
-): Effect.Effect<Attempt, GitError> {
+): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
-    const output = operation.attempt.output;
+    const output = operation.output;
     if (output?.kind !== "retained")
       return yield* fail("apply output", "Attempt has no retained output.");
     yield* requireCompactedCandidate(operation, output.tip);
@@ -296,29 +268,22 @@ function prepareRetainedApplication(
       operation.outputRef,
       output.tip,
     );
-    const root = candidateRoot(operation.attempt);
+    const root = candidateRoot(operation.spec);
     if (!(yield* ancestry(operation.target.commonDir, root, source)))
       return yield* fail("apply output", "Candidate does not contain its source root.");
     const destination = yield* destinationState(operation.target);
     if (destination.dirty) return yield* fail("apply output", "Destination checkout is dirty.");
     if (
-      !(yield* ancestry(
-        operation.target.commonDir,
-        baseCommit(operation.attempt),
-        destination.head,
-      ))
+      !(yield* ancestry(operation.target.commonDir, baseCommit(operation.spec), destination.head))
     )
       return yield* fail("apply output", "Destination no longer descends from the Attempt base.");
     yield* proveMergeable(operation.target.commonDir, destination.head, source);
     return {
-      ...operation.attempt,
-      output: {
-        kind: "applying" as const,
-        sourceRoot: root,
-        sourceTip: source,
-        destinationRef: destination.ref,
-        destinationHead: destination.head,
-      },
+      kind: "applying" as const,
+      sourceRoot: root,
+      sourceTip: source,
+      destinationRef: destination.ref,
+      destinationHead: destination.head,
     };
   });
 }
@@ -326,11 +291,10 @@ function prepareRetainedApplication(
 /** Recover structurally or advance only the prepared attached destination with merge --ff-only. */
 export function applyOutput(
   operation: RepositoryOperation,
-  at: string,
-): Effect.Effect<Attempt, GitError> {
+): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(operation.target);
-    const output = operation.attempt.output;
+    const output = operation.output;
     if (output?.kind !== "applying")
       return yield* fail("apply output", "Application has no durable preparation checkpoint.");
     yield* requireCompactedCandidate(operation, output.sourceTip);
@@ -350,16 +314,13 @@ export function applyOutput(
       !(yield* ancestry(operation.target.commonDir, output.sourceTip, revision))
     )
       return yield* fail("apply output", "Applied destination failed exact post-validation.");
-    return {
-      ...operation.attempt,
-      output: { kind: "applied" as const, revision, completedAt: at, cleanupTip: output.sourceTip },
-    };
+    return { kind: "applied" as const, revision, cleanupTip: output.sourceTip };
   }).pipe(Effect.provide(childProcessLayer));
 }
 
 function applicationRevision(
   operation: RepositoryOperation,
-  output: Extract<NonNullable<Attempt["output"]>, { kind: "applying" }>,
+  output: Extract<AttemptOutput, { kind: "applying" }>,
   head: string,
 ): Effect.Effect<string, GitError> {
   return Effect.gen(function* () {
@@ -390,48 +351,47 @@ function applicationRevision(
 /** Remove still-exact clean source resources only after the applied checkpoint is durable. */
 export function cleanupAppliedOutput(
   operation: RepositoryOperation,
-): Effect.Effect<Attempt, GitError> {
+): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
-    const output = operation.attempt.output;
-    if (output?.kind !== "applied" || output.cleanupTip === undefined) return operation.attempt;
+    const output = operation.output;
+    if (output?.kind !== "applied")
+      return yield* fail("cleanup applied output", "Attempt has no applied output to clean up.");
+    if (output.cleanupTip === undefined) return output;
     yield* revalidate(operation.target);
     yield* requireCompactedCandidate(operation, output.cleanupTip);
     yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.cleanupTip);
     const { cleanupTip: _cleanupTip, ...cleaned } = output;
-    return { ...operation.attempt, output: cleaned };
+    return cleaned;
   }).pipe(Effect.provide(childProcessLayer));
 }
 
-export function prepareDiscard(operation: RepositoryOperation, reason: string): Attempt {
-  if (reason.trim().length === 0) throw error("discard output", "Discard requires a reason.");
-  const output = operation.attempt.output;
-  if (output?.kind === "discarding") return operation.attempt;
+export function prepareDiscard(
+  operation: RepositoryOperation,
+  reason: string,
+): Effect.Effect<AttemptOutput, GitError> {
+  if (reason.trim().length === 0)
+    return Effect.fail(error("discard output", "Discard requires a reason."));
+  const output = operation.output;
+  if (output?.kind === "discarding") return Effect.succeed(output);
   if (output?.kind === "retained")
-    return {
-      ...operation.attempt,
-      output: { kind: "discarding", tip: output.tip, reason },
-    };
+    return Effect.succeed({ kind: "discarding", tip: output.tip, reason });
   if (output?.kind === "applied" && output.cleanupTip !== undefined)
-    return {
-      ...operation.attempt,
-      output: {
-        kind: "discarding",
-        tip: output.cleanupTip,
-        reason,
-        applied: { revision: output.revision, completedAt: output.completedAt },
-      },
-    };
-  throw error("discard output", "Attempt has no releasable output.");
+    return Effect.succeed({
+      kind: "discarding",
+      tip: output.cleanupTip,
+      reason,
+      applied: { revision: output.revision },
+    });
+  return Effect.fail(error("discard output", "Attempt has no releasable output."));
 }
 
 /** Destructively remove only resources named by a durable exact-attempt discard checkpoint. */
 export function discardOutput(
   operation: RepositoryOperation,
-  at: string,
-): Effect.Effect<Attempt, GitError> {
+): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(operation.target);
-    const output = operation.attempt.output;
+    const output = operation.output;
     if (output?.kind !== "discarding")
       return yield* fail("discard output", "Discard has no durable checkpoint.");
     const registration = yield* registeredWorktree(
@@ -457,38 +417,28 @@ export function discardOutput(
       yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.tip);
     }
     return output.applied === undefined
-      ? {
-          ...operation.attempt,
-          output: { kind: "discarded" as const, reason: output.reason, completedAt: at },
-        }
-      : {
-          ...operation.attempt,
-          output: {
-            kind: "applied" as const,
-            ...output.applied,
-            cleanupReason: output.reason,
-          },
-        };
+      ? { kind: "discarded" as const, reason: output.reason }
+      : { kind: "applied" as const, ...output.applied, cleanupReason: output.reason };
   }).pipe(Effect.provide(childProcessLayer));
 }
 
-function baseCommit(attempt: Attempt): string {
-  if (attempt.base.kind !== "repository")
+function baseCommit(spec: AttemptSpec): string {
+  if (spec.base.kind !== "repository")
     throw error("inspect output", "Attempt has no repository base.");
-  return attempt.base.baseCommit;
+  return spec.base.baseCommit;
 }
-function candidateRoot(attempt: Attempt): string {
-  return attempt.lineage?.candidateRoot ?? baseCommit(attempt);
+function candidateRoot(spec: AttemptSpec): string {
+  return spec.lineage?.candidateRoot ?? baseCommit(spec);
 }
 
 function validateCandidate(
   operation: RepositoryOperation,
   head: string,
 ): Effect.Effect<void, GitError> {
-  const lineage = operation.attempt.lineage?.candidateOf;
+  const lineage = operation.spec.lineage?.candidateOf;
   if (lineage?.kind !== "integrate") return Effect.void;
   return Effect.all([
-    ancestry(operation.target.commonDir, baseCommit(operation.attempt), head),
+    ancestry(operation.target.commonDir, baseCommit(operation.spec), head),
     ancestry(operation.target.commonDir, lineage.sourceTip, head),
   ]).pipe(
     Effect.flatMap(([destination, source]) =>
@@ -534,7 +484,7 @@ function destinationState(
 
 function isAppliedStructure(
   commonDir: string,
-  output: Extract<NonNullable<Attempt["output"]>, { kind: "applying" }>,
+  output: Extract<AttemptOutput, { kind: "applying" }>,
   revision: string,
 ): Effect.Effect<boolean, GitError> {
   return Effect.gen(function* () {
