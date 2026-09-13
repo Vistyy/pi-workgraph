@@ -1,6 +1,6 @@
 /* oxlint-disable typescript/no-this-alias -- Effect generators retain the runtime owner while yielding host failures. */
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { Data, Effect } from "effect";
+import { Data, Effect, Result } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -16,7 +16,6 @@ import {
   readWorkerAssignment,
   sameAttempt,
   type WorkerAssignment,
-  type WorkerDecision,
   type WorkerPhase,
   workerSystemPolicy,
 } from "./worker-context.js";
@@ -55,8 +54,10 @@ type MessageSink = (message: {
 
 class WorkerHostError extends Data.TaggedError("WorkerHostError")<{ readonly message: string }> {}
 
-export function configuredWorkerRole(value: string | undefined): WorkerDecision<WorkerRole | null> {
-  if (value === undefined || value === "") return { ok: true, value: null };
+export function configuredWorkerRole(
+  value: string | undefined,
+): Result.Result<WorkerRole | null, string> {
+  if (value === undefined || value === "") return Result.succeed(null);
   if (
     value === "research" ||
     value === "experiment" ||
@@ -64,8 +65,8 @@ export function configuredWorkerRole(value: string | undefined): WorkerDecision<
     value === "review" ||
     value === "implementation"
   )
-    return { ok: true, value };
-  return { ok: false, error: `Invalid PI_WORKGRAPH_ROLE: ${bounded(value)}` };
+    return Result.succeed(value);
+  return Result.fail(`Invalid PI_WORKGRAPH_ROLE: ${bounded(value)}`);
 }
 
 export class WorkerRuntime {
@@ -87,25 +88,22 @@ export class WorkerRuntime {
   restoreSession(
     branch: readonly WorkerEntry[],
     configuredDisabledTools: readonly string[],
-  ): WorkerDecision<void> {
+  ): Result.Result<void, string> {
     const assignment = readWorkerAssignment(branch, this.role);
-    if (!assignment.ok) return assignment;
+    if (Result.isFailure(assignment)) return Result.fail(assignment.failure);
     const protectedNames = new Set(["workgraph_report", "workgraph_plan"]);
     const invalid = configuredDisabledTools.find((name) => protectedNames.has(name));
     if (invalid !== undefined)
-      return {
-        ok: false,
-        error: `Worker setting cannot disable protected tool ${invalid}.`,
-      };
-    this.assignment = assignment.value;
-    this.plan = new WorkerPlanState(identityOf(assignment.value.details));
+      return Result.fail(`Worker setting cannot disable protected tool ${invalid}.`);
+    this.assignment = assignment.success;
+    this.plan = new WorkerPlanState(identityOf(assignment.success.details));
     this.plan.restore(this.attemptBranch(branch));
     this.directEditSeen = hasSuccessfulDirectEdit(this.attemptBranch(branch));
     this.executorMarkerSeen = this.hasMarker(branch, EXECUTOR_START_ENTRY);
     this.phase = this.executorMarkerSeen ? "executor" : "guide";
     this.cutoverFailed = this.hasMessage(branch, EXECUTOR_FAILURE_MESSAGE);
     this.disabledTools = new Set(configuredDisabledTools);
-    return { ok: true, value: undefined };
+    return Result.succeed(undefined);
   }
 
   failClosed(branch: readonly WorkerEntry[], diagnostic: string): void {
@@ -113,9 +111,9 @@ export class WorkerRuntime {
     this.disabledTools.clear();
     if (this.assignment === undefined) {
       const assignment = readWorkerAssignment(branch, this.role);
-      if (assignment.ok) {
-        this.assignment = assignment.value;
-        this.plan = new WorkerPlanState(identityOf(assignment.value.details));
+      if (Result.isSuccess(assignment)) {
+        this.assignment = assignment.success;
+        this.plan = new WorkerPlanState(identityOf(assignment.success.details));
         this.plan.restore(this.attemptBranch(branch));
       }
     }

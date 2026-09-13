@@ -1,6 +1,6 @@
 /* oxlint-disable effecttsgo/global-date -- Pi requires an epoch timestamp for the synthetic persistence marker. */
 import { type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
-import { Data, Effect, FileSystem } from "effect";
+import { Data, Effect, FileSystem, Result } from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
@@ -180,18 +180,18 @@ export function readWorkerSession(
   }
 
   const objective = attemptBranch(entries, expected);
-  const branch = objective.ok ? objective.value : entries;
+  const branch = Result.isSuccess(objective) ? objective.success : entries;
   const effectiveModels = orderedEffectiveModels(branch);
   const started = effectiveModels.length > 0;
   const settled = branch.some(
     (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-agent-settled",
   );
-  if (!objective.ok)
+  if (Result.isFailure(objective))
     return {
       unreadable: false,
       started,
       settled,
-      reportError: bounded(objective.error),
+      reportError: bounded(objective.failure),
       effectiveModels,
     };
 
@@ -259,18 +259,14 @@ function exactSession(
     header.id === request.objective.details.attemptId &&
     header.cwd === request.cwd &&
     header.parentSession === undefined &&
-    attemptBranch(session.getBranch(), request.objective).ok
+    Result.isSuccess(attemptBranch(session.getBranch(), request.objective))
   );
 }
-
-type SessionDecision<A> =
-  | { readonly ok: true; readonly value: A }
-  | { readonly ok: false; readonly error: string };
 
 function attemptBranch(
   entries: readonly SessionEntry[],
   objective: WorkerObjective,
-): SessionDecision<SessionEntry[]> {
+): Result.Result<SessionEntry[], string> {
   const objectiveEntries = entries.filter(
     (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
   );
@@ -285,8 +281,8 @@ function attemptBranch(
       objective.details,
     )
   )
-    return { ok: false, error: "Exact Worker objective is absent, malformed, or mismatched." };
-  return { ok: true, value: entries.slice(entries.indexOf(match)) };
+    return Result.fail("Exact Worker objective is absent, malformed, or mismatched.");
+  return Result.succeed(entries.slice(entries.indexOf(match)));
 }
 
 function orderedEffectiveModels(entries: readonly SessionEntry[]): ModelTarget[] {

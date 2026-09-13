@@ -1,6 +1,6 @@
 /* oxlint-disable effecttsgo/async-function, effecttsgo/process-env -- Pi owns these Promise callbacks and supplies the Worker process environment. */
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { Effect } from "effect";
+import { Effect, Result } from "effect";
 import type { WorkerReportInput } from "../src/domain/report.js";
 import { type WorkerPlanToolInput, WorkerPlanToolSchema } from "../src/worker-plan.js";
 import {
@@ -12,8 +12,8 @@ import { loadWorkerDisabledTools } from "../src/workgraph-settings.js";
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
   const configuredRole = configuredWorkerRole(process.env["PI_WORKGRAPH_ROLE"]);
-  if (!configuredRole.ok || configuredRole.value === null) return;
-  const runtime = new WorkerRuntime(configuredRole.value, (customType, data) =>
+  if (Result.isFailure(configuredRole) || configuredRole.success === null) return;
+  const runtime = new WorkerRuntime(configuredRole.success, (customType, data) =>
     pi.appendEntry(customType, data),
   );
   const branch = (ctx: ExtensionContext): SessionEntry[] => ctx.sessionManager.getBranch();
@@ -77,11 +77,11 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     try {
       const disabled = await loadWorkerDisabledTools();
       const restored = runtime.restoreSession(branch(ctx), disabled);
-      if (!restored.ok) {
-        runtime.failClosed(branch(ctx), restored.error);
+      if (Result.isFailure(restored)) {
+        runtime.failClosed(branch(ctx), restored.failure);
         pi.sendMessage({
           customType: "pi-workgraph-worker-diagnostic",
-          content: `[WORKGRAPH WORKER STARTUP FAILED]\n${restored.error}\nOnly a truthful failed report is permitted.`,
+          content: `[WORKGRAPH WORKER STARTUP FAILED]\n${restored.failure}\nOnly a truthful failed report is permitted.`,
           display: false,
         });
       } else {

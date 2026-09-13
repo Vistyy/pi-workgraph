@@ -1,4 +1,5 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Result } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -41,44 +42,34 @@ export interface WorkerAssignment {
   readonly content: string;
   readonly details: WorkerObjectiveDetails;
 }
-export type WorkerDecision<A> =
-  | { readonly ok: true; readonly value: A }
-  | { readonly ok: false; readonly error: string };
-
 /** The exact current-branch objective is the sole Worker assignment authority. */
 export function readWorkerAssignment(
   entries: readonly SessionEntry[],
   configuredRole: string,
-): WorkerDecision<WorkerAssignment> {
+): Result.Result<WorkerAssignment, string> {
   const objectives = entries.filter(
     (entry) =>
       entry.type === "custom_message" && entry.customType === WORKER_OBJECTIVE_MESSAGE_TYPE,
   );
   if (objectives.length !== 1)
-    return { ok: false, error: "Worker requires exactly one objective on its branch." };
+    return Result.fail("Worker requires exactly one objective on its branch.");
   const objective = objectives[0];
   if (
     objective?.type !== "custom_message" ||
     !Value.Check(ContentSchema, objective.content) ||
     !Value.Check(WorkerObjectiveDetailsSchema, objective.details)
   )
-    return { ok: false, error: "Worker objective is malformed." };
+    return Result.fail("Worker objective is malformed.");
   const details = Value.Decode(WorkerObjectiveDetailsSchema, objective.details);
   if (details.role !== configuredRole)
-    return {
-      ok: false,
-      error: "Worker role does not match the authoritative objective.",
-    };
+    return Result.fail("Worker role does not match the authoritative objective.");
   if (
     details.role === "implementation"
       ? details.executor === undefined
       : details.executor !== undefined
   )
-    return {
-      ok: false,
-      error: "Worker objective has invalid executor details for its role.",
-    };
-  return { ok: true, value: { content: objective.content, details } };
+    return Result.fail("Worker objective has invalid executor details for its role.");
+  return Result.succeed({ content: objective.content, details });
 }
 
 export function sameAttempt(
