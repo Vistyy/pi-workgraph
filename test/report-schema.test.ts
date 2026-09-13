@@ -23,7 +23,7 @@ function reportForMode(mode: WorkerMode) {
   };
 }
 
-void test("changed implementation input excludes host-owned Git metadata and persistence requires it", () => {
+void test("changed implementation reports remain semantic and exclude host-owned Git metadata", () => {
   const input = {
     kind: "implementation",
     status: "completed",
@@ -32,22 +32,11 @@ void test("changed implementation input excludes host-owned Git metadata and per
   } as const;
   const inputSchema = reportSchemaForMode("implementation");
   assert.equal(Value.Check(inputSchema, input), true);
-  assert.equal(Value.Check(inputSchema, { ...input, commit: "a".repeat(40) }), false);
-  assert.equal(Value.Check(inputSchema, { ...input, changedFiles: ["change.ts"] }), false);
-
-  assert.equal(Value.Check(WorkerReportSchema, input), false);
-  assert.equal(
-    Value.Check(WorkerReportSchema, {
-      ...input,
-      commit: "a".repeat(40),
-      changedFiles: ["change.ts"],
-    }),
-    true,
-  );
-  assert.equal(
-    Value.Check(WorkerReportSchema, { ...input, commit: "invalid", changedFiles: [] }),
-    false,
-  );
+  assert.equal(Value.Check(WorkerReportSchema, input), true);
+  for (const extra of [{ commit: "a".repeat(40) }, { changedFiles: ["change.ts"] }]) {
+    assert.equal(Value.Check(inputSchema, { ...input, ...extra }), false);
+    assert.equal(Value.Check(WorkerReportSchema, { ...input, ...extra }), false);
+  }
 });
 
 void test("live report schemas reject undeclared top-level and nested sensitive fields in every mode", () => {

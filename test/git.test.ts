@@ -1,416 +1,466 @@
+/* oxlint-disable effecttsgo/node-builtin-import -- These flows inspect real disposable Git repositories and bytes. */
 import assert from "node:assert/strict";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Disposable Git tests use real filesystem boundaries.
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Disposable Git tests use real path identities.
 import { join } from "node:path";
 import test from "node:test";
-import { Effect } from "effect";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Effect, Exit, Scope } from "effect";
+import { WorkstreamRuntime } from "../src/coordination/runtime.js";
+import type {
+  Attempt,
+  CoordinatorOwner,
+  Intent,
+  TaskTarget,
+  WorkstreamMetadata,
+} from "../src/domain/records.js";
+import { WORKSTREAM_FORMAT, WORKSTREAM_SCHEMA_VERSION } from "../src/domain/records.js";
 import {
-  type CandidateApplicationDestination,
-  type CandidateApplicationSource,
-  GitParseError,
-  GitRepository,
-  openRepository,
-  parseWorktreeList,
+  applyOutput,
+  classifyOutput,
+  cleanupAppliedOutput,
+  detachedPlacement,
+  discardOutput,
+  ensureDetachedWorktree,
+  GitError,
+  prepareApplication,
+  prepareDiscard,
+  type RepositoryOperation,
+  resolveTaskTarget,
 } from "../src/git.js";
+import { WorkstreamStore } from "../src/storage/workstream-store.js";
 import { git } from "./helpers.js";
 
-const runGit = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
+const at = "2026-03-20T12:00:00.000Z";
+const selection = {
+  kind: "implementation" as const,
+  guide: { model: "fixture/guide", thinking: "high" as const },
+  executor: { model: "fixture/executor", thinking: "high" as const },
+};
+type RepositoryTarget = Extract<TaskTarget, { kind: "repository" }>;
 
-async function applyCandidate(
-  repository: GitRepository,
-  source: CandidateApplicationSource,
-  destination: CandidateApplicationDestination,
-): Promise<string> {
-  return runGit(repository.applyCandidate(source, destination));
+async function waitFor(predicate: () => Promise<boolean>, attempts = 120): Promise<void> {
+  for (let count = 0; count < attempts; count += 1) {
+    if (await predicate()) return;
+    await Effect.runPromise(Effect.sleep(25));
+  }
+  assert.fail("Timed out waiting for Git settlement.");
 }
 
-async function fixture() {
+async function repository() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-git-"));
-  const root = join(parent, "repo");
+  const root = join(parent, "repository");
+  const agentDir = join(parent, "agent");
   await mkdir(root);
   await git(root, "init", "-b", "main");
-  await git(root, "config", "user.email", "fixture@example.test");
-  await git(root, "config", "user.name", "Fixture");
-  await writeFile(join(root, "data.txt"), "base\n");
+  await git(root, "config", "user.name", "Workgraph Test");
+  await git(root, "config", "user.email", "workgraph@example.invalid");
+  await writeFile(join(root, ".gitignore"), "ignored.bin\nnode_modules/\n");
+  await writeFile(join(root, "file.txt"), "base\n");
   await git(root, "add", ".");
-  await git(root, "commit", "-m", "Initial fixture");
-  await git(root, "commit", "--allow-empty", "-m", "Assigned base");
-  const repository = await Effect.runPromise(openRepository(root));
-  const { head } = repository;
-  return { parent, root, repository, base: await runGit(head()) };
+  await git(root, "commit", "-m", "base");
+  const base = await git(root, "rev-parse", "HEAD");
+  const resolved = await Effect.runPromise(resolveTaskTarget({ cwd: root, kind: "repository" }));
+  assert.equal(resolved.kind, "repository");
+  // SAFETY: The assertion above narrows this decoded target to the repository variant.
+  return { parent, root, agentDir, base, target: resolved as RepositoryTarget };
+}
+function operation(
+  fixture: Awaited<ReturnType<typeof repository>>,
+  attemptId: string,
+  attempt: Attempt,
+): RepositoryOperation {
+  return {
+    attemptId,
+    attempt,
+    target: fixture.target,
+    ...detachedPlacement({
+      agentDir: fixture.agentDir,
+      workstreamId: "ws-git",
+      attemptId,
+    }),
+    applicable: true,
+  };
+}
+function initial(baseCommit: string): Attempt {
+  return { selection, base: { kind: "repository", baseCommit } };
+}
+async function commit(checkout: string, text: string, message = text): Promise<string> {
+  await writeFile(join(checkout, "file.txt"), `${text}\n`);
+  await git(checkout, "add", "file.txt");
+  await git(checkout, "commit", "-m", message);
+  return git(checkout, "rev-parse", "HEAD");
 }
 
-void test("Git worktree parsing rejects missing paths and preserves embedded newlines", async () => {
-  const malformed = "branch refs/heads/missing-worktree\0\0";
-  const failure = await Effect.runPromise(Effect.flip(parseWorktreeList(malformed)));
-  assert.ok(failure instanceof GitParseError);
-  assert.equal(failure.output, malformed);
+void test("target resolution preserves real nested Git identity and rejects invalid targets", async () => {
+  const plain = await mkdtemp(join(tmpdir(), "workgraph-target-"));
+  try {
+    const directory = await Effect.runPromise(resolveTaskTarget({ cwd: plain }));
+    assert.deepEqual(directory, { kind: "directory", path: plain });
+    await assert.rejects(
+      Effect.runPromise(resolveTaskTarget({ cwd: plain, kind: "repository" })),
+      GitError,
+    );
+    const file = join(plain, "file");
+    await writeFile(file, "x");
+    await assert.rejects(
+      Effect.runPromise(resolveTaskTarget({ cwd: plain, path: file })),
+      GitError,
+    );
 
-  assert.deepEqual(
-    await Effect.runPromise(
-      parseWorktreeList(
-        "worktree /tmp/path-with\na-newline\0HEAD 0123456789abcdef\0branch refs/heads/main\0\0",
+    const unborn = join(plain, "unborn");
+    await mkdir(unborn);
+    await git(unborn, "init");
+    await assert.rejects(Effect.runPromise(resolveTaskTarget({ cwd: unborn })), GitError);
+
+    const fixture = await repository();
+    try {
+      const nested = join(fixture.root, "nested");
+      await mkdir(nested);
+      const link = join(fixture.parent, "linked");
+      await symlink(nested, link);
+      const target = await Effect.runPromise(
+        resolveTaskTarget({ cwd: plain, path: link, revision: fixture.base }),
+      );
+      assert.deepEqual(target, fixture.target);
+      await assert.rejects(
+        Effect.runPromise(resolveTaskTarget({ cwd: link, revision: "f".repeat(40) })),
+        GitError,
+      );
+    } finally {
+      await rm(fixture.parent, { recursive: true, force: true });
+    }
+  } finally {
+    await rm(plain, { recursive: true, force: true });
+  }
+});
+
+void test("classification removes unchanged output, compacts every clean descendant, and preserves dirty bytes", async () => {
+  const fixture = await repository();
+  try {
+    const unchanged = operation(fixture, "unchanged", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(unchanged));
+    const noOutput = await Effect.runPromise(classifyOutput(unchanged, at));
+    assert.equal(noOutput.output?.kind, "no_output");
+    await assert.rejects(readFile(join(unchanged.worktreePath, "file.txt")));
+    assert.equal(
+      await git(fixture.root, "show-ref", "--verify", "--quiet", unchanged.outputRef).catch(
+        () => "absent",
       ),
-    ),
-    [{ path: "/tmp/path-with\na-newline", branch: "main" }],
-  );
-});
+      "absent",
+    );
+    const unchangedRecovery = operation(fixture, "unchanged-recovery", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(unchangedRecovery));
+    await git(fixture.root, "worktree", "remove", unchangedRecovery.worktreePath);
+    const recoveredNoOutput = await Effect.runPromise(classifyOutput(unchangedRecovery, at));
+    assert.equal(recoveredNoOutput.output?.kind, "no_output");
 
-void test("Git placements preserve unknown data; cleanup requires exact clean identity and is idempotent", async () => {
-  const f = await fixture();
-  try {
-    const unknown = join(f.parent, ".pi-workgraph-worktrees", "repo", "run", "unknown");
-    await mkdir(unknown, { recursive: true });
-    await writeFile(join(unknown, "mine.txt"), "unattributed bytes");
-    await assert.rejects(
-      () => runGit(f.repository.createWorktree("run", "unknown", f.base)),
-      /Unregistered worktree path/,
-    );
-    assert.equal(await readFile(join(unknown, "mine.txt"), "utf8"), "unattributed bytes");
-    await assert.rejects(
-      () => runGit(f.repository.createWorktree("../escape", "worker", f.base)),
-      /Invalid worktree identity/,
+    const clean = operation(fixture, "clean", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(clean));
+    const cleanTip = await commit(clean.worktreePath, "candidate");
+    const retained = await Effect.runPromise(classifyOutput(clean, at));
+    assert.equal(retained.output?.kind, "retained");
+    assert.equal(retained.output?.kind === "retained" ? retained.output.tip : "", cleanTip);
+    assert.equal(await git(fixture.root, "rev-parse", clean.outputRef), cleanTip);
+    await assert.rejects(readFile(join(clean.worktreePath, "file.txt")));
+    const cleanRecovery = operation(fixture, "clean-recovery", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(cleanRecovery));
+    const recoveryTip = await commit(cleanRecovery.worktreePath, "recovered candidate");
+    await git(fixture.root, "update-ref", cleanRecovery.outputRef, recoveryTip);
+    await git(fixture.root, "worktree", "remove", cleanRecovery.worktreePath);
+    const recoveredRetained = await Effect.runPromise(classifyOutput(cleanRecovery, at));
+    assert.equal(
+      recoveredRetained.output?.kind === "retained" ? recoveredRetained.output.tip : "",
+      recoveryTip,
     );
 
-    const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
-    assert.deepEqual(await runGit(f.repository.createWorktree("run", "worker", f.base)), placement);
-    await writeFile(join(placement.path, "data.txt"), "maintained\n");
-    await assert.rejects(
-      () => runGit(f.repository.createWorktree("run", "worker", f.base)),
-      /uncertain state/,
-    );
-    await assert.rejects(
-      () => runGit(f.repository.cleanupWorktree(placement, f.base)),
-      /dirty worktree/,
-    );
-    await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Maintained change");
-    const commit = await runGit(f.repository.head(placement.path));
-    assert.deepEqual(await runGit(f.repository.validateWorkerCommit(placement, commit)), {
-      commit,
-      changedFiles: ["data.txt"],
-    });
-    await assert.rejects(
-      () => runGit(f.repository.cleanupWorktree(placement, f.base)),
-      /branch .* expected|HEAD is/,
-    );
-    assert.equal(await readFile(join(placement.path, "data.txt"), "utf8"), "maintained\n");
-    assert.equal(
-      (await runGit(f.repository.cleanupWorktree(placement, commit))).state,
-      "completed",
-    );
-    assert.equal(
-      (await runGit(f.repository.cleanupWorktree(placement, commit))).state,
-      "completed",
-    );
-    assert.equal(await readFile(join(unknown, "mine.txt"), "utf8"), "unattributed bytes");
+    const dirty = operation(fixture, "dirty", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(dirty));
+    await writeFile(join(dirty.worktreePath, "untracked.txt"), "untracked\n");
+    await writeFile(join(dirty.worktreePath, "ignored.bin"), "ignored\n");
+    const dirtyAttempt = await Effect.runPromise(classifyOutput(dirty, at));
+    assert.equal(dirtyAttempt.output?.kind, "retained");
+    assert.equal(await git(fixture.root, "rev-parse", dirty.outputRef), fixture.base);
+    assert.equal(await readFile(join(dirty.worktreePath, "ignored.bin"), "utf8"), "ignored\n");
   } finally {
-    await rm(f.parent, { recursive: true, force: true });
+    await rm(fixture.parent, { recursive: true, force: true });
   }
 });
 
-void test("successful compaction retains an exact branch for validation and explicit discard", async () => {
-  const f = await fixture();
+void test("application accepts ignored destination artifacts and recovers structurally before cleanup", async () => {
+  const fixture = await repository();
   try {
-    const placement = await runGit(f.repository.createWorktree("run", "candidate", f.base));
-    await writeFile(join(placement.path, "data.txt"), "candidate\n");
-    await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Candidate");
-    const commit = await runGit(f.repository.head(placement.path));
+    let fast = operation(fixture, "fast", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(fast));
+    const fastTip = await commit(fast.worktreePath, "fast");
+    fast = { ...fast, attempt: await Effect.runPromise(classifyOutput(fast, at)) };
+    await mkdir(join(fixture.root, "node_modules"));
+    await writeFile(join(fixture.root, "node_modules", "artifact.js"), "ignored artifact\n");
+    const fastPrepared = await Effect.runPromise(prepareApplication(fast));
+    fast = { ...fast, attempt: fastPrepared };
+    const fastApplied = await Effect.runPromise(applyOutput(fast, at));
+    assert.equal(fastApplied.output?.kind, "applied");
+    assert.equal(await git(fixture.root, "rev-parse", "HEAD"), fastTip);
+    assert.equal(await git(fixture.root, "rev-parse", fast.outputRef), fastTip);
     assert.equal(
-      (await runGit(f.repository.cleanupWorktree(placement, commit, true))).state,
-      "completed",
+      await readFile(join(fixture.root, "node_modules", "artifact.js"), "utf8"),
+      "ignored artifact\n",
+    );
+    const fastCleaned = await Effect.runPromise(
+      cleanupAppliedOutput({ ...fast, attempt: fastApplied }),
     );
     assert.equal(
-      (await git(f.root, "branch", "--list", placement.branch)).trim(),
-      placement.branch,
-    );
-    await assert.rejects(readFile(placement.path, "utf8"));
-    const validated = await runGit(f.repository.validateCandidate(placement, f.base, commit));
-    assert.deepEqual(validated, {
-      commit,
-      changedFiles: ["data.txt"],
-      rootCommit: f.base,
-      commits: [commit],
-    });
-    assert.equal(
-      (await runGit(f.repository.cleanupWorktree(placement, commit, true))).state,
-      "completed",
-    );
-    assert.equal((await runGit(f.repository.discardOutput(placement, commit))).state, "completed");
-    assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("discard removes dirty, untracked, and ignored owned content only after common-directory identity", async () => {
-  const f = await fixture();
-  try {
-    const placement = await runGit(f.repository.createWorktree("run", "discard", f.base));
-    await writeFile(join(placement.path, ".gitignore"), "ignored.txt\n");
-    await writeFile(join(placement.path, "candidate.txt"), "candidate\n");
-    await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Discard candidate");
-    const commit = await runGit(f.repository.head(placement.path));
-    await writeFile(join(placement.path, "candidate.txt"), "dirty\n");
-    await writeFile(join(placement.path, "untracked.txt"), "untracked\n");
-    await writeFile(join(placement.path, "ignored.txt"), "ignored\n");
-
-    const foreign = new GitRepository(f.root, join(f.parent, "foreign-common"));
-    await assert.rejects(
-      () => runGit(foreign.discardOutput(placement, commit)),
-      /common directory/,
-    );
-    assert.equal(await readFile(join(placement.path, "candidate.txt"), "utf8"), "dirty\n");
-    assert.equal(await readFile(join(placement.path, "untracked.txt"), "utf8"), "untracked\n");
-    assert.equal(await readFile(join(placement.path, "ignored.txt"), "utf8"), "ignored\n");
-
-    const discarded = await runGit(f.repository.discardOutput(placement, commit));
-    assert.match(discarded.detail, /dirty, untracked, and ignored/);
-    assert.doesNotMatch(
-      await git(f.root, "worktree", "list", "--porcelain"),
-      new RegExp(placement.path),
-    );
-    assert.equal(await git(f.root, "branch", "--list", placement.branch), "");
-    await assert.rejects(readFile(placement.path));
-    assert.equal((await runGit(f.repository.discardOutput(placement, commit))).state, "completed");
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("discard refuses moved placement and HEAD mismatch without deleting output", async () => {
-  const f = await fixture();
-  try {
-    const movedPlacement = await runGit(
-      f.repository.createWorktree("run", "moved-discard", f.base),
-    );
-    const movedPath = `${movedPlacement.path}-elsewhere`;
-    await git(f.root, "worktree", "move", movedPlacement.path, movedPath);
-    await assert.rejects(
-      () => runGit(f.repository.discardOutput(movedPlacement, f.base)),
-      /registered at .* not/,
-    );
-    assert.equal(await runGit(f.repository.head(movedPath)), f.base);
-    assert.equal(await git(f.root, "rev-parse", `refs/heads/${movedPlacement.branch}`), f.base);
-
-    const changedPlacement = await runGit(
-      f.repository.createWorktree("run", "changed-discard", f.base),
-    );
-    await writeFile(join(changedPlacement.path, "changed.txt"), "changed\n");
-    await git(changedPlacement.path, "add", ".");
-    await git(changedPlacement.path, "commit", "-m", "Unexpected head");
-    const changedHead = await runGit(f.repository.head(changedPlacement.path));
-    await assert.rejects(
-      () => runGit(f.repository.discardOutput(changedPlacement, f.base)),
-      /points to .* expected/,
-    );
-    assert.equal(await readFile(join(changedPlacement.path, "changed.txt"), "utf8"), "changed\n");
-    assert.equal(
-      await git(f.root, "rev-parse", `refs/heads/${changedPlacement.branch}`),
-      changedHead,
-    );
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("candidate application validates lineage, ref identity, and fast-forwards once", async () => {
-  const f = await fixture();
-  try {
-    const firstPlacement = await runGit(f.repository.createWorktree("run", "first", f.base));
-    await writeFile(join(firstPlacement.path, "data.txt"), "first\n");
-    await git(firstPlacement.path, "add", ".");
-    await git(firstPlacement.path, "commit", "-m", "First candidate");
-    const first = await runGit(f.repository.head(firstPlacement.path));
-    const secondPlacement = await runGit(f.repository.createWorktree("run", "second", first));
-    await writeFile(join(secondPlacement.path, "data.txt"), "second\n");
-    await git(secondPlacement.path, "add", ".");
-    await git(secondPlacement.path, "commit", "-m", "Second candidate");
-    const second = await runGit(f.repository.head(secondPlacement.path));
-    const validated = await runGit(f.repository.validateCandidate(secondPlacement, f.base, second));
-    assert.deepEqual(validated, {
-      commit: second,
-      changedFiles: ["data.txt"],
-      rootCommit: f.base,
-      commits: [first, second],
-    });
-    const source = { rootCommit: f.base, commit: second, commits: [first, second] };
-    const destination = await runGit(f.repository.inspectCandidateApplication(source));
-    assert.equal(
-      await runGit(f.repository.recoverCandidateApplication(destination, source)),
+      fastCleaned.output?.kind === "applied" ? fastCleaned.output.cleanupTip : "bad",
       undefined,
     );
-    await git(f.root, "branch", "switched-recovery", f.base);
-    await git(f.root, "switch", "switched-recovery");
-    await assert.rejects(
-      () => runGit(f.repository.recoverCandidateApplication(destination, source)),
-      /destination ref .* expected/,
+    await assert.rejects(git(fixture.root, "rev-parse", fast.outputRef));
+
+    const divergentBase = fastTip;
+    let divergent = operation(fixture, "divergent", initial(divergentBase));
+    await Effect.runPromise(ensureDetachedWorktree(divergent));
+    const sourceTip = await commit(divergent.worktreePath, "source");
+    divergent = { ...divergent, attempt: await Effect.runPromise(classifyOutput(divergent, at)) };
+    await writeFile(join(fixture.root, "destination.txt"), "destination\n");
+    await git(fixture.root, "add", "destination.txt");
+    await git(fixture.root, "commit", "-m", "destination");
+    const destinationTip = await git(fixture.root, "rev-parse", "HEAD");
+    const applying = await Effect.runPromise(prepareApplication(divergent));
+    divergent = { ...divergent, attempt: applying };
+    const applied = await Effect.runPromise(applyOutput(divergent, at));
+    assert.equal(applied.output?.kind, "applied");
+    const merge = applied.output?.kind === "applied" ? applied.output.revision : "";
+    assert.deepEqual((await git(fixture.root, "show", "-s", "--format=%P", merge)).split(" "), [
+      destinationTip,
+      sourceTip,
+    ]);
+    assert.equal(await git(fixture.root, "show", `${merge}:file.txt`), "source");
+    const recovered = await Effect.runPromise(applyOutput(divergent, at));
+    assert.equal(recovered.output?.kind === "applied" ? recovered.output.revision : "", merge);
+    assert.equal(await git(fixture.root, "status", "--porcelain"), "");
+
+    await git(fixture.root, "reset", "--hard", divergentBase);
+    await writeFile(join(fixture.root, "file.txt"), "source\n");
+    await git(fixture.root, "commit", "-am", "equivalent destination");
+    await git(fixture.root, "merge", "--no-commit", sourceTip);
+    assert.equal(await git(fixture.root, "status", "--porcelain"), "");
+    assert.equal(await git(fixture.root, "rev-parse", "--verify", "MERGE_HEAD"), sourceTip);
+    await assert.rejects(Effect.runPromise(prepareApplication(divergent)), GitError);
+    assert.equal(await git(fixture.root, "rev-parse", "--verify", "MERGE_HEAD"), sourceTip);
+    await git(fixture.root, "merge", "--abort");
+  } finally {
+    await rm(fixture.parent, { recursive: true, force: true });
+  }
+});
+
+void test("an integration parent source ref stays pinned until child classification", async () => {
+  const fixture = await repository();
+  const owner: CoordinatorOwner = {
+    sessionId: "coordinator",
+    sessionFile: "/sessions/coordinator.jsonl",
+    workspaceId: "workspace",
+    tabId: "tab",
+  };
+  const metadata: WorkstreamMetadata = {
+    format: WORKSTREAM_FORMAT,
+    schemaVersion: WORKSTREAM_SCHEMA_VERSION,
+    id: "ws-pin",
+    owner,
+    lifecycle: "active",
+    createdAt: at,
+    updatedAt: at,
+  };
+  const intent: Intent = {
+    statement: "Integrate retained source",
+    constraints: [],
+    authority: { receiptId: "receipt", sessionId: owner.sessionId, sessionFile: owner.sessionFile },
+    recordedAt: at,
+  };
+  const store = WorkstreamStore.create(fixture.agentDir, metadata, intent);
+  const pinOperation = (attemptId: string, value: Attempt): RepositoryOperation => ({
+    attemptId,
+    attempt: value,
+    target: fixture.target,
+    ...detachedPlacement({
+      agentDir: fixture.agentDir,
+      workstreamId: metadata.id,
+      attemptId,
+    }),
+    applicable: true,
+  });
+  try {
+    let sourceAttempt = initial(fixture.base);
+    let sourceOperation = pinOperation("source-1", sourceAttempt);
+    await Effect.runPromise(ensureDetachedWorktree(sourceOperation));
+    const sourceTip = await commit(sourceOperation.worktreePath, "source");
+    sourceAttempt = await Effect.runPromise(classifyOutput(sourceOperation, at));
+    sourceOperation = pinOperation("source-1", sourceAttempt);
+    const source = store.createTaskWithAttempt(
+      owner,
+      0,
+      "source",
+      {
+        target: fixture.target,
+        contract: { kind: "implementation", objective: "Create source", acceptance: ["Done"] },
+        createdAt: at,
+      },
+      "source-1",
+      { ...sourceAttempt, execution: { submission: "confirmed", closedAt: at } },
     );
-    assert.equal(await runGit(f.repository.head()), f.base);
-    await git(f.root, "switch", "main");
-    await git(f.root, "branch", "-D", "switched-recovery");
-    await assert.rejects(
-      () => applyCandidate(f.repository, { ...source, commits: [f.base] }, destination),
-      /exact source revisions/,
-    );
-    assert.equal(await runGit(f.repository.head()), f.base);
-    const mergeHead = join(f.repository.commonDir, "MERGE_HEAD");
-    await writeFile(mergeHead, `${first}\n`);
-    try {
-      await assert.rejects(
-        () => applyCandidate(f.repository, source, destination),
-        /pre-existing merge state/,
-      );
-      assert.equal(await runGit(f.repository.head()), f.base);
-    } finally {
-      await rm(mergeHead, { force: true });
-    }
-    await git(f.root, "branch", "switched-ff", f.base);
-    await git(f.root, "switch", "switched-ff");
-    try {
-      await assert.rejects(
-        () => runGit(f.repository.applyCandidate(source, destination)),
-        /Application destination changed/,
-      );
-    } finally {
-      await git(f.root, "switch", "main");
-      await git(f.root, "branch", "-D", "switched-ff");
-    }
-    assert.equal(await applyCandidate(f.repository, source, destination), second);
-    assert.equal(await runGit(f.repository.head()), second);
-    assert.equal(await git(f.root, "rev-list", "--count", `${f.base}..HEAD`), "2");
-    assert.deepEqual(await runGit(f.repository.recoverCandidateApplication(destination, source)), {
-      head: second,
+    store.insertOutcome(owner, "source-outcome", source.attempt.id, {
+      result: { kind: "cancelled", reason: "Fixture settled" },
+      effectiveModels: [selection.guide],
+      delivery: { requestedAt: at, failures: [], deliveredAt: at },
+      observedAt: at,
     });
-    await writeFile(join(f.root, "data.txt"), "moved\n");
-    await git(f.root, "add", ".");
-    await git(f.root, "commit", "-m", "Move destination");
-    const moved = await runGit(f.repository.head());
-    const movedBytes = await readFile(join(f.root, "data.txt"), "utf8");
-    assert.equal(
-      await applyCandidate(f.repository, source, {
-        expectedRef: "refs/heads/main",
-        expectedHead: moved,
-      }),
-      moved,
+    const childAttempt: Attempt = {
+      ...initial(fixture.base),
+      lineage: {
+        candidateRoot: fixture.base,
+        candidateOf: { kind: "integrate", attemptId: source.attempt.id, sourceTip },
+      },
+    };
+    const child = store.createTaskWithAttempt(
+      owner,
+      0,
+      "integration",
+      {
+        target: fixture.target,
+        contract: { kind: "implementation", objective: "Integrate source", acceptance: ["Done"] },
+        createdAt: at,
+      },
+      "integration-1",
+      childAttempt,
     );
-    assert.equal(await runGit(f.repository.head()), moved);
-    assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), movedBytes);
-    await writeFile(join(f.root, "unrelated.txt"), "dirty\n");
-    await assert.rejects(
-      () =>
-        applyCandidate(f.repository, source, {
-          expectedRef: "refs/heads/main",
-          expectedHead: moved,
-        }),
-      /not clean/,
-    );
-    assert.equal(await runGit(f.repository.head()), moved);
-    assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), movedBytes);
-    assert.equal(await readFile(join(f.root, "unrelated.txt"), "utf8"), "dirty\n");
-    assert.match(
-      await git(f.root, "worktree", "list", "--porcelain"),
-      new RegExp(secondPlacement.path),
-    );
+    let childOperation = pinOperation(child.attempt.id, childAttempt);
+    await Effect.runPromise(ensureDetachedWorktree(childOperation));
+
+    const scope = await Effect.runPromise(Scope.make());
+    try {
+      const attachment = await Effect.runPromise(
+        WorkstreamRuntime.acquire({
+          store,
+          owner,
+          agentDir: fixture.agentDir,
+          pi: { sendMessage() {} } satisfies Pick<ExtensionAPI, "sendMessage">,
+        }).pipe(Scope.provide(scope)),
+      );
+      assert.equal(attachment.state, "attached");
+      if (attachment.state !== "attached") return;
+      const applied = await Effect.runPromise(attachment.runtime.apply(source.attempt.id));
+      assert.equal(applied.attempt.output?.kind, "applied");
+      assert.equal(
+        applied.attempt.output?.kind === "applied" ? applied.attempt.output.cleanupTip : undefined,
+        sourceTip,
+      );
+      assert.equal(await git(fixture.root, "rev-parse", sourceOperation.outputRef), sourceTip);
+
+      await git(childOperation.worktreePath, "merge", "--no-ff", "-m", "integrate", sourceTip);
+      childOperation = { ...childOperation, attempt: store.readAttempt(child.attempt.id).attempt };
+      const classified = await Effect.runPromise(classifyOutput(childOperation, at));
+      store.checkpointAttempt(owner, child.attempt.id, classified);
+      await waitFor(async () => {
+        try {
+          await git(fixture.root, "rev-parse", sourceOperation.outputRef);
+          return false;
+        } catch {
+          return true;
+        }
+      });
+      await assert.rejects(git(fixture.root, "rev-parse", sourceOperation.outputRef));
+    } finally {
+      await Effect.runPromise(Scope.close(scope, Exit.void));
+    }
   } finally {
-    await rm(f.parent, { recursive: true, force: true });
+    await rm(fixture.parent, { recursive: true, force: true });
   }
 });
 
-void test("candidate application rejects unrelated destination history without mutation", async () => {
-  const f = await fixture();
+void test("integration ancestry, conflicts, and reasoned discard preserve foreign content", async () => {
+  const fixture = await repository();
   try {
-    const placement = await runGit(f.repository.createWorktree("run", "unrelated", f.base));
-    await writeFile(join(placement.path, "candidate.txt"), "candidate\n");
-    await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Candidate");
-    const candidate = await runGit(f.repository.head(placement.path));
-    const source = { rootCommit: f.base, commit: candidate, commits: [candidate] };
+    let source = operation(fixture, "source", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(source));
+    const sourceTip = await commit(source.worktreePath, "source");
+    source = { ...source, attempt: await Effect.runPromise(classifyOutput(source, at)) };
 
-    await git(f.root, "switch", "--orphan", "unrelated-destination");
-    await writeFile(join(f.root, "unrelated.txt"), "unrelated\n");
-    await git(f.root, "add", ".");
-    await git(f.root, "commit", "-m", "Unrelated destination");
-    const destination = await runGit(f.repository.head());
-    await assert.rejects(
-      () => runGit(f.repository.inspectCandidateApplication(source)),
-      /not descended from candidate root/,
-    );
-    assert.equal(await runGit(f.repository.head()), destination);
-    assert.equal(await readFile(join(f.root, "unrelated.txt"), "utf8"), "unrelated\n");
-    assert.equal(await runGit(f.repository.status()), "");
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("candidate inspection rejects conflicts before destination mutation or merge state", async () => {
-  const f = await fixture();
-  try {
-    const placement = await runGit(f.repository.createWorktree("run", "conflict", f.base));
-    await writeFile(join(placement.path, "data.txt"), "candidate\n");
-    await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Candidate conflict");
-    const candidate = await runGit(f.repository.head(placement.path));
-    await writeFile(join(f.root, "data.txt"), "destination\n");
-    await git(f.root, "add", ".");
-    await git(f.root, "commit", "-m", "Destination conflict");
-    const destination = await runGit(f.repository.head());
-    const source = { rootCommit: f.base, commit: candidate, commits: [candidate] };
-
-    await assert.rejects(
-      () => runGit(f.repository.inspectCandidateApplication(source)),
-      /conflict preview failed/,
-    );
-    assert.equal(await runGit(f.repository.head()), destination);
-    assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), "destination\n");
-    assert.equal(await runGit(f.repository.status()), "");
-    await assert.rejects(readFile(join(f.repository.commonDir, "MERGE_HEAD")));
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("candidate application creates the exact off-checkout merge tree", async () => {
-  const f = await fixture();
-  const placement = await runGit(f.repository.createWorktree("run", "candidate", f.base));
-  try {
-    await writeFile(join(placement.path, "data.txt"), "candidate\n");
-    await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Candidate");
-    const candidate = await runGit(f.repository.head(placement.path));
-    await writeFile(join(f.root, "other.txt"), "destination\n");
-    await git(f.root, "add", ".");
-    await git(f.root, "commit", "-m", "Destination");
-    const destinationHead = await runGit(f.repository.head());
-    const source = { rootCommit: f.base, commit: candidate, commits: [candidate] };
-    const destination = await runGit(f.repository.inspectCandidateApplication(source));
-    const expectedTree = (
-      await git(f.root, "merge-tree", "--write-tree", "--messages", destinationHead, candidate)
-    ).split("\n", 1)[0];
-    const applied = await applyCandidate(f.repository, source, destination);
-    assert.equal(
-      await git(f.root, "rev-list", "--parents", "-n", "1", applied),
-      `${applied} ${destinationHead} ${candidate}`,
-    );
-    assert.equal(await git(f.root, "rev-parse", `${applied}^{tree}`), expectedTree);
-    assert.equal(await readFile(join(f.root, "data.txt"), "utf8"), "candidate\n");
-    assert.equal(await readFile(join(f.root, "other.txt"), "utf8"), "destination\n");
-    assert.deepEqual(await runGit(f.repository.recoverCandidateApplication(destination, source)), {
-      head: applied,
+    await git(fixture.root, "reset", "--hard", fixture.base);
+    await writeFile(join(fixture.root, "destination.txt"), "destination\n");
+    await git(fixture.root, "add", "destination.txt");
+    await git(fixture.root, "commit", "-m", "destination");
+    const destinationTip = await git(fixture.root, "rev-parse", "HEAD");
+    let integration = operation(fixture, "integration", {
+      ...initial(destinationTip),
+      lineage: {
+        candidateRoot: destinationTip,
+        candidateOf: { kind: "integrate", attemptId: "source", sourceTip },
+      },
     });
-    await writeFile(join(f.root, "after.txt"), "later\n");
-    await git(f.root, "add", ".");
-    await git(f.root, "commit", "-m", "Descendant after application");
-    await assert.rejects(
-      () => runGit(f.repository.recoverCandidateApplication(destination, source)),
-      /ambiguous/,
+    await Effect.runPromise(ensureDetachedWorktree(integration));
+    await git(integration.worktreePath, "merge", "--no-ff", "-m", "integrate", sourceTip);
+    const integrationTip = await git(integration.worktreePath, "rev-parse", "HEAD");
+    integration = {
+      ...integration,
+      attempt: await Effect.runPromise(classifyOutput(integration, at)),
+    };
+    assert.equal(
+      integration.attempt.output?.kind === "retained" ? integration.attempt.output.tip : "",
+      integrationTip,
     );
+
+    await git(fixture.root, "reset", "--hard", fixture.base);
+    await writeFile(join(fixture.root, "file.txt"), "conflict destination\n");
+    await git(fixture.root, "commit", "-am", "conflict destination");
+    const before = await git(fixture.root, "rev-parse", "HEAD");
+    await assert.rejects(Effect.runPromise(prepareApplication(source)), GitError);
+    assert.equal(await git(fixture.root, "rev-parse", "HEAD"), before);
+    assert.equal(await readFile(join(fixture.root, "file.txt"), "utf8"), "conflict destination\n");
+
+    let dirty = operation(fixture, "discard", initial(before));
+    await Effect.runPromise(ensureDetachedWorktree(dirty));
+    await writeFile(join(dirty.worktreePath, "ignored.bin"), "owned ignored bytes\n");
+    dirty = { ...dirty, attempt: await Effect.runPromise(classifyOutput(dirty, at)) };
+    const checkpoint = prepareDiscard(dirty, "No longer needed after inspection");
+    const discarded = await Effect.runPromise(discardOutput({ ...dirty, attempt: checkpoint }, at));
+    assert.equal(discarded.output?.kind, "discarded");
+    await assert.rejects(readFile(join(dirty.worktreePath, "ignored.bin")));
+    await assert.rejects(git(fixture.root, "rev-parse", dirty.outputRef));
+
+    let foreign = operation(fixture, "foreign", initial(before));
+    await Effect.runPromise(ensureDetachedWorktree(foreign));
+    await writeFile(join(foreign.worktreePath, "untracked.txt"), "preserve me\n");
+    foreign = { ...foreign, attempt: await Effect.runPromise(classifyOutput(foreign, at)) };
+    await git(foreign.worktreePath, "add", "untracked.txt");
+    await git(foreign.worktreePath, "commit", "-m", "foreign advancement");
+    const refused = prepareDiscard(foreign, "Explicit but stale disposition");
+    await assert.rejects(
+      Effect.runPromise(discardOutput({ ...foreign, attempt: refused }, at)),
+      GitError,
+    );
+    assert.equal(
+      await readFile(join(foreign.worktreePath, "untracked.txt"), "utf8"),
+      "preserve me\n",
+    );
+    assert.equal(await git(fixture.root, "rev-parse", foreign.outputRef), before);
+
+    let missingRef = operation(fixture, "missing-ref", initial(before));
+    await Effect.runPromise(ensureDetachedWorktree(missingRef));
+    await writeFile(join(missingRef.worktreePath, "ignored.bin"), "must survive\n");
+    missingRef = {
+      ...missingRef,
+      attempt: await Effect.runPromise(classifyOutput(missingRef, at)),
+    };
+    await git(fixture.root, "update-ref", "-d", missingRef.outputRef);
+    const missingCheckpoint = prepareDiscard(missingRef, "Discard only with exact ref ownership");
+    await assert.rejects(
+      Effect.runPromise(discardOutput({ ...missingRef, attempt: missingCheckpoint }, at)),
+      GitError,
+    );
+    assert.equal(
+      await readFile(join(missingRef.worktreePath, "ignored.bin"), "utf8"),
+      "must survive\n",
+    );
+    assert.equal(await git(missingRef.worktreePath, "rev-parse", "HEAD"), before);
   } finally {
-    await rm(f.parent, { recursive: true, force: true });
+    await rm(fixture.parent, { recursive: true, force: true });
   }
 });

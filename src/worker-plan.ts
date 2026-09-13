@@ -1,20 +1,22 @@
 import { Data, Effect } from "effect";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
-import { isWorkerIdentityData, type WorkerContextIdentity } from "./worker-context.js";
+import type { WorkerObjectiveDetails } from "./pi-session.js";
+import { sameAttempt } from "./worker-context.js";
 
+const NonBlank = Type.String({ minLength: 1, pattern: "\\S" });
 const TodoStatusSchema = Type.Union([
   Type.Literal("pending"),
   Type.Literal("in_progress"),
   Type.Literal("done"),
   Type.Literal("blocked"),
 ]);
-const TodoIdSchema = Type.String();
+const TodoIdSchema = NonBlank;
 const TodoSchema = Type.Object(
   {
     id: TodoIdSchema,
-    text: Type.String(),
-    validation: Type.String(),
+    text: NonBlank,
+    validation: NonBlank,
     status: TodoStatusSchema,
     note: Type.Optional(Type.String()),
   },
@@ -23,8 +25,8 @@ const TodoSchema = Type.Object(
 const TodoListSchema = Type.Array(TodoSchema, { minItems: 1, maxItems: 9 });
 const TodoPatchSchema = Type.Object(
   {
-    text: Type.Optional(Type.String()),
-    validation: Type.Optional(Type.String()),
+    text: Type.Optional(NonBlank),
+    validation: Type.Optional(NonBlank),
     status: Type.Optional(TodoStatusSchema),
     note: Type.Optional(Type.String()),
   },
@@ -45,20 +47,31 @@ export const WorkerPlanToolSchema = Type.Union(
   { type: "object" },
 );
 const PlanAttemptDetailsSchema = Type.Object({
-  attempt: Type.Object({ runId: Type.String(), nodeId: Type.String() }),
+  attempt: Type.Object({
+    workstreamId: NonBlank,
+    taskId: NonBlank,
+    attemptId: NonBlank,
+  }),
 });
 const PlanResultDetailsSchema = Type.Object(
   {
     action: Type.Union([Type.Literal("get"), Type.Literal("set"), Type.Literal("update")]),
     todos: Type.Optional(TodoListSchema),
-    attempt: Type.Object({ runId: Type.String(), nodeId: Type.String() }),
+    attempt: Type.Object({
+      workstreamId: NonBlank,
+      taskId: NonBlank,
+      attemptId: NonBlank,
+    }),
   },
   { additionalProperties: false },
 );
 
 export type WorkerTodo = Static<typeof TodoSchema>;
 export type WorkerPlanToolInput = Static<typeof WorkerPlanToolSchema>;
-export type WorkerAttemptIdentity = WorkerContextIdentity;
+export type WorkerAttemptIdentity = Pick<
+  WorkerObjectiveDetails,
+  "workstreamId" | "taskId" | "attemptId"
+>;
 export interface WorkerPlanEntry {
   readonly type: string;
   readonly message?: {
@@ -102,7 +115,7 @@ export class WorkerPlanState {
       )
         continue;
       const attempt = Value.Decode(PlanAttemptDetailsSchema, entry.message.details).attempt;
-      if (!isWorkerIdentityData(attempt, this.identity)) continue;
+      if (!sameAttempt(attempt, this.identity)) continue;
       if (!Value.Check(PlanResultDetailsSchema, entry.message.details)) {
         this.todos = undefined;
         continue;

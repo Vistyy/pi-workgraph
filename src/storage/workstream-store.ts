@@ -1,1354 +1,803 @@
-/* oxlint-disable anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-unsafe-dictionary-type, anti-slop/no-widen-then-assert, anti-slop/require-safety-comment-for-type-assertion -- node:sqlite exposes untyped host rows; each query decodes its strict record projection, while explicit inspection validates the complete Workstream. */
-import { Clock, Data, Effect, FileSystem, Path, type Scope } from "effect";
-import type { PlatformError } from "effect/PlatformError";
+/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, typescript/no-unsafe-return -- node:sqlite rows and TypeBox outputs are decoded at this private host boundary; absent optional persisted facts remain omitted. */
+import { chmodSync, existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
+import { Data } from "effect";
+import type { Static, TSchema } from "typebox";
 import { Value } from "typebox/value";
-import type {
-  Attempt,
-  AttemptKey,
-  Completion,
-  CoordinatorIdentity,
-  Intent,
-  RepositoryIdentity,
-  Suspension,
-  Task,
-  Workstream,
-} from "../domain/workstream.js";
 import {
+  type Attempt,
+  type AttemptRecord,
   AttemptSchema,
+  type Completion,
+  type CoordinatorOwner,
+  CoordinatorOwnerSchema,
+  type Intent,
+  type IntentRecord,
   IntentSchema,
+  type Outcome,
+  type OutcomeDelivery,
+  OutcomeDeliverySchema,
+  type OutcomeRecord,
   OutcomeSchema,
+  type Task,
+  type TaskRecord,
   TaskSchema,
-  validateWorkstream,
-  validateWorkstreamInvariants,
-  WorkstreamSchema,
-} from "../domain/workstream.js";
-import {
-  inspectStorageEntry,
-  openWorkstreamDatabase,
-  type StorageEntry,
-  type WorkstreamDatabase,
-} from "./sqlite-host.js";
+  WORKSTREAM_FORMAT,
+  WORKSTREAM_SCHEMA_VERSION,
+  type WorkstreamMetadata,
+  WorkstreamMetadataSchema,
+} from "../domain/records.js";
 
-const FILE_MODE = 0o600;
-const DIRECTORY_MODE = 0o700;
-const SQLITE_HEADER = "SQLite format 3\u0000";
-const SQLITE_FILENAME = "workstream.sqlite";
-const STORE_FORMAT = "pi-workgraph-record-store";
-const STORE_VERSION = 1;
-const STORAGE_DIRECTORY = "pi-workgraph";
-const WORKSTREAM_DIRECTORY = "workstreams";
-const columns = (value: string) => value.split(" ");
-
-const RECORD_SCHEMA = {
-  store_header: columns("format version"),
-  metadata: columns(
-    "id purpose project_root git_common_dir owner_session_id owner_session_file revision lifecycle suspension_json completion_json created_at updated_at",
-  ),
-  intents: columns("intent_index intent_json"),
-  tasks: columns("task_id intent_index kind contract_json"),
-  attempts: columns("attempt_id task_id sequence operational_json"),
-  outcomes: columns("outcome_id attempt_id outcome_json"),
-  deliveries: columns("outcome_id delivery_json"),
-};
-
-const CREATE_SCHEMA = `
-CREATE TABLE store_header (singleton INTEGER PRIMARY KEY CHECK(singleton=1), format TEXT NOT NULL, version INTEGER NOT NULL) STRICT;
-CREATE TABLE metadata (
- singleton INTEGER PRIMARY KEY CHECK(singleton=1), id TEXT NOT NULL, purpose TEXT NOT NULL,
- project_root TEXT NOT NULL, git_common_dir TEXT NOT NULL, owner_session_id TEXT NOT NULL,
- owner_session_file TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision>=0),
- lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active','suspended','completed')),
- suspension_json TEXT, completion_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+const MAX_PAGE = 100;
+const safeId = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const SCHEMA = `
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS metadata (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+  format TEXT NOT NULL,
+  schema_version INTEGER NOT NULL,
+  workstream_id TEXT NOT NULL UNIQUE,
+  owner_session_id TEXT NOT NULL,
+  owner_session_file TEXT NOT NULL,
+  owner_workspace_id TEXT NOT NULL,
+  owner_tab_id TEXT NOT NULL,
+  lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active','completed')),
+  completion_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 ) STRICT;
-CREATE TABLE intents (intent_index INTEGER PRIMARY KEY CHECK(intent_index>=0), intent_json TEXT NOT NULL) STRICT;
-CREATE TABLE tasks (task_id TEXT PRIMARY KEY, intent_index INTEGER NOT NULL REFERENCES intents(intent_index), kind TEXT NOT NULL, contract_json TEXT NOT NULL) STRICT;
-CREATE TABLE attempts (attempt_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), sequence INTEGER NOT NULL CHECK(sequence>=0), operational_json TEXT NOT NULL, UNIQUE(task_id,sequence)) STRICT;
-CREATE TABLE outcomes (outcome_id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id), outcome_json TEXT NOT NULL) STRICT;
-CREATE TABLE deliveries (outcome_id TEXT PRIMARY KEY REFERENCES outcomes(outcome_id), delivery_json TEXT NOT NULL) STRICT;
+CREATE TABLE IF NOT EXISTS intents (
+  intent_index INTEGER PRIMARY KEY CHECK(intent_index>=0),
+  intent_json TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS tasks (
+  task_index INTEGER NOT NULL UNIQUE CHECK(task_index>=0),
+  task_id TEXT PRIMARY KEY,
+  intent_index INTEGER NOT NULL REFERENCES intents(intent_index),
+  task_json TEXT NOT NULL
+) STRICT;
+CREATE TABLE IF NOT EXISTS attempts (
+  attempt_index INTEGER NOT NULL UNIQUE CHECK(attempt_index>=0),
+  attempt_id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL REFERENCES tasks(task_id),
+  sequence INTEGER NOT NULL CHECK(sequence>=0),
+  attempt_json TEXT NOT NULL,
+  UNIQUE(task_id,sequence)
+) STRICT;
+CREATE TABLE IF NOT EXISTS outcomes (
+  outcome_index INTEGER NOT NULL UNIQUE CHECK(outcome_index>=0),
+  outcome_id TEXT PRIMARY KEY,
+  attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(attempt_id),
+  outcome_json TEXT NOT NULL
+) STRICT;
 `;
 
-export class WorkstreamStoreInvalidError extends Data.TaggedError("WorkstreamStoreInvalidError")<{
-  readonly code: "workstream_store_invalid";
-  readonly message: string;
-}> {
-  constructor(message: string) {
-    super({ code: "workstream_store_invalid", message });
-  }
+type Row = Record<string, SQLOutputValue>;
+
+interface WorkstreamDiscoveryItem {
+  workstreamId: string;
+  title: string;
+  lifecycle: WorkstreamMetadata["lifecycle"];
+  operationallySettled: boolean;
+  updatedAt: string;
 }
-class WorkstreamStoreIncompleteError extends Data.TaggedError("WorkstreamStoreIncompleteError")<{
-  readonly code: "workstream_store_incomplete";
-  readonly message: string;
-}> {
-  constructor(message: string) {
-    super({ code: "workstream_store_incomplete", message });
-  }
+interface WorkstreamDiscovery {
+  items: WorkstreamDiscoveryItem[];
+  errors: Array<{ workstreamId: string; error: string }>;
+  nextOffset?: number;
 }
-export class WorkstreamStoreUnsupportedError extends Data.TaggedError(
-  "WorkstreamStoreUnsupportedError",
-)<{ readonly code: "workstream_store_unsupported"; readonly message: string }> {
-  constructor(message: string) {
-    super({ code: "workstream_store_unsupported", message });
-  }
-}
-class WorkstreamStoreConflictError extends Data.TaggedError("WorkstreamStoreConflictError")<{
-  readonly code: "workstream_store_conflict";
-  readonly message: string;
-}> {
-  constructor(message: string) {
-    super({ code: "workstream_store_conflict", message });
-  }
-}
-class WorkstreamStoreHostError extends Data.TaggedError("WorkstreamStoreHostError")<{
-  readonly code: "workstream_store_host_failed";
+
+export class StoreError extends Data.TaggedError("StoreError")<{
   readonly operation: string;
   readonly message: string;
-  readonly cause: unknown;
-}> {
-  constructor(operation: string, cause: unknown) {
-    super({
-      code: "workstream_store_host_failed",
-      operation,
-      message: `Failed to ${operation}.`,
-      cause,
-    });
-  }
-}
-export type WorkstreamStoreError =
-  | WorkstreamStoreInvalidError
-  | WorkstreamStoreIncompleteError
-  | WorkstreamStoreUnsupportedError
-  | WorkstreamStoreConflictError
-  | WorkstreamStoreHostError;
+  readonly cause?: unknown;
+}> {}
 
-export interface WorkstreamStoreAttachment {
-  readonly store: WorkstreamStore;
-  readonly state: Workstream;
-}
-
-export type WorkstreamRecordMutation = Readonly<
-  | { kind: "append_intent"; intent: Intent; updatedAt: string }
-  | { kind: "create_task"; task: Task; updatedAt: string }
-  | { kind: "append_attempts"; taskId: string; attempts: readonly Attempt[]; updatedAt: string }
-  | {
-      kind: "update_attempt";
-      key: AttemptKey;
-      attempt: Attempt;
-      completion?: Completion;
-      updatedAt: string;
-    }
-  | {
-      kind: "update_lifecycle";
-      lifecycle: Workstream["lifecycle"];
-      suspension?: Suspension;
-      completion?: Completion;
-      updatedAt: string;
-    }
->;
-
-export interface AttemptRecords {
-  readonly revision: number;
-  readonly lifecycle: Workstream["lifecycle"];
-  readonly workstreamId: string;
-  readonly repository: RepositoryIdentity;
-  readonly currentIntentIndex: number;
-  readonly suspension?: Suspension;
-  readonly completion?: Completion;
-  readonly intent: Intent;
-  readonly task: Task;
-  readonly attempt: Attempt;
-}
-
-export interface ActionableRecords {
-  readonly lifecycle: Workstream["lifecycle"];
-  readonly currentIntentIndex: number;
-  readonly records: readonly Readonly<{ task: Task; attempt: Attempt }>[];
-}
-
-export interface WorkstreamPresentation {
-  readonly lifecycle: Workstream["lifecycle"];
-  readonly activeAttemptCount: number;
-}
-
-export interface PlanningRecords {
-  readonly revision: number;
-  readonly id: string;
-  readonly purpose: string;
-  readonly repository: RepositoryIdentity;
-  readonly coordinator: CoordinatorIdentity;
-  readonly lifecycle: Workstream["lifecycle"];
-  readonly suspension?: Suspension;
-  readonly completion?: Completion;
-  readonly currentIntentIndex: number;
-  readonly currentIntent: Intent;
-  readonly createdAt: string;
-  readonly updatedAt: string;
-}
-
-export interface HandoffParentRecords {
-  readonly id: string;
-  readonly repository: RepositoryIdentity;
-  readonly lifecycle: Workstream["lifecycle"];
-  readonly currentIntentIndex: number;
-  readonly currentIntent: Intent;
-}
-/** Private record store. Full assembly is reserved for inspection and pure-domain validation. */
 export class WorkstreamStore {
+  readonly path: string;
+
   private constructor(
-    readonly path: string,
     readonly id: string,
-    readonly repository: RepositoryIdentity,
-    private readonly database: WorkstreamDatabase,
-  ) {}
-
-  static pathFor(
-    repository: RepositoryIdentity,
-    id: string,
-  ): Effect.Effect<string, WorkstreamStoreInvalidError, Path.Path> {
-    return Effect.gen(function* () {
-      const paths = yield* Path.Path;
-      validateIdentity(paths, repository, id);
-      return workstreamPath(paths, repository.gitCommonDir, id);
-    });
+    private readonly database: DatabaseSync,
+    path: string,
+    private readonly readOnly: boolean,
+  ) {
+    this.path = path;
   }
 
-  static create(
-    initial: Workstream,
-  ): Effect.Effect<
-    WorkstreamStoreAttachment,
-    WorkstreamStoreError,
-    Scope.Scope | FileSystem.FileSystem | Path.Path
-  > {
-    return Effect.gen(function* () {
-      const paths = yield* Path.Path;
-      const fs = yield* FileSystem.FileSystem;
-      validateInitial(paths, initial);
-      const path = workstreamPath(paths, initial.repository.gitCommonDir, initial.id);
-      yield* claimStorageDirectories(paths, fs, path);
-      const entry = yield* inspect(path);
-      if (entry.exists)
-        return yield* new WorkstreamStoreConflictError(
-          `Workstream database already exists: ${path}.`,
-        );
-      yield* createPrivateDatabaseFile(fs, path);
-      return yield* Effect.onError(WorkstreamStore.initialize(path, initial), () =>
-        platform("remove incomplete workstream database", fs.remove(path)).pipe(Effect.ignore),
-      );
-    });
-  }
-
-  /** Recover only absent/empty creation residue, or attach an exact valid advanced store without resetting it. */
-  static resumeCreate(
-    initial: Workstream,
-  ): Effect.Effect<
-    WorkstreamStoreAttachment,
-    WorkstreamStoreError,
-    Scope.Scope | FileSystem.FileSystem | Path.Path
-  > {
-    return Effect.gen(function* () {
-      const paths = yield* Path.Path;
-      const fs = yield* FileSystem.FileSystem;
-      validateInitial(paths, initial);
-      const path = workstreamPath(paths, initial.repository.gitCommonDir, initial.id);
-      yield* claimStorageDirectories(paths, fs, path);
-      const entry = yield* inspect(path);
-      if (!entry.exists) yield* createPrivateDatabaseFile(fs, path);
-      else if (entry.symbolicLink || !entry.regularFile || entry.mode !== FILE_MODE)
-        return yield* invalid(
-          `Workstream creation residue is not a private ordinary file: ${path}.`,
-        );
-      if (!entry.exists || entry.size === 0)
-        return yield* WorkstreamStore.initialize(path, initial);
-      yield* classifyFileHeader(fs, path);
-      const attached = yield* WorkstreamStore.openAt(path, false);
-      if (
-        attached.state.id !== initial.id ||
-        !Value.Equal(attached.state.repository, initial.repository) ||
-        !Value.Equal(attached.state.coordinator, initial.coordinator)
-      )
-        return yield* new WorkstreamStoreConflictError(
-          "Advanced creation recovery identity does not match the prepared Workstream.",
-        );
-      return attached;
-    });
-  }
-
-  static open(
-    id: string,
-    repository: RepositoryIdentity,
-  ): Effect.Effect<
-    WorkstreamStoreAttachment,
-    WorkstreamStoreError,
-    Scope.Scope | FileSystem.FileSystem | Path.Path
-  > {
-    return Effect.gen(function* () {
-      const paths = yield* Path.Path;
-      validateIdentity(paths, repository, id);
-      const path = workstreamPath(paths, repository.gitCommonDir, id);
-      yield* assertPrivateStorage(paths, path);
-      const attached = yield* WorkstreamStore.openAt(path, false);
-      if (attached.state.id !== id || !Value.Equal(attached.state.repository, repository))
-        return yield* invalid("Workstream store has a foreign identity.");
-      return attached;
-    });
+  static pathFor(agentDir: string, id: string): string {
+    if (!safeId.test(id)) throw failure("locate", "Workstream id is not a safe path segment.");
+    return join(agentDir, "workgraph", "workstreams", id, "workstream.sqlite");
   }
 
   static discover(
-    path: string,
-  ): Effect.Effect<
-    WorkstreamStoreAttachment,
-    WorkstreamStoreError,
-    Scope.Scope | FileSystem.FileSystem | Path.Path
-  > {
-    return Effect.gen(function* () {
-      const paths = yield* Path.Path;
-      if (!paths.isAbsolute(path) || paths.resolve(path) !== path)
-        return yield* invalid("Workstream statePath must be absolute and normalized.");
-      yield* assertPrivateStorage(paths, path);
-      const attached = yield* WorkstreamStore.openAt(path, true);
-      validateIdentity(paths, attached.state.repository, attached.state.id);
-      if (workstreamPath(paths, attached.state.repository.gitCommonDir, attached.state.id) !== path)
-        return yield* invalid("Workstream statePath does not match its record identity.");
-      return attached;
-    });
+    agentDir: string,
+    includeSettled: boolean,
+    offset: number,
+    limit: number,
+  ): WorkstreamDiscovery {
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > MAX_PAGE
+    )
+      throw failure("discover Workstreams", "Page boundary is outside the supported range.");
+    const root = join(agentDir, "workgraph", "workstreams");
+    if (!existsSync(root)) return { items: [], errors: [] };
+    const candidates = readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && safeId.test(entry.name))
+      .flatMap((entry) => {
+        const path = join(root, entry.name, "workstream.sqlite");
+        if (!existsSync(path)) return [];
+        return [{ id: entry.name, mtime: statSync(path).mtimeMs }];
+      })
+      .sort((left, right) => right.mtime - left.mtime || left.id.localeCompare(right.id));
+    const items: WorkstreamDiscoveryItem[] = [];
+    const errors: Array<{ workstreamId: string; error: string }> = [];
+    for (const candidate of candidates) {
+      let store: WorkstreamStore | undefined;
+      try {
+        store = WorkstreamStore.openReadOnly(agentDir, candidate.id);
+        const metadata = store.readMetadata();
+        const operationallySettled = store.unsettled().length === 0;
+        if (includeSettled || metadata.lifecycle === "active" || !operationallySettled)
+          items.push({
+            workstreamId: metadata.id,
+            title: store.title(),
+            lifecycle: metadata.lifecycle,
+            operationallySettled,
+            updatedAt: metadata.updatedAt,
+          });
+      } catch (cause) {
+        errors.push({
+          workstreamId: candidate.id,
+          error: cause instanceof StoreError ? cause.message : "Invalid Workstream store.",
+        });
+      } finally {
+        store?.close();
+      }
+    }
+    const page = items.slice(offset, offset + limit);
+    return {
+      items: page,
+      errors: errors.slice(0, MAX_PAGE),
+      ...(offset + page.length < items.length ? { nextOffset: offset + page.length } : {}),
+    };
   }
 
-  private static openAt(
-    path: string,
-    readOnly: boolean,
-  ): Effect.Effect<
-    WorkstreamStoreAttachment,
-    WorkstreamStoreError,
-    Scope.Scope | FileSystem.FileSystem
-  > {
-    return Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem;
-      yield* classifyFileHeader(fs, path);
-      const database = yield* acquireDatabase(path, readOnly);
-      assertRecordSchema(database);
-      assertHeader(database);
-      const state = readRecords(database);
-      return {
-        store: new WorkstreamStore(path, state.id, structuredClone(state.repository), database),
-        state,
-      };
-    });
-  }
-
-  private static initialize(
-    path: string,
-    initial: Workstream,
-  ): Effect.Effect<
-    WorkstreamStoreAttachment,
-    WorkstreamStoreError,
-    Scope.Scope | FileSystem.FileSystem
-  > {
-    return Effect.gen(function* () {
-      const database = yield* acquireDatabase(path);
-      const store = new WorkstreamStore(
-        path,
-        initial.id,
-        structuredClone(initial.repository),
-        database,
-      );
-      yield* store.atomic(() => {
-        database.exec(CREATE_SCHEMA);
-        database.write(
-          "INSERT INTO store_header(singleton,format,version) VALUES(1,?,?)",
-          STORE_FORMAT,
-          STORE_VERSION,
-        );
-        writeRecords(database, initial);
-      });
-      return { store, state: structuredClone(initial) };
-    });
-  }
-
-  /** Assemble the complete immutable inspection view; command paths should prefer keyed reads. */
-  read(): Effect.Effect<Workstream, WorkstreamStoreError> {
-    return hostEffect("read Workstream records", () => this.readChecked());
-  }
-
-  /** Query only rows whose durable state can produce reconciliation work. */
-  readActionable(): Effect.Effect<ActionableRecords, WorkstreamStoreError> {
-    return hostEffect("read actionable Workstream records", () => {
-      const metadata = requiredRow(
-        this.database.readRow(
-          "SELECT lifecycle,(SELECT max(intent_index) FROM intents) AS current_intent FROM metadata WHERE singleton=1",
-        ),
-        "metadata",
-      );
-      const lifecycle = stringField(metadata, "lifecycle") as Workstream["lifecycle"];
-      if (lifecycle !== "active" && lifecycle !== "suspended" && lifecycle !== "completed")
-        throw new WorkstreamStoreInvalidError("lifecycle is malformed.");
-      const currentIntentIndex = numberField(metadata, "current_intent");
-      const rows = this.database.readRows(
-        `SELECT t.contract_json,a.operational_json,o.outcome_json,d.delivery_json
-         FROM attempts a JOIN tasks t ON t.task_id=a.task_id
-         LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id
-         LEFT JOIN deliveries d ON d.outcome_id=o.outcome_id
-         WHERE json_extract(a.operational_json,'$.state') IN ('queued','active')
-            OR (json_extract(a.operational_json,'$.state')='finished' AND
-                (json_extract(d.delivery_json,'$.state')='pending'
-                 OR (json_extract(a.operational_json,'$.execution.placement') IS NOT NULL AND
-                     (json_extract(a.operational_json,'$.cleanup') IS NULL OR json_extract(a.operational_json,'$.cleanup.state')='pending'))))
-         ORDER BY a.rowid`,
-      );
-      const records = rows.map((row) => {
-        const operational = parseJson(stringField(row, "operational_json")) as Record<
-          string,
-          unknown
-        >;
-        // biome-ignore lint/complexity/useLiteralKeys: node:sqlite rows are index-signature records under strict TypeScript.
-        const outcomeValue = row["outcome_json"];
-        const attemptValue =
-          outcomeValue === null
-            ? operational
-            : {
-                ...operational,
-                outcome: {
-                  ...(parseJson(stringField(row, "outcome_json")) as Record<string, unknown>),
-                  delivery: parseJson(stringField(row, "delivery_json")),
-                },
-              };
-        const taskValue = {
-          ...(parseJson(stringField(row, "contract_json")) as Record<string, unknown>),
-          attempts: [attemptValue],
-        };
-        if (!Value.Check(TaskSchema, taskValue) || !Value.Check(AttemptSchema, attemptValue))
-          throw new WorkstreamStoreInvalidError("Actionable Task or Attempt record is malformed.");
-        return {
-          task: structuredClone(taskValue as Task),
-          attempt: structuredClone(attemptValue as Attempt),
-        };
-      });
-      return { lifecycle, currentIntentIndex, records };
-    });
-  }
-
-  /** Minimal status projection for coordinator presentation; it contains no Task assembly. */
-  readPresentation(): Effect.Effect<WorkstreamPresentation, WorkstreamStoreError> {
-    return hostEffect("read Workstream presentation", () => {
-      const row = requiredRow(
-        this.database.readRow(
-          `SELECT lifecycle,
-                  (SELECT count(*) FROM attempts WHERE json_extract(operational_json,'$.state')='active') AS active_attempt_count
-           FROM metadata WHERE singleton=1`,
-        ),
-        "metadata",
-      );
-      const lifecycle = stringField(row, "lifecycle") as Workstream["lifecycle"];
-      if (lifecycle !== "active" && lifecycle !== "suspended" && lifecycle !== "completed")
-        throw new WorkstreamStoreInvalidError("lifecycle is malformed.");
-      return { lifecycle, activeAttemptCount: numberField(row, "active_attempt_count") };
-    });
-  }
-
-  /** Minimal parent facts for one-shot Handoff; it contains no Task scan. */
-  readHandoffParent(): Effect.Effect<HandoffParentRecords, WorkstreamStoreError> {
-    return hostEffect("read Handoff parent records", () => {
-      const row = requiredRow(
-        this.database.readRow(
-          `SELECT m.id,m.project_root,m.git_common_dir,m.lifecycle,
-                  (SELECT max(intent_index) FROM intents) AS current_intent,
-                  (SELECT intent_json FROM intents ORDER BY intent_index DESC LIMIT 1) AS intent_json
-           FROM metadata m WHERE singleton=1`,
-        ),
-        "metadata",
-      );
-      const lifecycle = stringField(row, "lifecycle") as Workstream["lifecycle"];
-      const currentIntent = parseJson(stringField(row, "intent_json"));
-      if (
-        (lifecycle !== "active" && lifecycle !== "suspended" && lifecycle !== "completed") ||
-        !Value.Check(IntentSchema, currentIntent)
-      )
-        throw new WorkstreamStoreInvalidError("Handoff parent records are malformed.");
-      return {
-        id: stringField(row, "id"),
-        repository: {
-          projectRoot: stringField(row, "project_root"),
-          gitCommonDir: stringField(row, "git_common_dir"),
-        },
-        lifecycle,
-        currentIntentIndex: numberField(row, "current_intent"),
-        currentIntent: structuredClone(currentIntent as Intent),
-      };
-    });
-  }
-
-  /** Current-Intent metadata used by queue planning; it contains no Task scan. */
-  readPlanningRecords(): Effect.Effect<PlanningRecords, WorkstreamStoreError> {
-    return hostEffect("read Workstream planning metadata", () => {
-      const row = requiredRow(
-        this.database.readRow(
-          `SELECT m.*,(SELECT max(intent_index) FROM intents) AS current_intent,
-                  (SELECT intent_json FROM intents ORDER BY intent_index DESC LIMIT 1) AS intent_json
-           FROM metadata m WHERE singleton=1`,
-        ),
-        "metadata",
-      );
-      const currentIntentIndex = numberField(row, "current_intent");
-      const intent = parseJson(stringField(row, "intent_json"));
-      if (!Value.Check(IntentSchema, intent))
-        throw new WorkstreamStoreInvalidError("Current Intent record is malformed.");
-      return {
-        revision: numberField(row, "revision"),
-        id: stringField(row, "id"),
-        purpose: stringField(row, "purpose"),
-        repository: {
-          projectRoot: stringField(row, "project_root"),
-          gitCommonDir: stringField(row, "git_common_dir"),
-        },
-        coordinator: {
-          sessionId: stringField(row, "owner_session_id"),
-          sessionFile: stringField(row, "owner_session_file"),
-        },
-        lifecycle: stringField(row, "lifecycle") as Workstream["lifecycle"],
-        ...nullableJson(row, "suspension_json", "suspension"),
-        currentIntentIndex,
-        currentIntent: structuredClone(intent as Intent),
-        ...nullableJson(row, "completion_json", "completion"),
-        createdAt: stringField(row, "created_at"),
-        updatedAt: stringField(row, "updated_at"),
-      };
-    });
-  }
-
-  /** Query only Tasks that can affect completion accounting or candidate inclusion. */
-  readCompletionState(): Effect.Effect<Workstream, WorkstreamStoreError> {
-    return Effect.gen(
-      function* (this: WorkstreamStore) {
-        const planning = yield* this.readPlanningRecords();
-        const state: Workstream = {
-          format: "pi-workgraph-workstream",
-          schemaVersion: 3,
-          revision: planning.revision,
-          id: planning.id,
-          purpose: planning.purpose,
-          repository: structuredClone(planning.repository),
-          coordinator: structuredClone(planning.coordinator),
-          lifecycle: planning.lifecycle,
-          intents: Array.from({ length: planning.currentIntentIndex + 1 }, () =>
-            structuredClone(planning.currentIntent),
-          ),
-          tasks: [],
-          createdAt: planning.createdAt,
-          updatedAt: planning.updatedAt,
-        };
-        if (planning.suspension !== undefined)
-          Object.assign(state, { suspension: structuredClone(planning.suspension) });
-        if (planning.completion !== undefined)
-          Object.assign(state, { completion: structuredClone(planning.completion) });
-        const taskIds = yield* hostEffect("read completion-related Task keys", () =>
-          this.database
-            .readRows(
-              `SELECT DISTINCT a.task_id FROM attempts a
-               JOIN tasks t ON t.task_id=a.task_id
-               LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id
-               LEFT JOIN deliveries d ON d.outcome_id=o.outcome_id
-               WHERE json_extract(a.operational_json,'$.state')!='finished'
-                  OR coalesce(json_extract(d.delivery_json,'$.state'),'pending')!='delivered'
-                  OR json_extract(a.operational_json,'$.application.state') IN ('pending','blocked','applied')
-                  OR (json_extract(a.operational_json,'$.execution.placement') IS NOT NULL AND
-                      (json_extract(a.operational_json,'$.cleanup.state')!='completed'
-                       OR coalesce(json_extract(a.operational_json,'$.cleanup.workerClosed'),0)!=1))
-                  OR (json_extract(a.operational_json,'$.execution.placement.kind')='isolated_worktree'
-                      AND coalesce(json_extract(a.operational_json,'$.outputDisposition.state'),'')!='completed')
-               ORDER BY a.task_id`,
-            )
-            .map((row) => stringField(row, "task_id")),
-        );
-        state.tasks.push(...(yield* Effect.forEach(taskIds, (id) => this.readTask(id))));
-        return state;
-      }.bind(this),
-    );
-  }
-
-  taskExists(taskId: string): Effect.Effect<boolean, WorkstreamStoreError> {
-    return hostEffect(
-      "read keyed Task identity",
-      () =>
-        this.database.readRow("SELECT task_id FROM tasks WHERE task_id=?", taskId) !== undefined,
-    );
-  }
-
-  readTask(taskId: string): Effect.Effect<Task, WorkstreamStoreError> {
-    return Effect.gen(
-      function* (this: WorkstreamStore) {
-        const ids = yield* hostEffect("read Task Attempt keys", () =>
-          this.database
-            .readRows("SELECT attempt_id FROM attempts WHERE task_id=? ORDER BY sequence", taskId)
-            .map((row) => stringField(row, "attempt_id")),
-        );
-        if (ids.length === 0)
-          return yield* new WorkstreamStoreConflictError(`Unknown Task ${taskId}.`);
-        const records = yield* Effect.forEach(ids, (id) => this.readAttempt(taskId, id));
-        const first = records[0];
-        if (first === undefined)
-          return yield* new WorkstreamStoreConflictError(`Unknown Task ${taskId}.`);
-        return { ...first.task, attempts: records.map((record) => record.attempt) } as Task;
-      }.bind(this),
-    );
-  }
-
-  readAttemptForOutcome(outcomeId: string): Effect.Effect<AttemptRecords, WorkstreamStoreError> {
-    return Effect.flatMap(
-      hostEffect("read Outcome Attempt key", () => {
-        const row = this.database.readRow(
-          "SELECT a.task_id,a.attempt_id FROM outcomes o JOIN attempts a ON a.attempt_id=o.attempt_id WHERE o.outcome_id=?",
-          outcomeId,
-        );
-        if (row === undefined)
-          throw new WorkstreamStoreConflictError(`Unknown Outcome ${outcomeId}.`);
-        return { taskId: stringField(row, "task_id"), attemptId: stringField(row, "attempt_id") };
-      }),
-      (key) => this.readAttempt(key.taskId, key.attemptId),
-    );
-  }
-
-  readRevision(): Effect.Effect<number, WorkstreamStoreError> {
-    return hostEffect("read Workstream revision", () =>
-      integerField(
-        this.database.readRow("SELECT revision FROM metadata WHERE singleton=1"),
-        "revision",
-      ),
-    );
-  }
-
-  readAttempt(
-    taskId: string | undefined,
-    attemptId: string,
-  ): Effect.Effect<AttemptRecords, WorkstreamStoreError> {
-    return hostEffect("read keyed Attempt context", () => {
-      const statement = `SELECT m.id,m.project_root,m.git_common_dir,m.revision,m.lifecycle,m.suspension_json,m.completion_json,
-                (SELECT max(intent_index) FROM intents) AS current_intent,
-                i.intent_json,t.contract_json,a.operational_json,o.outcome_json,d.delivery_json
-         FROM attempts a JOIN tasks t ON t.task_id=a.task_id
-         JOIN intents i ON i.intent_index=t.intent_index JOIN metadata m ON m.singleton=1
-         LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id
-         LEFT JOIN deliveries d ON d.outcome_id=o.outcome_id
-         WHERE ${taskId === undefined ? "a.attempt_id=?" : "t.task_id=? AND a.attempt_id=?"}`;
-      const row =
-        taskId === undefined
-          ? this.database.readRow(statement, attemptId)
-          : this.database.readRow(statement, taskId, attemptId);
-      if (row === undefined)
-        throw new WorkstreamStoreConflictError(`Unknown Attempt ${attemptId}.`);
-      const operational = parseJson(stringField(row, "operational_json")) as Record<
-        string,
-        unknown
-      >;
-      const attemptValue =
-        // biome-ignore lint/complexity/useLiteralKeys: node:sqlite rows are index-signature records under strict TypeScript.
-        row["outcome_json"] === null
-          ? operational
-          : {
-              ...operational,
-              outcome: {
-                ...(parseJson(stringField(row, "outcome_json")) as Record<string, unknown>),
-                delivery: parseJson(stringField(row, "delivery_json")),
-              },
-            };
-      const taskValue = {
-        ...(parseJson(stringField(row, "contract_json")) as Record<string, unknown>),
-        attempts: [attemptValue],
-      };
-      const intentValue = parseJson(stringField(row, "intent_json"));
-      if (
-        !Value.Check(IntentSchema, intentValue) ||
-        !Value.Check(TaskSchema, taskValue) ||
-        !Value.Check(AttemptSchema, attemptValue)
-      )
-        throw new WorkstreamStoreInvalidError("Keyed Attempt records are malformed.");
-      const lifecycle = {
-        ...nullableJson(row, "suspension_json", "suspension"),
-        ...nullableJson(row, "completion_json", "completion"),
-      } as { suspension?: Suspension; completion?: Completion };
-      return {
-        revision: numberField(row, "revision"),
-        lifecycle: stringField(row, "lifecycle") as Workstream["lifecycle"],
-        workstreamId: stringField(row, "id"),
-        repository: {
-          projectRoot: stringField(row, "project_root"),
-          gitCommonDir: stringField(row, "git_common_dir"),
-        },
-        currentIntentIndex: numberField(row, "current_intent"),
-        ...lifecycle,
-        intent: structuredClone(intentValue as Intent),
-        task: structuredClone(taskValue as Task),
-        attempt: structuredClone(attemptValue as Attempt),
-      };
-    });
-  }
-
-  readOutcome(
-    outcomeId: string,
-  ): Effect.Effect<NonNullable<Attempt["outcome"]>, WorkstreamStoreError> {
-    return hostEffect("read keyed Outcome record", () => {
-      const row = this.database.readRow(
-        `SELECT o.outcome_json,d.delivery_json FROM outcomes o
-         JOIN deliveries d ON d.outcome_id=o.outcome_id WHERE o.outcome_id=?`,
-        outcomeId,
-      );
-      if (row === undefined)
-        throw new WorkstreamStoreConflictError(`Unknown Outcome ${outcomeId}.`);
-      const value = {
-        ...(parseJson(stringField(row, "outcome_json")) as Record<string, unknown>),
-        delivery: parseJson(stringField(row, "delivery_json")),
-      };
-      if (!Value.Check(OutcomeSchema, value) || value.id !== outcomeId)
-        throw new WorkstreamStoreInvalidError(
-          `Outcome ${outcomeId} record is malformed or mismatched.`,
-        );
-      return structuredClone(value as NonNullable<Attempt["outcome"]>);
-    });
-  }
-
-  /** Apply one purpose-specific record mutation with an owner/revision fence. */
-  mutateRecords(
-    owner: CoordinatorIdentity,
-    expectedRevision: number,
-    mutation: WorkstreamRecordMutation,
-  ): Effect.Effect<number, WorkstreamStoreError, FileSystem.FileSystem> {
-    return this.atomic(() => {
-      const metadata = requiredRow(
-        this.database.readRow(
-          "SELECT owner_session_id,owner_session_file,revision FROM metadata WHERE singleton=1",
-        ),
-        "metadata",
-      );
-      if (
-        stringField(metadata, "owner_session_id") !== owner.sessionId ||
-        stringField(metadata, "owner_session_file") !== owner.sessionFile
-      )
-        throw new WorkstreamStoreConflictError("Workstream owner changed during mutation.");
-      const revision = numberField(metadata, "revision");
-      if (revision !== expectedRevision)
-        throw new WorkstreamStoreConflictError(
-          `Expected revision ${expectedRevision}, found ${revision}.`,
-        );
-      applyRecordMutation(this.database, mutation);
-      const nextRevision = revision + 1;
-      const changed = this.database.write(
-        "UPDATE metadata SET revision=?,updated_at=? WHERE singleton=1 AND revision=? AND owner_session_id=? AND owner_session_file=?",
-        nextRevision,
-        mutation.updatedAt,
-        revision,
-        owner.sessionId,
-        owner.sessionFile,
-      );
-      if (changed !== 1)
-        throw new WorkstreamStoreConflictError("Workstream revision changed during mutation.");
-      return nextRevision;
-    });
-  }
-
-  private readChecked(): Workstream {
-    const state = readRecords(this.database);
-    if (state.id !== this.id || !Value.Equal(state.repository, this.repository))
-      throw new WorkstreamStoreInvalidError("Workstream store has a foreign identity.");
-    return state;
-  }
-
-  private atomic<A>(
-    body: (nowMillis: number) => A,
-  ): Effect.Effect<A, WorkstreamStoreError, FileSystem.FileSystem> {
-    return Effect.uninterruptible(
-      Clock.clockWith((clock) =>
-        hostEffect("run Workstream record transaction", () => {
-          this.database.exec("BEGIN IMMEDIATE");
-          try {
-            const value = body(clock.currentTimeMillisUnsafe());
-            this.database.exec("COMMIT");
-            return value;
-          } catch (cause) {
-            try {
-              this.database.exec("ROLLBACK");
-            } catch (rollback) {
-              throw new WorkstreamStoreHostError(
-                "roll back Workstream record transaction",
-                new AggregateError([cause, rollback]),
-              );
-            }
-            throw cause;
+  static create(agentDir: string, metadata: WorkstreamMetadata, intent: Intent): WorkstreamStore {
+    return host("create workstream", () => {
+      decode(WorkstreamMetadataSchema, metadata, "metadata");
+      decode(IntentSchema, intent, "Intent");
+      if (metadata.lifecycle !== "active" || metadata.completion !== undefined)
+        throw failure("create workstream", "A new Workstream must be active and incomplete.");
+      const path = WorkstreamStore.pathFor(agentDir, metadata.id);
+      privateParents(path);
+      const database = new DatabaseSync(path);
+      const store = new WorkstreamStore(metadata.id, database, path, false);
+      try {
+        database.exec(SCHEMA);
+        chmodSync(path, 0o600);
+        store.transaction("create workstream", () => {
+          const existing = database
+            .prepare("SELECT workstream_id FROM metadata WHERE singleton=1")
+            .get() as Row | undefined;
+          if (existing !== undefined) {
+            store.readMetadata();
+            store.requireOwner(metadata.owner);
+            return;
           }
-        }),
-      ),
-    ).pipe(Effect.tap(() => secureFiles(this.path)));
+          const residue = number(
+            database
+              .prepare(
+                "SELECT (SELECT count(*) FROM intents)+(SELECT count(*) FROM tasks)+(SELECT count(*) FROM attempts)+(SELECT count(*) FROM outcomes) AS value",
+              )
+              .get(),
+            "value",
+          );
+          if (residue !== 0)
+            throw failure(
+              "create workstream",
+              "Creation residue contains records without metadata.",
+            );
+          database
+            .prepare(
+              `INSERT INTO metadata(singleton,format,schema_version,workstream_id,owner_session_id,owner_session_file,owner_workspace_id,owner_tab_id,lifecycle,completion_json,created_at,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?)`,
+            )
+            .run(
+              metadata.format,
+              metadata.schemaVersion,
+              metadata.id,
+              metadata.owner.sessionId,
+              metadata.owner.sessionFile,
+              metadata.owner.workspaceId,
+              metadata.owner.tabId,
+              metadata.lifecycle,
+              null,
+              metadata.createdAt,
+              metadata.updatedAt,
+            );
+          database
+            .prepare("INSERT INTO intents(intent_index,intent_json) VALUES(0,?)")
+            .run(json(intent));
+        });
+        store.readLatestIntent();
+        return store;
+      } catch (cause) {
+        database.close();
+        throw cause;
+      }
+    });
   }
-}
 
-function writeRecords(database: WorkstreamDatabase, state: Workstream): void {
-  database.write(
-    `INSERT INTO metadata(singleton,id,purpose,project_root,git_common_dir,owner_session_id,owner_session_file,revision,lifecycle,suspension_json,completion_json,created_at,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    state.id,
-    state.purpose,
-    state.repository.projectRoot,
-    state.repository.gitCommonDir,
-    state.coordinator.sessionId,
-    state.coordinator.sessionFile,
-    state.revision,
-    state.lifecycle,
-    optionalJson(state.suspension),
-    optionalJson(state.completion),
-    state.createdAt,
-    state.updatedAt,
-  );
-  state.intents.forEach((value, index) => {
-    database.write("INSERT INTO intents(intent_index,intent_json) VALUES(?,?)", index, json(value));
-  });
-  for (const task of state.tasks) {
-    const { attempts, ...contract } = task;
-    database.write(
-      "INSERT INTO tasks(task_id,intent_index,kind,contract_json) VALUES(?,?,?,?)",
-      task.id,
-      task.intentIndex,
-      task.kind,
-      json(contract),
-    );
-    attempts.forEach((attempt, sequence) => {
-      const { outcome, ...operational } = attempt;
-      database.write(
-        "INSERT INTO attempts(attempt_id,task_id,sequence,operational_json) VALUES(?,?,?,?)",
-        attempt.id,
-        task.id,
-        sequence,
-        json(operational),
+  static openOwned(agentDir: string, id: string, owner: CoordinatorOwner): WorkstreamStore {
+    const store = WorkstreamStore.openExact(agentDir, id, false);
+    try {
+      store.requireOwner(owner);
+      return store;
+    } catch (cause) {
+      store.close();
+      throw cause;
+    }
+  }
+
+  static openReadOnly(agentDir: string, id: string): WorkstreamStore {
+    return WorkstreamStore.openExact(agentDir, id, true);
+  }
+
+  private static openExact(agentDir: string, id: string, readOnly: boolean): WorkstreamStore {
+    return host(readOnly ? "open read-only workstream" : "open owned workstream", () => {
+      const path = WorkstreamStore.pathFor(agentDir, id);
+      if (!existsSync(path)) throw failure("open workstream", "Workstream store is absent.");
+      const database = new DatabaseSync(path, { readOnly });
+      const store = new WorkstreamStore(id, database, path, readOnly);
+      try {
+        database.exec("PRAGMA foreign_keys=ON");
+        store.readMetadata();
+        store.readLatestIntent();
+        return store;
+      } catch (cause) {
+        database.close();
+        throw cause;
+      }
+    });
+  }
+
+  close(): void {
+    host("close workstream", () => this.database.close());
+  }
+
+  readMetadata(): WorkstreamMetadata {
+    return host("read metadata", () => {
+      const row = this.one("SELECT * FROM metadata WHERE singleton=1");
+      const metadata = decode(
+        WorkstreamMetadataSchema,
+        {
+          format: text(row, "format"),
+          schemaVersion: number(row, "schema_version"),
+          id: text(row, "workstream_id"),
+          owner: {
+            sessionId: text(row, "owner_session_id"),
+            sessionFile: text(row, "owner_session_file"),
+            workspaceId: text(row, "owner_workspace_id"),
+            tabId: text(row, "owner_tab_id"),
+          },
+          lifecycle: text(row, "lifecycle"),
+          ...(row["completion_json"] === null
+            ? {}
+            : {
+                completion: parse(
+                  WorkstreamMetadataSchema.properties.completion,
+                  row["completion_json"],
+                  "completion",
+                ),
+              }),
+          createdAt: text(row, "created_at"),
+          updatedAt: text(row, "updated_at"),
+        },
+        "metadata",
       );
-      if (outcome !== undefined) {
-        const { delivery, ...immutableOutcome } = outcome;
-        database.write(
-          "INSERT INTO outcomes(outcome_id,attempt_id,outcome_json) VALUES(?,?,?)",
-          outcome.id,
-          attempt.id,
-          json(immutableOutcome),
+      if (metadata.id !== this.id) throw failure("read metadata", "Foreign Workstream identity.");
+      if (metadata.format !== WORKSTREAM_FORMAT)
+        throw failure("read metadata", "Unsupported Workstream format.");
+      if (metadata.schemaVersion !== WORKSTREAM_SCHEMA_VERSION)
+        throw failure("read metadata", "Unsupported Workstream schema version.");
+      if ((metadata.lifecycle === "completed") !== (metadata.completion !== undefined))
+        throw failure("read metadata", "Lifecycle and completion disagree.");
+      return metadata;
+    });
+  }
+
+  title(): string {
+    return this.readLatestIntent().intent.statement;
+  }
+
+  readLatestIntent(): IntentRecord {
+    const row = this.one(
+      "SELECT intent_index,intent_json FROM intents ORDER BY intent_index DESC LIMIT 1",
+    );
+    return intentRecord(row);
+  }
+
+  readIntent(index: number): IntentRecord {
+    return intentRecord(
+      this.one("SELECT intent_index,intent_json FROM intents WHERE intent_index=?", index),
+    );
+  }
+
+  appendIntent(owner: CoordinatorOwner, intent: Intent): IntentRecord {
+    return this.transaction("append Intent", () => {
+      this.requireOwner(owner);
+      if (this.readMetadata().lifecycle !== "active")
+        throw failure("append Intent", "Completed Workstreams reject new work.");
+      decode(IntentSchema, intent, "Intent");
+      const index = this.readLatestIntent().index + 1;
+      this.database
+        .prepare("INSERT INTO intents(intent_index,intent_json) VALUES(?,?)")
+        .run(index, json(intent));
+      this.touch(intent.recordedAt);
+      return { index, intent };
+    });
+  }
+
+  createTaskWithAttempt(
+    owner: CoordinatorOwner,
+    intentIndex: number,
+    taskId: string,
+    task: Task,
+    attemptId: string,
+    attempt: Attempt,
+  ): { task: TaskRecord; attempt: AttemptRecord } {
+    return this.transaction("create Task and Attempt", () => {
+      this.requireOwner(owner);
+      if (this.readMetadata().lifecycle !== "active")
+        throw failure("create Task and Attempt", "Completed Workstreams reject new work.");
+      decode(TaskSchema, task, "Task");
+      decode(AttemptSchema, attempt, "Attempt");
+      if (task.contract.kind === "review" && task.contract.subject.kind !== "revision") {
+        const outcomeIds =
+          task.contract.subject.kind === "outcome"
+            ? [task.contract.subject.outcomeId]
+            : task.contract.subject.outcomeIds;
+        for (const outcomeId of outcomeIds) this.readOutcomeById(outcomeId);
+      }
+      if (this.readLatestIntent().index !== intentIndex)
+        throw failure("create Task and Attempt", "Task must bind to the latest Intent.");
+      const taskIndex = this.nextIndex("tasks", "task_index");
+      const attemptIndex = this.nextIndex("attempts", "attempt_index");
+      this.database
+        .prepare("INSERT INTO tasks(task_index,task_id,intent_index,task_json) VALUES(?,?,?,?)")
+        .run(taskIndex, taskId, intentIndex, json(task));
+      this.database
+        .prepare(
+          "INSERT INTO attempts(attempt_index,attempt_id,task_id,sequence,attempt_json) VALUES(?,?,?,?,?)",
+        )
+        .run(attemptIndex, attemptId, taskId, 0, json(attempt));
+      this.touch(task.createdAt);
+      return {
+        task: { index: taskIndex, id: taskId, intentIndex, task },
+        attempt: { index: attemptIndex, id: attemptId, taskId, sequence: 0, attempt },
+      };
+    });
+  }
+
+  appendAttempt(
+    owner: CoordinatorOwner,
+    taskId: string,
+    attemptId: string,
+    attempt: Attempt,
+  ): AttemptRecord {
+    return this.transaction("append Attempt", () => {
+      this.requireOwner(owner);
+      if (this.readMetadata().lifecycle !== "active")
+        throw failure("append Attempt", "Completed Workstreams reject new work.");
+      decode(AttemptSchema, attempt, "Attempt");
+      const task = this.readTask(taskId);
+      if (task.intentIndex !== this.readLatestIntent().index)
+        throw failure("append Attempt", "Attempt Task does not belong to the latest Intent.");
+      const index = this.nextIndex("attempts", "attempt_index");
+      const sequence = number(
+        this.database.prepare("SELECT count(*) AS value FROM attempts WHERE task_id=?").get(taskId),
+        "value",
+      );
+      this.database
+        .prepare(
+          "INSERT INTO attempts(attempt_index,attempt_id,task_id,sequence,attempt_json) VALUES(?,?,?,?,?)",
+        )
+        .run(index, attemptId, taskId, sequence, json(attempt));
+      return { index, id: attemptId, taskId, sequence, attempt };
+    });
+  }
+
+  readTask(id: string): TaskRecord {
+    return taskRecord(
+      this.one("SELECT task_index,task_id,intent_index,task_json FROM tasks WHERE task_id=?", id),
+    );
+  }
+
+  readAttempt(id: string): AttemptRecord {
+    return attemptRecord(
+      this.one(
+        "SELECT attempt_index,attempt_id,task_id,sequence,attempt_json FROM attempts WHERE attempt_id=?",
+        id,
+      ),
+    );
+  }
+
+  checkpointAttempt(owner: CoordinatorOwner, attemptId: string, attempt: Attempt): AttemptRecord {
+    return this.transaction("checkpoint Attempt", () => {
+      this.requireOwner(owner);
+      decode(AttemptSchema, attempt, "Attempt");
+      const prior = this.readAttempt(attemptId);
+      if (
+        json({ ...prior.attempt, execution: undefined, output: undefined }) !==
+        json({ ...attempt, execution: undefined, output: undefined })
+      )
+        throw failure("checkpoint Attempt", "Immutable Attempt facts changed.");
+      this.database
+        .prepare("UPDATE attempts SET attempt_json=? WHERE attempt_id=?")
+        .run(json(attempt), attemptId);
+      return { ...prior, attempt };
+    });
+  }
+
+  insertOutcome(
+    owner: CoordinatorOwner,
+    id: string,
+    attemptId: string,
+    outcome: Outcome,
+  ): OutcomeRecord {
+    return this.transaction("insert Outcome", () => {
+      this.requireOwner(owner);
+      const attempt = this.readAttempt(attemptId);
+      const task = this.readTask(attempt.taskId);
+      decodeOutcome(outcome, task.task);
+      const index = this.nextIndex("outcomes", "outcome_index");
+      this.database
+        .prepare(
+          "INSERT INTO outcomes(outcome_index,outcome_id,attempt_id,outcome_json) VALUES(?,?,?,?)",
+        )
+        .run(index, id, attemptId, json(outcome));
+      this.touch(outcome.observedAt);
+      return { index, id, attemptId, outcome };
+    });
+  }
+
+  settleCancellation(
+    owner: CoordinatorOwner,
+    id: string,
+    attemptId: string,
+    attempt: Attempt,
+    outcome: Outcome,
+  ): OutcomeRecord {
+    return this.transaction("settle cancellation", () => {
+      this.requireOwner(owner);
+      decode(AttemptSchema, attempt, "Attempt");
+      const prior = this.readAttempt(attemptId);
+      if (
+        json({ ...prior.attempt, execution: undefined, output: undefined }) !==
+        json({ ...attempt, execution: undefined, output: undefined })
+      )
+        throw failure("settle cancellation", "Immutable Attempt facts changed.");
+      if (attempt.execution?.cancellation === undefined || attempt.execution.closedAt === undefined)
+        throw failure("settle cancellation", "Cancellation closure facts are incomplete.");
+      const task = this.readTask(prior.taskId);
+      decodeOutcome(outcome, task.task);
+      if (outcome.result.kind !== "cancelled")
+        throw failure("settle cancellation", "Outcome is not cancelled.");
+      const index = this.nextIndex("outcomes", "outcome_index");
+      this.database
+        .prepare("UPDATE attempts SET attempt_json=? WHERE attempt_id=?")
+        .run(json(attempt), attemptId);
+      this.database
+        .prepare(
+          "INSERT INTO outcomes(outcome_index,outcome_id,attempt_id,outcome_json) VALUES(?,?,?,?)",
+        )
+        .run(index, id, attemptId, json(outcome));
+      this.touch(outcome.observedAt);
+      return { index, id, attemptId, outcome };
+    });
+  }
+
+  readOutcomeById(id: string): OutcomeRecord {
+    const row = this.one(
+      "SELECT outcome_index,outcome_id,attempt_id,outcome_json FROM outcomes WHERE outcome_id=?",
+      id,
+    );
+    const attempt = this.readAttempt(text(row, "attempt_id"));
+    return outcomeRecord(row, this.readTask(attempt.taskId).task);
+  }
+
+  readOutcome(attemptId: string): OutcomeRecord | undefined {
+    const row = this.database
+      .prepare(
+        "SELECT outcome_index,outcome_id,attempt_id,outcome_json FROM outcomes WHERE attempt_id=?",
+      )
+      .get(attemptId) as Row | undefined;
+    return row === undefined
+      ? undefined
+      : outcomeRecord(row, this.readTask(this.readAttempt(attemptId).taskId).task);
+  }
+
+  updateDelivery(
+    owner: CoordinatorOwner,
+    attemptId: string,
+    delivery: OutcomeDelivery,
+  ): OutcomeRecord {
+    return this.transaction("update Outcome delivery", () => {
+      this.requireOwner(owner);
+      decode(OutcomeDeliverySchema, delivery, "Outcome delivery");
+      const record = this.readOutcome(attemptId);
+      if (record === undefined) throw failure("update Outcome delivery", "Outcome is absent.");
+      const outcome = { ...record.outcome, delivery };
+      decodeOutcome(outcome, this.readTask(this.readAttempt(attemptId).taskId).task);
+      this.database
+        .prepare("UPDATE outcomes SET outcome_json=? WHERE attempt_id=?")
+        .run(json(outcome), attemptId);
+      return { ...record, outcome };
+    });
+  }
+
+  unsettled(): Array<{ task: TaskRecord; attempt: AttemptRecord; outcome?: OutcomeRecord }> {
+    return host("read unsettled records", () => {
+      const rows = this.database
+        .prepare(
+          `SELECT a.attempt_id FROM attempts a LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id WHERE o.attempt_id IS NULL OR json_extract(o.outcome_json,'$.delivery.deliveredAt') IS NULL OR json_extract(a.attempt_json,'$.execution.closedAt') IS NULL OR (json_extract(a.attempt_json,'$.base.kind')='repository' AND (json_extract(a.attempt_json,'$.output.kind') IS NULL OR json_extract(a.attempt_json,'$.output.kind') IN ('applying','discarding') OR (json_extract(a.attempt_json,'$.output.kind')='applied' AND json_extract(a.attempt_json,'$.output.cleanupTip') IS NOT NULL))) ORDER BY a.attempt_index`,
+        )
+        .all() as Row[];
+      return rows.map((row) => {
+        const attempt = this.readAttempt(text(row, "attempt_id"));
+        const outcome = this.readOutcome(attempt.id);
+        return {
+          task: this.readTask(attempt.taskId),
+          attempt,
+          ...(outcome === undefined ? {} : { outcome }),
+        };
+      });
+    });
+  }
+
+  hasUnclassifiedIntegrationChild(parentAttemptId: string): boolean {
+    const row = this.database
+      .prepare(
+        `SELECT count(*) AS value FROM attempts WHERE json_extract(attempt_json,'$.lineage.candidateOf.kind')='integrate' AND json_extract(attempt_json,'$.lineage.candidateOf.attemptId')=? AND json_extract(attempt_json,'$.output.kind') IS NULL`,
+      )
+      .get(parentAttemptId) as Row | undefined;
+    return number(row, "value") > 0;
+  }
+
+  page(
+    section: "intents" | "tasks" | "attempts" | "outcomes",
+    after: number,
+    limit: number,
+  ): unknown[] {
+    if (
+      !Number.isSafeInteger(after) ||
+      after < -1 ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > MAX_PAGE
+    )
+      throw failure("page records", "Page boundary is outside the supported range.");
+    if (section === "intents")
+      return (
+        this.database
+          .prepare(
+            "SELECT intent_index,intent_json FROM intents WHERE intent_index>? ORDER BY intent_index LIMIT ?",
+          )
+          .all(after, limit) as Row[]
+      ).map(intentRecord);
+    if (section === "tasks")
+      return (
+        this.database
+          .prepare(
+            "SELECT task_index,task_id,intent_index,task_json FROM tasks WHERE task_index>? ORDER BY task_index LIMIT ?",
+          )
+          .all(after, limit) as Row[]
+      ).map(taskRecord);
+    if (section === "attempts")
+      return (
+        this.database
+          .prepare(
+            "SELECT attempt_index,attempt_id,task_id,sequence,attempt_json FROM attempts WHERE attempt_index>? ORDER BY attempt_index LIMIT ?",
+          )
+          .all(after, limit) as Row[]
+      ).map(attemptRecord);
+    return (
+      this.database
+        .prepare(
+          "SELECT outcome_index,outcome_id,attempt_id,outcome_json FROM outcomes WHERE outcome_index>? ORDER BY outcome_index LIMIT ?",
+        )
+        .all(after, limit) as Row[]
+    ).map((row) => {
+      const attempt = this.readAttempt(text(row, "attempt_id"));
+      return outcomeRecord(row, this.readTask(attempt.taskId).task);
+    });
+  }
+
+  complete(owner: CoordinatorOwner, completion: Completion): WorkstreamMetadata {
+    return this.transaction("complete Workstream", () => {
+      this.requireOwner(owner);
+      decode(WorkstreamMetadataSchema.properties.completion, completion, "completion");
+      if (this.readMetadata().lifecycle === "completed")
+        throw failure("complete Workstream", "Workstream is already complete.");
+      const missing = number(
+        this.database
+          .prepare(
+            "SELECT count(*) AS value FROM attempts a LEFT JOIN outcomes o ON o.attempt_id=a.attempt_id WHERE o.attempt_id IS NULL",
+          )
+          .get(),
+        "value",
+      );
+      if (missing !== 0)
+        throw failure("complete Workstream", "Every Attempt must have an Outcome.");
+      this.database
+        .prepare(
+          "UPDATE metadata SET lifecycle='completed',completion_json=?,updated_at=? WHERE singleton=1",
+        )
+        .run(json(completion), completion.completedAt);
+      return this.readMetadata();
+    });
+  }
+
+  adopt(
+    expected: CoordinatorOwner,
+    successor: CoordinatorOwner,
+    exactPriorAbsent: boolean,
+    at: string,
+  ): WorkstreamMetadata {
+    return this.transaction("adopt Workstream", () => {
+      if (!exactPriorAbsent)
+        throw failure("adopt Workstream", "Exact prior Coordinator absence was not established.");
+      this.requireOwner(expected);
+      decode(CoordinatorOwnerSchema, successor, "successor owner");
+      this.database
+        .prepare(
+          "UPDATE metadata SET owner_session_id=?,owner_session_file=?,owner_workspace_id=?,owner_tab_id=?,updated_at=? WHERE singleton=1",
+        )
+        .run(
+          successor.sessionId,
+          successor.sessionFile,
+          successor.workspaceId,
+          successor.tabId,
+          at,
         );
-        database.write(
-          "INSERT INTO deliveries(outcome_id,delivery_json) VALUES(?,?)",
-          outcome.id,
-          json(delivery),
-        );
+      return this.readMetadata();
+    });
+  }
+
+  private requireOwner(owner: CoordinatorOwner): void {
+    if (!Value.Equal(this.readMetadata().owner, owner))
+      throw failure("write Workstream", "Coordinator is not the exact owner.");
+  }
+
+  private touch(at: string): void {
+    this.database.prepare("UPDATE metadata SET updated_at=? WHERE singleton=1").run(at);
+  }
+
+  private nextIndex(table: "tasks" | "attempts" | "outcomes", column: string): number {
+    return number(
+      this.database.prepare(`SELECT coalesce(max(${column}),-1)+1 AS value FROM ${table}`).get(),
+      "value",
+    );
+  }
+
+  private one(sql: string, ...parameters: Array<string | number>): Row {
+    const row = this.database.prepare(sql).get(...parameters) as Row | undefined;
+    if (row === undefined) throw failure("read record", "Required record is absent.");
+    return row;
+  }
+
+  private transaction<A>(operation: string, run: () => A): A {
+    if (this.readOnly) throw failure(operation, "Store is read-only.");
+    return host(operation, () => {
+      this.database.exec("BEGIN IMMEDIATE");
+      try {
+        const result = run();
+        this.database.exec("COMMIT");
+        return result;
+      } catch (cause) {
+        this.database.exec("ROLLBACK");
+        throw cause;
       }
     });
   }
 }
-// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: the closed mutation union keeps each table-owned transaction explicit.
-function applyRecordMutation(
-  database: WorkstreamDatabase,
-  mutation: WorkstreamRecordMutation,
-): void {
-  switch (mutation.kind) {
-    case "append_intent": {
-      if (!Value.Check(IntentSchema, mutation.intent))
-        throw new WorkstreamStoreInvalidError("Intent record is malformed.");
-      const row = requiredRow(
-        database.readRow(
-          "SELECT lifecycle,(SELECT max(intent_index) FROM intents) AS current_intent FROM metadata WHERE singleton=1",
-        ),
-        "metadata",
-      );
-      if (stringField(row, "lifecycle") !== "active")
-        throw new WorkstreamStoreConflictError(
-          "Cannot revise Intent outside an active Workstream.",
-        );
-      if (
-        mutation.intent.grounding.kind !== "human_input_receipt" ||
-        mutation.intent.grounding.sessionId !==
-          stringField(metadataOwner(database), "owner_session_id") ||
-        mutation.intent.grounding.sessionFile !==
-          stringField(metadataOwner(database), "owner_session_file")
-      )
-        throw new WorkstreamStoreConflictError(
-          "Revised Intent requires a direct receipt from the current owner.",
-        );
-      database.write(
-        "INSERT INTO intents(intent_index,intent_json) VALUES(?,?)",
-        numberField(row, "current_intent") + 1,
-        json(mutation.intent),
-      );
-      return;
-    }
-    case "create_task": {
-      if (!Value.Check(TaskSchema, mutation.task))
-        throw new WorkstreamStoreInvalidError("Task record is malformed.");
-      const row = requiredRow(
-        database.readRow(
-          "SELECT lifecycle,(SELECT max(intent_index) FROM intents) AS current_intent FROM metadata WHERE singleton=1",
-        ),
-        "metadata",
-      );
-      if (
-        stringField(row, "lifecycle") !== "active" ||
-        mutation.task.intentIndex !== numberField(row, "current_intent")
-      )
-        throw new WorkstreamStoreConflictError(
-          "Task does not belong to the active current Intent.",
-        );
-      insertTaskRecords(database, mutation.task);
-      return;
-    }
-    case "append_attempts": {
-      const task = database.readRow(
-        "SELECT intent_index FROM tasks WHERE task_id=?",
-        mutation.taskId,
-      );
-      if (task === undefined)
-        throw new WorkstreamStoreConflictError(`Unknown Task ${mutation.taskId}.`);
-      const nextSequence = integerField(
-        database.readRow(
-          "SELECT coalesce(max(sequence),-1)+1 AS sequence FROM attempts WHERE task_id=?",
-          mutation.taskId,
-        ),
-        "sequence",
-      );
-      mutation.attempts.forEach((attempt, offset) => {
-        insertAttemptRecord(database, mutation.taskId, nextSequence + offset, attempt);
-      });
-      return;
-    }
-    case "update_attempt": {
-      if (
-        !Value.Check(AttemptSchema, mutation.attempt) ||
-        mutation.attempt.id !== mutation.key.attemptId
-      )
-        throw new WorkstreamStoreInvalidError("Attempt record is malformed or mismatched.");
-      const existing = database.readRow(
-        "SELECT attempt_id FROM attempts WHERE task_id=? AND attempt_id=?",
-        mutation.key.taskId,
-        mutation.key.attemptId,
-      );
-      if (existing === undefined)
-        throw new WorkstreamStoreConflictError(`Unknown Attempt ${mutation.key.attemptId}.`);
-      writeAttemptRecord(database, mutation.key.taskId, mutation.attempt);
-      if (mutation.completion !== undefined)
-        database.write(
-          "UPDATE metadata SET completion_json=? WHERE singleton=1",
-          json(mutation.completion),
-        );
-      return;
-    }
-    case "update_lifecycle": {
-      const current = stringField(
-        requiredRow(
-          database.readRow("SELECT lifecycle FROM metadata WHERE singleton=1"),
-          "metadata",
-        ),
-        "lifecycle",
-      );
-      const valid =
-        (current === "active" &&
-          mutation.lifecycle === "suspended" &&
-          mutation.suspension !== undefined &&
-          mutation.completion === undefined) ||
-        (current === "suspended" &&
-          mutation.lifecycle === "active" &&
-          mutation.suspension === undefined &&
-          mutation.completion === undefined) ||
-        (current === "active" &&
-          mutation.lifecycle === "completed" &&
-          mutation.suspension === undefined &&
-          mutation.completion !== undefined);
-      if (!valid)
-        throw new WorkstreamStoreConflictError(
-          `Invalid Workstream lifecycle transition from ${current} to ${mutation.lifecycle}.`,
-        );
-      database.write(
-        "UPDATE metadata SET lifecycle=?,suspension_json=?,completion_json=? WHERE singleton=1",
-        mutation.lifecycle,
-        optionalJson(mutation.suspension),
-        optionalJson(mutation.completion),
-      );
-      return;
-    }
-  }
-}
 
-function metadataOwner(database: WorkstreamDatabase): Record<string, unknown> {
-  return requiredRow(
-    database.readRow("SELECT owner_session_id,owner_session_file FROM metadata WHERE singleton=1"),
-    "metadata owner",
-  );
+function privateParents(path: string): void {
+  const workstreams = dirname(dirname(path));
+  const workgraph = dirname(workstreams);
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  chmodSync(workgraph, 0o700);
+  chmodSync(workstreams, 0o700);
+  chmodSync(dirname(path), 0o700);
 }
-
-function insertTaskRecords(database: WorkstreamDatabase, task: Task): void {
-  const { attempts, ...contract } = task;
-  database.write(
-    "INSERT INTO tasks(task_id,intent_index,kind,contract_json) VALUES(?,?,?,?)",
-    task.id,
-    task.intentIndex,
-    task.kind,
-    json(contract),
-  );
-  attempts.forEach((attempt, sequence) => {
-    insertAttemptRecord(database, task.id, sequence, attempt);
-  });
-}
-
-function insertAttemptRecord(
-  database: WorkstreamDatabase,
-  taskId: string,
-  sequence: number,
-  attempt: Attempt,
-): void {
-  if (!Value.Check(AttemptSchema, attempt))
-    throw new WorkstreamStoreInvalidError("Attempt record is malformed.");
-  const { outcome, ...operational } = attempt;
-  database.write(
-    "INSERT INTO attempts(attempt_id,task_id,sequence,operational_json) VALUES(?,?,?,?)",
-    attempt.id,
-    taskId,
-    sequence,
-    json(operational),
-  );
-  if (outcome !== undefined) insertOutcomeRecord(database, attempt.id, outcome);
-}
-
-function writeAttemptRecord(database: WorkstreamDatabase, taskId: string, attempt: Attempt): void {
-  const { outcome, ...operational } = attempt;
-  const changed = database.write(
-    "UPDATE attempts SET operational_json=? WHERE attempt_id=? AND task_id=?",
-    json(operational),
-    attempt.id,
-    taskId,
-  );
-  if (changed !== 1) throw new WorkstreamStoreConflictError(`Unknown Attempt ${attempt.id}.`);
-  const prior = database.readRow(
-    "SELECT outcome_id,outcome_json FROM outcomes WHERE attempt_id=?",
-    attempt.id,
-  );
-  if (outcome === undefined) {
-    if (prior !== undefined)
-      throw new WorkstreamStoreInvalidError(`Outcome for ${attempt.id} is immutable.`);
-    return;
-  }
-  if (prior === undefined) {
-    insertOutcomeRecord(database, attempt.id, outcome);
-    return;
-  }
-  const { delivery, ...immutableOutcome } = outcome;
-  if (
-    stringField(prior, "outcome_id") !== outcome.id ||
-    !Value.Equal(parseJson(stringField(prior, "outcome_json")), immutableOutcome)
-  )
-    throw new WorkstreamStoreInvalidError(`Outcome ${outcome.id} is immutable.`);
-  database.write(
-    "UPDATE deliveries SET delivery_json=? WHERE outcome_id=?",
-    json(delivery),
-    outcome.id,
-  );
-}
-
-function insertOutcomeRecord(
-  database: WorkstreamDatabase,
-  attemptId: string,
-  outcome: NonNullable<Attempt["outcome"]>,
-): void {
-  const { delivery, ...immutableOutcome } = outcome;
-  database.write(
-    "INSERT INTO outcomes(outcome_id,attempt_id,outcome_json) VALUES(?,?,?)",
-    outcome.id,
-    attemptId,
-    json(immutableOutcome),
-  );
-  database.write(
-    "INSERT INTO deliveries(outcome_id,delivery_json) VALUES(?,?)",
-    outcome.id,
-    json(delivery),
-  );
-}
-
-function readRecords(database: WorkstreamDatabase): Workstream {
-  assertRecordSchema(database);
-  assertHeader(database);
-  const metadata = requiredRow(
-    database.readRow("SELECT * FROM metadata WHERE singleton=1"),
-    "metadata",
-  );
-  const intents = database
-    .readRows("SELECT intent_json FROM intents ORDER BY intent_index")
-    .map((row) => parseJson(stringField(row, "intent_json")));
-  const tasks = database
-    .readRows("SELECT task_id,contract_json FROM tasks ORDER BY rowid")
-    .map((row) => {
-      const contract = parseJson(stringField(row, "contract_json")) as Record<string, unknown>;
-      const attempts = database
-        .readRows(
-          "SELECT attempt_id,operational_json FROM attempts WHERE task_id=? ORDER BY sequence",
-          stringField(row, "task_id"),
-        )
-        .map((attemptRow) => {
-          const operational = parseJson(stringField(attemptRow, "operational_json")) as Record<
-            string,
-            unknown
-          >;
-          const outcomeRow = database.readRow(
-            "SELECT outcome_id,outcome_json FROM outcomes WHERE attempt_id=?",
-            stringField(attemptRow, "attempt_id"),
-          );
-          if (outcomeRow === undefined) return operational;
-          const outcome = parseJson(stringField(outcomeRow, "outcome_json")) as Record<
-            string,
-            unknown
-          >;
-          const delivery = requiredRow(
-            database.readRow(
-              "SELECT delivery_json FROM deliveries WHERE outcome_id=?",
-              stringField(outcomeRow, "outcome_id"),
-            ),
-            "delivery",
-          );
-          return {
-            ...operational,
-            outcome: { ...outcome, delivery: parseJson(stringField(delivery, "delivery_json")) },
-          };
-        });
-      return { ...contract, attempts };
-    });
-  const state: unknown = {
-    format: "pi-workgraph-workstream",
-    schemaVersion: 3,
-    revision: numberField(metadata, "revision"),
-    id: stringField(metadata, "id"),
-    purpose: stringField(metadata, "purpose"),
-    repository: {
-      projectRoot: stringField(metadata, "project_root"),
-      gitCommonDir: stringField(metadata, "git_common_dir"),
-    },
-    coordinator: {
-      sessionId: stringField(metadata, "owner_session_id"),
-      sessionFile: stringField(metadata, "owner_session_file"),
-    },
-    lifecycle: stringField(metadata, "lifecycle"),
-    ...nullableJson(metadata, "suspension_json", "suspension"),
-    intents,
-    tasks,
-    ...nullableJson(metadata, "completion_json", "completion"),
-    createdAt: stringField(metadata, "created_at"),
-    updatedAt: stringField(metadata, "updated_at"),
+function intentRecord(row: Row): IntentRecord {
+  return {
+    index: number(row, "intent_index"),
+    intent: parse(IntentSchema, row["intent_json"], "Intent"),
   };
-  if (!Value.Check(WorkstreamSchema, state)) {
-    const issue = Value.Errors(WorkstreamSchema, state)[0];
-    throw new WorkstreamStoreInvalidError(
-      `Workstream records are malformed at ${issue?.instancePath === undefined || issue.instancePath === "" ? "/" : issue.instancePath}.`,
-    );
+}
+function taskRecord(row: Row): TaskRecord {
+  return {
+    index: number(row, "task_index"),
+    id: text(row, "task_id"),
+    intentIndex: number(row, "intent_index"),
+    task: parse(TaskSchema, row["task_json"], "Task"),
+  };
+}
+function attemptRecord(row: Row): AttemptRecord {
+  return {
+    index: number(row, "attempt_index"),
+    id: text(row, "attempt_id"),
+    taskId: text(row, "task_id"),
+    sequence: number(row, "sequence"),
+    attempt: parse(AttemptSchema, row["attempt_json"], "Attempt"),
+  };
+}
+function outcomeRecord(row: Row, task: Task): OutcomeRecord {
+  const outcome = parse(OutcomeSchema, row["outcome_json"], "Outcome");
+  decodeOutcome(outcome, task);
+  return {
+    index: number(row, "outcome_index"),
+    id: text(row, "outcome_id"),
+    attemptId: text(row, "attempt_id"),
+    outcome,
+  };
+}
+function decodeOutcome(outcome: Outcome, task: Task): void {
+  decode(OutcomeSchema, outcome, "Outcome");
+  const keys = outcome.effectiveModels.map((target) => `${target.model}\0${target.thinking}`);
+  if (new Set(keys).size !== keys.length)
+    throw failure("decode Outcome", "Effective models are not ordered-distinct.");
+  if (outcome.result.kind === "reported") {
+    const expected =
+      task.contract.kind === "implementation"
+        ? "implementation"
+        : task.contract.kind === "review"
+          ? "review"
+          : "research";
+    if (outcome.result.report.kind !== expected)
+      throw failure("decode Outcome", "Report kind does not match its Task.");
   }
+}
+function parse<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
+  if (typeof value !== "string") throw failure(`decode ${name}`, `${name} JSON is not text.`);
   try {
-    validateWorkstreamInvariants(state as Workstream);
+    return decode(schema, JSON.parse(value), name);
   } catch (cause) {
-    throw new WorkstreamStoreInvalidError(
-      `Workstream records violate invariants: ${message(cause)}`,
-    );
+    if (cause instanceof StoreError) throw cause;
+    throw failure(`decode ${name}`, `${name} JSON is malformed.`, cause);
   }
-  return structuredClone(state as Workstream);
 }
-function nullableJson(row: Record<string, unknown>, field: string, property: string): object {
+function decode<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
+  if (!Value.Check(schema, value)) throw failure(`decode ${name}`, `${name} is malformed.`);
+  return Value.Decode(schema, value) as Static<S>;
+}
+function text(row: Row, field: string): string {
   const value = row[field];
-  if (value === null) return {};
-  if (typeof value !== "string") throw new WorkstreamStoreInvalidError(`${field} is malformed.`);
-  return { [property]: parseJson(value) };
+  if (typeof value !== "string") throw failure("decode row", `${field} is malformed.`);
+  return value;
 }
-function assertHeader(database: WorkstreamDatabase): void {
-  const row = requiredRow(
-    database.readRow("SELECT format,version FROM store_header WHERE singleton=1"),
-    "store header",
-  );
-  if (stringField(row, "format") !== STORE_FORMAT || numberField(row, "version") !== STORE_VERSION)
-    throw new WorkstreamStoreUnsupportedError(
-      "Workstream store format is unsupported; historical aggregate stores are retained without migration.",
-    );
-}
-function assertRecordSchema(database: WorkstreamDatabase): void {
-  const tables = database.tableNames();
-  for (const [table, expected] of Object.entries(RECORD_SCHEMA)) {
-    if (!tables.includes(table))
-      throw new WorkstreamStoreUnsupportedError(
-        `Workstream database is not a record store (missing ${table}).`,
-      );
-    const actual = database.columnNames(table);
-    const absent = expected.filter((name) => !actual.includes(name));
-    if (absent.length > 0)
-      throw new WorkstreamStoreIncompleteError(
-        `Workstream record table ${table} lacks ${absent.join(", ")}.`,
-      );
-  }
-}
-function validateInitial(paths: Path.Path, state: Workstream): void {
-  validateIdentity(paths, state.repository, state.id);
-  validateWorkstream(state);
-  if (state.revision !== 0)
-    throw new WorkstreamStoreInvalidError("Initial Workstream revision must be zero.");
-}
-function validateIdentity(paths: Path.Path, repository: RepositoryIdentity, id: string): void {
-  if (!id || id === "." || id === ".." || paths.basename(id) !== id)
-    throw new WorkstreamStoreInvalidError("Workstream id is not a safe path segment.");
-  for (const value of [repository.projectRoot, repository.gitCommonDir])
-    if (!paths.isAbsolute(value) || paths.resolve(value) !== value)
-      throw new WorkstreamStoreInvalidError(
-        "Repository identity paths must be absolute and normalized.",
-      );
+function number(row: Row | undefined, field: string): number {
+  const value = row?.[field];
+  if (typeof value !== "number") throw failure("decode row", `${field} is malformed.`);
+  return value;
 }
 function json(value: unknown): string {
   return JSON.stringify(value);
 }
-function optionalJson(value: unknown): string | null {
-  return value === undefined ? null : json(value);
+function failure(operation: string, message: string, cause?: unknown): StoreError {
+  return new StoreError({ operation, message, cause });
 }
-function parseJson(value: string): unknown {
+function host<A>(operation: string, run: () => A): A {
   try {
-    return JSON.parse(value);
-  } catch {
-    throw new WorkstreamStoreInvalidError("Record JSON is malformed.");
+    return run();
+  } catch (cause) {
+    if (cause instanceof StoreError) throw cause;
+    throw failure(operation, `Failed to ${operation}.`, cause);
   }
-}
-function requiredRow(
-  value: Record<string, unknown> | undefined,
-  name: string,
-): Record<string, unknown> {
-  if (value === undefined)
-    throw new WorkstreamStoreIncompleteError(`Workstream ${name} row is missing.`);
-  return value;
-}
-function stringField(row: Record<string, unknown>, name: string): string {
-  const value = row[name];
-  if (typeof value !== "string") throw new WorkstreamStoreInvalidError(`${name} is malformed.`);
-  return value;
-}
-function numberField(row: Record<string, unknown>, name: string): number {
-  const value = row[name];
-  if (typeof value !== "number" || !Number.isSafeInteger(value))
-    throw new WorkstreamStoreInvalidError(`${name} is malformed.`);
-  return value;
-}
-function integerField(row: Record<string, unknown> | undefined, name: string): number {
-  return numberField(requiredRow(row, name), name);
-}
-function workstreamPath(paths: Path.Path, common: string, id: string): string {
-  return paths.join(common, STORAGE_DIRECTORY, WORKSTREAM_DIRECTORY, id, SQLITE_FILENAME);
-}
-function acquireDatabase(
-  path: string,
-  readOnly = false,
-): Effect.Effect<WorkstreamDatabase, WorkstreamStoreError, Scope.Scope> {
-  return Effect.acquireRelease(
-    hostEffect("open Workstream SQLite database", () => openWorkstreamDatabase(path, readOnly)),
-    (database) => Effect.sync(() => database.close()),
-  );
-}
-function createPrivateDatabaseFile(
-  fs: FileSystem.FileSystem,
-  path: string,
-): Effect.Effect<void, WorkstreamStoreError, Scope.Scope> {
-  return platform(
-    "create private Workstream database",
-    Effect.scoped(fs.open(path, { flag: "wx", mode: FILE_MODE })),
-  ).pipe(Effect.andThen(platform("secure Workstream database", fs.chmod(path, FILE_MODE))));
-}
-function claimStorageDirectories(
-  paths: Path.Path,
-  fs: FileSystem.FileSystem,
-  path: string,
-): Effect.Effect<void, WorkstreamStoreError> {
-  return Effect.gen(function* () {
-    for (const directory of [
-      paths.dirname(paths.dirname(paths.dirname(path))),
-      paths.dirname(paths.dirname(path)),
-      paths.dirname(path),
-    ]) {
-      const entry = yield* inspect(directory);
-      if (
-        entry.symbolicLink ||
-        (entry.exists && (!entry.directory || entry.mode !== DIRECTORY_MODE))
-      )
-        return yield* invalid(`Unsafe Workstream storage directory: ${directory}.`);
-      if (!entry.exists) {
-        yield* platform(
-          "create private Workstream directory",
-          fs.makeDirectory(directory, { mode: DIRECTORY_MODE }),
-        );
-        yield* platform("secure Workstream directory", fs.chmod(directory, DIRECTORY_MODE));
-      }
-    }
-  });
-}
-function assertPrivateStorage(
-  paths: Path.Path,
-  path: string,
-): Effect.Effect<void, WorkstreamStoreError> {
-  return Effect.gen(function* () {
-    for (const directory of [
-      paths.dirname(paths.dirname(paths.dirname(path))),
-      paths.dirname(paths.dirname(path)),
-      paths.dirname(path),
-    ]) {
-      const entry = yield* inspect(directory);
-      if (!entry.directory || entry.symbolicLink || entry.mode !== DIRECTORY_MODE)
-        return yield* invalid(`Workstream storage directory is unsafe: ${directory}.`);
-    }
-    const file = yield* inspect(path);
-    if (!file.regularFile || file.symbolicLink || file.mode !== FILE_MODE)
-      return yield* invalid(`Workstream database is not a private ordinary file: ${path}.`);
-  });
-}
-function classifyFileHeader(
-  fs: FileSystem.FileSystem,
-  path: string,
-): Effect.Effect<void, WorkstreamStoreError> {
-  return Effect.gen(function* () {
-    const bytes = yield* platform(
-      "read Workstream database header",
-      Effect.scoped(
-        Effect.gen(function* () {
-          const file = yield* fs.open(path, { flag: "r" });
-          const value = new Uint8Array(16);
-          const count = yield* file.read(value);
-          return value.subarray(0, Number(count));
-        }),
-      ),
-    );
-    if (bytes.length === 0)
-      return yield* new WorkstreamStoreIncompleteError(
-        "Workstream database is empty creation residue.",
-      );
-    if (new TextDecoder().decode(bytes) !== SQLITE_HEADER)
-      return yield* invalid("Workstream database is not SQLite.");
-  });
-}
-function secureFiles(
-  path: string,
-): Effect.Effect<void, WorkstreamStoreError, FileSystem.FileSystem> {
-  return Effect.gen(function* () {
-    const fs = yield* FileSystem.FileSystem;
-    for (const suffix of ["", "-journal", "-wal", "-shm"]) {
-      const file = `${path}${suffix}`;
-      if (suffix && !(yield* platform("inspect SQLite sidecar", fs.exists(file)))) continue;
-      yield* platform("secure SQLite file", fs.chmod(file, FILE_MODE));
-    }
-  });
-}
-function inspect(path: string): Effect.Effect<StorageEntry, WorkstreamStoreError> {
-  return hostEffect("inspect Workstream storage", () => inspectStorageEntry(path));
-}
-function invalid(text: string): Effect.Effect<never, WorkstreamStoreInvalidError> {
-  return Effect.fail(new WorkstreamStoreInvalidError(text));
-}
-function hostEffect<A>(operation: string, run: () => A): Effect.Effect<A, WorkstreamStoreError> {
-  return Effect.try({
-    try: run,
-    catch: (cause) =>
-      cause instanceof WorkstreamStoreInvalidError ||
-      cause instanceof WorkstreamStoreIncompleteError ||
-      cause instanceof WorkstreamStoreUnsupportedError ||
-      cause instanceof WorkstreamStoreConflictError ||
-      cause instanceof WorkstreamStoreHostError
-        ? cause
-        : new WorkstreamStoreHostError(operation, cause),
-  });
-}
-function platform<A, R>(
-  operation: string,
-  effect: Effect.Effect<A, PlatformError, R>,
-): Effect.Effect<A, WorkstreamStoreError, R> {
-  return effect.pipe(Effect.mapError((cause) => new WorkstreamStoreHostError(operation, cause)));
-}
-function message(cause: unknown): string {
-  return cause instanceof Error ? cause.message : String(cause);
 }

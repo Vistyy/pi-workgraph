@@ -1,1293 +1,825 @@
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Native mkdir establishes the validated placement parent while lstat and realpath fence exact worktree identity.
-import { lstat, mkdir, realpath } from "node:fs/promises";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Node path operations are the lexical identity boundary for Git worktrees.
-import { basename, dirname, join, resolve } from "node:path";
+/* oxlint-disable effecttsgo/node-builtin-import -- Git placement identity includes host filesystem paths. */
+
+import { mkdir, realpath, stat } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import * as NodeChildProcessSpawner from "@effect/platform-node-shared/NodeChildProcessSpawner";
 import { Data, Effect, Layer, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import type { Attempt, TaskTarget } from "./domain/records.js";
 import { liveLayer } from "./node-platform.js";
-
-export interface RepositoryInfo {
-  root: string;
-  commonDir: string;
-  head: string;
-  status: string;
-}
-
-export interface WorktreePlacement {
-  path: string;
-  branch: string;
-  baseCommit: string;
-}
-
-export interface ValidatedCommit {
-  commit: string;
-  changedFiles: string[];
-}
-
-export interface ValidatedCandidate extends ValidatedCommit {
-  rootCommit: string;
-  commits: string[];
-}
-
-export interface CandidateApplicationSource {
-  rootCommit: string;
-  commit: string;
-  commits: string[];
-}
-
-export interface CandidateApplicationDestination {
-  expectedRef: string;
-  expectedHead: string;
-}
-
-export interface WorktreeCleanupResult {
-  state: "completed";
-  path: string;
-  branch: string;
-  expectedHead: string;
-  detail: string;
-}
-
-interface WorktreeRecord {
-  path: string;
-  branch?: string;
-}
-
-interface WorktreeIdentity {
-  worktreeRoot: string;
-  placement: WorktreePlacement;
-}
-
-type RefInspection = { state: "absent" } | { state: "present"; head: string };
 
 const childProcessLayer = NodeChildProcessSpawner.layer.pipe(Layer.provide(liveLayer));
 
-interface GitCommandResult {
+type RepositoryTarget = Extract<TaskTarget, { kind: "repository" }>;
+export interface RepositoryOperation {
+  readonly attemptId: string;
+  readonly attempt: Attempt;
+  readonly target: RepositoryTarget;
+  readonly worktreePath: string;
+  readonly outputRef: string;
+  readonly applicable: boolean;
+}
+
+export class GitError extends Data.TaggedError("GitError")<{
+  readonly operation: string;
+  readonly message: string;
+}> {}
+
+interface CommandResult {
   readonly code: number;
   readonly stdout: string;
   readonly stderr: string;
 }
-
-interface GitClient {
-  readonly process: (
-    cwd: string,
-    args: readonly string[],
-    timeoutMs?: number,
-  ) => GitEffect<GitCommandResult>;
-  readonly text: (cwd: string, args: readonly string[], allowEmpty?: boolean) => GitEffect<string>;
+interface CheckoutState {
+  readonly head: string;
+  readonly dirty: boolean;
 }
 
-class GitOperationError extends Data.TaggedError("GitOperationError")<{
-  readonly message: string;
-}> {}
-
-class GitFileSystemError extends Data.TaggedError("GitFileSystemError")<{
-  readonly message: string;
-  readonly code: string;
-}> {}
-
-export class GitParseError extends Data.TaggedError("GitParseError")<{
-  readonly message: string;
-  readonly output: string;
-}> {}
-
-type GitFailure = GitOperationError | GitFileSystemError | GitParseError;
-export type GitEffect<A> = Effect.Effect<A, GitFailure>;
-
-export class GitRepository {
-  private readonly git: GitClient;
-
-  constructor(
-    readonly root: string,
-    readonly commonDir: string,
-  ) {
-    this.git = makeGitClient();
-  }
-
-  readonly head = (cwd: string = this.root): GitEffect<string> =>
-    this.git.text(cwd, ["rev-parse", "HEAD"]);
-
-  readonly resolveRevision = (revision: string): GitEffect<string> =>
-    resolveRevision(this.git, this.root, revision);
-
-  readonly status = (cwd: string = this.root): GitEffect<string> =>
-    this.git.text(cwd, ["status", "--porcelain", "--untracked-files=all"], true);
-
-  readonly assertClean = (cwd: string = this.root): GitEffect<void> => assertClean(this.git, cwd);
-
-  /**
-   * The one pure deterministic placement derivation. Reconciliation calls this for the
-   * durable `activate` declaration and again for ensure/recovery, so both use
-   * exactly the same path, branch, and base without touching Git state.
-   */
-  readonly deriveWorktreePlacement = (
-    runId: string,
-    nodeId: string,
-    baseCommit = "",
-  ): WorktreePlacement | undefined => worktreePlacement(this.root, runId, nodeId, baseCommit);
-
-  readonly createWorktree = (
-    runId: string,
-    nodeId: string,
-    baseCommit: string,
-  ): GitEffect<WorktreePlacement> => {
-    const root = this.root;
-    const git = this.git;
-    return Effect.gen(function* () {
-      const identity = yield* worktreeIdentity(root, runId, nodeId, baseCommit);
-      const resolvedBase = yield* resolveRevision(git, root, baseCommit);
-      if (resolvedBase !== baseCommit) {
-        return yield* fail("Worktree base must be an exact commit id.");
-      }
-      yield* filesystemPromise(() => mkdir(identity.worktreeRoot, { recursive: true }));
-
-      const records = yield* worktreeRecords(git, root);
-      const registered = yield* registeredPlacement(records, identity, nodeId);
-      if (registered !== undefined) {
-        yield* verifyExistingPlacement(git, identity);
-        return identity.placement;
-      }
-
-      yield* createUnregisteredWorktree(git, root, identity, nodeId);
-      return identity.placement;
-    });
-  };
-
-  readonly validateWorkerNoChange = (
-    placement: WorktreePlacement,
-    reportedRevision: string,
-  ): GitEffect<{ revision: string; changedFiles: string[] }> => {
-    const root = this.root;
-    const git = this.git;
-    return Effect.gen(function* () {
-      yield* validatePlacementIdentity(git, root, placement, "No-change validation");
-      const status = yield* git.text(
-        placement.path,
-        ["status", "--porcelain", "--untracked-files=all"],
-        true,
-      );
-      if (status.length > 0) {
-        return yield* fail(`No-change worktree is not clean:\n${status}`);
-      }
-      const revision = yield* git.text(placement.path, ["rev-parse", "HEAD"]);
-      if (reportedRevision !== revision) {
-        return yield* fail(
-          `Worker reported no-change revision ${reportedRevision}, but worktree HEAD is ${revision}.`,
-        );
-      }
-      if (revision !== placement.baseCommit) {
-        return yield* fail(
-          `Worker reported no change, but isolated worktree HEAD advanced from ${placement.baseCommit} to ${revision}.`,
-        );
-      }
-      yield* assertStableCleanHead(git, placement.path, revision, "No-change validation");
-      return { revision, changedFiles: [] };
-    });
-  };
-
-  readonly validateWorkerCommit = (
-    placement: WorktreePlacement,
-    reportedCommit?: string,
-  ): GitEffect<ValidatedCommit> => {
-    const root = this.root;
-    const git = this.git;
-    return Effect.gen(function* () {
-      yield* validatePlacementIdentity(git, root, placement, "Worker commit validation");
-      yield* assertClean(git, placement.path);
-      const validated = yield* validateDirectCommit(
-        git,
-        placement.path,
-        placement.baseCommit,
-        reportedCommit,
-        "worktree",
-        ["rev-parse", "HEAD"],
-      );
-      yield* assertStableCleanHead(
-        git,
-        placement.path,
-        validated.commit,
-        "Worker commit validation",
-      );
-      return validated;
-    });
-  };
-
-  readonly validateCandidate = (
-    placement: WorktreePlacement,
-    rootCommit: string,
-    reportedCommit?: string,
-  ): GitEffect<ValidatedCandidate> => {
-    if (!/^[0-9a-f]{40,64}$/.test(rootCommit))
-      return fail("Candidate root must be an exact commit id.");
-    const root = this.root;
-    const git = this.git;
-    const validateCommit = (target: WorktreePlacement, reported?: string) =>
-      this.validateWorkerCommit(target, reported);
-    return Effect.gen(function* () {
-      const records = yield* worktreeRecords(git, root);
-      const registered = yield* cleanupRegistration(root, records, placement);
-      const validated =
-        registered === undefined
-          ? yield* validateRetainedBranch(git, root, placement, reportedCommit)
-          : yield* validateCommit(placement, reportedCommit);
-      const commits = yield* candidateCommitChain(git, root, rootCommit, validated.commit);
-      return { ...validated, rootCommit, commits };
-    });
-  };
-  readonly inspectCandidateApplication = (
-    source: CandidateApplicationSource,
-  ): GitEffect<CandidateApplicationDestination> =>
-    inspectCandidateApplication(this.git, this.root, source);
-
-  readonly recoverCandidateApplication = (
-    destination: CandidateApplicationDestination,
-    source: CandidateApplicationSource,
-  ): GitEffect<{ head: string } | undefined> =>
-    classifyApplicationState(this.git, this.root, source, destination);
-
-  readonly applyCandidate = (
-    source: CandidateApplicationSource,
-    destination: CandidateApplicationDestination,
-  ): GitEffect<string> => applyCandidate(this.git, this.root, source, destination);
-
-  /** Irreversibly discard only an exact owned output after the Worker is closed. */
-  readonly discardOutput = (
-    placement: WorktreePlacement,
-    expectedHead: string,
-  ): GitEffect<WorktreeCleanupResult> => {
-    const root = this.root;
-    const commonDir = this.commonDir;
-    const git = this.git;
-    return Effect.gen(function* () {
-      yield* assertRepositoryCommonDir(git, root, commonDir);
-      const records = yield* worktreeRecords(git, root);
-      const registered = yield* cleanupRegistration(root, records, placement);
-      if (registered === undefined && (yield* pathExists(placement.path)))
-        return yield* fail(
-          `Refusing discard: unregistered worktree path ${placement.path} exists; inspect it before retrying.`,
-        );
-      const branchRef = `refs/heads/${placement.branch}`;
-      const branch = yield* inspectRef(
-        git,
-        root,
-        branchRef,
-        (result) => `Could not inspect worker branch ${placement.branch}: ${diagnostic(result)}`,
-      );
-      yield* verifyCleanupBranch(placement, expectedHead, branch, false);
-      if (registered !== undefined) {
-        yield* discardOwnedWorktree(git, commonDir, placement, expectedHead);
-        yield* removeRegisteredWorktree(git, root, placement, expectedHead, registered, true);
-      }
-      yield* removeWorkerBranch(git, root, placement.branch, branchRef, expectedHead, branch);
-      yield* requireCleanupComplete(git, root, placement, branchRef);
-      return {
-        state: "completed" as const,
-        path: placement.path,
-        branch: placement.branch,
-        expectedHead,
-        detail:
-          "Irreversibly removed all owned checkout content, including dirty, untracked, and ignored files, and removed the exact branch; both were already absent when applicable.",
-      };
-    });
-  };
-
-  readonly cleanupWorktree = (
-    placement: WorktreePlacement,
-    expectedHead: string,
-    retainBranch = false,
-  ): GitEffect<WorktreeCleanupResult> => {
-    const root = this.root;
-    const git = this.git;
-    return Effect.gen(function* () {
-      const records = yield* worktreeRecords(git, root);
-      const registered = yield* cleanupRegistration(root, records, placement);
-      if (registered === undefined && (yield* pathExists(placement.path)))
-        return yield* fail(
-          `Refusing cleanup: unregistered worktree path ${placement.path} exists; inspect it before retrying.`,
-        );
-      const branchRef = `refs/heads/${placement.branch}`;
-      const branch = yield* inspectRef(
-        git,
-        root,
-        branchRef,
-        (result) => `Could not inspect worker branch ${placement.branch}: ${diagnostic(result)}`,
-      );
-      yield* verifyCleanupBranch(placement, expectedHead, branch, retainBranch);
-      yield* removeRegisteredWorktree(git, root, placement, expectedHead, registered);
-      if (retainBranch)
-        yield* requireCompactionComplete(git, root, placement, branchRef, expectedHead);
-      else {
-        yield* removeWorkerBranch(git, root, placement.branch, branchRef, expectedHead, branch);
-        yield* requireCleanupComplete(git, root, placement, branchRef);
-      }
-      return {
-        state: "completed" as const,
-        path: placement.path,
-        branch: placement.branch,
-        expectedHead,
-        detail: retainBranch
-          ? "Exact clean worktree was removed and its exact output branch was retained."
-          : "Exact clean worktree and branch were removed, or were already absent.",
-      };
-    });
-  };
-}
-
-export function inspectRepository(cwd: string): GitEffect<RepositoryInfo> {
-  const git = makeGitClient();
+/** Resolve one immutable Task target from its real filesystem and Git identity. */
+export function resolveTaskTarget(input: {
+  cwd: string;
+  path?: string;
+  kind?: "directory" | "repository";
+  revision?: string;
+}): Effect.Effect<TaskTarget, GitError> {
   return Effect.gen(function* () {
-    const root = yield* git.text(cwd, ["rev-parse", "--show-toplevel"]);
-    const commonDirText = yield* git.text(root, [
+    const path = yield* filesystem("resolve target", () =>
+      realpath(resolve(input.cwd, input.path ?? ".")),
+    );
+    const targetStat = yield* filesystem("resolve target", () => stat(path));
+    if (!targetStat.isDirectory())
+      return yield* fail("resolve target", "Target is not a directory.");
+    if (input.kind === "directory") return { kind: "directory" as const, path };
+
+    const discovery = yield* gitResult(path, ["rev-parse", "--git-dir"]);
+    if (discovery.code !== 0) {
+      if (input.kind === "repository")
+        return yield* fail("resolve target", "Target is not an initialized Git work tree.");
+      return { kind: "directory" as const, path };
+    }
+    const inside = yield* git(path, ["rev-parse", "--is-inside-work-tree"]);
+    const bare = yield* git(path, ["rev-parse", "--is-bare-repository"]);
+    if (inside !== "true" || bare !== "false")
+      return yield* fail("resolve target", "Bare repositories are not valid Task targets.");
+    const checkoutText = yield* git(path, ["rev-parse", "--show-toplevel"]);
+    const checkoutRoot = yield* filesystem("resolve checkout root", () => realpath(checkoutText));
+    const commonText = yield* git(path, [
       "rev-parse",
       "--path-format=absolute",
       "--git-common-dir",
     ]);
-    const commonDir = resolve(root, commonDirText);
-    const head = yield* git.text(root, ["rev-parse", "HEAD"]);
-    const status = yield* git.text(root, ["status", "--porcelain", "--untracked-files=all"], true);
-    return { root, commonDir, head, status };
-  });
-}
-
-export function openRepository(cwd: string): GitEffect<GitRepository> {
-  return Effect.map(inspectRepository(cwd), (info) => new GitRepository(info.root, info.commonDir));
-}
-
-function assertRepositoryCommonDir(
-  git: GitClient,
-  root: string,
-  expectedCommonDir: string,
-): GitEffect<void> {
-  return Effect.gen(function* () {
-    const actualRoot = yield* git.text(root, ["rev-parse", "--show-toplevel"]);
-    const actualCommonDir = resolve(
-      actualRoot,
-      yield* git.text(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
+    const commonDir = yield* filesystem("resolve common directory", () =>
+      realpath(resolve(path, commonText)),
     );
-    if (resolve(actualRoot) !== resolve(root) || actualCommonDir !== resolve(expectedCommonDir))
-      return yield* fail(
-        `Refusing discard: repository root or Git common directory differs from stored identity ${root} at ${expectedCommonDir}.`,
-      );
-  });
+    yield* exactCommit(commonDir, input.revision ?? "HEAD", "resolve target", path);
+    return { kind: "repository" as const, checkoutRoot, commonDir };
+  }).pipe(Effect.provide(childProcessLayer));
 }
 
-function inspectRef(
-  git: GitClient,
-  root: string,
-  ref: string,
-  inspectionFailure: (result: GitCommandResult) => string,
-): GitEffect<RefInspection> {
-  return Effect.gen(function* () {
-    const result = yield* git.process(root, ["rev-parse", "--verify", "--quiet", ref]);
-    if (result.code === 0) {
-      if (result.stdout.length === 0) return yield* fail(inspectionFailure(result));
-      return { state: "present" as const, head: result.stdout };
-    }
-    if (result.code === 1) return { state: "absent" as const };
-    return yield* fail(inspectionFailure(result));
-  });
+export function currentRevision(target: RepositoryTarget): Effect.Effect<string, GitError> {
+  return resolveRevision(target, "HEAD");
 }
 
-function inspectCandidateApplication(
-  git: GitClient,
-  root: string,
-  source: CandidateApplicationSource,
-): GitEffect<CandidateApplicationDestination> {
-  return Effect.gen(function* () {
-    yield* validateApplicationSourceShape(source);
-    const destination = yield* inspectDestinationIdentity(git, root);
-    yield* applicationTopology(git, root, source, destination);
-    yield* assertApplicationDestination(git, root, destination);
-    return destination;
-  });
+export function resolveRevision(
+  target: RepositoryTarget,
+  revision: string,
+): Effect.Effect<string, GitError> {
+  return revalidate(target).pipe(
+    Effect.flatMap(() =>
+      exactCommit(target.commonDir, revision, "resolve revision", target.checkoutRoot),
+    ),
+    Effect.provide(childProcessLayer),
+  );
 }
-function applyCandidate(
-  git: GitClient,
-  root: string,
-  source: CandidateApplicationSource,
-  expected: CandidateApplicationDestination,
-): GitEffect<string> {
+
+/** A candidate parent is reusable only while its exact clean ref remains compacted. */
+export function validateRetainedCandidate(
+  operation: RepositoryOperation,
+): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
-    yield* validateApplicationSourceShape(source);
-    const destination = yield* inspectDestinationIdentity(git, root);
-    if (!sameDestination(destination, expected))
-      return yield* fail(
-        `Application destination changed: expected ${expected.expectedRef} at ${expected.expectedHead}, found ${destination.expectedRef} at ${destination.expectedHead}.`,
-      );
-    const topology = yield* applicationTopology(git, root, source, destination);
-    if (topology.kind === "already-integrated") {
-      yield* assertApplicationDestination(git, root, destination);
-      return topology.revision;
-    }
-    let target = source.commit;
-    if (topology.mergeTree !== undefined) {
-      target = yield* git.text(root, [
-        "commit-tree",
-        topology.mergeTree,
-        "-p",
-        destination.expectedHead,
-        "-p",
-        source.commit,
-        "-m",
-        `Apply retained candidate ${source.commit}`,
-      ]);
-      if (!/^[0-9a-f]{40,64}$/.test(target))
-        return yield* fail("Candidate application merge commit was not an exact commit id.");
-    }
-    yield* assertApplicationDestination(git, root, destination);
-    const result = yield* Effect.uninterruptible(
-      git.process(root, ["merge", "--ff-only", "--no-edit", target], 120_000),
+    yield* revalidate(operation.target);
+    const output = operation.attempt.output;
+    if (output?.kind !== "retained")
+      return yield* fail("extend candidate", "Candidate parent has no retained output.");
+    yield* requireCompactedCandidate(operation, output.tip);
+    yield* requireExactRef(operation.target.commonDir, operation.outputRef, output.tip);
+  }).pipe(Effect.provide(childProcessLayer));
+}
+
+export function isAncestor(
+  target: RepositoryTarget,
+  parent: string,
+  child: string,
+): Effect.Effect<boolean, GitError> {
+  return ancestry(target.commonDir, parent, child).pipe(Effect.provide(childProcessLayer));
+}
+
+export function detachedPlacement(input: {
+  agentDir: string;
+  workstreamId: string;
+  attemptId: string;
+}) {
+  return {
+    worktreePath: join(
+      input.agentDir,
+      "workgraph",
+      "worktrees",
+      input.workstreamId,
+      input.attemptId,
+    ),
+    outputRef: `refs/pi-workgraph/outputs/${input.workstreamId}/${input.attemptId}`,
+  };
+}
+
+/** Create or recover only the exact clean detached checkout declared by the Attempt. */
+export function ensureDetachedWorktree(
+  operation: RepositoryOperation,
+): Effect.Effect<void, GitError> {
+  return Effect.gen(function* () {
+    yield* revalidate(operation.target);
+    const base = baseCommit(operation.attempt);
+    yield* exactCommit(operation.target.commonDir, base, "create worktree");
+    if ((yield* readRef(operation.target.commonDir, operation.outputRef)) !== undefined)
+      return yield* fail("create worktree", "The Attempt private output ref already exists.");
+    if (yield* recoverPlacement(operation, base)) return;
+    yield* filesystem("create worktree directory", () =>
+      mkdir(dirname(operation.worktreePath), { recursive: true, mode: 0o700 }),
     );
-    if (!processSucceeded(result))
-      return yield* fail(`Fast-forward application of ${target} failed: ${diagnostic(result)}`);
-    yield* assertApplicationDestination(git, root, {
-      expectedRef: destination.expectedRef,
-      expectedHead: target,
-    });
-    return target;
+    yield* git(
+      operation.target.checkoutRoot,
+      ["worktree", "add", "--detach", operation.worktreePath, base],
+      true,
+    );
+    const state = yield* ownedCheckout(operation, true);
+    if (state.head !== base || state.dirty)
+      return yield* fail("create worktree", "Created worktree failed exact post-validation.");
+  }).pipe(Effect.provide(childProcessLayer));
+}
+
+function recoverPlacement(
+  operation: RepositoryOperation,
+  base: string,
+): Effect.Effect<boolean, GitError> {
+  return Effect.gen(function* () {
+    const registration = yield* registeredWorktree(
+      operation.target.commonDir,
+      operation.worktreePath,
+    );
+    const exists = yield* pathExists(operation.worktreePath);
+    if (registration === undefined && !exists) return false;
+    if (registration === undefined || !exists)
+      return yield* fail("create worktree", "Attempt placement is foreign or incomplete.");
+    const state = yield* ownedCheckout(operation, true);
+    if (state.head !== base || state.dirty)
+      return yield* fail("create worktree", "Existing worktree is not the clean Attempt base.");
+    return true;
   });
 }
-type ApplicationTopology =
-  | { kind: "already-integrated"; revision: string }
-  | { kind: "fast-forward"; mergeTree?: string };
 
-function applicationTopology(
-  git: GitClient,
-  root: string,
-  source: CandidateApplicationSource,
-  destination: CandidateApplicationDestination,
-): GitEffect<ApplicationTopology> {
+/** Classify repository bytes only after Worker closure, independent of semantic outcome. */
+export function classifyOutput(
+  operation: RepositoryOperation,
+  at: string,
+): Effect.Effect<Attempt, GitError> {
   return Effect.gen(function* () {
-    if (!(yield* isAncestor(git, root, source.rootCommit, destination.expectedHead)))
-      return yield* fail(
-        `Destination HEAD ${destination.expectedHead} is not descended from candidate root ${source.rootCommit}.`,
-      );
-    if (yield* isAncestor(git, root, source.commit, destination.expectedHead))
-      return { kind: "already-integrated", revision: destination.expectedHead };
-    if (yield* isAncestor(git, root, destination.expectedHead, source.commit))
-      return { kind: "fast-forward" };
+    yield* revalidate(operation.target);
+    const registration = yield* registeredWorktree(
+      operation.target.commonDir,
+      operation.worktreePath,
+    );
+    const exists = yield* pathExists(operation.worktreePath);
+    const base = baseCommit(operation.attempt);
+    if (registration === undefined && !exists)
+      return yield* classifyAbsentOutput(operation, base, at);
+    if (registration === undefined || !exists)
+      return yield* fail("classify output", "Attempt placement is foreign or incomplete.");
+    const state = yield* ownedCheckout(operation, true);
+    if (!(yield* ancestry(operation.target.commonDir, base, state.head)))
+      return yield* fail("classify output", "Attempt HEAD is unrelated to its exact base.");
+    yield* validateCandidate(operation, state.head);
+    if (!state.dirty && state.head === base) {
+      yield* removeCleanWorktree(operation);
+      return { ...operation.attempt, output: { kind: "no_output" as const, completedAt: at } };
+    }
+    yield* createExactRef(operation.target.commonDir, operation.outputRef, state.head);
+    if (!state.dirty) yield* removeCleanWorktree(operation);
     return {
-      kind: "fast-forward",
-      mergeTree: yield* mergedTree(git, root, destination.expectedHead, source.commit),
+      ...operation.attempt,
+      output: {
+        kind: "retained" as const,
+        tip: state.head,
+        reason: state.dirty
+          ? "Dirty output is preserved for explicit disposition."
+          : "Candidate output is retained.",
+      },
+    };
+  }).pipe(Effect.provide(childProcessLayer));
+}
+
+function classifyAbsentOutput(
+  operation: RepositoryOperation,
+  base: string,
+  at: string,
+): Effect.Effect<Attempt, GitError> {
+  return Effect.gen(function* () {
+    const tip = yield* readRef(operation.target.commonDir, operation.outputRef);
+    if (tip === undefined)
+      return { ...operation.attempt, output: { kind: "no_output" as const, completedAt: at } };
+    if (!(yield* ancestry(operation.target.commonDir, base, tip)))
+      return yield* fail("classify output", "Attempt output ref is unrelated to its exact base.");
+    yield* validateCandidate(operation, tip);
+    return {
+      ...operation.attempt,
+      output: {
+        kind: "retained" as const,
+        tip,
+        reason: "Candidate output is retained.",
+      },
     };
   });
 }
 
-function inspectDestinationIdentity(
-  git: GitClient,
-  root: string,
-): GitEffect<CandidateApplicationDestination> {
+/** Validate application facts and, at most once, checkpoint a clean same-ref advancement. */
+export function prepareApplication(
+  operation: RepositoryOperation,
+): Effect.Effect<Attempt, GitError> {
   return Effect.gen(function* () {
-    yield* assertClean(git, root);
-    const ref = yield* attachedRef(git, root);
-    const head = yield* git.text(root, ["rev-parse", "HEAD"]);
-    const refHead = yield* git.text(root, ["rev-parse", "--verify", ref]);
-    if (refHead !== head)
-      return yield* fail(`Attached destination ref ${ref} points to ${refHead}, not HEAD ${head}.`);
-    const priorMerge = yield* inspectRef(
-      git,
-      root,
-      "MERGE_HEAD",
-      (result) => `Could not inspect pre-application merge state: ${diagnostic(result)}`,
-    );
-    if (priorMerge.state === "present")
-      return yield* fail(
-        `Application found pre-existing merge state at ${priorMerge.head}; no mutation was attempted.`,
-      );
-    return { expectedRef: ref, expectedHead: head };
-  });
-}
-function sameDestination(
-  actual: CandidateApplicationDestination,
-  expected: CandidateApplicationDestination,
-): boolean {
-  return (
-    actual.expectedRef === expected.expectedRef && actual.expectedHead === expected.expectedHead
-  );
+    if (!operation.applicable)
+      return yield* fail("apply output", "Only implementation output can be applied.");
+    yield* revalidate(operation.target);
+    const output = operation.attempt.output;
+    return yield* output?.kind === "applying"
+      ? prepareApplicationRetry(operation, output)
+      : prepareRetainedApplication(operation);
+  }).pipe(Effect.provide(childProcessLayer));
 }
 
-function assertApplicationDestination(
-  git: GitClient,
-  root: string,
-  expected: CandidateApplicationDestination,
-): GitEffect<void> {
+function prepareApplicationRetry(
+  operation: RepositoryOperation,
+  output: Extract<NonNullable<Attempt["output"]>, { kind: "applying" }>,
+): Effect.Effect<Attempt, GitError> {
   return Effect.gen(function* () {
-    const current = yield* inspectDestinationIdentity(git, root);
-    if (!sameDestination(current, expected))
-      return yield* fail(
-        `Application destination changed: expected ${expected.expectedRef} at ${expected.expectedHead}, found ${current.expectedRef} at ${current.expectedHead}.`,
-      );
-  });
-}
-function attachedRef(git: GitClient, root: string): GitEffect<string> {
-  return Effect.gen(function* () {
-    const result = yield* git.process(root, ["symbolic-ref", "--quiet", "HEAD"]);
-    if (!processSucceeded(result))
-      return yield* fail(
-        `Application destination must be an attached clean branch: ${diagnostic(result)}`,
-      );
-    if (!/^refs\/heads\/[A-Za-z0-9._/-]+$/.test(result.stdout))
-      return yield* fail(`Application destination has an invalid attached ref ${result.stdout}.`);
-    return result.stdout;
-  });
-}
-
-function validateApplicationSourceShape(source: CandidateApplicationSource): GitEffect<void> {
-  if (
-    !/^[0-9a-f]{40,64}$/.test(source.rootCommit) ||
-    !/^[0-9a-f]{40,64}$/.test(source.commit) ||
-    !sameCommitChainShape(source.commits, source.commit)
-  )
-    return fail("Candidate application requires exact source revisions.");
-  return Effect.void;
-}
-
-function sameCommitChainShape(commits: readonly string[], commit: string): boolean {
-  return (
-    commits.length > 0 &&
-    commits.every((value) => /^[0-9a-f]{40,64}$/.test(value)) &&
-    commits.at(-1) === commit
-  );
-}
-
-function isAncestor(
-  git: GitClient,
-  root: string,
-  ancestor: string,
-  descendant: string,
-): GitEffect<boolean> {
-  return Effect.gen(function* () {
-    const result = yield* git.process(root, ["merge-base", "--is-ancestor", ancestor, descendant]);
-    if (result.code === 0) return true;
-    if (result.code === 1) return false;
-    return yield* fail(`Could not inspect Git ancestry: ${diagnostic(result)}`);
-  });
-}
-
-function mergedTree(git: GitClient, root: string, ours: string, theirs: string): GitEffect<string> {
-  return Effect.gen(function* () {
-    const result = yield* git.process(root, [
-      "merge-tree",
-      "--write-tree",
-      "--messages",
-      ours,
-      theirs,
-    ]);
-    if (!processSucceeded(result))
-      return yield* fail(`Candidate application conflict preview failed: ${diagnostic(result)}`);
-    const tree = result.stdout.split("\n", 1)[0] ?? "";
-    if (!/^[0-9a-f]{40,64}$/.test(tree))
-      return yield* fail("Candidate application conflict preview returned no exact merge tree.");
-    return tree;
-  });
-}
-
-function classifyApplicationState(
-  git: GitClient,
-  root: string,
-  source: CandidateApplicationSource,
-  expected: CandidateApplicationDestination,
-): GitEffect<{ head: string } | undefined> {
-  return Effect.gen(function* () {
-    yield* validateApplicationSourceShape(source);
-    const destination = yield* inspectDestinationIdentity(git, root);
-    if (destination.expectedRef !== expected.expectedRef)
-      return yield* fail(
-        `Application recovery found destination ref ${destination.expectedRef}; expected ${expected.expectedRef}.`,
-      );
-    if (!(yield* isAncestor(git, root, source.rootCommit, expected.expectedHead)))
-      return yield* fail(
-        `Application recovery found expected destination ${expected.expectedHead} outside candidate root ${source.rootCommit}.`,
-      );
-    const classification =
-      destination.expectedHead === expected.expectedHead
-        ? classifyUnchangedApplication(git, root, source, destination)
-        : destination.expectedHead === source.commit
-          ? classifyCandidateApplication(git, root, expected, destination)
-          : classifyMergeApplication(git, root, source, expected, destination);
-    return yield* classification;
-  });
-}
-
-function classifyUnchangedApplication(
-  git: GitClient,
-  root: string,
-  source: CandidateApplicationSource,
-  destination: CandidateApplicationDestination,
-): GitEffect<{ head: string } | undefined> {
-  return Effect.gen(function* () {
-    if (!(yield* isAncestor(git, root, source.commit, destination.expectedHead))) return undefined;
-    yield* assertApplicationDestination(git, root, destination);
-    return { head: destination.expectedHead };
-  });
-}
-
-function classifyCandidateApplication(
-  git: GitClient,
-  root: string,
-  expected: CandidateApplicationDestination,
-  destination: CandidateApplicationDestination,
-): GitEffect<{ head: string }> {
-  return Effect.gen(function* () {
-    if (!(yield* isAncestor(git, root, expected.expectedHead, destination.expectedHead)))
-      return yield* fail("Candidate application recovery found an invalid candidate head.");
-    yield* assertApplicationDestination(git, root, destination);
-    return { head: destination.expectedHead };
-  });
-}
-
-function classifyMergeApplication(
-  git: GitClient,
-  root: string,
-  source: CandidateApplicationSource,
-  expected: CandidateApplicationDestination,
-  destination: CandidateApplicationDestination,
-): GitEffect<{ head: string }> {
-  return Effect.gen(function* () {
-    const parents = yield* git.text(root, [
-      "rev-list",
-      "--parents",
-      "-n",
-      "1",
-      destination.expectedHead,
-    ]);
-    const tree = yield* git.text(root, ["rev-parse", `${destination.expectedHead}^{tree}`]);
-    const expectedTree = yield* mergedTree(git, root, expected.expectedHead, source.commit);
+    const destination = yield* destinationState(operation.target);
+    if (destination.ref !== output.destinationRef)
+      return yield* fail("apply output", "Destination ref changed.");
+    if (destination.dirty) return yield* fail("apply output", "Destination checkout is dirty.");
     if (
-      parents !== `${destination.expectedHead} ${expected.expectedHead} ${source.commit}` ||
-      tree !== expectedTree
+      destination.head === output.destinationHead ||
+      (yield* isAppliedStructure(operation.target.commonDir, output, destination.head))
     )
-      return yield* fail(
-        `Candidate application recovery found an ambiguous destination HEAD ${destination.expectedHead}.`,
-      );
-    yield* assertApplicationDestination(git, root, destination);
-    return { head: destination.expectedHead };
+      return operation.attempt;
+    if (yield* ancestry(operation.target.commonDir, output.sourceTip, destination.head))
+      return yield* fail("apply output", "Destination advanced beyond the exact candidate result.");
+    if (
+      output.replanned === true ||
+      !(yield* ancestry(operation.target.commonDir, output.destinationHead, destination.head))
+    )
+      return yield* fail("apply output", "Destination changed after application preparation.");
+    yield* proveMergeable(operation.target.commonDir, destination.head, output.sourceTip);
+    return {
+      ...operation.attempt,
+      output: { ...output, destinationHead: destination.head, replanned: true as const },
+    };
   });
 }
 
-function worktreePlacement(
-  root: string,
-  runId: string,
-  nodeId: string,
-  baseCommit: string,
-): WorktreePlacement | undefined {
-  if (!validIdentity(runId) || !validIdentity(nodeId)) return undefined;
-  const worktreeRoot = join(dirname(root), ".pi-workgraph-worktrees", basename(root), runId);
-  return {
-    path: join(worktreeRoot, nodeId),
-    branch: `pi-workgraph/${runId}/${nodeId}`,
-    baseCommit,
-  };
-}
-
-function worktreeIdentity(
-  root: string,
-  runId: string,
-  nodeId: string,
-  baseCommit: string,
-): GitEffect<WorktreeIdentity> {
-  const placement = worktreePlacement(root, runId, nodeId, baseCommit);
-  if (placement === undefined) return fail("Invalid worktree identity.");
-  return Effect.succeed({ worktreeRoot: dirname(placement.path), placement });
-}
-
-function worktreeRecords(git: GitClient, root: string): GitEffect<WorktreeRecord[]> {
-  return Effect.flatMap(
-    git.text(root, ["worktree", "list", "--porcelain", "-z"], true),
-    parseWorktreeList,
-  );
-}
-
-function validatePlacementIdentity(
-  git: GitClient,
-  root: string,
-  placement: WorktreePlacement,
-  operation: string,
-): GitEffect<void> {
+function prepareRetainedApplication(
+  operation: RepositoryOperation,
+): Effect.Effect<Attempt, GitError> {
   return Effect.gen(function* () {
-    const records = yield* worktreeRecords(git, root);
-    const registered = records.find(
-      (worktree) => resolve(worktree.path) === resolve(placement.path),
+    const output = operation.attempt.output;
+    if (output?.kind !== "retained")
+      return yield* fail("apply output", "Attempt has no retained output.");
+    yield* requireCompactedCandidate(operation, output.tip);
+    const source = yield* requireExactRef(
+      operation.target.commonDir,
+      operation.outputRef,
+      output.tip,
     );
-    if (registered === undefined || registered.branch !== placement.branch) {
-      return yield* fail(
-        `${operation} requires the recorded isolated worktree ${placement.path} on ${placement.branch}.`,
-      );
-    }
-    if ((yield* filesystemPromise(() => realpath(placement.path))) !== resolve(placement.path)) {
-      return yield* fail(`${operation} found a relocated worktree.`);
-    }
-    const actualRoot = yield* git.text(placement.path, ["rev-parse", "--show-toplevel"]);
-    if (resolve(actualRoot) !== resolve(placement.path)) {
-      return yield* fail(`${operation} found a changed worktree root.`);
-    }
-    const actualBranch = yield* git.text(placement.path, ["symbolic-ref", "--short", "HEAD"]);
-    if (actualBranch !== placement.branch) {
-      return yield* fail(`${operation} found a changed worktree branch.`);
-    }
+    const root = candidateRoot(operation.attempt);
+    if (!(yield* ancestry(operation.target.commonDir, root, source)))
+      return yield* fail("apply output", "Candidate does not contain its source root.");
+    const destination = yield* destinationState(operation.target);
+    if (destination.dirty) return yield* fail("apply output", "Destination checkout is dirty.");
+    if (
+      !(yield* ancestry(
+        operation.target.commonDir,
+        baseCommit(operation.attempt),
+        destination.head,
+      ))
+    )
+      return yield* fail("apply output", "Destination no longer descends from the Attempt base.");
+    yield* proveMergeable(operation.target.commonDir, destination.head, source);
+    return {
+      ...operation.attempt,
+      output: {
+        kind: "applying" as const,
+        sourceRoot: root,
+        sourceTip: source,
+        destinationRef: destination.ref,
+        destinationHead: destination.head,
+      },
+    };
   });
 }
 
-function registeredPlacement(
-  records: WorktreeRecord[],
-  identity: WorktreeIdentity,
-  nodeId: string,
-): GitEffect<WorktreeRecord | undefined> {
-  const { branch, path } = identity.placement;
-  const registered = records.find(
-    (worktree) => worktree.branch === branch || resolve(worktree.path) === resolve(path),
-  );
-  if (
-    registered !== undefined &&
-    (registered.branch !== branch || resolve(registered.path) !== resolve(path))
-  ) {
-    return fail(
-      `Worktree identity collision for ${nodeId}: ${registered.path} on ${registered.branch ?? "detached HEAD"}.`,
-    );
-  }
-  return Effect.succeed(registered);
+/** Recover structurally or advance only the prepared attached destination with merge --ff-only. */
+export function applyOutput(
+  operation: RepositoryOperation,
+  at: string,
+): Effect.Effect<Attempt, GitError> {
+  return Effect.gen(function* () {
+    yield* revalidate(operation.target);
+    const output = operation.attempt.output;
+    if (output?.kind !== "applying")
+      return yield* fail("apply output", "Application has no durable preparation checkpoint.");
+    yield* requireCompactedCandidate(operation, output.sourceTip);
+    yield* requireExactRef(operation.target.commonDir, operation.outputRef, output.sourceTip);
+    const destination = yield* destinationState(operation.target);
+    if (destination.ref !== output.destinationRef)
+      return yield* fail("apply output", "Destination ref changed.");
+    if (destination.dirty) return yield* fail("apply output", "Destination checkout is dirty.");
+
+    const revision = yield* applicationRevision(operation, output, destination.head);
+    const final = yield* destinationState(operation.target);
+    if (
+      final.ref !== output.destinationRef ||
+      final.head !== revision ||
+      final.dirty ||
+      !(yield* ancestry(operation.target.commonDir, output.sourceRoot, revision)) ||
+      !(yield* ancestry(operation.target.commonDir, output.sourceTip, revision))
+    )
+      return yield* fail("apply output", "Applied destination failed exact post-validation.");
+    return {
+      ...operation.attempt,
+      output: { kind: "applied" as const, revision, completedAt: at, cleanupTip: output.sourceTip },
+    };
+  }).pipe(Effect.provide(childProcessLayer));
 }
 
-function verifyExistingPlacement(git: GitClient, identity: WorktreeIdentity): GitEffect<void> {
-  const { baseCommit, path } = identity.placement;
+function applicationRevision(
+  operation: RepositoryOperation,
+  output: Extract<NonNullable<Attempt["output"]>, { kind: "applying" }>,
+  head: string,
+): Effect.Effect<string, GitError> {
   return Effect.gen(function* () {
-    const existingHead = yield* git.text(path, ["rev-parse", "HEAD"]);
-    const existingStatus = yield* git.text(
-      path,
-      ["status", "--porcelain", "--untracked-files=all"],
-      true,
-    );
-    const fencedHead = yield* git.text(path, ["rev-parse", "HEAD"]);
-    if (existingHead !== baseCommit || fencedHead !== existingHead || existingStatus.length > 0) {
-      return yield* fail(
-        `Existing worktree ${path} contains uncertain state at ${fencedHead}; inspect it before retrying.`,
-      );
+    if (yield* isAppliedStructure(operation.target.commonDir, output, head)) return head;
+    if (head !== output.destinationHead)
+      return yield* fail("apply output", "Destination changed after application preparation.");
+    if (yield* ancestry(operation.target.commonDir, output.sourceTip, head)) return head;
+    if (yield* ancestry(operation.target.commonDir, head, output.sourceTip)) {
+      yield* git(operation.target.checkoutRoot, ["merge", "--ff-only", output.sourceTip]);
+      return output.sourceTip;
     }
+    const tree = yield* proveMergeable(operation.target.commonDir, head, output.sourceTip);
+    const merge = yield* gitDir(operation.target.commonDir, [
+      "commit-tree",
+      tree,
+      "-p",
+      head,
+      "-p",
+      output.sourceTip,
+      "-m",
+      `Integrate Workgraph output ${operation.attemptId}`,
+    ]);
+    yield* git(operation.target.checkoutRoot, ["merge", "--ff-only", merge]);
+    return merge;
   });
 }
 
-function inspectWorkerBranch(
-  git: GitClient,
-  root: string,
-  branchRef: string,
-  branch: string,
-  baseCommit: string,
-): GitEffect<RefInspection> {
+/** Remove still-exact clean source resources only after the applied checkpoint is durable. */
+export function cleanupAppliedOutput(
+  operation: RepositoryOperation,
+): Effect.Effect<Attempt, GitError> {
   return Effect.gen(function* () {
-    const inspection = yield* inspectRef(
-      git,
-      root,
-      branchRef,
-      (result) => `Could not inspect worker branch ${branch}: ${diagnostic(result)}`,
-    );
-    if (inspection.state === "absent") return inspection;
-    const current = yield* git.text(root, ["rev-parse", branchRef]);
-    if (current !== baseCommit) {
-      return yield* fail(
-        `Existing worker branch ${branch} contains uncertain state at ${current}; inspect it before retrying.`,
-      );
-    }
-    return { state: "present", head: current };
-  });
+    const output = operation.attempt.output;
+    if (output?.kind !== "applied" || output.cleanupTip === undefined) return operation.attempt;
+    yield* revalidate(operation.target);
+    yield* requireCompactedCandidate(operation, output.cleanupTip);
+    yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.cleanupTip);
+    const { cleanupTip: _cleanupTip, ...cleaned } = output;
+    return { ...operation.attempt, output: cleaned };
+  }).pipe(Effect.provide(childProcessLayer));
 }
 
-function createUnregisteredWorktree(
-  git: GitClient,
-  root: string,
-  identity: WorktreeIdentity,
-  nodeId: string,
-): GitEffect<void> {
-  const { baseCommit, branch, path } = identity.placement;
-  const branchRef = `refs/heads/${branch}`;
+export function prepareDiscard(operation: RepositoryOperation, reason: string): Attempt {
+  if (reason.trim().length === 0) throw error("discard output", "Discard requires a reason.");
+  const output = operation.attempt.output;
+  if (output?.kind === "discarding") return operation.attempt;
+  if (output?.kind === "retained")
+    return {
+      ...operation.attempt,
+      output: { kind: "discarding", tip: output.tip, reason },
+    };
+  if (output?.kind === "applied" && output.cleanupTip !== undefined)
+    return {
+      ...operation.attempt,
+      output: {
+        kind: "discarding",
+        tip: output.cleanupTip,
+        reason,
+        applied: { revision: output.revision, completedAt: output.completedAt },
+      },
+    };
+  throw error("discard output", "Attempt has no releasable output.");
+}
+
+/** Destructively remove only resources named by a durable exact-attempt discard checkpoint. */
+export function discardOutput(
+  operation: RepositoryOperation,
+  at: string,
+): Effect.Effect<Attempt, GitError> {
   return Effect.gen(function* () {
-    const branchInspection = yield* inspectWorkerBranch(git, root, branchRef, branch, baseCommit);
-    if (yield* pathExists(path)) {
-      return yield* fail(`Unregistered worktree path ${path} exists; inspect it before retrying.`);
-    }
-    if (branchInspection.state === "present") {
-      const fencedHead = yield* git.text(root, ["rev-parse", branchRef]);
-      if (fencedHead !== baseCommit) {
+    yield* revalidate(operation.target);
+    const output = operation.attempt.output;
+    if (output?.kind !== "discarding")
+      return yield* fail("discard output", "Discard has no durable checkpoint.");
+    const registration = yield* registeredWorktree(
+      operation.target.commonDir,
+      operation.worktreePath,
+    );
+    const exists = yield* pathExists(operation.worktreePath);
+    if (registration === undefined && !exists) {
+      yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.tip);
+    } else {
+      if (registration === undefined || !exists)
+        return yield* fail("discard output", "Attempt placement is foreign or incomplete.");
+      yield* requireExactRef(operation.target.commonDir, operation.outputRef, output.tip);
+      const state = yield* ownedCheckout(operation, true);
+      if (state.head !== output.tip)
         return yield* fail(
-          `Existing worker branch ${branch} contains uncertain state at ${fencedHead}; inspect it before retrying.`,
+          "discard output",
+          "Attempt checkout HEAD no longer matches its checkpoint.",
         );
-      }
+      yield* git(operation.worktreePath, ["reset", "--hard", output.tip]);
+      yield* git(operation.worktreePath, ["clean", "-fdx"], true);
+      yield* removeCleanWorktree(operation);
+      yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.tip);
     }
-    const args =
-      branchInspection.state === "present"
-        ? ["worktree", "add", path, branch]
-        : ["worktree", "add", "-b", branch, path, baseCommit];
-    yield* Effect.uninterruptible(
-      Effect.gen(function* () {
-        const result = yield* git.process(root, args, 60_000);
-        if (!processSucceeded(result)) {
-          return yield* fail(
-            `Could not create worktree ${nodeId}: ${diagnostic(result)}; inspect worktree and branch state before retrying.`,
-          );
-        }
-        yield* validatePlacementIdentity(git, root, identity.placement, "Worktree creation");
-        yield* assertStableCleanHead(git, path, baseCommit, "Worktree creation");
-      }),
-    );
-  });
-}
-
-function cleanupRegistration(
-  root: string,
-  records: WorktreeRecord[],
-  placement: WorktreePlacement,
-): GitEffect<WorktreeRecord | undefined> {
-  if (!ownedPlacement(root, placement))
-    return fail("Refusing cleanup: isolated placement is not owned.");
-  const registered = records.find((worktree) => resolve(worktree.path) === resolve(placement.path));
-  const branchAtAnotherPath = records.find(
-    (worktree) =>
-      worktree.branch === placement.branch && resolve(worktree.path) !== resolve(placement.path),
-  );
-  return branchAtAnotherPath === undefined
-    ? Effect.succeed(registered)
-    : fail(
-        `Refusing cleanup: branch ${placement.branch} is registered at ${branchAtAnotherPath.path}, not ${placement.path}.`,
-      );
-}
-
-function removeRegisteredWorktree(
-  git: GitClient,
-  root: string,
-  placement: WorktreePlacement,
-  expectedHead: string,
-  registered: WorktreeRecord | undefined,
-  force = false,
-): GitEffect<void> {
-  if (registered === undefined) return Effect.void;
-  return Effect.gen(function* () {
-    if (registered.branch !== placement.branch) {
-      return yield* fail(
-        `Refusing cleanup: ${placement.path} is registered on ${registered.branch ?? "detached HEAD"}, not ${placement.branch}.`,
-      );
-    }
-    const head = yield* git.text(placement.path, ["rev-parse", "HEAD"]);
-    const status = yield* git.text(
-      placement.path,
-      ["status", "--porcelain", "--untracked-files=all"],
-      true,
-    );
-    const fencedHead = yield* git.text(placement.path, ["rev-parse", "HEAD"]);
-    if (head !== expectedHead || fencedHead !== expectedHead) {
-      return yield* fail(
-        `Refusing cleanup: ${placement.path} HEAD is ${fencedHead}, expected ${expectedHead}.`,
-      );
-    }
-    if (status.length > 0) {
-      return yield* fail(`Refusing cleanup of dirty worktree ${placement.path}: ${status}`);
-    }
-    yield* Effect.uninterruptible(
-      Effect.gen(function* () {
-        const result = yield* git.process(
-          root,
-          ["worktree", "remove", ...(force ? ["--force"] : []), placement.path],
-          60_000,
-        );
-        if (!processSucceeded(result)) {
-          return yield* fail(
-            `Could not remove worktree ${placement.path}: ${diagnostic(result)}; inspect registration before retrying.`,
-          );
-        }
-        const records = yield* worktreeRecords(git, root);
-        if (records.some((worktree) => resolve(worktree.path) === resolve(placement.path))) {
-          return yield* fail(
-            `Worktree removal postcondition failed for ${placement.path}; inspect registration before retrying.`,
-          );
-        }
-      }),
-    );
-  });
-}
-
-function discardOwnedWorktree(
-  git: GitClient,
-  commonDir: string,
-  placement: WorktreePlacement,
-  expectedHead: string,
-): GitEffect<void> {
-  return Effect.gen(function* () {
-    const actualPath = yield* filesystemPromise(() => realpath(placement.path));
-    if (actualPath !== resolve(placement.path))
-      return yield* fail("Refusing discard: worktree path was relocated.");
-    const branch = yield* git.text(placement.path, ["symbolic-ref", "--short", "HEAD"]);
-    const actualRoot = yield* git.text(placement.path, ["rev-parse", "--show-toplevel"]);
-    const actualCommonDir = resolve(
-      placement.path,
-      yield* git.text(placement.path, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
-    );
-    const head = yield* git.text(placement.path, ["rev-parse", "HEAD"]);
-    if (
-      branch !== placement.branch ||
-      resolve(actualRoot) !== resolve(placement.path) ||
-      actualCommonDir !== resolve(commonDir) ||
-      head !== expectedHead
-    )
-      return yield* fail(
-        "Refusing discard: worktree identity, common directory, or revision changed.",
-      );
-    yield* Effect.uninterruptible(
-      Effect.gen(function* () {
-        for (const args of [
-          ["reset", "--hard", expectedHead],
-          ["clean", "-fdx"],
-        ]) {
-          const result = yield* git.process(placement.path, args);
-          if (!processSucceeded(result))
-            return yield* fail(`Discard cleanup failed: ${diagnostic(result)}`);
-        }
-        yield* assertStableCleanHead(git, placement.path, expectedHead, "Discard cleanup");
-      }),
-    );
-  });
-}
-
-function validateDirectCommit(
-  git: GitClient,
-  cwd: string,
-  baseCommit: string,
-  reportedCommit: string | undefined,
-  source: "worktree" | "branch",
-  commitArgs: readonly string[],
-  branchName?: string,
-): GitEffect<ValidatedCommit> {
-  const labels =
-    source === "branch"
+    return output.applied === undefined
       ? {
-          head: "retained branch HEAD",
-          base: "Worker branch does not contain a changed commit.",
-          count: (value: number) =>
-            `Worker branch must contain exactly one commit, but contains ${value}.`,
-          parent: (_commit: string) =>
-            `Worker branch ${branchName} is not directly based on ${baseCommit}.`,
-          changed: "Worker branch does not change any files.",
+          ...operation.attempt,
+          output: { kind: "discarded" as const, reason: output.reason, completedAt: at },
         }
       : {
-          head: "worktree HEAD",
-          base: "Worker completed without creating a commit.",
-          count: (value: number) =>
-            `Worker must produce exactly one commit, but produced ${value}.`,
-          parent: (commit: string) =>
-            `Worker commit ${commit} is not directly based on ${baseCommit}.`,
-          changed: "Worker commit does not change any files.",
+          ...operation.attempt,
+          output: {
+            kind: "applied" as const,
+            ...output.applied,
+            cleanupReason: output.reason,
+          },
         };
-  return Effect.gen(function* () {
-    const commit = yield* git.text(cwd, commitArgs);
-    if (reportedCommit !== undefined && reportedCommit !== commit)
-      return yield* fail(
-        `Worker reported commit ${reportedCommit}, but ${labels.head} is ${commit}.`,
-      );
-    if (commit === baseCommit) return yield* fail(labels.base);
-    const commitCount = Number(
-      yield* git.text(cwd, ["rev-list", "--count", `${baseCommit}..${commit}`]),
-    );
-    if (commitCount !== 1) return yield* fail(labels.count(commitCount));
-    const parents = yield* git.text(cwd, ["rev-list", "--parents", "-n", "1", commit]);
-    if (parents !== `${commit} ${baseCommit}`) return yield* fail(labels.parent(commit));
-    const changedText = yield* git.text(
-      cwd,
-      ["diff", "--name-only", "--no-renames", baseCommit, commit],
-      true,
-    );
-    const changedFiles =
-      changedText.length === 0
-        ? []
-        : changedText
-            .split("\n")
-            .filter((path) => path.length > 0)
-            .sort();
-    if (changedFiles.length === 0) return yield* fail(labels.changed);
-    return { commit, changedFiles };
-  });
+  }).pipe(Effect.provide(childProcessLayer));
 }
 
-function validateRetainedBranch(
-  git: GitClient,
-  root: string,
-  placement: WorktreePlacement,
-  reportedCommit?: string,
-): GitEffect<ValidatedCommit> {
-  return Effect.gen(function* () {
-    const branchRef = `refs/heads/${placement.branch}`;
-    const branch = yield* inspectRef(
-      git,
-      root,
-      branchRef,
-      (result) =>
-        `Could not inspect retained worker branch ${placement.branch}: ${diagnostic(result)}`,
-    );
-    if (branch.state === "absent")
-      return yield* fail(`Retained worker branch ${placement.branch} is absent.`);
-    const validated = yield* validateDirectCommit(
-      git,
-      root,
-      placement.baseCommit,
-      reportedCommit,
-      "branch",
-      ["rev-parse", branchRef],
-      placement.branch,
-    );
-    yield* assertRetainedBranch(git, root, placement, branchRef, validated.commit);
-    return validated;
-  });
+function baseCommit(attempt: Attempt): string {
+  if (attempt.base.kind !== "repository")
+    throw error("inspect output", "Attempt has no repository base.");
+  return attempt.base.baseCommit;
+}
+function candidateRoot(attempt: Attempt): string {
+  return attempt.lineage?.candidateRoot ?? baseCommit(attempt);
 }
 
-function assertRetainedBranch(
-  git: GitClient,
-  root: string,
-  placement: WorktreePlacement,
-  branchRef: string,
-  expectedHead: string,
-): GitEffect<void> {
-  return Effect.gen(function* () {
-    const branch = yield* inspectRef(
-      git,
-      root,
-      branchRef,
-      (result) =>
-        `Could not re-observe retained worker branch ${placement.branch}: ${diagnostic(result)}`,
-    );
-    if (branch.state !== "present" || branch.head !== expectedHead)
-      return yield* fail(
-        `Retained worker branch ${placement.branch} moved during validation; expected ${expectedHead}.`,
-      );
-  });
-}
-
-function verifyCleanupBranch(
-  placement: WorktreePlacement,
-  expectedHead: string,
-  inspection: RefInspection,
-  retainBranch: boolean,
-): GitEffect<void> {
-  if (inspection.state === "absent") {
-    return retainBranch
-      ? fail(`Refusing compaction: retained worker branch ${placement.branch} is absent.`)
-      : Effect.void;
-  }
-  return inspection.head === expectedHead
-    ? Effect.void
-    : fail(
-        `Refusing cleanup: branch ${placement.branch} points to ${inspection.head}, expected ${expectedHead}.`,
-      );
-}
-
-function requireCompactionComplete(
-  git: GitClient,
-  root: string,
-  placement: WorktreePlacement,
-  branchRef: string,
-  expectedHead: string,
-): GitEffect<void> {
-  return Effect.gen(function* () {
-    const records = yield* worktreeRecords(git, root);
-    if (records.some((worktree) => resolve(worktree.path) === resolve(placement.path)))
-      return yield* fail(`Compaction worktree postcondition failed for ${placement.path}.`);
-    const branch = yield* inspectRef(
-      git,
-      root,
-      branchRef,
-      (result) =>
-        `Could not verify retained worker branch ${placement.branch}: ${diagnostic(result)}`,
-    );
-    if (branch.state !== "present" || branch.head !== expectedHead)
-      return yield* fail(
-        `Compaction branch postcondition failed for ${placement.branch}; expected ${expectedHead}.`,
-      );
-  });
-}
-
-function removeWorkerBranch(
-  git: GitClient,
-  root: string,
-  branch: string,
-  branchRef: string,
-  expectedHead: string,
-  inspection: RefInspection,
-): GitEffect<void> {
-  if (inspection.state === "absent") return Effect.void;
-  return Effect.gen(function* () {
-    const branchHead = yield* git.text(root, ["rev-parse", branchRef]);
-    if (branchHead !== expectedHead) {
-      return yield* fail(
-        `Refusing cleanup: branch ${branch} points to ${branchHead}, expected ${expectedHead}.`,
-      );
-    }
-    yield* Effect.uninterruptible(
-      Effect.gen(function* () {
-        const result = yield* git.process(root, ["update-ref", "-d", branchRef, expectedHead]);
-        if (!processSucceeded(result)) {
-          return yield* fail(
-            `Could not remove worker branch ${branch}: ${diagnostic(result)}; inspect the ref before retrying.`,
-          );
-        }
-        const removed = yield* inspectRef(
-          git,
-          root,
-          branchRef,
-          (inspection) =>
-            `Could not verify removal of worker branch ${branch}: ${diagnostic(inspection)}`,
-        );
-        if (removed.state !== "absent") {
-          return yield* fail(`Worker branch removal postcondition failed for ${branch}.`);
-        }
-      }),
-    );
-  });
-}
-
-function requireCleanupComplete(
-  git: GitClient,
-  root: string,
-  placement: WorktreePlacement,
-  branchRef: string,
-): GitEffect<void> {
-  return Effect.gen(function* () {
-    const records = yield* worktreeRecords(git, root);
-    if (records.some((worktree) => resolve(worktree.path) === resolve(placement.path))) {
-      return yield* fail(`Cleanup worktree postcondition failed for ${placement.path}.`);
-    }
-    if (records.some((worktree) => worktree.branch === placement.branch)) {
-      return yield* fail(
-        `Cleanup branch registration postcondition failed for ${placement.branch}.`,
-      );
-    }
-    const branch = yield* inspectRef(
-      git,
-      root,
-      branchRef,
-      (result) =>
-        `Could not verify cleanup of worker branch ${placement.branch}: ${diagnostic(result)}`,
-    );
-    if (branch.state === "present") {
-      return yield* fail(
-        `Cleanup branch postcondition failed: ${placement.branch} remains at ${branch.head}.`,
-      );
-    }
-  });
-}
-
-function ownedPlacement(root: string, placement: WorktreePlacement): boolean {
-  const parts = placement.branch.split("/");
-  if (
-    parts.length !== 3 ||
-    parts[0] !== "pi-workgraph" ||
-    !validIdentity(parts[1] ?? "") ||
-    !validIdentity(parts[2] ?? "")
-  )
-    return false;
-  const expectedPath = join(
-    dirname(root),
-    ".pi-workgraph-worktrees",
-    basename(root),
-    parts[1] ?? "",
-    parts[2] ?? "",
+function validateCandidate(
+  operation: RepositoryOperation,
+  head: string,
+): Effect.Effect<void, GitError> {
+  const lineage = operation.attempt.lineage?.candidateOf;
+  if (lineage?.kind !== "integrate") return Effect.void;
+  return Effect.all([
+    ancestry(operation.target.commonDir, baseCommit(operation.attempt), head),
+    ancestry(operation.target.commonDir, lineage.sourceTip, head),
+  ]).pipe(
+    Effect.flatMap(([destination, source]) =>
+      destination && source
+        ? Effect.void
+        : fail(
+            "classify output",
+            "Integration output lacks required destination or source ancestry.",
+          ),
+    ),
   );
-  return resolve(placement.path) === resolve(expectedPath);
 }
 
-function resolveRevision(git: GitClient, root: string, revision: string): GitEffect<string> {
-  if (!/^[0-9a-f]{40,64}$/.test(revision)) {
-    return fail("Revision must be an exact hexadecimal commit id.");
-  }
-  return git.text(root, ["rev-parse", "--verify", `${revision}^{commit}`]);
-}
-
-function assertClean(git: GitClient, cwd: string): GitEffect<void> {
+function requireCompactedCandidate(
+  operation: RepositoryOperation,
+  _tip: string,
+): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
-    const status = yield* git.text(cwd, ["status", "--porcelain", "--untracked-files=all"], true);
-    if (status.length > 0) {
-      return yield* fail(`Git working tree is not clean:\n${status}`);
-    }
-  });
-}
-
-function assertStableCleanHead(
-  git: GitClient,
-  cwd: string,
-  expectedHead: string,
-  operation: string,
-): GitEffect<void> {
-  return Effect.gen(function* () {
-    const status = yield* git.text(cwd, ["status", "--porcelain", "--untracked-files=all"], true);
-    const head = yield* git.text(cwd, ["rev-parse", "HEAD"]);
-    if (status.length > 0 || head !== expectedHead) {
-      return yield* fail(
-        `${operation} observed asynchronous Git state changes; inspect ${cwd} before retrying.`,
-      );
-    }
-  });
-}
-
-function gitText(
-  process: GitClient["process"],
-  cwd: string,
-  args: readonly string[],
-  allowEmpty = false,
-): GitEffect<string> {
-  return Effect.gen(function* () {
-    const result = yield* process(cwd, args);
-    if (!processSucceeded(result)) {
-      return yield* fail(`git ${args.join(" ")} failed: ${diagnostic(result)}`);
-    }
-    if (!allowEmpty && result.stdout.length === 0) {
-      return yield* fail(`git ${args.join(" ")} returned no output.`);
-    }
-    return result.stdout;
-  });
-}
-
-function candidateCommitChain(
-  git: GitClient,
-  root: string,
-  rootCommit: string,
-  commit: string,
-): GitEffect<string[]> {
-  return Effect.gen(function* () {
-    if (rootCommit === commit) return yield* fail("Candidate must contain at least one commit.");
-    const text = yield* git.text(
-      root,
-      ["rev-list", "--reverse", "--parents", `${rootCommit}..${commit}`],
-      true,
+    const registration = yield* registeredWorktree(
+      operation.target.commonDir,
+      operation.worktreePath,
     );
-    const lines = text.length === 0 ? [] : text.split("\n");
-    const commits: string[] = [];
-    let parent = rootCommit;
-    for (const line of lines) {
-      const current = nextCandidateCommit(line, parent);
-      if (current === undefined)
-        return yield* fail(
-          `Candidate ${commit} is not a complete linear history rooted at ${rootCommit}.`,
-        );
-      commits.push(current);
-      parent = current;
-    }
-    if (commits.at(-1) !== commit)
-      return yield* fail(`Candidate history does not terminate at exact source ${commit}.`);
-    return commits;
+    const exists = yield* pathExists(operation.worktreePath);
+    if (registration !== undefined || exists)
+      return yield* fail("apply output", "Only clean compacted candidate output can be applied.");
   });
 }
 
-function nextCandidateCommit(line: string, parent: string): string | undefined {
-  const parts = line.split(" ");
-  const current = parts.length === 2 && parts[1] === parent ? parts[0] : undefined;
-  return current !== undefined && /^[0-9a-f]{40,64}$/.test(current) ? current : undefined;
+function destinationState(
+  target: RepositoryTarget,
+): Effect.Effect<{ ref: string; head: string; dirty: boolean }, GitError> {
+  return Effect.gen(function* () {
+    const refResult = yield* gitResult(target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]);
+    if (refResult.code !== 0 || !refResult.stdout.startsWith("refs/heads/"))
+      return yield* fail("apply output", "Destination must be an attached branch checkout.");
+    return {
+      ref: refResult.stdout,
+      head: yield* exactCommit(target.commonDir, "HEAD", "apply output", target.checkoutRoot),
+      dirty: yield* destinationDirty(target.checkoutRoot),
+    };
+  });
 }
 
-function runGitCommand(
-  cwd: string,
-  args: readonly string[],
-  timeoutMs: number,
-): GitEffect<GitCommandResult> {
-  const command = ChildProcess.make("git", ["-C", cwd, ...args], { cwd, stdin: "ignore" });
-  const operation = Effect.scoped(
+function isAppliedStructure(
+  commonDir: string,
+  output: Extract<NonNullable<Attempt["output"]>, { kind: "applying" }>,
+  revision: string,
+): Effect.Effect<boolean, GitError> {
+  return Effect.gen(function* () {
+    if (
+      revision === output.sourceTip &&
+      (yield* ancestry(commonDir, output.destinationHead, revision))
+    )
+      return true;
+    const parentsText = yield* gitDir(commonDir, ["show", "-s", "--format=%P", revision], true);
+    const parents = parentsText.length === 0 ? [] : parentsText.split(" ");
+    if (
+      parents.length !== 2 ||
+      parents[0] !== output.destinationHead ||
+      parents[1] !== output.sourceTip
+    )
+      return false;
+    const expectedTree = yield* proveMergeable(commonDir, output.destinationHead, output.sourceTip);
+    const actualTree = yield* gitDir(commonDir, ["show", "-s", "--format=%T", revision]);
+    return actualTree === expectedTree;
+  });
+}
+
+function proveMergeable(
+  commonDir: string,
+  destination: string,
+  source: string,
+): Effect.Effect<string, GitError> {
+  return gitDir(commonDir, ["merge-tree", "--write-tree", destination, source]).pipe(
+    Effect.mapError(() =>
+      error("apply output", "Candidate conflicts with the destination; nothing was mutated."),
+    ),
+  );
+}
+
+function ownedCheckout(
+  operation: RepositoryOperation,
+  requireDetached: boolean,
+): Effect.Effect<CheckoutState, GitError> {
+  return Effect.gen(function* () {
+    const registered = yield* registeredWorktree(
+      operation.target.commonDir,
+      operation.worktreePath,
+    );
+    if (registered === undefined)
+      return yield* fail("inspect output", "Attempt checkout is not an exact registered worktree.");
+    const actualPath = yield* filesystem("inspect output", () => realpath(operation.worktreePath));
+    if (actualPath !== operation.worktreePath)
+      return yield* fail("inspect output", "Attempt checkout path is not its real placement.");
+    const common = yield* git(operation.worktreePath, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]);
+    const actualCommon = yield* filesystem("inspect output", () =>
+      realpath(resolve(operation.worktreePath, common)),
+    );
+    if (actualCommon !== operation.target.commonDir)
+      return yield* fail("inspect output", "Attempt checkout belongs to another repository.");
+    if (requireDetached) {
+      const symbolic = yield* gitResult(operation.worktreePath, ["symbolic-ref", "-q", "HEAD"]);
+      if (symbolic.code === 0)
+        return yield* fail("inspect output", "Attempt checkout is no longer detached.");
+    }
+    return {
+      head: yield* exactCommit(
+        operation.target.commonDir,
+        "HEAD",
+        "inspect output",
+        operation.worktreePath,
+      ),
+      dirty: yield* attemptDirty(operation.worktreePath),
+    };
+  });
+}
+
+function removeCleanWorktree(operation: RepositoryOperation): Effect.Effect<void, GitError> {
+  return Effect.gen(function* () {
+    const state = yield* ownedCheckout(operation, false);
+    if (state.dirty)
+      return yield* fail("remove worktree", "Refusing to remove a dirty Attempt checkout.");
+    yield* git(operation.target.checkoutRoot, ["worktree", "remove", operation.worktreePath], true);
+    if (
+      (yield* pathExists(operation.worktreePath)) ||
+      (yield* registeredWorktree(operation.target.commonDir, operation.worktreePath)) !== undefined
+    )
+      return yield* fail("remove worktree", "Attempt checkout removal could not be established.");
+  });
+}
+
+function revalidate(target: RepositoryTarget): Effect.Effect<void, GitError> {
+  return Effect.gen(function* () {
+    const root = yield* filesystem("revalidate repository", () => realpath(target.checkoutRoot));
+    const commonText = yield* git(root, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]);
+    const common = yield* filesystem("revalidate repository", () =>
+      realpath(resolve(root, commonText)),
+    );
+    const inside = yield* git(root, ["rev-parse", "--is-inside-work-tree"]);
+    const bare = yield* git(root, ["rev-parse", "--is-bare-repository"]);
+    if (
+      root !== target.checkoutRoot ||
+      common !== target.commonDir ||
+      inside !== "true" ||
+      bare !== "false"
+    )
+      return yield* fail("revalidate repository", "Stored Task repository identity changed.");
+  });
+}
+
+function registeredWorktree(
+  commonDir: string,
+  path: string,
+): Effect.Effect<string | undefined, GitError> {
+  return gitDir(commonDir, ["worktree", "list", "--porcelain", "-z"]).pipe(
+    Effect.map((text) => {
+      for (const field of text.split("\0")) {
+        if (!field.startsWith("worktree ")) continue;
+        const candidate = field.slice("worktree ".length);
+        if (resolve(candidate) === path) return candidate;
+      }
+      return undefined;
+    }),
+  );
+}
+
+function destinationDirty(cwd: string): Effect.Effect<boolean, GitError> {
+  return dirty(cwd, false);
+}
+function attemptDirty(cwd: string): Effect.Effect<boolean, GitError> {
+  return dirty(cwd, true);
+}
+function dirty(cwd: string, includeIgnored: boolean): Effect.Effect<boolean, GitError> {
+  const statusArgs = ["status", "--porcelain", "--untracked-files=all"];
+  if (includeIgnored) statusArgs.push("--ignored=matching");
+  return Effect.all([
+    git(cwd, statusArgs, true),
+    gitResult(cwd, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]),
+  ]).pipe(
+    Effect.flatMap(([status, mergeHead]) => {
+      if (mergeHead.code !== 0 && mergeHead.code !== 1)
+        return fail("inspect checkout", "Git could not inspect merge state.");
+      return Effect.succeed(status.length > 0 || mergeHead.code === 0);
+    }),
+  );
+}
+
+function ancestry(
+  commonDir: string,
+  parent: string,
+  child: string,
+): Effect.Effect<boolean, GitError> {
+  return gitDirResult(commonDir, ["merge-base", "--is-ancestor", parent, child]).pipe(
+    Effect.flatMap((result) => {
+      if (result.code === 0) return Effect.succeed(true);
+      if (result.code === 1) return Effect.succeed(false);
+      return fail("inspect ancestry", "Git could not inspect candidate ancestry.");
+    }),
+  );
+}
+
+function exactCommit(
+  commonDir: string,
+  revision: string,
+  operation: string,
+  cwd?: string,
+): Effect.Effect<string, GitError> {
+  const command =
+    cwd === undefined
+      ? gitDir(commonDir, ["rev-parse", "--verify", `${revision}^{commit}`])
+      : git(cwd, ["rev-parse", "--verify", `${revision}^{commit}`]);
+  return command.pipe(
+    Effect.filterOrFail(
+      (commit) => /^[0-9a-f]{40,64}$/.test(commit),
+      () => error(operation, "Revision did not resolve to one exact commit."),
+    ),
+    Effect.mapError((cause) =>
+      cause.operation === operation
+        ? cause
+        : error(operation, "Revision did not resolve to one exact commit."),
+    ),
+  );
+}
+
+function readRef(commonDir: string, ref: string): Effect.Effect<string | undefined, GitError> {
+  return gitDirResult(commonDir, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]).pipe(
+    Effect.flatMap((result) => {
+      if (result.code === 0) return Effect.succeed(result.stdout);
+      // oxlint-disable-next-line effecttsgo/effect-succeed-with-void -- This branch inhabits the explicit optional-ref result.
+      if (result.code === 1) return Effect.succeed<string | undefined>(undefined);
+      return fail("inspect output ref", "Private output ref could not be inspected.");
+    }),
+  );
+}
+function requireExactRef(
+  commonDir: string,
+  ref: string,
+  tip: string,
+): Effect.Effect<string, GitError> {
+  return readRef(commonDir, ref).pipe(
+    Effect.filterOrFail(
+      (actual): actual is string => actual === tip,
+      () => error("inspect output ref", "Private output ref is absent or was repointed."),
+    ),
+  );
+}
+function createExactRef(
+  commonDir: string,
+  ref: string,
+  tip: string,
+): Effect.Effect<void, GitError> {
+  return readRef(commonDir, ref).pipe(
+    Effect.flatMap((actual) => {
+      if (actual === tip) return Effect.void;
+      if (actual !== undefined)
+        return fail("retain output", "Private output ref was already owned by other content.");
+      return gitDir(commonDir, ["update-ref", ref, tip, "0".repeat(tip.length)], true).pipe(
+        Effect.asVoid,
+      );
+    }),
+  );
+}
+function deleteExactRef(
+  commonDir: string,
+  ref: string,
+  tip: string,
+): Effect.Effect<void, GitError> {
+  return readRef(commonDir, ref).pipe(
+    Effect.flatMap((actual) => {
+      if (actual === undefined) return Effect.void;
+      if (actual !== tip)
+        return fail("discard output", "Private output ref was repointed; nothing was deleted.");
+      return gitDir(commonDir, ["update-ref", "-d", ref, tip], true).pipe(Effect.asVoid);
+    }),
+  );
+}
+
+function pathExists(path: string): Effect.Effect<boolean, GitError> {
+  return Effect.tryPromise({
+    try: () =>
+      stat(path).then(
+        () => true,
+        (cause: unknown) => {
+          if (isErrno(cause, "ENOENT")) return false;
+          throw cause;
+        },
+      ),
+    catch: () => error("inspect path", "Attempt placement could not be inspected."),
+  });
+}
+function isErrno(cause: unknown, code: string): boolean {
+  return cause instanceof Error && "code" in cause && cause.code === code;
+}
+function filesystem<A>(operation: string, run: () => Promise<A>): Effect.Effect<A, GitError> {
+  return Effect.tryPromise({
+    try: run,
+    catch: () => error(operation, "Filesystem operation failed."),
+  });
+}
+function git(cwd: string, args: string[], allowEmpty = false): Effect.Effect<string, GitError> {
+  return gitResult(cwd, args).pipe(Effect.flatMap((result) => checked(args, result, allowEmpty)));
+}
+function gitDir(
+  commonDir: string,
+  args: string[],
+  allowEmpty = false,
+): Effect.Effect<string, GitError> {
+  return gitDirResult(commonDir, args).pipe(
+    Effect.flatMap((result) => checked(args, result, allowEmpty)),
+  );
+}
+function gitDirResult(commonDir: string, args: string[]): Effect.Effect<CommandResult, GitError> {
+  return command([`--git-dir=${commonDir}`, ...args]);
+}
+function gitResult(cwd: string, args: string[]): Effect.Effect<CommandResult, GitError> {
+  return command(["-C", cwd, ...args]);
+}
+function command(args: string[]): Effect.Effect<CommandResult, GitError> {
+  const process = ChildProcess.make("git", args, { cwd: processCwd(), stdin: "ignore" });
+  return Effect.scoped(
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-      const child = yield* spawner.spawn(command);
+      const child = yield* spawner.spawn(process);
       const result = yield* Effect.all(
         {
           code: child.exitCode,
@@ -1303,106 +835,27 @@ function runGitCommand(
       };
     }),
   ).pipe(
-    Effect.mapError(
-      (cause) =>
-        new GitOperationError({
-          message: `git ${args.join(" ")} could not execute: ${String(cause)}`,
-        }),
-    ),
-    Effect.timeoutOrElse({
-      duration: timeoutMs,
-      orElse: () =>
-        Effect.fail(
-          new GitOperationError({
-            message: `git ${args.join(" ")} timed out after ${timeoutMs}ms.`,
-          }),
-        ),
-    }),
+    Effect.mapError(() => error(args.join(" "), "Git process failed.")),
     Effect.provide(childProcessLayer),
   );
-  return operation;
 }
-
-function makeGitClient(): GitClient {
-  const process: GitClient["process"] = (cwd, args, timeoutMs = 30_000) =>
-    runGitCommand(cwd, args, timeoutMs);
-  return {
-    process,
-    text: (cwd, args, allowEmpty = false) => gitText(process, cwd, args, allowEmpty),
-  };
+function checked(
+  args: readonly string[],
+  result: CommandResult,
+  allowEmpty: boolean,
+): Effect.Effect<string, GitError> {
+  if (result.code !== 0)
+    return fail(args.join(" "), result.stderr || result.stdout || "Git command failed.");
+  if (!allowEmpty && result.stdout.length === 0)
+    return fail(args.join(" "), "Git returned no output.");
+  return Effect.succeed(result.stdout);
 }
-
-function filesystemPromise<A>(operation: () => Promise<A>): GitEffect<A> {
-  return Effect.tryPromise({
-    try: operation,
-    catch: (cause) =>
-      new GitFileSystemError({
-        message: cause instanceof Error ? cause.message : String(cause),
-        code: cause instanceof Error && "code" in cause ? String(cause.code) : "UNKNOWN",
-      }),
-  });
+function fail(operation: string, message: string): Effect.Effect<never, GitError> {
+  return Effect.fail(error(operation, message));
 }
-
-function pathExists(path: string): GitEffect<boolean> {
-  return filesystemPromise(() => lstat(path)).pipe(
-    Effect.as(true),
-    Effect.catchIf(
-      (error): error is GitFileSystemError =>
-        error instanceof GitFileSystemError && error.code === "ENOENT",
-      () => Effect.succeed(false),
-    ),
-  );
+function error(operation: string, message: string): GitError {
+  return new GitError({ operation, message });
 }
-
-function fail(message: string): GitEffect<never> {
-  return Effect.fail(new GitOperationError({ message }));
-}
-
-function processSucceeded(result: GitCommandResult): boolean {
-  return result.code === 0;
-}
-
-function diagnostic(result: GitCommandResult): string {
-  const details = [`exit code ${result.code}`];
-  if (result.stderr.length > 0) details.push(result.stderr);
-  else if (result.stdout.length > 0) details.push(result.stdout);
-  return details.join("; ");
-}
-
-function validIdentity(value: string): boolean {
-  return /^[a-z0-9][a-z0-9_-]{0,63}$/.test(value);
-}
-
-export function parseWorktreeList(value: string): Effect.Effect<WorktreeRecord[], GitParseError> {
-  return Effect.try({
-    try: () => {
-      if (value.length === 0) return [];
-      if (!value.endsWith("\0\0")) {
-        throw new Error("Invalid git worktree output: missing NUL record terminator.");
-      }
-      return value
-        .slice(0, -2)
-        .split("\0\0")
-        .map((block) => {
-          const fields = block.split("\0");
-          const pathField = fields.find((field) => field.startsWith("worktree "));
-          if (pathField === undefined) {
-            throw new Error(`Invalid git worktree record: ${block}`);
-          }
-          const branchField = fields.find((field) => field.startsWith("branch refs/heads/"));
-          const worktree: WorktreeRecord = {
-            path: pathField.slice("worktree ".length),
-          };
-          if (branchField !== undefined) {
-            worktree.branch = branchField.slice("branch refs/heads/".length);
-          }
-          return worktree;
-        });
-    },
-    catch: (cause) =>
-      new GitParseError({
-        message: cause instanceof Error ? cause.message : String(cause),
-        output: value,
-      }),
-  });
+function processCwd(): string {
+  return globalThis.process.cwd();
 }

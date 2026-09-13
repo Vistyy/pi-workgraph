@@ -1,1187 +1,1216 @@
-/** Process-local workstream command and reconciliation owner. */
+/* oxlint-disable effecttsgo/node-builtin-import, typescript/no-this-alias, effecttsgo/try-catch-in-effect-gen, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Effect owns runtime serialization; store pages and reports are decoded before use, while exact optional runtime facts remain omitted. */
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Clock, Data, DateTime, Effect, Queue, type Scope, Semaphore } from "effect";
+import type { ModelTarget } from "../domain/model-target.js";
+import type {
+  Attempt,
+  AttemptLineage,
+  AttemptRecord,
+  AttemptSelection,
+  CoordinatorOwner,
+  Intent,
+  Outcome,
+  OutcomeRecord,
+  Task,
+  TaskContract,
+  TaskRecord,
+  TaskTarget,
+  WorkstreamMetadata,
+} from "../domain/records.js";
 import {
-  Cause,
-  Clock,
-  Data,
-  DateTime,
-  Deferred,
-  Effect,
-  Exit,
-  Fiber,
-  FiberSet,
-  type FileSystem,
-  type Path,
-  Ref,
-  Scope,
-  Semaphore,
-} from "effect";
-import type { PlatformError } from "effect/PlatformError";
-import { Value } from "typebox/value";
+  applyOutput,
+  classifyOutput,
+  cleanupAppliedOutput,
+  currentRevision,
+  detachedPlacement,
+  discardOutput,
+  ensureDetachedWorktree,
+  GitError,
+  isAncestor,
+  prepareApplication,
+  prepareDiscard,
+  type RepositoryOperation,
+  resolveRevision,
+  validateRetainedCandidate,
+} from "../git.js";
 import {
-  type AttemptKey,
-  activateAttempt,
-  type CoordinatorIdentity,
-  checkpointCancellation,
-  checkpointCleanup,
-  completeWorkstream,
-  type Intent,
-  type RepositoryIdentity,
-  recordDeliveryFailure,
-  recordDeliverySuccess,
-  recordEffectiveModel,
-  recordWorkerExecution,
-  type Task,
-  terminalizeAttempt,
-  type Workstream,
-} from "../domain/workstream.js";
-import { loadModelPolicyEffect, type ModelPolicy, type ModelPolicyError } from "../model-policy.js";
+  HerdrCliRuntime,
+  HerdrError,
+  type HerdrLaunchRequest,
+  type WorkerObservation,
+} from "../herdr.js";
+import { liveLayer } from "../node-platform.js";
 import {
-  type AttemptRecords,
-  type PlanningRecords,
-  type WorkstreamPresentation,
-  type WorkstreamRecordMutation,
-  WorkstreamStore,
-  type WorkstreamStoreError,
-} from "../storage/workstream-store.js";
-import {
-  appendFacts,
-  CancelCommandSchema,
-  type CompleteCommand,
-  CompleteCommandSchema,
-  decodeCommand,
-  enqueueFacts,
-  exactAttempt,
-  type ResumeCommand,
-  ResumeCommandSchema,
-  ReviseIntentCommandSchema,
-  SteerCommandSchema,
-  type SuspendCommand,
-  SuspendCommandSchema,
-  type WorkstreamAppendCommand,
-  WorkstreamCommandError,
-  type WorkstreamCommandPorts,
-  type WorkstreamEnqueueCommand,
-  workerIdentity,
-} from "./commands.js";
-import { classifyActionable, type FrontierEntry } from "./frontier.js";
-import { applyMaintainedOutput, discardMaintainedOutput } from "./output.js";
-import { decodeAppend, decodeEnqueue, planAppend, planEnqueue } from "./queue.js";
-import {
-  type ReconciliationAttention,
-  type ReconciliationCommit,
-  type ReconciliationContext,
-  type ReconciliationControl,
-  ReconciliationControlError,
-  type ReconciliationDriver,
-  type ReconciliationFrontierObservation,
-  type ReconciliationMutation,
-  ReconciliationScheduler,
-  type ResolvedReviewInput,
-} from "./reconciliation.js";
+  createWorkerSessionEffect,
+  readWorkerSession,
+  WORKER_KICKOFF,
+  type WorkerObjective,
+  type WorkerRole,
+} from "../pi-session.js";
+import { StoreError, type WorkstreamStore } from "../storage/workstream-store.js";
 
-class WorkstreamRuntimeIdentityError extends Data.TaggedError("WorkstreamRuntimeIdentityError")<{
-  readonly message: string;
-}> {}
+interface WorkerContext {
+  readonly workstreamId: string;
+  readonly attemptId: string;
+  readonly taskId: string;
+  readonly cwd: string;
+  readonly objective: WorkerObjective;
+  readonly role: WorkerRole;
+  readonly target: ModelTarget;
+}
 
-class WorkstreamRuntimeStoppedError extends Data.TaggedError("WorkstreamRuntimeStoppedError")<{
-  readonly message: string;
-}> {}
-
-export class WorkstreamRuntimeOperationError extends Data.TaggedError(
-  "WorkstreamRuntimeOperationError",
-)<{
-  readonly operation: string;
-  readonly message: string;
-  readonly cause?: unknown;
-}> {}
-
-class WorkstreamRuntimeStaleError extends Data.TaggedError("WorkstreamRuntimeStaleError")<{
+export class RuntimeError extends Data.TaggedError("RuntimeError")<{
   readonly operation: string;
   readonly message: string;
 }> {}
+export type Attachment =
+  | { readonly state: "detached" }
+  | { readonly state: "blocked"; readonly reason: string }
+  | { readonly state: "attached"; readonly runtime: WorkstreamRuntime };
 
-export type WorkstreamRuntimeError =
-  | WorkstreamStoreError
-  | ModelPolicyError
-  | PlatformError
-  | WorkstreamRuntimeIdentityError
-  | WorkstreamRuntimeStoppedError
-  | WorkstreamRuntimeStaleError
-  | WorkstreamRuntimeOperationError
-  | WorkstreamCommandError;
-
-export type WorkstreamRuntimeEffect<A> = Effect.Effect<
-  A,
-  WorkstreamRuntimeError,
-  FileSystem.FileSystem
->;
-
-export interface WorkstreamRuntimeInspectionSnapshot {
-  readonly workstream: Workstream;
-  readonly reconciliation: readonly ReconciliationFrontierObservation[];
+interface ReconciliationBlocker {
+  readonly detail: string;
+  readonly failures: number;
+  readonly retryAt: number;
 }
 
-export interface WorkstreamRuntimeAcquisition {
-  readonly id: string;
-  readonly repository: RepositoryIdentity;
-  readonly coordinator: CoordinatorIdentity;
-  /** Process-local controller fence checked immediately before external effects. */
-  readonly owns?: () => boolean;
-  readonly policyPath?: string;
-  readonly driver: ReconciliationDriver;
-  readonly commands?: WorkstreamCommandPorts;
-  readonly onReconciliationAttention?: ReconciliationAttention;
-  readonly onPresentationChanged?: (state: WorkstreamPresentation) => Effect.Effect<void, never>;
-  readonly onFatal?: (error: WorkstreamRuntimeError) => Effect.Effect<void, never>;
+interface SessionPreparation {
+  readonly record: AttemptRecord;
+  readonly fresh: boolean;
 }
 
-const STOPPED_MESSAGE = "Workstream runtime is closed and accepts no further commands.";
-
-type RecordPlan =
-  | Readonly<{ kind: "attempt"; key: AttemptKey }>
-  | Readonly<{ kind: "lifecycle"; current: Workstream }>;
-
-type QueuePlanningContext = {
-  readonly planning: PlanningRecords;
-  readonly tasks: Task[];
-};
-type WritableWorkstream = { -readonly [Key in keyof Workstream]: Workstream[Key] };
-type MutableAttemptMutation = {
-  -readonly [Key in keyof Extract<WorkstreamRecordMutation, { kind: "update_attempt" }>]: Extract<
-    WorkstreamRecordMutation,
-    { kind: "update_attempt" }
-  >[Key];
-};
-type MutableLifecycleMutation = {
-  -readonly [Key in keyof Extract<WorkstreamRecordMutation, { kind: "update_lifecycle" }>]: Extract<
-    WorkstreamRecordMutation,
-    { kind: "update_lifecycle" }
-  >[Key];
-};
-
-/** Ready scoped owner for serialized workstream coordinator commands. */
 export class WorkstreamRuntime {
+  private readonly blockers = new Map<string, ReconciliationBlocker>();
   private closed = false;
-  private started = false;
-
   private constructor(
-    private readonly resourceScope: Scope.Scope,
-    private readonly store: WorkstreamStore,
+    readonly store: WorkstreamStore,
+    readonly owner: CoordinatorOwner,
+    readonly agentDir: string,
+    private readonly pi: Pick<ExtensionAPI, "sendMessage">,
+    private readonly herdr: HerdrCliRuntime,
     private readonly semaphore: Semaphore.Semaphore,
-    private readonly fibers: FiberSet.FiberSet<unknown, never>,
-    private readonly scheduler: ReconciliationScheduler,
-    private readonly closeRequest: Deferred.Deferred<WorkstreamRuntimeError | undefined>,
-    private readonly shutdownClaimed: Ref.Ref<boolean>,
-    private readonly completion: Deferred.Deferred<void, WorkstreamRuntimeError>,
-    private readonly acquisition: WorkstreamRuntimeAcquisition,
+    private readonly wakeQueue: Queue.Queue<void>,
   ) {}
 
-  /**
-   * Eagerly acquire a caller-Scope-owned workstream runtime. Escaping an
-   * `Effect.scoped` acquisition returns an already-closed handle.
-   */
-  static acquire(
-    acquisition: WorkstreamRuntimeAcquisition,
-  ): Effect.Effect<WorkstreamRuntime, WorkstreamRuntimeError, FileSystem.FileSystem | Path.Path> {
-    return WorkstreamRuntime.initialize(acquisition);
-  }
-
-  private static initialize(
-    acquisition: WorkstreamRuntimeAcquisition,
-  ): Effect.Effect<WorkstreamRuntime, WorkstreamRuntimeError, FileSystem.FileSystem | Path.Path> {
+  static acquire(input: {
+    store: WorkstreamStore;
+    owner: CoordinatorOwner;
+    agentDir: string;
+    pi: Pick<ExtensionAPI, "sendMessage">;
+    herdr?: HerdrCliRuntime;
+  }): Effect.Effect<Attachment, never, Scope.Scope> {
     return Effect.gen(function* () {
-      const resourceScope = yield* Scope.make("sequential");
-      return yield* WorkstreamRuntime.build(resourceScope, acquisition).pipe(
-        Scope.provide(resourceScope),
-        Effect.onError((cause) => Scope.close(resourceScope, Exit.failCause(cause))),
-      );
-    });
-  }
-
-  private static build(
-    resourceScope: Scope.Scope,
-    acquisition: WorkstreamRuntimeAcquisition,
-  ): Effect.Effect<
-    WorkstreamRuntime,
-    WorkstreamRuntimeError,
-    FileSystem.FileSystem | Path.Path | Scope.Scope
-  > {
-    return Effect.gen(function* () {
-      const attachment = yield* WorkstreamStore.open(acquisition.id, acquisition.repository);
-      const { store } = attachment;
-      const state = attachment.state;
-      if (!sameCoordinator(state.coordinator, acquisition.coordinator))
-        return yield* new WorkstreamRuntimeIdentityError({
-          message: `Workstream ${acquisition.id} belongs to another coordinator session.`,
-        });
+      let metadata: WorkstreamMetadata;
+      try {
+        metadata = input.store.readMetadata();
+      } catch (cause) {
+        return { state: "blocked" as const, reason: message(cause) };
+      }
+      if (!sameOwner(metadata.owner, input.owner))
+        return { state: "blocked" as const, reason: "Workstream belongs to another Coordinator." };
       const semaphore = yield* Semaphore.make(1);
-      const fibers = yield* FiberSet.make<unknown, never>();
-      const scheduler = yield* ReconciliationScheduler.make(
-        acquisition.driver,
-        acquisition.onReconciliationAttention ?? (() => Effect.void),
-      );
-      const closeRequest = yield* Deferred.make<WorkstreamRuntimeError | undefined>();
-      const shutdownClaimed = yield* Ref.make(false);
-      const completion = yield* Deferred.make<void, WorkstreamRuntimeError>();
+      const wakeQueue = yield* Queue.dropping<void>(1);
       const runtime = new WorkstreamRuntime(
-        resourceScope,
-        store,
+        input.store,
+        input.owner,
+        input.agentDir,
+        input.pi,
+        input.herdr ?? new HerdrCliRuntime(),
         semaphore,
-        fibers,
-        scheduler,
-        closeRequest,
-        shutdownClaimed,
-        completion,
-        acquisition,
+        wakeQueue,
       );
-      yield* scheduler.provideControls((key) => runtime.controlFor(key));
-      yield* scheduler.provideSource(() =>
-        store
-          .readActionable()
-          .pipe(
-            Effect.map((records) =>
-              classifyActionable(records.lifecycle, records.currentIntentIndex, records.records),
-            ),
-          ),
+      // Registered first so forkScoped's later finalizer interrupts and joins reconciliation first.
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          runtime.closed = true;
+          input.store.close();
+        }),
       );
-      if (acquisition.owns === undefined) yield* runtime.start();
-      return runtime;
+      yield* Effect.forkScoped(runtime.reconciliation());
+      return { state: "attached" as const, runtime };
     });
   }
 
-  /** Publish-time activation keeps controller acquisition free of external effects. */
-  readonly start = (): Effect.Effect<
-    void,
-    WorkstreamRuntimeError,
-    FileSystem.FileSystem | Path.Path
-  > =>
-    this.serialized(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          if (this.started) return;
-          yield* this.fence();
-          this.started = true;
-          yield* this.scheduler.attach();
-          yield* FiberSet.run(this.fibers, this.scheduler.run());
-        }.bind(this),
-      ),
+  inspectionStatus(): { lifecycle: WorkstreamMetadata["lifecycle"]; blocker?: string } {
+    const status = { lifecycle: this.store.readMetadata().lifecycle };
+    const blocker = [...this.blockers.entries()]
+      .map(([attemptId, blocked]) => `${attemptId}: ${blocked.detail}`)
+      .join("; ");
+    return blocker.length === 0 ? status : { ...status, blocker };
+  }
+
+  createTask(input: {
+    id: string;
+    target: TaskTarget;
+    contract: TaskContract;
+    selection: AttemptSelection;
+    lineage?: AttemptLineage;
+    baseCommit?: string;
+  }): Effect.Effect<AttemptRecord, RuntimeError> {
+    const self = this;
+    return this.serializedEffect(
+      "create Task",
+      Effect.gen(function* () {
+        const task: Task = { target: input.target, contract: input.contract, createdAt: now() };
+        const attemptId = `${input.id}-1`;
+        const attempt = yield* self.newAttempt(
+          task,
+          input.selection,
+          input.lineage,
+          input.baseCommit,
+        );
+        const records = self.store.createTaskWithAttempt(
+          self.owner,
+          self.store.readLatestIntent().index,
+          input.id,
+          task,
+          attemptId,
+          attempt,
+        );
+        yield* self.wake();
+        return records.attempt;
+      }).pipe(Effect.mapError((cause) => runtimeError("create Task", cause))),
     );
+  }
 
-  /** Fenced read through the serialized boundary; also re-proves ownership. */
-  readonly read = (): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(this.fencedRead().pipe(Effect.map((state) => structuredClone(state))));
-
-  /** Assemble a current inspection view from authoritative records. */
-  readonly snapshot = (): WorkstreamRuntimeEffect<Workstream> => this.serialized(this.store.read());
-
-  /** Read only the status facts consumed by coordinator presentation. */
-  readonly presentation = (): WorkstreamRuntimeEffect<WorkstreamPresentation> =>
-    this.serialized(this.store.readPresentation());
-
-  /** Read only the parent facts needed to derive a one-shot Handoff Grant. */
-  readonly handoffParent = () => this.serialized(this.store.readHandoffParent());
-
-  /** Process-local ownership is the exact active runtime instance. */
-  readonly checkOwnership = (): WorkstreamRuntimeEffect<void> => this.serialized(this.fence());
-
-  /** Enqueue one immutable Task with its resolved initial Attempt(s). */
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the workstream TypeBox schema.
-  readonly enqueue = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(this.enqueueEffect(command));
-
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the workstream TypeBox schema.
-  readonly appendAttempts = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(this.appendEffect(command));
-
-  readonly readAttempt = (
-    attemptId: string,
-  ): WorkstreamRuntimeEffect<ReturnType<typeof exactAttempt>> =>
-    this.serialized(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          yield* this.fence();
-          const records = yield* this.store.readAttempt(undefined, attemptId);
-          return {
-            key: { taskId: records.task.id, attemptId },
-            task: records.task,
-            attempt: records.attempt,
-          };
-        }.bind(this),
-      ),
+  createAttempt(input: {
+    taskId: string;
+    selection: AttemptSelection;
+    lineage?: AttemptLineage;
+    baseCommit?: string;
+  }): Effect.Effect<AttemptRecord, RuntimeError> {
+    const self = this;
+    return this.serializedEffect(
+      "create Attempt",
+      Effect.gen(function* () {
+        const task = self.store.readTask(input.taskId);
+        const attemptId = `${task.id}-${randomUUID()}`;
+        const attempt = yield* self.newAttempt(
+          task.task,
+          input.selection,
+          input.lineage,
+          input.baseCommit,
+        );
+        const record = self.store.appendAttempt(self.owner, task.id, attemptId, attempt);
+        yield* self.wake();
+        return record;
+      }).pipe(Effect.mapError((cause) => runtimeError("create Attempt", cause))),
     );
+  }
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
-  readonly suspend = (command: unknown): WorkstreamRuntimeEffect<void> =>
-    this.scheduler.withDispatchBarrier(
-      Effect.uninterruptible(
-        this.serialized(
-          Effect.gen(
-            function* (this: WorkstreamRuntime) {
-              const input = yield* this.try("decode suspension", () =>
-                decodeCommand<SuspendCommand>(SuspendCommandSchema, command, "suspension command"),
-              );
-              const now = yield* this.now();
-              const revision = yield* this.store.readRevision();
-              yield* this.store.mutateRecords(this.acquisition.coordinator, revision, {
-                kind: "update_lifecycle",
-                lifecycle: "suspended",
-                suspension: { reason: input.reason, suspendedAt: now },
-                updatedAt: now,
-              });
-              yield* this.scheduler.attach();
-              yield* this.publishPresentation();
-            }.bind(this),
-          ),
-        ),
-      ),
-    );
-
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
-  readonly resume = (command: unknown): WorkstreamRuntimeEffect<void> =>
-    this.scheduler.withDispatchBarrier(
-      Effect.uninterruptible(
-        this.serialized(
-          Effect.gen(
-            function* (this: WorkstreamRuntime) {
-              yield* this.try("decode resumption", () =>
-                decodeCommand<ResumeCommand>(ResumeCommandSchema, command, "resumption command"),
-              );
-              const now = yield* this.now();
-              const revision = yield* this.store.readRevision();
-              yield* this.store.mutateRecords(this.acquisition.coordinator, revision, {
-                kind: "update_lifecycle",
-                lifecycle: "active",
-                updatedAt: now,
-              });
-              yield* this.scheduler.attach();
-              yield* this.publishPresentation();
-            }.bind(this),
-          ),
-        ),
-      ),
-    );
-
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
-  readonly reviseIntent = (command: unknown): WorkstreamRuntimeEffect<void> =>
-    this.serialized(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          const intent = yield* this.try("decode Intent revision", () =>
-            decodeCommand<Intent>(ReviseIntentCommandSchema, command, "Intent revision"),
-          );
-          const revision = yield* this.store.readRevision();
-          const now = yield* this.now();
-          yield* this.store.mutateRecords(this.acquisition.coordinator, revision, {
-            kind: "append_intent",
-            intent,
-            updatedAt: now,
+  steer(attemptId: string, instruction: string): Effect.Effect<void, RuntimeError> {
+    const self = this;
+    return this.serializedEffect(
+      "steer Worker",
+      Effect.gen(function* () {
+        const record = self.store.readAttempt(attemptId);
+        const observation = yield* self.observeWorker(record);
+        if (observation.state !== "ready")
+          return yield* new RuntimeError({
+            operation: "steer Worker",
+            message: `Exact Worker is ${observation.state}; no prompt was issued.`,
           });
-          yield* this.scheduler.attach();
-        }.bind(this),
+        yield* self.herdr
+          .prompt(observation.identity, instruction)
+          .pipe(Effect.mapError((cause) => runtimeError("steer Worker", cause)));
+      }),
+    );
+  }
+
+  cancel(attemptId: string, reason: string): Effect.Effect<AttemptRecord, RuntimeError> {
+    const self = this;
+    return this.serializedEffect(
+      "request cancellation",
+      Effect.gen(function* () {
+        if (reason.trim().length === 0)
+          return yield* new RuntimeError({
+            operation: "request cancellation",
+            message: "Cancellation requires a nonblank reason.",
+          });
+        const record = self.store.readAttempt(attemptId);
+        if (self.store.readOutcome(attemptId) !== undefined)
+          return yield* new RuntimeError({
+            operation: "request cancellation",
+            message: "Attempt already has an Outcome.",
+          });
+        if (record.attempt.execution?.cancellation !== undefined)
+          return yield* new RuntimeError({
+            operation: "request cancellation",
+            message: "Cancellation was already requested; close will not be repeated.",
+          });
+        const execution = record.attempt.execution ?? { submission: "absent" as const };
+        const saved = self.store.checkpointAttempt(self.owner, attemptId, {
+          ...record.attempt,
+          execution: {
+            ...execution,
+            cancellation: { reason, requestedAt: now() },
+          },
+        });
+        self.blockers.delete(attemptId);
+        yield* self.closeNewCancellation(saved);
+        yield* self.wake();
+        return self.store.readAttempt(attemptId);
+      }),
+    );
+  }
+
+  apply(attemptId: string): Effect.Effect<AttemptRecord, RuntimeError> {
+    const self = this;
+    return this.serializedEffect(
+      "apply output",
+      Effect.gen(function* () {
+        let record = self.store.readAttempt(attemptId);
+        if (self.store.readTask(record.taskId).intentIndex !== self.store.readLatestIntent().index)
+          return yield* new RuntimeError({
+            operation: "apply output",
+            message: "Attempt does not belong to the latest Intent.",
+          });
+        if (record.attempt.execution?.closedAt === undefined)
+          return yield* new RuntimeError({
+            operation: "apply output",
+            message: "Worker must be definitively closed first.",
+          });
+        let prepared = yield* prepareApplication(self.repositoryOperation(record));
+        record = self.store.checkpointAttempt(self.owner, attemptId, prepared);
+        prepared = yield* prepareApplication(self.repositoryOperation(record));
+        record = self.store.checkpointAttempt(self.owner, attemptId, prepared);
+        const applied = yield* applyOutput(self.repositoryOperation(record), now());
+        record = self.store.checkpointAttempt(self.owner, attemptId, applied);
+        if (self.store.hasUnclassifiedIntegrationChild(attemptId)) return record;
+        const cleaned = yield* cleanupAppliedOutput(self.repositoryOperation(record));
+        return self.store.checkpointAttempt(self.owner, attemptId, cleaned);
+      }).pipe(Effect.mapError((cause) => runtimeError("apply output", cause))),
+    );
+  }
+  discard(attemptId: string, reason: string): Effect.Effect<AttemptRecord, RuntimeError> {
+    const self = this;
+    return this.serializedEffect(
+      "discard output",
+      Effect.gen(function* () {
+        let record = self.store.readAttempt(attemptId);
+        if (record.attempt.execution?.closedAt === undefined)
+          return yield* new RuntimeError({
+            operation: "discard output",
+            message: "Worker must be definitively closed first.",
+          });
+        if (self.store.hasUnclassifiedIntegrationChild(attemptId))
+          return yield* new RuntimeError({
+            operation: "discard output",
+            message: "An integration child still depends on this private source.",
+          });
+        const checkpoint = prepareDiscard(self.repositoryOperation(record), reason);
+        record = self.store.checkpointAttempt(self.owner, attemptId, checkpoint);
+        const discarded = yield* discardOutput(self.repositoryOperation(record), now());
+        return self.store.checkpointAttempt(self.owner, attemptId, discarded);
+      }).pipe(Effect.mapError((cause) => runtimeError("discard output", cause))),
+    );
+  }
+  inspect(
+    section: "intents" | "tasks" | "attempts" | "outcomes",
+    after = -1,
+    limit = 20,
+  ): Effect.Effect<{ records: unknown[]; nextAfter?: number }, RuntimeError> {
+    return this.serialized("inspect records", () => {
+      const records = this.store.page(section, after, limit);
+      const last = records.at(-1) as { index?: number } | undefined;
+      return records.length < limit || last?.index === undefined
+        ? { records }
+        : { records, nextAfter: last.index };
+    });
+  }
+  complete(input: {
+    conclusion: string;
+    evidence: string[];
+    limitations?: string[];
+  }): Effect.Effect<WorkstreamMetadata, RuntimeError> {
+    return this.serialized("complete Workstream", () =>
+      this.store.complete(this.owner, {
+        ...input,
+        limitations: input.limitations ?? [],
+        completedAt: now(),
+      }),
+    );
+  }
+
+  private newAttempt(
+    task: Task,
+    selection: AttemptSelection,
+    lineage?: AttemptLineage,
+    requestedBase?: string,
+  ): Effect.Effect<Attempt, RuntimeError> {
+    if (task.target.kind === "directory") {
+      if (lineage !== undefined || requestedBase !== undefined)
+        throw new RuntimeError({
+          operation: "create Attempt",
+          message: "Directory Tasks cannot carry candidate lineage.",
+        });
+      return Effect.succeed({ selection, base: { kind: "directory" } });
+    }
+    return this.repositoryAttempt(task.target, selection, lineage, requestedBase).pipe(
+      Effect.mapError((cause) => runtimeError("create Attempt", cause)),
+    );
+  }
+  private repositoryAttempt(
+    target: Extract<TaskTarget, { kind: "repository" }>,
+    selection: AttemptSelection,
+    lineage?: AttemptLineage,
+    requestedBase?: string,
+  ): Effect.Effect<Attempt, RuntimeError | import("../git.js").GitError> {
+    const self = this;
+    return Effect.gen(function* () {
+      const baseCommit =
+        requestedBase === undefined
+          ? yield* currentRevision(target)
+          : yield* resolveRevision(target, requestedBase);
+      if (lineage?.candidateOf === undefined)
+        return { selection, base: { kind: "repository" as const, baseCommit } };
+      const facts = yield* self.candidateFacts(
+        target,
+        { ...lineage, candidateOf: lineage.candidateOf },
+        baseCommit,
+        requestedBase,
+      );
+      return {
+        selection,
+        base: { kind: "repository" as const, baseCommit: facts.baseCommit },
+        lineage: facts.lineage,
+      };
+    });
+  }
+  private candidateFacts(
+    target: Extract<TaskTarget, { kind: "repository" }>,
+    lineage: AttemptLineage & { candidateOf: NonNullable<AttemptLineage["candidateOf"]> },
+    baseCommit: string,
+    requestedBase?: string,
+  ): Effect.Effect<
+    { baseCommit: string; lineage: AttemptLineage },
+    RuntimeError | import("../git.js").GitError
+  > {
+    const parentRecord = this.store.readAttempt(lineage.candidateOf.attemptId);
+    const parent = parentRecord.attempt;
+    if (parent.output?.kind !== "retained")
+      return Effect.fail(
+        new RuntimeError({
+          operation: "create Attempt",
+          message: "Candidate parent has no retained output.",
+        }),
+      );
+    const parentOperation = this.repositoryOperation(parentRecord);
+    if (parentOperation.target.commonDir !== target.commonDir)
+      return Effect.fail(
+        new RuntimeError({
+          operation: "create Attempt",
+          message: "Candidate parent belongs to another Task repository.",
+        }),
+      );
+    return validateRetainedCandidate(parentOperation).pipe(
+      Effect.flatMap(() =>
+        lineage.candidateOf.kind === "extend"
+          ? this.extendFacts(target, parentRecord, requestedBase)
+          : this.integrateFacts(lineage, parentRecord, baseCommit),
       ),
     );
-
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
-  readonly complete = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          const input = yield* this.try("decode completion", () =>
-            decodeCommand<CompleteCommand>(CompleteCommandSchema, command, "completion command"),
-          );
-          const now = yield* this.now();
-          const current = yield* this.store.readCompletionState();
-          return yield* this.authoritative(
-            "complete Workstream",
-            (state) => completeWorkstream(state, { ...input, completedAt: now }, now),
-            { kind: "lifecycle", current },
-          );
-        }.bind(this),
-      ),
-    );
-
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
-  readonly cancel = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          const input = yield* this.try("decode cancellation", () =>
-            decodeCommand<{ attemptId: string; reason: string }>(
-              CancelCommandSchema,
-              command,
-              "cancellation command",
+  }
+  private extendFacts(
+    target: Extract<TaskTarget, { kind: "repository" }>,
+    parentRecord: AttemptRecord,
+    requestedBase?: string,
+  ): Effect.Effect<
+    { baseCommit: string; lineage: AttemptLineage },
+    RuntimeError | import("../git.js").GitError
+  > {
+    const parent = parentRecord.attempt;
+    if (parent.output?.kind !== "retained")
+      return Effect.fail(
+        new RuntimeError({
+          operation: "create Attempt",
+          message: "Candidate parent is not retained.",
+        }),
+      );
+    const parentTip = parent.output.tip;
+    if (requestedBase !== undefined)
+      return Effect.fail(
+        new RuntimeError({
+          operation: "create Attempt",
+          message: "Extend forbids an independent base revision.",
+        }),
+      );
+    const inheritedRoot =
+      parent.lineage?.candidateRoot ??
+      (parent.base.kind === "repository" ? parent.base.baseCommit : parentTip);
+    return isAncestor(target, inheritedRoot, parentTip).pipe(
+      Effect.flatMap((present) =>
+        present
+          ? Effect.succeed({
+              baseCommit: parentTip,
+              lineage: {
+                candidateRoot: inheritedRoot,
+                candidateOf: { kind: "extend", attemptId: parentRecord.id },
+              },
+            })
+          : Effect.fail(
+              new RuntimeError({
+                operation: "create Attempt",
+                message: "Candidate lineage is not present in the Task repository.",
+              }),
             ),
-          );
-          const before = yield* this.keyedState(input.attemptId);
-          const located = yield* this.try("resolve cancellation Attempt", () =>
-            exactAttempt(before, input.attemptId),
-          );
-          const now = yield* this.now();
-          const committed = yield* this.authoritative(
-            "request workstream cancellation",
-            (state) => planCancellation(state, located.key, input.reason, now),
-            { kind: "attempt", key: located.key },
-          );
-          if (before.revision !== committed.revision)
-            yield* this.notifyCommitted(committed, [located.key]);
-          return committed;
-        }.bind(this),
       ),
     );
+  }
+  private integrateFacts(
+    lineage: AttemptLineage & { candidateOf: NonNullable<AttemptLineage["candidateOf"]> },
+    parentRecord: AttemptRecord,
+    baseCommit: string,
+  ): Effect.Effect<{ baseCommit: string; lineage: AttemptLineage }, RuntimeError> {
+    const parent = parentRecord.attempt;
+    if (
+      parent.output?.kind !== "retained" ||
+      lineage.candidateOf.kind !== "integrate" ||
+      lineage.candidateOf.sourceTip !== parent.output.tip
+    )
+      return Effect.fail(
+        new RuntimeError({
+          operation: "create Attempt",
+          message: "Integration source tip no longer matches its retained parent.",
+        }),
+      );
+    return Effect.succeed({
+      baseCommit,
+      lineage: {
+        candidateRoot: baseCommit,
+        candidateOf: {
+          kind: "integrate",
+          attemptId: parentRecord.id,
+          sourceTip: parent.output.tip,
+        },
+      },
+    });
+  }
+  private ensureRepository(
+    task: TaskRecord,
+    attempt: AttemptRecord,
+  ): Effect.Effect<void, import("../git.js").GitError> {
+    return task.task.target.kind === "repository"
+      ? ensureDetachedWorktree(this.repositoryOperation(attempt))
+      : Effect.void;
+  }
+  private repositoryOperation(record: AttemptRecord): RepositoryOperation {
+    const task = this.store.readTask(record.taskId).task;
+    if (task.target.kind !== "repository")
+      throw new RuntimeError({
+        operation: "inspect output",
+        message: "Attempt Task has no repository target.",
+      });
+    return {
+      attemptId: record.id,
+      attempt: record.attempt,
+      target: task.target,
+      ...detachedPlacement({
+        agentDir: this.agentDir,
+        workstreamId: this.store.id,
+        attemptId: record.id,
+      }),
+      applicable: task.contract.kind === "implementation",
+    };
+  }
+  private reconcileAttempt(attemptId: string): Effect.Effect<void, RuntimeError> {
+    const self = this;
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: this one ordered flow keeps independent settlement failures visible.
+    return Effect.gen(function* () {
+      let record = self.store.readAttempt(attemptId);
+      let outcome = self.store.readOutcome(attemptId);
+      const transitionResult =
+        outcome === undefined
+          ? yield* Effect.result(
+              record.attempt.execution?.cancellation === undefined
+                ? self.reconcileExecution(record)
+                : self.reconcileCancellation(record),
+            )
+          : undefined;
+      record = self.store.readAttempt(attemptId);
+      outcome = self.store.readOutcome(attemptId);
+      const closureResult =
+        outcome !== undefined && record.attempt.execution?.closedAt === undefined
+          ? yield* Effect.result(self.settleObservedClosure(record))
+          : undefined;
+      record = self.store.readAttempt(attemptId);
+      const outputResult =
+        outcome !== undefined && record.attempt.execution?.closedAt !== undefined
+          ? yield* Effect.result(self.reconcileOutput(record))
+          : undefined;
+      const currentOutcome = self.store.readOutcome(attemptId);
+      const deliveryResult =
+        currentOutcome !== undefined && currentOutcome.outcome.delivery.deliveredAt === undefined
+          ? yield* Effect.result(self.deliver(currentOutcome))
+          : undefined;
+      const failures = [transitionResult, closureResult, outputResult, deliveryResult].flatMap(
+        (result) => (result?._tag === "Failure" ? [result.failure.message] : []),
+      );
+      if (failures.length > 0)
+        return yield* new RuntimeError({
+          operation: "reconcile Attempt",
+          message: failures.join("; "),
+        });
+    });
+  }
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
-  readonly steer = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(this.steerEffect(command));
+  private reconcileExecution(record: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    const task = this.store.readTask(record.taskId);
+    const context = this.workerContext(record, task);
+    return this.ensureRepository(task, record).pipe(
+      Effect.mapError((cause) => runtimeError("prepare Attempt repository", cause)),
+      Effect.flatMap(() => this.ensureWorkerSession(record, context)),
+      Effect.flatMap((prepared) => this.ensureWorkerAgent(prepared, context)),
+      Effect.flatMap((agentRecord) => this.reconcileWorkerSession(agentRecord, context)),
+    );
+  }
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
-  readonly apply = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(
-      Effect.flatMap(this.commandPorts(), (ports) =>
-        applyMaintainedOutput(this.outputControl(ports), command),
+  private ensureWorkerSession(
+    record: AttemptRecord,
+    context: WorkerContext,
+  ): Effect.Effect<SessionPreparation, RuntimeError> {
+    if (record.attempt.execution?.sessionFile !== undefined)
+      return Effect.succeed({ record, fresh: false });
+    return createWorkerSessionEffect({
+      cwd: context.cwd,
+      sessionDir: join(this.agentDir, "workgraph", "worker-sessions", this.store.id),
+      objective: context.objective,
+    }).pipe(
+      Effect.provide(liveLayer),
+      Effect.mapError((cause) => runtimeError("create Worker session", cause)),
+      Effect.map((created) => ({
+        fresh: created.fresh,
+        record: this.store.checkpointAttempt(this.owner, record.id, {
+          ...record.attempt,
+          execution: { submission: "absent", sessionFile: created.sessionFile },
+        }),
+      })),
+    );
+  }
+
+  private ensureWorkerAgent(
+    prepared: SessionPreparation,
+    context: WorkerContext,
+  ): Effect.Effect<AttemptRecord, RuntimeError> {
+    const execution = prepared.record.attempt.execution;
+    if (execution?.sessionFile === undefined)
+      return Effect.fail(
+        new RuntimeError({
+          operation: "prepare Worker session",
+          message: "Session checkpoint is absent.",
+        }),
+      );
+    const request = this.herdrRequest(context, execution.sessionFile);
+    if (prepared.fresh)
+      return this.herdr.launch(request).pipe(
+        Effect.mapError((cause) => runtimeError(cause.operation, cause)),
+        Effect.as(prepared.record),
+      );
+    return this.herdr.observeWorker(request).pipe(
+      Effect.mapError((cause) => runtimeError(cause.operation, cause)),
+      Effect.flatMap((observation) =>
+        observation.state === "ready"
+          ? Effect.succeed(prepared.record)
+          : Effect.fail(
+              new RuntimeError({
+                operation: "recover Worker",
+                message:
+                  observation.state === "partial"
+                    ? `${observation.detail} Launch will not be continued automatically.`
+                    : "No exact Worker resource follows the prior session; launch will not be replayed.",
+              }),
+            ),
       ),
     );
+  }
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Workstream TypeBox schema decodes this external command value.
-  readonly discardOutput = (command: unknown): WorkstreamRuntimeEffect<Workstream> =>
-    this.serialized(
-      Effect.flatMap(this.commandPorts(), (ports) =>
-        discardMaintainedOutput(this.outputControl(ports), command),
+  private reconcileWorkerSession(
+    record: AttemptRecord,
+    context: WorkerContext,
+  ): Effect.Effect<void, RuntimeError> {
+    const execution = record.attempt.execution;
+    if (execution?.sessionFile === undefined) return Effect.void;
+    const read = readWorkerSession(execution.sessionFile, context.cwd, context.objective);
+    if (execution.submission === "uncertain")
+      return this.recoverSubmission(record, read.kickoffPersisted);
+    if (execution.submission === "absent") return this.submitWorker(record);
+    if (read.unreadable)
+      return Effect.fail(
+        new RuntimeError({ operation: "read Worker session", message: read.error }),
+      );
+    if (!read.settled) return Effect.void;
+    if (read.effectiveModels.length === 0)
+      return Effect.fail(
+        new RuntimeError({
+          operation: "record Outcome",
+          message: "Settled session has no exact effective model.",
+        }),
+      );
+    const result: Outcome["result"] =
+      read.report === undefined
+        ? { kind: "unreported", reason: read.reportError ?? "Worker report is absent." }
+        : { kind: "reported", report: read.report };
+    const self = this;
+    return Effect.gen(function* () {
+      self.store.insertOutcome(
+        self.owner,
+        `${record.id}-outcome`,
+        record.id,
+        outcomeFor(result, read.effectiveModels, now()),
+      );
+      yield* self.closeNewOutcome(record);
+    });
+  }
+
+  private recoverSubmission(
+    record: AttemptRecord,
+    kickoffPersisted: boolean,
+  ): Effect.Effect<void, RuntimeError> {
+    if (!kickoffPersisted)
+      return Effect.fail(
+        new RuntimeError({
+          operation: "recover Worker submission",
+          message:
+            "Kickoff is uncertain and the session does not prove the exact persisted kickoff.",
+        }),
+      );
+    const execution = record.attempt.execution;
+    return effect("confirm Worker submission", () => {
+      if (execution === undefined) return;
+      this.store.checkpointAttempt(this.owner, record.id, {
+        ...record.attempt,
+        execution: { ...execution, submission: "confirmed" },
+      });
+    });
+  }
+
+  private submitWorker(record: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    const execution = record.attempt.execution;
+    if (execution === undefined) return Effect.void;
+    const self = this;
+    return Effect.gen(function* () {
+      const observation = yield* self.observeWorker(record);
+      if (observation.state !== "ready")
+        return yield* new RuntimeError({
+          operation: "submit Worker",
+          message: `Exact Worker is ${observation.state}; kickoff was not issued.`,
+        });
+      const checkpoint = self.store.checkpointAttempt(self.owner, record.id, {
+        ...record.attempt,
+        execution: { ...execution, submission: "uncertain" },
+      });
+      yield* self.herdr
+        .prompt(observation.identity, WORKER_KICKOFF)
+        .pipe(Effect.mapError((cause) => runtimeError(cause.operation, cause)));
+      const uncertain = checkpoint.attempt.execution;
+      if (uncertain !== undefined)
+        self.store.checkpointAttempt(self.owner, record.id, {
+          ...checkpoint.attempt,
+          execution: { ...uncertain, submission: "confirmed" },
+        });
+    });
+  }
+
+  /** Reconciliation after reload is observation-only and never repeats close. */
+  private reconcileCancellation(record: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    const execution = record.attempt.execution;
+    if (execution?.cancellation === undefined) return Effect.void;
+    if (execution.sessionFile === undefined) return this.settleCancellation(record);
+    return this.observeWorker(record).pipe(
+      Effect.flatMap((observation) =>
+        observation.state === "absent"
+          ? this.settleCancellation(record)
+          : Effect.fail(
+              new RuntimeError({
+                operation: "cancel Worker",
+                message:
+                  `Exact Worker is ${observation.state}; close will not be repeated. ${observation.state === "partial" ? observation.detail : ""}`.trim(),
+              }),
+            ),
       ),
     );
+  }
 
-  /** Derive the current reconciliation projection from SQLite facts. */
-  readonly frontierSnapshot = (): Effect.Effect<
-    readonly FrontierEntry[],
-    never,
-    FileSystem.FileSystem
-  > => this.scheduler.snapshot();
+  /** Only the call that newly persisted cancellation may issue its one close. */
+  private closeNewCancellation(record: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    const execution = record.attempt.execution;
+    if (execution?.cancellation === undefined) return Effect.void;
+    if (execution.sessionFile === undefined) return this.settleCancellation(record);
+    const self = this;
+    return Effect.gen(function* () {
+      const observation = yield* self.observeWorker(record);
+      if (observation.state === "absent") return yield* self.settleCancellation(record);
+      const closed = yield* self.closeObservedWorker(record, observation);
+      if (closed !== "absent")
+        return yield* new RuntimeError({
+          operation: "cancel Worker",
+          message: `Exact Worker remains ${closed}; close will not be repeated.`,
+        });
+      yield* self.settleCancellation(record);
+    });
+  }
 
-  readonly inspectionSnapshot = (): WorkstreamRuntimeEffect<WorkstreamRuntimeInspectionSnapshot> =>
-    this.serialized(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          const current = yield* this.fencedRead();
-          return {
-            workstream: structuredClone(current),
-            reconciliation: yield* this.scheduler.inspectionSnapshot(),
-          };
-        }.bind(this),
+  private settleCancellation(record: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    const execution = record.attempt.execution;
+    const cancellation = execution?.cancellation;
+    if (execution === undefined || cancellation === undefined) return Effect.void;
+    const observedAt = now();
+    return effect("settle cancellation", () => {
+      this.store.settleCancellation(
+        this.owner,
+        `${record.id}-outcome`,
+        record.id,
+        { ...record.attempt, execution: { ...execution, closedAt: observedAt } },
+        outcomeFor(
+          { kind: "cancelled", reason: cancellation.reason },
+          selectedModels(record.attempt),
+          observedAt,
+        ),
+      );
+    });
+  }
+
+  /** Only the transition that newly inserted the normal Outcome may issue its one close. */
+  private closeNewOutcome(record: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    const self = this;
+    return Effect.gen(function* () {
+      const observation = yield* self.observeWorker(record);
+      if (observation.state !== "absent") {
+        const closed = yield* self.closeObservedWorker(record, observation);
+        if (closed !== "absent")
+          return yield* new RuntimeError({
+            operation: "close Worker",
+            message: `Exact Worker remains ${closed}; close will not be repeated.`,
+          });
+      }
+      yield* self.recordClosed(record);
+    });
+  }
+
+  /** Later reconciliation can settle verified absence but cannot issue close. */
+  private settleObservedClosure(record: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    const execution = record.attempt.execution;
+    if (execution === undefined)
+      return Effect.fail(
+        new RuntimeError({ operation: "close Worker", message: "Worker checkpoint is absent." }),
+      );
+    const outcome = this.store.readOutcome(record.id);
+    const context = this.workerContext(record, this.store.readTask(record.taskId));
+    if (outcome?.outcome.result.kind !== "cancelled") {
+      const read =
+        execution.sessionFile === undefined
+          ? undefined
+          : readWorkerSession(execution.sessionFile, context.cwd, context.objective);
+      if (read === undefined || read.unreadable || !read.settled)
+        return Effect.fail(
+          new RuntimeError({
+            operation: "close Worker",
+            message: "Durable Outcome exists, but the exact readable session is not settled.",
+          }),
+        );
+    }
+    if (execution.sessionFile === undefined) return this.recordClosed(record);
+    return this.observeWorker(record).pipe(
+      Effect.flatMap((observation) =>
+        observation.state === "absent"
+          ? this.recordClosed(record)
+          : Effect.fail(
+              new RuntimeError({
+                operation: "close Worker",
+                message:
+                  `Exact Worker is ${observation.state}; close will not be repeated. ${observation.state === "partial" ? observation.detail : ""}`.trim(),
+              }),
+            ),
       ),
     );
+  }
 
-  /** Clear transient observations and wake reconciliation from current records. */
-  readonly reconcile = (): WorkstreamRuntimeEffect<readonly FrontierEntry[]> =>
-    this.serialized(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          yield* this.fence();
-          yield* this.scheduler.attach();
-          return yield* this.scheduler.snapshot();
-        }.bind(this),
+  private recordClosed(record: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    const execution = record.attempt.execution;
+    if (execution === undefined) return Effect.void;
+    return effect("record Worker closure", () => {
+      this.store.checkpointAttempt(this.owner, record.id, {
+        ...record.attempt,
+        execution: { ...execution, closedAt: now() },
+      });
+    });
+  }
+
+  private closeObservedWorker(
+    record: AttemptRecord,
+    observation: Exclude<WorkerObservation, { readonly state: "absent" }>,
+  ): Effect.Effect<"absent" | "present", RuntimeError> {
+    const request = this.workerRequest(record);
+    return this.herdr.closeObservedWorker(request, observation).pipe(
+      Effect.mapError(
+        (cause) =>
+          new RuntimeError({
+            operation: cause.operation,
+            message: `${cause.message} ${workerObservationDetail(observation)} Close will not be repeated.`,
+          }),
       ),
     );
+  }
 
-  /** Restrict one driver dispatch to its exact Attempt. */
-  private controlFor(
-    key: AttemptKey,
-  ): Effect.Effect<ReconciliationControl, ReconciliationControlError, FileSystem.FileSystem> {
-    return this.serialized(this.contextFor(key)).pipe(
-      Effect.map((initialContext) => {
-        let context = initialContext;
-        return {
-          context: () => context,
-          checkOwnership: this.fence().pipe(
-            Effect.mapError((error) => controlError(errorMessage(error), error)),
-          ),
-          commit: (mutation: ReconciliationMutation) =>
-            this.controlCommit(key, mutation).pipe(
-              Effect.tap((result) =>
-                Effect.sync(() => {
-                  if (result.kind === "committed") context = result.receipt.context;
-                }),
+  private reconcileOutput(record: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    if (record.attempt.base.kind !== "repository") return Effect.void;
+    const operation = this.repositoryOperation(record);
+    const output = record.attempt.output;
+    const action =
+      output?.kind === "applying"
+        ? prepareApplication(operation).pipe(
+            Effect.flatMap((attempt) =>
+              effect("checkpoint application plan", () =>
+                this.store.checkpointAttempt(this.owner, record.id, attempt),
               ),
             ),
-        };
-      }),
-      Effect.mapError((error) => controlError(errorMessage(error), error)),
+            Effect.flatMap((checkpoint) =>
+              applyOutput(this.repositoryOperation(checkpoint), now()),
+            ),
+          )
+        : output?.kind === "discarding"
+          ? discardOutput(operation, now())
+          : output?.kind === "applied" &&
+              output.cleanupTip !== undefined &&
+              !this.store.hasUnclassifiedIntegrationChild(record.id)
+            ? cleanupAppliedOutput(operation)
+            : output === undefined
+              ? classifyOutput(operation, now())
+              : Effect.succeed(record.attempt);
+    return action.pipe(
+      Effect.flatMap((attempt) =>
+        effect("checkpoint repository output", () => {
+          this.store.checkpointAttempt(this.owner, record.id, attempt);
+        }),
+      ),
+      Effect.mapError((cause) => runtimeError("reconcile repository output", cause)),
     );
   }
 
-  /** Exact-key context assembled from one Attempt and explicitly referenced records. */
-  private contextFor(key: AttemptKey): WorkstreamRuntimeEffect<ReconciliationContext> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const records = yield* this.store.readAttempt(key.taskId, key.attemptId);
-        const { attempts: _attempts, ...contract } = records.task;
-        const context: WritableContext = {
-          workstreamId: records.workstreamId,
-          repository: records.repository,
-          intent: { index: records.task.intentIndex, value: records.intent },
-          task: contract,
-          attempt: records.attempt,
-        };
-        if (records.task.kind === "review")
-          context.reviewInput = yield* this.resolveReviewInput(records.task.subject);
-        const continuation = records.attempt.continuationOf;
-        if (continuation !== undefined) {
-          const parent = yield* this.store.readAttempt(records.task.id, continuation);
-          const sessionFile = parent.attempt.execution?.sessionFile;
-          if (sessionFile !== undefined) context.continuationSessionFile = sessionFile;
-        }
-        return structuredClone(context);
-      }.bind(this),
-    );
+  private observeWorker(record: AttemptRecord): Effect.Effect<WorkerObservation, RuntimeError> {
+    const request = this.workerRequest(record);
+    return this.herdr
+      .observeWorker(request)
+      .pipe(Effect.mapError((cause) => runtimeError(cause.operation, cause)));
   }
 
-  private resolveReviewInput(
-    subject: Extract<Task, { kind: "review" }>["subject"],
-  ): WorkstreamRuntimeEffect<ResolvedReviewInput> {
-    switch (subject.kind) {
-      case "revision":
-        return Effect.succeed({ kind: "revision", revision: subject.revision });
-      case "outcome":
-        return this.store
-          .readOutcome(subject.outcomeId)
-          .pipe(Effect.map((outcome) => ({ kind: "outcome" as const, outcome })));
-      case "comparison":
-        return Effect.forEach(subject.outcomeIds, (id) => this.store.readOutcome(id)).pipe(
-          Effect.map((outcomes) => ({ kind: "comparison" as const, outcomes })),
-        );
-      case "artifact":
-        return Effect.flatMap(this.store.readOutcome(subject.outcomeId), (outcome) => {
-          const artifact = outcome.artifacts.find(
-            (item) => item.id === subject.artifactId && item.retention === "retained",
-          );
-          return artifact === undefined
-            ? Effect.fail(
-                new WorkstreamRuntimeOperationError({
-                  operation: "resolve review input",
-                  message: `Review subject references an artifact that is not retained: ${subject.artifactId}.`,
-                }),
-              )
-            : Effect.succeed({ kind: "artifact" as const, outcome, artifact });
-        });
-    }
+  private workerRequest(record: AttemptRecord): HerdrLaunchRequest {
+    const context = this.workerContext(record, this.store.readTask(record.taskId));
+    const sessionFile = record.attempt.execution?.sessionFile;
+    if (sessionFile === undefined)
+      throw new RuntimeError({
+        operation: "observe Worker",
+        message: "Attempt has no durable Worker session identity.",
+      });
+    return this.herdrRequest(context, sessionFile);
   }
 
-  /** Commit one driver mutation; durable no-ops do not wake reconciliation. */
-  private controlCommit(
-    key: AttemptKey,
-    mutation: ReconciliationMutation,
-  ): Effect.Effect<ReconciliationCommit, ReconciliationControlError, FileSystem.FileSystem> {
-    const effect = Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const beforeRevision = yield* this.store.readRevision();
-        const now = yield* this.now();
-        const committed = yield* this.authoritative(
-          "apply workstream reconciliation mutation",
-          (expected) => applyReconciliationMutation(expected, key, mutation, now),
-          { kind: "attempt", key },
-        );
-        if (committed.revision === beforeRevision) return { kind: "no_change" } as const;
-        yield* this.notifyCommitted(committed, [key]);
-        return {
-          kind: "committed",
-          receipt: {
-            key,
-            revision: committed.revision,
-            context: yield* this.contextFor(key),
-          },
-        } as const;
-      }.bind(this),
-    );
-    return this.serialized(effect).pipe(
-      Effect.mapError((error) => controlError(errorMessage(error), error)),
-    );
-  }
-
-  /** The single idempotent close boundary for explicit shutdown. */
-  readonly close = (): Effect.Effect<void, WorkstreamRuntimeError> => this.closeEffect();
-
-  readonly awaitClosed = (): Effect.Effect<void, WorkstreamRuntimeError> =>
-    Deferred.await(this.completion);
-
-  private fencedRead(): Effect.Effect<Workstream, WorkstreamStoreError, FileSystem.FileSystem> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        return yield* this.store.read();
-      }.bind(this),
-    );
-  }
-
-  private enqueueEffect(
-    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the workstream TypeBox schema.
-    command: unknown,
-  ): Effect.Effect<Workstream, WorkstreamRuntimeError, FileSystem.FileSystem> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const decoded = yield* this.try("decode workstream Task enqueue", () =>
-          decodeEnqueue(command),
-        );
-        const policy = yield* this.policy();
-        const plan = yield* this.try("plan workstream Task enqueue", () =>
-          planEnqueue(decoded, policy),
-        );
-        const context = yield* this.enqueueState(decoded);
-        if (yield* this.store.taskExists(plan.taskId))
-          return yield* new WorkstreamRuntimeOperationError({
-            operation: "enqueue workstream Task",
-            message: `Task ${plan.taskId} already exists.`,
-          });
-        const facts = yield* enqueueFacts(context, decoded, this.acquisition.commands?.git);
-        const now = yield* this.now();
-        const attemptIds = Array.from(
-          { length: plan.attemptCount },
-          () => `attempt-${randomUUID()}`,
-        );
-        const task = yield* this.try("enqueue workstream Task", () =>
-          plan.materialize(attemptIds, now, context.planning.currentIntentIndex, facts),
-        );
-        const revision = yield* this.store.mutateRecords(
-          this.acquisition.coordinator,
-          context.planning.revision,
-          { kind: "create_task", task, updatedAt: now },
-        );
-        if (revision !== context.planning.revision + 1)
-          return yield* staleError("enqueue workstream Task");
-        yield* this.publishPresentation();
-        const committed = yield* this.keyedState(attemptIds[0] ?? "");
-        yield* this.notifyCommitted(
-          committed,
-          attemptIds.map((attemptId) => ({ taskId: plan.taskId, attemptId })),
-        );
-        return committed;
-      }.bind(this),
-    );
-  }
-
-  private appendEffect(
-    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Queue commands are external boundary values validated by the workstream TypeBox schema.
-    command: unknown,
-  ): Effect.Effect<Workstream, WorkstreamRuntimeError, FileSystem.FileSystem> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const decoded = yield* this.try("decode workstream append command", () =>
-          decodeAppend(command),
-        );
-        const policy = yield* this.policy();
-        const context = yield* this.appendState(decoded);
-        const resolved = yield* this.try("resolve workstream append plan", () => {
-          const task = context.tasks.find((item) => item.id === decoded.taskId);
-          if (task === undefined) throw new Error(`Unknown Task ${decoded.taskId}.`);
-          return planAppend(decoded, task, policy);
-        });
-        const facts = yield* appendFacts(context, decoded, this.acquisition.commands?.git);
-        const now = yield* this.now();
-        const attemptIds = Array.from(
-          { length: resolved.attemptCount },
-          () => `attempt-${randomUUID()}`,
-        );
-        const attempts = yield* this.try("append workstream Attempts", () =>
-          resolved.materialize(attemptIds, now, facts),
-        );
-        const revision = yield* this.store.mutateRecords(
-          this.acquisition.coordinator,
-          context.planning.revision,
-          { kind: "append_attempts", taskId: decoded.taskId, attempts, updatedAt: now },
-        );
-        if (revision !== context.planning.revision + 1)
-          return yield* staleError("append workstream Attempts");
-        yield* this.publishPresentation();
-        const committed = yield* this.keyedState(attemptIds[0] ?? "");
-        yield* this.notifyCommitted(
-          committed,
-          attemptIds.map((attemptId) => ({ taskId: decoded.taskId, attemptId })),
-        );
-        return committed;
-      }.bind(this),
-    );
-  }
-
-  private enqueueState(
-    command: WorkstreamEnqueueCommand,
-  ): WorkstreamRuntimeEffect<QueuePlanningContext> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const planning = yield* this.store.readPlanningRecords();
-        const tasks: Task[] = [];
-        const candidate = candidateAttempt(command);
-        if (candidate !== undefined) {
-          const parent = yield* this.store.readAttempt(undefined, candidate);
-          tasks.push(parent.task);
-        }
-        for (const id of reviewOutcomes(command)) {
-          const records = yield* this.store.readAttemptForOutcome(id);
-          yield* this.store.readOutcome(id);
-          const existing = tasks.find((task) => task.id === records.task.id);
-          if (existing === undefined) tasks.push(records.task);
-          else if (!existing.attempts.some((attempt) => attempt.id === records.attempt.id))
-            existing.attempts.push(records.attempt);
-        }
-        return { planning, tasks };
-      }.bind(this),
-    );
-  }
-
-  private appendState(
-    command: WorkstreamAppendCommand,
-  ): WorkstreamRuntimeEffect<QueuePlanningContext> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const planning = yield* this.store.readPlanningRecords();
-        const tasks = [yield* this.store.readTask(command.taskId)];
-        if (command.candidateOf !== undefined) {
-          const parent = yield* this.store.readAttempt(undefined, command.candidateOf);
-          const existing = tasks.find((task) => task.id === parent.task.id);
-          if (existing === undefined) tasks.push(parent.task);
-          else if (!existing.attempts.some((attempt) => attempt.id === parent.attempt.id))
-            existing.attempts.push(parent.attempt);
-        }
-        return { planning, tasks };
-      }.bind(this),
-    );
-  }
-
-  private outputControl(ports: WorkstreamCommandPorts) {
+  private herdrRequest(context: WorkerContext, sessionFile: string): HerdrLaunchRequest {
     return {
-      state: (attemptId: string) => this.keyedState(attemptId),
-      commit: (operation: string, key: AttemptKey, plan: (state: Workstream) => Workstream) =>
-        Effect.tap(this.authoritative(operation, plan, { kind: "attempt", key }), (committed) =>
-          this.notifyCommitted(committed, [key]),
-        ),
-      fence: this.fence(),
-      now: this.now(),
-      ports,
+      workspaceId: this.owner.workspaceId,
+      runId: context.workstreamId,
+      nodeId: context.attemptId,
+      attemptId: context.attemptId,
+      assignmentId: context.taskId,
+      objective: context.objective.content,
+      role: herdrRole(context.role),
+      cwd: context.cwd,
+      sessionFile,
+      environment: {
+        PI_WORKGRAPH_ROLE: context.role,
+        PI_CODING_AGENT_DIR: this.agentDir,
+      },
+      model: context.target.model,
+      thinking: context.target.thinking,
     };
   }
 
-  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Called only from the schema-owning public steering boundary.
-  private steerEffect(command: unknown): WorkstreamRuntimeEffect<Workstream> {
-    return Effect.gen(
+  private workerContext(attempt: AttemptRecord, task: TaskRecord): WorkerContext {
+    const target = task.task.target;
+    const cwd =
+      target.kind === "directory" ? target.path : this.repositoryOperation(attempt).worktreePath;
+    const role = task.task.contract.kind;
+    const intent = this.store.readIntent(task.intentIndex);
+    const modelTarget =
+      attempt.attempt.selection.kind === "implementation"
+        ? attempt.attempt.selection.guide
+        : attempt.attempt.selection.target;
+    return {
+      workstreamId: this.store.id,
+      attemptId: attempt.id,
+      taskId: task.id,
+      cwd,
+      target: modelTarget,
+      role,
+      objective: this.workerObjective(task, attempt, role, intent.intent),
+    };
+  }
+
+  private workerObjective(
+    task: TaskRecord,
+    attempt: AttemptRecord,
+    role: WorkerRole,
+    intent: Intent,
+  ): WorkerObjective {
+    const objective = workerObjective(
+      this.store.id,
+      task.id,
+      attempt.id,
+      role,
+      intent,
+      task.task.contract,
+      attempt.attempt,
+    );
+    if (task.task.contract.kind !== "review") return objective;
+    const ids =
+      task.task.contract.subject.kind === "outcome"
+        ? [task.task.contract.subject.outcomeId]
+        : task.task.contract.subject.kind === "comparison"
+          ? task.task.contract.subject.outcomeIds
+          : [];
+    const sources = ids.map((id) => {
+      const outcome = this.store.readOutcomeById(id);
+      const sourceAttempt = this.store.readAttempt(outcome.attemptId);
+      const sourceTask = this.store.readTask(sourceAttempt.taskId);
+      const summary =
+        outcome.outcome.result.kind === "reported"
+          ? outcome.outcome.result.report.summary
+          : outcome.outcome.result.reason;
+      return `Review source Outcome ${id}: summary=${JSON.stringify(summary)} task=${sourceTask.id} target=${JSON.stringify(sourceTask.task.target)} session=${sourceAttempt.attempt.execution?.sessionFile ?? "none"} revision=${sourceAttempt.attempt.output?.kind === "retained" ? sourceAttempt.attempt.output.tip : sourceAttempt.attempt.base.kind === "repository" ? sourceAttempt.attempt.base.baseCommit : "none"}`;
+    });
+    return { ...objective, content: [...objective.content.split("\n"), ...sources].join("\n") };
+  }
+
+  private reconciliation(): Effect.Effect<never, never> {
+    const tick = Effect.gen(
       function* (this: WorkstreamRuntime) {
-        const input = yield* this.try("decode steering command", () =>
-          decodeCommand<{ attemptId: string; instruction: string }>(
-            SteerCommandSchema,
-            command,
-            "steering command",
-          ),
+        const unsettled = yield* this.serialized("read unsettled records", () =>
+          this.store.unsettled(),
         );
-        const ports = yield* this.commandPorts();
-        const initial = yield* this.keyedState(input.attemptId);
-        const located = yield* this.try("resolve steering Attempt", () =>
-          exactAttempt(initial, input.attemptId),
+        this.blockers.delete("runtime");
+        const tickAt = yield* Clock.currentTimeMillis;
+        for (const item of unsettled) {
+          const prior = this.blockers.get(item.attempt.id);
+          if (prior !== undefined && prior.retryAt > tickAt) continue;
+          const result = yield* Effect.result(
+            this.serializedEffect("reconcile Attempt", this.reconcileAttempt(item.attempt.id)),
+          );
+          if (result._tag === "Success") this.blockers.delete(item.attempt.id);
+          else {
+            const failures = (prior?.failures ?? 0) + 1;
+            const delay = Math.min(30_000, 1_000 * 2 ** Math.min(failures - 1, 5));
+            this.blockers.set(item.attempt.id, {
+              detail: result.failure.message,
+              failures,
+              retryAt: tickAt + delay,
+            });
+          }
+        }
+        yield* Queue.take(this.wakeQueue).pipe(
+          Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.void }),
         );
-        const currentSteering = located.attempt.execution?.steering;
-        if (currentSteering?.state === "submitted" && currentSteering.text === input.instruction)
-          return initial;
-        if (currentSteering?.state === "uncertain")
-          return yield* new WorkstreamCommandError({
-            operation: "steer Worker",
-            message: `Attempt ${input.attemptId} has an uncertain steering delivery; inspect before any resend.`,
+      }.bind(this),
+    ).pipe(
+      Effect.catch((failure) =>
+        Effect.sync(() => {
+          this.blockers.set("runtime", {
+            detail: failure.message,
+            failures: 1,
+            retryAt: 0,
           });
-        const identity = yield* this.try("resolve ready Worker", () =>
-          workerIdentity(located.attempt),
-        );
-        const now = yield* this.now();
-        yield* this.authoritative(
-          "checkpoint uncertain steering",
-          (state) =>
-            recordWorkerExecution(
-              state,
-              located.key,
-              { steering: { text: input.instruction, state: "uncertain", observedAt: now } },
-              now,
-            ),
-          { kind: "attempt", key: located.key },
-        );
-        yield* this.fence();
-        yield* ports.workers.steer(identity, input.instruction);
-        const submittedAt = yield* this.now();
-        const committed = yield* this.authoritative(
-          "checkpoint submitted steering",
-          (state) =>
-            recordWorkerExecution(
-              state,
-              located.key,
-              {
-                steering: { text: input.instruction, state: "submitted", observedAt: submittedAt },
-              },
-              submittedAt,
-            ),
-          { kind: "attempt", key: located.key },
-        );
-        yield* this.notifyCommitted(committed, [located.key]);
-        return committed;
-      }.bind(this),
+        }).pipe(Effect.andThen(Effect.sleep(1_000))),
+      ),
     );
+    return Effect.forever(tick);
   }
 
-  private keyedState(attemptId: string): WorkstreamRuntimeEffect<Workstream> {
-    return this.store
-      .readAttempt(undefined, attemptId)
-      .pipe(Effect.map((records) => partialWorkstream(records, this.acquisition.coordinator)));
-  }
-
-  /** Direct fence for code already holding the sole runtime Semaphore. */
-  private fence(): Effect.Effect<void, WorkstreamRuntimeIdentityError> {
-    return Effect.suspend(() =>
-      this.acquisition.owns === undefined || this.acquisition.owns()
-        ? Effect.void
-        : Effect.fail(
-            new WorkstreamRuntimeIdentityError({
-              message: "Workstream runtime is no longer the active controller instance.",
-            }),
-          ),
-    );
-  }
-
-  private commandPorts(): Effect.Effect<WorkstreamCommandPorts, WorkstreamRuntimeOperationError> {
-    return this.acquisition.commands === undefined
-      ? Effect.fail(
-          new WorkstreamRuntimeOperationError({
-            operation: "workstream explicit command",
-            message: "Workstream explicit command host ports are unavailable.",
-          }),
-        )
-      : Effect.succeed(this.acquisition.commands);
-  }
-
-  /** Commit one planned domain mutation at the current record revision. */
-  private authoritative(
-    operation: string,
-    plan: (expected: Workstream) => Workstream,
-    records: RecordPlan,
-  ): Effect.Effect<Workstream, WorkstreamRuntimeError, FileSystem.FileSystem> {
-    return Effect.gen(
-      function* (this: WorkstreamRuntime) {
-        const current =
-          records.kind === "attempt"
-            ? partialWorkstream(
-                yield* this.store.readAttempt(records.key.taskId, records.key.attemptId),
-                this.acquisition.coordinator,
-              )
-            : records.current;
-        if (this.closed) return yield* stoppedError();
-        const expectedRevision = current.revision;
-        const next = yield* this.try(operation, () => plan(current));
-        if (Value.Equal(current, next)) return structuredClone(current);
-        const mutation = yield* this.try(operation, () => recordMutation(current, next, records));
-        const revision = yield* this.store.mutateRecords(
-          this.acquisition.coordinator,
-          expectedRevision,
-          mutation,
+  private deliver(record: OutcomeRecord): Effect.Effect<void, RuntimeError> {
+    let current = record;
+    const delivered = Effect.result(
+      boundaryEffect("deliver Outcome", () => {
+        this.pi.sendMessage(
+          {
+            customType: "pi-workgraph-outcome",
+            content: `Workgraph Outcome ${current.id} for Attempt ${current.attemptId}: ${JSON.stringify(current.outcome.result)}`,
+            display: true,
+            details: { outcomeId: current.id, attemptId: current.attemptId },
+          },
+          { deliverAs: "followUp", triggerTurn: true },
         );
-        if (revision !== next.revision) return yield* staleError(operation);
-        yield* this.publishPresentation();
-        return structuredClone(next);
-      }.bind(this),
+      }),
     );
-  }
-
-  private publishPresentation(): Effect.Effect<void, never, FileSystem.FileSystem> {
-    const publish = this.acquisition.onPresentationChanged;
-    return publish === undefined
-      ? Effect.void
-      : this.store.readPresentation().pipe(Effect.flatMap(publish), Effect.ignoreCause);
-  }
-
-  private policy(): Effect.Effect<
-    ModelPolicy,
-    ModelPolicyError | PlatformError,
-    FileSystem.FileSystem
-  > {
-    return loadModelPolicyEffect(this.acquisition.policyPath);
-  }
-
-  /** Update reconciliation for only the Attempts changed by a commit. */
-  private notifyCommitted(committed: Workstream, keys: readonly AttemptKey[]): Effect.Effect<void> {
-    return this.scheduler.notifyCommitted(committed, keys);
-  }
-
-  private now(): Effect.Effect<string> {
-    return Clock.clockWith((clock) =>
-      Effect.sync(() => isoFromMillis(clock.currentTimeMillisUnsafe())),
-    );
-  }
-
-  private try<A>(
-    operation: string,
-    run: () => A,
-  ): Effect.Effect<A, WorkstreamRuntimeOperationError> {
-    return Effect.try({
-      try: run,
-      catch: (cause) =>
-        new WorkstreamRuntimeOperationError({
-          operation,
-          message: errorMessage(cause),
-          cause,
-        }),
+    const self = this;
+    return Effect.gen(function* () {
+      const result = yield* delivered;
+      const delivery =
+        result._tag === "Success"
+          ? { ...current.outcome.delivery, deliveredAt: now() }
+          : {
+              ...current.outcome.delivery,
+              failures: [
+                ...current.outcome.delivery.failures.slice(-4),
+                { at: now(), detail: result.failure.message },
+              ],
+            };
+      current = self.store.updateDelivery(self.owner, record.attemptId, delivery);
+      if (result._tag === "Failure") return yield* result.failure;
     });
   }
 
-  /** Serialize a command in the owned FiberSet so close interrupts and joins it. */
-  private serialized<A, E, R>(
-    effect: Effect.Effect<A, E, R>,
-  ): Effect.Effect<A, E | WorkstreamRuntimeStoppedError, R> {
-    return Effect.suspend(
-      function (this: WorkstreamRuntime) {
-        if (this.closed) return Effect.fail(stoppedError());
-        const run = Effect.gen(
-          function* (this: WorkstreamRuntime) {
-            const fiber = yield* FiberSet.run(
-              this.fibers,
-              Effect.exit(
-                this.semaphore.withPermit(
-                  Effect.suspend<A, E | WorkstreamRuntimeStoppedError, R>(() =>
-                    this.closed ? Effect.fail(stoppedError()) : effect,
-                  ),
-                ),
-              ),
-            );
-            const exit = yield* Fiber.join(fiber).pipe(
-              Effect.onInterrupt(() => Fiber.interrupt(fiber).pipe(Effect.asVoid)),
-            );
-            return yield* exit;
-          }.bind(this),
-        );
-        return run;
-      }.bind(this),
-    );
+  private wake(): Effect.Effect<void> {
+    return Queue.offer(this.wakeQueue, undefined).pipe(Effect.asVoid);
   }
-
-  private requestClose(fatal?: WorkstreamRuntimeError): Effect.Effect<void> {
-    return Effect.sync(() => {
-      this.closed = true;
-    }).pipe(Effect.andThen(Deferred.succeed(this.closeRequest, fatal)), Effect.asVoid);
+  private serialized<A>(operation: string, run: () => A): Effect.Effect<A, RuntimeError> {
+    return this.serializedEffect(operation, effect(operation, run));
   }
-
-  /** One uninterruptible claim closes resources and settles shared completion. */
-  private shutdown(): Effect.Effect<void, WorkstreamRuntimeError> {
-    const close: Effect.Effect<WorkstreamRuntimeError | undefined> = Effect.uninterruptible(
-      Effect.gen(
-        function* (this: WorkstreamRuntime) {
-          const owned = yield* Ref.getAndSet(this.shutdownClaimed, true);
-          if (owned) return undefined;
-          const fatal = yield* Deferred.await(this.closeRequest);
-          const exit = yield* Effect.exit(Scope.close(this.resourceScope, Exit.void));
-          const closeError = Exit.isFailure(exit) ? closeFailure(exit.cause) : undefined;
-          if (closeError === undefined) yield* Deferred.succeed(this.completion, undefined);
-          else yield* Deferred.fail(this.completion, closeError);
-          if (fatal === undefined) return undefined;
-          return closeError === undefined ? fatal : combineFatalClose(fatal, closeError);
-        }.bind(this),
+  private serializedEffect<A>(
+    operation: string,
+    value: Effect.Effect<A, RuntimeError>,
+  ): Effect.Effect<A, RuntimeError> {
+    if (this.closed)
+      return Effect.fail(new RuntimeError({ operation, message: "Runtime is closed." }));
+    return this.semaphore.withPermit(
+      value.pipe(
+        Effect.catchDefect((cause) =>
+          isExpectedError(cause) ? Effect.fail(runtimeError(operation, cause)) : Effect.die(cause),
+        ),
       ),
     );
-    return close.pipe(
-      Effect.tap((fatal) => (fatal === undefined ? Effect.void : this.report(fatal))),
-      Effect.andThen(Deferred.await(this.completion)),
-    );
-  }
-
-  private report(error: WorkstreamRuntimeError): Effect.Effect<void> {
-    const report = this.acquisition.onFatal;
-    return report === undefined ? Effect.void : report(error).pipe(Effect.ignoreCause);
-  }
-
-  private closeEffect(): Effect.Effect<void, WorkstreamRuntimeError> {
-    return this.requestClose().pipe(Effect.andThen(this.shutdown()));
   }
 }
 
-function candidateAttempt(command: WorkstreamEnqueueCommand): string | undefined {
-  return command.kind === "implementation" ? command.candidateOf : undefined;
-}
-
-function reviewOutcomes(command: WorkstreamEnqueueCommand): readonly string[] {
-  if (command.kind !== "review" || command.subject.kind === "revision") return [];
-  return command.subject.kind === "comparison"
-    ? command.subject.outcomeIds
-    : [command.subject.outcomeId];
-}
-
-function partialWorkstream(records: AttemptRecords, coordinator: CoordinatorIdentity): Workstream {
-  const intents = Array.from({ length: records.currentIntentIndex + 1 }, () =>
-    structuredClone(records.intent),
-  );
-  const value: WritableWorkstream = {
-    format: "pi-workgraph-workstream",
-    schemaVersion: 3,
-    revision: records.revision,
-    id: records.workstreamId,
-    purpose: records.intent.statement,
-    repository: structuredClone(records.repository),
-    coordinator: structuredClone(coordinator),
-    lifecycle: records.lifecycle,
-    intents,
-    tasks: [structuredClone(records.task)],
-    createdAt: records.attempt.createdAt,
-    updatedAt: records.attempt.updatedAt,
+function workerObjective(
+  workstreamId: string,
+  taskId: string,
+  attemptId: string,
+  role: WorkerRole,
+  intent: Intent,
+  contract: TaskContract,
+  attempt: Attempt,
+): WorkerObjective {
+  const lines = [
+    "[WORKGRAPH WORKER OBJECTIVE]",
+    `Intent: ${intent.statement}`,
+    ...intent.constraints.map((constraint) => `Constraint: ${constraint}`),
+  ];
+  if (contract.kind === "research") {
+    lines.push(`Question: ${contract.question}`);
+    lines.push(...contract.expectedEvidence.map((item) => `Expected evidence: ${item}`));
+  } else if (contract.kind === "experiment") {
+    lines.push(`Question: ${contract.question}`);
+    lines.push(...contract.expectedEvidence.map((item) => `Expected evidence: ${item}`));
+    lines.push(...contract.permittedEffects.map((item) => `Permitted effect: ${item}`));
+    lines.push(`Stop condition: ${contract.stopCondition}`);
+  } else if (contract.kind === "consultation") {
+    lines.push(`Question: ${contract.question}`);
+    if (contract.context !== undefined) lines.push(`Context: ${contract.context}`);
+  } else if (contract.kind === "implementation") {
+    lines.push(`Objective: ${contract.objective}`);
+    lines.push(...contract.acceptance.map((item) => `Acceptance: ${item}`));
+  } else {
+    lines.push(`Objective: ${contract.objective}`, `Concern: ${contract.concern}`);
+    lines.push(`Review subject: ${JSON.stringify(contract.subject)}`);
+  }
+  if (attempt.base.kind === "repository") lines.push(`Base revision: ${attempt.base.baseCommit}`);
+  if (attempt.lineage !== undefined)
+    lines.push(`Candidate facts: ${JSON.stringify(attempt.lineage)}`);
+  return {
+    content: lines.join("\n"),
+    details: {
+      workstreamId,
+      taskId,
+      attemptId,
+      role,
+      ...(attempt.selection.kind === "implementation"
+        ? { executor: attempt.selection.executor }
+        : {}),
+    },
   };
-  if (records.suspension !== undefined) value.suspension = structuredClone(records.suspension);
-  if (records.completion !== undefined) value.completion = structuredClone(records.completion);
-  return value;
 }
-
-function recordMutation(
-  current: Workstream,
-  next: Workstream,
-  plan: RecordPlan,
-): WorkstreamRecordMutation {
-  switch (plan.kind) {
-    case "attempt": {
-      const mutation: MutableAttemptMutation = {
-        kind: "update_attempt",
-        key: plan.key,
-        attempt: exactAttempt(next, plan.key.attemptId).attempt,
-        updatedAt: next.updatedAt,
-      };
-      if (next.completion !== undefined) {
-        const outcomeIds = new Set(
-          [
-            exactAttempt(current, plan.key.attemptId).attempt.outcome?.id,
-            exactAttempt(next, plan.key.attemptId).attempt.outcome?.id,
-          ].filter((id): id is string => id !== undefined),
-        );
-        mutation.completion =
-          current.completion === undefined
-            ? next.completion
-            : {
-                ...next.completion,
-                accounting: [
-                  ...current.completion.accounting.filter((item) =>
-                    "taskId" in item
-                      ? item.taskId !== plan.key.taskId || item.attemptId !== plan.key.attemptId
-                      : !outcomeIds.has(item.outcomeId),
-                  ),
-                  ...next.completion.accounting,
-                ],
-              };
-      }
-      return mutation;
-    }
-    case "lifecycle": {
-      const mutation: MutableLifecycleMutation = {
-        kind: "update_lifecycle",
-        lifecycle: next.lifecycle,
-        updatedAt: next.updatedAt,
-      };
-      if (next.suspension !== undefined) mutation.suspension = next.suspension;
-      if (next.completion !== undefined) mutation.completion = next.completion;
-      return mutation;
-    }
-  }
+function workerObservationDetail(
+  observation: Exclude<WorkerObservation, { readonly state: "absent" }>,
+): string {
+  const native = observation.state === "ready" ? observation.identity : observation.pane;
+  return `Exact resource workspace=${native.workspaceId} tab=${native.tabId} pane=${native.paneId}.`;
 }
-
-function planCancellation(
-  state: Workstream,
-  key: AttemptKey,
-  reason: string,
-  now: string,
-): Workstream {
-  const current = exactAttempt(state, key.attemptId).attempt;
-  if (current.state === "queued")
-    return terminalizeAttempt(
-      state,
-      key,
-      {
-        kind: "cancelled",
-        observedAt: now,
-        artifacts: [],
-        reason,
-        deliveryRequestedAt: now,
-      },
-      now,
-    );
-  if (current.state === "finished") {
-    if (current.outcome?.kind === "cancelled" && current.outcome.reason === reason) return state;
-    throw new Error(`Attempt ${key.attemptId} is already finished.`);
-  }
-  const existing = current.execution?.cancellation;
-  if (existing !== undefined) {
-    if (existing.reason === reason) return state;
-    throw new Error(`Attempt ${key.attemptId} has a conflicting cancellation request.`);
-  }
-  return checkpointCancellation(state, key, { state: "requested", requestedAt: now, reason }, now);
-}
-
-/** A mutable context shape so optional facts are added only when present. */
-type WritableContext = {
-  -readonly [Key in keyof ReconciliationContext]: ReconciliationContext[Key];
-};
-
-function applyReconciliationMutation(
-  workstream: Workstream,
-  key: AttemptKey,
-  mutation: ReconciliationMutation,
-  now: string,
-): Workstream {
-  switch (mutation.kind) {
-    case "activate":
-      return activateAttempt(workstream, key, now, {
-        placement: mutation.placement,
-        submission: "not_sent",
-      });
-    case "record_worker_execution":
-      return recordWorkerExecution(workstream, key, mutation.execution, now);
-    case "record_effective_model":
-      return recordEffectiveModel(workstream, key, mutation.observation, now);
-    case "checkpoint_cancellation":
-      return checkpointCancellation(workstream, key, mutation.checkpoint, now);
-    case "checkpoint_cleanup":
-      return checkpointCleanup(workstream, key, mutation.checkpoint, now);
-    case "terminalize":
-      return terminalizeAttempt(workstream, key, mutation.observation, now);
-    case "record_delivery_failure":
-      return recordDeliveryFailure(workstream, key, { at: now, detail: mutation.detail }, now);
-    case "record_delivery_success":
-      return recordDeliverySuccess(workstream, key, now, now);
-  }
-}
-
-function controlError(detail: string, cause?: unknown): ReconciliationControlError {
-  return new ReconciliationControlError(cause === undefined ? { detail } : { detail, cause });
-}
-
-function sameCoordinator(left: CoordinatorIdentity, right: CoordinatorIdentity): boolean {
-  return left.sessionId === right.sessionId && left.sessionFile === right.sessionFile;
-}
-
-function stoppedError(): WorkstreamRuntimeStoppedError {
-  return new WorkstreamRuntimeStoppedError({ message: STOPPED_MESSAGE });
-}
-
-function staleError(operation: string): WorkstreamRuntimeStaleError {
-  return new WorkstreamRuntimeStaleError({
-    operation,
-    message: `${operation} planned from revision that no longer matches authoritative records; inspect or reconcile before retrying.`,
+function selectedModels(attempt: Attempt): ModelTarget[] {
+  const selected =
+    attempt.selection.kind === "target"
+      ? [attempt.selection.target]
+      : [attempt.selection.guide, attempt.selection.executor];
+  const seen = new Set<string>();
+  return selected.filter((target) => {
+    const key = `${target.model}\0${target.thinking}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
   });
 }
-
-function closeFailure(cause: Cause.Cause<unknown>): WorkstreamRuntimeOperationError {
-  return new WorkstreamRuntimeOperationError({
-    operation: "close workstream runtime",
-    message: "Failed to close the workstream runtime.",
-    cause: Cause.squash(cause),
+function outcomeFor(
+  result: Outcome["result"],
+  effectiveModels: readonly ModelTarget[],
+  observedAt: string,
+): Outcome {
+  if (effectiveModels.length === 0)
+    throw new RuntimeError({
+      operation: "record Outcome",
+      message: "No exact effective Worker model was observed.",
+    });
+  return {
+    result,
+    effectiveModels: [...effectiveModels],
+    delivery: { requestedAt: observedAt, failures: [] },
+    observedAt,
+  };
+}
+function runtimeError(operation: string, cause: unknown): RuntimeError {
+  return cause instanceof RuntimeError
+    ? cause
+    : new RuntimeError({ operation, message: message(cause) });
+}
+function isExpectedError(
+  cause: unknown,
+): cause is RuntimeError | StoreError | GitError | HerdrError {
+  return (
+    cause instanceof RuntimeError ||
+    cause instanceof StoreError ||
+    cause instanceof GitError ||
+    cause instanceof HerdrError
+  );
+}
+function effect<A>(operation: string, run: () => A): Effect.Effect<A, RuntimeError> {
+  return Effect.try({
+    try: run,
+    catch: (cause) => {
+      if (isExpectedError(cause)) return runtimeError(operation, cause);
+      throw cause;
+    },
   });
 }
-
-/** Preserve both a fatal runtime episode and a close failure. */
-function combineFatalClose(
-  fatal: WorkstreamRuntimeError,
-  closeError: WorkstreamRuntimeOperationError,
-): WorkstreamRuntimeError {
-  return new WorkstreamRuntimeOperationError({
-    operation: "close workstream runtime after fatal failure",
-    message: "Workstream runtime failure and close failure.",
-    cause: new AggregateError([fatal, closeError]),
+function boundaryEffect<A>(operation: string, run: () => A): Effect.Effect<A, RuntimeError> {
+  return Effect.try({
+    try: run,
+    catch: (cause) => runtimeError(operation, cause),
   });
 }
-
-function isoFromMillis(millis: number): string {
-  return DateTime.toDate(DateTime.makeUnsafe(millis)).toISOString();
+function herdrRole(role: WorkerRole): import("../herdr-naming.js").WorkerRole {
+  return role === "implementation" ? "implement" : role === "experiment" ? "research" : role;
 }
-
-function errorMessage(cause: unknown): string {
-  return cause instanceof Error ? cause.message.slice(0, 300) : "unspecified failure";
+function sameOwner(left: CoordinatorOwner, right: CoordinatorOwner): boolean {
+  return (
+    left.sessionId === right.sessionId &&
+    left.sessionFile === right.sessionFile &&
+    left.workspaceId === right.workspaceId &&
+    left.tabId === right.tabId
+  );
+}
+function now(): string {
+  return DateTime.formatIso(DateTime.nowUnsafe());
+}
+function message(cause: unknown): string {
+  return cause instanceof StoreError || cause instanceof Error
+    ? cause.message
+    : "Operation failed.";
 }

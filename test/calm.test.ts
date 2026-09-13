@@ -1062,8 +1062,8 @@ void test("Calm on projects the chat while shutdown restores native presentation
 
 void test("coordinator scope and activity state remain unchanged", () => {
   assert.equal(isCoordinatorScope({}), true);
-  assert.equal(isCoordinatorScope({ PI_WORKGRAPH_MODE: "" }), true);
-  assert.equal(isCoordinatorScope({ PI_WORKGRAPH_MODE: "implementation" }), false);
+  assert.equal(isCoordinatorScope({ PI_WORKGRAPH_ROLE: "" }), true);
+  assert.equal(isCoordinatorScope({ PI_WORKGRAPH_ROLE: "implementation" }), false);
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 0 }), false);
   assert.equal(isCalmActivityActive({ coordinatorActive: true, activeWorkers: 0 }), true);
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 2 }), true);
