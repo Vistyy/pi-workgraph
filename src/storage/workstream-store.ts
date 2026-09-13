@@ -287,6 +287,13 @@ export class WorkstreamStore {
         throw failure("create Task and Attempt", "Completed Workstreams reject new work.");
       decode(TaskSchema, task, "Task");
       decode(AttemptSchema, attempt, "Attempt");
+      if (task.contract.kind === "review" && task.contract.subject.kind !== "revision") {
+        const outcomeIds =
+          task.contract.subject.kind === "outcome"
+            ? [task.contract.subject.outcomeId]
+            : task.contract.subject.outcomeIds;
+        for (const outcomeId of outcomeIds) this.readOutcomeById(outcomeId);
+      }
       if (this.readLatestIntent().index !== intentIndex)
         throw failure("create Task and Attempt", "Task must bind to the latest Intent.");
       const taskIndex = this.nextIndex("tasks", "task_index");
@@ -379,6 +386,42 @@ export class WorkstreamStore {
       const task = this.readTask(attempt.taskId);
       decodeOutcome(outcome, task.task);
       const index = this.nextIndex("outcomes", "outcome_index");
+      this.database
+        .prepare(
+          "INSERT INTO outcomes(outcome_index,outcome_id,attempt_id,outcome_json) VALUES(?,?,?,?)",
+        )
+        .run(index, id, attemptId, json(outcome));
+      this.touch(outcome.observedAt);
+      return { index, id, attemptId, outcome };
+    });
+  }
+
+  settleCancellation(
+    owner: CoordinatorOwner,
+    id: string,
+    attemptId: string,
+    attempt: Attempt,
+    outcome: Outcome,
+  ): OutcomeRecord {
+    return this.transaction("settle cancellation", () => {
+      this.requireOwner(owner);
+      decode(AttemptSchema, attempt, "Attempt");
+      const prior = this.readAttempt(attemptId);
+      if (
+        json({ ...prior.attempt, execution: undefined, output: undefined }) !==
+        json({ ...attempt, execution: undefined, output: undefined })
+      )
+        throw failure("settle cancellation", "Immutable Attempt facts changed.");
+      if (attempt.execution?.cancellation === undefined || attempt.execution.closedAt === undefined)
+        throw failure("settle cancellation", "Cancellation closure facts are incomplete.");
+      const task = this.readTask(prior.taskId);
+      decodeOutcome(outcome, task.task);
+      if (outcome.result.kind !== "cancelled")
+        throw failure("settle cancellation", "Outcome is not cancelled.");
+      const index = this.nextIndex("outcomes", "outcome_index");
+      this.database
+        .prepare("UPDATE attempts SET attempt_json=? WHERE attempt_id=?")
+        .run(json(attempt), attemptId);
       this.database
         .prepare(
           "INSERT INTO outcomes(outcome_index,outcome_id,attempt_id,outcome_json) VALUES(?,?,?,?)",

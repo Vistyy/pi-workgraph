@@ -56,8 +56,12 @@ export function herdrWorkerName(request: WorkerNamingContext): string {
 export function herdrWorkerTabLabel(request: WorkerNamingContext): string {
   const role = request.role ?? "research";
   const prefix = `${WORKER_TAB_PREFIX}[${WORKER_TAB_ROLE_MARKERS[role]}] `;
-  const subject = boundAtWord(workerSubject(request), WORKER_TAB_LABEL_LIMIT - prefix.length);
-  return `${prefix}${subject}`;
+  const suffix = identitySuffix(workerIdentity(request), IDENTITY_SUFFIX_LENGTH);
+  const subject = boundAtWord(
+    workerSubject(request),
+    WORKER_TAB_LABEL_LIMIT - prefix.length - suffix.length - 1,
+  );
+  return `${prefix}${subject || "task"}-${suffix}`;
 }
 
 export function herdrCoordinatorNames(request: CoordinatorNamingContext) {

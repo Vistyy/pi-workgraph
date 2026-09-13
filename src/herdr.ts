@@ -64,6 +64,33 @@ const AgentListResponseSchema = Type.Object({
     agents: Type.Array(ListedAgentSchema),
   }),
 });
+const TabListResponseSchema = Type.Object({
+  result: Type.Object({
+    type: Type.Optional(Type.String()),
+    tabs: Type.Array(
+      Type.Object({
+        tab_id: NonBlank,
+        workspace_id: NonBlank,
+        label: Type.Optional(NonBlank),
+      }),
+    ),
+  }),
+});
+const PaneListResponseSchema = Type.Object({
+  result: Type.Object({
+    type: Type.Optional(Type.String()),
+    panes: Type.Array(
+      Type.Object({
+        workspace_id: NonBlank,
+        tab_id: NonBlank,
+        pane_id: NonBlank,
+        terminal_id: NonBlank,
+        cwd: NonBlank,
+        name: Type.Optional(NonBlank),
+      }),
+    ),
+  }),
+});
 const TabCreateResponseSchema = Type.Object({
   result: Type.Object({
     type: Type.Optional(Type.String()),
@@ -98,6 +125,7 @@ const NOT_FOUND = Symbol("HerdrNotFound");
 
 type AgentStatus = Static<typeof AgentStatusSchema>;
 type NativeAgent = Static<typeof AgentSchema>;
+type ListedAgent = Static<typeof ListedAgentSchema>;
 type CommandOptions = { readonly timeout?: number; readonly notFound?: readonly string[] };
 interface CommandResult {
   readonly code: number;
@@ -146,6 +174,15 @@ interface HerdrObservation {
   readonly status: AgentStatus;
   readonly observedAt: string;
 }
+export type WorkerObservation =
+  | ({ readonly state: "ready" } & HerdrObservation)
+  | {
+      readonly state: "partial";
+      readonly pane: WorkerPane;
+      readonly observedAt: string;
+      readonly detail: string;
+    }
+  | { readonly state: "absent"; readonly observedAt: string };
 export type HerdrInspection =
   | HerdrObservation
   | { readonly identity: WorkerIdentity; readonly status: "absent"; readonly observedAt: string };
@@ -281,58 +318,102 @@ export class HerdrCliRuntime {
     );
   }
 
-  /** Recover an exact agent after its pane was durably checkpointed. */
-  recoverWorker(
-    pane: WorkerPane,
-    sessionFile: string,
-  ): Effect.Effect<HerdrInspection | undefined, HerdrError> {
+  /** Derive current Worker identity from Herdr-owned native facts. */
+  observeWorker(request: HerdrLaunchRequest): Effect.Effect<WorkerObservation, HerdrError> {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
-        const response = yield* this.command(["agent", "list"], AgentListResponseSchema);
-        if (response === NOT_FOUND)
+        yield* this.requireAvailable();
+        const listed = yield* this.command(["agent", "list"], AgentListResponseSchema);
+        if (listed === NOT_FOUND)
           return yield* this.failure(
             "agent list",
             "Herdr reported an impossible not-found result.",
           );
-        const inPane = response.result.agents.filter((agent) => agent.pane_id === pane.paneId);
-        if (inPane.length === 0) return undefined;
-        if (inPane.length !== 1)
-          return yield* this.failure(
-            "agent list",
-            "Checkpointed Worker pane has ambiguous agents.",
-          );
-        const agent = inPane[0];
-        if (
-          agent === undefined ||
-          agent.name !== pane.agentName ||
-          agent.cwd !== pane.cwd ||
-          agent.agent_session?.value !== sessionFile
-        )
-          return yield* this.failure(
-            "agent list",
-            "Checkpointed Worker pane contains a foreign or incomplete agent identity.",
-          );
-        const observation = exactObservation(
-          { ...pane, sessionFile },
-          { ...agent, name: agent.name, agent_session: agent.agent_session },
+        const sessionAgents = listed.result.agents.filter(
+          (agent) => agent.agent_session?.value === request.sessionFile,
         );
-        return observation instanceof HerdrError ? yield* observation : observation;
+        const ready = sessionAgentObservation(request, sessionAgents);
+        if (ready instanceof HerdrError) return yield* ready;
+        return ready ?? (yield* this.observePartialWorker(request, listed.result.agents));
       }.bind(this),
     );
   }
 
-  /** Close a checkpointed owned tab before an agent terminal identity exists. */
-  closeWorkerPane(pane: WorkerPane): Effect.Effect<"absent" | "present" | "unknown", HerdrError> {
+  private observePartialWorker(
+    request: HerdrLaunchRequest,
+    agents: readonly ListedAgent[],
+  ): Effect.Effect<WorkerObservation, HerdrError> {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
-        yield* Effect.result(this.command(["tab", "close", pane.tabId], SuccessResponseSchema));
-        const after = yield* Effect.result(
-          this.command(["tab", "get", pane.tabId], SuccessResponseSchema, {
-            notFound: ["tab_not_found"],
-          }),
+        const listedTabs = yield* this.command(
+          ["tab", "list", "--workspace", request.workspaceId],
+          TabListResponseSchema,
         );
-        if (after._tag === "Failure") return "unknown" as const;
-        return after.success === NOT_FOUND ? ("absent" as const) : ("present" as const);
+        if (listedTabs === NOT_FOUND)
+          return yield* this.failure("tab list", "Herdr reported an impossible not-found result.");
+        const label = herdrWorkerTabLabel(request);
+        const tabs = listedTabs.result.tabs.filter(
+          (tab) => tab.workspace_id === request.workspaceId && tab.label === label,
+        );
+        if (tabs.length === 0) return { state: "absent" as const, observedAt: now() };
+        if (tabs.length > 1)
+          return yield* this.failure(
+            "observe Worker",
+            `Worker label ${JSON.stringify(label)} identifies ${tabs.length} tabs; identity is ambiguous.`,
+          );
+        const tab = tabs[0];
+        if (tab === undefined)
+          return yield* this.failure("observe Worker", "Worker tab observation is incomplete.");
+        if (agents.some((candidate) => candidate.tab_id === tab.tab_id))
+          return yield* this.failure(
+            "observe Worker",
+            `Attempt-labelled tab=${tab.tab_id} contains a foreign or incomplete agent identity.`,
+          );
+        const listedPanes = yield* this.command(
+          ["pane", "list", "--workspace", request.workspaceId],
+          PaneListResponseSchema,
+        );
+        if (listedPanes === NOT_FOUND)
+          return yield* this.failure("pane list", "Herdr reported an impossible not-found result.");
+        const panes = listedPanes.result.panes.filter((pane) => pane.tab_id === tab.tab_id);
+        const pane = panes[0];
+        if (
+          panes.length !== 1 ||
+          pane === undefined ||
+          pane.workspace_id !== request.workspaceId ||
+          pane.cwd !== request.cwd
+        )
+          return yield* this.failure(
+            "observe Worker",
+            `Attempt-labelled tab=${tab.tab_id} has ambiguous or foreign pane identity.`,
+          );
+        return {
+          state: "partial" as const,
+          pane: {
+            workspaceId: request.workspaceId,
+            tabId: tab.tab_id,
+            paneId: pane.pane_id,
+            agentName: herdrWorkerName(request),
+            cwd: request.cwd,
+          },
+          observedAt: now(),
+          detail: `Attempt-labelled tab=${tab.tab_id} pane=${pane.pane_id} exists without the exact Pi session.`,
+        };
+      }.bind(this),
+    );
+  }
+
+  /** Issue one close for an exactly observed Worker and verify through fresh observation. */
+  closeObservedWorker(
+    request: HerdrLaunchRequest,
+    observed: Exclude<WorkerObservation, { readonly state: "absent" }>,
+  ): Effect.Effect<"absent" | "present", HerdrError> {
+    const tabId = observed.state === "ready" ? observed.identity.tabId : observed.pane.tabId;
+    return Effect.gen(
+      function* (this: HerdrCliRuntime) {
+        yield* Effect.result(this.command(["tab", "close", tabId], SuccessResponseSchema));
+        const after = yield* this.observeWorker(request);
+        return after.state === "absent" ? ("absent" as const) : ("present" as const);
       }.bind(this),
     );
   }
@@ -659,6 +740,43 @@ function decodeCommandFailure(
       message: `herdr ${operation} failed: ${error.code}${error.message === undefined ? "" : `: ${error.message}`}`,
     }),
   );
+}
+
+function sessionAgentObservation(
+  request: HerdrLaunchRequest,
+  agents: readonly ListedAgent[],
+): Extract<WorkerObservation, { readonly state: "ready" }> | HerdrError | undefined {
+  if (agents.length > 1)
+    return new HerdrError({
+      operation: "observe Worker",
+      message: `Worker session has ${agents.length} native agents; identity is ambiguous.`,
+    });
+  const agent = agents[0];
+  if (agent === undefined) return undefined;
+  const agentName = herdrWorkerName(request);
+  if (
+    agent.workspace_id !== request.workspaceId ||
+    agent.cwd !== request.cwd ||
+    (agent.name !== undefined && agent.name !== agentName)
+  )
+    return new HerdrError({
+      operation: "observe Worker",
+      message: `Worker session has foreign native identity workspace=${agent.workspace_id} tab=${agent.tab_id} pane=${agent.pane_id} cwd=${agent.cwd} name=${agent.name ?? "omitted"}.`,
+    });
+  const observation = exactObservation(
+    {
+      workspaceId: request.workspaceId,
+      tabId: agent.tab_id,
+      paneId: agent.pane_id,
+      agentName,
+      sessionFile: request.sessionFile,
+      cwd: request.cwd,
+    },
+    { ...agent, agent_session: { value: request.sessionFile } },
+  );
+  return observation instanceof HerdrError
+    ? observation
+    : { state: "ready" as const, ...observation };
 }
 
 function exactObservation(

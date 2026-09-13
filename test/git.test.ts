@@ -4,8 +4,17 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { Effect } from "effect";
-import type { Attempt, TaskTarget } from "../src/domain/records.js";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Effect, Exit, Scope } from "effect";
+import { WorkstreamRuntime } from "../src/coordination/runtime.js";
+import type {
+  Attempt,
+  CoordinatorOwner,
+  Intent,
+  TaskTarget,
+  WorkstreamMetadata,
+} from "../src/domain/records.js";
+import { WORKSTREAM_FORMAT, WORKSTREAM_SCHEMA_VERSION } from "../src/domain/records.js";
 import {
   applyOutput,
   classifyOutput,
@@ -19,6 +28,7 @@ import {
   type RepositoryOperation,
   resolveTaskTarget,
 } from "../src/git.js";
+import { WorkstreamStore } from "../src/storage/workstream-store.js";
 import { git } from "./helpers.js";
 
 const at = "2026-03-20T12:00:00.000Z";
@@ -229,6 +239,122 @@ void test("application accepts ignored destination artifacts and recovers struct
     await assert.rejects(Effect.runPromise(prepareApplication(divergent)), GitError);
     assert.equal(await git(fixture.root, "rev-parse", "--verify", "MERGE_HEAD"), sourceTip);
     await git(fixture.root, "merge", "--abort");
+  } finally {
+    await rm(fixture.parent, { recursive: true, force: true });
+  }
+});
+
+void test("an integration parent source ref stays pinned until child classification", async () => {
+  const fixture = await repository();
+  const owner: CoordinatorOwner = {
+    sessionId: "coordinator",
+    sessionFile: "/sessions/coordinator.jsonl",
+    workspaceId: "workspace",
+    tabId: "tab",
+  };
+  const metadata: WorkstreamMetadata = {
+    format: WORKSTREAM_FORMAT,
+    schemaVersion: WORKSTREAM_SCHEMA_VERSION,
+    id: "ws-pin",
+    owner,
+    lifecycle: "active",
+    createdAt: at,
+    updatedAt: at,
+  };
+  const intent: Intent = {
+    statement: "Integrate retained source",
+    constraints: [],
+    authority: { receiptId: "receipt", sessionId: owner.sessionId, sessionFile: owner.sessionFile },
+    recordedAt: at,
+  };
+  const store = WorkstreamStore.create(fixture.agentDir, metadata, intent);
+  const pinOperation = (attemptId: string, value: Attempt): RepositoryOperation => ({
+    attemptId,
+    attempt: value,
+    target: fixture.target,
+    ...detachedPlacement({
+      agentDir: fixture.agentDir,
+      workstreamId: metadata.id,
+      attemptId,
+    }),
+    applicable: true,
+  });
+  try {
+    let sourceAttempt = initial(fixture.base);
+    let sourceOperation = pinOperation("source-1", sourceAttempt);
+    await Effect.runPromise(ensureDetachedWorktree(sourceOperation));
+    const sourceTip = await commit(sourceOperation.worktreePath, "source");
+    sourceAttempt = await Effect.runPromise(classifyOutput(sourceOperation, at));
+    sourceOperation = pinOperation("source-1", sourceAttempt);
+    const source = store.createTaskWithAttempt(
+      owner,
+      0,
+      "source",
+      {
+        target: fixture.target,
+        contract: { kind: "implementation", objective: "Create source", acceptance: ["Done"] },
+        createdAt: at,
+      },
+      "source-1",
+      { ...sourceAttempt, execution: { submission: "confirmed", closedAt: at } },
+    );
+    store.insertOutcome(owner, "source-outcome", source.attempt.id, {
+      result: { kind: "cancelled", reason: "Fixture settled" },
+      effectiveModels: [selection.guide],
+      delivery: { requestedAt: at, failures: [], deliveredAt: at },
+      observedAt: at,
+    });
+    const childAttempt: Attempt = {
+      ...initial(fixture.base),
+      lineage: {
+        candidateRoot: fixture.base,
+        candidateOf: { kind: "integrate", attemptId: source.attempt.id, sourceTip },
+      },
+    };
+    const child = store.createTaskWithAttempt(
+      owner,
+      0,
+      "integration",
+      {
+        target: fixture.target,
+        contract: { kind: "implementation", objective: "Integrate source", acceptance: ["Done"] },
+        createdAt: at,
+      },
+      "integration-1",
+      childAttempt,
+    );
+    let childOperation = pinOperation(child.attempt.id, childAttempt);
+    await Effect.runPromise(ensureDetachedWorktree(childOperation));
+
+    const scope = await Effect.runPromise(Scope.make());
+    try {
+      const attachment = await Effect.runPromise(
+        WorkstreamRuntime.acquire({
+          store,
+          owner,
+          agentDir: fixture.agentDir,
+          pi: { sendMessage() {} } satisfies Pick<ExtensionAPI, "sendMessage">,
+        }).pipe(Scope.provide(scope)),
+      );
+      assert.equal(attachment.state, "attached");
+      if (attachment.state !== "attached") return;
+      const applied = await Effect.runPromise(attachment.runtime.apply(source.attempt.id));
+      assert.equal(applied.attempt.output?.kind, "applied");
+      assert.equal(
+        applied.attempt.output?.kind === "applied" ? applied.attempt.output.cleanupTip : undefined,
+        sourceTip,
+      );
+      assert.equal(await git(fixture.root, "rev-parse", sourceOperation.outputRef), sourceTip);
+
+      await git(childOperation.worktreePath, "merge", "--no-ff", "-m", "integrate", sourceTip);
+      childOperation = { ...childOperation, attempt: store.readAttempt(child.attempt.id).attempt };
+      const classified = await Effect.runPromise(classifyOutput(childOperation, at));
+      store.checkpointAttempt(owner, child.attempt.id, classified);
+      await Effect.runPromise(attachment.runtime.observe(source.attempt.id));
+      await assert.rejects(git(fixture.root, "rev-parse", sourceOperation.outputRef));
+    } finally {
+      await Effect.runPromise(Scope.close(scope, Exit.void));
+    }
   } finally {
     await rm(fixture.parent, { recursive: true, force: true });
   }

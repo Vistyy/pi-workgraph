@@ -32,14 +32,15 @@ void test("Worker session creation uses the Attempt id and recovers only the exa
     const first = await runNodePlatformPromise(
       createWorkerSessionEffect({ cwd, sessionDir, objective }),
     );
-    const opened = SessionManager.open(first);
+    assert.equal(first.fresh, true);
+    const opened = SessionManager.open(first.sessionFile);
     assert.equal(opened.getHeader()?.id, objective.details.attemptId);
     assert.equal(opened.getHeader()?.cwd, cwd);
     assert.equal(opened.getHeader()?.parentSession, undefined);
     assert.equal(opened.getSessionDir(), sessionDir);
-    assert.equal(
+    assert.deepEqual(
       await runNodePlatformPromise(createWorkerSessionEffect({ cwd, sessionDir, objective })),
-      first,
+      { sessionFile: first.sessionFile, fresh: false },
     );
 
     const objectiveEntries = opened
@@ -61,7 +62,7 @@ void test("Worker session creation uses the Attempt id and recovers only the exa
       /header and objective/,
     );
 
-    await copyFile(first, join(sessionDir, "duplicate_session-1.jsonl"));
+    await copyFile(first.sessionFile, join(sessionDir, "duplicate_session-1.jsonl"));
     await assert.rejects(
       runNodePlatformPromise(createWorkerSessionEffect({ cwd, sessionDir, objective })),
       /Multiple Worker sessions/,
@@ -76,9 +77,10 @@ void test("Worker session readback derives ordered actual models, settlement, an
   const cwd = join(parent, "cwd");
   const sessionDir = join(parent, "sessions");
   try {
-    const file = await runNodePlatformPromise(
+    const created = await runNodePlatformPromise(
       createWorkerSessionEffect({ cwd, sessionDir, objective }),
     );
+    const file = created.sessionFile;
     const session = SessionManager.open(file);
     session.appendCustomEntry("pi-workgraph-effective-model", {
       model: "fixture/guide",
@@ -134,9 +136,10 @@ void test("settled readable sessions expose bounded report errors", async () => 
   const parent = await mkdtemp(join(tmpdir(), "workgraph-report-error-"));
   const cwd = join(parent, "cwd");
   try {
-    const file = await runNodePlatformPromise(
+    const created = await runNodePlatformPromise(
       createWorkerSessionEffect({ cwd, sessionDir: join(parent, "sessions"), objective }),
     );
+    const file = created.sessionFile;
     const session = SessionManager.open(file);
     session.appendCustomEntry("pi-workgraph-effective-model", {
       model: "fixture/guide",

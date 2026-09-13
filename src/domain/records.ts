@@ -122,9 +122,6 @@ const AttemptLineageSchema = strict({
 });
 const AttemptExecutionSchema = strict({
   sessionFile: Type.Optional(Text),
-  paneId: Type.Optional(Text),
-  tabId: Type.Optional(Text),
-  terminalId: Type.Optional(Text),
   submission: Type.Union([
     Type.Literal("absent"),
     Type.Literal("uncertain"),

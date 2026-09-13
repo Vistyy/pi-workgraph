@@ -52,12 +52,18 @@ export class PiSessionError extends Data.TaggedError("PiSessionError")<{
   readonly message: string;
 }> {}
 
+export interface WorkerSessionCreation {
+  readonly sessionFile: string;
+  /** True only for the fresh session persisted by this uninterrupted call. */
+  readonly fresh: boolean;
+}
+
 /** Create or recover the one exact Pi session owned by an Attempt. */
 export function createWorkerSessionEffect(request: {
   readonly cwd: string;
   readonly sessionDir: string;
   readonly objective: WorkerObjective;
-}): Effect.Effect<string, PiSessionError | PlatformError, FileSystem.FileSystem> {
+}): Effect.Effect<WorkerSessionCreation, PiSessionError | PlatformError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     if (!validObjective(request.objective))
       return yield* new PiSessionError({
@@ -93,7 +99,7 @@ export function createWorkerSessionEffect(request: {
           operation: "recover",
           message: "Existing Worker session does not match its exact header and objective.",
         });
-      return existing.path;
+      return { sessionFile: existing.path, fresh: false };
     }
 
     const session = yield* native("create", () =>
@@ -135,7 +141,7 @@ export function createWorkerSessionEffect(request: {
         operation: "resolve",
         message: "Worker session did not produce a session file.",
       });
-    return file;
+    return { sessionFile: file, fresh: true };
   });
 }
 

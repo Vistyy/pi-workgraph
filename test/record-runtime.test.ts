@@ -1,13 +1,13 @@
-/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion -- Behavioral tests exercise typed records returned by native temporary SQLite storage. */
+/* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/global-date, anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion -- Behavioral tests exercise typed records returned by native temporary SQLite storage. */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { type ExtensionAPI, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Effect, Exit, Scope } from "effect";
 import { Value } from "typebox/value";
-import { WorkstreamRuntime } from "../src/coordination/runtime.js";
+import { RuntimeError, WorkstreamRuntime } from "../src/coordination/runtime.js";
 import type {
   Attempt,
   CoordinatorOwner,
@@ -17,10 +17,15 @@ import type {
   WorkstreamMetadata,
 } from "../src/domain/records.js";
 import {
+  AttemptSchema,
   TaskIdSchema,
   WORKSTREAM_FORMAT,
   WORKSTREAM_SCHEMA_VERSION,
 } from "../src/domain/records.js";
+import { HerdrCliRuntime } from "../src/herdr.js";
+import { herdrWorkerTabLabel } from "../src/herdr-naming.js";
+import { runNodePlatformPromise } from "../src/node-platform.js";
+import { createWorkerSessionEffect } from "../src/pi-session.js";
 import { StoreError, WorkstreamStore } from "../src/storage/workstream-store.js";
 
 const at = "2026-03-20T12:00:00.000Z";
@@ -73,6 +78,36 @@ function task(id: string): Task {
 function attempt(): Attempt {
   return { selection: { kind: "target", target }, base: { kind: "directory" } };
 }
+function fakeHerdr(root: string, body: string): { runtime: HerdrCliRuntime; log: string } {
+  const executable = join(root, "herdr-fixture.mjs");
+  const log = join(root, "herdr.log");
+  writeFileSync(
+    executable,
+    `#!/usr/bin/env node\nimport { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";\nconst args = process.argv.slice(2);\nappendFileSync(${JSON.stringify(log)}, JSON.stringify(args) + "\\n");\n${body}\n`,
+  );
+  chmodSync(executable, 0o700);
+  return {
+    runtime: new HerdrCliRuntime(executable, {
+      HERDR_ENV: "1",
+      HERDR_WORKSPACE_ID: owner.workspaceId,
+    }),
+    log,
+  };
+}
+function commands(log: string): string[][] {
+  return readFileSync(log, "utf8")
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as string[]);
+}
+async function waitFor(predicate: () => boolean, attempts = 120): Promise<void> {
+  for (let count = 0; count < attempts; count += 1) {
+    if (predicate()) return;
+    await Effect.runPromise(Effect.sleep(25));
+  }
+  assert.fail("Timed out waiting for runtime settlement.");
+}
 function outcome(summary: string): Outcome {
   return {
     result: {
@@ -85,8 +120,19 @@ function outcome(summary: string): Outcome {
   };
 }
 
-void test("public Task IDs are bounded safe identity components", () => {
+void test("public Task IDs and persisted execution have strict bounded identity", () => {
   assert.equal(Value.Check(TaskIdSchema, "git-output-correction"), true);
+  assert.equal(
+    Value.Check(AttemptSchema, {
+      ...attempt(),
+      execution: { sessionFile: "/session.jsonl", submission: "confirmed", paneId: "native" },
+    }),
+    false,
+  );
+  const firstLabel = herdrWorkerTabLabel({ runId: "ws", attemptId: "attempt-one" });
+  const secondLabel = herdrWorkerTabLabel({ runId: "ws", attemptId: "attempt-two" });
+  assert.notEqual(firstLabel, secondLabel);
+  assert.ok(firstLabel.length <= 18);
   for (const unsafe of ["../foreign", "nested/task", ".hidden", "task.lock", "x".repeat(65)])
     assert.equal(Value.Check(TaskIdSchema, unsafe), false, unsafe);
 });
@@ -190,14 +236,10 @@ void test("the concrete runtime settles and delivers prelaunch cancellation", as
   const root = temporary();
   const records = initial("ws-cancel");
   const store = WorkstreamStore.create(root, records.metadata, records.intent);
-  const created = store.createTaskWithAttempt(
-    owner,
-    0,
-    "queued",
-    task("queued"),
-    "queued-1",
-    attempt(),
-  );
+  const created = store.createTaskWithAttempt(owner, 0, "queued", task("queued"), "queued-1", {
+    ...attempt(),
+    selection: { kind: "implementation", guide: target, executor: target },
+  });
   store.checkpointAttempt(owner, created.attempt.id, {
     ...created.attempt.attempt,
     execution: {
@@ -225,8 +267,292 @@ void test("the concrete runtime settles and delivers prelaunch cancellation", as
       await Effect.runPromise(Effect.sleep(10));
     const outcomeRecord = store.readOutcome("queued-1");
     assert.equal(outcomeRecord?.outcome.result.kind, "cancelled");
+    assert.deepEqual(outcomeRecord?.outcome.effectiveModels, [target]);
     assert.notEqual(store.readAttempt("queued-1").attempt.execution?.closedAt, undefined);
     assert.equal(delivered.length, 1);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("fresh sessions launch once, recover by sessionFile, and cancellation closes once", async () => {
+  const root = temporary();
+  const records = initial("ws-native-ready");
+  let store = WorkstreamStore.create(root, records.metadata, records.intent);
+  const created = store.createTaskWithAttempt(
+    owner,
+    0,
+    "ready",
+    task("ready"),
+    "ready-1",
+    attempt(),
+  );
+  const statePath = join(root, "native-state.json");
+  const { runtime: herdr, log } = fakeHerdr(
+    root,
+    `const statePath = ${JSON.stringify(statePath)};
+const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : { present: false };
+const save = () => writeFileSync(statePath, JSON.stringify(state));
+const ok = (result) => console.log(JSON.stringify({ result }));
+if (args[0] === "tab" && args[1] === "create") {
+  state.present = true; save();
+  ok({ tab: { tab_id: "tab-ready", workspace_id: "workspace-1" }, root_pane: { pane_id: "pane-ready", workspace_id: "workspace-1", tab_id: "tab-ready", cwd: "/targets/ready" } });
+} else if (args[0] === "agent" && args[1] === "start") {
+  state.sessionFile = args[args.indexOf("--session") + 1]; state.name = args[2]; save();
+  ok({ agent: { workspace_id: "workspace-1", tab_id: "tab-ready", pane_id: "pane-ready", terminal_id: "terminal-ready", agent_status: "working", cwd: "/targets/ready", name: state.name, agent_session: { value: state.sessionFile }, interactive_ready: true } });
+} else if (args[0] === "agent" && args[1] === "list") {
+  ok({ agents: state.present && state.sessionFile ? [{ workspace_id: "workspace-1", tab_id: "tab-ready", pane_id: "pane-ready", terminal_id: "terminal-ready", agent_status: "working", cwd: "/targets/ready", agent_session: { value: state.sessionFile } }] : [] });
+} else if (args[0] === "agent" && args[1] === "get") {
+  ok({ agent: { workspace_id: "workspace-1", tab_id: "tab-ready", pane_id: "pane-ready", terminal_id: "terminal-ready", agent_status: "working", cwd: "/targets/ready", agent_session: { value: state.sessionFile } } });
+} else if (args[0] === "tab" && args[1] === "list") ok({ tabs: [] });
+else if (args[0] === "agent" && args[1] === "prompt") ok({});
+else if (args[0] === "tab" && args[1] === "close") { state.present = false; save(); ok({}); }
+else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process.exitCode = 1; }`,
+  );
+  let scope = await Effect.runPromise(Scope.make());
+  try {
+    let attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: { sendMessage() {} },
+        herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    if (attachment.state !== "attached") return;
+    await waitFor(
+      () => store.readAttempt(created.attempt.id).attempt.execution?.submission === "confirmed",
+    );
+    const execution = store.readAttempt(created.attempt.id).attempt.execution;
+    assert.notEqual(execution?.sessionFile, undefined);
+    assert.deepEqual(Object.keys(execution ?? {}).sort(), ["sessionFile", "submission"]);
+    const observationsBeforeReload = commands(log).filter(
+      (args) => args.slice(0, 2).join(" ") === "agent list",
+    ).length;
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+
+    store = WorkstreamStore.openOwned(root, records.metadata.id, owner);
+    scope = await Effect.runPromise(Scope.make());
+    attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: { sendMessage() {} },
+        herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    if (attachment.state !== "attached") return;
+    await waitFor(
+      () =>
+        commands(log).filter((args) => args.slice(0, 2).join(" ") === "agent list").length >
+        observationsBeforeReload,
+    );
+    await Effect.runPromise(attachment.runtime.cancel(created.attempt.id, "Stop exact Worker"));
+    assert.equal(store.readOutcome(created.attempt.id)?.outcome.result.kind, "cancelled");
+    assert.notEqual(store.readAttempt(created.attempt.id).attempt.execution?.closedAt, undefined);
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+
+    store = WorkstreamStore.openOwned(root, records.metadata.id, owner);
+    scope = await Effect.runPromise(Scope.make());
+    attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: { sendMessage() {} },
+        herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    await Effect.runPromise(Effect.sleep(1_200));
+    const nativeCommands = commands(log);
+    assert.equal(
+      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "tab create").length,
+      1,
+    );
+    assert.equal(
+      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "agent start").length,
+      1,
+    );
+    assert.equal(
+      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "agent prompt").length,
+      1,
+    );
+    assert.equal(
+      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "tab close").length,
+      1,
+    );
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("normal Outcome insertion closes once and reload only observes settled closure", async () => {
+  const root = temporary();
+  const records = initial("ws-normal-close");
+  let store = WorkstreamStore.create(root, records.metadata, records.intent);
+  const objective = {
+    content:
+      "[WORKGRAPH WORKER OBJECTIVE]\nIntent: Coordinate several independent targets\nConstraint: Keep each target independent\nQuestion: Research normal\nExpected evidence: Direct observation",
+    details: {
+      workstreamId: records.metadata.id,
+      taskId: "normal",
+      attemptId: "normal-1",
+      role: "research" as const,
+    },
+  };
+  const createdSession = await runNodePlatformPromise(
+    createWorkerSessionEffect({
+      cwd: "/targets/normal",
+      sessionDir: join(root, "sessions"),
+      objective,
+    }),
+  );
+  const session = SessionManager.open(createdSession.sessionFile);
+  session.appendCustomEntry("pi-workgraph-effective-model", target);
+  session.appendMessage({
+    role: "toolResult",
+    toolCallId: "report",
+    toolName: "workgraph_report",
+    content: [{ type: "text", text: "done" }],
+    details: {
+      report: {
+        kind: "research",
+        status: "completed",
+        summary: "Normal completion",
+        evidence: [],
+        findings: [],
+      },
+    },
+    isError: false,
+    timestamp: Date.now(),
+  });
+  session.appendCustomEntry("pi-workgraph-agent-settled", {});
+  const sessionFile = createdSession.sessionFile;
+  store.createTaskWithAttempt(owner, 0, "normal", task("normal"), "normal-1", {
+    ...attempt(),
+    execution: { sessionFile, submission: "confirmed" },
+  });
+  const statePath = join(root, "normal-native.json");
+  writeFileSync(statePath, JSON.stringify({ present: true }));
+  const { runtime: herdr, log } = fakeHerdr(
+    root,
+    `const statePath = ${JSON.stringify(statePath)};
+const state = JSON.parse(readFileSync(statePath, "utf8"));
+const ok = (result) => console.log(JSON.stringify({ result }));
+if (args[0] === "agent" && args[1] === "list") ok({ agents: state.present ? [{ workspace_id: "workspace-1", tab_id: "tab-normal", pane_id: "pane-normal", terminal_id: "terminal-normal", agent_status: "idle", cwd: "/targets/normal", agent_session: { value: ${JSON.stringify(sessionFile)} } }] : [] });
+else if (args[0] === "tab" && args[1] === "list") ok({ tabs: [] });
+else if (args[0] === "tab" && args[1] === "close") { state.present = false; writeFileSync(statePath, JSON.stringify(state)); ok({}); }
+else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process.exitCode = 1; }`,
+  );
+  let scope = await Effect.runPromise(Scope.make());
+  try {
+    let attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: { sendMessage() {} },
+        herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    await waitFor(
+      () =>
+        store.readOutcome("normal-1") !== undefined &&
+        store.readAttempt("normal-1").attempt.execution?.closedAt !== undefined,
+    );
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    store = WorkstreamStore.openOwned(root, records.metadata.id, owner);
+    scope = await Effect.runPromise(Scope.make());
+    attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: { sendMessage() {} },
+        herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    await Effect.runPromise(Effect.sleep(1_200));
+    assert.equal(
+      commands(log).filter((args) => args.slice(0, 2).join(" ") === "tab close").length,
+      1,
+    );
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("a failed fresh start recovers a labelled partial tab without relaunch", async () => {
+  const root = temporary();
+  const records = initial("ws-native-partial");
+  let store = WorkstreamStore.create(root, records.metadata, records.intent);
+  store.createTaskWithAttempt(owner, 0, "partial", task("partial"), "partial-1", attempt());
+  const label = herdrWorkerTabLabel({
+    runId: records.metadata.id,
+    attemptId: "partial-1",
+    assignmentId: "partial",
+    role: "research",
+  });
+  const { runtime: herdr, log } = fakeHerdr(
+    root,
+    `const ok = (result) => console.log(JSON.stringify({ result }));
+if (args[0] === "tab" && args[1] === "create") ok({ tab: { tab_id: "tab-partial", workspace_id: "workspace-1" }, root_pane: { pane_id: "pane-partial", workspace_id: "workspace-1", tab_id: "tab-partial", cwd: "/targets/partial" } });
+else if (args[0] === "agent" && args[1] === "start") { console.error(JSON.stringify({ error: { code: "start_failed" } })); process.exitCode = 1; }
+else if (args[0] === "agent" && args[1] === "list") ok({ agents: [] });
+else if (args[0] === "tab" && args[1] === "list") ok({ tabs: [{ tab_id: "tab-partial", workspace_id: "workspace-1", label: ${JSON.stringify(label)} }] });
+else if (args[0] === "pane" && args[1] === "list") ok({ panes: [{ workspace_id: "workspace-1", tab_id: "tab-partial", pane_id: "pane-partial", terminal_id: "terminal-partial", cwd: "/targets/partial" }] });
+else { console.error(JSON.stringify({ error: { code: "unexpected_write" } })); process.exitCode = 1; }`,
+  );
+  let scope = await Effect.runPromise(Scope.make());
+  try {
+    let attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: { sendMessage() {} },
+        herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    if (attachment.state !== "attached") return;
+    const firstRuntime = attachment.runtime;
+    await waitFor(() => (firstRuntime.status().blocker ?? "").includes("partial"));
+    await Effect.runPromise(Effect.sleep(1_200));
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    store = WorkstreamStore.openOwned(root, records.metadata.id, owner);
+    scope = await Effect.runPromise(Scope.make());
+    attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: { sendMessage() {} },
+        herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    await Effect.runPromise(Effect.sleep(1_200));
+    const nativeCommands = commands(log);
+    assert.equal(
+      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "tab create").length,
+      1,
+    );
+    assert.equal(
+      nativeCommands.filter((args) => args.slice(0, 2).join(" ") === "agent start").length,
+      1,
+    );
+    assert.ok(nativeCommands.some((args) => args.slice(0, 2).join(" ") === "pane list"));
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });
@@ -241,9 +567,6 @@ void test("review objectives retain cited Outcome summaries and exact source fac
     ...attempt(),
     execution: {
       sessionFile: "/sessions/source.jsonl",
-      paneId: "source-pane",
-      tabId: "source-tab",
-      terminalId: "source-terminal",
       submission: "confirmed",
       closedAt: later,
     },
@@ -264,6 +587,23 @@ void test("review objectives retain cited Outcome summaries and exact source fac
     );
     assert.equal(attachment.state, "attached");
     if (attachment.state !== "attached") return;
+    await assert.rejects(
+      Effect.runPromise(
+        attachment.runtime.createTask({
+          id: "missing-review",
+          target: { kind: "directory", path: root },
+          contract: {
+            kind: "review",
+            objective: "Review missing source",
+            concern: "Evidence quality",
+            subject: { kind: "outcome", outcomeId: "missing-outcome" },
+          },
+          selection: { kind: "target", target },
+        }),
+      ),
+      RuntimeError,
+    );
+    assert.equal(store.page("tasks", -1, 10).length, 1);
     const review = await Effect.runPromise(
       attachment.runtime.createTask({
         id: "review",
@@ -296,6 +636,79 @@ void test("review objectives retain cited Outcome summaries and exact source fac
     assert.match(objectiveEntry.content, /source-outcome/);
     assert.match(objectiveEntry.content, /\/targets\/source/);
     assert.match(objectiveEntry.content, /\/sessions\/source\.jsonl/);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("output and delivery failures remain visible with bounded independent backoff", async () => {
+  const root = temporary();
+  const records = initial("ws-visible-failures");
+  const store = WorkstreamStore.create(root, records.metadata, records.intent);
+  const broken = store.createTaskWithAttempt(
+    owner,
+    0,
+    "broken-output",
+    {
+      target: {
+        kind: "repository",
+        checkoutRoot: join(root, "absent-checkout"),
+        commonDir: join(root, "absent-git"),
+      },
+      contract: {
+        kind: "implementation",
+        objective: "Classify output",
+        acceptance: ["Surface failure"],
+      },
+      createdAt: at,
+    },
+    "broken-output-1",
+    {
+      selection: { kind: "implementation", guide: target, executor: target },
+      base: { kind: "repository", baseCommit: "f".repeat(40) },
+      execution: { submission: "confirmed", closedAt: later },
+    },
+  );
+  store.insertOutcome(owner, "broken-outcome", broken.attempt.id, {
+    result: { kind: "cancelled", reason: "Fixture is already closed" },
+    effectiveModels: [target],
+    delivery: { requestedAt: later, failures: [], deliveredAt: later },
+    observedAt: later,
+  });
+  const queued = store.createTaskWithAttempt(owner, 0, "delivery", task("delivery"), "delivery-1", {
+    ...attempt(),
+    execution: {
+      submission: "absent",
+      cancellation: { reason: "No work", requestedAt: later },
+    },
+  });
+  let deliveries = 0;
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    const attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: {
+          sendMessage() {
+            deliveries += 1;
+            throw new Error("delivery unavailable");
+          },
+        },
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    if (attachment.state !== "attached") return;
+    await waitFor(() => {
+      const blocker = attachment.runtime.status().blocker ?? "";
+      return blocker.includes("broken-output-1") && blocker.includes("delivery unavailable");
+    });
+    await Effect.runPromise(Effect.sleep(2_400));
+    assert.ok(deliveries <= 2, `expected bounded delivery retries, observed ${deliveries}`);
+    assert.ok((store.readOutcome(queued.attempt.id)?.outcome.delivery.failures.length ?? 0) <= 2);
+    assert.match(attachment.runtime.status().blocker ?? "", /broken-output-1/);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });
