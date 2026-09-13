@@ -527,7 +527,7 @@ function destinationState(
     return {
       ref: refResult.stdout,
       head: yield* exactCommit(target.commonDir, "HEAD", "apply output", target.checkoutRoot),
-      dirty: yield* dirty(target.checkoutRoot),
+      dirty: yield* destinationDirty(target.checkoutRoot),
     };
   });
 }
@@ -605,7 +605,7 @@ function ownedCheckout(
         "inspect output",
         operation.worktreePath,
       ),
-      dirty: yield* dirty(operation.worktreePath),
+      dirty: yield* attemptDirty(operation.worktreePath),
     };
   });
 }
@@ -663,9 +663,17 @@ function registeredWorktree(
   );
 }
 
-function dirty(cwd: string): Effect.Effect<boolean, GitError> {
+function destinationDirty(cwd: string): Effect.Effect<boolean, GitError> {
+  return dirty(cwd, false);
+}
+function attemptDirty(cwd: string): Effect.Effect<boolean, GitError> {
+  return dirty(cwd, true);
+}
+function dirty(cwd: string, includeIgnored: boolean): Effect.Effect<boolean, GitError> {
+  const statusArgs = ["status", "--porcelain", "--untracked-files=all"];
+  if (includeIgnored) statusArgs.push("--ignored=matching");
   return Effect.all([
-    git(cwd, ["status", "--porcelain", "--untracked-files=all", "--ignored=matching"], true),
+    git(cwd, statusArgs, true),
     gitResult(cwd, ["rev-parse", "--verify", "--quiet", "MERGE_HEAD"]),
   ]).pipe(
     Effect.flatMap(([status, mergeHead]) => {

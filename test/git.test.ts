@@ -37,7 +37,7 @@ async function repository() {
   await git(root, "init", "-b", "main");
   await git(root, "config", "user.name", "Workgraph Test");
   await git(root, "config", "user.email", "workgraph@example.invalid");
-  await writeFile(join(root, ".gitignore"), "ignored.bin\n");
+  await writeFile(join(root, ".gitignore"), "ignored.bin\nnode_modules/\n");
   await writeFile(join(root, "file.txt"), "base\n");
   await git(root, "add", ".");
   await git(root, "commit", "-m", "base");
@@ -169,19 +169,25 @@ void test("classification removes unchanged output, compacts every clean descend
   }
 });
 
-void test("fast-forward and divergent application recover structurally and clean only after checkpoint", async () => {
+void test("application accepts ignored destination artifacts and recovers structurally before cleanup", async () => {
   const fixture = await repository();
   try {
     let fast = operation(fixture, "fast", initial(fixture.base));
     await Effect.runPromise(ensureDetachedWorktree(fast));
     const fastTip = await commit(fast.worktreePath, "fast");
     fast = { ...fast, attempt: await Effect.runPromise(classifyOutput(fast, at)) };
+    await mkdir(join(fixture.root, "node_modules"));
+    await writeFile(join(fixture.root, "node_modules", "artifact.js"), "ignored artifact\n");
     const fastPrepared = await Effect.runPromise(prepareApplication(fast));
     fast = { ...fast, attempt: fastPrepared };
     const fastApplied = await Effect.runPromise(applyOutput(fast, at));
     assert.equal(fastApplied.output?.kind, "applied");
     assert.equal(await git(fixture.root, "rev-parse", "HEAD"), fastTip);
     assert.equal(await git(fixture.root, "rev-parse", fast.outputRef), fastTip);
+    assert.equal(
+      await readFile(join(fixture.root, "node_modules", "artifact.js"), "utf8"),
+      "ignored artifact\n",
+    );
     const fastCleaned = await Effect.runPromise(
       cleanupAppliedOutput({ ...fast, attempt: fastApplied }),
     );

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Value } from "typebox/value";
 import type {
   Attempt,
   CoordinatorOwner,
@@ -12,7 +13,11 @@ import type {
   Task,
   WorkstreamMetadata,
 } from "../src/domain/records.js";
-import { WORKSTREAM_FORMAT, WORKSTREAM_SCHEMA_VERSION } from "../src/domain/records.js";
+import {
+  TaskIdSchema,
+  WORKSTREAM_FORMAT,
+  WORKSTREAM_SCHEMA_VERSION,
+} from "../src/domain/records.js";
 import { StoreError, WorkstreamStore } from "../src/storage/workstream-store.js";
 
 const at = "2026-03-20T12:00:00.000Z";
@@ -76,6 +81,12 @@ function outcome(summary: string): Outcome {
     observedAt: at,
   };
 }
+
+void test("public Task IDs are bounded safe identity components", () => {
+  assert.equal(Value.Check(TaskIdSchema, "git-output-correction"), true);
+  for (const unsafe of ["../foreign", "nested/task", ".hidden", "task.lock", "x".repeat(65)])
+    assert.equal(Value.Check(TaskIdSchema, unsafe), false, unsafe);
+});
 
 void test("creation is private and retries attach without replaying an advanced store", () => {
   const root = temporary();

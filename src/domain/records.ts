@@ -9,6 +9,11 @@ const Text = Type.String({ minLength: 1 });
 const NonBlankText = Type.String({ minLength: 1, pattern: "\\S" });
 const Instant = Type.String({ format: "date-time" });
 const Commit = Type.String({ pattern: "^[0-9a-f]{40,64}$" });
+export const TaskIdSchema = Type.String({
+  minLength: 1,
+  maxLength: 64,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$",
+});
 const strict = <const Fields extends Parameters<typeof Type.Object>[0]>(fields: Fields) =>
   Type.Object(fields, { additionalProperties: false });
 
@@ -149,7 +154,6 @@ const AttemptOutputSchema = Type.Union([
     tip: Commit,
     reason: NonBlankText,
     applied: Type.Optional(strict({ revision: Commit, completedAt: Instant })),
-    error: Type.Optional(NonBlankText),
   }),
   strict({ kind: Type.Literal("no_output"), completedAt: Instant }),
   strict({

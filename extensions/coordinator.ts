@@ -23,6 +23,7 @@ import {
   type CoordinatorOwner,
   type Intent,
   type TaskContract,
+  TaskIdSchema,
   WORKSTREAM_FORMAT,
   WORKSTREAM_SCHEMA_VERSION,
   type WorkstreamMetadata,
@@ -66,7 +67,7 @@ const Selection = Type.Optional(
     { additionalProperties: false },
   ),
 );
-const taskFields = { id: Text, target: Target };
+const taskFields = { id: TaskIdSchema, target: Target };
 const HandoffGrant = Type.Object(
   {
     grantId: Text,
