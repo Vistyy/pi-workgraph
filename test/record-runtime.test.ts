@@ -25,7 +25,7 @@ import {
 import { HerdrCliRuntime } from "../src/herdr.js";
 import { herdrWorkerTabLabel } from "../src/herdr-naming.js";
 import { runNodePlatformPromise } from "../src/node-platform.js";
-import { createWorkerSessionEffect } from "../src/pi-session.js";
+import { createWorkerSessionEffect, WORKER_KICKOFF } from "../src/pi-session.js";
 import { StoreError, WorkstreamStore } from "../src/storage/workstream-store.js";
 
 const at = "2026-03-20T12:00:00.000Z";
@@ -270,6 +270,77 @@ void test("the concrete runtime settles and delivers prelaunch cancellation", as
     assert.deepEqual(outcomeRecord?.outcome.effectiveModels, [target]);
     assert.notEqual(store.readAttempt("queued-1").attempt.execution?.closedAt, undefined);
     assert.equal(delivered.length, 1);
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("uncertain submission recovery requires the exact persisted kickoff, not a model marker", async () => {
+  const root = temporary();
+  const records = initial("ws-kickoff-proof");
+  const store = WorkstreamStore.create(root, records.metadata, records.intent);
+  const objective = {
+    content: [
+      "[WORKGRAPH WORKER OBJECTIVE]",
+      `Intent: ${records.intent.statement}`,
+      ...records.intent.constraints.map((constraint) => `Constraint: ${constraint}`),
+      "Question: Research kickoff-proof",
+      "Expected evidence: Direct observation",
+    ].join("\n"),
+    details: {
+      workstreamId: records.metadata.id,
+      taskId: "kickoff-proof",
+      attemptId: "kickoff-proof-1",
+      role: "research" as const,
+    },
+  };
+  const createdSession = await runNodePlatformPromise(
+    createWorkerSessionEffect({
+      cwd: "/targets/kickoff-proof",
+      sessionDir: join(root, "sessions"),
+      objective,
+    }),
+  );
+  const session = SessionManager.open(createdSession.sessionFile);
+  session.appendCustomEntry("pi-workgraph-effective-model", target);
+  store.createTaskWithAttempt(owner, 0, "kickoff-proof", task("kickoff-proof"), "kickoff-proof-1", {
+    ...attempt(),
+    execution: { sessionFile: createdSession.sessionFile, submission: "uncertain" },
+  });
+  const { runtime: herdr, log } = fakeHerdr(
+    root,
+    `const ok = (result) => console.log(JSON.stringify({ result }));
+if (args[0] === "agent" && args[1] === "list") ok({ agents: [{ workspace_id: "workspace-1", tab_id: "tab-proof", pane_id: "pane-proof", terminal_id: "terminal-proof", agent_status: "working", cwd: "/targets/kickoff-proof", agent_session: { value: ${JSON.stringify(createdSession.sessionFile)} } }] });
+else { console.error(JSON.stringify({ error: { code: "unexpected" } })); process.exitCode = 1; }`,
+  );
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    const attachment = await Effect.runPromise(
+      WorkstreamRuntime.acquire({
+        store,
+        owner,
+        agentDir: root,
+        pi: { sendMessage() {} },
+        herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    assert.equal(attachment.state, "attached");
+    if (attachment.state !== "attached") return;
+
+    await assert.rejects(
+      Effect.runPromise(attachment.runtime.observe("kickoff-proof-1")),
+      /does not prove the exact persisted kickoff/,
+    );
+    assert.equal(store.readAttempt("kickoff-proof-1").attempt.execution?.submission, "uncertain");
+
+    session.appendMessage({ role: "user", content: WORKER_KICKOFF, timestamp: Date.now() });
+    await Effect.runPromise(attachment.runtime.observe("kickoff-proof-1"));
+    assert.equal(store.readAttempt("kickoff-proof-1").attempt.execution?.submission, "confirmed");
+    assert.equal(
+      commands(log).filter((args) => args.slice(0, 2).join(" ") === "agent prompt").length,
+      0,
+    );
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });

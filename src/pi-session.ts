@@ -32,6 +32,8 @@ const ReportDetailsSchema = Type.Object(
   { report: Type.Unknown() },
   { additionalProperties: false },
 );
+export const WORKER_KICKOFF = "Begin the assigned Workgraph task";
+
 const EffectiveModelSchema = Type.Object(
   {
     model: ModelTargetSchema.properties.model,
@@ -150,12 +152,14 @@ export type WorkerSessionRead =
       readonly unreadable: true;
       readonly error: string;
       readonly started: false;
+      readonly kickoffPersisted: false;
       readonly settled: false;
       readonly effectiveModels: readonly [];
     }
   | {
       readonly unreadable: false;
       readonly started: boolean;
+      readonly kickoffPersisted: boolean;
       readonly settled: boolean;
       readonly report?: WorkerReport;
       readonly reportError?: string;
@@ -189,6 +193,14 @@ export function readWorkerSession(
   const branch = Result.isSuccess(objective) ? objective.success : entries;
   const effectiveModels = orderedEffectiveModels(branch);
   const started = effectiveModels.length > 0;
+  const kickoffPersisted =
+    Result.isSuccess(objective) &&
+    branch.some(
+      (entry) =>
+        entry.type === "message" &&
+        entry.message.role === "user" &&
+        entry.message.content === WORKER_KICKOFF,
+    );
   const settled = branch.some(
     (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-agent-settled",
   );
@@ -196,6 +208,7 @@ export function readWorkerSession(
     return {
       unreadable: false,
       started,
+      kickoffPersisted,
       settled,
       reportError: bounded(objective.failure),
       effectiveModels,
@@ -220,25 +233,28 @@ export function readWorkerSession(
       ? {
           unreadable: false,
           started,
+          kickoffPersisted,
           settled,
           reportError: "Settled Worker session has no successful terminal report.",
           effectiveModels,
         }
-      : { unreadable: false, started, settled, effectiveModels };
+      : { unreadable: false, started, kickoffPersisted, settled, effectiveModels };
   if (!Value.Check(ReportDetailsSchema, reportDetails))
     return {
       unreadable: false,
       started,
+      kickoffPersisted,
       settled,
       reportError: "Worker terminal report details are malformed.",
       effectiveModels,
     };
   const report = Value.Decode(ReportDetailsSchema, reportDetails).report;
   return isWorkerReport(report)
-    ? { unreadable: false, started, settled, report, effectiveModels }
+    ? { unreadable: false, started, kickoffPersisted, settled, report, effectiveModels }
     : {
         unreadable: false,
         started,
+        kickoffPersisted,
         settled,
         reportError: "Worker terminal report is malformed.",
         effectiveModels,
@@ -328,6 +344,7 @@ function unreadable(error: string): WorkerSessionRead {
     unreadable: true,
     error: bounded(error),
     started: false,
+    kickoffPersisted: false,
     settled: false,
     effectiveModels: [],
   };

@@ -45,6 +45,7 @@ import { liveLayer } from "../node-platform.js";
 import {
   createWorkerSessionEffect,
   readWorkerSession,
+  WORKER_KICKOFF,
   type WorkerObjective,
   type WorkerRole,
 } from "../pi-session.js";
@@ -643,7 +644,8 @@ export class WorkstreamRuntime {
     const execution = record.attempt.execution;
     if (execution?.sessionFile === undefined) return Effect.void;
     const read = readWorkerSession(execution.sessionFile, context.cwd, context.objective);
-    if (execution.submission === "uncertain") return this.recoverSubmission(record, read.started);
+    if (execution.submission === "uncertain")
+      return this.recoverSubmission(record, read.kickoffPersisted);
     if (execution.submission === "absent") return this.submitWorker(record);
     if (read.unreadable)
       return Effect.fail(
@@ -675,13 +677,14 @@ export class WorkstreamRuntime {
 
   private recoverSubmission(
     record: AttemptRecord,
-    started: boolean,
+    kickoffPersisted: boolean,
   ): Effect.Effect<void, RuntimeError> {
-    if (!started)
+    if (!kickoffPersisted)
       return Effect.fail(
         new RuntimeError({
           operation: "recover Worker submission",
-          message: "Kickoff is uncertain and the session does not prove actual start.",
+          message:
+            "Kickoff is uncertain and the session does not prove the exact persisted kickoff.",
         }),
       );
     const execution = record.attempt.execution;
@@ -710,7 +713,7 @@ export class WorkstreamRuntime {
         execution: { ...execution, submission: "uncertain" },
       });
       yield* self.herdr
-        .prompt(observation.identity, "Begin the assigned Workgraph task")
+        .prompt(observation.identity, WORKER_KICKOFF)
         .pipe(Effect.mapError((cause) => runtimeError(cause.operation, cause)));
       const uncertain = checkpoint.attempt.execution;
       if (uncertain !== undefined)

@@ -569,19 +569,6 @@ export class HerdrCliRuntime {
     );
   }
 
-  close(identity: WorkerIdentity): Effect.Effect<"absent" | "present" | "unknown", HerdrError> {
-    return Effect.gen(
-      function* (this: HerdrCliRuntime) {
-        const before = yield* this.inspect(identity);
-        if (before.status === "absent") return "absent" as const;
-        yield* Effect.result(this.command(["tab", "close", identity.tabId], SuccessResponseSchema));
-        const after = yield* Effect.result(this.inspect(identity));
-        if (after._tag === "Failure") return "unknown" as const;
-        return after.success.status === "absent" ? ("absent" as const) : ("present" as const);
-      }.bind(this),
-    );
-  }
-
   observeCoordinator(identity: {
     readonly workspaceId: string;
     readonly tabId: string;
