@@ -2,8 +2,10 @@
 import { lstat, mkdir, realpath } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Node path operations are the lexical identity boundary for Git worktrees.
 import { basename, dirname, join, resolve } from "node:path";
-import { Data, Effect } from "effect";
-import { type ProcessExecutionError, type ProcessResult, processEffect } from "./process.js";
+import * as NodeChildProcessSpawner from "@effect/platform-node-shared/NodeChildProcessSpawner";
+import { Data, Effect, Layer, Stream } from "effect";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { liveLayer } from "./node-platform.js";
 
 export interface RepositoryInfo {
   root: string;
@@ -59,24 +61,20 @@ interface WorktreeIdentity {
 
 type RefInspection = { state: "absent" } | { state: "present"; head: string };
 
-export interface GitProcessRequest {
-  readonly cwd: string;
-  readonly args: readonly string[];
-  readonly timeoutMs: number;
-  readonly digestStdout: boolean;
-}
+const childProcessLayer = NodeChildProcessSpawner.layer.pipe(Layer.provide(liveLayer));
 
-export type GitProcessRunner = (
-  request: GitProcessRequest,
-) => Effect.Effect<ProcessResult, ProcessExecutionError>;
+interface GitCommandResult {
+  readonly code: number;
+  readonly stdout: string;
+  readonly stderr: string;
+}
 
 interface GitClient {
   readonly process: (
     cwd: string,
     args: readonly string[],
     timeoutMs?: number,
-    digestStdout?: boolean,
-  ) => GitEffect<ProcessResult>;
+  ) => GitEffect<GitCommandResult>;
   readonly text: (cwd: string, args: readonly string[], allowEmpty?: boolean) => GitEffect<string>;
 }
 
@@ -94,7 +92,7 @@ export class GitParseError extends Data.TaggedError("GitParseError")<{
   readonly output: string;
 }> {}
 
-type GitFailure = GitOperationError | GitFileSystemError | GitParseError | ProcessExecutionError;
+type GitFailure = GitOperationError | GitFileSystemError | GitParseError;
 export type GitEffect<A> = Effect.Effect<A, GitFailure>;
 
 export class GitRepository {
@@ -103,9 +101,8 @@ export class GitRepository {
   constructor(
     readonly root: string,
     readonly commonDir: string,
-    processRunner: GitProcessRunner = liveGitProcessRunner,
   ) {
-    this.git = makeGitClient(processRunner);
+    this.git = makeGitClient();
   }
 
   readonly head = (cwd: string = this.root): GitEffect<string> =>
@@ -338,7 +335,7 @@ export class GitRepository {
 }
 
 export function inspectRepository(cwd: string): GitEffect<RepositoryInfo> {
-  const git = makeGitClient(liveGitProcessRunner);
+  const git = makeGitClient();
   return Effect.gen(function* () {
     const root = yield* git.text(cwd, ["rev-parse", "--show-toplevel"]);
     const commonDirText = yield* git.text(root, [
@@ -379,18 +376,15 @@ function inspectRef(
   git: GitClient,
   root: string,
   ref: string,
-  inspectionFailure: (result: ProcessResult) => string,
+  inspectionFailure: (result: GitCommandResult) => string,
 ): GitEffect<RefInspection> {
   return Effect.gen(function* () {
     const result = yield* git.process(root, ["rev-parse", "--verify", "--quiet", ref]);
-    if (result.timedOut || result.stdoutTruncated) {
-      return yield* fail(inspectionFailure(result));
-    }
-    if (result.exitCode === 0) {
+    if (result.code === 0) {
       if (result.stdout.length === 0) return yield* fail(inspectionFailure(result));
       return { state: "present" as const, head: result.stdout };
     }
-    if (result.exitCode === 1) return { state: "absent" as const };
+    if (result.code === 1) return { state: "absent" as const };
     return yield* fail(inspectionFailure(result));
   });
 }
@@ -565,10 +559,8 @@ function isAncestor(
 ): GitEffect<boolean> {
   return Effect.gen(function* () {
     const result = yield* git.process(root, ["merge-base", "--is-ancestor", ancestor, descendant]);
-    if (result.timedOut || result.stdoutTruncated || result.stderrTruncated)
-      return yield* fail(`Could not inspect Git ancestry: ${diagnostic(result)}`);
-    if (result.exitCode === 0) return true;
-    if (result.exitCode === 1) return false;
+    if (result.code === 0) return true;
+    if (result.code === 1) return false;
     return yield* fail(`Could not inspect Git ancestry: ${diagnostic(result)}`);
   });
 }
@@ -582,7 +574,7 @@ function mergedTree(git: GitClient, root: string, ours: string, theirs: string):
       ours,
       theirs,
     ]);
-    if (!processSucceeded(result) || result.stdoutTruncated)
+    if (!processSucceeded(result))
       return yield* fail(`Candidate application conflict preview failed: ${diagnostic(result)}`);
     const tree = result.stdout.split("\n", 1)[0] ?? "";
     if (!/^[0-9a-f]{40,64}$/.test(tree))
@@ -1242,11 +1234,6 @@ function gitText(
     if (!processSucceeded(result)) {
       return yield* fail(`git ${args.join(" ")} failed: ${diagnostic(result)}`);
     }
-    if (result.stdoutTruncated) {
-      return yield* fail(
-        `git ${args.join(" ")} exceeded the inspection output limit; partial output cannot establish Git identity.`,
-      );
-    }
     if (!allowEmpty && result.stdout.length === 0) {
       return yield* fail(`git ${args.join(" ")} returned no output.`);
     }
@@ -1291,16 +1278,54 @@ function nextCandidateCommit(line: string, parent: string): string | undefined {
   return current !== undefined && /^[0-9a-f]{40,64}$/.test(current) ? current : undefined;
 }
 
-const liveGitProcessRunner: GitProcessRunner = ({ cwd, args, timeoutMs, digestStdout }) =>
-  processEffect("git", ["-C", cwd, ...args], {
-    cwd,
-    timeoutMs,
-    digestStdout,
-  });
+function runGitCommand(
+  cwd: string,
+  args: readonly string[],
+  timeoutMs: number,
+): GitEffect<GitCommandResult> {
+  const command = ChildProcess.make("git", ["-C", cwd, ...args], { cwd, stdin: "ignore" });
+  const operation = Effect.scoped(
+    Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const child = yield* spawner.spawn(command);
+      const result = yield* Effect.all(
+        {
+          code: child.exitCode,
+          stdout: child.stdout.pipe(Stream.decodeText(), Stream.mkString),
+          stderr: child.stderr.pipe(Stream.decodeText(), Stream.mkString),
+        },
+        { concurrency: "unbounded" },
+      );
+      return {
+        code: Number(result.code),
+        stdout: result.stdout.trim(),
+        stderr: result.stderr.trim(),
+      };
+    }),
+  ).pipe(
+    Effect.mapError(
+      (cause) =>
+        new GitOperationError({
+          message: `git ${args.join(" ")} could not execute: ${String(cause)}`,
+        }),
+    ),
+    Effect.timeoutOrElse({
+      duration: timeoutMs,
+      orElse: () =>
+        Effect.fail(
+          new GitOperationError({
+            message: `git ${args.join(" ")} timed out after ${timeoutMs}ms.`,
+          }),
+        ),
+    }),
+    Effect.provide(childProcessLayer),
+  );
+  return operation;
+}
 
-function makeGitClient(runner: GitProcessRunner): GitClient {
-  const process: GitClient["process"] = (cwd, args, timeoutMs = 30_000, digestStdout = false) =>
-    runner({ cwd, args, timeoutMs, digestStdout });
+function makeGitClient(): GitClient {
+  const process: GitClient["process"] = (cwd, args, timeoutMs = 30_000) =>
+    runGitCommand(cwd, args, timeoutMs);
   return {
     process,
     text: (cwd, args, allowEmpty = false) => gitText(process, cwd, args, allowEmpty),
@@ -1333,13 +1358,12 @@ function fail(message: string): GitEffect<never> {
   return Effect.fail(new GitOperationError({ message }));
 }
 
-function processSucceeded(result: ProcessResult): boolean {
-  return !result.timedOut && result.exitCode === 0;
+function processSucceeded(result: GitCommandResult): boolean {
+  return result.code === 0;
 }
 
-function diagnostic(result: ProcessResult): string {
-  const details = [`exit code ${result.exitCode}`];
-  if (result.timedOut) details.push("timed out before a reliable result was observed");
+function diagnostic(result: GitCommandResult): string {
+  const details = [`exit code ${result.code}`];
   if (result.stderr.length > 0) details.push(result.stderr);
   else if (result.stdout.length > 0) details.push(result.stdout);
   return details.join("; ");

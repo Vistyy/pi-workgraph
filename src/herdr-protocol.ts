@@ -1,22 +1,20 @@
-import { Data, Effect } from "effect";
+import * as NodeChildProcessSpawner from "@effect/platform-node-shared/NodeChildProcessSpawner";
+import { Data, Effect, Layer, Stream } from "effect";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { decodeErrorResponse } from "./herdr-decoder.js";
-import { processEffect } from "./process.js";
+import { liveLayer } from "./node-platform.js";
 
-/** Herdr control responses and full snapshots are expected to remain well below one MiB. */
-export const HERDR_PROTOCOL_OUTPUT_LIMIT = 1024 * 1024;
+const childProcessLayer = NodeChildProcessSpawner.layer.pipe(Layer.provide(liveLayer));
 
 export interface HerdrCommandResult {
   readonly code: number;
   readonly stdout: string;
   readonly stderr: string;
-  readonly timedOut: boolean;
-  readonly stdoutTruncated: boolean;
-  readonly stderrTruncated: boolean;
 }
 
 export class HerdrProtocolError extends Data.TaggedError("HerdrProtocolError")<{
   readonly operation: string;
-  readonly reason: "process" | "command" | "overflow" | "malformed" | "identity" | "unavailable";
+  readonly reason: "process" | "command" | "malformed" | "identity" | "unavailable";
   readonly detail: string;
   readonly cause?: unknown;
 }> {
@@ -36,7 +34,7 @@ export type InspectionDecode<Decoded> =
   | { readonly _tag: "DecodedInspection"; readonly value: Decoded }
   | InvalidInspection;
 
-/** Owns bounded Herdr subprocess transport and protocol-envelope decoding. */
+/** Owns Herdr command execution and protocol-envelope decoding. */
 export class HerdrCommandTransport {
   constructor(private readonly command: string) {}
 
@@ -55,11 +53,29 @@ export class HerdrCommandTransport {
   }
 
   spawn(args: string[], timeoutMs: number): Effect.Effect<HerdrCommandResult, HerdrProtocolError> {
-    return processEffect(this.command, args, {
+    const command = ChildProcess.make(this.command, args, {
       cwd: process.cwd(),
-      timeoutMs,
-      outputLimit: HERDR_PROTOCOL_OUTPUT_LIMIT,
-    }).pipe(
+      stdin: "ignore",
+    });
+    return Effect.scoped(
+      Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const child = yield* spawner.spawn(command);
+        const result = yield* Effect.all(
+          {
+            code: child.exitCode,
+            stdout: child.stdout.pipe(Stream.decodeText(), Stream.mkString),
+            stderr: child.stderr.pipe(Stream.decodeText(), Stream.mkString),
+          },
+          { concurrency: "unbounded" },
+        );
+        return {
+          code: Number(result.code),
+          stdout: result.stdout.trim(),
+          stderr: result.stderr.trim(),
+        };
+      }),
+    ).pipe(
       Effect.mapError(
         (cause) =>
           new HerdrProtocolError({
@@ -69,22 +85,18 @@ export class HerdrCommandTransport {
             cause,
           }),
       ),
-      Effect.flatMap((result) =>
-        result.stdoutTruncated || result.stderrTruncated
-          ? protocolFailure(
-              args,
-              "overflow",
-              `Herdr protocol output exceeded ${HERDR_PROTOCOL_OUTPUT_LIMIT} bytes for ${operationName(args)}; no truncated stdout or stderr was decoded.`,
-            )
-          : Effect.succeed({
-              code: result.exitCode,
-              stdout: result.stdout,
-              stderr: result.stderr,
-              timedOut: result.timedOut,
-              stdoutTruncated: result.stdoutTruncated,
-              stderrTruncated: result.stderrTruncated,
+      Effect.timeoutOrElse({
+        duration: timeoutMs,
+        orElse: () =>
+          Effect.fail(
+            new HerdrProtocolError({
+              operation: operationName(args),
+              reason: "command",
+              detail: `herdr ${operationName(args)} failed: command timed out after ${timeoutMs}ms.`,
             }),
-      ),
+          ),
+      }),
+      Effect.provide(childProcessLayer),
     );
   }
 }
@@ -170,7 +182,6 @@ function decodeCommandResponse<Decoded>(
   args: string[],
   decode: HerdrResponseDecoder<Decoded>,
 ): Decoded {
-  assertCompleteProtocolOutput(result, args);
   let parsed: unknown;
   try {
     parsed = JSON.parse(result.stdout);
@@ -189,7 +200,6 @@ export function isNotFound(
   result: HerdrCommandResult,
   expectedCode: "agent_not_found" | "pane_not_found" | "tab_not_found",
 ): boolean {
-  if (result.stdoutTruncated || result.stderrTruncated) return false;
   for (const candidate of [result.stderr, result.stdout]) {
     try {
       const error = decodeErrorResponse(JSON.parse(candidate));
@@ -203,10 +213,7 @@ export function protocolCommandError(
   args: string[],
   result: HerdrCommandResult,
 ): HerdrProtocolError {
-  if (result.stdoutTruncated || result.stderrTruncated) return overflowError(args);
-  let message = result.timedOut
-    ? "command timed out"
-    : result.stderr || result.stdout || `Herdr exited ${result.code}.`;
+  let message = result.stderr || result.stdout || `Herdr exited ${result.code}.`;
   for (const candidate of [result.stderr, result.stdout]) {
     try {
       const error = decodeErrorResponse(JSON.parse(candidate));
@@ -222,17 +229,5 @@ export function protocolCommandError(
     operation: operationName(args),
     reason: "command",
     detail: `herdr ${operationName(args)} failed: ${message}`,
-  });
-}
-
-function assertCompleteProtocolOutput(result: HerdrCommandResult, args: string[]): void {
-  if (result.stdoutTruncated || result.stderrTruncated) throw overflowError(args);
-}
-
-function overflowError(args: string[]): HerdrProtocolError {
-  return new HerdrProtocolError({
-    operation: operationName(args),
-    reason: "overflow",
-    detail: `Herdr protocol output exceeded ${HERDR_PROTOCOL_OUTPUT_LIMIT} bytes for ${operationName(args)}; no truncated stdout or stderr was decoded.`,
   });
 }

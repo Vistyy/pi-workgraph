@@ -18,7 +18,7 @@ import {
   herdrWorkerTabLabel,
   type WorkerRole,
 } from "../src/herdr-naming.js";
-import { HERDR_PROTOCOL_OUTPUT_LIMIT, HerdrProtocolError } from "../src/herdr-protocol.js";
+import { HerdrCommandTransport, HerdrProtocolError } from "../src/herdr-protocol.js";
 
 const runEffect = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
 
@@ -854,70 +854,30 @@ else console.log(JSON.stringify({result:{accepted:true}}));
   }
 });
 
-await test("bounded protocol output fails before a valid truncated JSON suffix can imply absence", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "workgraph-herdr-protocol-bound-"));
-  const command = join(parent, "fake-herdr-bound.mjs");
-  const mode = join(parent, "mode");
-  const cwd = join(parent, "worktree");
-  const identity: WorkerIdentity = {
-    workspaceId: "workspace-1",
-    tabId: "workspace-1:tab-1",
-    paneId: "workspace-1:pane-1",
-    terminalId: "terminal-1",
-    agentName: "owned-worker",
-    sessionFile: join(parent, "worker.jsonl"),
-    cwd,
-  };
+await test("Herdr command execution reports malformed output and timeout as owner failures", async () => {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-herdr-command-"));
+  const command = join(parent, "fake-herdr-command.mjs");
   await writeFile(
     command,
     `#!/usr/bin/env node
-import { readFileSync } from "node:fs";
-const mode = readFileSync(${JSON.stringify(mode)}, "utf8");
-if (mode === "overflow") {
-  process.stdout.write(" ".repeat(${HERDR_PROTOCOL_OUTPUT_LIMIT + 128}) + JSON.stringify({error:{code:"pane_not_found",message:"gone"}}));
-  process.exitCode = 1;
-} else if (mode === "stderr-overflow") {
-  process.stderr.write(" ".repeat(${HERDR_PROTOCOL_OUTPUT_LIMIT + 128}) + JSON.stringify({error:{code:"pane_not_found",message:"gone"}}));
-  process.exitCode = 1;
-} else {
-  process.stdout.write("{malformed");
-}
+const mode = process.argv[2];
+if (mode === "timeout") setInterval(() => {}, 1000);
+else process.stdout.write("{malformed");
 `,
   );
   await chmod(command, 0o755);
-  const runtime = new HerdrCliRuntime(command, {
-    HERDR_ENV: "1",
-    HERDR_WORKSPACE_ID: identity.workspaceId,
-  });
+  const transport = new HerdrCommandTransport(command);
   try {
-    await writeFile(mode, "overflow");
     await assert.rejects(
-      () => Effect.runPromise(runtime.inspect(identity)),
-      (error) => {
-        assert.ok(error instanceof HerdrProtocolError);
-        assert.equal(error.reason, "overflow");
-        assert.match(error.message, /no truncated stdout or stderr was decoded/);
-        return true;
-      },
+      () => runEffect(transport.call(["malformed"], (value) => value)),
+      (error) => error instanceof HerdrProtocolError && error.reason === "malformed",
     );
-
-    await writeFile(mode, "stderr-overflow");
     await assert.rejects(
-      () => Effect.runPromise(runtime.inspect(identity)),
+      () => runEffect(transport.spawn(["timeout"], 25)),
       (error) => {
         assert.ok(error instanceof HerdrProtocolError);
-        assert.equal(error.reason, "overflow");
-        assert.match(error.message, /no truncated stdout or stderr was decoded/);
-        return true;
-      },
-    );
-
-    await writeFile(mode, "malformed");
-    await assert.rejects(
-      () => Effect.runPromise(runtime.observe(identity)),
-      (error) => {
-        assert.ok(error instanceof HerdrProtocolError);
-        assert.equal(error.reason, "malformed");
+        assert.equal(error.reason, "command");
+        assert.match(error.message, /timed out after 25ms/);
         return true;
       },
     );

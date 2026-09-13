@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Disposable test repositories use the native Git executable for fixture setup.
+import { execFile } from "node:child_process";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Test setup writes an isolated user policy fixture before loading the real extension boundary.
 import { mkdir, writeFile } from "node:fs/promises";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 import { join, resolve } from "node:path";
+import { promisify } from "node:util";
 import type { ExtensionActions } from "@earendil-works/pi-coding-agent";
 import {
   DefaultResourceLoader,
@@ -15,7 +18,8 @@ import {
 import { Clock, Effect } from "effect";
 import { Value } from "typebox/value";
 import type { ModelPolicy } from "../src/model-policy.js";
-import { processEffect } from "../src/process.js";
+
+const execFilePromise = promisify(execFile);
 
 export const fixturePolicy: ModelPolicy = {
   version: 6,
@@ -47,13 +51,7 @@ export const usage = {
 };
 // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
 export async function git(cwd: string, ...args: string[]): Promise<string> {
-  const result = await Effect.runPromise(
-    processEffect("git", ["-C", cwd, ...args], {
-      cwd,
-      timeoutMs: 30_000,
-    }),
-  );
-  assert.equal(result.exitCode, 0, result.stderr);
+  const result = await execFilePromise("git", ["-C", cwd, ...args], { cwd });
   return result.stdout.trim();
 }
 

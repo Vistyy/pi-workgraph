@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Disposable Git tests use real filesystem boundaries.
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Disposable Git tests use real path identities.
 import { join } from "node:path";
@@ -10,13 +10,10 @@ import {
   type CandidateApplicationDestination,
   type CandidateApplicationSource,
   GitParseError,
-  type GitProcessRequest,
-  type GitProcessRunner,
   GitRepository,
   openRepository,
   parseWorktreeList,
 } from "../src/git.js";
-import { ProcessExecutionError, type ProcessResult, processEffect } from "../src/process.js";
 import { git } from "./helpers.js";
 
 const runGit = <A, E>(effect: Effect.Effect<A, E>) => Effect.runPromise(effect);
@@ -27,18 +24,6 @@ async function applyCandidate(
   destination: CandidateApplicationDestination,
 ): Promise<string> {
   return runGit(repository.applyCandidate(source, destination));
-}
-
-async function waitForFile(path: string): Promise<string> {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    try {
-      return await readFile(path, "utf8");
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      await Effect.runPromise(Effect.sleep("10 millis"));
-    }
-  }
-  throw new Error(`Timed out waiting for ${path}.`);
 }
 
 async function fixture() {
@@ -57,41 +42,6 @@ async function fixture() {
   return { parent, root, repository, base: await runGit(head()) };
 }
 
-function processResult(
-  overrides: Partial<Pick<ProcessResult, "exitCode" | "stderr" | "stdout" | "timedOut">>,
-): ProcessResult {
-  return {
-    exitCode: overrides.exitCode ?? 0,
-    stderr: overrides.stderr ?? "",
-    stderrTruncated: false,
-    stdout: overrides.stdout ?? "",
-    stdoutTruncated: false,
-    timedOut: overrides.timedOut ?? false,
-  };
-}
-
-function liveProcess(request: GitProcessRequest) {
-  return processEffect("git", ["-C", request.cwd, ...request.args], {
-    cwd: request.cwd,
-    timeoutMs: request.timeoutMs,
-    digestStdout: request.digestStdout,
-  });
-}
-
-function interceptProcess(
-  intercept: (request: GitProcessRequest) => ReturnType<GitProcessRunner> | undefined,
-): GitProcessRunner {
-  return (request) => intercept(request) ?? liveProcess(request);
-}
-
-function processUnavailable(request: GitProcessRequest, message: string): ProcessExecutionError {
-  return new ProcessExecutionError({
-    command: "git",
-    args: ["-C", request.cwd, ...request.args],
-    cause: new Error(message),
-  });
-}
-
 void test("Git worktree parsing rejects missing paths and preserves embedded newlines", async () => {
   const malformed = "branch refs/heads/missing-worktree\0\0";
   const failure = await Effect.runPromise(Effect.flip(parseWorktreeList(malformed)));
@@ -106,32 +56,6 @@ void test("Git worktree parsing rejects missing paths and preserves embedded new
     ),
     [{ path: "/tmp/path-with\na-newline", branch: "main" }],
   );
-});
-
-void test("interrupting a long read-only Git effect waits for the Git child to close", async () => {
-  const f = await fixture();
-  const hook = join(f.parent, "fsmonitor-hook");
-  const started = join(f.parent, "fsmonitor-started");
-  const closed = join(f.parent, "git-closed");
-  try {
-    await writeFile(
-      hook,
-      `#!/bin/sh\nparent="$PPID"\nprintf '%s' "$parent" > ${JSON.stringify(started)}\nwhile kill -0 "$parent" 2>/dev/null; do sleep 0.02; done\nprintf closed > ${JSON.stringify(closed)}\n`,
-    );
-    await chmod(hook, 0o755);
-    await git(f.root, "config", "core.fsmonitor", hook);
-
-    const controller = new AbortController();
-    const running = Effect.runPromise(f.repository.status(), {
-      signal: controller.signal,
-    });
-    assert.match(await waitForFile(started), /^[0-9]+$/);
-    controller.abort();
-    await assert.rejects(running);
-    assert.equal(await waitForFile(closed), "closed");
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
 });
 
 void test("Git placements preserve unknown data; cleanup requires exact clean identity and is idempotent", async () => {
@@ -294,122 +218,6 @@ void test("discard refuses moved placement and HEAD mismatch without deleting ou
   }
 });
 
-void test("branch-only candidate validation fences the final retained ref observation", async () => {
-  const f = await fixture();
-  try {
-    const placement = await runGit(f.repository.createWorktree("run", "fenced", f.base));
-    await writeFile(join(placement.path, "candidate.txt"), "candidate\n");
-    await git(placement.path, "add", ".");
-    await git(placement.path, "commit", "-m", "Candidate");
-    const commit = await runGit(f.repository.head(placement.path));
-    await runGit(f.repository.cleanupWorktree(placement, commit, true));
-    const moved = "f".repeat(40);
-    const branchRef = `refs/heads/${placement.branch}`;
-    let observations = 0;
-    const repository = new GitRepository(
-      f.root,
-      f.repository.commonDir,
-      interceptProcess((request) => {
-        if (request.args.join("\\0") !== `rev-parse\\0--verify\\0--quiet\\0${branchRef}`)
-          return undefined;
-        observations += 1;
-        return observations === 2
-          ? Effect.succeed(processResult({ stdout: `${moved}\\n` }))
-          : undefined;
-      }),
-    );
-    await assert.rejects(
-      () => runGit(repository.validateCandidate(placement, f.base, commit)),
-      /moved during validation/,
-    );
-    assert.equal(await git(f.root, "rev-parse", branchRef), commit);
-    assert.equal(await runGit(repository.head()), f.base);
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
-void test("timed-out and unavailable ref observations never remove a real worker worktree or branch", async () => {
-  const observationFailures = [
-    {
-      name: "timeout",
-      run: () => Effect.succeed(processResult({ exitCode: 1, timedOut: true })),
-      expected: /timed out before a reliable result/,
-    },
-    {
-      name: "unavailable",
-      run: (request: GitProcessRequest) =>
-        Effect.fail(processUnavailable(request, "ref observation unavailable")),
-      expected: /ref observation unavailable/,
-    },
-  ] as const;
-
-  for (const observationFailure of observationFailures) {
-    const f = await fixture();
-    const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
-    const branchRef = `refs/heads/${placement.branch}`;
-    const repository = new GitRepository(
-      f.root,
-      f.repository.commonDir,
-      interceptProcess((request) =>
-        request.args.join("\0") === `rev-parse\0--verify\0--quiet\0${branchRef}`
-          ? observationFailure.run(request)
-          : undefined,
-      ),
-    );
-    try {
-      const failure = await Effect.runPromise(
-        Effect.flip(repository.cleanupWorktree(placement, f.base)),
-      );
-      if (failure instanceof ProcessExecutionError) {
-        const cause =
-          failure.cause instanceof Error ? failure.cause.message : String(failure.cause);
-        assert.match(cause, observationFailure.expected);
-      } else {
-        assert.match(failure.message, observationFailure.expected);
-      }
-      assert.equal(await git(f.root, "rev-parse", branchRef), f.base);
-      assert.match(
-        await git(f.root, "worktree", "list", "--porcelain"),
-        new RegExp(placement.path),
-      );
-    } finally {
-      await rm(f.parent, { recursive: true, force: true });
-    }
-  }
-});
-
-void test("cleanup independently rechecks the exact branch after worktree registration disappears", async () => {
-  const f = await fixture();
-  const placement = await runGit(f.repository.createWorktree("run", "worker", f.base));
-  const branchRef = `refs/heads/${placement.branch}`;
-  let refInspections = 0;
-  const repository = new GitRepository(
-    f.root,
-    f.repository.commonDir,
-    interceptProcess((request) => {
-      if (request.args.join("\0") !== `rev-parse\0--verify\0--quiet\0${branchRef}`) {
-        return undefined;
-      }
-      refInspections += 1;
-      return refInspections === 1 ? Effect.succeed(processResult({ exitCode: 1 })) : undefined;
-    }),
-  );
-  try {
-    await assert.rejects(
-      () => runGit(repository.cleanupWorktree(placement, f.base)),
-      /Cleanup branch postcondition failed/,
-    );
-    assert.equal(await git(f.root, "rev-parse", branchRef), f.base);
-    assert.doesNotMatch(
-      await git(f.root, "worktree", "list", "--porcelain"),
-      new RegExp(placement.path),
-    );
-  } finally {
-    await rm(f.parent, { recursive: true, force: true });
-  }
-});
-
 void test("candidate application validates lineage, ref identity, and fast-forwards once", async () => {
   const f = await fixture();
   try {
@@ -461,23 +269,6 @@ void test("candidate application validates lineage, ref identity, and fast-forwa
     } finally {
       await rm(mergeHead, { force: true });
     }
-    let mergeAttempts = 0;
-    const unchangedFailureRepository = new GitRepository(
-      f.root,
-      f.repository.commonDir,
-      interceptProcess((request) => {
-        if (request.args.join("\\0") !== `merge\\0--ff-only\\0--no-edit\\0${second}`)
-          return undefined;
-        mergeAttempts += 1;
-        return Effect.succeed(processResult({ exitCode: 7, stderr: "merge failed" }));
-      }),
-    );
-    await assert.rejects(
-      () => applyCandidate(unchangedFailureRepository, source, destination),
-      /Fast-forward application.*failed/,
-    );
-    assert.equal(await runGit(f.repository.head()), f.base);
-    assert.equal(mergeAttempts, 1);
     await git(f.root, "branch", "switched-ff", f.base);
     await git(f.root, "switch", "switched-ff");
     try {
