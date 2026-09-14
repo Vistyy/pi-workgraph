@@ -1,7 +1,6 @@
-/* oxlint-disable effecttsgo/async-function, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion -- The finite loopback provider owns Node HTTP callbacks and validates untyped OpenAI request payloads before use. */
+/* oxlint-disable effecttsgo/async-function, anti-slop/no-runtime-typeof -- The finite loopback provider owns Node HTTP callbacks and validates untyped OpenAI request payloads before use. */
 import { once } from "node:events";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Verification owns one loopback HTTP boundary.
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 
 export interface ControlledRequest {
   readonly index: number;
@@ -84,13 +83,16 @@ function decodeRequest(incoming: IncomingMessage, raw: string, index: number): C
   if (incoming.method !== "POST" || incoming.url !== "/v1/chat/completions")
     throw new Error(`Unexpected provider boundary: ${incoming.method} ${incoming.url}`);
 
-  const parsed = JSON.parse(raw) as {
-    model?: unknown;
-    messages?: unknown;
-    tools?: unknown;
-  };
+  const parsed: unknown = JSON.parse(raw);
 
-  if (typeof parsed.model !== "string" || !Array.isArray(parsed.messages))
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    !("model" in parsed) ||
+    typeof parsed.model !== "string" ||
+    !("messages" in parsed) ||
+    !Array.isArray(parsed.messages)
+  )
     throw new Error("Controlled provider received an invalid OpenAI request.");
 
   return {
@@ -99,14 +101,14 @@ function decodeRequest(incoming: IncomingMessage, raw: string, index: number): C
     url: incoming.url,
     model: parsed.model,
     messages: parsed.messages,
-    tools: Array.isArray(parsed.tools) ? parsed.tools : [],
+    tools: "tools" in parsed && Array.isArray(parsed.tools) ? parsed.tools : [],
     raw,
   };
 }
 
 async function handleRequest(
   incoming: IncomingMessage,
-  outgoing: import("node:http").ServerResponse,
+  outgoing: ServerResponse,
   responses: readonly ControlledResponse[],
   requests: ControlledRequest[],
   errors: Error[],

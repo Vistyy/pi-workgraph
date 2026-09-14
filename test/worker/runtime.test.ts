@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/global-date -- Tests own disposable native files and protocol timestamps. */
+/* oxlint-disable effecttsgo/global-date -- Tests own disposable native files and protocol timestamps. */
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/global-date, anti-slop/no-object-parameters, typescript/no-unsafe-member-access, anti-slop/require-safety-comment-for-type-assertion -- Flow tests inspect deterministic native transport logs and real Pi session files. */
+/* oxlint-disable effecttsgo/global-date, anti-slop/no-object-parameters, typescript/no-unsafe-member-access -- Flow tests inspect deterministic native transport logs and real Pi session files. */
 import assert from "node:assert/strict";
 import {
   chmodSync,
@@ -82,13 +82,26 @@ else{console.error(JSON.stringify({error:{code:"unexpected"}}));process.exitCode
   };
 }
 
+function isCommand(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every((argument): argument is string => typeof argument === "string")
+  );
+}
+
 function commands(path: string): string[][] {
   try {
     return readFileSync(path, "utf8")
       .trim()
       .split("\n")
       .filter(Boolean)
-      .map((line) => JSON.parse(line) as string[]);
+      .map((line) => {
+        const value: unknown = JSON.parse(line);
+
+        if (!isCommand(value)) throw new Error("Controlled Herdr command log entry is malformed.");
+
+        return value;
+      });
   } catch {
     return [];
   }

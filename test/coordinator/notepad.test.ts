@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Disposable sessions establish Pi's branch and entry behavior.
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path"; // oxlint-disable-line effecttsgo/node-builtin-import -- Fixture paths are exact disposable identities.
+import { join } from "node:path";
 import test from "node:test";
 import { Value } from "typebox/value";
 import { installNotepad } from "../../src/coordinator/notepad.js";

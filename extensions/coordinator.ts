@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
+/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
 import { readFileSync } from "node:fs";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -6,7 +6,7 @@ import {
   type ExtensionContext,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
-import { Effect, Exit, Scope } from "effect";
+import { Effect, Exit, Match, Scope } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
 import type { HerdrCliRuntime } from "../src/coordinator/herdr.js";
@@ -395,12 +395,18 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           return result({ attemptId: params.attemptId, steered: true });
         }
 
-        const attempt =
-          params.action === "cancel"
-            ? await Effect.runPromise(current.cancel(params.attemptId, params.reason))
-            : params.action === "apply"
-              ? await Effect.runPromise(current.apply(params.attemptId))
-              : await Effect.runPromise(current.discard(params.attemptId, params.reason));
+        const operation = Match.value(params).pipe(
+          Match.when({ action: "cancel" }, ({ attemptId, reason }) =>
+            current.cancel(attemptId, reason),
+          ),
+          Match.when({ action: "apply" }, ({ attemptId }) => current.apply(attemptId)),
+          Match.when({ action: "discard_output" }, ({ attemptId, reason }) =>
+            current.discard(attemptId, reason),
+          ),
+          Match.exhaustive,
+        );
+
+        const attempt = await Effect.runPromise(operation);
 
         return result(attemptReceipt(attempt));
       });
@@ -539,11 +545,11 @@ function selectionForAttempt(
     kind: "target",
     target: configuredTarget(
       policy,
-      contract.kind === "review"
-        ? "review"
-        : contract.kind === "consultation"
-          ? "consultation.advisor"
-          : "research",
+      Match.value(contract.kind).pipe(
+        Match.when("review", () => "review" as const),
+        Match.when("consultation", () => "consultation.advisor" as const),
+        Match.orElse(() => "research" as const),
+      ),
     ),
   };
 }

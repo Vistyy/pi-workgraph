@@ -1,8 +1,6 @@
 import assert from "node:assert/strict";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This test owns an isolated policy-file boundary.
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Temporary paths identify this test's isolated policy files.
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";

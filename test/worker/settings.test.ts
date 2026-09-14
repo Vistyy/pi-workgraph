@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
 // SAFETY: Test-only files stay inside an owned temporary directory.
-// oxlint-disable-next-line effecttsgo/node-builtin-import
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 // SAFETY: Test-only paths stay inside an owned temporary directory.
-// oxlint-disable-next-line effecttsgo/node-builtin-import
 import { join } from "node:path";
 import test from "node:test";
 import { loadWorkerDisabledTools } from "../../src/worker/settings.js";

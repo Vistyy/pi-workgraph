@@ -1,7 +1,6 @@
 /* oxlint-disable typescript/no-this-alias -- Effect generators retain the runtime owner while yielding serialized lifecycle operations. */
 /* biome-ignore-all lint/complexity/noExcessiveCognitiveComplexity: lifecycle ordering is intentionally visible in cohesive flow owners. */
 import { randomUUID } from "node:crypto";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Worker session and repository paths are host identities.
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Clock, Data, Effect, Queue, type Scope, Semaphore } from "effect";

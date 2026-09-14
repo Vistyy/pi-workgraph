@@ -1,10 +1,11 @@
-/* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/global-timers, effecttsgo/new-promise -- This bounded integration owns disposable native files and waits for Pi's asynchronous follow-up. */
+/* oxlint-disable effecttsgo/global-timers, effecttsgo/new-promise -- This bounded integration owns disposable native files and waits for Pi's asynchronous follow-up. */
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
 import {
+  type AgentSession,
   createAgentSession,
   DefaultResourceLoader,
   ModelRuntime,
@@ -92,7 +93,7 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
     },
   ]);
 
-  let session: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
+  let session: AgentSession | undefined;
 
   try {
     const agentDir = join(parent, "agent");
@@ -164,7 +165,9 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
     await session.prompt("Begin the assigned Workgraph task", { source: "rpc" });
 
     for (let index = 0; index < 100 && provider.requests.length < 4; index += 1) {
-      await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
+      await new Promise((resolveDelay) => {
+        setTimeout(resolveDelay, 10);
+      });
     }
 
     await session.agent.waitForIdle();
@@ -261,7 +264,7 @@ void test("real Pi restores the exact guide before continuing after executor sel
     },
   ]);
 
-  let session: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
+  let session: AgentSession | undefined;
 
   try {
     const agentDir = join(parent, "agent");

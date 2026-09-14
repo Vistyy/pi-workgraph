@@ -140,11 +140,16 @@ export function fakePi() {
   };
 }
 
-/** Feed a structurally partial fixture into a guarded host boundary. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- The adapter, not the fixture type, owns validation of this partial host value.
-export function fixture<T>(value: unknown): T {
-  // SAFETY: Fixtures supply only the fields Calm consumes; the adapter validates the rest.
-  return value as T;
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This test adapter owns the deliberately partial host fixture boundary.
+function extensionApiFixture(value: unknown): ExtensionAPI {
+  // SAFETY: The fixture implements only the ExtensionAPI members Calm consumes at its guarded host boundary.
+  return value as ExtensionAPI;
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This test adapter owns the deliberately partial host fixture boundary.
+function extensionContextFixture(value: unknown): ExtensionContext {
+  // SAFETY: The fixture implements only the ExtensionContext members Calm consumes at its guarded host boundary.
+  return value as ExtensionContext;
 }
 
 export function calmHarness(options: {
@@ -158,7 +163,7 @@ export function calmHarness(options: {
   const ui = fakeUi(tui);
   const pi = fakePi();
 
-  const calm = installCalmMode(fixture<ExtensionAPI>(pi), {
+  const calm = installCalmMode(extensionApiFixture(pi), {
     intervalMs: options.intervalMs ?? 10_000,
     preferences: options.preferences ?? {
       load: () => Promise.resolve(false),
@@ -167,8 +172,7 @@ export function calmHarness(options: {
     loadRuntime: options.loadRuntime ?? (() => Promise.resolve(options.runtime)),
   });
 
-  // SAFETY: The fixture supplies only the ExtensionContext fields Calm consumes.
-  const context = fixture<ExtensionContext>({
+  const context = extensionContextFixture({
     mode: "tui",
     ui,
     isIdle: () => true,

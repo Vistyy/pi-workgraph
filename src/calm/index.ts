@@ -70,7 +70,7 @@ function loadDefaultCalm(
   preferences: CalmPreferences,
   isCurrent: () => boolean,
 ): Promise<boolean> {
-  return preferences.load().catch((error) => {
+  return preferences.load().catch((error: unknown) => {
     if (isCurrent())
       ui.notify(
         `Could not load Calm default: ${error instanceof Error ? error.message : String(error)}`,
@@ -398,9 +398,9 @@ export function installCalmMode(
   pi.registerCommand("calm", {
     description: "Toggle Calm for this session; /calm default on|off saves the startup default",
     getArgumentCompletions: (prefix) =>
-      ["default on", "default off"]
-        .filter((value) => value.startsWith(prefix))
-        .map((value) => ({ value, label: value })),
+      ["default on", "default off"].flatMap((value) =>
+        value.startsWith(prefix) ? [{ value, label: value }] : [],
+      ),
     handler: (args, ctx) =>
       Promise.resolve()
         .then(() => {
@@ -447,7 +447,7 @@ export function installCalmMode(
 
           return;
         })
-        .catch((error) => {
+        .catch((error: unknown) => {
           ctx.ui.notify(
             `Could not save Calm preference: ${error instanceof Error ? error.message : String(error)}`,
             "error",

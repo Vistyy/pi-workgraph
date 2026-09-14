@@ -1,4 +1,3 @@
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This is Pi's documented global settings location.
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Data, Effect, FileSystem } from "effect";
@@ -92,12 +91,9 @@ function loadGlobalSettingsEffect<A>(
   return Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
 
-    const contents = yield* fileSystem.readFileString(path).pipe(
-      Effect.catchIf(
-        (error) => error.reason._tag === "NotFound",
-        () => Effect.void,
-      ),
-    );
+    const contents = yield* fileSystem
+      .readFileString(path)
+      .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.void));
 
     if (contents === undefined) return decode({}, path);
 

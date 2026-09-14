@@ -1,9 +1,9 @@
-/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, typescript/no-unsafe-return -- node:sqlite rows and TypeBox outputs are decoded at this private host boundary. */
+/* oxlint-disable anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, typescript/no-unsafe-return -- node:sqlite rows and TypeBox outputs are decoded at this private host boundary. */
 /* biome-ignore-all lint/complexity/useLiteralKeys: SQLite rows require indexed access under noPropertyAccessFromIndexSignature. */
 import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
-import { Data } from "effect";
+import { Data, Match } from "effect";
 import type { Static, TSchema } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -266,7 +266,7 @@ export class RecordStore {
                  WHERE parent.attempt_id=? AND parent.session_id=child.session_id
                )`,
           )
-          .get(this.sessionId, parentAttemptId, parentAttemptId) as Row | undefined,
+          .get(this.sessionId, parentAttemptId, parentAttemptId),
         "value",
       ) > 0
     );
@@ -293,7 +293,7 @@ export class RecordStore {
                  WHERE parent.attempt_id=? AND parent.session_id=child.session_id
                )`,
           )
-          .get(this.sessionId, parentAttemptId, parentAttemptId) as Row | undefined,
+          .get(this.sessionId, parentAttemptId, parentAttemptId),
         "value",
       ) > 0
     );
@@ -350,7 +350,7 @@ export class RecordStore {
            END),0) AS active_workers
          FROM attempts WHERE session_id=?`,
       )
-      .get(this.sessionId, this.sessionId) as Row | undefined;
+      .get(this.sessionId, this.sessionId);
 
     return {
       tasks: integer(row, "tasks"),
@@ -362,7 +362,7 @@ export class RecordStore {
   private readTaskFrom(database: DatabaseSync, taskId: string): TaskRecord {
     const row = database
       .prepare("SELECT * FROM tasks WHERE session_id=? AND task_id=?")
-      .get(this.sessionId, taskId) as Row | undefined;
+      .get(this.sessionId, taskId);
 
     if (row === undefined) throw failure("read Task", "Required Task is absent.");
 
@@ -372,7 +372,7 @@ export class RecordStore {
   private readAttemptFrom(database: DatabaseSync, attemptId: string): AttemptRecord {
     const row = database
       .prepare("SELECT * FROM attempts WHERE session_id=? AND attempt_id=?")
-      .get(this.sessionId, attemptId) as Row | undefined;
+      .get(this.sessionId, attemptId);
 
     if (row === undefined) throw failure("read Attempt", "Required Attempt is absent.");
 
@@ -504,14 +504,11 @@ function isInitialized(database: DatabaseSync, operation: string): boolean {
 }
 
 function userVersion(database: DatabaseSync): number {
-  return integer(database.prepare("PRAGMA user_version").get() as Row | undefined, "user_version");
+  return integer(database.prepare("PRAGMA user_version").get(), "user_version");
 }
 
 function schemaObjectCount(database: DatabaseSync): number {
-  return integer(
-    database.prepare("SELECT count(*) AS value FROM sqlite_schema").get() as Row | undefined,
-    "value",
-  );
+  return integer(database.prepare("SELECT count(*) AS value FROM sqlite_schema").get(), "value");
 }
 
 function prepareParent(path: string, create: boolean, operation: string): boolean {
@@ -585,12 +582,11 @@ function validateOutcome(outcome: Outcome, task: Task): void {
 
   if (outcome.result.kind !== "reported") return;
 
-  const expected =
-    task.contract.kind === "implementation"
-      ? "implementation"
-      : task.contract.kind === "review"
-        ? "review"
-        : "research";
+  const expected = Match.value(task.contract.kind).pipe(
+    Match.when("implementation", () => "implementation" as const),
+    Match.when("review", () => "review" as const),
+    Match.orElse(() => "research" as const),
+  );
 
   if (outcome.result.report.kind !== expected)
     throw failure("decode Outcome", "Report kind does not match its Task.");
@@ -636,6 +632,7 @@ function decode<S extends TSchema>(schema: S, value: unknown, name: string): Sta
   return Value.Decode(schema, value) as Static<S>;
 }
 
+// oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Name and Value preserve the computed key-to-value relation in the mapped return type.
 function optional<const Name extends string, Value>(name: Name, value: Value | undefined) {
   return value === undefined ? {} : ({ [name]: value } as { [Key in Name]: Value });
 }

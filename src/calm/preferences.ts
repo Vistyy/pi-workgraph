@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 // SAFETY: Resolves the extension-owned preference file within Pi's configured agent directory.
-// oxlint-disable-next-line effecttsgo/node-builtin-import
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Data, Effect, FileSystem, Path } from "effect";

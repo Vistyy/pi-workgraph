@@ -1,4 +1,3 @@
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Native paths are part of the public configuration API.
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { Data, Effect, FileSystem } from "effect";
@@ -73,8 +72,9 @@ export function loadModelPolicyEffect(
     const fileSystem = yield* FileSystem.FileSystem;
 
     const contents = yield* fileSystem.readFileString(path).pipe(
-      Effect.catchIf(
-        (error) => error.reason._tag === "NotFound",
+      Effect.catchReason(
+        "PlatformError",
+        "NotFound",
         () =>
           new ModelPolicyError({
             operation: "read",

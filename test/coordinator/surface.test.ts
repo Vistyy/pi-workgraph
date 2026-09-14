@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs"; // oxlint-disable-line effecttsgo/node-builtin-import -- The pre-mutation assertion observes the real Store path.
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Real isolated sessions and SQLite establish the registered boundary.
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path"; // oxlint-disable-line effecttsgo/node-builtin-import -- Fixture paths are exact disposable identities.
+import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
@@ -219,6 +219,7 @@ void test("registered extension starts candidate extension from the exact retain
       /Private output ref is absent or was repointed/,
     );
     const afterRejection = await f.call("workgraph_inspect", { section: "overview" });
+    // SAFETY: The registered inspect tool owns this successful overview detail shape.
     assert.deepEqual(
       (afterRejection.details as { counts: { tasks: number; attempts: number } }).counts,
       { tasks: 1, attempts: 1, activeWorkers: 0 },

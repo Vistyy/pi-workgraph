@@ -1,4 +1,5 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers, effecttsgo/new-promise, effecttsgo/node-builtin-import, effecttsgo/process-env, anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, typescript/strict-boolean-expressions, typescript/no-unsafe-return -- This operator-controlled native boundary owns host resources, chronology, untyped Herdr envelopes, and bounded cleanup. */
+/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers, effecttsgo/new-promise, effecttsgo/process-env, anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, typescript/strict-boolean-expressions, typescript/no-unsafe-return -- This operator-controlled native boundary owns host resources, chronology, untyped Herdr envelopes, and bounded cleanup. */
+/* biome-ignore-all lint/complexity/useLiteralKeys: decoded JSON records require indexed access under noPropertyAccessFromIndexSignature. */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -66,12 +67,8 @@ function env(name: string): string | undefined {
   return process.env[name];
 }
 
-function prop<T>(value: Record<string, unknown>, key: string): T {
-  const result = value[key];
-
-  if (result === undefined) throw new Error(`Missing Herdr response field ${key}.`);
-
-  return result as T;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function checkSignal(signal: AbortSignal): void {
@@ -105,14 +102,13 @@ async function herdr(
 ): Promise<Record<string, unknown>> {
   const envelope: unknown = JSON.parse(await command(cwd, "herdr", args, signal));
 
-  if (typeof envelope !== "object" || envelope === null || !("result" in envelope))
+  if (!isRecord(envelope) || !("result" in envelope))
     throw new Error(`Invalid Herdr response for ${args.join(" ")}.`);
-  const result = envelope.result;
+  const result = envelope["result"];
 
-  if (typeof result !== "object" || result === null)
-    throw new Error(`Invalid Herdr result for ${args.join(" ")}.`);
+  if (!isRecord(result)) throw new Error(`Invalid Herdr result for ${args.join(" ")}.`);
 
-  return result as Record<string, unknown>;
+  return result;
 }
 
 async function phase<T>(name: string, run: () => Promise<T>, signal: AbortSignal): Promise<T> {
@@ -347,7 +343,10 @@ function modelConfig(id: string) {
 async function persistCheckpoint(extra: Record<string, unknown> = {}): Promise<void> {
   assert.ok(checkpointFile);
   const previous = await readFile(checkpointFile, "utf8");
-  const checkpoint = JSON.parse(previous) as Record<string, unknown>;
+  const checkpoint: unknown = JSON.parse(previous);
+
+  if (!isRecord(checkpoint)) throw new Error("Controlled-native checkpoint is not a record.");
+
   await writeFile(checkpointFile, JSON.stringify({ ...checkpoint, ...extra }, null, 2));
 }
 
@@ -380,65 +379,64 @@ async function closeWorkspace(signal: AbortSignal): Promise<void> {
   )
     return;
 
-  const info = prop<Record<string, unknown>>(
-    await herdr(repo, signal, "workspace", "get", workspaceId),
-    "workspace",
-  );
+  const workspaceResult = await herdr(repo, signal, "workspace", "get", workspaceId);
+  const info = workspaceResult["workspace"];
 
-  assert.equal(prop<string>(info, "workspace_id"), workspaceId);
+  assert.ok(isRecord(info), "Herdr workspace get result is malformed.");
+  assert.equal(info["workspace_id"], workspaceId);
 
-  const tabs = prop<Array<Record<string, unknown>>>(
-    await herdr(repo, signal, "tab", "list", "--workspace", workspaceId),
-    "tabs",
-  );
+  const tabResult = await herdr(repo, signal, "tab", "list", "--workspace", workspaceId);
+  const tabs = tabResult["tabs"];
 
-  const panes = prop<Array<Record<string, unknown>>>(
-    await herdr(repo, signal, "pane", "list", "--workspace", workspaceId),
-    "panes",
-  );
+  assert.ok(Array.isArray(tabs) && tabs.every(isRecord), "Herdr tab list result is malformed.");
 
-  assert.equal(prop<number>(info, "tab_count"), tabs.length);
-  assert.equal(prop<number>(info, "pane_count"), panes.length);
+  const paneResult = await herdr(repo, signal, "pane", "list", "--workspace", workspaceId);
+  const panes = paneResult["panes"];
+
+  assert.ok(Array.isArray(panes) && panes.every(isRecord), "Herdr pane list result is malformed.");
+  assert.equal(info["tab_count"], tabs.length);
+  assert.equal(info["pane_count"], panes.length);
   assert.deepEqual(
     tabs.map((tab) => ({
-      id: prop<string>(tab, "tab_id"),
-      workspace: prop<string>(tab, "workspace_id"),
+      id: tab["tab_id"],
+      workspace: tab["workspace_id"],
     })),
     [{ id: tabId, workspace: workspaceId }],
   );
   assert.deepEqual(
     panes.map((pane) => ({
-      id: prop<string>(pane, "pane_id"),
-      tab: prop<string>(pane, "tab_id"),
-      workspace: prop<string>(pane, "workspace_id"),
-      terminal: prop<string>(pane, "terminal_id"),
+      id: pane["pane_id"],
+      tab: pane["tab_id"],
+      workspace: pane["workspace_id"],
+      terminal: pane["terminal_id"],
     })),
     [{ id: paneId, tab: tabId, workspace: workspaceId, terminal: terminalId }],
   );
 
-  const observed = prop<Record<string, unknown>>(
-    await herdr(repo, signal, "agent", "get", paneId),
-    "agent",
-  );
+  const agentResult = await herdr(repo, signal, "agent", "get", paneId);
+  const observed = agentResult["agent"];
 
-  assert.equal(prop<string>(observed, "workspace_id"), workspaceId);
-  assert.equal(prop<string>(observed, "tab_id"), tabId);
-  assert.equal(prop<string>(observed, "pane_id"), paneId);
-  assert.equal(prop<string>(observed, "terminal_id"), terminalId);
-  assert.equal(
-    prop<string>(prop<Record<string, unknown>>(observed, "agent_session"), "value"),
-    sessionFile,
-  );
-  assert.ok(["idle", "done"].includes(prop<string>(observed, "agent_status")));
+  assert.ok(isRecord(observed), "Herdr agent get result is malformed.");
+  assert.equal(observed["workspace_id"], workspaceId);
+  assert.equal(observed["tab_id"], tabId);
+  assert.equal(observed["pane_id"], paneId);
+  assert.equal(observed["terminal_id"], terminalId);
+  const agentSession = observed["agent_session"];
+
+  assert.ok(isRecord(agentSession), "Herdr agent session result is malformed.");
+  assert.equal(agentSession["value"], sessionFile);
+  assert.ok(observed["agent_status"] === "idle" || observed["agent_status"] === "done");
   evidence.workspaceSnapshots.push({ beforeClose: { info, tabs, panes, agent: observed } });
   await herdr(repo, signal, "workspace", "close", workspaceId);
 
-  const remaining = prop<Array<{ workspace_id: string }>>(
-    await herdr(repo, signal, "workspace", "list"),
-    "workspaces",
-  );
+  const listResult = await herdr(repo, signal, "workspace", "list");
+  const remaining = listResult["workspaces"];
 
-  assert.ok(!remaining.some((item) => item.workspace_id === workspaceId));
+  assert.ok(
+    Array.isArray(remaining) && remaining.every(isRecord),
+    "Herdr workspace list result is malformed.",
+  );
+  assert.ok(!remaining.some((item) => item["workspace_id"] === workspaceId));
   evidence.cleanup.push(
     "Exact owned workspace absence verified after checking its tab, pane, terminal, session, and idle agent identity.",
   );
@@ -595,11 +593,27 @@ async function run(signal: AbortSignal): Promise<void> {
     signal,
   );
 
-  workspaceId = prop<string>(prop(created, "workspace"), "workspace_id");
+  const createdWorkspace = created["workspace"];
+  const rootPane = created["root_pane"];
+  const createdTab = created["tab"];
+
+  if (!isRecord(createdWorkspace) || !isRecord(rootPane) || !isRecord(createdTab))
+    throw new Error("Herdr workspace create result is malformed.");
+  const createdWorkspaceId = createdWorkspace["workspace_id"];
+  const createdPaneId = rootPane["pane_id"];
+  const createdTabId = createdTab["tab_id"];
+
+  if (
+    typeof createdWorkspaceId !== "string" ||
+    typeof createdPaneId !== "string" ||
+    typeof createdTabId !== "string"
+  )
+    throw new Error("Herdr workspace create identities are malformed.");
+  workspaceId = createdWorkspaceId;
   await persistCheckpoint({ identities: { workspaceId } });
-  paneId = prop<string>(prop(created, "root_pane"), "pane_id");
+  paneId = createdPaneId;
   await persistCheckpoint({ identities: { workspaceId, paneId } });
-  tabId = prop<string>(prop(created, "tab"), "tab_id");
+  tabId = createdTabId;
   await persistCheckpoint({ identities: { workspaceId, paneId, tabId } });
 
   const launched = await phase(
@@ -632,29 +646,33 @@ async function run(signal: AbortSignal): Promise<void> {
     signal,
   );
 
-  terminalId = prop<string>(prop(launched, "agent"), "terminal_id");
+  const launchedAgent = launched["agent"];
+
+  if (!isRecord(launchedAgent) || typeof launchedAgent["terminal_id"] !== "string")
+    throw new Error("Herdr agent start result is malformed.");
+  terminalId = launchedAgent["terminal_id"];
   await persistCheckpoint({ identities: { workspaceId, paneId, tabId, terminalId } });
   await waitFor(
     "coordinator-ready",
     async () => {
-      const observed = prop<Record<string, unknown>>(
-        await herdr(repo as string, signal, "agent", "get", paneId as string),
-        "agent",
-      );
+      const result = await herdr(repo as string, signal, "agent", "get", paneId as string);
+      const observed = result["agent"];
 
-      if (prop<string>(observed, "agent_status") === "blocked")
+      if (!isRecord(observed)) throw new Error("Herdr agent get result is malformed.");
+
+      if (observed["agent_status"] === "blocked")
         throw new Error("Pi startup is blocked; no trust bypass was attempted.");
-      assert.equal(prop<string>(observed, "cwd"), repo);
-      assert.equal(prop<string>(observed, "terminal_id"), terminalId);
+      assert.equal(observed["cwd"], repo);
+      assert.equal(observed["terminal_id"], terminalId);
+      const agentSession = observed["agent_session"];
 
-      return (
-        prop<string>(prop<Record<string, unknown>>(observed, "agent_session"), "value") ===
-        sessionFile
-      );
+      if (!isRecord(agentSession)) throw new Error("Herdr agent session result is malformed.");
+
+      return agentSession["value"] === sessionFile;
     },
     signal,
   );
-  settlementBaseline = settledEvents(await eventEntries(), sessionFile as string).length;
+  settlementBaseline = settledEvents(await eventEntries(), sessionFile).length;
   await phase(
     "initial-prompt-submitted",
     () =>

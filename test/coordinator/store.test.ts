@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion, typescript/require-array-sort-compare -- focused tests inspect native SQLite row shapes through node:sqlite's open row type. */
+/* oxlint-disable anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion, typescript/require-array-sort-compare -- focused tests inspect native SQLite row shapes through node:sqlite's open row type. */
 import assert from "node:assert/strict";
 import {
   chmodSync,

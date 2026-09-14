@@ -12,7 +12,7 @@ import { attachCalmProjection, type CalmProjection } from "../../src/calm/projec
  * used a statically imported public class, every fixture row would be dropped.
  */
 
-// oxlint-disable anti-slop/no-object-parameters, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, typescript/unbound-method
+// oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, typescript/unbound-method
 
 export type ContentPart = AssistantMessage["content"][number];
 

@@ -1,5 +1,3 @@
-/* oxlint-disable effecttsgo/node-builtin-import -- Git placement identity includes host filesystem paths. */
-
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";

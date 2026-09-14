@@ -1,5 +1,5 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { Data, Effect, Result } from "effect";
+import { Data, Effect, Match, Result } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -392,7 +392,11 @@ export class WorkerRuntime {
 }
 
 function reportMode(role: WorkerRole): WorkerSessionMode {
-  return role === "review" ? "review" : role === "implementation" ? "implementation" : "research";
+  return Match.value(role).pipe(
+    Match.when("review", () => "review" as const),
+    Match.when("implementation", () => "implementation" as const),
+    Match.orElse(() => "research" as const),
+  );
 }
 
 function hasEntry(

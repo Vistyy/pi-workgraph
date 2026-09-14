@@ -1,8 +1,6 @@
 // SAFETY: This module only reads the running Pi installation to locate its presentation module.
-// oxlint-disable-next-line effecttsgo/node-builtin-import
 import { readdir, readFile } from "node:fs/promises";
 // SAFETY: These paths identify the read-only running Pi installation; no installed file is modified.
-// oxlint-disable-next-line effecttsgo/node-builtin-import
 import { dirname, join } from "node:path";
 // SAFETY: This converts the discovered running module path to an import URL only.
 import { pathToFileURL } from "node:url";

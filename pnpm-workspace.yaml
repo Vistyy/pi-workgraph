@@ -4,4 +4,4 @@ allowBuilds:
   msgpackr-extract: true
   protobufjs: true
 minimumReleaseAgeExclude:
-  - '@syzom/typescript-quality@0.2.0'
+  - '@syzom/typescript-quality@0.4.2'

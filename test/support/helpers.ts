@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Disposable test repositories use the native Git executable for fixture setup.
 import { execFile } from "node:child_process";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Test setup writes an isolated user policy fixture before loading the real extension boundary.
 import { mkdir, writeFile } from "node:fs/promises";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths identify isolated repositories, agent directories, policies, and sessions.
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionActions } from "@earendil-works/pi-coding-agent";

@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- The installed-Pi locator inspects real host symlinks and files.
 import { existsSync, realpathSync } from "node:fs";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- The disposable bundle fixture uses real temporary host files.
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- The installed-Pi locator resolves real host bundle paths.
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
