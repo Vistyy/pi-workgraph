@@ -114,3 +114,7 @@ Configure tools unavailable to every Worker in `~/.pi/agent/settings.json`:
 ```
 
 `disabledTools` is deduplicated and preserves unknown future tool names. `workgraph_report` and the implementation-only `workgraph_plan` are protected and cannot be configured here. Missing settings disable nothing; unreadable or malformed settings fail closed before the first request and leave only truthful failed reporting available. Role gates remain independent: research, review, and consultation cannot edit; experiments and implementations can edit; bash remains role-eligible.
+
+## Releasing
+
+Update the package version and the installation examples above, commit and push, then push the matching `v<version>` tag. GitHub Actions verifies the tag, installs and packs with pnpm, and publishes the verified tarball through npm trusted publishing. The npm CLI is only the OIDC publication transport; pnpm owns installation and packing.

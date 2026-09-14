@@ -1,0 +1,32 @@
+name: Publish
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - name: Check release version
+        run: node -e 'if (process.env.GITHUB_REF_NAME !== `v${require("./package.json").version}`) throw new Error("Tag must match package.json version")'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: pnpm typecheck
+      - run: pnpm verify:package
+      - run: pnpm pack --out release.tgz
+      # npm is only the OIDC publication transport; pnpm owns installation and packing.
+      - run: npm publish ./release.tgz --access public
