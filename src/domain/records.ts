@@ -3,11 +3,14 @@ import { ModelTargetSchema } from "./model-target.js";
 import { WorkerReportSchema } from "./report.js";
 
 const Text = Type.String({ minLength: 1 });
+
 const NonBlankText = Type.String({ minLength: 1, pattern: "\\S" });
+
 const strict = <const Fields extends Parameters<typeof Type.Object>[0]>(fields: Fields) =>
   Type.Object(fields, { additionalProperties: false });
 
 export const CommitSchema = Type.String({ pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" });
+
 export const TaskIdSchema = Type.String({
   minLength: 1,
   maxLength: 64,
@@ -18,6 +21,7 @@ const TaskTargetSchema = Type.Union([
   strict({ kind: Type.Literal("directory"), path: Text }),
   strict({ kind: Type.Literal("repository"), checkoutRoot: Text, commonDir: Text }),
 ]);
+
 export const ReviewSubjectSchema = Type.Union([
   strict({ kind: Type.Literal("attempt"), attemptId: Text }),
   strict({
@@ -26,6 +30,7 @@ export const ReviewSubjectSchema = Type.Union([
   }),
   strict({ kind: Type.Literal("revision"), revision: CommitSchema }),
 ]);
+
 const TaskContractSchema = Type.Union([
   strict({
     kind: Type.Literal("research"),
@@ -56,6 +61,7 @@ const TaskContractSchema = Type.Union([
     subject: ReviewSubjectSchema,
   }),
 ]);
+
 export const TaskSchema = strict({
   target: TaskTargetSchema,
   contract: TaskContractSchema,
@@ -69,18 +75,22 @@ const AttemptSelectionSchema = Type.Union([
     executor: ModelTargetSchema,
   }),
 ]);
+
 const AttemptBaseSchema = Type.Union([
   strict({ kind: Type.Literal("directory") }),
   strict({ kind: Type.Literal("repository"), baseCommit: CommitSchema }),
 ]);
+
 const CandidateOfSchema = Type.Union([
   strict({ kind: Type.Literal("extend"), attemptId: Text }),
   strict({ kind: Type.Literal("integrate"), attemptId: Text, sourceTip: CommitSchema }),
 ]);
+
 const AttemptLineageSchema = strict({
   candidateRoot: CommitSchema,
   candidateOf: Type.Optional(CandidateOfSchema),
 });
+
 export const AttemptSpecSchema = strict({
   selection: AttemptSelectionSchema,
   base: AttemptBaseSchema,
@@ -138,18 +148,26 @@ const OutcomeResultSchema = Type.Union([
   strict({ kind: Type.Literal("unreported"), reason: NonBlankText }),
   strict({ kind: Type.Literal("cancelled"), reason: NonBlankText }),
 ]);
+
 export const OutcomeSchema = strict({
   result: OutcomeResultSchema,
   effectiveModels: Type.Array(ModelTargetSchema, { uniqueItems: true }),
 });
 
 export type TaskTarget = Static<typeof TaskTargetSchema>;
+
 export type TaskContract = Static<typeof TaskContractSchema>;
+
 export type Task = Static<typeof TaskSchema>;
+
 export type AttemptSelection = Static<typeof AttemptSelectionSchema>;
+
 export type AttemptSpec = Static<typeof AttemptSpecSchema>;
+
 export type WorkerState = Static<typeof WorkerStateSchema>;
+
 export type AttemptOutput = Static<typeof AttemptOutputSchema>;
+
 export type Outcome = Static<typeof OutcomeSchema>;
 
 export interface TaskRecord {

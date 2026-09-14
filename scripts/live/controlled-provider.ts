@@ -37,7 +37,9 @@ function errorOf(cause: unknown): Error {
 async function bodyOf(request: IncomingMessage): Promise<string> {
   request.setEncoding("utf8");
   const chunks: string[] = [];
+
   for await (const chunk of request) chunks.push(String(chunk));
+
   return chunks.join("");
 }
 
@@ -59,7 +61,9 @@ function sse(model: string, reply: ControlledReply): string {
             },
           ],
         };
+
   const finishReason = reply.tool === undefined ? "stop" : "tool_calls";
+
   const chunks = [
     { delta, finish_reason: null },
     { delta: {}, finish_reason: finishReason },
@@ -72,19 +76,23 @@ function sse(model: string, reply: ControlledReply): string {
       choices: [{ index: 0, ...choice }],
     }),
   );
+
   return `${chunks.map((chunk) => `data: ${chunk}\n\n`).join("")}data: [DONE]\n\n`;
 }
 
 function decodeRequest(incoming: IncomingMessage, raw: string, index: number): ControlledRequest {
   if (incoming.method !== "POST" || incoming.url !== "/v1/chat/completions")
     throw new Error(`Unexpected provider boundary: ${incoming.method} ${incoming.url}`);
+
   const parsed = JSON.parse(raw) as {
     model?: unknown;
     messages?: unknown;
     tools?: unknown;
   };
+
   if (typeof parsed.model !== "string" || !Array.isArray(parsed.messages))
     throw new Error("Controlled provider received an invalid OpenAI request.");
+
   return {
     index,
     method: incoming.method,
@@ -106,6 +114,7 @@ async function handleRequest(
   try {
     const request = decodeRequest(incoming, await bodyOf(incoming), requests.length);
     const response = responses[request.index];
+
     if (response === undefined)
       throw new Error(
         `Unexpected provider request ${request.index + 1}; finite response list exhausted.`,
@@ -131,6 +140,7 @@ export async function startControlledProvider(
   const requests: ControlledRequest[] = [];
   const errors: Error[] = [];
   const active = new Set<Promise<void>>();
+
   const server = createServer((incoming, outgoing) => {
     const operation = handleRequest(incoming, outgoing, responses, requests, errors);
     active.add(operation);
@@ -139,11 +149,14 @@ export async function startControlledProvider(
       () => active.delete(operation),
     );
   });
+
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const address = server.address();
+
   if (address === null || typeof address === "string")
     throw new Error("Loopback server did not bind.");
+
   return {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     requests,
@@ -158,7 +171,9 @@ export async function startControlledProvider(
     },
     assertComplete() {
       const firstError = errors[0];
+
       if (firstError !== undefined) throw firstError;
+
       if (requests.length !== responses.length)
         throw new Error(
           `Controlled provider consumed ${requests.length} of ${responses.length} responses.`,

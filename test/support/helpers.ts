@@ -48,9 +48,11 @@ export const usage = {
   totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
+
 // oxlint-disable-next-line effecttsgo/async-function -- Real Git fixture setup exposes the native Promise returned by execFile.
 export async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await execFilePromise("git", ["-C", cwd, ...args], { cwd });
+
   return result.stdout.trim();
 }
 
@@ -72,6 +74,7 @@ export function persistentSession(root: string, sessionDir: string) {
     stopReason: "stop",
     timestamp,
   });
+
   return session;
 }
 
@@ -92,6 +95,7 @@ export async function extensionFixture(
     `${JSON.stringify(fixturePolicy)}\n`,
     { mode: 0o600 },
   );
+
   const resourceLoader = new DefaultResourceLoader({
     cwd: root,
     agentDir: join(parent, "agent"),
@@ -106,9 +110,11 @@ export async function extensionFixture(
     noThemes: true,
     noContextFiles: true,
   });
+
   await resourceLoader.reload();
   const loaded = resourceLoader.getExtensions();
   assert.deepEqual(loaded.errors, []);
+
   const models = await ModelRuntime.create({
     authPath: join(parent, "auth.json"),
     modelsPath: null,
@@ -116,6 +122,7 @@ export async function extensionFixture(
     refreshOnCreate: false,
     allowModelNetwork: false,
   });
+
   const registry = new ModelRegistry(models);
   const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, session, registry);
   const messages: Parameters<ExtensionActions["sendMessage"]>[0][] = [];
@@ -123,10 +130,12 @@ export async function extensionFixture(
   let level: ReturnType<ExtensionActions["getThinkingLevel"]> = "high";
   let model = registry.getAll()[0];
   const errors: string[] = [];
+
   const notifications: Array<{
     message: string;
     type?: "info" | "warning" | "error";
   }> = [];
+
   runner.onError((error) => errors.push(error.error));
   runner.setUIContext(
     {
@@ -154,6 +163,7 @@ export async function extensionFixture(
       setModel: async (next) => {
         model = next;
         selected.push(`${next.provider}/${next.id}`);
+
         return true;
       },
       ...actions,
@@ -174,6 +184,7 @@ export async function extensionFixture(
       getSystemPrompt: () => "Fixture",
     },
   );
+
   // oxlint-disable-next-line effecttsgo/async-function -- Raw fixture input is decoded against the exact registered tool schema before execution.
   async function callWithId(
     toolCallId: string,
@@ -187,6 +198,7 @@ export async function extensionFixture(
     assert.ok(Value.Check(tool.parameters, params), `Invalid fixture input to ${toolName}`);
     // SAFETY: Pi's registered definition erases its concrete schema generic, but Value.Check above validates this value against the exact runtime schema.
     const decoded = Value.Decode(tool.parameters, params);
+
     return tool.execute(toolCallId, decoded, signal, undefined, runner.createContext());
   }
 

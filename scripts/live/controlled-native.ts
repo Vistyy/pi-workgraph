@@ -14,8 +14,11 @@ import {
 } from "./controlled-provider.js";
 
 const exec = promisify(execFile);
+
 const source = process.cwd();
+
 const started = Date.now();
+
 const evidence = {
   status: "failed" as "passed" | "failed",
   candidateRevision: undefined as string | undefined,
@@ -32,18 +35,31 @@ const evidence = {
   settlementEvents: [] as unknown[],
   workspaceSnapshots: [] as unknown[],
 };
+
 let parent: string | undefined;
+
 let repo: string | undefined;
+
 let workspaceId: string | undefined;
+
 let paneId: string | undefined;
+
 let tabId: string | undefined;
+
 let terminalId: string | undefined;
+
 let sessionFile: string | undefined;
+
 let checkpointFile: string | undefined;
+
 let eventFile: string | undefined;
+
 let provider: Awaited<ReturnType<typeof startControlledProvider>> | undefined;
+
 let researchGate: ResearchGate | undefined;
+
 let settlementBaseline = 0;
+
 let lastBoundary = "initialization";
 
 function env(name: string): string | undefined {
@@ -52,7 +68,9 @@ function env(name: string): string | undefined {
 
 function prop<T>(value: Record<string, unknown>, key: string): T {
   const result = value[key];
+
   if (result === undefined) throw new Error(`Missing Herdr response field ${key}.`);
+
   return result as T;
 }
 
@@ -67,13 +85,16 @@ async function command(
   signal: AbortSignal,
 ): Promise<string> {
   checkSignal(signal);
+
   const result = await exec(file, args, {
     cwd,
     signal,
     timeout: 30_000,
     maxBuffer: 2_000_000,
   });
+
   checkSignal(signal);
+
   return result.stdout.trim();
 }
 
@@ -83,11 +104,14 @@ async function herdr(
   ...args: string[]
 ): Promise<Record<string, unknown>> {
   const envelope: unknown = JSON.parse(await command(cwd, "herdr", args, signal));
+
   if (typeof envelope !== "object" || envelope === null || !("result" in envelope))
     throw new Error(`Invalid Herdr response for ${args.join(" ")}.`);
   const result = envelope.result;
+
   if (typeof result !== "object" || result === null)
     throw new Error(`Invalid Herdr result for ${args.join(" ")}.`);
+
   return result as Record<string, unknown>;
 }
 
@@ -97,12 +121,14 @@ async function phase<T>(name: string, run: () => Promise<T>, signal: AbortSignal
   const result = await run();
   checkSignal(signal);
   evidence.phases.push({ name, ms: Date.now() - started });
+
   return result;
 }
 
 async function sessionEntries(): Promise<unknown[]> {
   assert.ok(sessionFile);
   const text = await readFile(sessionFile, "utf8");
+
   return text
     .trim()
     .split("\n")
@@ -112,8 +138,10 @@ async function sessionEntries(): Promise<unknown[]> {
 
 async function eventEntries(): Promise<unknown[]> {
   assert.ok(eventFile);
+
   try {
     const text = await readFile(eventFile, "utf8");
+
     return text
       .trim()
       .split("\n")
@@ -134,12 +162,15 @@ async function waitFor(
     name,
     async () => {
       const until = Date.now() + 30_000;
+
       while (Date.now() < until) {
         checkSignal(signal);
         assertProviderHealthy();
+
         if (await check()) return;
         await sleep(200, undefined, { signal });
       }
+
       throw new Error(`Timed out at ${name}.`);
     },
     signal,
@@ -156,6 +187,7 @@ function collectProviderErrors(): void {
 function assertProviderHealthy(): void {
   collectProviderErrors();
   const error = provider?.errors[0];
+
   if (error !== undefined) throw error;
 }
 
@@ -173,6 +205,7 @@ function settledEvents(entries: readonly unknown[], identity: string): unknown[]
 
 function coordinatorResponse(request: ControlledRequest, count: number): ControlledReply {
   assert.equal(request.model, "coordinator");
+
   if (count === 1)
     return {
       tool: {
@@ -185,16 +218,21 @@ function coordinatorResponse(request: ControlledRequest, count: number): Control
         },
       },
     };
+
   if (count === 2) {
     const result = request.messages.find((message) =>
       JSON.stringify(message).includes('"tool_call_id":"research-request"'),
     );
+
     assert.ok(result);
     assert.doesNotMatch(JSON.stringify(result), /isError.*true/);
+
     return { text: "Initial coordinator turn settled independently." };
   }
+
   if (count === 3) {
     assert.match(JSON.stringify(request.messages), /Workgraph Outcome/);
+
     return {
       tool: {
         id: "marker-call",
@@ -206,13 +244,17 @@ function coordinatorResponse(request: ControlledRequest, count: number): Control
       },
     };
   }
+
   assert.equal(count, 4);
+
   const marker = request.messages.find((message) =>
     JSON.stringify(message).includes('"tool_call_id":"marker-call"'),
   );
+
   assert.ok(marker);
   assert.doesNotMatch(JSON.stringify(marker), /isError.*true/);
   assert.match(JSON.stringify(marker), /Notepad replaced/);
+
   return { text: "Notification-driven turn settled." };
 }
 
@@ -227,6 +269,7 @@ function createResearchGate(signal: AbortSignal): ResearchGate {
   let rejectGate: ((cause: unknown) => void) | undefined;
   let settled = false;
   const cleanup = () => signal.removeEventListener("abort", abort);
+
   const settle = (settleGate: () => void) => {
     if (settled) return;
     settled = true;
@@ -235,16 +278,21 @@ function createResearchGate(signal: AbortSignal): ResearchGate {
     resolveGate = undefined;
     rejectGate = undefined;
   };
+
   const abort = () =>
     settle(() => rejectGate?.(signal.reason ?? new Error("Research release was aborted.")));
+
   const promise = new Promise<void>((resolve, reject) => {
     resolveGate = resolve;
     rejectGate = reject;
+
     if (signal.aborted) abort();
     else signal.addEventListener("abort", abort, { once: true });
   });
+
   // The provider may not reach this promise before cleanup rejects it.
   void promise.catch(() => undefined);
+
   return {
     promise,
     release: () => settle(() => resolveGate?.()),
@@ -264,9 +312,11 @@ async function responseFor(
   });
   const count = (counts.get(request.model) ?? 0) + 1;
   counts.set(request.model, count);
+
   if (request.model !== "research") return coordinatorResponse(request, count);
   assert.equal(count, 1);
   await researchRelease;
+
   return {
     tool: {
       id: "research-report",
@@ -304,14 +354,18 @@ async function persistCheckpoint(extra: Record<string, unknown> = {}): Promise<v
 async function workspaceSnapshot(signal: AbortSignal): Promise<Record<string, unknown>> {
   assert.ok(repo);
   const workspace = await herdr(repo, signal, "workspace", "list");
+
   const tabs = workspaceId
     ? await herdr(repo, signal, "tab", "list", "--workspace", workspaceId)
     : undefined;
+
   const panes = workspaceId
     ? await herdr(repo, signal, "pane", "list", "--workspace", workspaceId)
     : undefined;
+
   const snapshot = { workspace, tabs, panes };
   evidence.workspaceSnapshots.push(snapshot);
+
   return snapshot;
 }
 
@@ -325,19 +379,24 @@ async function closeWorkspace(signal: AbortSignal): Promise<void> {
     sessionFile === undefined
   )
     return;
+
   const info = prop<Record<string, unknown>>(
     await herdr(repo, signal, "workspace", "get", workspaceId),
     "workspace",
   );
+
   assert.equal(prop<string>(info, "workspace_id"), workspaceId);
+
   const tabs = prop<Array<Record<string, unknown>>>(
     await herdr(repo, signal, "tab", "list", "--workspace", workspaceId),
     "tabs",
   );
+
   const panes = prop<Array<Record<string, unknown>>>(
     await herdr(repo, signal, "pane", "list", "--workspace", workspaceId),
     "panes",
   );
+
   assert.equal(prop<number>(info, "tab_count"), tabs.length);
   assert.equal(prop<number>(info, "pane_count"), panes.length);
   assert.deepEqual(
@@ -356,10 +415,12 @@ async function closeWorkspace(signal: AbortSignal): Promise<void> {
     })),
     [{ id: paneId, tab: tabId, workspace: workspaceId, terminal: terminalId }],
   );
+
   const observed = prop<Record<string, unknown>>(
     await herdr(repo, signal, "agent", "get", paneId),
     "agent",
   );
+
   assert.equal(prop<string>(observed, "workspace_id"), workspaceId);
   assert.equal(prop<string>(observed, "tab_id"), tabId);
   assert.equal(prop<string>(observed, "pane_id"), paneId);
@@ -371,10 +432,12 @@ async function closeWorkspace(signal: AbortSignal): Promise<void> {
   assert.ok(["idle", "done"].includes(prop<string>(observed, "agent_status")));
   evidence.workspaceSnapshots.push({ beforeClose: { info, tabs, panes, agent: observed } });
   await herdr(repo, signal, "workspace", "close", workspaceId);
+
   const remaining = prop<Array<{ workspace_id: string }>>(
     await herdr(repo, signal, "workspace", "list"),
     "workspaces",
   );
+
   assert.ok(!remaining.some((item) => item.workspace_id === workspaceId));
   evidence.cleanup.push(
     "Exact owned workspace absence verified after checking its tab, pane, terminal, session, and idle agent identity.",
@@ -510,6 +573,7 @@ async function run(signal: AbortSignal): Promise<void> {
     join(agentDir, "settings.json"),
     JSON.stringify({ packages: [source], quietStartup: true, retry: { enabled: false } }),
   );
+
   const created = await phase(
     "workspace-created",
     () =>
@@ -530,12 +594,14 @@ async function run(signal: AbortSignal): Promise<void> {
       ),
     signal,
   );
+
   workspaceId = prop<string>(prop(created, "workspace"), "workspace_id");
   await persistCheckpoint({ identities: { workspaceId } });
   paneId = prop<string>(prop(created, "root_pane"), "pane_id");
   await persistCheckpoint({ identities: { workspaceId, paneId } });
   tabId = prop<string>(prop(created, "tab"), "tab_id");
   await persistCheckpoint({ identities: { workspaceId, paneId, tabId } });
+
   const launched = await phase(
     "coordinator-started",
     () =>
@@ -565,6 +631,7 @@ async function run(signal: AbortSignal): Promise<void> {
       ),
     signal,
   );
+
   terminalId = prop<string>(prop(launched, "agent"), "terminal_id");
   await persistCheckpoint({ identities: { workspaceId, paneId, tabId, terminalId } });
   await waitFor(
@@ -574,10 +641,12 @@ async function run(signal: AbortSignal): Promise<void> {
         await herdr(repo as string, signal, "agent", "get", paneId as string),
         "agent",
       );
+
       if (prop<string>(observed, "agent_status") === "blocked")
         throw new Error("Pi startup is blocked; no trust bypass was attempted.");
       assert.equal(prop<string>(observed, "cwd"), repo);
       assert.equal(prop<string>(observed, "terminal_id"), terminalId);
+
       return (
         prop<string>(prop<Record<string, unknown>>(observed, "agent_session"), "value") ===
         sessionFile
@@ -629,11 +698,13 @@ async function run(signal: AbortSignal): Promise<void> {
   assert.equal(provider.requests.length, 5);
   assert.equal(provider.requests.filter((request) => request.model === "coordinator").length, 4);
   assert.equal(provider.requests.filter((request) => request.model === "research").length, 1);
+
   const providerRequests = provider.requests.map((request) => ({
     index: request.index,
     model: request.model,
     messages: request.messages,
   }));
+
   await phase("provider-cleanup", () => provider?.close() ?? Promise.resolve(), signal);
   await phase("native-cleanup", () => closeWorkspace(signal), signal);
   evidence.cleanup.push("Loopback provider closed after all requests.");
@@ -659,10 +730,12 @@ async function run(signal: AbortSignal): Promise<void> {
 }
 
 const controller = new AbortController();
+
 const overallTimer = setTimeout(
   () => controller.abort(new Error("verify:native exceeded its 180-second overall deadline.")),
   180_000,
 );
+
 try {
   await run(controller.signal);
 } catch (cause) {
@@ -673,14 +746,18 @@ try {
   process.exitCode = 1;
 } finally {
   clearTimeout(overallTimer);
+
   if (evidence.status !== "passed")
     controller.abort(evidence.failure ?? new Error("Native run failed."));
+
   if (evidence.status !== "passed") researchGate?.reject(controller.signal.reason);
   const cleanupController = new AbortController();
+
   const cleanupTimer = setTimeout(
     () => cleanupController.abort(new Error("Native cleanup exceeded its 30-second deadline.")),
     30_000,
   );
+
   try {
     if (provider !== undefined) {
       await provider.close();
@@ -688,6 +765,7 @@ try {
       provider = undefined;
       evidence.cleanup.push("Loopback provider closure joined all request handlers.");
     }
+
     if (evidence.failure !== undefined && workspaceId !== undefined) {
       await closeWorkspace(cleanupController.signal);
     }
@@ -696,6 +774,7 @@ try {
   } finally {
     clearTimeout(cleanupTimer);
   }
+
   if (parent !== undefined) {
     if (evidence.failure === undefined) {
       await rm(parent, { recursive: true, force: true });
@@ -703,6 +782,7 @@ try {
       await writeFile(join(parent, "failure.json"), JSON.stringify(evidence, null, 2));
     }
   }
+
   process.stdout.write(
     `${JSON.stringify({ ...evidence, lastBoundary, totalMs: Date.now() - started }, null, 2)}\n`,
   );

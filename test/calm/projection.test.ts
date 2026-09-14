@@ -55,6 +55,7 @@ class CountingRow implements Component {
 
   handleMouse(): undefined {
     this.clicks += 1;
+
     return undefined;
   }
 }
@@ -64,6 +65,7 @@ class MouseUser extends FixtureUser {
 
   override handleMouse(): undefined {
     this.clicks += 1;
+
     return undefined;
   }
 }
@@ -80,6 +82,7 @@ void test("Calm projects the current visible transcript with final exclusions an
   chat.addChild(new FixtureCustomMessage(customMessage("pi-workgraph-unknown")));
   chat.addChild(new FixtureCustomMessage(customMessage("pi-workgraph-attention")));
   const projection = projected(chat);
+
   try {
     assert.deepEqual(renderedLines(chat), [
       "hello",
@@ -99,6 +102,7 @@ void test("render observes streaming, finalization, terminal notices, and direct
   const assistant = new FixtureAssistant();
   chat.addChild(assistant);
   const projection = projected(chat);
+
   try {
     assistant.updateContent(assistantMessage([textPart("partial")]), true);
     assert.deepEqual(renderedLines(chat), ["partial"]);
@@ -133,6 +137,7 @@ void test("skill pairing is metadata-driven and unknown rows pass through", () =
   chat.addChild(new FixtureUser("paired request"));
   chat.addChild(new CountingRow("future native row"));
   const projection = projected(chat);
+
   try {
     assert.deepEqual(renderedLines(chat), [
       "/skill:calm",
@@ -148,9 +153,11 @@ void test("skill pairing is metadata-driven and unknown rows pass through", () =
 void test("toggle, mouse routing, invalidate freshness, and detach preserve native fallback", () => {
   const chat = new FixtureContainer();
   const user = new MouseUser("click me");
+
   const assistant = new FixtureAssistant(
     assistantMessage([thinkingPart("native"), textPart("answer")]),
   );
+
   const tool = new FixtureToolExecution("read");
   chat.addChild(user);
   chat.addChild(assistant);
@@ -206,10 +213,12 @@ void test("discovery validates the live document and chat class identity", () =>
 
 void test("Calm rail keeps activity first, worker status second, and clears when Calm turns off", async () => {
   const chat = new FixtureContainer();
+
   const { ui, pi, context } = calmHarness({
     runtime: fixtureRuntime,
     tui: fakeTuiRoot(() => new FixtureContainer(), chat),
   });
+
   await start(pi, context);
   await command(pi, context);
   await pi.events.get("agent_start")?.({}, context);
@@ -297,6 +306,7 @@ void test("Calm presentation is unavailable when the chat seam cannot be discove
 void test("Calm session default persists across reload, resume, and new sessions", async () => {
   let defaultOn = false;
   let saves = 0;
+
   const { ui, pi, context } = calmHarness({
     runtime: fixtureRuntime,
     preferences: {
@@ -304,10 +314,12 @@ void test("Calm session default persists across reload, resume, and new sessions
       save: (on) => {
         defaultOn = on;
         saves += 1;
+
         return Promise.resolve();
       },
     },
   });
+
   const isOn = (): boolean => ui.statuses.get("calm") !== undefined;
   await start(pi, context);
   assert.equal(isOn(), false);
@@ -338,6 +350,7 @@ void test("Calm session default persists across reload, resume, and new sessions
 void test("Calm on projects the chat while shutdown restores native presentation and stops timers", async () => {
   const chat = new FixtureContainer();
   const tui = fakeTuiRoot(() => new FixtureContainer(), chat);
+
   const { ui, pi, context } = calmHarness({
     runtime: fixtureRuntime,
     tui,
@@ -346,6 +359,7 @@ void test("Calm on projects the chat while shutdown restores native presentation
       save: () => Promise.resolve(),
     },
   });
+
   await start(pi, context);
   const hidden = new FixtureToolExecution("read");
   chat.addChild(new FixtureAssistant(assistantMessage([textPart("answer")])));
@@ -394,6 +408,7 @@ void test("activity tracker bounds history, live labels, width, and secrets", ()
     80,
     theme,
   );
+
   assert.equal(lines[0], "bash › web_search");
   assert.doesNotMatch(lines.join(" "), /secret|never-render/);
 
@@ -403,6 +418,7 @@ void test("activity tracker bounds history, live labels, width, and secrets", ()
     80,
     theme,
   );
+
   assert.match(waiting.join(" "), /awaiting input/);
   assert.match(waiting.join(" "), /2 workers active/);
 

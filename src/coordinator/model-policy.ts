@@ -9,10 +9,13 @@ import { type ModelTarget, ModelTargetSchema } from "../domain/model-target.js";
 import { runNodePlatformPromise } from "../node-platform.js";
 
 export const MODEL_LIST_ROLES = ["research", "review", "consultation.advisor"] as const;
+
 export type ListModelRole = (typeof MODEL_LIST_ROLES)[number];
+
 type ModelTargetList = [ModelTarget, ...ModelTarget[]];
 
 const ModelTargetListSchema = Type.Array(ModelTargetSchema, { minItems: 1 });
+
 const ModelPolicySchema = Type.Object(
   {
     roles: Type.Object(
@@ -45,6 +48,7 @@ export const SelectionRequestSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
 export type SelectionRequest = Static<typeof SelectionRequestSchema>;
 
 export type ModelPolicyOperation = "read" | "parse" | "decode";
@@ -67,6 +71,7 @@ export function loadModelPolicyEffect(
 ): Effect.Effect<ModelPolicy, ModelPolicyError | PlatformError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
+
     const contents = yield* fileSystem.readFileString(path).pipe(
       Effect.catchIf(
         (error) => error.reason._tag === "NotFound",
@@ -78,6 +83,7 @@ export function loadModelPolicyEffect(
           }),
       ),
     );
+
     const parsed = yield* Effect.try({
       // oxlint-disable-next-line anti-slop/no-unknown-returns, effecttsgo/prefer-schema-over-json -- The strict decoder immediately validates this external JSON value.
       try: (): unknown => JSON.parse(contents),
@@ -88,6 +94,7 @@ export function loadModelPolicyEffect(
           message: `Invalid JSON in Workgraph model policy ${path}.`,
         }),
     });
+
     return yield* decodeModelPolicyEffect(parsed, path);
   });
 }
@@ -117,18 +124,23 @@ function decodeModelPolicyEffect(
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Policy JSON is unknown until this strict boundary accepts it.
 function decodeModelPolicy(value: unknown): ModelPolicy {
   const issue = Value.Errors(ModelPolicySchema, value)[0];
+
   if (issue !== undefined) {
     const location = issue.instancePath === "" ? "/" : issue.instancePath;
     throw new Error(`Invalid Workgraph model policy at ${location}: ${issue.message}.`);
   }
+
   // SAFETY: strict schema validation establishes the complete shape; tuple casts are checked below as nonempty lists.
   const policy = Value.Decode(ModelPolicySchema, value) as ModelPolicy;
+
   for (const role of MODEL_LIST_ROLES) rejectDuplicateModels(role, policy.roles[role]);
+
   return policy;
 }
 
 function rejectDuplicateModels(role: ListModelRole, targets: ModelTargetList): void {
   const seen = new Set<string>();
+
   for (const target of targets) {
     if (seen.has(target.model))
       throw new Error(
@@ -144,10 +156,13 @@ export function configuredTarget(
   model?: string,
 ): ModelTarget {
   const targets = policy.roles[role];
+
   if (model === undefined) return exactTarget(targets[0]);
   const target = targets.find((candidate) => candidate.model === model);
+
   if (target === undefined)
     throw new Error(`Model ${model} is not configured for Workgraph role ${role}.`);
+
   return exactTarget(target);
 }
 
@@ -157,13 +172,16 @@ export function resolveSelection<Role extends ListModelRole>(
   policy: ModelPolicy,
 ): SelectionReceipt<Role> {
   const normalized = request ?? {};
+
   if (!Value.Check(SelectionRequestSchema, normalized))
     throw new Error(`Invalid model selection request for ${role}.`);
   const count = normalized.count ?? 1;
   const distinctModels = normalized.distinctModels ?? false;
   let selected: ModelTarget[];
+
   if (distinctModels) {
     const configured = policy.roles[role];
+
     if (configured.length < count)
       throw new Error(
         `Requested ${count} distinct ${role} models, but policy configures only ${configured.length}.`,
@@ -173,6 +191,7 @@ export function resolveSelection<Role extends ListModelRole>(
     const target = configuredTarget(policy, role);
     selected = Array.from({ length: count }, () => exactTarget(target));
   }
+
   return { role, count, distinctModels, selected };
 }
 
@@ -191,10 +210,12 @@ export function implementationTargets(policy: ModelPolicy, useEscalationExecutor
   const executor = useEscalationExecutor
     ? policy.roles["implementation.escalationExecutor"]
     : policy.roles["implementation.executor"];
+
   if (executor === undefined)
     throw new Error(
       "The required Workgraph model policy configures no implementation.escalationExecutor.",
     );
+
   return {
     guide: exactTarget(policy.roles["implementation.guide"]),
     executor: exactTarget(executor),

@@ -22,6 +22,7 @@ const accepted = [
   "workgraph_control",
   "workgraph_notepad",
 ] as const;
+
 async function fixture(
   available: boolean,
   workspaceId = available ? "workspace-exact" : null,
@@ -36,6 +37,7 @@ async function fixture(
   await writeFile(join(root, "file.txt"), "base\n");
   await git(root, "add", ".");
   await git(root, "commit", "-m", "base");
+
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_ROLE: role,
@@ -44,7 +46,9 @@ async function fixture(
     HERDR_TAB_ID: null,
     PI_WORKGRAPH_HERDR_BIN: "/bin/false",
   });
+
   const pi = await extensionFixture("coordinator", root, parent);
+
   return {
     ...pi,
     parent,
@@ -60,12 +64,14 @@ async function fixture(
 
 void test("coordinator registers exactly nine strict tools", async () => {
   const f = await fixture(false);
+
   try {
     const registered = f.runner
       .getAllRegisteredTools()
       .map((tool) => tool.definition.name)
       .filter((name) => name.startsWith("workgraph_"))
       .sort();
+
     assert.deepEqual(registered, [...accepted].sort());
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
@@ -104,12 +110,14 @@ void test("coordinator registers exactly nine strict tools", async () => {
     const guidance = (
       await readFile(new URL("../../COORDINATOR.md", import.meta.url), "utf8")
     ).trim();
+
     const injected = await f.runner.emitBeforeAgentStart(
       "Coordinate the request",
       undefined,
       "Base coordinator prompt",
       { cwd: f.root },
     );
+
     assert.equal(
       injected?.systemPrompt,
       `Base coordinator prompt\n\n${guidance}`,
@@ -122,6 +130,7 @@ void test("coordinator registers exactly nine strict tools", async () => {
 
 void test("coordinator extension remains inactive in Worker scope", async () => {
   const f = await fixture(false, null, "research");
+
   try {
     assert.deepEqual(
       f.runner
@@ -144,6 +153,7 @@ void test("registered extension starts candidate extension from the exact retain
   const f = await fixture(true);
   const sourceAttemptId = "attempt-source";
   const sourceRef = `refs/pi-workgraph/outputs/${sourceAttemptId}`;
+
   try {
     const base = await git(f.root, "rev-parse", "HEAD");
     await writeFile(join(f.root, "file.txt"), "candidate\n");
@@ -164,6 +174,7 @@ void test("registered extension starts candidate extension from the exact retain
         acceptance: ["The committed candidate is retained"],
       },
     } satisfies Task;
+
     const sourceSpec = {
       selection: {
         kind: "implementation",
@@ -172,6 +183,7 @@ void test("registered extension starts candidate extension from the exact retain
       },
       base: { kind: "repository", baseCommit: base },
     } satisfies AttemptSpec;
+
     const seed = new RecordStore(f.agentDir, f.session.getSessionId());
     seed.createTaskWithAttempt("source", sourceTask, sourceAttemptId, sourceSpec);
     seed.recordOutcome(sourceAttemptId, {
@@ -213,22 +225,27 @@ void test("registered extension starts candidate extension from the exact retain
     );
 
     await git(f.root, "update-ref", sourceRef, sourceTip);
+
     const created = await f.call("workgraph_implement", {
       id: "extension",
       objective: "Extend the retained Candidate",
       acceptance: ["The successor starts at the source tip"],
       candidateOf: { attemptId: sourceAttemptId, mode: "extend" },
     });
+
     // SAFETY: The registered implementation tool returns this bounded creation receipt.
     const receipt = created.details as {
       attempts: { attemptId: string }[];
     };
+
     const successorId = receipt.attempts[0]?.attemptId;
     assert.ok(successorId !== undefined);
+
     const inspected = await f.call("workgraph_inspect", {
       section: "attempt",
       id: successorId,
     });
+
     // SAFETY: Exact Attempt inspection returns the strictly decoded persisted specification.
     const successor = (inspected.details as { spec: AttemptSpec }).spec;
     assert.deepEqual(successor.base, { kind: "repository", baseCommit: sourceTip });
@@ -239,10 +256,13 @@ void test("registered extension starts candidate extension from the exact retain
 
     const worktree = join(f.agentDir, "workgraph", "worktrees", successorId);
     let worktreeHead = "";
+
     for (let index = 0; index < 100 && worktreeHead === ""; index += 1) {
       worktreeHead = await git(worktree, "rev-parse", "HEAD").catch(() => "");
+
       if (worktreeHead === "") await Effect.runPromise(Effect.sleep(10));
     }
+
     assert.equal(worktreeHead, sourceTip);
     assert.equal(await git(f.root, "rev-parse", sourceRef), sourceTip);
     assert.equal(await git(f.root, "rev-parse", "HEAD"), base);
@@ -254,20 +274,24 @@ void test("registered extension starts candidate extension from the exact retain
 
 void test("one session creates frozen Task and Attempt records and inspects them boundedly", async () => {
   const f = await fixture(true);
+
   try {
     await f.runner.emit({ type: "session_start", reason: "startup" });
     const base = await git(f.root, "rev-parse", "HEAD");
+
     const created = await f.call("workgraph_implement", {
       id: "change",
       cwd: ".",
       objective: "Change the fixture",
       acceptance: ["The change is committed"],
     });
+
     // SAFETY: The registered implementation tool returns this bounded creation receipt.
     const details = created.details as {
       taskId: string;
       attempts: { taskId: string; attemptId: string }[];
     };
+
     assert.equal(details.taskId, "change");
     assert.equal(details.attempts.length, 1);
     const attemptId = details.attempts[0]?.attemptId;
@@ -287,11 +311,13 @@ void test("one session creates frozen Task and Attempt records and inspects them
     );
     // SAFETY: Pi tool details are object-shaped for every registered Workgraph result.
     assert.equal("report" in (attempt.details as object), false);
+
     const page = await f.call("workgraph_inspect", {
       section: "attempt",
       offset: 0,
       limit: 1,
     });
+
     // SAFETY: Attempt page inspection returns its bounded attempts array.
     assert.equal((page.details as { attempts: unknown[] }).attempts.length, 1);
 
@@ -337,6 +363,7 @@ void test("without exact Herdr launch identity inspection remains usable and cre
     [true, ""],
   ] as const) {
     const f = await fixture(available, workspaceId);
+
     try {
       await f.runner.emit({ type: "session_start", reason: "startup" });
       const overview = await f.call("workgraph_inspect", { section: "overview" });

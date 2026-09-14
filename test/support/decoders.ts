@@ -11,6 +11,7 @@ type FixtureEnvironment = Partial<Record<FixtureVariable, string | null>>;
 
 export function configureFixtureEnvironment(changes: FixtureEnvironment): NodeJS.ProcessEnv {
   const previous = { ...process.env };
+
   for (const [key, value] of Object.entries(changes)) {
     if (value === null) {
       Reflect.deleteProperty(process.env, key);
@@ -18,6 +19,7 @@ export function configureFixtureEnvironment(changes: FixtureEnvironment): NodeJS
       Reflect.set(process.env, key, value);
     }
   }
+
   return previous;
 }
 
@@ -27,5 +29,6 @@ export function restoreFixtureEnvironment(previous: NodeJS.ProcessEnv): void {
       Reflect.deleteProperty(process.env, key);
     }
   }
+
   Object.assign(process.env, previous);
 }

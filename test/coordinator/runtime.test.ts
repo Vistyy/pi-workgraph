@@ -25,8 +25,11 @@ import { createWorkerSessionEffect, type WorkerObjective } from "../../src/worke
 import { git } from "../support/helpers.js";
 
 const target = { model: "test/model", thinking: "high" as const };
+
 const selection = { kind: "target" as const, target };
+
 const spec: AttemptSpec = { selection, base: { kind: "directory" } };
+
 const task = (root: string, id: string): Task => ({
   target: { kind: "directory", path: join(root, id) },
   contract: {
@@ -35,6 +38,7 @@ const task = (root: string, id: string): Task => ({
     expectedEvidence: ["Direct observation"],
   },
 });
+
 const objective = (taskId: string, attemptId: string, value: Task): WorkerObjective => ({
   content: [
     "[WORKGRAPH WORKER OBJECTIVE]",
@@ -44,9 +48,11 @@ const objective = (taskId: string, attemptId: string, value: Task): WorkerObject
   ].join("\n"),
   details: { taskId, attemptId, role: "research" },
 });
+
 function temporary(): string {
   return mkdtempSync(join(tmpdir(), "session-runtime-"));
 }
+
 function fixture(root: string, initial: object = {}) {
   const executable = join(root, "herdr.mjs");
   const statePath = join(root, "native.json");
@@ -68,12 +74,14 @@ else if(args[0]==="tab"&&args[1]==="close"){if(!state.ignoreClose)state.present=
 else{console.error(JSON.stringify({error:{code:"unexpected"}}));process.exitCode=1}`,
   );
   chmodSync(executable, 0o700);
+
   return {
     herdr: new HerdrCliRuntime(executable, { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "coordinator" }),
     statePath,
     log,
   };
 }
+
 function commands(path: string): string[][] {
   try {
     return readFileSync(path, "utf8")
@@ -85,16 +93,20 @@ function commands(path: string): string[][] {
     return [];
   }
 }
+
 async function waitFor(predicate: () => boolean): Promise<void> {
   for (let index = 0; index < 160; index += 1) {
     if (predicate()) return;
     await Effect.runPromise(Effect.sleep(25));
   }
+
   assert.fail("timed out");
 }
+
 function workerName(taskId: string, attemptId: string): string {
   return herdrWorkerName({ taskId, attemptId, role: "research" });
 }
+
 async function session(root: string, taskId: string, attemptId: string, value: Task) {
   return runNodePlatformPromise(
     createWorkerSessionEffect({
@@ -104,6 +116,7 @@ async function session(root: string, taskId: string, attemptId: string, value: T
     }),
   );
 }
+
 function appendSettledReport(sessionFile: string, summary: string): void {
   const manager = SessionManager.open(sessionFile);
   manager.appendCustomEntry("pi-workgraph-effective-model", target);
@@ -134,6 +147,7 @@ void test("staged launch persists original workspace and shutdown never closes t
   const attempt = store.createTaskWithAttempt("launch", value, "attempt-launch", spec).attempt;
   const native = fixture(root);
   const scope = await Effect.runPromise(Scope.make());
+
   try {
     const runtime = await Effect.runPromise(
       SessionRuntime.acquire({
@@ -144,6 +158,7 @@ void test("staged launch persists original workspace and shutdown never closes t
         herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
+
     await waitFor(
       () =>
         store.readAttempt(attempt.id).worker?.kickoff === "confirmed" ||
@@ -157,9 +172,11 @@ void test("staged launch persists original workspace and shutdown never closes t
         .blockers.map((item) => item.detail)
         .join("; "),
     );
+
     const start = commands(native.log).find(
       (entry) => entry[0] === "agent" && entry[1] === "start",
     );
+
     assert.match(start?.[2] ?? "", /^wg-research-[0-9a-f]{6}$/);
     assert.equal(store.readAttempt(attempt.id).worker?.workspaceId, "workspace-old");
     await Effect.runPromise(Scope.close(scope, Exit.void));
@@ -180,6 +197,7 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
     const value = task(root, stage);
     const attempt = store.createTaskWithAttempt(stage, value, `attempt-${stage}`, spec).attempt;
     const created = await session(root, stage, attempt.id, value);
+
     const state = {
       present: true,
       partial: stage === "tab",
@@ -189,20 +207,25 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
       session: created.sessionFile,
       name: workerName(stage, attempt.id),
     };
+
     const native = fixture(root, state);
+
     const requestLabel = herdrWorkerTabLabel({
       taskId: stage,
       attemptId: attempt.id,
       role: "research",
     });
+
     state.label = requestLabel;
     writeFileSync(native.statePath, JSON.stringify(state));
+
     if (stage === "tab")
       store.checkpointWorker(attempt.id, {
         sessionFile: created.sessionFile,
         workspaceId: "workspace-owner",
         tab: { state: "uncertain" },
       });
+
     if (stage === "agent")
       store.checkpointWorker(attempt.id, {
         sessionFile: created.sessionFile,
@@ -210,6 +233,7 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
         tab: { state: "ready", tabId: "tab-1", paneId: "pane-1" },
         agent: "uncertain",
       });
+
     if (stage === "kickoff")
       store.checkpointWorker(attempt.id, {
         sessionFile: created.sessionFile,
@@ -219,6 +243,7 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
         kickoff: "uncertain",
       });
     const scope = await Effect.runPromise(Scope.make());
+
     try {
       const runtime = await Effect.runPromise(
         SessionRuntime.acquire({
@@ -229,6 +254,7 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
           herdr: native.herdr,
         }).pipe(Scope.provide(scope)),
       );
+
       if (stage === "kickoff") {
         await waitFor(() =>
           runtime
@@ -270,6 +296,7 @@ void test("Outcome is written before one close and reload duplicates neither clo
     agent: "ready",
     kickoff: "confirmed",
   });
+
   const native = fixture(root, {
     present: true,
     partial: false,
@@ -279,10 +306,12 @@ void test("Outcome is written before one close and reload duplicates neither clo
     session: created.sessionFile,
     name: workerName("settle", attempt.id),
   });
+
   let notifications = 0;
   let notification: unknown;
   let outcomeWasDurableAtNotification = false;
   let scope = await Effect.runPromise(Scope.make());
+
   try {
     await Effect.runPromise(
       SessionRuntime.acquire({
@@ -345,6 +374,7 @@ void test("completed repository reports settle through mutable scratch and retai
   await git(repository, "add", ".");
   await git(repository, "commit", "-m", "base");
   const base = await git(repository, "rev-parse", "HEAD");
+
   const value: Task = {
     target: {
       kind: "repository",
@@ -359,19 +389,24 @@ void test("completed repository reports settle through mutable scratch and retai
       stopCondition: "Stop after reporting",
     },
   };
+
   const repositorySpec: AttemptSpec = {
     selection,
     base: { kind: "repository", baseCommit: base },
   };
+
   const store = new RecordStore(root, "session-repository-scratch");
+
   const attempt = store.createTaskWithAttempt(
     "repository-scratch",
     value,
     "attempt-repository-scratch",
     repositorySpec,
   ).attempt;
+
   const native = fixture(root);
   const scope = await Effect.runPromise(Scope.make());
+
   try {
     const runtime = await Effect.runPromise(
       SessionRuntime.acquire({
@@ -382,6 +417,7 @@ void test("completed repository reports settle through mutable scratch and retai
         herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
+
     await waitFor(() => store.readAttempt(attempt.id).worker?.kickoff === "confirmed");
     const running = store.readAttempt(attempt.id);
     const worktree = join(root, "workgraph", "worktrees", attempt.id);
@@ -392,6 +428,7 @@ void test("completed repository reports settle through mutable scratch and retai
     const observations = commands(native.log).filter(
       (entry) => entry.slice(0, 2).join(" ") === "agent list",
     ).length;
+
     await waitFor(
       () =>
         commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "agent list")
@@ -405,6 +442,7 @@ void test("completed repository reports settle through mutable scratch and retai
 
     await waitFor(() => {
       const settled = store.readAttempt(attempt.id);
+
       return settled.worker?.closed === true && settled.output?.kind === "no_output";
     });
     const settled = store.readAttempt(attempt.id);
@@ -451,15 +489,18 @@ void test("an unplaced extension child pins source discard until its detached pl
       acceptance: ["The Candidate is retained."],
     },
   };
+
   const implementationSelection = {
     kind: "implementation" as const,
     guide: target,
     executor: target,
   };
+
   const sourceSpec: AttemptSpec = {
     selection: implementationSelection,
     base: { kind: "repository", baseCommit: base },
   };
+
   const childSpec: AttemptSpec = {
     selection: implementationSelection,
     base: { kind: "repository", baseCommit: sourceTip },
@@ -468,6 +509,7 @@ void test("an unplaced extension child pins source discard until its detached pl
       candidateOf: { kind: "extend", attemptId: "attempt-source" },
     },
   };
+
   const store = new RecordStore(root, "session-extension-discard");
   store.createTaskWithAttempt("source", repositoryTask, "attempt-source", sourceSpec);
   store.recordOutcome("attempt-source", {
@@ -483,6 +525,7 @@ void test("an unplaced extension child pins source discard until its detached pl
   store.createAttempt("source", "attempt-extension", childSpec);
 
   const scope = await Effect.runPromise(Scope.make());
+
   try {
     const runtime = await Effect.runPromise(
       SessionRuntime.acquire({
@@ -493,6 +536,7 @@ void test("an unplaced extension child pins source discard until its detached pl
         herdr: new HerdrCliRuntime("/bin/false", {}),
       }).pipe(Scope.provide(scope)),
     );
+
     await assert.rejects(
       Effect.runPromise(runtime.discard("attempt-source", "superseded")),
       /An unplaced extension child pins this output/,
@@ -530,12 +574,14 @@ void test("an unplaced extension child pins source discard until its detached pl
 void test("queued cancellation makes no Herdr call and active cancellation closes exactly once", async () => {
   const root = temporary();
   const store = new RecordStore(root, "session-cancel");
+
   const queued = store.createTaskWithAttempt(
     "queued",
     task(root, "queued"),
     "attempt-queued",
     spec,
   ).attempt;
+
   const activeValue = task(root, "active");
   const active = store.createTaskWithAttempt("active", activeValue, "attempt-active", spec).attempt;
   const created = await session(root, "active", active.id, activeValue);
@@ -551,6 +597,7 @@ void test("queued cancellation makes no Herdr call and active cancellation close
     agent: "ready",
     kickoff: "confirmed",
   });
+
   const native = fixture(root, {
     present: true,
     partial: false,
@@ -560,8 +607,10 @@ void test("queued cancellation makes no Herdr call and active cancellation close
     session: created.sessionFile,
     name: workerName("active", active.id),
   });
+
   const scope = await Effect.runPromise(Scope.make());
   let notifications = 0;
+
   try {
     const runtime = await Effect.runPromise(
       SessionRuntime.acquire({
@@ -576,6 +625,7 @@ void test("queued cancellation makes no Herdr call and active cancellation close
         herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
+
     await assert.rejects(Effect.runPromise(runtime.steer(active.id, "continue")), RuntimeError);
     assert.equal(
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "agent prompt").length,
@@ -607,6 +657,7 @@ void test("creation uses global Attempt IDs and rejects unsettled review sources
   const store = new RecordStore(root, "session-create");
   const native = fixture(root);
   const scope = await Effect.runPromise(Scope.make());
+
   try {
     const runtime = await Effect.runPromise(
       SessionRuntime.acquire({
@@ -617,6 +668,7 @@ void test("creation uses global Attempt IDs and rejects unsettled review sources
         herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
+
     const first = await Effect.runPromise(
       runtime.createTask({
         id: "source",
@@ -625,6 +677,7 @@ void test("creation uses global Attempt IDs and rejects unsettled review sources
         selection,
       }),
     );
+
     const second = await Effect.runPromise(runtime.createAttempt({ taskId: "source", selection }));
     assert.match(first.id, /^attempt-[0-9a-f-]{36}$/);
     assert.match(second.id, /^attempt-[0-9a-f-]{36}$/);
@@ -667,6 +720,7 @@ void test("a close-present blocker never repeats the close effect", async () => 
     agent: "ready",
     kickoff: "confirmed",
   });
+
   const native = fixture(root, {
     present: true,
     partial: false,
@@ -676,7 +730,9 @@ void test("a close-present blocker never repeats the close effect", async () => 
     session: created.sessionFile,
     name: workerName("blocked", attempt.id),
   });
+
   const scope = await Effect.runPromise(Scope.make());
+
   try {
     const runtime = await Effect.runPromise(
       SessionRuntime.acquire({
@@ -687,6 +743,7 @@ void test("a close-present blocker never repeats the close effect", async () => 
         herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
+
     await waitFor(() => store.readAttempt(attempt.id).worker?.closing?.kind === "settled");
     await Effect.runPromise(Effect.sleep(800));
     assert.equal(
@@ -719,6 +776,7 @@ void test("steering and repository classification reject inexact or open Workers
     agent: "ready",
     kickoff: "confirmed",
   });
+
   const native = fixture(root, {
     present: false,
     partial: false,
@@ -726,7 +784,9 @@ void test("steering and repository classification reject inexact or open Workers
     cwd: value.target.kind === "directory" ? value.target.path : "",
     session: created.sessionFile,
   });
+
   const scope = await Effect.runPromise(Scope.make());
+
   try {
     const runtime = await Effect.runPromise(
       SessionRuntime.acquire({
@@ -737,6 +797,7 @@ void test("steering and repository classification reject inexact or open Workers
         herdr: native.herdr,
       }).pipe(Scope.provide(scope)),
     );
+
     await assert.rejects(Effect.runPromise(runtime.steer(attempt.id, "continue")), RuntimeError);
     assert.equal(
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "agent prompt").length,

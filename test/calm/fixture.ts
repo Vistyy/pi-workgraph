@@ -15,6 +15,7 @@ import { attachCalmProjection, type CalmProjection } from "../../src/calm/projec
 // oxlint-disable anti-slop/no-object-parameters, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, typescript/unbound-method
 
 export type ContentPart = AssistantMessage["content"][number];
+
 export type FakeMouseEvent = {
   readonly y: number;
   readonly height: number;
@@ -57,16 +58,21 @@ export class FixtureContainer extends Container {
   handleMouse(event: FakeMouseEvent): FakeMouseEvent | undefined {
     if (event.y < 0 || event.y >= event.height) return undefined;
     let childY = 0;
+
     for (const child of this.children) {
       const height = child.render(event.width).length;
+
       if (event.y >= childY && event.y < childY + height) {
         const handler = (
           child as { handleMouse?(event: FakeMouseEvent): FakeMouseEvent | undefined }
         ).handleMouse;
+
         return handler?.call(child, { ...event, y: event.y - childY, height });
       }
+
       childY += height;
     }
+
     return undefined;
   }
 }
@@ -86,6 +92,7 @@ export class FixtureAssistant extends FixtureContainer {
   constructor(message?: AssistantMessage) {
     super();
     FixtureAssistant.instances.push(this);
+
     if (message !== undefined) this.updateContent(message);
   }
 
@@ -95,13 +102,16 @@ export class FixtureAssistant extends FixtureContainer {
     this.lastMessage = message;
     this.isStreaming = isStreaming;
     this.clear();
+
     for (const part of message.content) {
       if (part.type === "text" && part.text.trim() !== "")
         this.addChild(new FixtureText(part.text));
       else if (part.type === "thinking" && part.thinking.trim() !== "")
         this.addChild(new FixtureText(part.thinking));
     }
+
     const notice = terminalNotice(message);
+
     if (notice !== undefined) this.addChild(new FixtureText(notice));
   }
 
@@ -154,11 +164,13 @@ export class FixtureToolExecution extends FixtureContainer {
 
   override render(): string[] {
     this.renders += 1;
+
     return [`[tool] ${this.toolName}`];
   }
 
   override handleMouse(): undefined {
     this.clicks += 1;
+
     return undefined;
   }
 
@@ -176,6 +188,7 @@ export class FixtureCustomMessage extends FixtureContainer {
 
   override render(): string[] {
     this.renders += 1;
+
     return [`[${this.message.customType}] ${this.message.content}`];
   }
 
@@ -198,13 +211,18 @@ export class FixtureSkill extends FixtureContainer {
 /** Mirror Pi's terminal notice rules so projection visibility is observable through rendering. */
 function terminalNotice(message: AssistantMessage): string | undefined {
   const hasToolCalls = message.content.some((part) => part.type === "toolCall");
+
   if (message.stopReason === "length") return "Response was truncated before completion.";
+
   if (hasToolCalls) return undefined;
+
   if (message.stopReason === "aborted")
     return message.errorMessage !== undefined && message.errorMessage !== "Request was aborted"
       ? message.errorMessage
       : "Operation aborted";
+
   if (message.stopReason === "error") return `Error: ${message.errorMessage ?? "Unknown error"}`;
+
   return undefined;
 }
 
@@ -218,6 +236,7 @@ export class FixtureText implements Component {
 
   render(): string[] {
     this.renders += 1;
+
     return [this.#text];
   }
 
@@ -265,11 +284,14 @@ export function projected(
     styleSeparator: (text) => text,
     onIncompatible,
   });
+
   projection.setEnabled(true);
+
   return projection;
 }
 
 export function constructSkill(runtime: CalmChatRuntime, block: SkillBlockFixture): Component {
   const Skill = runtime.skill as unknown as new (skillBlock: SkillBlockFixture) => Component;
+
   return new Skill(block);
 }

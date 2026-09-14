@@ -31,9 +31,11 @@ interface StubUi {
 interface ToolExecutionArgs {
   readonly path?: string;
 }
+
 interface ToolExecutionOptions {
   readonly showImages?: boolean;
 }
+
 interface ToolDefinition {
   readonly renderShell?: "default" | "self";
 }
@@ -79,21 +81,26 @@ async function writeBundleFixture(root: string, withIndex: boolean): Promise<str
   );
   const cli = join(root, "cli.js");
   await writeFile(cli, "export const main = () => {};\n");
+
   if (withIndex)
     await writeFile(join(root, "index.js"), 'export * from "./chunks/chunk-fixture.js";\n');
+
   return cli;
 }
 
 void test("loader uses the running bundle's class identities", async () => {
   const root = await mkdtemp(join(tmpdir(), "calm-bundle-"));
+
   try {
     const publicPi = await import("@earendil-works/pi-coding-agent");
     const publicTui = await import("@earendil-works/pi-tui");
+
     for (const withIndex of [true, false]) {
       const cli = await writeBundleFixture(
         join(root, withIndex ? "indexed" : "chunked"),
         withIndex,
       );
+
       const runtime = await loadCalmChatRuntime(cli);
       assert.notEqual(runtime.assistant, publicPi.AssistantMessageComponent);
       assert.notEqual(runtime.container, publicTui.Container);
@@ -108,6 +115,7 @@ void test("loader uses the running bundle's class identities", async () => {
         chat,
       );
       const projection = projected(chat, runtime);
+
       try {
         chat.addChild(new runtime.user("hello"));
         const assistant = new runtime.assistant();
@@ -126,35 +134,46 @@ void test("loader uses the running bundle's class identities", async () => {
 
 function installedPiInDirectory(directory: string): string | undefined {
   const binary = join(directory, "pi");
+
   if (!existsSync(binary)) return undefined;
   let real: string;
+
   try {
     real = realpathSync(binary);
   } catch {
     return undefined;
   }
+
   if (real.endsWith(".js")) return real;
+
   const layouts = [
     join(dirname(real), "..", "lib", "node_modules", "pi-monorepo", "dist", "bundle", "cli.js"),
     join(dirname(real), "..", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js"),
     join(dirname(real), "..", "pi-coding-agent", "dist", "bundle", "cli.js"),
   ];
+
   return layouts.find((layout) => existsSync(layout));
 }
 
 function locateInstalledPiEntrypoint(): string | undefined {
   const { PI_WORKGRAPH_PI_ENTRYPOINT: configured, PATH: path = "" } = process.env;
+
   if (configured !== undefined && existsSync(configured)) return configured;
   const candidates: string[] = [];
+
   for (const directory of path.split(":")) {
     const found = installedPiInDirectory(directory);
+
     if (found !== undefined && !candidates.includes(found)) candidates.push(found);
   }
+
   const checkoutModules = join(import.meta.dirname, "..", "..", "node_modules");
+
   return candidates.find((candidate) => !candidate.startsWith(checkoutModules)) ?? candidates[0];
 }
 
 const installedEntrypoint = locateInstalledPiEntrypoint();
+
 const installedRuntimeTest = (name: string, body: () => Promise<void>): void =>
   void test(
     name,
@@ -183,6 +202,7 @@ installedRuntimeTest(
     const CustomMessage = runtime.customMessage as unknown as CustomMessageCtor;
     const chat = new runtime.container();
     const projection = projected(chat, runtime);
+
     try {
       chat.addChild(new runtime.user("hello"));
       const assistant = new runtime.assistant();
@@ -214,8 +234,10 @@ installedRuntimeTest(
   async () => {
     initTheme("dark", false);
     const runtime = await loadCalmChatRuntime(installedEntrypoint);
+
     const markStreaming = (markdown: string, context: { isStreaming?: boolean }): string =>
       `${markdown} ${context.isStreaming === true ? "S1" : "S0"}`;
+
     const message = assistantMessage([textPart("streamed further")]);
 
     const control = new runtime.assistant();
@@ -228,6 +250,7 @@ installedRuntimeTest(
 
     const chat = new runtime.container();
     const projection = projected(chat, runtime);
+
     try {
       const assistant = new runtime.assistant();
       Reflect.set(assistant, "markdownTransformers", [markStreaming]);
@@ -252,15 +275,19 @@ installedRuntimeTest(
   async () => {
     initTheme("dark", false);
     const entrypoint = installedEntrypoint;
+
     if (entrypoint === undefined) return;
     const runtime = await loadCalmChatRuntime(entrypoint);
+
     // SAFETY: This is the bundle module already validated by the runtime loader.
     const bundle = (await import(pathToFileURL(join(dirname(entrypoint), "index.js")).href)) as {
       readonly BashExecutionComponent: BashExecutionCtor;
     };
+
     const stubUi = { requestRender: () => {} };
     const chat = new runtime.container();
     const projection = projected(chat, runtime);
+
     try {
       const bash = new bundle.BashExecutionComponent("echo hi", stubUi, false);
       bash.setComplete(0, false, undefined, undefined);

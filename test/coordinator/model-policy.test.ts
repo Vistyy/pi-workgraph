@@ -34,9 +34,11 @@ const valid: ModelPolicy = {
 await test("loads only the complete strict user policy shape", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-models-"));
   const path = join(parent, "models.json");
+
   try {
     await writeFile(path, `${JSON.stringify(valid)}\n`);
     assert.deepEqual(await loadModelPolicy(path), valid);
+
     for (const invalid of [
       undefined,
       { ...valid, extra: true },
@@ -69,6 +71,7 @@ await test("loads only the complete strict user policy shape", async () => {
         await assert.rejects(loadModelPolicy(path), /Invalid Workgraph model policy/);
       }
     }
+
     const { review: _review, ...rolesWithoutReview } = valid.roles;
     await writeFile(path, JSON.stringify({ ...valid, roles: rolesWithoutReview }));
     await assert.rejects(loadModelPolicy(path), /Invalid Workgraph model policy/);
@@ -81,10 +84,12 @@ await test("loads only the complete strict user policy shape", async () => {
 
 await test("policy Effect classifies missing and malformed files", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-policy-errors-"));
+
   try {
     const missing = await Effect.runPromise(
       Effect.flip(Effect.provide(loadModelPolicyEffect(join(parent, "missing.json")), liveLayer)),
     );
+
     assert.ok(missing instanceof ModelPolicyError);
     assert.equal(missing.operation, "read");
   } finally {
@@ -123,6 +128,7 @@ await test("implementation uses its configured executor and only an explicitly r
     executor: { model: "fixture/executor", thinking: "xhigh" },
   });
   assert.throws(() => implementationTargets(valid, true), /escalationExecutor/);
+
   const escalated: ModelPolicy = {
     ...valid,
     roles: {
@@ -130,6 +136,7 @@ await test("implementation uses its configured executor and only an explicitly r
       "implementation.escalationExecutor": { model: "fixture/escalation", thinking: "max" },
     },
   };
+
   assert.deepEqual(implementationTargets(escalated, true), {
     guide: { model: "fixture/guide", thinking: "low" },
     executor: { model: "fixture/escalation", thinking: "max" },

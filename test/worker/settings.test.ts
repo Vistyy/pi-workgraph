@@ -12,6 +12,7 @@ import { loadWorkerDisabledTools } from "../../src/worker/settings.js";
 void test("global Pi settings validate worker tool settings and ignore Calm sections", async () => {
   const root = await mkdtemp(join(tmpdir(), "wg-workgraph-settings-"));
   const path = join(root, "settings.json");
+
   try {
     assert.deepEqual(await loadWorkerDisabledTools(path), []);
 

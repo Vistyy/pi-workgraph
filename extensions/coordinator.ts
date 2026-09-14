@@ -35,14 +35,18 @@ import {
 import { resolveRevision, resolveTaskTarget } from "../src/repository.js";
 
 const Text = Type.String({ minLength: 1, pattern: "\\S" });
+
 const CandidateOf = Type.Optional(
   Type.Object(
     { attemptId: Text, mode: StringEnum(["extend", "integrate"] as const) },
     { additionalProperties: false },
   ),
 );
+
 const Selection = Type.Optional(SelectionRequestSchema);
+
 const TaskFields = { id: TaskIdSchema, cwd: Type.Optional(Text) };
+
 const PageFields = {
   offset: Type.Optional(Type.Integer({ minimum: 0 })),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
@@ -70,19 +74,25 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       () => undefined,
       () => undefined,
     );
+
     return result;
   };
+
   const runtime = (): SessionRuntime => {
     if (attached === undefined) throw new Error("Workgraph session runtime is not attached.");
+
     return attached;
   };
+
   const close = async (): Promise<void> => {
     attached = undefined;
+
     if (scope !== undefined) {
       const closing = scope;
       scope = undefined;
       await Effect.runPromise(Scope.close(closing, Exit.void));
     }
+
     calm.setActiveWorkers(0);
   };
 
@@ -96,6 +106,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       await close();
       const nextScope = await Effect.runPromise(Scope.make());
       const store = new RecordStore(agentDir, ctx.sessionManager.getSessionId());
+
       try {
         const next = await Effect.runPromise(
           SessionRuntime.acquire({
@@ -108,6 +119,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
             setActiveWorkers: (count) => calm.setActiveWorkers(count),
           }).pipe(Scope.provide(nextScope)),
         );
+
         scope = nextScope;
         attached = next;
       } catch (cause) {
@@ -130,6 +142,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     ),
     async execute(_id, params) {
       const policy = await loadModelPolicy(policyPath);
+
       return result({
         path: policyPath,
         role: params.role,
@@ -172,6 +185,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
               permittedEffects: params.experiment.permittedEffects,
               stopCondition: params.experiment.stopCondition,
             };
+
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
@@ -198,10 +212,12 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     ),
     async (params, ctx) => {
       const policy = await loadModelPolicy(policyPath);
+
       const contract: TaskContract =
         params.context === undefined
           ? { kind: "consultation", question: params.question }
           : { kind: "consultation", question: params.question, context: params.context };
+
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
@@ -236,6 +252,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         throw new Error("Candidate extension forbids baseRevision.");
       const policy = await loadModelPolicy(policyPath);
       const selected = implementationTargets(policy, params.useEscalationExecutor ?? false);
+
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
@@ -371,16 +388,20 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     execute(_id, params) {
       return serialize(async () => {
         const current = runtime();
+
         if (params.action === "steer") {
           await Effect.runPromise(current.steer(params.attemptId, params.instruction));
+
           return result({ attemptId: params.attemptId, steered: true });
         }
+
         const attempt =
           params.action === "cancel"
             ? await Effect.runPromise(current.cancel(params.attemptId, params.reason))
             : params.action === "apply"
               ? await Effect.runPromise(current.apply(params.attemptId))
               : await Effect.runPromise(current.discard(params.attemptId, params.reason));
+
         return result(attemptReceipt(attempt));
       });
     },
@@ -408,6 +429,7 @@ async function createTask(
     input.candidateOf?.mode === "extend"
       ? retainedTip(runtime, input.candidateOf.attemptId)
       : input.baseRevision;
+
   const resolved = await Effect.runPromise(
     resolveTaskTarget({
       cwd: ctx.cwd,
@@ -416,9 +438,12 @@ async function createTask(
       ...(input.targetKind === "repository" && revision !== undefined ? { revision } : {}),
     }),
   );
+
   const selections = await selectionsFor(input, policyPath);
   const first = selections[0];
+
   if (first === undefined) throw new Error("Task requires at least one model selection.");
+
   const initial = await Effect.runPromise(
     runtime.createTask({
       id: input.id,
@@ -431,7 +456,9 @@ async function createTask(
         : {}),
     }),
   );
+
   const attempts = [initial];
+
   for (const selection of selections.slice(1)) {
     attempts.push(
       await Effect.runPromise(
@@ -443,6 +470,7 @@ async function createTask(
       ),
     );
   }
+
   return { taskId: input.id, attempts: attempts.map(attemptReceipt) };
 }
 
@@ -453,6 +481,7 @@ async function selectionsFor(
   if (input.fixedSelection !== undefined) return [input.fixedSelection];
   const policy = await loadModelPolicy(policyPath);
   const role = input.contract.kind === "review" ? "review" : "research";
+
   return resolveSelection(role, input.selection, policy).selected.map((target) => ({
     kind: "target",
     target,
@@ -472,15 +501,19 @@ async function createAttempt(
   if (params.candidateOf?.mode === "extend" && params.baseRevision !== undefined)
     throw new Error("Candidate extension forbids baseRevision.");
   const task = runtime.store.readTask(params.taskId).task;
+
   if (params.candidateOf !== undefined && task.contract.kind !== "implementation")
     throw new Error("candidateOf is supported only for implementation Attempts.");
+
   if (params.useEscalationExecutor !== undefined && task.contract.kind !== "implementation")
     throw new Error("useEscalationExecutor is supported only for implementation Attempts.");
+
   if (params.baseRevision !== undefined && task.target.kind !== "repository")
     throw new Error("baseRevision is supported only for repository Attempts.");
   const policy = await loadModelPolicy(policyPath);
   const selection = selectionForAttempt(task.contract, policy, params.useEscalationExecutor);
   const baseCommit = await baseForAttempt(task, params.candidateOf, params.baseRevision);
+
   return Effect.runPromise(
     runtime.createAttempt({
       taskId: params.taskId,
@@ -498,8 +531,10 @@ function selectionForAttempt(
 ): AttemptSelection {
   if (contract.kind === "implementation") {
     const selected = implementationTargets(policy, useEscalationExecutor ?? false);
+
     return { kind: "implementation", guide: selected.guide, executor: selected.executor };
   }
+
   return {
     kind: "target",
     target: configuredTarget(
@@ -519,18 +554,22 @@ async function baseForAttempt(
   baseRevision?: string,
 ): Promise<string | undefined> {
   if (task.target.kind !== "repository" || candidateOf?.mode === "extend") return undefined;
+
   const requested =
     baseRevision ??
     (task.contract.kind === "review" && task.contract.subject.kind === "revision"
       ? task.contract.subject.revision
       : "HEAD");
+
   return Effect.runPromise(resolveRevision(task.target, requested));
 }
 
 function retainedTip(runtime: SessionRuntime, attemptId: string): string {
   const attempt = runtime.store.readAttempt(attemptId);
+
   if (attempt.output?.kind !== "retained")
     throw new Error("Candidate parent has no retained output.");
+
   return attempt.output.tip;
 }
 
@@ -559,15 +598,18 @@ type InspectInput =
 function inspect(runtime: SessionRuntime, params: Static<TSchema>) {
   // SAFETY: this helper receives only values decoded by the registered inspection union.
   const input = params as InspectInput;
+
   switch (input.section) {
     case "overview": {
       const status = runtime.inspectionStatus();
+
       return {
         counts: runtime.store.counts(),
         blockers: status.blockers,
         activeWorkers: status.activeWorkers,
       };
     }
+
     case "task":
       return inspectTasks(runtime, input);
     case "attempt":
@@ -581,6 +623,7 @@ function inspectTasks(runtime: SessionRuntime, input: Extract<InspectInput, { se
   if (input.id !== undefined) return runtime.store.readTask(input.id);
   const offset = input.offset ?? 0;
   const limit = input.limit ?? 20;
+
   return {
     offset,
     limit,
@@ -599,6 +642,7 @@ function inspectAttempts(
   if (input.id !== undefined) return inspectedAttempt(runtime.store.readAttempt(input.id));
   const offset = input.offset ?? 0;
   const limit = input.limit ?? 20;
+
   return {
     offset,
     limit,
@@ -616,10 +660,12 @@ function inspectReport(
   input: Extract<InspectInput, { section: "report" }>,
 ) {
   const attempt = runtime.store.readAttempt(input.attemptId);
+
   if (attempt.outcome?.result.kind !== "reported") throw new Error("Attempt has no report.");
   const text = JSON.stringify(attempt.outcome.result.report);
   const offset = input.offset ?? 0;
   const maxChars = input.maxChars ?? 4_000;
+
   return {
     attemptId: input.attemptId,
     offset,
@@ -631,6 +677,7 @@ function inspectReport(
 
 function inspectedAttempt(attempt: AttemptRecord) {
   const outcome = attempt.outcome;
+
   return {
     attemptId: attempt.id,
     taskId: attempt.taskId,
@@ -674,12 +721,14 @@ function registerTask<S extends TSchema>(
 function attemptReceipt(record: AttemptRecord) {
   return { taskId: record.taskId, attemptId: record.id };
 }
+
 function result(value: object) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
     details: value,
   };
 }
+
 function publicMessage(cause: unknown): string {
   return (
     cause instanceof RuntimeError

@@ -12,6 +12,7 @@ import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../suppo
 import { extensionFixture, persistentSession, usage } from "../support/helpers.js";
 
 const defaultExecutor = { model: "openai/gpt-4o", thinking: "high" as const };
+
 const objective: WorkerObjective = {
   content:
     "[WORKGRAPH WORKER OBJECTIVE]\nPurpose: exercise the Worker\nObjective: change only the fixture",
@@ -22,6 +23,7 @@ const objective: WorkerObjective = {
     executor: defaultExecutor,
   },
 };
+
 const todo = [
   {
     id: "implement",
@@ -40,15 +42,19 @@ async function fixture(
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-"));
   const root = join(parent, "repo");
   await mkdir(root);
+
   if (settings !== undefined) {
     await mkdir(join(parent, "agent"), { recursive: true });
     await writeFile(join(parent, "agent", "settings.json"), settings);
   }
+
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_ROLE: role,
   });
+
   const session = persistentSession(root, join(parent, "sessions"));
+
   const assigned: WorkerObjective = {
     content: objective.content,
     details:
@@ -60,6 +66,7 @@ async function fixture(
             role,
           },
   };
+
   session.appendCustomMessageEntry(
     "pi-workgraph-objective",
     assigned.content,
@@ -67,6 +74,7 @@ async function fixture(
     assigned.details,
   );
   let activeTools = ["read", "bash", "edit", "write", "workgraph_plan", "workgraph_report"];
+
   const pi = await extensionFixture(
     "worker",
     root,
@@ -81,7 +89,9 @@ async function fixture(
     [],
     session,
   );
+
   await pi.runner.emit({ type: "session_start", reason: "startup" });
+
   return {
     ...pi,
     activeTools: () => activeTools,
@@ -102,6 +112,7 @@ async function endTool(f: Awaited<ReturnType<typeof fixture>>, toolName: string,
     isError,
   });
 }
+
 function appendPlan(session: SessionManager) {
   session.appendMessage({
     role: "toolResult",
@@ -113,6 +124,7 @@ function appendPlan(session: SessionManager) {
     timestamp: Date.now(),
   });
 }
+
 function appendResult(session: SessionManager, toolName: string, isError = false) {
   session.appendMessage({
     role: "toolResult",
@@ -124,6 +136,7 @@ function appendResult(session: SessionManager, toolName: string, isError = false
     timestamp: Date.now(),
   });
 }
+
 function assistant(session: SessionManager, model = "gpt-4o") {
   session.appendMessage({
     role: "assistant",
@@ -139,6 +152,7 @@ function assistant(session: SessionManager, model = "gpt-4o") {
 
 void test("plan tool keeps one strict nonblank 1–9 item current snapshot", async () => {
   const f = await fixture();
+
   try {
     const tool = f.runner.getToolDefinition("workgraph_plan");
     assert.ok(tool);
@@ -151,11 +165,13 @@ void test("plan tool keeps one strict nonblank 1–9 item current snapshot", asy
     assert.equal(Value.Check(tool.parameters, { action: "add", todo: todo[0] }), false);
     const set = await f.call("workgraph_plan", { action: "set", todos: todo });
     assert.deepEqual(set.details, { action: "set", todos: todo });
+
     const update = await f.call("workgraph_plan", {
       action: "update",
       id: "implement",
       patch: { status: "done", note: "verified" },
     });
+
     // SAFETY: The registered plan tool returned schema-validated snapshot details.
     assert.equal((update.details as { todos: typeof todo }).todos[0]?.status, "done");
     await assert.rejects(
@@ -170,6 +186,7 @@ void test("plan tool keeps one strict nonblank 1–9 item current snapshot", asy
 void test("TODO and successful direct edit trigger one executor cutover in either order", async () => {
   for (const order of ["plan-first", "edit-first"] as const) {
     const f = await fixture();
+
     try {
       if (order === "plan-first") {
         await f.call("workgraph_plan", { action: "set", todos: todo });
@@ -184,23 +201,28 @@ void test("TODO and successful direct edit trigger one executor cutover in eithe
         await f.call("workgraph_plan", { action: "set", todos: todo });
         await endTool(f, "workgraph_plan");
       }
+
       assert.deepEqual(f.selected, ["openai/gpt-4o"]);
       await endTool(f, "edit");
       assert.deepEqual(f.selected, ["openai/gpt-4o"]);
+
       const executorStarts = f.session
         .getBranch()
         .filter(
           (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-executor-start",
         );
+
       assert.equal(executorStarts.length, 1);
       assert.deepEqual(
         executorStarts[0]?.type === "custom" ? executorStarts[0].data : undefined,
         {},
       );
       await f.runner.emit({ type: "agent_settled" });
+
       const reminder = f.messages.find(
         (message) => message.customType === "pi-workgraph-todo-reminder",
       );
+
       assert.deepEqual(reminder?.details, {});
     } finally {
       await f.dispose();
@@ -211,9 +233,11 @@ void test("TODO and successful direct edit trigger one executor cutover in eithe
 void test("selection failure remains guide-owned, blocks mutation, never retries, and permits failed report", async () => {
   let session: SessionManager | undefined;
   let calls = 0;
+
   const f = await fixture("implementation", {
     async setModel() {
       calls += 1;
+
       return false;
     },
     sendMessage(message) {
@@ -225,7 +249,9 @@ void test("selection failure remains guide-owned, blocks mutation, never retries
       );
     },
   });
+
   session = f.session;
+
   try {
     await f.call("workgraph_plan", { action: "set", todos: todo });
     await endTool(f, "workgraph_plan");
@@ -244,6 +270,7 @@ void test("selection failure remains guide-owned, blocks mutation, never retries
         ).length,
       1,
     );
+
     const report = await f.call("workgraph_report", {
       kind: "implementation",
       status: "failed",
@@ -251,6 +278,7 @@ void test("selection failure remains guide-owned, blocks mutation, never retries
       evidence: [],
       findings: [],
     });
+
     assert.equal(report.terminate, true);
   } finally {
     session = undefined;
@@ -260,6 +288,7 @@ void test("selection failure remains guide-owned, blocks mutation, never retries
 
 void test("recovery derives cutover and changed proof from the exact trajectory", async () => {
   const f = await fixture();
+
   try {
     appendPlan(f.session);
     appendResult(f.session, "write");
@@ -277,6 +306,7 @@ void test("recovery derives cutover and changed proof from the exact trajectory"
       /later successful executor assistant message/,
     );
     assistant(f.session);
+
     const report = await f.call("workgraph_report", {
       kind: "implementation",
       status: "completed",
@@ -285,6 +315,7 @@ void test("recovery derives cutover and changed proof from the exact trajectory"
       evidence: [],
       findings: [],
     });
+
     assert.deepEqual(report.details, {
       report: {
         kind: "implementation",
@@ -305,6 +336,7 @@ void test("reattach promotes only exact frozen executor state with persisted TOD
     model: "amazon-bedrock/amazon.nova-2-lite-v1:0",
     thinking: "high",
   });
+
   try {
     appendPlan(f.session);
     appendResult(f.session, "edit");
@@ -325,6 +357,7 @@ void test("reattach promotes only exact frozen executor state with persisted TOD
 
 void test("guide terminal paths and role-owned edit gates are independent", async () => {
   const guide = await fixture();
+
   try {
     const noChange = await guide.call("workgraph_report", {
       kind: "implementation",
@@ -335,12 +368,15 @@ void test("guide terminal paths and role-owned edit gates are independent", asyn
       evidence: [],
       findings: [],
     });
+
     assert.equal(noChange.terminate, true);
   } finally {
     await guide.dispose();
   }
+
   for (const role of ["research", "review", "consultation"] as const) {
     const worker = await fixture(role);
+
     try {
       assert.equal(worker.runner.getToolDefinition("workgraph_plan"), undefined);
       assert.equal(worker.activeTools().includes("bash"), true);
@@ -350,7 +386,9 @@ void test("guide terminal paths and role-owned edit gates are independent", asyn
       await worker.dispose();
     }
   }
+
   const experiment = await fixture("experiment");
+
   try {
     assert.equal(experiment.activeTools().includes("edit"), true);
     assert.equal(experiment.activeTools().includes("write"), true);
@@ -363,10 +401,12 @@ void test("malformed objective fails closed but retains actual-model and settled
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-objective-"));
   const root = join(parent, "repo");
   await mkdir(root);
+
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_ROLE: "implementation",
   });
+
   const session = SessionManager.create(root, join(parent, "sessions"), { id: "attempt" });
   session.appendCustomMessageEntry("pi-workgraph-objective", objective.content, true, {
     ...objective.details,
@@ -383,8 +423,10 @@ void test("malformed objective fails closed but retains actual-model and settled
     stopReason: "stop",
     timestamp: Date.now(),
   });
+
   try {
     let activeTools = ["read", "bash", "edit", "write", "workgraph_plan", "workgraph_report"];
+
     const loaded = await extensionFixture(
       "worker",
       root,
@@ -398,9 +440,11 @@ void test("malformed objective fails closed but retains actual-model and settled
       [],
       session,
     );
+
     await loaded.runner.emit({ type: "session_start", reason: "startup" });
     await loaded.runner.emit({ type: "agent_start" });
     await loaded.runner.emit({ type: "agent_settled" });
+
     const report = await loaded.call("workgraph_report", {
       kind: "implementation",
       status: "failed",
@@ -408,16 +452,20 @@ void test("malformed objective fails closed but retains actual-model and settled
       evidence: [],
       findings: [],
     });
+
     assert.equal(report.terminate, true);
     const file = session.getSessionFile();
+
     if (file === undefined) assert.fail("Worker session was not persisted.");
     const read = readWorkerSession(file, root, objective);
     assert.equal(read.unreadable, false, read.unreadable ? read.error : "");
+
     if (!read.unreadable) {
       assert.equal(read.started, true);
       assert.equal(read.settled, true);
       assert.match(read.reportError ?? "", /objective.*mismatched/i);
     }
+
     await loaded.close();
   } finally {
     restoreFixtureEnvironment(previous);
@@ -429,10 +477,12 @@ void test("invalid Worker role does not crash extension loading", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-role-"));
   const root = join(parent, "repo");
   await mkdir(root);
+
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_ROLE: "invalid-role",
   });
+
   try {
     const loaded = await extensionFixture("worker", root, parent);
     assert.equal(loaded.runner.getToolDefinition("workgraph_report"), undefined);
@@ -450,6 +500,7 @@ void test("unreadable or protected settings fail closed before requests and pres
     JSON.stringify({ "pi-workgraph": { worker: { disabledTools: ["workgraph_report"] } } }),
   ]) {
     const f = await fixture("implementation", {}, settings);
+
     try {
       assert.deepEqual(f.activeTools(), ["workgraph_report"]);
       assert.equal(
@@ -467,6 +518,7 @@ void test("unreadable or protected settings fail closed before requests and pres
         }),
         /only a truthful failed report/,
       );
+
       const failed = await f.call("workgraph_report", {
         kind: "implementation",
         status: "failed",
@@ -474,6 +526,7 @@ void test("unreadable or protected settings fail closed before requests and pres
         evidence: [],
         findings: [],
       });
+
       assert.equal(failed.terminate, true);
     } finally {
       await f.dispose();
@@ -483,14 +536,17 @@ void test("unreadable or protected settings fail closed before requests and pres
 
 void test("genuine compaction restores the authoritative objective and current TODO once", async () => {
   const f = await fixture();
+
   try {
     await f.call("workgraph_plan", { action: "set", todos: todo });
     appendPlan(f.session);
+
     const kept = f.session.appendMessage({
       role: "user",
       content: "Continue after compaction.",
       timestamp: Date.now(),
     });
+
     f.session.appendCompaction("Earlier context compacted.", kept, 1_000);
     assert.equal(
       f.session
@@ -510,9 +566,11 @@ void test("genuine compaction restores the authoritative objective and current T
       reason: "manual",
       willRetry: false,
     });
+
     const recoveries = f.messages.filter(
       (message) => message.customType === "pi-workgraph-compaction-recovery",
     );
+
     assert.equal(recoveries.length, 1);
     const recovery = recoveries[0];
     assert.ok(recovery);
@@ -528,6 +586,7 @@ void test("genuine compaction restores the authoritative objective and current T
 
 void test("actual models are recorded only at agent_start with actual thinking", async () => {
   const f = await fixture();
+
   try {
     await f.runner.emit({ type: "agent_start" });
     const model = f.registry.getAll()[0];
@@ -538,12 +597,15 @@ void test("actual models are recorded only at agent_start with actual thinking",
       previousModel: undefined,
       source: "set",
     });
+
     const markers = f.session
       .getBranch()
       .filter(
         (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-effective-model",
       );
+
     assert.equal(markers.length, 1);
+
     if (markers[0]?.type === "custom") {
       // SAFETY: The marker is emitted only from the typed agent_start observation.
       assert.equal((markers[0].data as { thinking: string }).thinking, "high");

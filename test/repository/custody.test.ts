@@ -27,6 +27,7 @@ const selection = {
   guide: { model: "fixture/guide", thinking: "high" as const },
   executor: { model: "fixture/executor", thinking: "high" as const },
 };
+
 async function repository() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-git-"));
   const root = join(parent, "repository");
@@ -41,11 +42,14 @@ async function repository() {
   await git(root, "commit", "-m", "base");
   const base = await git(root, "rev-parse", "HEAD");
   const resolved = await Effect.runPromise(resolveTaskTarget({ cwd: root, kind: "repository" }));
+
   if (!("commit" in resolved)) throw new Error("Expected repository resolution.");
   assert.equal(resolved.target.kind, "repository");
   assert.equal(resolved.commit, base);
+
   return { parent, root, agentDir, base, target: resolved.target };
 }
+
 function operation(
   fixture: Awaited<ReturnType<typeof repository>>,
   attemptId: string,
@@ -56,20 +60,25 @@ function operation(
   assert.equal(placement.worktreePath, join(fixture.agentDir, "workgraph", "worktrees", attemptId));
   assert.equal(placement.outputRef, `refs/pi-workgraph/outputs/${attemptId}`);
   const base = { attemptId, spec, target: fixture.target, ...placement };
+
   return output === undefined ? base : { ...base, output };
 }
+
 function initial(baseCommit: string): AttemptSpec {
   return { selection, base: { kind: "repository", baseCommit } };
 }
+
 async function commit(checkout: string, text: string, message = text): Promise<string> {
   await writeFile(join(checkout, "file.txt"), `${text}\n`);
   await git(checkout, "add", "file.txt");
   await git(checkout, "commit", "-m", message);
+
   return git(checkout, "rev-parse", "HEAD");
 }
 
 void test("target resolution preserves real nested Git identity and rejects invalid targets", async () => {
   const plain = await mkdtemp(join(tmpdir(), "workgraph-target-"));
+
   try {
     const directory = await Effect.runPromise(resolveTaskTarget({ cwd: plain, kind: "directory" }));
     assert.deepEqual(directory, { target: { kind: "directory", path: plain } });
@@ -111,14 +120,17 @@ void test("target resolution preserves real nested Git identity and rejects inva
     );
 
     const fixture = await repository();
+
     try {
       const nested = join(fixture.root, "nested");
       await mkdir(nested);
       const link = join(fixture.parent, "linked");
       await symlink(nested, link);
+
       const target = await Effect.runPromise(
         resolveTaskTarget({ cwd: plain, path: link, kind: "repository", revision: fixture.base }),
       );
+
       assert.deepEqual(target, { target: fixture.target, commit: fixture.base });
       await assert.rejects(
         Effect.runPromise(
@@ -126,16 +138,19 @@ void test("target resolution preserves real nested Git identity and rejects inva
         ),
         GitError,
       );
+
       const symlinkedPlacement = detachedPlacement({
         agentDir: linkedAgent,
         attemptId: "symlinked",
       });
+
       const symlinkedOperation: RepositoryOperation = {
         attemptId: "symlinked",
         spec: initial(fixture.base),
         target: fixture.target,
         ...symlinkedPlacement,
       };
+
       await Effect.runPromise(ensureDetachedWorktree(symlinkedOperation));
       assert.deepEqual(await Effect.runPromise(classifyOutput(symlinkedOperation)), {
         kind: "no_output",
@@ -150,6 +165,7 @@ void test("target resolution preserves real nested Git identity and rejects inva
 
 void test("classification compacts completed commits, releases completed scratch, and preserves uncertain bytes", async () => {
   const fixture = await repository();
+
   try {
     const unchanged = operation(fixture, "unchanged", initial(fixture.base));
     await Effect.runPromise(ensureDetachedWorktree(unchanged));
@@ -224,6 +240,7 @@ void test("classification compacts completed commits, releases completed scratch
 
 void test("application accepts ignored destination artifacts and recovers structurally before cleanup", async () => {
   const fixture = await repository();
+
   try {
     let fast = operation(fixture, "fast", initial(fixture.base));
     await Effect.runPromise(ensureDetachedWorktree(fast));
@@ -241,9 +258,11 @@ void test("application accepts ignored destination artifacts and recovers struct
       await readFile(join(fixture.root, "node_modules", "artifact.js"), "utf8"),
       "ignored artifact\n",
     );
+
     const fastCleaned = await Effect.runPromise(
       cleanupAppliedOutput({ ...fast, output: fastApplied }),
     );
+
     assert.equal(fastCleaned.kind === "applied" ? fastCleaned.cleanupTip : "bad", undefined);
     await assert.rejects(git(fixture.root, "rev-parse", fast.outputRef));
 
@@ -312,6 +331,7 @@ void test("application accepts ignored destination artifacts and recovers struct
 
 void test("integration ancestry, conflicts, and reasoned discard preserve foreign content", async () => {
   const fixture = await repository();
+
   try {
     let source = operation(fixture, "source", initial(fixture.base));
     await Effect.runPromise(ensureDetachedWorktree(source));
@@ -323,6 +343,7 @@ void test("integration ancestry, conflicts, and reasoned discard preserve foreig
     await git(fixture.root, "add", "destination.txt");
     await git(fixture.root, "commit", "-m", "destination");
     const destinationTip = await git(fixture.root, "rev-parse", "HEAD");
+
     let integration = operation(fixture, "integration", {
       ...initial(destinationTip),
       lineage: {
@@ -330,6 +351,7 @@ void test("integration ancestry, conflicts, and reasoned discard preserve foreig
         candidateOf: { kind: "integrate", attemptId: "source", sourceTip },
       },
     });
+
     await Effect.runPromise(ensureDetachedWorktree(integration));
     await git(integration.worktreePath, "merge", "--no-ff", "-m", "integrate", sourceTip);
     const integrationTip = await git(integration.worktreePath, "rev-parse", "HEAD");
@@ -360,9 +382,11 @@ void test("integration ancestry, conflicts, and reasoned discard preserve foreig
     await Effect.runPromise(ensureDetachedWorktree(dirty));
     await writeFile(join(dirty.worktreePath, "ignored.bin"), "owned ignored bytes\n");
     dirty = { ...dirty, output: await Effect.runPromise(classifyOutput(dirty)) };
+
     const checkpoint = await Effect.runPromise(
       prepareDiscard(dirty, "No longer needed after inspection"),
     );
+
     const discarded = await Effect.runPromise(discardOutput({ ...dirty, output: checkpoint }));
     assert.equal(discarded.kind, "discarded");
     await assert.rejects(readFile(join(dirty.worktreePath, "ignored.bin")));
@@ -374,9 +398,11 @@ void test("integration ancestry, conflicts, and reasoned discard preserve foreig
     foreign = { ...foreign, output: await Effect.runPromise(classifyOutput(foreign)) };
     await git(foreign.worktreePath, "add", "untracked.txt");
     await git(foreign.worktreePath, "commit", "-m", "foreign advancement");
+
     const refused = await Effect.runPromise(
       prepareDiscard(foreign, "Explicit but stale disposition"),
     );
+
     await assert.rejects(
       Effect.runPromise(discardOutput({ ...foreign, output: refused })),
       GitError,
@@ -395,9 +421,11 @@ void test("integration ancestry, conflicts, and reasoned discard preserve foreig
       output: await Effect.runPromise(classifyOutput(missingRef)),
     };
     await git(fixture.root, "update-ref", "-d", missingRef.outputRef);
+
     const missingCheckpoint = await Effect.runPromise(
       prepareDiscard(missingRef, "Discard only with exact ref ownership"),
     );
+
     await assert.rejects(
       Effect.runPromise(discardOutput({ ...missingRef, output: missingCheckpoint })),
       GitError,

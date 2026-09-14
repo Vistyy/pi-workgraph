@@ -8,19 +8,24 @@ import { Value } from "typebox/value";
 import { runNodePlatformPromise } from "../node-platform.js";
 
 const ToolNameSchema = Type.String({ minLength: 1, pattern: "^\\S+$" });
+
 const WorkerSettingsSchema = Type.Object(
   { disabledTools: Type.Optional(Type.Array(ToolNameSchema)) },
   { additionalProperties: true },
 );
+
 const WorkgraphSettingsDocumentSchema = Type.Object(
   { worker: Type.Optional(Type.Unknown()) },
   { additionalProperties: true },
 );
+
 const GlobalSettingsDocumentSchema = Type.Object(
   { "pi-workgraph": Type.Optional(Type.Unknown()) },
   { additionalProperties: true },
 );
+
 type GlobalSettingsDocument = Static<typeof GlobalSettingsDocumentSchema>;
+
 type WorkgraphSettingsDocument = Static<typeof WorkgraphSettingsDocumentSchema>;
 
 class WorkgraphSettingsError extends Data.TaggedError("WorkgraphSettingsError")<{
@@ -43,6 +48,7 @@ function parseGlobalSettingsDocument(value: unknown, path: string): GlobalSettin
       path,
       message: `Invalid pi-workgraph settings in ${path}.`,
     });
+
   return Value.Decode(GlobalSettingsDocumentSchema, value);
 }
 
@@ -51,25 +57,31 @@ function workgraphSettings(
   path: string,
 ): WorkgraphSettingsDocument | undefined {
   const workgraph = settings["pi-workgraph"];
+
   if (workgraph === undefined) return undefined;
+
   if (!Value.Check(WorkgraphSettingsDocumentSchema, workgraph))
     throw new WorkgraphSettingsError({
       operation: "decode",
       path,
       message: `Invalid pi-workgraph.worker settings in ${path}.`,
     });
+
   return Value.Decode(WorkgraphSettingsDocumentSchema, workgraph);
 }
 
 function decodeWorker(value: GlobalSettingsDocument, path: string): readonly string[] {
   const worker = workgraphSettings(value, path)?.worker;
+
   if (worker === undefined) return [];
+
   if (!Value.Check(WorkerSettingsSchema, worker))
     throw new WorkgraphSettingsError({
       operation: "decode",
       path,
       message: `Invalid pi-workgraph.worker.disabledTools in ${path}; expected an array of non-whitespace tool names.`,
     });
+
   return unique(Value.Decode(WorkerSettingsSchema, worker).disabledTools ?? []);
 }
 
@@ -79,13 +91,16 @@ function loadGlobalSettingsEffect<A>(
 ): Effect.Effect<A, WorkgraphSettingsError | PlatformError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
+
     const contents = yield* fileSystem.readFileString(path).pipe(
       Effect.catchIf(
         (error) => error.reason._tag === "NotFound",
         () => Effect.void,
       ),
     );
+
     if (contents === undefined) return decode({}, path);
+
     const parsed = yield* Effect.try({
       // oxlint-disable-next-line anti-slop/no-unknown-returns, effecttsgo/prefer-schema-over-json -- The result is decoded by the requested owned subsection immediately below.
       try: (): unknown => JSON.parse(contents),
@@ -96,6 +111,7 @@ function loadGlobalSettingsEffect<A>(
           message: `Invalid JSON in ${path}.`,
         }),
     });
+
     return decode(parseGlobalSettingsDocument(parsed, path), path);
   });
 }

@@ -3,7 +3,9 @@ import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
 const ENTRY_TYPE = "pi-workgraph-notepad";
+
 const RECOVERY_MESSAGE_TYPE = "pi-workgraph-notepad-recovery";
+
 const MAX_TEXT_LENGTH = 4_000;
 
 const NotepadEntrySchema = Type.Object(
@@ -27,13 +29,17 @@ type NotepadEntry = Static<typeof NotepadEntrySchema>;
 
 function currentMemo(ctx: ExtensionContext): string {
   const branch = ctx.sessionManager.getBranch();
+
   for (let index = branch.length - 1; index >= 0; index -= 1) {
     const entry = branch.at(index);
+
     if (entry?.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
+
     return Value.Check(NotepadEntrySchema, entry.data)
       ? Value.Decode(NotepadEntrySchema, entry.data).text
       : "";
   }
+
   return "";
 }
 
@@ -50,21 +56,26 @@ export function installNotepad(pi: ExtensionAPI): void {
       switch (params.action) {
         case "read": {
           const text = currentMemo(ctx);
+
           return {
             content: [{ type: "text", text: text.length === 0 ? "Notepad is empty." : text }],
             details: { text },
           };
         }
+
         case "replace": {
           const entry: NotepadEntry = { text: params.text };
           pi.appendEntry(ENTRY_TYPE, entry);
+
           return {
             content: [{ type: "text", text: "Notepad replaced." }],
             details: {},
           };
         }
+
         case "clear":
           pi.appendEntry(ENTRY_TYPE, { text: "" } satisfies NotepadEntry);
+
           return {
             content: [{ type: "text", text: "Notepad cleared." }],
             details: {},
@@ -75,6 +86,7 @@ export function installNotepad(pi: ExtensionAPI): void {
 
   pi.on("session_compact", (_event, ctx) => {
     const text = currentMemo(ctx);
+
     if (text.length === 0) return;
     pi.sendMessage({
       customType: RECOVERY_MESSAGE_TYPE,

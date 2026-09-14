@@ -12,6 +12,7 @@ async function fixture() {
   const root = join(parent, "repo");
   await mkdir(root);
   const pi = await extensionFixture("coordinator", root, parent, {}, [installNotepad]);
+
   return {
     ...pi,
     parent,
@@ -24,6 +25,7 @@ async function fixture() {
 
 void test("workgraph_notepad has only the strict bounded action shapes", async () => {
   const f = await fixture();
+
   try {
     const tool = f.runner.getToolDefinition("workgraph_notepad");
     assert.ok(tool !== undefined);
@@ -50,12 +52,15 @@ void test("workgraph_notepad has only the strict bounded action shapes", async (
 
 void test("latest replacements and clears are branch-local and mutation results do not disclose text", async () => {
   const f = await fixture();
+
   try {
     const firstText = "first private memo";
+
     const firstResult = await f.call("workgraph_notepad", {
       action: "replace",
       text: firstText,
     });
+
     assert.equal(JSON.stringify(firstResult).includes(firstText), false);
     const firstLeaf = f.session.getLeafId();
     assert.ok(firstLeaf !== null);
@@ -65,10 +70,12 @@ void test("latest replacements and clears are branch-local and mutation results 
     assert.deepEqual(firstEntry.data, { text: firstText });
 
     const secondText = "alternate private memo";
+
     const secondResult = await f.call("workgraph_notepad", {
       action: "replace",
       text: secondText,
     });
+
     assert.equal(JSON.stringify(secondResult).includes(secondText), false);
     const secondLeaf = f.session.getLeafId();
     assert.ok(secondLeaf !== null);
@@ -103,6 +110,7 @@ void test("latest replacements and clears are branch-local and mutation results 
 
 void test("only successful compaction recovers one nonempty current-branch memo", async () => {
   const f = await fixture();
+
   try {
     const text = "recover this memo";
     await f.call("workgraph_notepad", { action: "replace", text });

@@ -17,4 +17,5 @@ export const ModelTargetSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
 export type ModelTarget = Static<typeof ModelTargetSchema>;

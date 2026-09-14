@@ -24,6 +24,7 @@ const EvidenceSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
 const FindingSchema = Type.Object(
   {
     severity: Type.Union([
@@ -37,6 +38,7 @@ const FindingSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
 const ReportContentFields = {
   summary: Type.String(),
   uncertainty: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
@@ -56,7 +58,9 @@ function readOnlyReportSchema<const Kind extends "research" | "review">(kind: Ki
 }
 
 const ResearchReportSchema = readOnlyReportSchema("research");
+
 const ReviewReportSchema = readOnlyReportSchema("review");
+
 const ImplementationNoChangeReportSchema = Type.Object(
   {
     kind: Type.Literal("implementation"),
@@ -67,6 +71,7 @@ const ImplementationNoChangeReportSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
 const ImplementationIncompleteReportSchema = Type.Object(
   {
     kind: Type.Literal("implementation"),
@@ -75,6 +80,7 @@ const ImplementationIncompleteReportSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
 const ImplementationChangedInputSchema = Type.Object(
   {
     kind: Type.Literal("implementation"),
@@ -84,6 +90,7 @@ const ImplementationChangedInputSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
 const ImplementationReportSchema = Type.Union(
   [
     ImplementationChangedInputSchema,
@@ -92,16 +99,21 @@ const ImplementationReportSchema = Type.Union(
   ],
   { type: "object" },
 );
+
 const WorkerReportInputSchema = Type.Union([
   ResearchReportSchema,
   ReviewReportSchema,
   ImplementationReportSchema,
 ]);
+
 export const WorkerReportSchema = WorkerReportInputSchema;
 
 export type WorkerReportInput = Static<typeof WorkerReportInputSchema>;
+
 export type WorkerReport = Static<typeof WorkerReportSchema>;
+
 export type WorkerMode = WorkerReportInput["kind"];
+
 export type WorkerSessionMode = WorkerMode;
 
 export function reportSchemaForMode(mode: WorkerSessionMode) {

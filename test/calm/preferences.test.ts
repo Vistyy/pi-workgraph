@@ -12,6 +12,7 @@ import { calmPreferences } from "../../src/calm/preferences.js";
 void test("Calm default persists across readers, atomically replaces, and rejects corruption", async () => {
   const root = await mkdtemp(join(tmpdir(), "wg-calm-"));
   const path = join(root, "workgraph", "calm-default");
+
   try {
     const first = calmPreferences(path);
     assert.equal(await first.load(), true);

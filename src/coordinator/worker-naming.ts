@@ -9,8 +9,11 @@ export interface WorkerNamingContext {
 }
 
 const AGENT_LIMIT = 32;
+
 const LABEL_LIMIT = 18;
+
 const SUFFIX_LENGTH = 6;
+
 const ROLE_MARKER: Record<WorkerRole, string> = {
   consultation: "C",
   experiment: "E",
@@ -21,6 +24,7 @@ const ROLE_MARKER: Record<WorkerRole, string> = {
 
 export function herdrWorkerName(context: WorkerNamingContext): string {
   const suffix = identitySuffix(context);
+
   return `wg-${context.role}-${suffix}`.slice(0, AGENT_LIMIT);
 }
 
@@ -29,6 +33,7 @@ export function herdrWorkerTabLabel(context: WorkerNamingContext): string {
   const suffix = identitySuffix(context);
   const subject = words(context.taskId);
   const available = LABEL_LIMIT - prefix.length - suffix.length - 1;
+
   return `${prefix}${boundAtWord(subject, available) || "task"}-${suffix}`;
 }
 
@@ -41,8 +46,10 @@ function identitySuffix(context: WorkerNamingContext): string {
 
 function boundAtWord(value: string, limit: number): string {
   const bounded = value.slice(0, limit).replace(/[ -]+$/g, "");
+
   if (value.length <= limit) return bounded;
   const boundary = bounded.lastIndexOf(" ");
+
   return boundary > 0 ? bounded.slice(0, boundary) : bounded;
 }
 

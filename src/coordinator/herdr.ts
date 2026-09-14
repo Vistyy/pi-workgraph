@@ -8,13 +8,16 @@ import { childProcessLayer } from "../node-platform.js";
 import { herdrWorkerName, herdrWorkerTabLabel, type WorkerNamingContext } from "./worker-naming.js";
 
 const Text = Type.String({ minLength: 1 });
+
 const ReadyStatus = Type.Union([Type.Literal("idle"), Type.Literal("working")]);
+
 const AgentStatus = Type.Union([
   ReadyStatus,
   Type.Literal("blocked"),
   Type.Literal("done"),
   Type.Literal("unknown"),
 ]);
+
 const Agent = Type.Object({
   workspace_id: Text,
   tab_id: Text,
@@ -24,6 +27,7 @@ const Agent = Type.Object({
   name: Type.Optional(Text),
   agent_session: Type.Optional(Type.Object({ value: Text })),
 });
+
 const StartedAgent = Type.Intersect([
   Agent,
   Type.Object({
@@ -32,28 +36,36 @@ const StartedAgent = Type.Intersect([
     interactive_ready: Type.Literal(true),
   }),
 ]);
+
 const AgentStartEnvelope = Type.Object({ result: Type.Object({ agent: StartedAgent }) });
+
 const AgentListEnvelope = Type.Object({ result: Type.Object({ agents: Type.Array(Agent) }) });
+
 const TabCreateEnvelope = Type.Object({
   result: Type.Object({
     tab: Type.Object({ workspace_id: Text, tab_id: Text }),
     root_pane: Type.Object({ workspace_id: Text, tab_id: Text, pane_id: Text, cwd: Text }),
   }),
 });
+
 const TabListEnvelope = Type.Object({
   result: Type.Object({
     tabs: Type.Array(Type.Object({ workspace_id: Text, tab_id: Text, label: Type.Optional(Text) })),
   }),
 });
+
 const PaneListEnvelope = Type.Object({
   result: Type.Object({
     panes: Type.Array(Type.Object({ workspace_id: Text, tab_id: Text, pane_id: Text, cwd: Text })),
   }),
 });
+
 const SuccessEnvelope = Type.Object({ result: Type.Object({}) });
+
 const ErrorEnvelope = Type.Object({
   error: Type.Object({ code: Text, message: Type.Optional(Type.String()) }),
 });
+
 export interface WorkerRequest extends WorkerNamingContext {
   readonly workspaceId: string;
   readonly cwd: string;
@@ -62,22 +74,28 @@ export interface WorkerRequest extends WorkerNamingContext {
   readonly thinking: string;
   readonly environment: Readonly<Record<string, string | undefined>>;
 }
+
 export interface WorkerTab {
   readonly workspaceId: string;
   readonly tabId: string;
   readonly paneId: string;
 }
+
 export interface ExactWorker extends WorkerTab {
   readonly state: "agent";
   readonly status: "idle" | "working" | "blocked" | "done" | "unknown";
 }
+
 export interface ReadyWorker extends ExactWorker {
   readonly status: "idle" | "working";
 }
+
 export interface PartialWorker extends WorkerTab {
   readonly state: "partial";
 }
+
 export type WorkerObservation = ExactWorker | PartialWorker | { readonly state: "absent" };
+
 export type WorkerLocator =
   | { readonly state: "uncertain"; readonly workspaceId: string }
   | ({ readonly state: "ready" } & WorkerTab);
@@ -104,6 +122,7 @@ export class HerdrCliRuntime {
     return Effect.gen(
       function* (this: HerdrCliRuntime) {
         yield* this.requireAvailable();
+
         const response = yield* this.command(
           [
             "tab",
@@ -119,7 +138,9 @@ export class HerdrCliRuntime {
           ],
           TabCreateEnvelope,
         );
+
         const { tab, root_pane: pane } = response.result;
+
         if (
           tab.workspace_id !== request.workspaceId ||
           pane.workspace_id !== request.workspaceId ||
@@ -130,6 +151,7 @@ export class HerdrCliRuntime {
             "tab create",
             "Created Worker tab has mismatched native identity; resources were retained.",
           );
+
         return { workspaceId: request.workspaceId, tabId: tab.tab_id, paneId: pane.pane_id };
       }.bind(this),
     );
@@ -177,12 +199,15 @@ export class HerdrCliRuntime {
       function* (this: HerdrCliRuntime) {
         yield* this.requireAvailable();
         const agents = (yield* this.command(["agent", "list"], AgentListEnvelope)).result.agents;
+
         const sessionAgents = agents.filter(
           (agent) => agent.agent_session?.value === request.sessionFile,
         );
+
         if (sessionAgents.length > 1)
           return yield* this.fail("observe Worker", "Worker session identity is ambiguous.");
         const sessionAgent = sessionAgents[0];
+
         if (sessionAgent !== undefined) {
           const tab =
             locator.state === "ready"
@@ -192,6 +217,7 @@ export class HerdrCliRuntime {
                   tabId: sessionAgent.tab_id,
                   paneId: sessionAgent.pane_id,
                 };
+
           return yield* exactWorker(request, tab, sessionAgent, "observe Worker");
         }
 
@@ -199,6 +225,7 @@ export class HerdrCliRuntime {
           ["tab", "list", "--workspace", locator.workspaceId],
           TabListEnvelope,
         )).result.tabs;
+
         const matches =
           locator.state === "ready"
             ? tabs.filter(
@@ -209,22 +236,29 @@ export class HerdrCliRuntime {
                   tab.workspace_id === locator.workspaceId &&
                   tab.label === herdrWorkerTabLabel(request),
               );
+
         if (matches.length === 0) return { state: "absent" as const };
+
         if (matches.length !== 1)
           return yield* this.fail("observe Worker", "Worker tab identity is ambiguous.");
         const tab = matches[0];
+
         if (tab === undefined)
           return yield* this.fail("observe Worker", "Worker tab identity is incomplete.");
+
         if (agents.some((agent) => agent.tab_id === tab.tab_id))
           return yield* this.fail(
             "observe Worker",
             "Worker tab contains a foreign or incomplete agent identity.",
           );
+
         const panes = (yield* this.command(
           ["pane", "list", "--workspace", locator.workspaceId],
           PaneListEnvelope,
         )).result.panes.filter((pane) => pane.tab_id === tab.tab_id);
+
         const pane = panes[0];
+
         if (
           panes.length !== 1 ||
           pane === undefined ||
@@ -236,6 +270,7 @@ export class HerdrCliRuntime {
             "observe Worker",
             "Worker pane identity is ambiguous, foreign, or incomplete.",
           );
+
         return {
           state: "partial" as const,
           workspaceId: locator.workspaceId,
@@ -250,7 +285,9 @@ export class HerdrCliRuntime {
     if (worker.status !== "idle" && worker.status !== "working")
       return this.fail("agent prompt", `Worker is not ready (status=${worker.status}).`);
     const prompt = text.trim();
+
     if (prompt.length === 0) return this.fail("agent prompt", "Worker prompt cannot be blank.");
+
     return this.command(["agent", "prompt", worker.paneId, prompt], SuccessEnvelope, 15_000).pipe(
       Effect.asVoid,
     );
@@ -266,6 +303,7 @@ export class HerdrCliRuntime {
       tabId: worker.tabId,
       paneId: worker.paneId,
     };
+
     return Effect.result(this.command(["tab", "close", worker.tabId], SuccessEnvelope)).pipe(
       Effect.andThen(this.observeWorker(request, locator)),
       Effect.map((observed) =>
@@ -288,14 +326,17 @@ export class HerdrCliRuntime {
     timeout = 30_000,
   ): Effect.Effect<Static<S>, HerdrError> {
     const operation = args.slice(0, 2).join(" ");
+
     const process = ChildProcess.make(this.executable, args, {
       cwd: globalThis.process.cwd(),
       stdin: "ignore",
     });
+
     return Effect.scoped(
       Effect.gen(function* () {
         const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
         const child = yield* spawner.spawn(process);
+
         return yield* Effect.all(
           {
             code: child.exitCode,
@@ -341,6 +382,7 @@ function exactWorker(
         message: "Worker native identity is foreign or mismatched; no mutation was issued.",
       }),
     );
+
   return Effect.succeed({ ...expected, state: "agent", status: agent.agent_status });
 }
 
@@ -367,6 +409,7 @@ function decode<const S extends TSchema>(
   const code = Number(result.code);
   const text = (code === 0 ? result.stdout : result.stderr || result.stdout).trim();
   let value: unknown;
+
   try {
     value = JSON.parse(text);
   } catch {
@@ -374,10 +417,12 @@ function decode<const S extends TSchema>(
       new HerdrError({ operation, message: `herdr ${operation} returned invalid JSON.` }),
     );
   }
+
   if (code !== 0) {
     const detail = Value.Check(ErrorEnvelope, value)
       ? Value.Decode(ErrorEnvelope, value).error
       : undefined;
+
     return Effect.fail(
       new HerdrError({
         operation,
@@ -388,6 +433,7 @@ function decode<const S extends TSchema>(
       }),
     );
   }
+
   // SAFETY: Value.Check establishes the complete supplied TypeBox schema before this decode cast.
   return Value.Check(schema, value)
     ? Effect.succeed(Value.Decode(schema, value) as Static<S>)

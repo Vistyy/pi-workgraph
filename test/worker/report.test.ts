@@ -34,9 +34,11 @@ void test("changed implementation reports remain semantic and exclude host-owned
     outcome: "changed",
     ...reportContent,
   } as const;
+
   const inputSchema = reportSchemaForMode("implementation");
   assert.equal(Value.Check(inputSchema, input), true);
   assert.equal(Value.Check(WorkerReportSchema, input), true);
+
   for (const extra of [{ commit: "a".repeat(40) }, { changedFiles: ["change.ts"] }]) {
     assert.equal(Value.Check(inputSchema, { ...input, ...extra }), false);
     assert.equal(Value.Check(WorkerReportSchema, { ...input, ...extra }), false);

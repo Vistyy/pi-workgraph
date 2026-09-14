@@ -8,12 +8,16 @@ import { promisify } from "node:util";
 const execFilePromise = promisify(execFile);
 
 const checkout = process.cwd();
+
 const started = Date.now();
+
 const controller = new AbortController();
+
 const deadlineTimer = setTimeout(
   () => controller.abort(new Error("verify:package exceeded its 180-second overall deadline.")),
   180_000,
 );
+
 let parent: string | undefined;
 
 async function command(cwd: string, file: string, args: string[]): Promise<string> {
@@ -24,6 +28,7 @@ async function command(cwd: string, file: string, args: string[]): Promise<strin
     timeout: 30_000,
     maxBuffer: 2_000_000,
   });
+
   return result.stdout.trim();
 }
 
@@ -31,6 +36,7 @@ async function smokePackage(): Promise<void> {
   parent = await mkdtemp(join(tmpdir(), "workgraph-package-smoke-"));
   const packed = await command(checkout, "pnpm", ["pack", "--pack-destination", parent]);
   const tarball = packed.split("\n").at(-1);
+
   if (tarball === undefined || tarball === "")
     throw new Error("pnpm pack returned no tarball path.");
   const tarballPath = isAbsolute(tarball) ? tarball : join(parent, tarball);
@@ -47,9 +53,11 @@ async function smokePackage(): Promise<void> {
   const packageRoot = join(consumer, "node_modules/@vistyy/pi-workgraph");
   const agentDir = join(parent, "agent");
   await mkdir(agentDir);
+
   const modules = ["extensions/coordinator.ts", "extensions/worker.ts"].map((path) =>
     join(packageRoot, path),
   );
+
   await command(consumer, "node", [
     "--input-type=module",
     "--eval",
@@ -97,5 +105,6 @@ try {
   process.exitCode = 1;
 } finally {
   clearTimeout(deadlineTimer);
+
   if (parent !== undefined) await rm(parent, { recursive: true, force: true });
 }

@@ -30,8 +30,11 @@ import {
 } from "../../src/domain/records.js";
 
 const commit = "1".repeat(40);
+
 const otherCommit = "2".repeat(40);
+
 const model = { model: "provider/model", thinking: "medium" } as const;
+
 const directoryTask: Task = {
   target: { kind: "directory", path: "/tmp/project" },
   contract: {
@@ -40,6 +43,7 @@ const directoryTask: Task = {
     expectedEvidence: ["Direct evidence"],
   },
 };
+
 const repositoryTask: Task = {
   target: { kind: "repository", checkoutRoot: "/tmp/repo", commonDir: "/tmp/repo/.git" },
   contract: {
@@ -48,15 +52,18 @@ const repositoryTask: Task = {
     acceptance: ["It works."],
   },
 };
+
 const directorySpec: AttemptSpec = {
   selection: { kind: "target", target: model },
   base: { kind: "directory" },
 };
+
 const repositorySpec: AttemptSpec = {
   selection: { kind: "implementation", guide: model, executor: model },
   base: { kind: "repository", baseCommit: commit },
   lineage: { candidateRoot: commit },
 };
+
 const unreported: Outcome = {
   result: { kind: "unreported", reason: "No report was produced." },
   effectiveModels: [],
@@ -64,6 +71,7 @@ const unreported: Outcome = {
 
 function fixture(): { root: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "record-store-"));
+
   return { root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -89,6 +97,7 @@ void test("record schemas accept exact current shapes and reject undeclared fiel
 
 void test("RecordStore creates one exact database lazily", () => {
   const { root, cleanup } = fixture();
+
   try {
     chmodSync(root, 0o751);
     const store = new RecordStore(root, "session-a");
@@ -109,6 +118,7 @@ void test("RecordStore creates one exact database lazily", () => {
     const database = new DatabaseSync(join(root, "workgraph", "workgraph.sqlite"), {
       readOnly: true,
     });
+
     assert.equal(
       (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
       1,
@@ -162,6 +172,7 @@ void test("RecordStore creates one exact database lazily", () => {
 
 void test("session partitions share one file without sharing records or relations", () => {
   const { root, cleanup } = fixture();
+
   try {
     const first = new RecordStore(root, "session-a");
     const second = new RecordStore(root, "session-b");
@@ -190,6 +201,7 @@ void test("session partitions share one file without sharing records or relation
 
 void test("RecordStore permits only agentDir itself to redirect placement", () => {
   const { root, cleanup } = fixture();
+
   try {
     const realAgent = join(root, "real-agent");
     const linkedAgent = join(root, "linked-agent");
@@ -208,6 +220,7 @@ void test("RecordStore permits only agentDir itself to redirect placement", () =
 
 void test("RecordStore preserves and rejects a redirected Workgraph directory", () => {
   const { root, cleanup } = fixture();
+
   try {
     const outside = join(root, "outside");
     mkdirSync(outside, { mode: 0o751 });
@@ -229,6 +242,7 @@ void test("RecordStore preserves and rejects a redirected Workgraph directory", 
 
 void test("RecordStore preserves and rejects a redirected database file", () => {
   const { root, cleanup } = fixture();
+
   try {
     const parent = join(root, "workgraph");
     const outside = join(root, "outside.sqlite");
@@ -252,6 +266,7 @@ void test("RecordStore preserves and rejects a redirected database file", () => 
 
 void test("RecordStore resumes an interrupted empty initialization", () => {
   const { root, cleanup } = fixture();
+
   try {
     const parent = join(root, "workgraph");
     const path = join(parent, "workgraph.sqlite");
@@ -277,6 +292,7 @@ void test("RecordStore resumes an interrupted empty initialization", () => {
 
 void test("RecordStore preserves and rejects a nonempty version-zero database", () => {
   const { root, cleanup } = fixture();
+
   try {
     const parent = join(root, "workgraph");
     const path = join(parent, "workgraph.sqlite");
@@ -309,6 +325,7 @@ void test("RecordStore preserves and rejects a nonempty version-zero database", 
 
 void test("supported reads strictly decode persisted JSON rows", () => {
   const { root, cleanup } = fixture();
+
   try {
     const store = new RecordStore(root, "session-a");
     store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec);
@@ -330,6 +347,7 @@ void test("supported reads strictly decode persisted JSON rows", () => {
 
 void test("Task and initial Attempt are atomic and focused checkpoints preserve the spec", () => {
   const { root, cleanup } = fixture();
+
   try {
     const store = new RecordStore(root, "session-a");
     store.createTaskWithAttempt("existing", directoryTask, "global-attempt", directorySpec);
@@ -363,9 +381,11 @@ void test("Task and initial Attempt are atomic and focused checkpoints preserve 
 
 void test("Outcome is null-to-value once and validates report kind and distinct models", () => {
   const { root, cleanup } = fixture();
+
   try {
     const store = new RecordStore(root, "session-a");
     store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec);
+
     const wrongReport: Outcome = {
       result: {
         kind: "reported",
@@ -379,6 +399,7 @@ void test("Outcome is null-to-value once and validates report kind and distinct 
       },
       effectiveModels: [model],
     };
+
     assert.throws(() => store.recordOutcome("attempt", wrongReport), StoreError);
     assert.throws(
       () =>
@@ -399,11 +420,13 @@ void test("Outcome is null-to-value once and validates report kind and distinct 
 
 void test("cancellation settles Worker and Outcome atomically", () => {
   const { root, cleanup } = fixture();
+
   try {
     const store = new RecordStore(root, "session-a");
     store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec);
     const cancelling = worker({ closing: { kind: "cancelled", reason: "No longer needed." } });
     store.checkpointWorker("attempt", cancelling);
+
     const cancelled: Outcome = {
       result: { kind: "cancelled", reason: "No longer needed." },
       effectiveModels: [],
@@ -434,6 +457,7 @@ void test("cancellation settles Worker and Outcome atomically", () => {
 
 void test("only same-session queued extension children pin their exact parent", () => {
   const { root, cleanup } = fixture();
+
   try {
     const store = new RecordStore(root, "session-a");
     const other = new RecordStore(root, "session-b");
@@ -448,6 +472,7 @@ void test("only same-session queued extension children pin their exact parent", 
         candidateOf: { kind: "extend", attemptId: "parent" },
       },
     };
+
     store.createAttempt("source", "queued-extension", extensionSpec);
     assert.equal(store.hasUnplacedExtensionChild("parent"), true);
 
@@ -484,6 +509,7 @@ void test("only same-session queued extension children pin their exact parent", 
 
 void test("numeric rowid paging and settlement queries expose meaningful current state", () => {
   const { root, cleanup } = fixture();
+
   try {
     const store = new RecordStore(root, "session-a");
     store.createTaskWithAttempt("task-a", directoryTask, "attempt-a", directorySpec);

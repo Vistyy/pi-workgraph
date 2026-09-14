@@ -30,15 +30,18 @@ void test("Worker session creation uses the Attempt id and recovers only the exa
   const parent = await mkdtemp(join(tmpdir(), "workgraph-session-"));
   const cwd = join(parent, "cwd");
   const sessionDir = join(parent, "agent", "workgraph", "worker-sessions");
+
   try {
     assert.equal(Value.Check(WorkerObjectiveDetailsSchema, objective.details), true);
     assert.equal(
       Value.Check(WorkerObjectiveDetailsSchema, { ...objective.details, extra: "rejected" }),
       false,
     );
+
     const first = await runNodePlatformPromise(
       createWorkerSessionEffect({ cwd, sessionDir, objective }),
     );
+
     assert.equal(first.fresh, true);
     const opened = SessionManager.open(first.sessionFile);
     assert.equal(opened.getHeader()?.id, objective.details.attemptId);
@@ -55,6 +58,7 @@ void test("Worker session creation uses the Attempt id and recovers only the exa
       .filter(
         (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
       );
+
     assert.equal(objectiveEntries.length, 1);
     assert.equal(
       opened
@@ -83,10 +87,12 @@ void test("Worker session readback derives ordered actual models, settlement, an
   const parent = await mkdtemp(join(tmpdir(), "workgraph-readback-"));
   const cwd = join(parent, "cwd");
   const sessionDir = join(parent, "sessions");
+
   try {
     const created = await runNodePlatformPromise(
       createWorkerSessionEffect({ cwd, sessionDir, objective }),
     );
+
     const file = created.sessionFile;
     const session = SessionManager.open(file);
     session.appendCustomEntry("pi-workgraph-effective-model", {
@@ -131,6 +137,7 @@ void test("Worker session readback derives ordered actual models, settlement, an
       { model: "fixture/guide", thinking: "medium" },
       { model: "fixture/executor", thinking: "high" },
     ]);
+
     if (!read.unreadable) assert.equal(read.report?.kind, "implementation");
 
     const wrong = readWorkerSession(file, join(parent, "wrong"), objective);
@@ -144,10 +151,12 @@ void test("Worker session readback derives ordered actual models, settlement, an
 void test("settled readable sessions expose bounded report errors", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-report-error-"));
   const cwd = join(parent, "cwd");
+
   try {
     const created = await runNodePlatformPromise(
       createWorkerSessionEffect({ cwd, sessionDir: join(parent, "sessions"), objective }),
     );
+
     const file = created.sessionFile;
     const session = SessionManager.open(file);
     session.appendCustomEntry("pi-workgraph-effective-model", {
@@ -157,13 +166,16 @@ void test("settled readable sessions expose bounded report errors", async () => 
     session.appendCustomEntry("pi-workgraph-agent-settled", {});
     const read = readWorkerSession(file, cwd, objective);
     assert.equal(read.unreadable, false);
+
     if (!read.unreadable) assert.match(read.reportError ?? "", /no successful terminal report/);
 
     const mismatched = readWorkerSession(file, cwd, {
       ...objective,
       content: `${objective.content}\nDifferent acceptance`,
     });
+
     assert.equal(mismatched.unreadable, false);
+
     if (!mismatched.unreadable) {
       assert.equal(mismatched.started, true);
       assert.equal(mismatched.settled, true);

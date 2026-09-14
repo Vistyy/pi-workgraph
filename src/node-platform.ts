@@ -5,6 +5,7 @@ import { Effect, type FileSystem, Layer, type Path } from "effect";
 
 /** Live Node providers shared by host-facing Effect boundaries. */
 export const liveLayer = Layer.merge(NodeFileSystem.layer, NodePath.layer);
+
 export const childProcessLayer = NodeChildProcessSpawner.layer.pipe(Layer.provide(liveLayer));
 
 /** Promise boundary for host callers that do not yet run inside an Effect runtime. */

@@ -23,7 +23,9 @@ import {
 } from "../domain/records.js";
 
 const MAX_PAGE = 100;
+
 const BUSY_TIMEOUT_MS = 5_000;
+
 const SCHEMA = `
 CREATE TABLE tasks (
   session_id TEXT NOT NULL,
@@ -69,12 +71,16 @@ export class RecordStore {
     private readonly sessionId: string,
   ) {
     if (sessionId.length === 0) throw failure("construct Store", "Session id is empty.");
+
     const placement = host("resolve Store placement", () => {
       const resolved = realpathSync(agentDir);
+
       if (!lstatSync(resolved).isDirectory())
         throw failure("resolve Store placement", "Agent directory is not a directory.");
+
       return resolved;
     });
+
     this.path = join(placement, "workgraph", "workgraph.sqlite");
   }
 
@@ -95,6 +101,7 @@ export class RecordStore {
     decode(TaskSchema, task, "Task");
     validateAttemptId(attemptId);
     decode(AttemptSpecSchema, spec, "Attempt specification");
+
     return this.transaction("create Task and Attempt", true, (database) => {
       database
         .prepare("INSERT INTO tasks(session_id,task_id,task_json) VALUES(?,?,?)")
@@ -102,6 +109,7 @@ export class RecordStore {
       database
         .prepare("INSERT INTO attempts(attempt_id,session_id,task_id,spec_json) VALUES(?,?,?,?)")
         .run(attemptId, this.sessionId, taskId, json(spec));
+
       return {
         task: { id: taskId, task },
         attempt: { id: attemptId, taskId, spec },
@@ -113,11 +121,13 @@ export class RecordStore {
     decode(TaskIdSchema, taskId, "Task id");
     validateAttemptId(attemptId);
     decode(AttemptSpecSchema, spec, "Attempt specification");
+
     return this.transaction("create Attempt", false, (database) => {
       this.readTaskFrom(database, taskId);
       database
         .prepare("INSERT INTO attempts(attempt_id,session_id,task_id,spec_json) VALUES(?,?,?,?)")
         .run(attemptId, this.sessionId, taskId, json(spec));
+
       return { id: attemptId, taskId, spec };
     });
   }
@@ -125,23 +135,27 @@ export class RecordStore {
   readTask(taskId: string): TaskRecord {
     decode(TaskIdSchema, taskId, "Task id");
     const database = this.requireExisting("read Task");
+
     return this.readTaskFrom(database, taskId);
   }
 
   readAttempt(attemptId: string): AttemptRecord {
     validateAttemptId(attemptId);
     const database = this.requireExisting("read Attempt");
+
     return this.readAttemptFrom(database, attemptId);
   }
 
   checkpointWorker(attemptId: string, worker: WorkerState): AttemptRecord {
     validateAttemptId(attemptId);
     decode(WorkerStateSchema, worker, "Worker state");
+
     return this.transaction("checkpoint Worker", false, (database) => {
       const prior = this.readAttemptFrom(database, attemptId);
       database
         .prepare("UPDATE attempts SET worker_json=? WHERE attempt_id=? AND session_id=?")
         .run(json(worker), attemptId, this.sessionId);
+
       return { ...prior, worker };
     });
   }
@@ -149,20 +163,24 @@ export class RecordStore {
   checkpointOutput(attemptId: string, output: AttemptOutput): AttemptRecord {
     validateAttemptId(attemptId);
     decode(AttemptOutputSchema, output, "Attempt output");
+
     return this.transaction("checkpoint output", false, (database) => {
       const prior = this.readAttemptFrom(database, attemptId);
       database
         .prepare("UPDATE attempts SET output_json=? WHERE attempt_id=? AND session_id=?")
         .run(json(output), attemptId, this.sessionId);
+
       return { ...prior, output };
     });
   }
 
   recordOutcome(attemptId: string, outcome: Outcome): AttemptRecord {
     validateAttemptId(attemptId);
+
     return this.transaction("record Outcome", false, (database) => {
       const prior = this.readAttemptFrom(database, attemptId);
       validateOutcome(outcome, this.readTaskFrom(database, prior.taskId).task);
+
       if (prior.outcome !== undefined)
         throw failure("record Outcome", "Outcome is already recorded.");
       database
@@ -170,6 +188,7 @@ export class RecordStore {
           "UPDATE attempts SET outcome_json=? WHERE attempt_id=? AND session_id=? AND outcome_json IS NULL",
         )
         .run(json(outcome), attemptId, this.sessionId);
+
       return { ...prior, outcome };
     });
   }
@@ -181,13 +200,17 @@ export class RecordStore {
   ): AttemptRecord {
     validateAttemptId(attemptId);
     decode(WorkerStateSchema, closedWorker, "Worker state");
+
     if (closedWorker.closing?.kind !== "cancelled" || closedWorker.closed !== true)
       throw failure("settle cancellation", "Worker is not closed as cancelled.");
+
     if (outcome.result.kind !== "cancelled")
       throw failure("settle cancellation", "Outcome is not cancelled.");
+
     return this.transaction("settle cancellation", false, (database) => {
       const prior = this.readAttemptFrom(database, attemptId);
       validateOutcome(outcome, this.readTaskFrom(database, prior.taskId).task);
+
       if (prior.outcome !== undefined)
         throw failure("settle cancellation", "Outcome is already recorded.");
       database
@@ -195,13 +218,16 @@ export class RecordStore {
           "UPDATE attempts SET worker_json=?,outcome_json=? WHERE attempt_id=? AND session_id=? AND outcome_json IS NULL",
         )
         .run(json(closedWorker), json(outcome), attemptId, this.sessionId);
+
       return { ...prior, worker: closedWorker, outcome };
     });
   }
 
   unsettled(): AttemptRecord[] {
     const database = this.existingOrUndefined("read unsettled Attempts");
+
     if (database === undefined) return [];
+
     const rows = database
       .prepare(
         `SELECT * FROM attempts
@@ -216,13 +242,16 @@ export class RecordStore {
          ) ORDER BY rowid`,
       )
       .all(this.sessionId) as Row[];
+
     return rows.map((row) => this.attemptRecord(database, row));
   }
 
   hasUnclassifiedIntegrationChild(parentAttemptId: string): boolean {
     validateAttemptId(parentAttemptId);
     const database = this.existingOrUndefined("read integration children");
+
     if (database === undefined) return false;
+
     return (
       integer(
         database
@@ -246,7 +275,9 @@ export class RecordStore {
   hasUnplacedExtensionChild(parentAttemptId: string): boolean {
     validateAttemptId(parentAttemptId);
     const database = this.existingOrUndefined("read extension children");
+
     if (database === undefined) return false;
+
     return (
       integer(
         database
@@ -271,7 +302,9 @@ export class RecordStore {
   listTasks(offset: number, limit: number): TaskRecord[] {
     validatePage(offset, limit);
     const database = this.existingOrUndefined("list Tasks");
+
     if (database === undefined) return [];
+
     return (
       database
         .prepare("SELECT * FROM tasks WHERE session_id=? ORDER BY rowid LIMIT ? OFFSET ?")
@@ -281,9 +314,12 @@ export class RecordStore {
 
   listAttempts(offset: number, limit: number, taskId?: string): AttemptRecord[] {
     validatePage(offset, limit);
+
     if (taskId !== undefined) decode(TaskIdSchema, taskId, "Task id");
     const database = this.existingOrUndefined("list Attempts");
+
     if (database === undefined) return [];
+
     const rows =
       taskId === undefined
         ? (database
@@ -294,12 +330,15 @@ export class RecordStore {
               "SELECT * FROM attempts WHERE session_id=? AND task_id=? ORDER BY rowid LIMIT ? OFFSET ?",
             )
             .all(this.sessionId, taskId, limit, offset) as Row[]);
+
     return rows.map((row) => this.attemptRecord(database, row));
   }
 
   counts(): RecordCounts {
     const database = this.existingOrUndefined("count records");
+
     if (database === undefined) return { tasks: 0, attempts: 0, activeWorkers: 0 };
+
     const row = database
       .prepare(
         `SELECT
@@ -312,6 +351,7 @@ export class RecordStore {
          FROM attempts WHERE session_id=?`,
       )
       .get(this.sessionId, this.sessionId) as Row | undefined;
+
     return {
       tasks: integer(row, "tasks"),
       attempts: integer(row, "attempts"),
@@ -323,7 +363,9 @@ export class RecordStore {
     const row = database
       .prepare("SELECT * FROM tasks WHERE session_id=? AND task_id=?")
       .get(this.sessionId, taskId) as Row | undefined;
+
     if (row === undefined) throw failure("read Task", "Required Task is absent.");
+
     return taskRecord(row);
   }
 
@@ -331,7 +373,9 @@ export class RecordStore {
     const row = database
       .prepare("SELECT * FROM attempts WHERE session_id=? AND attempt_id=?")
       .get(this.sessionId, attemptId) as Row | undefined;
+
     if (row === undefined) throw failure("read Attempt", "Required Attempt is absent.");
+
     return this.attemptRecord(database, row);
   }
 
@@ -339,7 +383,9 @@ export class RecordStore {
     const taskId = text(row, "task_id");
     const task = this.readTaskFrom(database, taskId).task;
     const outcome = nullableParse(OutcomeSchema, row["outcome_json"], "Outcome");
+
     if (outcome !== undefined) validateOutcome(outcome, task);
+
     return {
       id: text(row, "attempt_id"),
       taskId,
@@ -361,12 +407,16 @@ export class RecordStore {
     return host(operation, () => {
       const acquired = mayInitialize && this.database === undefined;
       const database = mayInitialize ? this.forInitialMutation() : this.requireExisting(operation);
+
       try {
         database.exec("BEGIN IMMEDIATE");
+
         if (mayInitialize) initializeOrValidate(database);
         const result = run(database);
         database.exec("COMMIT");
+
         if (acquired) this.database = database;
+
         return result;
       } catch (cause) {
         abandonTransaction(database, acquired);
@@ -377,31 +427,42 @@ export class RecordStore {
 
   private forInitialMutation(): DatabaseSync {
     this.requireOpen();
+
     if (this.database !== undefined) return this.database;
     prepareParent(this.path, true, "initialize Store");
     prepareDatabase(this.path, true, "initialize Store");
+
     return openDatabase(this.path);
   }
 
   private requireExisting(operation: string): DatabaseSync {
     const database = this.existingOrUndefined(operation);
+
     if (database === undefined) throw failure(operation, "Record Store is absent.");
+
     return database;
   }
 
   private existingOrUndefined(operation: string): DatabaseSync | undefined {
     this.requireOpen();
+
     if (this.database !== undefined) return this.database;
+
     return host(operation, () => {
       if (!prepareParent(this.path, false, operation)) return undefined;
+
       if (!prepareDatabase(this.path, false, operation)) return undefined;
       const database = openDatabase(this.path);
+
       try {
         if (isInitialized(database, operation)) {
           this.database = database;
+
           return database;
         }
+
         database.close();
+
         return undefined;
       } catch (cause) {
         database.close();
@@ -425,6 +486,7 @@ function abandonTransaction(database: DatabaseSync, close: boolean): void {
 
 function configure(database: DatabaseSync): DatabaseSync {
   database.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
+
   return database;
 }
 
@@ -434,7 +496,9 @@ function initializeOrValidate(database: DatabaseSync): void {
 
 function isInitialized(database: DatabaseSync, operation: string): boolean {
   const version = userVersion(database);
+
   if (version === 1) return true;
+
   if (version === 0 && schemaObjectCount(database) === 0) return false;
   throw failure(operation, "Unsupported database schema version.");
 }
@@ -453,39 +517,50 @@ function schemaObjectCount(database: DatabaseSync): number {
 function prepareParent(path: string, create: boolean, operation: string): boolean {
   const parent = dirname(path);
   let entry = lstatSync(parent, { throwIfNoEntry: false });
+
   if (entry === undefined) {
     if (!create) return false;
+
     try {
       mkdirSync(parent, { mode: 0o700 });
     } catch (cause) {
       if (!hasCode(cause, "EEXIST")) throw cause;
     }
+
     entry = lstatSync(parent);
   }
+
   if (!entry.isDirectory())
     throw failure(operation, "Workgraph data directory is not an owned directory.");
   chmodSync(parent, 0o700);
+
   return true;
 }
 
 function prepareDatabase(path: string, create: boolean, operation: string): boolean {
   let entry = lstatSync(path, { throwIfNoEntry: false });
+
   if (entry === undefined) {
     if (!create) return false;
+
     try {
       closeSync(openSync(path, "wx", 0o600));
     } catch (cause) {
       if (!hasCode(cause, "EEXIST")) throw cause;
     }
+
     entry = lstatSync(path);
   }
+
   if (!entry.isFile()) throw failure(operation, "Record Store path is not an owned regular file.");
   chmodSync(path, 0o600);
+
   return true;
 }
 
 function openDatabase(path: string): DatabaseSync {
   const database = new DatabaseSync(path);
+
   try {
     return configure(database);
   } catch (cause) {
@@ -507,13 +582,16 @@ function taskRecord(row: Row): TaskRecord {
 
 function validateOutcome(outcome: Outcome, task: Task): void {
   decode(OutcomeSchema, outcome, "Outcome");
+
   if (outcome.result.kind !== "reported") return;
+
   const expected =
     task.contract.kind === "implementation"
       ? "implementation"
       : task.contract.kind === "review"
         ? "review"
         : "research";
+
   if (outcome.result.report.kind !== expected)
     throw failure("decode Outcome", "Report kind does not match its Task.");
 }
@@ -543,6 +621,7 @@ function nullableParse<S extends TSchema>(
 
 function parse<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
   if (typeof value !== "string") throw failure(`decode ${name}`, `${name} JSON is not text.`);
+
   try {
     return decode(schema, JSON.parse(value), name);
   } catch (cause) {
@@ -553,6 +632,7 @@ function parse<S extends TSchema>(schema: S, value: unknown, name: string): Stat
 
 function decode<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
   if (!Value.Check(schema, value)) throw failure(`decode ${name}`, `${name} is malformed.`);
+
   return Value.Decode(schema, value) as Static<S>;
 }
 
@@ -562,14 +642,18 @@ function optional<const Name extends string, Value>(name: Name, value: Value | u
 
 function text(row: Row, field: string): string {
   const value = row[field];
+
   if (typeof value !== "string") throw failure("decode row", `${field} is malformed.`);
+
   return value;
 }
 
 function integer(row: Row | undefined, field: string): number {
   const value = row?.[field];
+
   if (typeof value !== "number" || !Number.isSafeInteger(value))
     throw failure("decode row", `${field} is malformed.`);
+
   return value;
 }
 

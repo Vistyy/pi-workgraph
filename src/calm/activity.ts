@@ -6,6 +6,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 // oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof
 
 type CalmActivityPhase = "thinking" | "responding";
+
 type CalmToolActivity = {
   readonly toolCallId: string;
   readonly toolName: string;
@@ -21,11 +22,15 @@ export interface CalmActivityState {
   readonly completedTools?: readonly CalmToolActivity[] | undefined;
   readonly activeTools?: readonly CalmToolActivity[] | undefined;
 }
+
 type ActivityTheme = Pick<ExtensionUIContext["theme"], "fg" | "italic">;
 
 const MAX_ACTIVITY_CRUMBS = 3;
+
 const MAX_TOOL_NAME_WIDTH = 24;
+
 const MAX_PATH_HINT_WIDTH = 32;
+
 const PATH_HINT_TOOLS = new Set(["read", "edit", "write"]);
 
 export interface CalmActivityTracker {
@@ -44,24 +49,30 @@ export function isCalmActivityActive(state: CalmActivityState): boolean {
 
 function detailLabel(state: CalmActivityState): string | undefined {
   const workers = `${state.activeWorkers} worker${state.activeWorkers === 1 ? "" : "s"} active`;
+
   if (state.waitingForInput === true)
     return state.activeWorkers > 0 ? `awaiting input · ${workers}` : "awaiting input";
+
   return state.activeWorkers > 0 ? workers : undefined;
 }
 
 function safeToolName(name: string): string {
   const safe = name.replace(/[^A-Za-z0-9_:-]/g, "").slice(0, MAX_TOOL_NAME_WIDTH);
+
   return safe === "" ? "tool" : safe;
 }
 
 function toolLabel(tool: CalmToolActivity): string {
   const name = safeToolName(tool.toolName);
+
   if (tool.pathHint === undefined) return name;
+
   return `${name} ${tool.pathHint}`;
 }
 
 function activeToolLabels(tools: readonly CalmToolActivity[]): string[] {
   if (tools.length <= MAX_ACTIVITY_CRUMBS) return tools.map(toolLabel);
+
   return [
     ...tools.slice(0, MAX_ACTIVITY_CRUMBS - 1).map(toolLabel),
     `+${tools.length - (MAX_ACTIVITY_CRUMBS - 1)} tools`,
@@ -74,9 +85,12 @@ function activityLabel(state: CalmActivityState): string | undefined {
   const phase = active.length === 0 && state.coordinatorActive ? state.phase : undefined;
   const live = phase === undefined ? active : [phase];
   const historySlots = MAX_ACTIVITY_CRUMBS - live.length;
+
   const history =
     historySlots === 0 ? [] : (state.completedTools ?? []).slice(-historySlots).map(toolLabel);
+
   const crumbs = [...history, ...live];
+
   return crumbs.length === 0 ? undefined : crumbs.join(" › ");
 }
 
@@ -94,7 +108,9 @@ export function calmActivityLines(
   const styledDetail = detail === undefined ? "" : theme.fg("muted", ` · ${detail}`);
   const status = truncateToWidth(`${pulse} ${title}${styledDetail}`, width, "");
   const current = activityLabel(state);
+
   if (current === undefined) return [status];
+
   return [truncateToWidth(theme.italic(theme.fg("dim", current)), width, ""), status];
 }
 
@@ -103,6 +119,7 @@ export function createCalmActivityTracker(onChange: () => void = () => {}): Calm
   const completedTools: CalmToolActivity[] = [];
   const tools = new Map<string, CalmToolActivity>();
   const changed = (): void => onChange();
+
   const clearCurrent = (): void => {
     phase = undefined;
     tools.clear();
@@ -122,6 +139,7 @@ export function createCalmActivityTracker(onChange: () => void = () => {}): Calm
         : eventType.startsWith("text_")
           ? "responding"
           : undefined;
+
       if (next === undefined || next === phase) return;
       phase = next;
       changed();
@@ -129,16 +147,20 @@ export function createCalmActivityTracker(onChange: () => void = () => {}): Calm
     toolStart(toolCallId: string, toolName: string, args: unknown): void {
       phase = undefined;
       const pathHint = PATH_HINT_TOOLS.has(toolName) ? validatedPathBasename(args) : undefined;
+
       const tool: CalmToolActivity =
         pathHint === undefined ? { toolCallId, toolName } : { toolCallId, toolName, pathHint };
+
       tools.set(toolCallId, tool);
       changed();
     },
     toolEnd(toolCallId: string): void {
       const tool = tools.get(toolCallId);
+
       if (tool === undefined) return;
       tools.delete(toolCallId);
       completedTools.push(tool);
+
       if (completedTools.length > MAX_ACTIVITY_CRUMBS)
         completedTools.splice(0, completedTools.length - MAX_ACTIVITY_CRUMBS);
       changed();
@@ -147,7 +169,9 @@ export function createCalmActivityTracker(onChange: () => void = () => {}): Calm
       const hadCurrent = phase !== undefined || tools.size > 0;
       const hadHistory = completedTools.length > 0;
       clearCurrent();
+
       if (!preserveHistory) completedTools.length = 0;
+
       if (hadCurrent || (!preserveHistory && hadHistory)) changed();
     },
     clear(): void {
@@ -166,12 +190,16 @@ function validatedPathBasename(args: unknown): string | undefined {
   // SAFETY: Pi tool arguments are untrusted. Accept only an own data property so malformed
   // getters and proxies fail closed without exposing arbitrary fields.
   if (args === null || typeof args !== "object" || Array.isArray(args)) return undefined;
+
   try {
     const descriptor = Object.getOwnPropertyDescriptor(args, "path");
+
     if (descriptor === undefined || !("value" in descriptor)) return undefined;
     const path: unknown = descriptor.value;
+
     if (typeof path !== "string") return undefined;
     const basename = path.split(/[\\/]/u).filter(Boolean).at(-1);
+
     if (
       basename === undefined ||
       basename === "." ||
@@ -179,6 +207,7 @@ function validatedPathBasename(args: unknown): string | undefined {
       !/^[A-Za-z0-9._-]+$/.test(basename)
     )
       return undefined;
+
     return truncateToWidth(basename, MAX_PATH_HINT_WIDTH, "");
   } catch {
     return undefined;

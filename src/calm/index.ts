@@ -19,10 +19,15 @@ export {
 } from "./activity.js";
 
 const CALM_INTERVAL_MS = 400;
+
 const CALM_WIDGET = "calm";
+
 const CALM_PROBE_WIDGET = "calm-probe";
+
 const CALM_STATUS = "calm";
+
 const CALM_SESSION_ENTRY = "pi-workgraph-calm-preference";
+
 const CalmSessionSchema = Type.Object({ sessionId: Type.String(), on: Type.Boolean() });
 
 export interface CalmMode {
@@ -53,7 +58,9 @@ function savedCalmChoice(
       Value.Check(CalmSessionSchema, entry.data) &&
       entry.data.sessionId === sessionId,
   );
+
   if (saved === undefined || !Value.Check(CalmSessionSchema, saved.data)) return undefined;
+
   return saved.data.on;
 }
 
@@ -69,6 +76,7 @@ function loadDefaultCalm(
         `Could not load Calm default: ${error instanceof Error ? error.message : String(error)}`,
         "warning",
       );
+
     return false;
   });
 }
@@ -118,46 +126,61 @@ export function installCalmMode(
     waitingForInput,
     ...activityTracker.snapshot(),
   });
+
   const pulsing = (): boolean => state.on && coordinatorActive && !waitingForInput;
+
   const renderSignature = (current: CalmActivityState): string =>
     JSON.stringify([current, pulsing() ? frame % 4 < 2 : false]);
+
   const stopTimer = (): void => {
     if (timer !== undefined) clearInterval(timer);
     timer = undefined;
   };
+
   const publishStatus = (visible: boolean): void => {
     if (ui === undefined || visible === statusPublished) return;
     statusPublished = visible;
     ui.setStatus(CALM_STATUS, visible ? ui.theme.fg("dim", "calm") : undefined);
   };
+
   const clearWidget = (): void => {
     if (widgetVisible && ui !== undefined) ui.setWidget(CALM_WIDGET, undefined);
     widgetVisible = false;
     widgetSignature = undefined;
     requestWidgetRender = undefined;
   };
+
   const syncWidget = (): void => {
     if (ui === undefined || !state.on) {
       clearWidget();
+
       return;
     }
+
     const current = activity();
+
     if (!isCalmActivityActive(current)) {
       clearWidget();
+
       return;
     }
+
     const signature = renderSignature(current);
+
     if (widgetVisible) {
       if (signature === widgetSignature) return;
       widgetSignature = signature;
       requestWidgetRender?.();
+
       return;
     }
+
     widgetVisible = true;
     widgetSignature = signature;
     ui.setWidget(CALM_WIDGET, (tui, theme) => {
       const request: () => void = () => tui.requestRender();
       requestWidgetRender = request;
+
       return {
         render: (width) => calmActivityLines(activity(), frame, width, theme),
         invalidate() {},
@@ -167,11 +190,14 @@ export function installCalmMode(
       };
     });
   };
+
   const syncTimer = (): void => {
     if (ui === undefined || !pulsing()) {
       stopTimer();
+
       return;
     }
+
     if (timer !== undefined) return;
     // SAFETY: This timer only advances the rail pulse and is cleared by stopTimer and shutdown.
     // oxlint-disable-next-line effecttsgo/global-timers
@@ -180,30 +206,37 @@ export function installCalmMode(
       syncWidget();
     }, intervalMs);
   };
+
   activityTracker = createCalmActivityTracker(() => {
     syncWidget();
     syncTimer();
   });
+
   const syncChrome = (): void => {
     if (ui === undefined) return;
     projection?.setEnabled(state.on);
+
     if (state.on) {
       if (!workingHidden) {
         // Calm owns the single activity surface; Pi keeps its working indicator hidden.
         ui.setWorkingVisible(false);
         workingHidden = true;
       }
+
       publishStatus(true);
     } else {
       if (workingHidden) {
         ui.setWorkingVisible(true);
         workingHidden = false;
       }
+
       publishStatus(false);
     }
+
     syncWidget();
     syncTimer();
   };
+
   // Calm becomes unavailable only for a real incompatibility that disables the projection.
   const diagnose: Diagnostic = (message) => {
     if (diagnosed.has(message)) return;
@@ -212,6 +245,7 @@ export function installCalmMode(
     queueMicrotask(() => {
       // A stale failure must not disable a newer attachment or rewrite current chrome.
       if (diagnosedGeneration !== generation) return;
+
       if (state.on) state.on = false;
       adapterReady = false;
       const current = projection;
@@ -221,6 +255,7 @@ export function installCalmMode(
       ui?.notify(`Calm unavailable: ${message} Native rows remain visible.`, "warning");
     });
   };
+
   const shutdown = (): void => {
     generation += 1;
     diagnosed.clear();
@@ -230,32 +265,40 @@ export function installCalmMode(
     projection?.detach();
     projection = undefined;
     adapterReady = false;
+
     if (ui !== undefined) {
       clearWidget();
       publishStatus(false);
+
       if (workingHidden) {
         ui.setWorkingVisible(true);
         workingHidden = false;
       }
     }
+
     ui = undefined;
     coordinatorActive = false;
     waitingForInput = false;
     activeWorkers = 0;
     frame = 0;
   };
+
   const captureTui = (context: ExtensionUIContext): TUI | undefined => {
     let captured: TUI | undefined;
     context.setWidget(CALM_PROBE_WIDGET, (tui) => {
       captured = tui;
+
       return { render: () => [], invalidate() {}, dispose() {} };
     });
     context.setWidget(CALM_PROBE_WIDGET, undefined);
+
     return captured;
   };
+
   const attachProjection = (chatRuntime: CalmChatRuntime): void => {
     if (ui === undefined) throw new Error("the Pi TUI is unavailable.");
     const tui = captureTui(ui);
+
     if (tui === undefined) throw new Error("the Pi TUI root seam is missing.");
     projection = attachCalmProjection(discoverCalmChat(tui, chatRuntime), {
       runtime: chatRuntime,
@@ -263,6 +306,7 @@ export function installCalmMode(
       onIncompatible: diagnose,
     });
   };
+
   // Loading the running Pi module is a native dynamic import that must settle before attachment.
   // oxlint-disable-next-line effecttsgo/async-function
   const startSession = async (
@@ -273,8 +317,10 @@ export function installCalmMode(
     if (currentGeneration !== generation) return;
     appendSavedChoice?.(on);
     state.on = on;
+
     try {
       const chatRuntime = await loadRuntime();
+
       if (currentGeneration !== generation) return;
       attachProjection(chatRuntime);
       adapterReady = true;
@@ -285,21 +331,25 @@ export function installCalmMode(
       state.on = false;
       diagnose(error instanceof Error ? error.message : String(error));
     }
+
     syncChrome();
   };
 
   pi.on("session_start", (_event, ctx) => {
     shutdown();
+
     if (ctx.mode !== "tui") return;
     ui = ctx.ui;
     coordinatorActive = !ctx.isIdle();
     const currentGeneration = generation;
     const sessionId = ctx.sessionManager.getSessionId();
     const sessionChoice = savedCalmChoice(ctx.sessionManager.getEntries(), sessionId);
+
     const initial =
       sessionChoice === undefined
         ? loadDefaultCalm(ctx.ui, preferences, () => currentGeneration === generation)
         : Promise.resolve(sessionChoice);
+
     return initial.then((on) =>
       startSession(
         currentGeneration,
@@ -339,6 +389,7 @@ export function installCalmMode(
   });
   pi.on("ui_prompt_end", () => {
     waitingForInput = false;
+
     if (!coordinatorActive && activeWorkers === 0) activityTracker.clear();
     syncChrome();
   });
@@ -354,8 +405,10 @@ export function installCalmMode(
       Promise.resolve()
         .then(() => {
           const command = args.trim();
+
           if (command === "default on" || command === "default off") {
             const currentGeneration = generation;
+
             return preferences.save(command === "default on").then(() => {
               if (currentGeneration === generation)
                 ctx.ui.notify(
@@ -364,17 +417,22 @@ export function installCalmMode(
                 );
             });
           }
+
           if (command !== "") {
             ctx.ui.notify("Usage: /calm or /calm default on|off", "warning");
+
             return;
           }
+
           if (!state.on && (!adapterReady || ctx.mode !== "tui")) {
             ctx.ui.notify(
               "Calm is unavailable in this session; operational rows remain visible.",
               "warning",
             );
+
             return;
           }
+
           pi.appendEntry(CALM_SESSION_ENTRY, {
             sessionId: ctx.sessionManager.getSessionId(),
             on: !state.on,
@@ -386,6 +444,7 @@ export function installCalmMode(
             `Calm ${state.on ? "on" : "off"} for this session (saved default unchanged).`,
             "info",
           );
+
           return;
         })
         .catch((error) => {
@@ -399,8 +458,10 @@ export function installCalmMode(
   return {
     setActiveWorkers(count: number): void {
       const next = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+
       if (next === activeWorkers) return;
       activeWorkers = next;
+
       if (activeWorkers === 0 && !coordinatorActive && !waitingForInput) activityTracker.clear();
       syncChrome();
     },

@@ -14,11 +14,15 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   // The dedicated Worker process receives its role through the launch environment.
   // biome-ignore lint/complexity/useLiteralKeys: ProcessEnv keys require indexed access under noPropertyAccessFromIndexSignature.
   const configuredRole = configuredWorkerRole(process.env["PI_WORKGRAPH_ROLE"]); // oxlint-disable-line effecttsgo/process-env
+
   if (Result.isFailure(configuredRole) || configuredRole.success === null) return;
+
   const runtime = new WorkerRuntime(configuredRole.success, (customType, data) =>
     pi.appendEntry(customType, data),
   );
+
   const branch = (ctx: ExtensionContext): SessionEntry[] => ctx.sessionManager.getBranch();
+
   const modelHost = (ctx: ExtensionContext): WorkerModelHost => ({
     current() {
       return ctx.model === undefined
@@ -30,7 +34,9 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     },
     async selectModel(provider, modelId) {
       const model = ctx.modelRegistry.find(provider, modelId);
+
       if (model === undefined) return "missing";
+
       return (await pi.setModel(model)) ? "selected" : "no_credentials";
     },
     setThinking(level) {
@@ -38,11 +44,14 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       pi.setThinkingLevel(level as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
     },
   });
+
   const reconcileTools = (): void => {
     const current = pi.getActiveTools();
     const allowed = runtime.allowedTools(current);
+
     if (allowed.length !== current.length) pi.setActiveTools(allowed);
   };
+
   const failStartup = (current: readonly SessionEntry[], diagnostic: string): void => {
     runtime.failClosed(current, diagnostic);
     pi.sendMessage({
@@ -88,17 +97,21 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       const disabled = await loadWorkerDisabledTools();
       const current = branch(ctx);
       const restored = runtime.restoreSession(current, disabled);
+
       if (Result.isFailure(restored)) {
         failStartup(current, restored.failure);
       } else {
         const diagnostic = await Effect.runPromise(runtime.recoverModel(current, modelHost(ctx)));
+
         if (diagnostic !== undefined) pi.sendMessage(diagnostic);
       }
     } catch (cause) {
       const diagnostic =
         cause instanceof Error ? cause.message : "Worker startup state is unreadable.";
+
       failStartup(branch(ctx), diagnostic);
     }
+
     reconcileTools();
   });
   pi.on("tool_call", (event) =>
@@ -108,6 +121,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   );
   pi.on("tool_execution_end", async (event, ctx) => {
     const result = await Effect.runPromise(runtime.observeToolExecution(event, modelHost(ctx)));
+
     if (result !== undefined) pi.sendMessage(result);
     reconcileTools();
   });
@@ -125,10 +139,12 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   });
   pi.on("session_compact", (_event, ctx) => {
     const recovery = runtime.compactionRecovery(ctx.sessionManager.buildContextEntries());
+
     if (recovery !== undefined) pi.sendMessage(recovery);
   });
   pi.on("context", (event) => {
     const checklist = runtime.completionChecklist(event.messages);
+
     return {
       messages: [
         {
@@ -160,6 +176,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   });
   pi.on("before_agent_start", (event) => {
     reconcileTools();
+
     return { systemPrompt: event.systemPrompt };
   });
 }

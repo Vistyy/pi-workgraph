@@ -57,6 +57,7 @@ export function fakeUi(tui: FakeTui) {
   const notifications: string[] = [];
   const theme = fakeTheme();
   let workingVisible = true;
+
   const ui = {
     statuses,
     widgets,
@@ -75,14 +76,17 @@ export function fakeUi(tui: FakeTui) {
       // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Pi's widget callback may be a factory or plain lines.
       if (typeof content !== "function") {
         widgets.set(key, undefined);
+
         return;
       }
+
       widgets.set(key, content(tui, theme));
     },
     notify(message: string): void {
       notifications.push(message);
     },
   };
+
   return ui;
 }
 
@@ -93,6 +97,7 @@ export function fakeTuiRoot(container: () => Container, chat?: Container): FakeT
   document.addChild(chat ?? container());
   const tui = new FakeTui();
   tui.addChild(document);
+
   return tui;
 }
 
@@ -106,12 +111,16 @@ interface FakeEvent {
 
 export function fakePi() {
   type Handler = (event: FakeEvent, context: ExtensionContext) => void | Promise<void>;
+
   const events = new Map<string, Handler>();
+
   const commands = new Map<
     string,
     (args: string, context: ExtensionContext) => void | Promise<void>
   >();
+
   const session = SessionManager.inMemory();
+
   return {
     events,
     commands,
@@ -148,6 +157,7 @@ export function calmHarness(options: {
   const tui = options.tui ?? fakeTuiRoot(() => new options.runtime.container());
   const ui = fakeUi(tui);
   const pi = fakePi();
+
   const calm = installCalmMode(fixture<ExtensionAPI>(pi), {
     intervalMs: options.intervalMs ?? 10_000,
     preferences: options.preferences ?? {
@@ -156,6 +166,7 @@ export function calmHarness(options: {
     },
     loadRuntime: options.loadRuntime ?? (() => Promise.resolve(options.runtime)),
   });
+
   // SAFETY: The fixture supplies only the ExtensionContext fields Calm consumes.
   const context = fixture<ExtensionContext>({
     mode: "tui",
@@ -163,15 +174,19 @@ export function calmHarness(options: {
     isIdle: () => true,
     sessionManager: pi.session,
   });
+
   return { tui, ui, pi, calm, context };
 }
 
 export const start = (pi: ReturnType<typeof fakePi>, context: ExtensionContext) =>
   pi.events.get("session_start")?.({}, context);
+
 export const shutdown = (pi: ReturnType<typeof fakePi>, context: ExtensionContext) =>
   pi.events.get("session_shutdown")?.({}, context);
+
 export const command = (pi: ReturnType<typeof fakePi>, context: ExtensionContext, args = "") =>
   pi.commands.get("calm")?.(args, context);
+
 export const messageUpdate = (
   pi: ReturnType<typeof fakePi>,
   context: ExtensionContext,

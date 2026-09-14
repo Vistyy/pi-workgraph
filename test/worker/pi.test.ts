@@ -30,15 +30,18 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-pi-"));
   const cwd = join(parent, "repo");
   await mkdir(cwd);
+
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_ROLE: "implementation",
   });
+
   const provider = await startControlledProvider([
     (request) => {
       assert.equal(request.model, "guide");
       assert.match(request.raw, /IMPLEMENTATION GUIDE POLICY/);
       assert.doesNotMatch(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
+
       return {
         tool: {
           id: "plan",
@@ -65,11 +68,13 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
       assert.match(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
       assert.match(request.raw, /EXECUTOR COMPLETION CHECKLIST/);
       assert.doesNotMatch(request.raw, /IMPLEMENTATION GUIDE POLICY/);
+
       return { text: "Executor verified the bounded edit." };
     },
     (request) => {
       assert.match(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
       assert.doesNotMatch(request.raw, /EXECUTOR COMPLETION CHECKLIST/);
+
       return {
         tool: {
           id: "report",
@@ -86,9 +91,12 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
       };
     },
   ]);
+
   let session: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
+
   try {
     const agentDir = join(parent, "agent");
+
     const models = await ModelRuntime.create({
       authPath: join(parent, "auth.json"),
       modelsPath: null,
@@ -96,6 +104,7 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
       refreshOnCreate: false,
       allowModelNetwork: false,
     });
+
     models.registerProvider("fixture", {
       name: "fixture",
       api: "openai-completions",
@@ -103,10 +112,12 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
       baseUrl: provider.baseUrl,
       models: [model("guide"), model("executor")],
     });
+
     const settings = SettingsManager.inMemory({
       compaction: { enabled: false },
       retry: { enabled: false },
     });
+
     const manager = SessionManager.create(cwd, join(parent, "sessions"), { id: "attempt" });
     manager.appendCustomMessageEntry(
       "pi-workgraph-objective",
@@ -119,6 +130,7 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
         executor: { model: "fixture/executor", thinking: "off" },
       },
     );
+
     const loader = new DefaultResourceLoader({
       cwd,
       agentDir,
@@ -130,9 +142,11 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
       noThemes: true,
       systemPrompt: "Controlled Worker.",
     });
+
     await loader.reload();
     const guide = models.getModel("fixture", "guide");
     assert.ok(guide);
+
     const created = await createAgentSession({
       cwd,
       agentDir,
@@ -144,12 +158,15 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
       sessionManager: manager,
       settingsManager: settings,
     });
+
     session = created.session;
     await session.bindExtensions({});
     await session.prompt("Begin the assigned Workgraph task", { source: "rpc" });
+
     for (let index = 0; index < 100 && provider.requests.length < 4; index += 1) {
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 10));
     }
+
     await session.agent.waitForIdle();
     provider.assertComplete();
     assert.equal(await readFile(join(cwd, "value.txt"), "utf8"), "after\n");
@@ -171,12 +188,14 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
         { model: "fixture/executor", thinking: "off" },
       ],
     );
+
     const report = branch.findLast(
       (entry) =>
         entry.type === "message" &&
         entry.message.role === "toolResult" &&
         entry.message.toolName === "workgraph_report",
     );
+
     assert.ok(report?.type === "message" && report.message.role === "toolResult");
     // SAFETY: The preceding role assertion narrows this to the tool-result details boundary.
     assert.deepEqual(Object.keys(report.message.details as object), ["report"]);
@@ -193,10 +212,12 @@ void test("real Pi restores the exact guide before continuing after executor sel
   const parent = await mkdtemp(join(tmpdir(), "workgraph-worker-pi-failure-"));
   const cwd = join(parent, "repo");
   await mkdir(cwd);
+
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_ROLE: "implementation",
   });
+
   const provider = await startControlledProvider([
     () => ({
       tool: {
@@ -223,6 +244,7 @@ void test("real Pi restores the exact guide before continuing after executor sel
       assert.match(request.raw, /IMPLEMENTATION GUIDE POLICY/);
       assert.doesNotMatch(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
       assert.match(request.raw, /EXECUTOR SELECTION FAILED/);
+
       return {
         tool: {
           id: "report",
@@ -238,9 +260,12 @@ void test("real Pi restores the exact guide before continuing after executor sel
       };
     },
   ]);
+
   let session: import("@earendil-works/pi-coding-agent").AgentSession | undefined;
+
   try {
     const agentDir = join(parent, "agent");
+
     const models = await ModelRuntime.create({
       authPath: join(parent, "auth.json"),
       modelsPath: null,
@@ -248,6 +273,7 @@ void test("real Pi restores the exact guide before continuing after executor sel
       refreshOnCreate: false,
       allowModelNetwork: false,
     });
+
     models.registerProvider("fixture", {
       name: "fixture",
       api: "openai-completions",
@@ -255,10 +281,12 @@ void test("real Pi restores the exact guide before continuing after executor sel
       baseUrl: provider.baseUrl,
       models: [model("guide"), model("executor")],
     });
+
     const settings = SettingsManager.inMemory({
       compaction: { enabled: false },
       retry: { enabled: false },
     });
+
     const manager = SessionManager.create(cwd, join(parent, "sessions"), { id: "attempt" });
     manager.appendCustomMessageEntry(
       "pi-workgraph-objective",
@@ -271,6 +299,7 @@ void test("real Pi restores the exact guide before continuing after executor sel
         executor: { model: "fixture/executor", thinking: "high" },
       },
     );
+
     const loader = new DefaultResourceLoader({
       cwd,
       agentDir,
@@ -282,9 +311,11 @@ void test("real Pi restores the exact guide before continuing after executor sel
       noThemes: true,
       systemPrompt: "Controlled Worker.",
     });
+
     await loader.reload();
     const guide = models.getModel("fixture", "guide");
     assert.ok(guide);
+
     const created = await createAgentSession({
       cwd,
       agentDir,
@@ -296,6 +327,7 @@ void test("real Pi restores the exact guide before continuing after executor sel
       sessionManager: manager,
       settingsManager: settings,
     });
+
     session = created.session;
     await session.bindExtensions({});
     await session.prompt("Begin the assigned Workgraph task", { source: "rpc" });

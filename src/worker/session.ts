@@ -7,6 +7,7 @@ import { type ModelTarget, ModelTargetSchema } from "../domain/model-target.js";
 import { isWorkerReport, type WorkerReport } from "../domain/report.js";
 
 const Text = Type.String({ minLength: 1, pattern: "\\S" });
+
 const RoleSchema = Type.Union([
   Type.Literal("research"),
   Type.Literal("experiment"),
@@ -14,6 +15,7 @@ const RoleSchema = Type.Union([
   Type.Literal("review"),
   Type.Literal("implementation"),
 ]);
+
 export const WorkerObjectiveDetailsSchema = Type.Object(
   {
     taskId: Text,
@@ -23,10 +25,12 @@ export const WorkerObjectiveDetailsSchema = Type.Object(
   },
   { additionalProperties: false },
 );
+
 const ReportDetailsSchema = Type.Object(
   { report: Type.Unknown() },
   { additionalProperties: false },
 );
+
 export const WORKER_KICKOFF = "Begin the assigned Workgraph task";
 
 const EffectiveModelSchema = Type.Object(
@@ -38,7 +42,9 @@ const EffectiveModelSchema = Type.Object(
 );
 
 export type WorkerRole = Static<typeof RoleSchema>;
+
 export type WorkerObjectiveDetails = Static<typeof WorkerObjectiveDetailsSchema>;
+
 export interface WorkerObjective {
   readonly content: string;
   readonly details: WorkerObjectiveDetails;
@@ -69,23 +75,29 @@ export function createWorkerSessionEffect(request: {
       });
     const fileSystem = yield* FileSystem.FileSystem;
     yield* fileSystem.makeDirectory(request.sessionDir, { recursive: true });
+
     const matches = yield* nativePromise("recover", () =>
       SessionManager.listAll(request.sessionDir),
     );
+
     const sameId = matches.filter((entry) => entry.id === request.objective.details.attemptId);
+
     if (sameId.length > 1)
       return yield* new PiSessionError({
         operation: "recover",
         message: "Multiple Worker sessions claim the exact Attempt session id.",
       });
     const existing = sameId[0];
+
     if (existing !== undefined) {
       const session = yield* native("recover", () => SessionManager.open(existing.path));
+
       if (!exactSession(session, request))
         return yield* new PiSessionError({
           operation: "recover",
           message: "Existing Worker session does not match its exact header and objective.",
         });
+
       return { sessionFile: existing.path, fresh: false };
     }
 
@@ -94,6 +106,7 @@ export function createWorkerSessionEffect(request: {
         id: request.objective.details.attemptId,
       }),
     );
+
     yield* native("append-objective", () =>
       session.appendCustomMessageEntry(
         "pi-workgraph-objective",
@@ -125,11 +138,13 @@ export function createWorkerSessionEffect(request: {
       }),
     );
     const file = session.getSessionFile();
+
     if (file === undefined)
       return yield* new PiSessionError({
         operation: "resolve",
         message: "Worker session did not produce a session file.",
       });
+
     return { sessionFile: file, fresh: true };
   });
 }
@@ -161,9 +176,11 @@ export function readWorkerSession(
 ): WorkerSessionRead {
   let session: SessionManager;
   let entries: SessionEntry[];
+
   try {
     session = SessionManager.open(sessionFile);
     const header = session.getHeader();
+
     if (
       header === null ||
       header.id !== expected.details.attemptId ||
@@ -180,11 +197,13 @@ export function readWorkerSession(
   const branch = Result.isSuccess(objective) ? objective.success : entries;
   const effectiveModels = orderedEffectiveModels(branch);
   const started = effectiveModels.length > 0;
+
   const kickoffPersisted =
     Result.isSuccess(objective) &&
     branch.some((entry) => {
       if (entry.type !== "message" || entry.message.role !== "user") return false;
       const { content } = entry.message;
+
       return (
         content === WORKER_KICKOFF ||
         (Array.isArray(content) &&
@@ -193,9 +212,11 @@ export function readWorkerSession(
           content[0].text === WORKER_KICKOFF)
       );
     });
+
   const settled = branch.some(
     (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-agent-settled",
   );
+
   if (Result.isFailure(objective))
     return {
       unreadable: false,
@@ -208,8 +229,10 @@ export function readWorkerSession(
 
   let reportDetails: unknown;
   let reportFound = false;
+
   for (let index = branch.length - 1; index >= 0; index -= 1) {
     const entry = branch.at(index);
+
     if (
       entry?.type === "message" &&
       entry.message.role === "toolResult" &&
@@ -221,6 +244,7 @@ export function readWorkerSession(
       break;
     }
   }
+
   if (!reportFound)
     return settled
       ? {
@@ -232,6 +256,7 @@ export function readWorkerSession(
           effectiveModels,
         }
       : { unreadable: false, started, kickoffPersisted, settled, effectiveModels };
+
   if (!Value.Check(ReportDetailsSchema, reportDetails))
     return {
       unreadable: false,
@@ -242,6 +267,7 @@ export function readWorkerSession(
       effectiveModels,
     };
   const report = Value.Decode(ReportDetailsSchema, reportDetails).report;
+
   return isWorkerReport(report)
     ? { unreadable: false, started, kickoffPersisted, settled, report, effectiveModels }
     : {
@@ -269,6 +295,7 @@ function exactSession(
   request: { readonly cwd: string; readonly objective: WorkerObjective },
 ): boolean {
   const header = session.getHeader();
+
   return (
     header !== null &&
     header.id === request.objective.details.attemptId &&
@@ -285,7 +312,9 @@ function attemptBranch(
   const objectiveEntries = entries.filter(
     (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
   );
+
   const match = objectiveEntries[0];
+
   if (
     objectiveEntries.length !== 1 ||
     match?.type !== "custom_message" ||
@@ -297,12 +326,14 @@ function attemptBranch(
     )
   )
     return Result.fail("Exact Worker objective is absent, malformed, or mismatched.");
+
   return Result.succeed(entries.slice(entries.indexOf(match)));
 }
 
 function orderedEffectiveModels(entries: readonly SessionEntry[]): ModelTarget[] {
   const result: ModelTarget[] = [];
   const seen = new Set<string>();
+
   for (const entry of entries) {
     if (
       entry.type !== "custom" ||
@@ -312,10 +343,12 @@ function orderedEffectiveModels(entries: readonly SessionEntry[]): ModelTarget[]
       continue;
     const marker = Value.Decode(EffectiveModelSchema, entry.data);
     const key = `${marker.model}\0${marker.thinking}`;
+
     if (seen.has(key)) continue;
     seen.add(key);
     result.push({ model: marker.model, thinking: marker.thinking });
   }
+
   return result;
 }
 
@@ -331,6 +364,7 @@ function sameObjectiveDetails(
     actual.executor?.thinking === expected.executor?.thinking
   );
 }
+
 function unreadable(error: string): WorkerSessionRead {
   return {
     unreadable: true,
@@ -341,9 +375,11 @@ function unreadable(error: string): WorkerSessionRead {
     effectiveModels: [],
   };
 }
+
 function bounded(message: string): string {
   return message.replace(/\s+/g, " ").slice(0, 300);
 }
+
 function native<A>(
   operation: PiSessionError["operation"],
   run: () => A,
@@ -354,6 +390,7 @@ function native<A>(
       new PiSessionError({ operation, message: `Pi SessionManager ${operation} failed.` }),
   });
 }
+
 function nativePromise<A>(
   operation: PiSessionError["operation"],
   run: () => Promise<A>,
