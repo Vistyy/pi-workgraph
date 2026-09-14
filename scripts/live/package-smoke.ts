@@ -50,7 +50,7 @@ async function smokePackage(): Promise<void> {
     "--no-fund",
     tarballPath,
   ]);
-  const packageRoot = join(consumer, "node_modules/@vistyy/pi-workgraph");
+  const packageRoot = join(consumer, "node_modules/@syzom/pi-workgraph");
   const agentDir = join(parent, "agent");
   await mkdir(agentDir);
 

@@ -9,7 +9,7 @@ Requirements: Node.js 24+, Git, Pi, and a Herdr-managed Pi pane with Herdr's Pi 
 Install the published npm release:
 
 ```bash
-pi install npm:@vistyy/pi-workgraph@0.1.0
+pi install npm:@syzom/pi-workgraph@0.1.0
 ```
 
 Or install the matching GitHub release:
