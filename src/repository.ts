@@ -171,9 +171,10 @@ function recoverPlacement(
   });
 }
 
-/** Classify repository bytes only after Worker closure, independent of semantic outcome. */
+/** Classify repository commits after closure; completed reports relinquish uncommitted scratch. */
 export function classifyOutput(
   operation: RepositoryOperation,
+  reportCompleted = false,
 ): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(operation.target);
@@ -186,22 +187,38 @@ export function classifyOutput(
     if (registration === undefined && !exists) return yield* classifyAbsentOutput(operation, base);
     if (registration === undefined || !exists)
       return yield* fail("classify output", "Attempt placement is foreign or incomplete.");
+    return yield* classifyPresentOutput(operation, base, reportCompleted);
+  });
+}
+
+function classifyPresentOutput(
+  operation: RepositoryOperation,
+  base: string,
+  reportCompleted: boolean,
+): Effect.Effect<AttemptOutput, GitError> {
+  return Effect.gen(function* () {
     const state = yield* ownedCheckout(operation, true);
     if (!(yield* ancestry(operation.target.commonDir, base, state.head)))
       return yield* fail("classify output", "Attempt HEAD is unrelated to its exact base.");
     yield* validateCandidate(operation, state.head);
-    if (!state.dirty && state.head === base) {
-      yield* removeCleanWorktree(operation);
+    if (!reportCompleted && state.dirty) {
+      yield* createExactRef(operation.target.commonDir, operation.outputRef, state.head);
+      return {
+        kind: "retained" as const,
+        tip: state.head,
+        reason: "Dirty checkout is preserved for explicit disposition.",
+      };
+    }
+    if (state.head === base) {
+      yield* removeWorktree(operation, reportCompleted);
       return { kind: "no_output" as const };
     }
     yield* createExactRef(operation.target.commonDir, operation.outputRef, state.head);
-    if (!state.dirty) yield* removeCleanWorktree(operation);
+    yield* removeWorktree(operation, reportCompleted);
     return {
       kind: "retained" as const,
       tip: state.head,
-      reason: state.dirty
-        ? "Dirty output is preserved for explicit disposition."
-        : "Candidate output is retained.",
+      reason: "Committed output is retained.",
     };
   });
 }
@@ -216,7 +233,7 @@ function classifyAbsentOutput(
     if (!(yield* ancestry(operation.target.commonDir, base, tip)))
       return yield* fail("classify output", "Attempt output ref is unrelated to its exact base.");
     yield* validateCandidate(operation, tip);
-    return { kind: "retained" as const, tip, reason: "Candidate output is retained." };
+    return { kind: "retained" as const, tip, reason: "Committed output is retained." };
   });
 }
 
@@ -417,7 +434,7 @@ export function discardOutput(
         );
       yield* git(operation.worktreePath, ["reset", "--hard", output.tip]);
       yield* git(operation.worktreePath, ["clean", "-fdx"], true);
-      yield* removeCleanWorktree(operation);
+      yield* removeWorktree(operation);
       yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.tip);
     }
     return output.applied === undefined
@@ -561,12 +578,19 @@ function ownedCheckout(
   });
 }
 
-function removeCleanWorktree(operation: RepositoryOperation): Effect.Effect<void, GitError> {
+function removeWorktree(
+  operation: RepositoryOperation,
+  force = false,
+): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
     const state = yield* ownedCheckout(operation, false);
-    if (state.dirty)
+    if (!force && state.dirty)
       return yield* fail("remove worktree", "Refusing to remove a dirty Attempt checkout.");
-    yield* git(operation.target.checkoutRoot, ["worktree", "remove", operation.worktreePath], true);
+    yield* git(
+      operation.target.checkoutRoot,
+      ["worktree", "remove", ...(force ? ["--force"] : []), operation.worktreePath],
+      true,
+    );
     if (
       (yield* pathExists(operation.worktreePath)) ||
       (yield* registeredWorktree(operation.target.commonDir, operation.worktreePath)) !== undefined

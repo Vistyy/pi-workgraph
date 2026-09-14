@@ -35,7 +35,7 @@ A clean retained implementation repository output for which Workgraph can prove 
 The immutable relationship between a Candidate-producing Attempt and an exact source Candidate. Extension starts the successor Attempt at the source tip and preserves its root; integration starts from another explicit base and records the source tip to incorporate.
 
 **Repository output**:
-The repository changes, if any, produced by an Attempt together with Workgraph's custody state for them. Repository output may exist without qualifying as a Candidate and is separate from the Attempt's Outcome.
+The commits, if any, produced by an Attempt together with Workgraph's custody state for them. Ignored, untracked, and uncommitted worktree bytes are execution scratch rather than repository output; a completed report relinquishes them.
 
 _Avoid_: Outcome
 

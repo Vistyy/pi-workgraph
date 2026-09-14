@@ -42,15 +42,16 @@ Use real disposable Git repositories through the registered coordinator/runtime 
 - directory targets resolve to one real path and never create Git output;
 - repository targets freeze checkout root and common directory;
 - each repository Attempt freezes an exact base commit and runs in its exact detached worktree;
+- placement recovery requires the clean exact base before agent start, while later execution dirtiness cannot prevent reported or unreported settlement;
 - `candidateOf: extend` requires the exact retained source Candidate ref and starts from its tip;
 - `candidateOf: integrate` preserves an explicit base, exact source Candidate-producing Attempt, and source tip;
-- clean unchanged output removes its worktree without a ref;
-- clean changed output creates `refs/pi-workgraph/outputs/<attemptId>` before worktree removal; and
-- dirty, ignored, untracked, moved, foreign, or uncertain resources remain physically present and blocked.
+- a completed report retains only commits: unchanged HEAD produces no output, changed HEAD creates `refs/pi-workgraph/outputs/<attemptId>`, and the whole worktree is removed in either case;
+- failed, escalated, unreported, and cancelled Attempts preserve dirty, ignored, and untracked bytes while compacting clean commit state normally; and
+- moved, foreign, incomplete, unrelated, or ambiguous resources remain physically present and blocked.
 
 Application preparation must leave destination bytes, HEAD, and ref unchanged while proving source ref, base, Candidate lineage, destination identity, cleanliness, ancestry, and conflicts. The explicit apply flow must produce only the prepared structural result, record its exact revision, then release output. Recovery accepts only the exact expected Git structure; a switched, unrelated, or advanced destination blocks without rollback or automatic retry.
 
-Explicit discard requires an exact Attempt and nonblank destructive reason. Prove that disposition is checkpointed before deletion, only the verified private ref or owned worktree is removed, and interruption recovery accepts only proven postconditions. Outcome recording, shutdown, failed commands, and retries must never remove dirty, foreign, or uncertain output. No supported flow pushes or publishes.
+Explicit discard must checkpoint its reason before deleting exact verified output. Separately prove that completed reports remove only their exact worktree, including uncommitted scratch, while non-completed Outcomes and failed cleanup preserve dirty or uncertain resources. No supported flow pushes or publishes.
 
 ## Worker behavior
 

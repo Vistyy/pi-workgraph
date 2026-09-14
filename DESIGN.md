@@ -38,9 +38,9 @@ The store has no aggregate mirror, global revision, cached frontier, ownership r
 
 Every Attempt receives a fresh Worker Pi session under `<agentDir>/workgraph/worker-sessions/`. The Worker session file is its durable execution history; Herdr owns current workspace, tab, pane, and agent observations. The runtime serializes commands and reconciliation for one coordinator session with Effect primitives.
 
-Launching crosses native boundaries in a fixed checkpoint sequence: persist the Worker session, establish workspace placement, create and identify the tab, start and identify the agent, persist the kickoff in the Pi session, then submit it. Each successful external effect is reflected in the Attempt before the next effect. Recovery observes the exact persisted and native identities. It never replays an uncertain placement, tab creation, agent start, kickoff submission, steering prompt, or close request. Ambiguous or foreign identity blocks rather than being guessed into ownership.
+Launching establishes the exact clean workspace placement, persists the Worker session, creates the tab, starts the agent, persists the kickoff, then submits it. Placement must remain at the clean Attempt base until agent start is checkpointed as uncertain; afterward mutable worktree state no longer gates Worker reconciliation. Recovery observes exact persisted and native identity without replaying uncertain effects or guessing ownership.
 
-Normal settlement derives a semantic Outcome from the Worker session and records it before checkpointing and issuing one exact close. It then observes exact absence before marking the Worker closed. A missing Worker that can no longer report becomes a bounded unreported Outcome rather than an endless wait.
+Normal settlement derives a semantic Outcome from the Worker session independently of repository state and records it before checkpointing and issuing one exact close. It then observes exact absence before marking the Worker closed. A missing Worker that can no longer report becomes a bounded unreported Outcome rather than an endless wait.
 
 Cancellation is definitive rather than graceful steering. A queued Attempt records a cancelled Outcome without creating a Worker. An active Attempt first checkpoints the cancellation reason, issues close at most once, proves exact absence, and then records the closed Worker and cancelled Outcome together. Recovery after either close checkpoint observes only; it never repeats close. Steering remains a separate prompt to an exact active Worker.
 
@@ -70,7 +70,7 @@ Directory Attempts have no Git output. Repository Attempts execute in detached w
 
 ## Repository custody
 
-After exact Worker closure, clean unchanged repository work removes its detached worktree with no output. Clean changed work is anchored at `refs/pi-workgraph/outputs/<attemptId>` before checkout removal. Dirty, moved, foreign, missing, or ambiguous resources remain physically preserved and blocked because their postconditions cannot be proven.
+After exact Worker closure, a completed report retains only committed HEAD and removes the worktree; unchanged HEAD produces no output. Non-completed Attempts preserve dirty worktrees, and inexact or ambiguous resources always block.
 
 Apply and discard are serialized per exact Attempt and repository. Application first proves the private source ref, Candidate root and lineage, attached destination identity, current destination ref and HEAD, cleanliness, ancestry, and conflicts without mutating destination state. It checkpoints the expected source and destination facts, re-proves them, then performs only the prepared fast-forward form. Recovery accepts application only when Git structure proves the exact expected result; an unrelated, switched, or advanced destination blocks without rollback or automatic retry. Output cleanup occurs only after application is recorded.
 

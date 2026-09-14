@@ -1,6 +1,14 @@
 /* oxlint-disable effecttsgo/node-builtin-import, effecttsgo/global-date, anti-slop/no-object-parameters, typescript/no-unsafe-member-access, anti-slop/require-safety-comment-for-type-assertion -- Flow tests inspect deterministic native transport logs and real Pi session files. */
 import assert from "node:assert/strict";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +21,7 @@ import { herdrWorkerName, herdrWorkerTabLabel } from "../../src/coordinator/work
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
 import { runNodePlatformPromise } from "../../src/node-platform.js";
 import { createWorkerSessionEffect, type WorkerObjective } from "../../src/worker/session.js";
+import { git } from "../support/helpers.js";
 
 const target = { model: "test/model", thinking: "high" as const };
 const selection = { kind: "target" as const, target };
@@ -93,6 +102,28 @@ async function session(root: string, taskId: string, attemptId: string, value: T
       objective: objective(taskId, attemptId, value),
     }),
   );
+}
+function appendSettledReport(sessionFile: string, summary: string): void {
+  const manager = SessionManager.open(sessionFile);
+  manager.appendCustomEntry("pi-workgraph-effective-model", target);
+  manager.appendMessage({
+    role: "toolResult",
+    toolCallId: "report",
+    toolName: "workgraph_report",
+    content: [{ type: "text", text: "done" }],
+    details: {
+      report: {
+        kind: "research",
+        status: "completed",
+        summary,
+        evidence: [],
+        findings: [],
+      },
+    },
+    isError: false,
+    timestamp: Date.now(),
+  });
+  manager.appendCustomEntry("pi-workgraph-agent-settled", {});
 }
 
 void test("staged launch persists original workspace and shutdown never closes the Worker", async () => {
@@ -230,26 +261,7 @@ void test("Outcome is written before one close and reload duplicates neither clo
   const value = task(root, "settle");
   const attempt = store.createTaskWithAttempt("settle", value, "attempt-settle", spec).attempt;
   const created = await session(root, "settle", attempt.id, value);
-  const manager = SessionManager.open(created.sessionFile);
-  manager.appendCustomEntry("pi-workgraph-effective-model", target);
-  manager.appendMessage({
-    role: "toolResult",
-    toolCallId: "report",
-    toolName: "workgraph_report",
-    content: [{ type: "text", text: "done" }],
-    details: {
-      report: {
-        kind: "research",
-        status: "completed",
-        summary: "settled",
-        evidence: [],
-        findings: [],
-      },
-    },
-    isError: false,
-    timestamp: Date.now(),
-  });
-  manager.appendCustomEntry("pi-workgraph-agent-settled", {});
+  appendSettledReport(created.sessionFile, "settled");
   store.checkpointWorker(attempt.id, {
     sessionFile: created.sessionFile,
     workspaceId: "workspace-owner",
@@ -309,6 +321,96 @@ void test("Outcome is written before one close and reload duplicates neither clo
     assert.equal(
       notification,
       `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: reported: settled`,
+    );
+    assert.equal(
+      commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
+      1,
+    );
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("completed repository reports settle through mutable scratch and retain only commits", async () => {
+  const root = temporary();
+  const repository = join(root, "repository");
+  mkdirSync(repository);
+  await git(repository, "init", "-b", "main");
+  await git(repository, "config", "user.name", "Workgraph Test");
+  await git(repository, "config", "user.email", "workgraph@example.invalid");
+  writeFileSync(join(repository, ".gitignore"), "node_modules/\n");
+  writeFileSync(join(repository, "file.txt"), "base\n");
+  await git(repository, "add", ".");
+  await git(repository, "commit", "-m", "base");
+  const base = await git(repository, "rev-parse", "HEAD");
+  const value: Task = {
+    target: {
+      kind: "repository",
+      checkoutRoot: repository,
+      commonDir: join(repository, ".git"),
+    },
+    contract: {
+      kind: "experiment",
+      question: "Inspect the repository",
+      expectedEvidence: ["Direct observation"],
+      permittedEffects: ["Install dependencies and inspect files"],
+      stopCondition: "Stop after reporting",
+    },
+  };
+  const repositorySpec: AttemptSpec = {
+    selection,
+    base: { kind: "repository", baseCommit: base },
+  };
+  const store = new RecordStore(root, "session-repository-scratch");
+  const attempt = store.createTaskWithAttempt(
+    "repository-scratch",
+    value,
+    "attempt-repository-scratch",
+    repositorySpec,
+  ).attempt;
+  const native = fixture(root);
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    const runtime = await Effect.runPromise(
+      SessionRuntime.acquire({
+        store,
+        agentDir: root,
+        workspaceId: "workspace-owner",
+        pi: { sendMessage() {} },
+        herdr: native.herdr,
+      }).pipe(Scope.provide(scope)),
+    );
+    await waitFor(() => store.readAttempt(attempt.id).worker?.kickoff === "confirmed");
+    const running = store.readAttempt(attempt.id);
+    const worktree = join(root, "workgraph", "worktrees", attempt.id);
+    mkdirSync(join(worktree, "node_modules"));
+    writeFileSync(join(worktree, "node_modules", "artifact.js"), "scratch\n");
+    writeFileSync(join(worktree, "file.txt"), "uncommitted scratch\n");
+
+    const observations = commands(native.log).filter(
+      (entry) => entry.slice(0, 2).join(" ") === "agent list",
+    ).length;
+    await waitFor(
+      () =>
+        commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "agent list")
+          .length > observations || runtime.inspectionStatus().blockers.length > 0,
+    );
+    assert.deepEqual(runtime.inspectionStatus().blockers, []);
+
+    const sessionFile = running.worker?.sessionFile;
+    assert.ok(sessionFile !== undefined);
+    appendSettledReport(sessionFile, "Experiment completed");
+
+    await waitFor(() => {
+      const settled = store.readAttempt(attempt.id);
+      return settled.worker?.closed === true && settled.output?.kind === "no_output";
+    });
+    const settled = store.readAttempt(attempt.id);
+    assert.equal(settled.outcome?.result.kind, "reported");
+    assert.equal(existsSync(worktree), false);
+    await assert.rejects(
+      git(repository, "show-ref", "--verify", `refs/pi-workgraph/outputs/${attempt.id}`),
     );
     assert.equal(
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,

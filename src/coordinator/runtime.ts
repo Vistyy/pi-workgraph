@@ -476,7 +476,7 @@ export class SessionRuntime {
       let attempt = initial;
       const context = self.context(attempt);
       if (attempt.worker === undefined) yield* self.requireLaunchAvailable("launch Worker");
-      if (attempt.spec.base.kind === "repository")
+      if (attempt.spec.base.kind === "repository" && attempt.worker?.agent === undefined)
         yield* ensureDetachedWorktree(self.repositoryOperation(attempt)).pipe(
           Effect.mapError((cause) => runtimeError("prepare repository", cause)),
         );
@@ -718,7 +718,8 @@ export class SessionRuntime {
     else if (attempt.output?.kind === "applied" && attempt.output.cleanupTip !== undefined) {
       if (this.store.hasUnclassifiedIntegrationChild(attempt.id)) return Effect.void;
       action = cleanupAppliedOutput(operation);
-    } else if (attempt.output === undefined) action = classifyOutput(operation);
+    } else if (attempt.output === undefined)
+      action = classifyOutput(operation, this.hasCompletedReport(attempt));
     else return Effect.void;
     return action.pipe(
       Effect.flatMap((output) =>
@@ -728,6 +729,11 @@ export class SessionRuntime {
       ),
       Effect.mapError((cause) => runtimeError("reconcile output", cause)),
     );
+  }
+
+  private hasCompletedReport(attempt: AttemptRecord): boolean {
+    const result = attempt.outcome?.result;
+    return result?.kind === "reported" && result.report.status === "completed";
   }
 
   private context(attempt: AttemptRecord): WorkerContext {

@@ -148,7 +148,7 @@ void test("target resolution preserves real nested Git identity and rejects inva
   }
 });
 
-void test("classification removes unchanged output, compacts every clean descendant, and preserves dirty bytes", async () => {
+void test("classification compacts completed commits, releases completed scratch, and preserves uncertain bytes", async () => {
   const fixture = await repository();
   try {
     const unchanged = operation(fixture, "unchanged", initial(fixture.base));
@@ -192,6 +192,31 @@ void test("classification removes unchanged output, compacts every clean descend
     assert.equal(dirtyAttempt.kind, "retained");
     assert.equal(await git(fixture.root, "rev-parse", dirty.outputRef), fixture.base);
     assert.equal(await readFile(join(dirty.worktreePath, "ignored.bin"), "utf8"), "ignored\n");
+
+    const completedUnchanged = operation(fixture, "completed-unchanged", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(completedUnchanged));
+    await mkdir(join(completedUnchanged.worktreePath, "node_modules"));
+    await writeFile(
+      join(completedUnchanged.worktreePath, "node_modules", "artifact.js"),
+      "scratch\n",
+    );
+    assert.deepEqual(await Effect.runPromise(classifyOutput(completedUnchanged, true)), {
+      kind: "no_output",
+    });
+    await assert.rejects(
+      readFile(join(completedUnchanged.worktreePath, "node_modules", "artifact.js")),
+    );
+
+    const completedChanged = operation(fixture, "completed-changed", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(completedChanged));
+    const completedTip = await commit(completedChanged.worktreePath, "committed output");
+    await writeFile(join(completedChanged.worktreePath, "file.txt"), "uncommitted scratch\n");
+    await writeFile(join(completedChanged.worktreePath, "ignored.bin"), "ignored scratch\n");
+    const completedOutput = await Effect.runPromise(classifyOutput(completedChanged, true));
+    assert.equal(completedOutput.kind === "retained" ? completedOutput.tip : "", completedTip);
+    assert.equal(await git(fixture.root, "rev-parse", completedChanged.outputRef), completedTip);
+    assert.equal(await git(fixture.root, "show", `${completedTip}:file.txt`), "committed output");
+    await assert.rejects(readFile(join(completedChanged.worktreePath, "file.txt")));
   } finally {
     await rm(fixture.parent, { recursive: true, force: true });
   }
