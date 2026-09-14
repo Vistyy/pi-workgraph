@@ -21,7 +21,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node --import tsx --test test/**/*.test.ts",
     "typecheck": "tsc --noEmit",
     "quality:prepare": "effect-tsgo patch --oxlint --no-typescript",
     "quality": "pnpm run quality:prepare && biome check --error-on-warnings . && oxlint --config oxlint.config.ts .",

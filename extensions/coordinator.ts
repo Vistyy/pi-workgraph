@@ -8,23 +8,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Effect, Exit, Scope } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
-import { installCalmMode, isCoordinatorScope } from "../src/calm.js";
-import {
-  type CandidateRequest,
-  RuntimeError,
-  SessionRuntime,
-} from "../src/coordination/runtime.js";
-import {
-  type AttemptRecord,
-  type AttemptSelection,
-  CommitSchema,
-  ReviewSubjectSchema,
-  type Task,
-  type TaskContract,
-  TaskIdSchema,
-} from "../src/domain/records.js";
-import { resolveRevision, resolveTaskTarget } from "../src/git.js";
-import type { HerdrCliRuntime } from "../src/herdr.js";
+import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
+import type { HerdrCliRuntime } from "../src/coordinator/herdr.js";
 import {
   configuredTarget,
   implementationTargets,
@@ -34,9 +19,20 @@ import {
   modelPolicyPath,
   resolveSelection,
   SelectionRequestSchema,
-} from "../src/model-policy.js";
-import { installNotepad } from "../src/notepad.js";
-import { RecordStore } from "../src/storage/record-store.js";
+} from "../src/coordinator/model-policy.js";
+import { installNotepad } from "../src/coordinator/notepad.js";
+import { type CandidateRequest, RuntimeError, SessionRuntime } from "../src/coordinator/runtime.js";
+import { RecordStore } from "../src/coordinator/store.js";
+import {
+  type AttemptRecord,
+  type AttemptSelection,
+  CommitSchema,
+  ReviewSubjectSchema,
+  type Task,
+  type TaskContract,
+  TaskIdSchema,
+} from "../src/domain/records.js";
+import { resolveRevision, resolveTaskTarget } from "../src/repository.js";
 
 const Text = Type.String({ minLength: 1, pattern: "\\S" });
 const CandidateOf = Type.Optional(

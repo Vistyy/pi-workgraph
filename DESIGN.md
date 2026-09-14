@@ -7,6 +7,12 @@ This document owns the integrated rationale and durable constraints for Workgrap
 - [ADR 0001: Own record schemas, effects, and host adapters](docs/adr/0001-own-schemas-effects-and-host-adapters.md)
 - [ADR 0002: Project Calm over the live Pi chat](docs/adr/0002-project-calm-over-the-live-pi-chat.md)
 
+## Source ownership
+
+Production source is grouped by cohesive feature ownership rather than generic technical layers. `src/coordinator/` owns coordinator-session orchestration, record persistence, model policy, pending memory, and native Worker placement. `src/worker/` owns Worker policy, execution trajectory, TODO state, and Pi session behavior. `src/calm/` owns the complete presentation feature and its Pi compatibility seam. Shared structural vocabulary lives in `src/domain/`; repository custody remains one cohesive `src/repository.ts` boundary; and the small shared Effect/Node bridge remains `src/node-platform.ts`. The two files in `extensions/` are thin Pi host entry points.
+
+Tests are grouped by the supported responsibility they exercise rather than mechanically mirroring each source module. Shared test construction lives only under `test/support/`.
+
 ## Coordination ownership
 
 The coordinator's exact Pi session is the unit of ownership. Its Tasks and Attempts are private coordination records, not a shared project board. Other sessions cannot enumerate or take over those records. Session shutdown releases coordinator-owned runtime activity while preserving independent Worker sessions, native resources, and repository output.

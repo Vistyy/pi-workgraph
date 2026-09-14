@@ -2,13 +2,13 @@
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Effect, Result } from "effect";
 import type { WorkerReportInput } from "../src/domain/report.js";
-import { type WorkerPlanToolInput, WorkerPlanToolSchema } from "../src/worker-plan.js";
+import { type WorkerPlanToolInput, WorkerPlanToolSchema } from "../src/worker/plan.js";
 import {
   configuredWorkerRole,
   type WorkerModelHost,
   WorkerRuntime,
-} from "../src/worker-runtime.js";
-import { loadWorkerDisabledTools } from "../src/workgraph-settings.js";
+} from "../src/worker/runtime.js";
+import { loadWorkerDisabledTools } from "../src/worker/settings.js";
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
   const configuredRole = configuredWorkerRole(process.env["PI_WORKGRAPH_ROLE"]);
