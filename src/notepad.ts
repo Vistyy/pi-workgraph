@@ -41,7 +41,7 @@ export function installNotepad(pi: ExtensionAPI): void {
     name: "workgraph_notepad",
     label: "Workgraph Notepad",
     description:
-      "Read, replace, or clear the current branch's session memo. Replacement text is limited to 4,000 characters.",
+      "Read, replace, or clear the current branch's coordinator memo for pending context. It is not Task state, evidence, authority, or acceptance; replacement text is limited to 4,000 characters.",
     parameters: NotepadParameters,
     // oxlint-disable-next-line effecttsgo/async-function -- Pi's tool boundary requires a Promise; notepad persistence itself is synchronous.
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
