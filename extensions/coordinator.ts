@@ -101,6 +101,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           SessionRuntime.acquire({
             store,
             agentDir,
+            // biome-ignore lint/complexity/useLiteralKeys: ProcessEnv keys require indexed access under noPropertyAccessFromIndexSignature.
             workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "",
             pi,
             ...(options.herdr === undefined ? {} : { herdr: options.herdr }),

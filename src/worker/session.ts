@@ -1,4 +1,3 @@
-/* oxlint-disable effecttsgo/global-date -- Pi requires an epoch timestamp for the synthetic persistence marker. */
 import { type SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Data, Effect, FileSystem, Result } from "effect";
 import type { PlatformError } from "effect/PlatformError";
@@ -120,6 +119,8 @@ export function createWorkerSessionEffect(request: {
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
         },
         stopReason: "stop",
+        // Pi requires an epoch timestamp for the synthetic persistence marker.
+        // oxlint-disable-next-line effecttsgo/global-date
         timestamp: Date.now(),
       }),
     );
@@ -207,9 +208,10 @@ export function readWorkerSession(
 
   let reportDetails: unknown;
   let reportFound = false;
-  for (const entry of [...branch].reverse()) {
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch.at(index);
     if (
-      entry.type === "message" &&
+      entry?.type === "message" &&
       entry.message.role === "toolResult" &&
       entry.message.toolName === "workgraph_report" &&
       entry.message.isError !== true

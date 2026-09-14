@@ -28,11 +28,6 @@ const MAX_TOOL_NAME_WIDTH = 24;
 const MAX_PATH_HINT_WIDTH = 32;
 const PATH_HINT_TOOLS = new Set(["read", "edit", "write"]);
 
-interface MutableToolActivity {
-  toolCallId: string;
-  toolName: string;
-  pathHint?: string;
-}
 export interface CalmActivityTracker {
   readonly startAgent: () => void;
   readonly messageUpdate: (eventType: string) => void;
@@ -62,7 +57,7 @@ function safeToolName(name: string): string {
 function toolLabel(tool: CalmToolActivity): string {
   const name = safeToolName(tool.toolName);
   if (tool.pathHint === undefined) return name;
-  return `${name} ${truncateToWidth(tool.pathHint, MAX_PATH_HINT_WIDTH, "")}`;
+  return `${name} ${tool.pathHint}`;
 }
 
 function activeToolLabels(tools: readonly CalmToolActivity[]): string[] {
@@ -134,11 +129,8 @@ export function createCalmActivityTracker(onChange: () => void = () => {}): Calm
     toolStart(toolCallId: string, toolName: string, args: unknown): void {
       phase = undefined;
       const pathHint = PATH_HINT_TOOLS.has(toolName) ? validatedPathBasename(args) : undefined;
-      const tool: MutableToolActivity = {
-        toolCallId,
-        toolName,
-      };
-      if (pathHint !== undefined) tool.pathHint = pathHint;
+      const tool: CalmToolActivity =
+        pathHint === undefined ? { toolCallId, toolName } : { toolCallId, toolName, pathHint };
       tools.set(toolCallId, tool);
       changed();
     },
@@ -173,7 +165,6 @@ export function createCalmActivityTracker(onChange: () => void = () => {}): Calm
 function validatedPathBasename(args: unknown): string | undefined {
   // SAFETY: Pi tool arguments are untrusted. Accept only an own data property so malformed
   // getters and proxies fail closed without exposing arbitrary fields.
-  // oxlint-disable-next-line anti-slop/no-runtime-typeof
   if (args === null || typeof args !== "object" || Array.isArray(args)) return undefined;
   try {
     const descriptor = Object.getOwnPropertyDescriptor(args, "path");

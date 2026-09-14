@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env -- Pi owns these Promise callbacks and supplies the Worker process environment. */
+/* oxlint-disable effecttsgo/async-function -- Pi owns these native Promise callbacks. */
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Effect, Result } from "effect";
 import type { WorkerReportInput } from "../src/domain/report.js";
@@ -11,7 +11,9 @@ import {
 import { loadWorkerDisabledTools } from "../src/worker/settings.js";
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
-  const configuredRole = configuredWorkerRole(process.env["PI_WORKGRAPH_ROLE"]);
+  // The dedicated Worker process receives its role through the launch environment.
+  // biome-ignore lint/complexity/useLiteralKeys: ProcessEnv keys require indexed access under noPropertyAccessFromIndexSignature.
+  const configuredRole = configuredWorkerRole(process.env["PI_WORKGRAPH_ROLE"]); // oxlint-disable-line effecttsgo/process-env
   if (Result.isFailure(configuredRole) || configuredRole.success === null) return;
   const runtime = new WorkerRuntime(configuredRole.success, (customType, data) =>
     pi.appendEntry(customType, data),
@@ -40,6 +42,14 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
     const current = pi.getActiveTools();
     const allowed = runtime.allowedTools(current);
     if (allowed.length !== current.length) pi.setActiveTools(allowed);
+  };
+  const failStartup = (current: readonly SessionEntry[], diagnostic: string): void => {
+    runtime.failClosed(current, diagnostic);
+    pi.sendMessage({
+      customType: "pi-workgraph-worker-diagnostic",
+      content: `[WORKGRAPH WORKER STARTUP FAILED]\n${diagnostic}\nOnly a truthful failed report is permitted.`,
+      display: false,
+    });
   };
 
   if (runtime.hasPlanTool()) {
@@ -76,29 +86,18 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   pi.on("session_start", async (_event, ctx) => {
     try {
       const disabled = await loadWorkerDisabledTools();
-      const restored = runtime.restoreSession(branch(ctx), disabled);
+      const current = branch(ctx);
+      const restored = runtime.restoreSession(current, disabled);
       if (Result.isFailure(restored)) {
-        runtime.failClosed(branch(ctx), restored.failure);
-        pi.sendMessage({
-          customType: "pi-workgraph-worker-diagnostic",
-          content: `[WORKGRAPH WORKER STARTUP FAILED]\n${restored.failure}\nOnly a truthful failed report is permitted.`,
-          display: false,
-        });
+        failStartup(current, restored.failure);
       } else {
-        const diagnostic = await Effect.runPromise(
-          runtime.recoverModel(branch(ctx), modelHost(ctx)),
-        );
+        const diagnostic = await Effect.runPromise(runtime.recoverModel(current, modelHost(ctx)));
         if (diagnostic !== undefined) pi.sendMessage(diagnostic);
       }
     } catch (cause) {
       const diagnostic =
         cause instanceof Error ? cause.message : "Worker startup state is unreadable.";
-      runtime.failClosed(branch(ctx), diagnostic);
-      pi.sendMessage({
-        customType: "pi-workgraph-worker-diagnostic",
-        content: `[WORKGRAPH WORKER STARTUP FAILED]\n${diagnostic}\nOnly a truthful failed report is permitted.`,
-        display: false,
-      });
+      failStartup(branch(ctx), diagnostic);
     }
     reconcileTools();
   });

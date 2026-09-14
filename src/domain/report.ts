@@ -84,18 +84,9 @@ const ImplementationChangedInputSchema = Type.Object(
   },
   { additionalProperties: false },
 );
-const ImplementationChangedReportSchema = ImplementationChangedInputSchema;
-const ImplementationReportInputSchema = Type.Union(
-  [
-    ImplementationChangedInputSchema,
-    ImplementationNoChangeReportSchema,
-    ImplementationIncompleteReportSchema,
-  ],
-  { type: "object" },
-);
 const ImplementationReportSchema = Type.Union(
   [
-    ImplementationChangedReportSchema,
+    ImplementationChangedInputSchema,
     ImplementationNoChangeReportSchema,
     ImplementationIncompleteReportSchema,
   ],
@@ -104,13 +95,9 @@ const ImplementationReportSchema = Type.Union(
 const WorkerReportInputSchema = Type.Union([
   ResearchReportSchema,
   ReviewReportSchema,
-  ImplementationReportInputSchema,
-]);
-export const WorkerReportSchema = Type.Union([
-  ResearchReportSchema,
-  ReviewReportSchema,
   ImplementationReportSchema,
 ]);
+export const WorkerReportSchema = WorkerReportInputSchema;
 
 export type WorkerReportInput = Static<typeof WorkerReportInputSchema>;
 export type WorkerReport = Static<typeof WorkerReportSchema>;
@@ -124,7 +111,7 @@ export function reportSchemaForMode(mode: WorkerSessionMode) {
     case "review":
       return ReviewReportSchema;
     case "implementation":
-      return ImplementationReportInputSchema;
+      return ImplementationReportSchema;
   }
 }
 

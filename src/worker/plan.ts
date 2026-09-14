@@ -72,7 +72,7 @@ export class WorkerContractError extends Data.TaggedError("WorkerContractError")
   readonly message: string;
 }> {}
 
-function contractFailure(message: string) {
+export function contractFailure(message: string) {
   return Effect.fail(new WorkerContractError({ message }));
 }
 

@@ -57,38 +57,6 @@ function savedCalmChoice(
   return saved.data.on;
 }
 
-interface CalmSessionStart {
-  readonly isCurrent: () => boolean;
-  readonly appendSavedChoice: ((on: boolean) => void) | undefined;
-  readonly setOn: (on: boolean) => void;
-  readonly loadRuntime: () => Promise<CalmChatRuntime>;
-  readonly attach: (runtime: CalmChatRuntime) => void;
-  readonly setReady: (ready: boolean) => void;
-  readonly diagnose: Diagnostic;
-  readonly syncChrome: () => void;
-}
-
-/** Apply one resolved Calm startup choice: load the live runtime, attach, and publish chrome. */
-// oxlint-disable-next-line effecttsgo/async-function -- Loading the running Pi module is a native dynamic import that must settle before attachment.
-async function startCalmSession(start: CalmSessionStart, on: boolean): Promise<void> {
-  if (!start.isCurrent()) return;
-  start.appendSavedChoice?.(on);
-  start.setOn(on);
-  try {
-    const chatRuntime = await start.loadRuntime();
-    if (!start.isCurrent()) return;
-    start.attach(chatRuntime);
-    start.setReady(true);
-  } catch (error) {
-    // A superseded session's rejection must not mutate, detach, or report through the current one.
-    if (!start.isCurrent()) return;
-    start.setReady(false);
-    start.setOn(false);
-    start.diagnose(error instanceof Error ? error.message : String(error));
-  }
-  start.syncChrome();
-}
-
 /** Load the saved startup default, reporting a read failure once as a non-fatal warning. */
 function loadDefaultCalm(
   ui: ExtensionUIContext,
@@ -139,9 +107,8 @@ export function installCalmMode(
   let statusPublished = false;
   let workingHidden = false;
   let requestWidgetRender: (() => void) | undefined;
-  // Dedupe within one session generation so a real incompatibility is reported again in a later
-  // session instead of being suppressed for the process lifetime.
-  const diagnosed = new Map<string, number>();
+  // Report each real incompatibility once per session.
+  const diagnosed = new Set<string>();
   let activityTracker: ReturnType<typeof createCalmActivityTracker>;
 
   const activity = (): CalmActivityState => ({
@@ -152,8 +119,8 @@ export function installCalmMode(
     ...activityTracker.snapshot(),
   });
   const pulsing = (): boolean => state.on && coordinatorActive && !waitingForInput;
-  const renderSignature = (): string =>
-    JSON.stringify([activity(), pulsing() ? frame % 4 < 2 : false]);
+  const renderSignature = (current: CalmActivityState): string =>
+    JSON.stringify([current, pulsing() ? frame % 4 < 2 : false]);
   const stopTimer = (): void => {
     if (timer !== undefined) clearInterval(timer);
     timer = undefined;
@@ -170,11 +137,16 @@ export function installCalmMode(
     requestWidgetRender = undefined;
   };
   const syncWidget = (): void => {
-    if (ui === undefined || !state.on || !isCalmActivityActive(activity())) {
+    if (ui === undefined || !state.on) {
       clearWidget();
       return;
     }
-    const signature = renderSignature();
+    const current = activity();
+    if (!isCalmActivityActive(current)) {
+      clearWidget();
+      return;
+    }
+    const signature = renderSignature(current);
     if (widgetVisible) {
       if (signature === widgetSignature) return;
       widgetSignature = signature;
@@ -234,8 +206,8 @@ export function installCalmMode(
   };
   // Calm becomes unavailable only for a real incompatibility that disables the projection.
   const diagnose: Diagnostic = (message) => {
-    if (diagnosed.get(message) === generation) return;
-    diagnosed.set(message, generation);
+    if (diagnosed.has(message)) return;
+    diagnosed.add(message);
     const diagnosedGeneration = generation;
     queueMicrotask(() => {
       // A stale failure must not disable a newer attachment or rewrite current chrome.
@@ -251,6 +223,7 @@ export function installCalmMode(
   };
   const shutdown = (): void => {
     generation += 1;
+    diagnosed.clear();
     state.on = false;
     activityTracker.clear();
     stopTimer();
@@ -290,6 +263,30 @@ export function installCalmMode(
       onIncompatible: diagnose,
     });
   };
+  // Loading the running Pi module is a native dynamic import that must settle before attachment.
+  // oxlint-disable-next-line effecttsgo/async-function
+  const startSession = async (
+    currentGeneration: number,
+    on: boolean,
+    appendSavedChoice: ((on: boolean) => void) | undefined,
+  ): Promise<void> => {
+    if (currentGeneration !== generation) return;
+    appendSavedChoice?.(on);
+    state.on = on;
+    try {
+      const chatRuntime = await loadRuntime();
+      if (currentGeneration !== generation) return;
+      attachProjection(chatRuntime);
+      adapterReady = true;
+    } catch (error) {
+      // A superseded session's rejection must not mutate or report through the current one.
+      if (currentGeneration !== generation) return;
+      adapterReady = false;
+      state.on = false;
+      diagnose(error instanceof Error ? error.message : String(error));
+    }
+    syncChrome();
+  };
 
   pi.on("session_start", (_event, ctx) => {
     shutdown();
@@ -304,25 +301,12 @@ export function installCalmMode(
         ? loadDefaultCalm(ctx.ui, preferences, () => currentGeneration === generation)
         : Promise.resolve(sessionChoice);
     return initial.then((on) =>
-      startCalmSession(
-        {
-          isCurrent: () => currentGeneration === generation,
-          appendSavedChoice:
-            sessionChoice === undefined
-              ? (value) => pi.appendEntry(CALM_SESSION_ENTRY, { sessionId, on: value })
-              : undefined,
-          setOn: (value) => {
-            state.on = value;
-          },
-          loadRuntime,
-          attach: attachProjection,
-          setReady: (ready) => {
-            adapterReady = ready;
-          },
-          diagnose,
-          syncChrome,
-        },
+      startSession(
+        currentGeneration,
         on,
+        sessionChoice === undefined
+          ? (value) => pi.appendEntry(CALM_SESSION_ENTRY, { sessionId, on: value })
+          : undefined,
       ),
     );
   });

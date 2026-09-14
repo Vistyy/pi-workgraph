@@ -26,8 +26,10 @@ const NotepadParameters = Type.Union([
 type NotepadEntry = Static<typeof NotepadEntrySchema>;
 
 function currentMemo(ctx: ExtensionContext): string {
-  for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
-    if (entry.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
+  const branch = ctx.sessionManager.getBranch();
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch.at(index);
+    if (entry?.type !== "custom" || entry.customType !== ENTRY_TYPE) continue;
     return Value.Check(NotepadEntrySchema, entry.data)
       ? Value.Decode(NotepadEntrySchema, entry.data).text
       : "";

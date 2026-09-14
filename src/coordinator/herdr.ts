@@ -1,12 +1,10 @@
-/* oxlint-disable effecttsgo/process-env, anti-slop/require-safety-comment-for-type-assertion -- This host adapter snapshots its executable environment and casts only after TypeBox validation. */
 /* biome-ignore-all lint/complexity/noExcessiveCognitiveComplexity: observation performs one cohesive exact native identity proof. */
 /* biome-ignore-all lint/complexity/useLiteralKeys: ProcessEnv keys require indexed access under noPropertyAccessFromIndexSignature. */
-import * as NodeChildProcessSpawner from "@effect/platform-node-shared/NodeChildProcessSpawner";
-import { Data, Effect, Layer, Stream } from "effect";
+import { Data, Effect, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
-import { liveLayer } from "../node-platform.js";
+import { childProcessLayer } from "../node-platform.js";
 import { herdrWorkerName, herdrWorkerTabLabel, type WorkerNamingContext } from "./worker-naming.js";
 
 const Text = Type.String({ minLength: 1 });
@@ -56,8 +54,6 @@ const SuccessEnvelope = Type.Object({ result: Type.Object({}) });
 const ErrorEnvelope = Type.Object({
   error: Type.Object({ code: Text, message: Type.Optional(Type.String()) }),
 });
-const childProcessLayer = NodeChildProcessSpawner.layer.pipe(Layer.provide(liveLayer));
-
 export interface WorkerRequest extends WorkerNamingContext {
   readonly workspaceId: string;
   readonly cwd: string;
@@ -95,6 +91,8 @@ export class HerdrError extends Data.TaggedError("HerdrError")<{
 export class HerdrCliRuntime {
   readonly available: boolean;
   constructor(
+    // Herdr launch configuration belongs to this exact host adapter.
+    // oxlint-disable-next-line effecttsgo/process-env
     private readonly executable = process.env["PI_WORKGRAPH_HERDR_BIN"] ?? "herdr",
     environment: NodeJS.ProcessEnv = process.env,
   ) {
@@ -390,6 +388,7 @@ function decode<const S extends TSchema>(
       }),
     );
   }
+  // SAFETY: Value.Check establishes the complete supplied TypeBox schema before this decode cast.
   return Value.Check(schema, value)
     ? Effect.succeed(Value.Decode(schema, value) as Static<S>)
     : Effect.fail(

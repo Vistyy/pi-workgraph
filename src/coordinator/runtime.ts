@@ -1,6 +1,7 @@
-/* oxlint-disable effecttsgo/node-builtin-import, typescript/no-this-alias, anti-slop/no-conditional-empty-object-spread -- Effect owns serialization; omission and host presentation stay explicit at their narrow boundaries. */
+/* oxlint-disable typescript/no-this-alias -- Effect generators retain the runtime owner while yielding serialized lifecycle operations. */
 /* biome-ignore-all lint/complexity/noExcessiveCognitiveComplexity: lifecycle ordering is intentionally visible in cohesive flow owners. */
 import { randomUUID } from "node:crypto";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Worker session and repository paths are host identities.
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Clock, Data, Effect, Queue, type Scope, Semaphore } from "effect";
@@ -792,6 +793,7 @@ export class SessionRuntime {
         taskId: task.id,
         attemptId: attempt.id,
         role: contract.kind,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- Only implementation assignments carry an executor target.
         ...(attempt.spec.selection.kind === "implementation"
           ? { executor: attempt.spec.selection.executor }
           : {}),
@@ -874,10 +876,15 @@ export class SessionRuntime {
     operation: string,
   ): Effect.Effect<ReadyWorker, RuntimeError> {
     return this.observe(attempt).pipe(
-      Effect.flatMap((observed) =>
-        observed.state === "agent" && (observed.status === "idle" || observed.status === "working")
-          ? Effect.succeed({ ...observed, status: observed.status })
-          : fail(operation, `Exact Worker is not ready (${observed.state}).`),
+      Effect.filterOrFail(
+        (observed): observed is ReadyWorker =>
+          observed.state === "agent" &&
+          (observed.status === "idle" || observed.status === "working"),
+        (observed) =>
+          new RuntimeError({
+            operation,
+            message: `Exact Worker is not ready (${observed.state}).`,
+          }),
       ),
     );
   }
@@ -891,6 +898,7 @@ export class SessionRuntime {
     return {
       attemptId: attempt.id,
       spec: attempt.spec,
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- Absence remains omitted across the exact repository boundary.
       ...(attempt.output === undefined ? {} : { output: attempt.output }),
       target,
       ...detachedPlacement({ agentDir: this.agentDir, attemptId: attempt.id }),
@@ -924,7 +932,10 @@ export class SessionRuntime {
       function* (this: SessionRuntime) {
         const at = yield* Clock.currentTimeMillis;
         const read = yield* Effect.result(
-          this.serialized("read unsettled", () => this.store.unsettled()),
+          this.serializedEffect(
+            "read unsettled",
+            Effect.sync(() => this.store.unsettled()),
+          ),
         );
         if (read._tag === "Failure") {
           const prior = this.blockers.get("runtime");
@@ -976,9 +987,6 @@ export class SessionRuntime {
     this.publishActiveWorkers();
     return Queue.offer(this.wakeSignal, undefined).pipe(Effect.asVoid);
   }
-  private serialized<A>(operation: string, run: () => A): Effect.Effect<A, RuntimeError> {
-    return this.serializedEffect(operation, host(operation, run));
-  }
   private serializedEffect<A>(
     operation: string,
     value: Effect.Effect<A, RuntimeError>,
@@ -1029,15 +1037,4 @@ function isExpected(cause: unknown): cause is RuntimeError | StoreError | GitErr
     cause instanceof GitError ||
     cause instanceof HerdrError
   );
-}
-function host<A>(operation: string, run: () => A): Effect.Effect<A, RuntimeError> {
-  return Effect.try({
-    try: run,
-    catch: (cause) =>
-      isExpected(cause)
-        ? runtimeError(operation, cause)
-        : (() => {
-            throw cause;
-          })(),
-  });
 }

@@ -3,13 +3,10 @@
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import * as NodeChildProcessSpawner from "@effect/platform-node-shared/NodeChildProcessSpawner";
-import { Data, Effect, Layer, Stream } from "effect";
+import { Data, Effect, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import type { AttemptOutput, AttemptSpec, TaskTarget } from "./domain/records.js";
-import { liveLayer } from "./node-platform.js";
-
-const childProcessLayer = NodeChildProcessSpawner.layer.pipe(Layer.provide(liveLayer));
+import { childProcessLayer } from "./node-platform.js";
 
 type RepositoryTarget = Extract<TaskTarget, { kind: "repository" }>;
 export interface RepositoryOperation {
@@ -85,7 +82,7 @@ export function resolveTaskTarget(
       target: { kind: "repository" as const, checkoutRoot, commonDir },
       commit,
     };
-  }).pipe(Effect.provide(childProcessLayer));
+  });
 }
 
 export function resolveRevision(
@@ -96,7 +93,6 @@ export function resolveRevision(
     Effect.flatMap(() =>
       exactCommit(target.commonDir, revision, "resolve revision", target.checkoutRoot),
     ),
-    Effect.provide(childProcessLayer),
   );
 }
 
@@ -111,7 +107,7 @@ export function validateRetainedCandidate(
       return yield* fail("extend candidate", "Candidate parent has no retained output.");
     yield* requireCompactedCandidate(operation);
     yield* requireExactRef(operation.target.commonDir, operation.outputRef, output.tip);
-  }).pipe(Effect.provide(childProcessLayer));
+  });
 }
 
 export function isAncestor(
@@ -119,7 +115,7 @@ export function isAncestor(
   parent: string,
   child: string,
 ): Effect.Effect<boolean, GitError> {
-  return ancestry(target.commonDir, parent, child).pipe(Effect.provide(childProcessLayer));
+  return ancestry(target.commonDir, parent, child);
 }
 
 export function detachedPlacement(input: { agentDir: string; attemptId: string }) {
@@ -152,7 +148,7 @@ export function ensureDetachedWorktree(
     const state = yield* ownedCheckout(operation, true);
     if (state.head !== base || state.dirty)
       return yield* fail("create worktree", "Created worktree failed exact post-validation.");
-  }).pipe(Effect.provide(childProcessLayer));
+  });
 }
 
 function recoverPlacement(
@@ -207,7 +203,7 @@ export function classifyOutput(
         ? "Dirty output is preserved for explicit disposition."
         : "Candidate output is retained.",
     };
-  }).pipe(Effect.provide(childProcessLayer));
+  });
 }
 
 function classifyAbsentOutput(
@@ -234,7 +230,7 @@ export function prepareApplication(
     return yield* output?.kind === "applying"
       ? prepareApplicationRetry(operation, output)
       : prepareRetainedApplication(operation);
-  }).pipe(Effect.provide(childProcessLayer));
+  });
 }
 
 function prepareApplicationRetry(
@@ -323,7 +319,7 @@ export function applyOutput(
     )
       return yield* fail("apply output", "Applied destination failed exact post-validation.");
     return { kind: "applied" as const, revision, cleanupTip: output.sourceTip };
-  }).pipe(Effect.provide(childProcessLayer));
+  });
 }
 
 function applicationRevision(
@@ -370,7 +366,7 @@ export function cleanupAppliedOutput(
     yield* deleteExactRef(operation.target.commonDir, operation.outputRef, output.cleanupTip);
     const { cleanupTip: _cleanupTip, ...cleaned } = output;
     return cleaned;
-  }).pipe(Effect.provide(childProcessLayer));
+  });
 }
 
 export function prepareDiscard(
@@ -427,7 +423,7 @@ export function discardOutput(
     return output.applied === undefined
       ? { kind: "discarded" as const, reason: output.reason }
       : { kind: "applied" as const, ...output.applied, cleanupReason: output.reason };
-  }).pipe(Effect.provide(childProcessLayer));
+  });
 }
 
 function baseCommit(spec: AttemptSpec): string {
@@ -668,11 +664,7 @@ function exactCommit(
       (commit) => /^[0-9a-f]{40,64}$/.test(commit),
       () => error(operation, "Revision did not resolve to one exact commit."),
     ),
-    Effect.mapError((cause) =>
-      cause.operation === operation
-        ? cause
-        : error(operation, "Revision did not resolve to one exact commit."),
-    ),
+    Effect.mapError(() => error(operation, "Revision did not resolve to one exact commit.")),
   );
 }
 
@@ -770,7 +762,10 @@ function gitResult(cwd: string, args: string[]): Effect.Effect<CommandResult, Gi
   return command(["-C", cwd, ...args]);
 }
 function command(args: string[]): Effect.Effect<CommandResult, GitError> {
-  const process = ChildProcess.make("git", args, { cwd: processCwd(), stdin: "ignore" });
+  const process = ChildProcess.make("git", args, {
+    cwd: globalThis.process.cwd(),
+    stdin: "ignore",
+  });
   return Effect.scoped(
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -819,7 +814,4 @@ function canonicalFuturePath(path: string): string {
     ancestor = dirname(ancestor);
   }
   return join(realpathSync(ancestor), ...missing);
-}
-function processCwd(): string {
-  return globalThis.process.cwd();
 }

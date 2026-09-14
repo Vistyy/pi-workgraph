@@ -315,10 +315,10 @@ class ChatProjectionAdapter implements CalmProjection {
 
   #assistant(source: AssistantMessageComponent): Component | undefined {
     const state = readAssistantState(source);
-    const text = state.message?.content.filter(isVisibleTextPart).map((part) => part.text) ?? [];
-    const visible =
-      text.length > 0 || (state.message !== undefined && hasTerminalNotice(state.message));
-    if (state.message === undefined || !visible) return undefined;
+    if (state.message === undefined) return undefined;
+    const visibleContent = state.message.content.filter(isVisibleTextPart);
+    const text = visibleContent.map((part) => part.text);
+    if (text.length === 0 && !hasTerminalNotice(state.message)) return undefined;
     let cached = this.#assistantCache.get(source);
     if (cached === undefined) {
       cached = { projected: new this.#runtime.assistant(), snapshot: undefined };
@@ -334,7 +334,7 @@ class ChatProjectionAdapter implements CalmProjection {
     if (!sameSnapshot(cached.snapshot, snapshot)) {
       copyPresentation(source, cached.projected);
       cached.projected.updateContent(
-        { ...state.message, content: state.message.content.filter(isVisibleTextPart) },
+        { ...state.message, content: visibleContent },
         state.streaming,
       );
       cached.snapshot = snapshot;

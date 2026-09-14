@@ -116,12 +116,10 @@ function decodeModelPolicyEffect(
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Policy JSON is unknown until this strict boundary accepts it.
 function decodeModelPolicy(value: unknown): ModelPolicy {
-  if (!Value.Check(ModelPolicySchema, value)) {
-    const issue = Value.Errors(ModelPolicySchema, value)[0];
-    const location =
-      issue?.instancePath !== undefined && issue.instancePath !== "" ? issue.instancePath : "/";
-    const detail = issue?.message ?? "does not match the policy schema";
-    throw new Error(`Invalid Workgraph model policy at ${location}: ${detail}.`);
+  const issue = Value.Errors(ModelPolicySchema, value)[0];
+  if (issue !== undefined) {
+    const location = issue.instancePath === "" ? "/" : issue.instancePath;
+    throw new Error(`Invalid Workgraph model policy at ${location}: ${issue.message}.`);
   }
   // SAFETY: strict schema validation establishes the complete shape; tuple casts are checked below as nonempty lists.
   const policy = Value.Decode(ModelPolicySchema, value) as ModelPolicy;

@@ -48,7 +48,6 @@ function parseGlobalSettingsDocument(value: unknown, path: string): GlobalSettin
 
 function workgraphSettings(
   settings: GlobalSettingsDocument,
-  section: "worker",
   path: string,
 ): WorkgraphSettingsDocument | undefined {
   const workgraph = settings["pi-workgraph"];
@@ -57,13 +56,13 @@ function workgraphSettings(
     throw new WorkgraphSettingsError({
       operation: "decode",
       path,
-      message: `Invalid pi-workgraph.${section} settings in ${path}.`,
+      message: `Invalid pi-workgraph.worker settings in ${path}.`,
     });
   return Value.Decode(WorkgraphSettingsDocumentSchema, workgraph);
 }
 
 function decodeWorker(value: GlobalSettingsDocument, path: string): readonly string[] {
-  const worker = workgraphSettings(value, "worker", path)?.worker;
+  const worker = workgraphSettings(value, path)?.worker;
   if (worker === undefined) return [];
   if (!Value.Check(WorkerSettingsSchema, worker))
     throw new WorkgraphSettingsError({

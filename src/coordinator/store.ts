@@ -1,4 +1,5 @@
 /* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, typescript/no-unsafe-return -- node:sqlite rows and TypeBox outputs are decoded at this private host boundary. */
+/* biome-ignore-all lint/complexity/useLiteralKeys: SQLite rows require indexed access under noPropertyAccessFromIndexSignature. */
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";

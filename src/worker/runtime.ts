@@ -1,4 +1,3 @@
-/* oxlint-disable typescript/no-this-alias -- Effect generators retain the runtime owner while yielding host failures. */
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Data, Effect, Result } from "effect";
 import { Type } from "typebox";
@@ -17,10 +16,16 @@ import {
   type WorkerPhase,
   workerSystemPolicy,
 } from "./context.js";
-import { WorkerContractError, WorkerPlanState, type WorkerPlanToolInput } from "./plan.js";
+import {
+  contractFailure,
+  type WorkerContractError,
+  WorkerPlanState,
+  type WorkerPlanToolInput,
+} from "./plan.js";
 import type { WorkerRole } from "./session.js";
 
 const MAX_PLAN_REMINDERS = 2;
+const NON_SUCCESS_STOP_REASONS = new Set(["error", "aborted", "pending"]);
 const REMINDER = "pi-workgraph-todo-reminder";
 const MODEL_MARKER = "pi-workgraph-effective-model";
 const SETTLED_MARKER = "pi-workgraph-agent-settled";
@@ -96,11 +101,12 @@ export class WorkerRuntime {
       return Result.fail(`Worker setting cannot disable protected tool ${invalid}.`);
     this.assignment = assignment.success;
     this.plan = new WorkerPlanState();
-    this.plan.restore(this.attemptBranch(branch));
-    this.directEditSeen = hasSuccessfulDirectEdit(this.attemptBranch(branch));
-    this.executorMarkerSeen = this.hasMarker(branch, EXECUTOR_START_ENTRY);
+    const scoped = this.attemptBranch(branch);
+    this.plan.restore(scoped);
+    this.directEditSeen = hasSuccessfulDirectEdit(scoped);
+    this.executorMarkerSeen = hasEntry(scoped, "custom", EXECUTOR_START_ENTRY);
     this.phase = this.executorMarkerSeen ? "executor" : "guide";
-    this.cutoverFailed = this.hasMessage(branch, EXECUTOR_FAILURE_MESSAGE);
+    this.cutoverFailed = hasEntry(scoped, "custom_message", EXECUTOR_FAILURE_MESSAGE);
     this.disabledTools = new Set(configuredDisabledTools);
     return Result.succeed(undefined);
   }
@@ -137,9 +143,10 @@ export class WorkerRuntime {
     if (this.settingsError !== undefined) return true;
     if (name === "workgraph_plan") return this.role !== "implementation";
     if (this.disabledTools.has(name)) return true;
-    if ((name === "edit" || name === "write") && this.cutoverFailed) return true;
-    if (name === "edit" || name === "write")
+    if (name === "edit" || name === "write") {
+      if (this.cutoverFailed) return true;
       return this.role !== "implementation" && this.role !== "experiment";
+    }
     return false;
   }
   allowedTools(activeTools: readonly string[]): string[] {
@@ -156,6 +163,8 @@ export class WorkerRuntime {
   }
 
   recoverModel(branch: readonly WorkerEntry[], host: WorkerModelHost) {
+    // Effect generators retain the runtime owner while yielding host failures.
+    // oxlint-disable-next-line typescript/no-this-alias
     const self = this;
     return Effect.gen(function* () {
       if (self.role !== "implementation" || self.assignment === undefined) return undefined;
@@ -180,6 +189,8 @@ export class WorkerRuntime {
   }
 
   private liveCutover(host: WorkerModelHost) {
+    // Effect generators retain the runtime owner while yielding host failures.
+    // oxlint-disable-next-line typescript/no-this-alias
     const self = this;
     return Effect.gen(function* () {
       if (
@@ -225,7 +236,8 @@ export class WorkerRuntime {
     if (model !== undefined) this.appendEntry(MODEL_MARKER, { model, thinking });
   }
   settleAgent(branch: readonly WorkerEntry[], send: MessageSink): void {
-    if (this.hasMarker(branch, SETTLED_MARKER) || this.scheduleReminder(branch, send)) return;
+    const scoped = this.attemptBranch(branch);
+    if (hasEntry(scoped, "custom", SETTLED_MARKER) || this.scheduleReminder(scoped, send)) return;
     this.appendEntry(SETTLED_MARKER, {});
   }
   systemPolicy(): string {
@@ -234,11 +246,8 @@ export class WorkerRuntime {
   completionChecklist(messages: readonly ContextMessage[]): string | undefined {
     const executor = this.assignment?.details.executor;
     if (this.phase !== "executor" || executor === undefined) return undefined;
-    const hasExecutorAssistant = messages.some(
-      (message) =>
-        message.role === "assistant" &&
-        `${message.provider}/${message.model}` === executor.model &&
-        !["error", "aborted", "pending"].includes(message.stopReason ?? ""),
+    const hasExecutorAssistant = messages.some((message) =>
+      isSuccessfulExecutorAssistant(message, executor.model),
     );
     return hasExecutorAssistant
       ? undefined
@@ -275,9 +284,10 @@ export class WorkerRuntime {
       params.status === "completed" &&
       params.outcome === "changed"
     ) {
-      if (this.phase !== "executor" || !this.hasMarker(branch, EXECUTOR_START_ENTRY))
+      const scoped = this.attemptBranch(branch);
+      if (this.phase !== "executor" || !hasEntry(scoped, "custom", EXECUTOR_START_ENTRY))
         return contractFailure("Changed implementation requires guide-to-executor cutover.");
-      if (!hasLaterExecutorAssistant(this.attemptBranch(branch), this.assignment?.details.executor))
+      if (!hasLaterExecutorAssistant(scoped, this.assignment?.details.executor))
         return contractFailure(
           "Changed implementation requires a later successful executor assistant message.",
         );
@@ -295,15 +305,15 @@ export class WorkerRuntime {
     return this.settingsError;
   }
 
-  private scheduleReminder(branch: readonly WorkerEntry[], send: MessageSink): boolean {
+  private scheduleReminder(scoped: readonly WorkerEntry[], send: MessageSink): boolean {
     if (
       this.role !== "implementation" ||
       this.phase !== "executor" ||
       this.plan?.hasActionableItems() !== true ||
-      hasTerminalReport(this.attemptBranch(branch))
+      hasTerminalReport(scoped)
     )
       return false;
-    const count = this.attemptBranch(branch).filter(
+    const count = scoped.filter(
       (entry) => entry.type === "custom_message" && entry.customType === REMINDER,
     ).length;
     if (count >= MAX_PLAN_REMINDERS) return false;
@@ -323,20 +333,17 @@ export class WorkerRuntime {
     );
     return start < 0 ? [] : entries.slice(start);
   }
-  private hasMarker(entries: readonly WorkerEntry[], type: string): boolean {
-    return this.attemptBranch(entries).some(
-      (entry) => entry.type === "custom" && entry.customType === type,
-    );
-  }
-  private hasMessage(entries: readonly WorkerEntry[], type: string): boolean {
-    return this.attemptBranch(entries).some(
-      (entry) => entry.type === "custom_message" && entry.customType === type,
-    );
-  }
 }
 
 function reportMode(role: WorkerRole): WorkerSessionMode {
   return role === "review" ? "review" : role === "implementation" ? "implementation" : "research";
+}
+function hasEntry(
+  entries: readonly WorkerEntry[],
+  entryType: "custom" | "custom_message",
+  customType: string,
+): boolean {
+  return entries.some((entry) => entry.type === entryType && entry.customType === customType);
 }
 function hasSuccessfulDirectEdit(entries: readonly WorkerEntry[]): boolean {
   return entries.some(
@@ -356,27 +363,27 @@ function hasTerminalReport(entries: readonly WorkerEntry[]): boolean {
       entry.message.isError !== true,
   );
 }
+function isSuccessfulExecutorAssistant(message: ContextMessage, model: string): boolean {
+  return (
+    message.role === "assistant" &&
+    `${message.provider}/${message.model}` === model &&
+    !NON_SUCCESS_STOP_REASONS.has(message.stopReason ?? "")
+  );
+}
 function hasLaterExecutorAssistant(
   entries: readonly WorkerEntry[],
   executor: { readonly model: string; readonly thinking: string } | undefined,
 ): boolean {
-  if (executor === undefined) return false;
+  if (executor === undefined || executor.model.indexOf("/") <= 0) return false;
   const boundary = entries.findIndex(
     (entry) => entry.type === "custom" && entry.customType === EXECUTOR_START_ENTRY,
   );
-  const slash = executor.model.indexOf("/");
-  return (
-    boundary >= 0 &&
-    entries
-      .slice(boundary + 1)
-      .some(
-        (entry) =>
-          entry.type === "message" &&
-          entry.message.role === "assistant" &&
-          `${entry.message.provider}/${entry.message.model}` === executor.model &&
-          !["error", "aborted", "pending"].includes(entry.message.stopReason ?? ""),
-      ) &&
-    slash > 0
+  if (boundary < 0) return false;
+  return entries.some(
+    (entry, index) =>
+      index > boundary &&
+      entry.type === "message" &&
+      isSuccessfulExecutorAssistant(entry.message, executor.model),
   );
 }
 function firstActualModel(entries: readonly WorkerEntry[]) {
@@ -417,34 +424,29 @@ function selectTarget(
 ): Effect.Effect<void, WorkerHostError | WorkerContractError> {
   const slash = model.indexOf("/");
   if (slash <= 0) return contractFailure(`Invalid Worker model: ${model}`);
-  const self = { model, thinking };
   return Effect.gen(function* () {
-    if (!selected(host, self.model, self.thinking)) {
+    if (!selected(host, model, thinking)) {
       const result = yield* Effect.tryPromise({
-        try: () => host.selectModel(self.model.slice(0, slash), self.model.slice(slash + 1)),
-        catch: () => new WorkerHostError({ message: `Pi could not select model ${self.model}.` }),
+        try: () => host.selectModel(model.slice(0, slash), model.slice(slash + 1)),
+        catch: () => new WorkerHostError({ message: `Pi could not select model ${model}.` }),
       });
       if (result !== "selected")
         return yield* new WorkerHostError({
           message:
             result === "missing"
-              ? `Worker model is unavailable: ${self.model}`
-              : `Worker model has no usable credentials: ${self.model}`,
+              ? `Worker model is unavailable: ${model}`
+              : `Worker model has no usable credentials: ${model}`,
         });
       yield* Effect.try({
-        try: () => host.setThinking(self.thinking),
-        catch: () =>
-          new WorkerHostError({ message: `Pi could not select thinking ${self.thinking}.` }),
+        try: () => host.setThinking(thinking),
+        catch: () => new WorkerHostError({ message: `Pi could not select thinking ${thinking}.` }),
       });
     }
-    if (!selected(host, self.model, self.thinking))
+    if (!selected(host, model, thinking))
       return yield* new WorkerHostError({
         message: "Pi did not apply the exact model and clamped thinking target.",
       });
   });
-}
-function contractFailure(message: string) {
-  return Effect.fail(new WorkerContractError({ message }));
 }
 function bounded(message: string): string {
   return message.replace(/\s+/g, " ").slice(0, 300);
