@@ -17,7 +17,7 @@ Exercise the native SQLite store through separate exact-session instances. Estab
 
 Use actual rows and transaction failure, not only TypeBox value checks. A decoder test should mutate the one field whose supported-read rejection is being established, then remove the disposable database. Do not build a durable corruption matrix: arbitrary external database tampering is not a supported recovery interface.
 
-There is no verification obligation for migrations, old Workstream compatibility, aggregate reconstruction, global discovery, leases, or concurrent processes sharing one Pi session. Tests for those removed responsibilities should be deleted rather than translated.
+Do not add migration, aggregate-reconstruction, cross-session-discovery, lease, or concurrent same-session process fixtures unless those become supported responsibilities.
 
 ## Worker lifecycle
 

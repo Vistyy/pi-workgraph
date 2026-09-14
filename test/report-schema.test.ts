@@ -65,13 +65,5 @@ void test("live report schemas reject undeclared top-level and nested sensitive 
       false,
       `${mode} finding extra`,
     );
-    assert.equal(
-      Value.Check(schema, {
-        ...report,
-        findings: [{ ...report.findings[0], envelopeImpact: "none" }],
-      }),
-      false,
-      `${mode} superseded finding classification`,
-    );
   }
 });

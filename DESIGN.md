@@ -17,8 +17,6 @@ A Task is immutable and owns a contract plus one resolved target. An Attempt is 
 
 An Outcome records a reported, unreported, or cancelled semantic result and the effective model targets observed in the Worker session. It does not represent repository custody or authorize a Git operation. Effective models may be empty when execution never established one, and may differ from the frozen selection when Pi's actual session trajectory differs.
 
-There is no Workstream, Intent, global discovery, lease, migration, compatibility, publication, Handoff, or completion subsystem in this design.
-
 ## Record store
 
 All coordinator sessions share one private `<agentDir>/workgraph/workgraph.sqlite` file. Exact session identity partitions every supported query and mutation. The database has only two strict tables:

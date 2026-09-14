@@ -18,6 +18,7 @@ import {
   type AttemptRecord,
   type AttemptSelection,
   CommitSchema,
+  ReviewSubjectSchema,
   type Task,
   type TaskContract,
   TaskIdSchema,
@@ -32,6 +33,7 @@ import {
   type ModelPolicy,
   modelPolicyPath,
   resolveSelection,
+  SelectionRequestSchema,
 } from "../src/model-policy.js";
 import { installNotepad } from "../src/notepad.js";
 import { RecordStore } from "../src/storage/record-store.js";
@@ -43,27 +45,8 @@ const CandidateOf = Type.Optional(
     { additionalProperties: false },
   ),
 );
-const Selection = Type.Optional(
-  Type.Object(
-    {
-      count: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })),
-      distinctModels: Type.Optional(Type.Boolean()),
-    },
-    { additionalProperties: false },
-  ),
-);
+const Selection = Type.Optional(SelectionRequestSchema);
 const TaskFields = { id: TaskIdSchema, cwd: Type.Optional(Text) };
-const ReviewSubject = Type.Union([
-  Type.Object({ kind: Type.Literal("attempt"), attemptId: Text }, { additionalProperties: false }),
-  Type.Object(
-    { kind: Type.Literal("comparison"), attemptIds: Type.Array(Text, { minItems: 2 }) },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    { kind: Type.Literal("revision"), revision: CommitSchema },
-    { additionalProperties: false },
-  ),
-]);
 const PageFields = {
   offset: Type.Optional(Type.Integer({ minimum: 0 })),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
@@ -286,7 +269,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         ...TaskFields,
         objective: Text,
         concern: Text,
-        subject: ReviewSubject,
+        subject: ReviewSubjectSchema,
         selection: Selection,
       },
       { additionalProperties: false },

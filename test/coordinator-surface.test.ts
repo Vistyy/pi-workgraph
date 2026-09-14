@@ -20,16 +20,6 @@ const accepted = [
   "workgraph_control",
   "workgraph_notepad",
 ] as const;
-const retired = [
-  "workgraph_intent",
-  "workgraph_handoff",
-  "workgraph_complete",
-  "workgraph_adopt",
-  "workgraph_suspend",
-  "workgraph_resume",
-  "workgraph_continue",
-] as const;
-
 async function fixture(available: boolean, workspaceId = available ? "workspace-exact" : null) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-coordinator-"));
   const root = join(parent, "repo");
@@ -62,14 +52,15 @@ async function fixture(available: boolean, workspaceId = available ? "workspace-
   };
 }
 
-void test("coordinator registers exactly nine strict final tools", async () => {
+void test("coordinator registers exactly nine strict tools", async () => {
   const f = await fixture(false);
   try {
-    for (const name of accepted) assert.ok(f.runner.getToolDefinition(name), name);
-    for (const name of retired) assert.equal(f.runner.getToolDefinition(name), undefined, name);
-
-    const registered = accepted.filter((name) => f.runner.getToolDefinition(name) !== undefined);
-    assert.equal(registered.length, 9);
+    const registered = f.runner
+      .getAllRegisteredTools()
+      .map((tool) => tool.definition.name)
+      .filter((name) => name.startsWith("workgraph_"))
+      .sort();
+    assert.deepEqual(registered, [...accepted].sort());
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(
@@ -85,10 +76,10 @@ void test("coordinator registers exactly nine strict final tools", async () => {
     );
     assert.equal(
       Value.Check(implement.parameters, {
-        taskId: "change",
+        id: "change",
         objective: "Change it",
         acceptance: ["Works"],
-        candidate: { attemptId: "old", mode: "extend" },
+        unexpected: true,
       }),
       false,
     );

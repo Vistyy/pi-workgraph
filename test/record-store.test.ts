@@ -64,19 +64,16 @@ function worker(overrides: Partial<WorkerState> = {}): WorkerState {
   };
 }
 
-test("record schemas reject superseded mutable and chronological fields", () => {
+test("record schemas accept exact current shapes and reject undeclared fields", () => {
   assert.equal(Value.Check(CommitSchema, "a".repeat(40)), true);
   assert.equal(Value.Check(CommitSchema, "a".repeat(64)), true);
   assert.equal(Value.Check(CommitSchema, "a".repeat(41)), false);
   assert.equal(Value.Check(CommitSchema, "A".repeat(40)), false);
   assert.equal(Value.Check(TaskSchema, directoryTask), true);
-  assert.equal(
-    Value.Check(TaskSchema, { ...directoryTask, createdAt: "2026-01-01T00:00:00.000Z" }),
-    false,
-  );
-  assert.equal(Value.Check(AttemptSpecSchema, { ...directorySpec, worker: worker() }), false);
+  assert.equal(Value.Check(TaskSchema, { ...directoryTask, unexpected: true }), false);
+  assert.equal(Value.Check(AttemptSpecSchema, { ...directorySpec, unexpected: true }), false);
   assert.equal(Value.Check(WorkerStateSchema, worker({ closed: true })), true);
-  assert.equal(Value.Check(WorkerStateSchema, { ...worker(), terminalId: "terminal" }), false);
+  assert.equal(Value.Check(WorkerStateSchema, { ...worker(), unexpected: true }), false);
 });
 
 test("RecordStore creates one exact database lazily", () => {

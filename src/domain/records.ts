@@ -18,7 +18,7 @@ const TaskTargetSchema = Type.Union([
   strict({ kind: Type.Literal("directory"), path: Text }),
   strict({ kind: Type.Literal("repository"), checkoutRoot: Text, commonDir: Text }),
 ]);
-const ReviewSubjectSchema = Type.Union([
+export const ReviewSubjectSchema = Type.Union([
   strict({ kind: Type.Literal("attempt"), attemptId: Text }),
   strict({
     kind: Type.Literal("comparison"),
