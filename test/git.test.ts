@@ -91,6 +91,24 @@ void test("target resolution preserves real nested Git identity and rejects inva
       GitError,
     );
 
+    const realAgent = join(plain, "real-agent");
+    const linkedAgent = join(plain, "linked-agent");
+    await mkdir(realAgent);
+    await symlink(realAgent, linkedAgent);
+    assert.equal(
+      detachedPlacement({ agentDir: linkedAgent, attemptId: "linked" }).worktreePath,
+      join(realAgent, "workgraph", "worktrees", "linked"),
+    );
+    const nestedAgent = join(plain, "nested-agent");
+    const realWorkgraph = join(plain, "real-workgraph");
+    await mkdir(nestedAgent);
+    await mkdir(realWorkgraph);
+    await symlink(realWorkgraph, join(nestedAgent, "workgraph"));
+    assert.equal(
+      detachedPlacement({ agentDir: nestedAgent, attemptId: "nested" }).worktreePath,
+      join(realWorkgraph, "worktrees", "nested"),
+    );
+
     const fixture = await repository();
     try {
       const nested = join(fixture.root, "nested");
@@ -107,6 +125,20 @@ void test("target resolution preserves real nested Git identity and rejects inva
         ),
         GitError,
       );
+      const symlinkedPlacement = detachedPlacement({
+        agentDir: linkedAgent,
+        attemptId: "symlinked",
+      });
+      const symlinkedOperation: RepositoryOperation = {
+        attemptId: "symlinked",
+        spec: initial(fixture.base),
+        target: fixture.target,
+        ...symlinkedPlacement,
+      };
+      await Effect.runPromise(ensureDetachedWorktree(symlinkedOperation));
+      assert.deepEqual(await Effect.runPromise(classifyOutput(symlinkedOperation)), {
+        kind: "no_output",
+      });
     } finally {
       await rm(fixture.parent, { recursive: true, force: true });
     }

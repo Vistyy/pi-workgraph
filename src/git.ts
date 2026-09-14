@@ -1,7 +1,8 @@
 /* oxlint-disable effecttsgo/node-builtin-import -- Git placement identity includes host filesystem paths. */
 
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, realpath, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import * as NodeChildProcessSpawner from "@effect/platform-node-shared/NodeChildProcessSpawner";
 import { Data, Effect, Layer, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
@@ -122,8 +123,9 @@ export function isAncestor(
 }
 
 export function detachedPlacement(input: { agentDir: string; attemptId: string }) {
+  const worktreeRoot = canonicalFuturePath(join(input.agentDir, "workgraph", "worktrees"));
   return {
-    worktreePath: join(input.agentDir, "workgraph", "worktrees", input.attemptId),
+    worktreePath: join(worktreeRoot, input.attemptId),
     outputRef: `refs/pi-workgraph/outputs/${input.attemptId}`,
   };
 }
@@ -808,6 +810,15 @@ function fail(operation: string, message: string): Effect.Effect<never, GitError
 }
 function error(operation: string, message: string): GitError {
   return new GitError({ operation, message });
+}
+function canonicalFuturePath(path: string): string {
+  const missing: string[] = [];
+  let ancestor = resolve(path);
+  while (!existsSync(ancestor)) {
+    missing.unshift(basename(ancestor));
+    ancestor = dirname(ancestor);
+  }
+  return join(realpathSync(ancestor), ...missing);
 }
 function processCwd(): string {
   return globalThis.process.cwd();

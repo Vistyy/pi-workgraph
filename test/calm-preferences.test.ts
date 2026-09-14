@@ -14,7 +14,7 @@ void test("Calm default persists across readers, atomically replaces, and reject
   const path = join(root, "workgraph", "calm-default");
   try {
     const first = calmPreferences(path);
-    assert.equal(await first.load(), false);
+    assert.equal(await first.load(), true);
     await first.save(true);
     assert.equal(await calmPreferences(path).load(), true);
     await calmPreferences(path).save(false);

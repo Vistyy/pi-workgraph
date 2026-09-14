@@ -26,7 +26,7 @@ export function calmPreferences(
             .readFileString(path)
             .pipe(
               Effect.catchTag("PlatformError", (error) =>
-                error.reason._tag === "NotFound" ? Effect.succeed("off") : Effect.fail(error),
+                error.reason._tag === "NotFound" ? Effect.succeed("on") : Effect.fail(error),
               ),
             );
           if (text.trim() === "on") return true;
