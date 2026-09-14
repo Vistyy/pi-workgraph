@@ -14,11 +14,11 @@ export const TaskIdSchema = Type.String({
   pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$",
 });
 
-export const TaskTargetSchema = Type.Union([
+const TaskTargetSchema = Type.Union([
   strict({ kind: Type.Literal("directory"), path: Text }),
   strict({ kind: Type.Literal("repository"), checkoutRoot: Text, commonDir: Text }),
 ]);
-export const ReviewSubjectSchema = Type.Union([
+const ReviewSubjectSchema = Type.Union([
   strict({ kind: Type.Literal("attempt"), attemptId: Text }),
   strict({
     kind: Type.Literal("comparison"),
@@ -26,7 +26,7 @@ export const ReviewSubjectSchema = Type.Union([
   }),
   strict({ kind: Type.Literal("revision"), revision: CommitSchema }),
 ]);
-export const TaskContractSchema = Type.Union([
+const TaskContractSchema = Type.Union([
   strict({
     kind: Type.Literal("research"),
     question: NonBlankText,
@@ -61,7 +61,7 @@ export const TaskSchema = strict({
   contract: TaskContractSchema,
 });
 
-export const AttemptSelectionSchema = Type.Union([
+const AttemptSelectionSchema = Type.Union([
   strict({ kind: Type.Literal("target"), target: ModelTargetSchema }),
   strict({
     kind: Type.Literal("implementation"),
@@ -69,15 +69,15 @@ export const AttemptSelectionSchema = Type.Union([
     executor: ModelTargetSchema,
   }),
 ]);
-export const AttemptBaseSchema = Type.Union([
+const AttemptBaseSchema = Type.Union([
   strict({ kind: Type.Literal("directory") }),
   strict({ kind: Type.Literal("repository"), baseCommit: CommitSchema }),
 ]);
-export const CandidateOfSchema = Type.Union([
+const CandidateOfSchema = Type.Union([
   strict({ kind: Type.Literal("extend"), attemptId: Text }),
   strict({ kind: Type.Literal("integrate"), attemptId: Text, sourceTip: CommitSchema }),
 ]);
-export const AttemptLineageSchema = strict({
+const AttemptLineageSchema = strict({
   candidateRoot: CommitSchema,
   candidateOf: Type.Optional(CandidateOfSchema),
 });
@@ -147,7 +147,6 @@ export type TaskTarget = Static<typeof TaskTargetSchema>;
 export type TaskContract = Static<typeof TaskContractSchema>;
 export type Task = Static<typeof TaskSchema>;
 export type AttemptSelection = Static<typeof AttemptSelectionSchema>;
-export type AttemptLineage = Static<typeof AttemptLineageSchema>;
 export type AttemptSpec = Static<typeof AttemptSpecSchema>;
 export type WorkerState = Static<typeof WorkerStateSchema>;
 export type AttemptOutput = Static<typeof AttemptOutputSchema>;

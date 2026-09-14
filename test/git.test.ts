@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
-import type { AttemptOutput, AttemptSpec, TaskTarget } from "../src/domain/records.js";
+import type { AttemptOutput, AttemptSpec } from "../src/domain/records.js";
 import {
   applyOutput,
   classifyOutput,
@@ -26,8 +26,6 @@ const selection = {
   guide: { model: "fixture/guide", thinking: "high" as const },
   executor: { model: "fixture/executor", thinking: "high" as const },
 };
-type RepositoryTarget = Extract<TaskTarget, { kind: "repository" }>;
-
 async function repository() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-git-"));
   const root = join(parent, "repository");
@@ -42,9 +40,10 @@ async function repository() {
   await git(root, "commit", "-m", "base");
   const base = await git(root, "rev-parse", "HEAD");
   const resolved = await Effect.runPromise(resolveTaskTarget({ cwd: root, kind: "repository" }));
-  assert.equal(resolved.kind, "repository");
-  // SAFETY: The assertion above narrows this decoded target to the repository variant.
-  return { parent, root, agentDir, base, target: resolved as RepositoryTarget };
+  if (!("commit" in resolved)) throw new Error("Expected repository resolution.");
+  assert.equal(resolved.target.kind, "repository");
+  assert.equal(resolved.commit, base);
+  return { parent, root, agentDir, base, target: resolved.target };
 }
 function operation(
   fixture: Awaited<ReturnType<typeof repository>>,
@@ -72,7 +71,7 @@ void test("target resolution preserves real nested Git identity and rejects inva
   const plain = await mkdtemp(join(tmpdir(), "workgraph-target-"));
   try {
     const directory = await Effect.runPromise(resolveTaskTarget({ cwd: plain, kind: "directory" }));
-    assert.deepEqual(directory, { kind: "directory", path: plain });
+    assert.deepEqual(directory, { target: { kind: "directory", path: plain } });
     await assert.rejects(
       Effect.runPromise(resolveTaskTarget({ cwd: plain, kind: "repository" })),
       GitError,
@@ -101,7 +100,7 @@ void test("target resolution preserves real nested Git identity and rejects inva
       const target = await Effect.runPromise(
         resolveTaskTarget({ cwd: plain, path: link, kind: "repository", revision: fixture.base }),
       );
-      assert.deepEqual(target, fixture.target);
+      assert.deepEqual(target, { target: fixture.target, commit: fixture.base });
       await assert.rejects(
         Effect.runPromise(
           resolveTaskTarget({ cwd: link, kind: "repository", revision: "f".repeat(40) }),

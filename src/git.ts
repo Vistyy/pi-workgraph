@@ -35,7 +35,14 @@ interface CheckoutState {
   readonly dirty: boolean;
 }
 
-/** Resolve one immutable Task target from its real filesystem and Git identity. */
+export type ResolvedTaskTarget =
+  | { readonly target: Extract<TaskTarget, { kind: "directory" }> }
+  | {
+      readonly target: Extract<TaskTarget, { kind: "repository" }>;
+      readonly commit: string;
+    };
+
+/** Resolve one immutable Task target and retain the exact commit validated for a repository. */
 export function resolveTaskTarget(
   input:
     | { readonly cwd: string; readonly path?: string; readonly kind: "directory" }
@@ -45,7 +52,7 @@ export function resolveTaskTarget(
         readonly kind: "repository";
         readonly revision?: string;
       },
-): Effect.Effect<TaskTarget, GitError> {
+): Effect.Effect<ResolvedTaskTarget, GitError> {
   return Effect.gen(function* () {
     const path = yield* filesystem("resolve target", () =>
       realpath(resolve(input.cwd, input.path ?? ".")),
@@ -53,7 +60,7 @@ export function resolveTaskTarget(
     const targetStat = yield* filesystem("resolve target", () => stat(path));
     if (!targetStat.isDirectory())
       return yield* fail("resolve target", "Target is not a directory.");
-    if (input.kind === "directory") return { kind: "directory" as const, path };
+    if (input.kind === "directory") return { target: { kind: "directory" as const, path } };
 
     const discovery = yield* gitResult(path, ["rev-parse", "--git-dir"]);
     if (discovery.code !== 0)
@@ -72,13 +79,12 @@ export function resolveTaskTarget(
     const commonDir = yield* filesystem("resolve common directory", () =>
       realpath(resolve(path, commonText)),
     );
-    yield* exactCommit(commonDir, input.revision ?? "HEAD", "resolve target", path);
-    return { kind: "repository" as const, checkoutRoot, commonDir };
+    const commit = yield* exactCommit(commonDir, input.revision ?? "HEAD", "resolve target", path);
+    return {
+      target: { kind: "repository" as const, checkoutRoot, commonDir },
+      commit,
+    };
   }).pipe(Effect.provide(childProcessLayer));
-}
-
-export function currentRevision(target: RepositoryTarget): Effect.Effect<string, GitError> {
-  return resolveRevision(target, "HEAD");
 }
 
 export function resolveRevision(

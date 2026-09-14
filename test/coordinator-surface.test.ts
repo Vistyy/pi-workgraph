@@ -1,24 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Real isolated session and SQLite storage establish the registered boundary.
+import { existsSync } from "node:fs"; // oxlint-disable-line effecttsgo/node-builtin-import -- The pre-mutation assertion observes the real Store path.
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Real isolated sessions and SQLite establish the registered boundary.
 import { tmpdir } from "node:os";
 import { join } from "node:path"; // oxlint-disable-line effecttsgo/node-builtin-import -- Fixture paths are exact disposable identities.
 import test from "node:test";
 import { Value } from "typebox/value";
-import {
-  type CoordinatorOwner,
-  type Intent,
-  WORKSTREAM_FORMAT,
-  WORKSTREAM_SCHEMA_VERSION,
-  type WorkstreamMetadata,
-} from "../src/domain/records.js";
-import { WorkstreamStore } from "../src/storage/workstream-store.js";
+import { RecordStore } from "../src/storage/record-store.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "./decoders.js";
-import { extensionFixture } from "./helpers.js";
+import { extensionFixture, git } from "./helpers.js";
 
-const toolNames = [
+const accepted = [
   "workgraph_models",
-  "workgraph_intent",
-  "workgraph_handoff",
   "workgraph_research",
   "workgraph_consult",
   "workgraph_implement",
@@ -26,25 +18,42 @@ const toolNames = [
   "workgraph_attempt",
   "workgraph_inspect",
   "workgraph_control",
+  "workgraph_notepad",
+] as const;
+const retired = [
+  "workgraph_intent",
+  "workgraph_handoff",
   "workgraph_complete",
   "workgraph_adopt",
+  "workgraph_suspend",
+  "workgraph_resume",
+  "workgraph_continue",
 ] as const;
 
-async function fixture() {
+async function fixture(available: boolean) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-coordinator-"));
   const root = join(parent, "repo");
   await mkdir(root);
+  await git(root, "init", "-b", "main");
+  await git(root, "config", "user.name", "Workgraph Test");
+  await git(root, "config", "user.email", "workgraph@example.invalid");
+  await writeFile(join(root, "file.txt"), "base\n");
+  await git(root, "add", ".");
+  await git(root, "commit", "-m", "base");
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_ROLE: null,
-    HERDR_ENV: null,
-    HERDR_WORKSPACE_ID: "workspace-exact",
-    HERDR_TAB_ID: "tab-exact",
+    HERDR_ENV: available ? "1" : null,
+    HERDR_WORKSPACE_ID: available ? "workspace-exact" : null,
+    HERDR_TAB_ID: null,
+    PI_WORKGRAPH_HERDR_BIN: "/bin/false",
   });
   const pi = await extensionFixture("coordinator", root, parent);
   return {
     ...pi,
     parent,
+    root,
+    agentDir: join(parent, "agent"),
     async dispose() {
       await pi.close();
       restoreFixtureEnvironment(previous);
@@ -53,193 +62,137 @@ async function fixture() {
   };
 }
 
-void test("coordinator registers exactly the accepted twelve tools and strict final schemas", async () => {
-  const f = await fixture();
+void test("coordinator registers exactly nine strict final tools", async () => {
+  const f = await fixture(false);
   try {
-    for (const name of toolNames) assert.ok(f.runner.getToolDefinition(name), name);
-    assert.equal(f.runner.getToolDefinition("workgraph_notepad"), undefined);
-    assert.equal(f.runner.getToolDefinition("workgraph_continue"), undefined);
-    assert.equal(f.runner.getToolDefinition("workgraph_suspend"), undefined);
+    for (const name of accepted) assert.ok(f.runner.getToolDefinition(name), name);
+    for (const name of retired) assert.equal(f.runner.getToolDefinition(name), undefined, name);
 
-    const intent = f.runner.getToolDefinition("workgraph_intent");
-    assert.ok(intent !== undefined);
-    assert.equal(Value.Check(intent.parameters, { statement: "Current goal" }), true);
-    assert.equal(
-      Value.Check(intent.parameters, { statement: "Current goal", authorityReceiptId: "old" }),
-      false,
-    );
-
+    const registered = accepted.filter((name) => f.runner.getToolDefinition(name) !== undefined);
+    assert.equal(registered.length, 9);
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(
       Value.Check(implement.parameters, {
-        taskId: "change",
-        cwd: "./repo",
+        id: "change",
+        cwd: ".",
         objective: "Change it",
         acceptance: ["Works"],
-        candidate: { attemptId: "prior-1", mode: "extend" },
+        candidateOf: { attemptId: "attempt-old", mode: "integrate" },
+        baseRevision: "a".repeat(40),
       }),
       true,
     );
     assert.equal(
       Value.Check(implement.parameters, {
         taskId: "change",
-        target: { path: "./repo", kind: "repository" },
         objective: "Change it",
         acceptance: ["Works"],
-        candidateOf: "prior-1",
-        integrate: false,
+        candidate: { attemptId: "old", mode: "extend" },
       }),
       false,
     );
-
-    const adopt = f.runner.getToolDefinition("workgraph_adopt");
-    assert.ok(adopt !== undefined);
-    assert.equal(Value.Check(adopt.parameters, { workstreamId: "ws-1" }), true);
-    assert.equal(Value.Check(adopt.parameters, { workstreamId: "ws-1", prior: {} }), false);
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("human Intent creation appends the strict pointer before creating and reload attaches it", async () => {
-  const f = await fixture();
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    await f.input("Please establish this initiative.");
-    const result = await f.call("workgraph_intent", { statement: "Coordinate the initiative" });
-    // SAFETY: workgraph_intent's registered result contract returns these two bounded receipt fields.
-    const details = result.details as { workstreamId: string; intentIndex: number };
-    assert.equal(details.intentIndex, 0);
-    const pointer = f.session
-      .getBranch()
-      .findLast(
-        (entry) =>
-          entry.type === "custom" && entry.customType === "pi-workgraph-workstream-pointer",
-      );
-    assert.ok(pointer?.type === "custom");
-    assert.deepEqual(pointer.data, { version: 1, workstreamId: details.workstreamId });
+    const control = f.runner.getToolDefinition("workgraph_control");
+    assert.ok(control !== undefined);
     assert.equal(
-      f.session
-        .getBranch()
-        .some(
-          (entry) => entry.type === "custom" && entry.customType === "pi-workgraph-record-pointer",
-        ),
-      false,
-    );
-    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
-    await f.runner.emit({ type: "session_start", reason: "reload" });
-    const overview = await f.call("workgraph_inspect", {
-      section: "overview",
-      workstreamId: details.workstreamId,
-    });
-    assert.equal(
-      // SAFETY: exact overview inspection returns metadata decoded by WorkstreamStore.
-      (overview.details as { metadata: { id: string } }).metadata.id,
-      details.workstreamId,
-    );
-
-    const adopted = await f.call("workgraph_adopt", { workstreamId: details.workstreamId });
-    assert.equal(
-      // SAFETY: exact already-current adoption returns this bounded lost-response receipt.
-      (adopted.details as { alreadyCurrent: boolean }).alreadyCurrent,
+      Value.Check(control.parameters, { action: "cancel", attemptId: "a", reason: "stop" }),
       true,
     );
-    const beforeHandoff = WorkstreamStore.openReadOnly(
-      join(f.parent, "agent"),
-      details.workstreamId,
+    assert.equal(Value.Check(control.parameters, { action: "cancel", attemptId: "a" }), false);
+    assert.equal(
+      Value.Check(control.parameters, { action: "discard_output", attemptId: "a", reason: "old" }),
+      true,
     );
-    const metadataBefore = beforeHandoff.readMetadata();
-    beforeHandoff.close();
-    await assert.rejects(
-      f.call("workgraph_handoff", { request: "Narrow independent investigation" }),
-      /Handoff launch is uncertain; retained child session/,
-    );
-    const afterHandoff = WorkstreamStore.openReadOnly(
-      join(f.parent, "agent"),
-      details.workstreamId,
-    );
-    assert.deepEqual(afterHandoff.readMetadata(), metadataBefore);
-    afterHandoff.close();
   } finally {
     await f.dispose();
   }
 });
 
-void test("global discovery is bounded, newest-first, filters settled completion, and surfaces invalid stores", async () => {
-  const f = await fixture();
-  const agentDir = join(f.parent, "agent");
-  const owner: CoordinatorOwner = {
-    sessionId: "owner-session",
-    sessionFile: "/sessions/owner.jsonl",
-    workspaceId: "owner-workspace",
-    tabId: "owner-tab",
-  };
-  const create = (id: string, lifecycle: "active" | "completed") => {
-    const at = "2026-01-01T00:00:00.000Z";
-    const metadata: WorkstreamMetadata = {
-      format: WORKSTREAM_FORMAT,
-      schemaVersion: WORKSTREAM_SCHEMA_VERSION,
-      id,
-      owner,
-      lifecycle: "active",
-      createdAt: at,
-      updatedAt: at,
-    };
-    const intent: Intent = {
-      statement: id,
-      constraints: [],
-      authority: {
-        receiptId: "receipt",
-        sessionId: owner.sessionId,
-        sessionFile: owner.sessionFile,
-      },
-      recordedAt: at,
-    };
-    const store = WorkstreamStore.create(agentDir, metadata, intent);
-    if (lifecycle === "completed")
-      store.complete(owner, {
-        conclusion: "Done",
-        evidence: [],
-        limitations: [],
-        completedAt: "2026-01-02T00:00:00.000Z",
-      });
-    store.close();
-  };
+void test("one session creates frozen Task and Attempt records and inspects them boundedly", async () => {
+  const f = await fixture(true);
   try {
-    create("active-old", "active");
-    create("completed-new", "completed");
-    const activePath = WorkstreamStore.pathFor(agentDir, "active-old");
-    const completedPath = WorkstreamStore.pathFor(agentDir, "completed-new");
-    await utimes(activePath, 1, 1);
-    await utimes(completedPath, 2, 2);
-    const invalidDir = join(agentDir, "workgraph", "workstreams", "invalid");
-    await mkdir(invalidDir, { recursive: true });
-    await writeFile(join(invalidDir, "workstream.sqlite"), "not sqlite");
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    const base = await git(f.root, "rev-parse", "HEAD");
+    const created = await f.call("workgraph_implement", {
+      id: "change",
+      cwd: ".",
+      objective: "Change the fixture",
+      acceptance: ["The change is committed"],
+    });
+    // SAFETY: The registered implementation tool returns this bounded creation receipt.
+    const details = created.details as {
+      taskId: string;
+      attempts: { taskId: string; attemptId: string }[];
+    };
+    assert.equal(details.taskId, "change");
+    assert.equal(details.attempts.length, 1);
+    const attemptId = details.attempts[0]?.attemptId;
+    assert.ok(attemptId !== undefined);
 
-    const defaults = WorkstreamStore.discover(agentDir, false, 0, 10);
+    const task = await f.call("workgraph_inspect", { section: "task", id: "change" });
+    // SAFETY: Exact Task inspection returns the strictly decoded persisted Task record.
     assert.deepEqual(
-      defaults.items.map((item) => item.workstreamId),
-      ["active-old"],
+      (task.details as { task: { target: { checkoutRoot: string } } }).task.target.checkoutRoot,
+      f.root,
     );
-    assert.deepEqual(
-      defaults.errors.map((item) => item.workstreamId),
-      ["invalid"],
+    const attempt = await f.call("workgraph_inspect", { section: "attempt", id: attemptId });
+    // SAFETY: Exact Attempt inspection returns the strictly decoded persisted Attempt projection.
+    assert.equal(
+      (attempt.details as { spec: { base: { baseCommit: string } } }).spec.base.baseCommit,
+      base,
     );
-    const all = WorkstreamStore.discover(agentDir, true, 0, 1);
-    assert.deepEqual(
-      all.items.map((item) => item.workstreamId),
-      ["completed-new"],
-    );
-    assert.equal(all.nextOffset, 1);
+    // SAFETY: Pi tool details are object-shaped for every registered Workgraph result.
+    assert.equal("report" in (attempt.details as object), false);
+    const page = await f.call("workgraph_inspect", {
+      section: "attempt",
+      offset: 0,
+      limit: 1,
+    });
+    // SAFETY: Attempt page inspection returns its bounded attempts array.
+    assert.equal((page.details as { attempts: unknown[] }).attempts.length, 1);
 
+    await f.call("workgraph_notepad", { action: "replace", text: "Keep the target frozen." });
+    const note = await f.call("workgraph_notepad", { action: "read" });
+    // SAFETY: The notepad read action returns its bounded text field.
+    assert.equal((note.details as { text: string }).text, "Keep the target frozen.");
+
+    const other = new RecordStore(f.agentDir, "other-session");
+    assert.deepEqual(other.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
+    other.close();
+
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    const restored = new RecordStore(f.agentDir, f.session.getSessionId());
+    assert.equal(restored.readAttempt(attemptId).spec.base.kind, "repository");
+    assert.equal(restored.readAttempt(attemptId).taskId, "change");
+    restored.close();
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("without exact Herdr availability inspection remains usable and creation mutates nothing", async () => {
+  const f = await fixture(false);
+  try {
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    const overview = await f.call("workgraph_inspect", { section: "overview" });
+    // SAFETY: Overview inspection returns the RecordStore count projection.
+    assert.deepEqual((overview.details as { counts: object }).counts, {
+      tasks: 0,
+      attempts: 0,
+      activeWorkers: 0,
+    });
+    const models = await f.call("workgraph_models", { role: "research" });
+    // SAFETY: Model inspection returns the strictly decoded configured target list.
+    assert.equal((models.details as { targets: unknown[] }).targets.length, 2);
     await assert.rejects(
-      f.call("workgraph_adopt", { workstreamId: "active-old" }),
-      /Herdr runtime is unavailable/,
+      f.call("workgraph_research", {
+        id: "blocked",
+        question: "What changed?",
+        expectedEvidence: ["Direct inspection"],
+      }),
+      /Herdr runtime and exact workspace identity are unavailable/,
     );
-    const blocked = WorkstreamStore.openReadOnly(agentDir, "active-old");
-    assert.deepEqual(blocked.readMetadata().owner, owner);
-    blocked.close();
+    assert.equal(existsSync(join(f.agentDir, "workgraph", "workgraph.sqlite")), false);
   } finally {
     await f.dispose();
   }

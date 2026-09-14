@@ -22,7 +22,6 @@ import type { ModelPolicy } from "../src/model-policy.js";
 const execFilePromise = promisify(execFile);
 
 export const fixturePolicy: ModelPolicy = {
-  version: 6,
   roles: {
     research: [
       { model: "fixture/research", thinking: "high" },

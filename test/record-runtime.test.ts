@@ -115,12 +115,15 @@ void test("staged launch persists original workspace and shutdown never closes t
     await waitFor(
       () =>
         store.readAttempt(attempt.id).worker?.kickoff === "confirmed" ||
-        runtime.inspectionStatus().blocker !== undefined,
+        runtime.inspectionStatus().blockers.length > 0,
     );
     assert.equal(
       store.readAttempt(attempt.id).worker?.kickoff,
       "confirmed",
-      runtime.inspectionStatus().blocker,
+      runtime
+        .inspectionStatus()
+        .blockers.map((item) => item.detail)
+        .join("; "),
     );
     const start = commands(native.log).find(
       (entry) => entry[0] === "agent" && entry[1] === "start",
@@ -195,7 +198,11 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
         }).pipe(Scope.provide(scope)),
       );
       if (stage === "kickoff") {
-        await waitFor(() => /Kickoff is uncertain/.test(runtime.inspectionStatus().blocker ?? ""));
+        await waitFor(() =>
+          runtime
+            .inspectionStatus()
+            .blockers.some((item) => /Kickoff is uncertain/.test(item.detail)),
+        );
         assert.equal(store.readAttempt(attempt.id).worker?.kickoff, "uncertain");
         const cancelled = await Effect.runPromise(runtime.cancel(attempt.id, "stop"));
         assert.equal(cancelled.outcome?.result.kind, "cancelled");
@@ -473,7 +480,13 @@ void test("a close-present blocker never repeats the close effect", async () => 
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
       1,
     );
-    assert.match(runtime.inspectionStatus().blocker ?? "", /close will not be repeated/);
+    assert.match(
+      runtime
+        .inspectionStatus()
+        .blockers.map((item) => item.detail)
+        .join("; "),
+      /close will not be repeated/,
+    );
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });

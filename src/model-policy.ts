@@ -15,7 +15,6 @@ type ModelTargetList = [ModelTarget, ...ModelTarget[]];
 const ModelTargetListSchema = Type.Array(ModelTargetSchema, { minItems: 1 });
 const ModelPolicySchema = Type.Object(
   {
-    version: Type.Literal(6),
     roles: Type.Object(
       {
         research: ModelTargetListSchema,
@@ -32,7 +31,6 @@ const ModelPolicySchema = Type.Object(
 );
 
 export interface ModelPolicy {
-  version: 6;
   roles: Record<ListModelRole, ModelTargetList> & {
     "implementation.guide": ModelTarget;
     "implementation.executor": ModelTarget;
@@ -76,7 +74,7 @@ export function loadModelPolicyEffect(
           new ModelPolicyError({
             operation: "read",
             path,
-            message: `Workgraph model policy is required at ${path}. Create a complete version 6 policy before using Workgraph.`,
+            message: `Workgraph model policy is required at ${path}. Create a complete policy before using Workgraph.`,
           }),
       ),
     );
@@ -122,10 +120,10 @@ function decodeModelPolicy(value: unknown): ModelPolicy {
     const issue = Value.Errors(ModelPolicySchema, value)[0];
     const location =
       issue?.instancePath !== undefined && issue.instancePath !== "" ? issue.instancePath : "/";
-    const detail = issue?.message ?? "does not match schema version 6";
+    const detail = issue?.message ?? "does not match the policy schema";
     throw new Error(`Invalid Workgraph model policy at ${location}: ${detail}.`);
   }
-  // SAFETY: strict schema validation establishes the complete v6 shape; tuple casts are checked below as nonempty lists.
+  // SAFETY: strict schema validation establishes the complete shape; tuple casts are checked below as nonempty lists.
   const policy = Value.Decode(ModelPolicySchema, value) as ModelPolicy;
   for (const role of MODEL_LIST_ROLES) rejectDuplicateModels(role, policy.roles[role]);
   return policy;
@@ -177,7 +175,7 @@ export function resolveSelection<Role extends ListModelRole>(
     const target = configuredTarget(policy, role);
     selected = Array.from({ length: count }, () => exactTarget(target));
   }
-  return { role, count, distinctModels, selected, source: "policy" };
+  return { role, count, distinctModels, selected };
 }
 
 export interface SelectionReceipt<Role extends ListModelRole = ListModelRole> {
@@ -185,7 +183,6 @@ export interface SelectionReceipt<Role extends ListModelRole = ListModelRole> {
   count: number;
   distinctModels: boolean;
   selected: ModelTarget[];
-  source: "policy";
 }
 
 /**

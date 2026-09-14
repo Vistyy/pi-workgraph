@@ -19,7 +19,6 @@ import {
 import { liveLayer } from "../src/node-platform.js";
 
 const valid: ModelPolicy = {
-  version: 6,
   roles: {
     research: [
       { model: "fixture/research-first", thinking: "high" },
@@ -32,7 +31,7 @@ const valid: ModelPolicy = {
   },
 };
 
-await test("loads only a complete strict schema-v6 user policy", async () => {
+await test("loads only the complete strict user policy shape", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-models-"));
   const path = join(parent, "models.json");
   try {
@@ -40,7 +39,7 @@ await test("loads only a complete strict schema-v6 user policy", async () => {
     assert.deepEqual(await loadModelPolicy(path), valid);
     for (const invalid of [
       undefined,
-      { ...valid, version: 5 },
+      { ...valid, version: 6 },
       { ...valid, roles: { ...valid.roles, research: [] } },
       { ...valid, roles: { ...valid.roles, "extra.role": valid.roles.research } },
       {

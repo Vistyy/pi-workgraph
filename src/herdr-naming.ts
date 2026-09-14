@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export type WorkerRole = "consultation" | "experiment" | "implementation" | "research" | "review";
+type WorkerRole = "consultation" | "experiment" | "implementation" | "research" | "review";
 
 export interface WorkerNamingContext {
   readonly taskId: string;

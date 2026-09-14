@@ -203,7 +203,7 @@ export class RecordStore {
            (worker_json IS NOT NULL AND json_extract(worker_json,'$.closed') IS NOT 1) OR
            (json_extract(spec_json,'$.base.kind')='repository' AND (
              output_json IS NULL OR
-             json_extract(output_json,'$.kind') IN ('retained','applying','discarding') OR
+             json_extract(output_json,'$.kind') IN ('applying','discarding') OR
              (json_extract(output_json,'$.kind')='applied' AND json_extract(output_json,'$.cleanupTip') IS NOT NULL)
            ))
          ) ORDER BY rowid`,

@@ -176,35 +176,16 @@ function coordinatorResponse(request: ControlledRequest, count: number): Control
   if (count === 1)
     return {
       tool: {
-        id: "intent-request",
-        name: "workgraph_intent",
-        arguments: {
-          statement: "Establish the read-only controlled-baseline scope.",
-          constraints: ["Do not modify the fixture repository."],
-        },
-      },
-    };
-  if (count === 2) {
-    const result = request.messages.find((message) =>
-      JSON.stringify(message).includes('"tool_call_id":"intent-request"'),
-    );
-    assert.ok(result);
-    assert.doesNotMatch(JSON.stringify(result), /isError.*true/);
-    assert.match(JSON.stringify(result), /Recorded intent revision/);
-    return {
-      tool: {
         id: "research-request",
         name: "workgraph_research",
         arguments: {
           id: "controlled-baseline",
           question: "Read the fixture without changing it.",
           expectedEvidence: ["The fixture remains unchanged."],
-          selection: { model: "controlled/research" },
         },
       },
     };
-  }
-  if (count === 3) {
+  if (count === 2) {
     const result = request.messages.find((message) =>
       JSON.stringify(message).includes('"tool_call_id":"research-request"'),
     );
@@ -212,28 +193,27 @@ function coordinatorResponse(request: ControlledRequest, count: number): Control
     assert.doesNotMatch(JSON.stringify(result), /isError.*true/);
     return { text: "Initial coordinator turn settled independently." };
   }
-  if (count === 4) {
-    assert.match(JSON.stringify(request.messages), /\[WORKGRAPH OUTCOME\]/);
+  if (count === 3) {
+    assert.match(JSON.stringify(request.messages), /Workgraph Outcome/);
     return {
       tool: {
         id: "marker-call",
         name: "workgraph_notepad",
         arguments: {
-          action: "add",
-          id: "native-marker",
+          action: "replace",
           text: "Native result triggered this turn.",
         },
       },
     };
   }
-  assert.equal(count, 5);
+  assert.equal(count, 4);
   const marker = request.messages.find((message) =>
     JSON.stringify(message).includes('"tool_call_id":"marker-call"'),
   );
   assert.ok(marker);
   assert.doesNotMatch(JSON.stringify(marker), /isError.*true/);
-  assert.match(JSON.stringify(marker), /Native result triggered this turn/);
-  return { text: "Notification-driven continuation settled." };
+  assert.match(JSON.stringify(marker), /Notepad replaced/);
+  return { text: "Notification-driven turn settled." };
 }
 
 interface ResearchGate {
@@ -495,7 +475,7 @@ async function run(signal: AbortSignal): Promise<void> {
     () =>
       startControlledProvider(
         Array.from(
-          { length: 6 },
+          { length: 5 },
           () => (request: ControlledRequest) => responseFor(request, counts, gate.promise),
         ),
       ),
@@ -517,7 +497,6 @@ async function run(signal: AbortSignal): Promise<void> {
   await writeFile(
     join(agentDir, "workgraph", "models.json"),
     JSON.stringify({
-      version: 6,
       roles: {
         research: [{ model: "controlled/research", thinking: "off" }],
         review: [{ model: "controlled/research", thinking: "off" }],
@@ -618,7 +597,7 @@ async function run(signal: AbortSignal): Promise<void> {
         "agent",
         "prompt",
         paneId as string,
-        "First establish the coordinator scope with workgraph_intent, then run exactly one read-only controlled-baseline research attempt, then stop. When its result arrives, record the continuation marker.",
+        "Run exactly one read-only controlled-baseline research attempt, then stop. When its result arrives, record the notification marker in the notepad.",
       ),
     signal,
   );
@@ -632,14 +611,14 @@ async function run(signal: AbortSignal): Promise<void> {
   await gate.promise;
   await waitFor(
     "notification-requested",
-    async () => (counts.get("coordinator") ?? 0) >= 4,
+    async () => (counts.get("coordinator") ?? 0) >= 3,
     signal,
   );
   await waitFor(
-    "continuation-settlement",
+    "notification-settlement",
     async () =>
       settledEvents(await eventEntries(), sessionFile as string).length >= settlementBaseline + 2 &&
-      (counts.get("coordinator") ?? 0) === 5,
+      (counts.get("coordinator") ?? 0) === 4,
     signal,
   );
   evidence.settlementEvents = await eventEntries();
@@ -649,8 +628,8 @@ async function run(signal: AbortSignal): Promise<void> {
   assert.equal(await readFile(join(repo, "fixture.txt"), "utf8"), "unchanged\n");
   assertProviderHealthy();
   provider.assertComplete();
-  assert.equal(provider.requests.length, 6);
-  assert.equal(provider.requests.filter((request) => request.model === "coordinator").length, 5);
+  assert.equal(provider.requests.length, 5);
+  assert.equal(provider.requests.filter((request) => request.model === "coordinator").length, 4);
   assert.equal(provider.requests.filter((request) => request.model === "research").length, 1);
   const providerRequests = provider.requests.map((request) => ({
     index: request.index,

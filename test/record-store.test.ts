@@ -323,7 +323,7 @@ test("numeric rowid paging and settlement queries expose meaningful current stat
     assert.deepEqual(store.counts(), { tasks: 2, attempts: 4, activeWorkers: 1 });
     assert.deepEqual(
       store.unsettled().map((record) => record.id),
-      ["attempt-a", "attempt-b", "attempt-c"],
+      ["attempt-a", "attempt-c"],
     );
     store.checkpointWorker(
       "attempt-a",

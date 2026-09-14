@@ -6,7 +6,6 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Clock, Data, Effect, Queue, type Scope, Semaphore } from "effect";
 import type { ModelTarget } from "../domain/model-target.js";
 import type {
-  AttemptLineage,
   AttemptOutput,
   AttemptRecord,
   AttemptSelection,
@@ -60,6 +59,16 @@ interface Blocker {
   readonly failures: number;
   readonly retryAt: number;
 }
+export interface CandidateRequest {
+  readonly attemptId: string;
+  readonly mode: "extend" | "integrate";
+}
+
+export interface RuntimeInspectionStatus {
+  readonly blockers: readonly { readonly attemptId: string; readonly detail: string }[];
+  readonly activeWorkers: number;
+}
+
 interface WorkerContext {
   readonly task: TaskRecord;
   readonly attempt: AttemptRecord;
@@ -81,6 +90,7 @@ export class SessionRuntime {
     private readonly herdr: HerdrCliRuntime,
     private readonly semaphore: Semaphore.Semaphore,
     private readonly wakeSignal: Queue.Queue<void>,
+    private readonly setActiveWorkers: (count: number) => void,
   ) {}
 
   static acquire(input: {
@@ -89,6 +99,7 @@ export class SessionRuntime {
     readonly workspaceId: string;
     readonly pi: Pick<ExtensionAPI, "sendMessage">;
     readonly herdr?: HerdrCliRuntime;
+    readonly setActiveWorkers?: (count: number) => void;
   }): Effect.Effect<SessionRuntime, never, Scope.Scope> {
     return Effect.gen(function* () {
       const semaphore = yield* Semaphore.make(1);
@@ -101,23 +112,29 @@ export class SessionRuntime {
         input.herdr ?? new HerdrCliRuntime(),
         semaphore,
         wake,
+        input.setActiveWorkers ?? (() => {}),
       );
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           runtime.closed = true;
+          runtime.setActiveWorkers(0);
           input.store.close();
         }),
       );
+      runtime.publishActiveWorkers();
       yield* Effect.forkScoped(runtime.reconciliation());
       return runtime;
     });
   }
 
-  inspectionStatus(): { readonly blocker?: string } {
-    const blocker = [...this.blockers.entries()]
-      .map(([id, value]) => `${id}: ${value.detail}`)
-      .join("; ");
-    return blocker.length === 0 ? {} : { blocker };
+  inspectionStatus(): RuntimeInspectionStatus {
+    return {
+      blockers: [...this.blockers.entries()].slice(0, 20).map(([attemptId, value]) => ({
+        attemptId,
+        detail: value.detail,
+      })),
+      activeWorkers: this.store.counts().activeWorkers,
+    };
   }
 
   createTask(input: {
@@ -125,19 +142,20 @@ export class SessionRuntime {
     readonly target: TaskTarget;
     readonly contract: TaskContract;
     readonly selection: AttemptSelection;
-    readonly lineage?: AttemptLineage;
+    readonly candidateOf?: CandidateRequest;
     readonly baseCommit?: string;
   }): Effect.Effect<AttemptRecord, RuntimeError> {
     const self = this;
     return this.serializedEffect(
       "create Task",
       Effect.gen(function* () {
+        yield* self.requireLaunchAvailable("create Task");
         yield* self.validateReview(input.contract);
         const task: Task = { target: input.target, contract: input.contract };
         const spec = yield* self.newAttemptSpec(
           task,
           input.selection,
-          input.lineage,
+          input.candidateOf,
           input.baseCommit,
         );
         const attemptId = newAttemptId();
@@ -151,18 +169,19 @@ export class SessionRuntime {
   createAttempt(input: {
     readonly taskId: string;
     readonly selection: AttemptSelection;
-    readonly lineage?: AttemptLineage;
+    readonly candidateOf?: CandidateRequest;
     readonly baseCommit?: string;
   }): Effect.Effect<AttemptRecord, RuntimeError> {
     const self = this;
     return this.serializedEffect(
       "create Attempt",
       Effect.gen(function* () {
+        yield* self.requireLaunchAvailable("create Attempt");
         const task = self.store.readTask(input.taskId);
         const spec = yield* self.newAttemptSpec(
           task.task,
           input.selection,
-          input.lineage,
+          input.candidateOf,
           input.baseCommit,
         );
         const result = self.store.createAttempt(task.id, newAttemptId(), spec);
@@ -336,15 +355,15 @@ export class SessionRuntime {
   private newAttemptSpec(
     task: Task,
     selection: AttemptSelection,
-    lineage?: AttemptLineage,
+    candidate?: CandidateRequest,
     baseCommit?: string,
   ): Effect.Effect<AttemptSpec, RuntimeError> {
     if (task.target.kind === "directory") {
-      if (lineage !== undefined || baseCommit !== undefined)
+      if (candidate !== undefined || baseCommit !== undefined)
         return fail("create Attempt", "Directory Attempts reject base and candidate lineage.");
       return Effect.succeed({ selection, base: { kind: "directory" } });
     }
-    if (lineage?.candidateOf === undefined) {
+    if (candidate === undefined) {
       if (baseCommit === undefined)
         return fail(
           "create Attempt",
@@ -352,17 +371,15 @@ export class SessionRuntime {
         );
       return Effect.succeed({ selection, base: { kind: "repository", baseCommit } });
     }
-    return this.candidateSpec(task.target, selection, lineage, baseCommit);
+    return this.candidateSpec(task.target, selection, candidate, baseCommit);
   }
 
   private candidateSpec(
     target: Extract<TaskTarget, { kind: "repository" }>,
     selection: AttemptSelection,
-    lineage: AttemptLineage,
+    candidate: CandidateRequest,
     baseCommit?: string,
   ): Effect.Effect<AttemptSpec, RuntimeError> {
-    const candidate = lineage.candidateOf;
-    if (candidate === undefined) return fail("create Attempt", "Candidate lineage is incomplete.");
     const parent = this.store.readAttempt(candidate.attemptId);
     const parentTask = this.store.readTask(parent.taskId);
     if (
@@ -380,7 +397,7 @@ export class SessionRuntime {
     return validateRetainedCandidate(operation).pipe(
       Effect.mapError((cause) => runtimeError("create Attempt", cause)),
       Effect.flatMap((): Effect.Effect<AttemptSpec, RuntimeError> => {
-        if (candidate.kind === "extend") {
+        if (candidate.mode === "extend") {
           if (baseCommit !== undefined)
             return fail("create Attempt", "Extend forbids an independent base.");
           const root =
@@ -408,12 +425,17 @@ export class SessionRuntime {
         }
         if (baseCommit === undefined)
           return fail("create Attempt", "Integration requires an exact destination base.");
-        if (candidate.sourceTip !== retained.tip)
-          return fail("create Attempt", "Integration source tip does not match retained output.");
         return Effect.succeed({
           selection,
           base: { kind: "repository" as const, baseCommit },
-          lineage: { candidateRoot: baseCommit, candidateOf: candidate },
+          lineage: {
+            candidateRoot: baseCommit,
+            candidateOf: {
+              kind: "integrate" as const,
+              attemptId: candidate.attemptId,
+              sourceTip: retained.tip,
+            },
+          },
         });
       }),
     );
@@ -452,6 +474,7 @@ export class SessionRuntime {
     return Effect.gen(function* () {
       let attempt = initial;
       const context = self.context(attempt);
+      if (attempt.worker === undefined) yield* self.requireLaunchAvailable("launch Worker");
       if (attempt.spec.base.kind === "repository")
         yield* ensureDetachedWorktree(self.repositoryOperation(attempt)).pipe(
           Effect.mapError((cause) => runtimeError("prepare repository", cause)),
@@ -928,6 +951,7 @@ export class SessionRuntime {
               this.blockers.delete(this.blockers.keys().next().value ?? "");
           }
         }
+        this.publishActiveWorkers();
         yield* Queue.take(this.wakeSignal).pipe(
           Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.void }),
         );
@@ -935,7 +959,16 @@ export class SessionRuntime {
     );
     return Effect.forever(tick);
   }
+  private requireLaunchAvailable(operation: string): Effect.Effect<void, RuntimeError> {
+    return this.herdr.available
+      ? Effect.void
+      : fail(operation, "Herdr runtime and exact workspace identity are unavailable.");
+  }
+  private publishActiveWorkers(): void {
+    this.setActiveWorkers(this.store.counts().activeWorkers);
+  }
   private wake(): Effect.Effect<void> {
+    this.publishActiveWorkers();
     return Queue.offer(this.wakeSignal, undefined).pipe(Effect.asVoid);
   }
   private serialized<A>(operation: string, run: () => A): Effect.Effect<A, RuntimeError> {
