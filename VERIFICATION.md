@@ -43,13 +43,14 @@ Use real disposable Git repositories through the registered coordinator/runtime 
 - repository targets freeze checkout root and common directory;
 - each repository Attempt freezes an exact base commit and runs in its exact detached worktree;
 - placement recovery requires the clean exact base before agent start, while later execution dirtiness cannot prevent reported or unreported settlement;
-- `candidateOf: extend` requires the exact retained source Candidate ref and starts from its tip;
+- `candidateOf: extend` requires the exact retained source Candidate ref, preserves its root, starts from its tip, and prevents source discard until successor placement;
 - `candidateOf: integrate` preserves an explicit base, exact source Candidate-producing Attempt, and source tip;
 - a completed report retains only commits: unchanged HEAD produces no output, changed HEAD creates `refs/pi-workgraph/outputs/<attemptId>`, and the whole worktree is removed in either case;
-- failed, escalated, unreported, and cancelled Attempts preserve dirty, ignored, and untracked bytes while compacting clean commit state normally; and
+- failed, escalated, unreported, and cancelled Attempts preserve dirty, ignored, and untracked bytes while compacting clean commit state normally;
+- complete absence recovers compacted output, while external deletion or pruning remains unsupported; and
 - moved, foreign, incomplete, unrelated, or ambiguous resources remain physically present and blocked.
 
-Application preparation must leave destination bytes, HEAD, and ref unchanged while proving source ref, base, Candidate lineage, destination identity, cleanliness, ancestry, and conflicts. The explicit apply flow must produce only the prepared structural result, record its exact revision, then release output. Recovery accepts only the exact expected Git structure; a switched, unrelated, or advanced destination blocks without rollback or automatic retry.
+Application preparation must leave destination bytes, HEAD, and ref unchanged while proving source ref, base, Candidate lineage, destination identity, cleanliness, ancestry, and tree mergeability. The explicit apply flow must produce only the prepared structural result, record its exact revision, then release output. It must refuse to overwrite an ignored destination path tracked by the Candidate while allowing and preserving unrelated ignored artifacts. Recovery accepts only the exact expected Git structure; a switched, unrelated, or advanced destination blocks without rollback or automatic retry.
 
 Explicit discard must checkpoint its reason before deleting exact verified output. Separately prove that completed reports remove only their exact worktree, including uncommitted scratch, while non-completed Outcomes and failed cleanup preserve dirty or uncertain resources. No supported flow pushes or publishes.
 
@@ -105,7 +106,7 @@ Live native and destructive checks are operator-controlled. Use uniquely named d
 ## Limits on evidence
 
 - One coordinator process per Pi session is supported; concurrent use of the same session is not.
-- Concurrent user mutation of the destination checkout or destination ref during apply is unsupported.
+- Concurrent mutation of the destination checkout or destination ref by another session, process, or user during apply is unsupported; no repository-wide lock is claimed.
 - Multi-repository effects are independent and have no cross-repository transaction or rollback.
 - Worktrees and tool gates are not security sandboxes.
 - SQLite process safety does not establish power-loss durability.

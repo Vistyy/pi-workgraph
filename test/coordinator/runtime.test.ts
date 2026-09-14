@@ -20,6 +20,7 @@ import { RecordStore } from "../../src/coordinator/store.js";
 import { herdrWorkerName, herdrWorkerTabLabel } from "../../src/coordinator/worker-naming.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
 import { runNodePlatformPromise } from "../../src/node-platform.js";
+import { detachedPlacement, ensureDetachedWorktree } from "../../src/repository.js";
 import { createWorkerSessionEffect, type WorkerObjective } from "../../src/worker/session.js";
 import { git } from "../support/helpers.js";
 
@@ -416,6 +417,110 @@ void test("completed repository reports settle through mutable scratch and retai
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
       1,
     );
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+void test("an unplaced extension child pins source discard until its detached placement", async () => {
+  const root = temporary();
+  const repository = join(root, "repository");
+  mkdirSync(repository);
+  await git(repository, "init", "-b", "main");
+  await git(repository, "config", "user.name", "Workgraph Test");
+  await git(repository, "config", "user.email", "workgraph@example.invalid");
+  writeFileSync(join(repository, "file.txt"), "base\n");
+  await git(repository, "add", ".");
+  await git(repository, "commit", "-m", "base");
+  const base = await git(repository, "rev-parse", "HEAD");
+  writeFileSync(join(repository, "file.txt"), "candidate\n");
+  await git(repository, "commit", "-am", "candidate");
+  const sourceTip = await git(repository, "rev-parse", "HEAD");
+  await git(repository, "reset", "--hard", base);
+
+  const repositoryTask: Task = {
+    target: {
+      kind: "repository",
+      checkoutRoot: repository,
+      commonDir: join(repository, ".git"),
+    },
+    contract: {
+      kind: "implementation",
+      objective: "Produce a Candidate.",
+      acceptance: ["The Candidate is retained."],
+    },
+  };
+  const implementationSelection = {
+    kind: "implementation" as const,
+    guide: target,
+    executor: target,
+  };
+  const sourceSpec: AttemptSpec = {
+    selection: implementationSelection,
+    base: { kind: "repository", baseCommit: base },
+  };
+  const childSpec: AttemptSpec = {
+    selection: implementationSelection,
+    base: { kind: "repository", baseCommit: sourceTip },
+    lineage: {
+      candidateRoot: base,
+      candidateOf: { kind: "extend", attemptId: "attempt-source" },
+    },
+  };
+  const store = new RecordStore(root, "session-extension-discard");
+  store.createTaskWithAttempt("source", repositoryTask, "attempt-source", sourceSpec);
+  store.recordOutcome("attempt-source", {
+    result: { kind: "unreported", reason: "Candidate retained for disposition." },
+    effectiveModels: [],
+  });
+  store.checkpointOutput("attempt-source", {
+    kind: "retained",
+    tip: sourceTip,
+    reason: "Committed output is retained.",
+  });
+  await git(repository, "update-ref", "refs/pi-workgraph/outputs/attempt-source", sourceTip);
+  store.createAttempt("source", "attempt-extension", childSpec);
+
+  const scope = await Effect.runPromise(Scope.make());
+  try {
+    const runtime = await Effect.runPromise(
+      SessionRuntime.acquire({
+        store,
+        agentDir: root,
+        workspaceId: "workspace-owner",
+        pi: { sendMessage() {} },
+        herdr: new HerdrCliRuntime("/bin/false", {}),
+      }).pipe(Scope.provide(scope)),
+    );
+    await assert.rejects(
+      Effect.runPromise(runtime.discard("attempt-source", "superseded")),
+      /An unplaced extension child pins this output/,
+    );
+    assert.equal(store.readAttempt("attempt-source").output?.kind, "retained");
+    assert.equal(
+      await git(repository, "rev-parse", "refs/pi-workgraph/outputs/attempt-source"),
+      sourceTip,
+    );
+
+    const placement = detachedPlacement({ agentDir: root, attemptId: "attempt-extension" });
+    await Effect.runPromise(
+      ensureDetachedWorktree({
+        attemptId: "attempt-extension",
+        spec: childSpec,
+        target: repositoryTask.target.kind === "repository" ? repositoryTask.target : assert.fail(),
+        ...placement,
+      }),
+    );
+    store.checkpointWorker("attempt-extension", {
+      sessionFile: join(root, "placed-session.jsonl"),
+      workspaceId: "workspace-owner",
+    });
+    const discarded = await Effect.runPromise(runtime.discard("attempt-source", "superseded"));
+    assert.equal(discarded.output?.kind, "discarded");
+    await assert.rejects(git(repository, "rev-parse", "refs/pi-workgraph/outputs/attempt-source"));
+    assert.equal(await git(placement.worktreePath, "rev-parse", "HEAD"), sourceTip);
+    assert.equal(await git(repository, "rev-parse", "HEAD"), base);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });

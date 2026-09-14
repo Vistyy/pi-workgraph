@@ -350,7 +350,7 @@ function applicationRevision(
       return yield* fail("apply output", "Destination changed after application preparation.");
     if (yield* ancestry(operation.target.commonDir, output.sourceTip, head)) return head;
     if (yield* ancestry(operation.target.commonDir, head, output.sourceTip)) {
-      yield* git(operation.target.checkoutRoot, ["merge", "--ff-only", output.sourceTip]);
+      yield* mergeIntoDestination(operation.target.checkoutRoot, output.sourceTip);
       return output.sourceTip;
     }
     const tree = yield* proveMergeable(operation.target.commonDir, head, output.sourceTip);
@@ -364,9 +364,13 @@ function applicationRevision(
       "-m",
       `Integrate Workgraph output ${operation.attemptId}`,
     ]);
-    yield* git(operation.target.checkoutRoot, ["merge", "--ff-only", merge]);
+    yield* mergeIntoDestination(operation.target.checkoutRoot, merge);
     return merge;
   });
+}
+
+function mergeIntoDestination(cwd: string, revision: string): Effect.Effect<string, GitError> {
+  return git(cwd, ["merge", "--ff-only", "--no-overwrite-ignore", revision]);
 }
 
 /** Remove still-exact clean source resources only after the applied checkpoint is durable. */

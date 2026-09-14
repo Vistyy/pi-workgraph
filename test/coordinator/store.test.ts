@@ -432,6 +432,56 @@ void test("cancellation settles Worker and Outcome atomically", () => {
   }
 });
 
+void test("only same-session queued extension children pin their exact parent", () => {
+  const { root, cleanup } = fixture();
+  try {
+    const store = new RecordStore(root, "session-a");
+    const other = new RecordStore(root, "session-b");
+    store.createTaskWithAttempt("source", repositoryTask, "parent", repositorySpec);
+    other.createTaskWithAttempt("other", repositoryTask, "other-root", repositorySpec);
+
+    const extensionSpec: AttemptSpec = {
+      ...repositorySpec,
+      base: { kind: "repository", baseCommit: otherCommit },
+      lineage: {
+        candidateRoot: commit,
+        candidateOf: { kind: "extend", attemptId: "parent" },
+      },
+    };
+    store.createAttempt("source", "queued-extension", extensionSpec);
+    assert.equal(store.hasUnplacedExtensionChild("parent"), true);
+
+    store.recordOutcome("queued-extension", {
+      result: { kind: "cancelled", reason: "Cancelled while queued." },
+      effectiveModels: [],
+    });
+    assert.equal(store.hasUnplacedExtensionChild("parent"), false);
+
+    store.createAttempt("source", "placed-extension", extensionSpec);
+    assert.equal(store.hasUnplacedExtensionChild("parent"), true);
+    store.checkpointWorker("placed-extension", worker());
+    assert.equal(store.hasUnplacedExtensionChild("parent"), false);
+
+    store.createAttempt("source", "integration-child", {
+      ...repositorySpec,
+      lineage: {
+        candidateRoot: commit,
+        candidateOf: { kind: "integrate", attemptId: "parent", sourceTip: otherCommit },
+      },
+    });
+    assert.equal(store.hasUnplacedExtensionChild("parent"), false);
+
+    other.createAttempt("other", "other-session-extension", extensionSpec);
+    assert.equal(store.hasUnplacedExtensionChild("parent"), false);
+    assert.equal(other.hasUnplacedExtensionChild("parent"), false);
+
+    store.close();
+    other.close();
+  } finally {
+    cleanup();
+  }
+});
+
 void test("numeric rowid paging and settlement queries expose meaningful current state", () => {
   const { root, cleanup } = fixture();
   try {

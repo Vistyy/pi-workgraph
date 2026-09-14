@@ -64,17 +64,17 @@ Actual effective models are derived from persisted Pi model events in trajectory
 
 A Task resolves either an exact directory path or a repository identity consisting of checkout root and Git common directory. Every Attempt inherits that immutable target. The coordinator's current directory is only a resolution input, never later placement authority. This permits Tasks in several repositories within one session without distributed transactions, dependencies, rollback, or all-or-nothing application claims.
 
-Repository Attempt bases are exact commits. A root Candidate is rooted at its Attempt's explicit base. `candidateOf: extend` starts the successor Attempt from the exact retained source Candidate tip and preserves its root. `candidateOf: integrate` starts from a separately explicit base and records both the exact source Candidate-producing Attempt and source tip to incorporate. Candidate lineage is immutable and checked against exact retained refs; session continuation is not content ancestry.
+Repository Attempt bases are exact commits. A root Candidate is rooted at its Attempt's explicit base. `candidateOf: extend` starts the successor Attempt from the exact retained source Candidate tip, preserves its root, and prevents source discard until successor placement. `candidateOf: integrate` starts from a separately explicit base and records both the exact source Candidate-producing Attempt and source tip to incorporate. Candidate lineage is immutable and checked against exact retained refs; session continuation is not content ancestry.
 
 Directory Attempts have no Git output. Repository Attempts execute in detached worktrees at `<agentDir>/workgraph/worktrees/<attemptId>` and never borrow the destination checkout as execution state.
 
 ## Repository custody
 
-After exact Worker closure, a completed report retains only committed HEAD and removes the worktree; unchanged HEAD produces no output. Non-completed Attempts preserve dirty worktrees, and inexact or ambiguous resources always block.
+After exact Worker closure, a completed report retains only committed HEAD and removes the worktree; unchanged HEAD produces no output. Non-completed Attempts preserve dirty worktrees. Complete absence recovers compacted output; external deletion or pruning of Workgraph-managed resources is unsupported. One-sided, moved, foreign, unrelated, or otherwise ambiguous resources block.
 
-Apply and discard are serialized per exact Attempt and repository. Application first proves the private source ref, Candidate root and lineage, attached destination identity, current destination ref and HEAD, cleanliness, ancestry, and conflicts without mutating destination state. It checkpoints the expected source and destination facts, re-proves them, then performs only the prepared fast-forward form. Recovery accepts application only when Git structure proves the exact expected result; an unrelated, switched, or advanced destination blocks without rollback or automatic retry. Output cleanup occurs only after application is recorded.
+Repository custody is serialized within one coordinator session, not across sessions or processes. Concurrent mutation of the same destination checkout is unsupported. Application proves the private source ref, Candidate lineage, destination identity and state, ancestry, and tree mergeability before its checkpointed fast-forward. The merge preserves unrelated ignored artifacts and refuses to overwrite an ignored destination path. Recovery accepts only the exact expected Git structure; changed destination state blocks without rollback or automatic retry. Output cleanup occurs only after application is recorded.
 
-Discard is explicitly destructive and requires a reason. It checkpoints the exact retained tip and disposition before deleting only the verified private ref or owned worktree. Interruption recovery accepts only proven postconditions and never removes foreign or uncertain resources. Semantic Outcomes and routine shutdown cannot discard output.
+Discard is explicitly destructive and requires a reason. It checkpoints the exact retained tip and disposition before deleting only the verified private ref or owned worktree. An unplaced extension child and an unclassified integration child pin their source output. Interruption recovery accepts only proven postconditions and never removes foreign or uncertain resources. Semantic Outcomes and routine shutdown cannot discard output.
 
 Applying changes a local repository only. Workgraph never pushes or publishes; any later publication remains an external, deliberate action.
 
@@ -91,7 +91,7 @@ Effect owns serialized application flow, interruption, scoped acquisition and re
 ## Supported limits
 
 - One coordinator process may operate a given Pi session at a time.
-- Concurrent user mutation of a destination checkout or ref during application is unsupported and causes a blocked result when detected.
+- Concurrent mutation of a destination checkout or ref by another session, process, or user during application is unsupported and causes a blocked result when detected.
 - Multi-repository Tasks have independent effects; Workgraph provides no cross-repository transaction or rollback.
 - Worktrees and tool gates are ownership boundaries, not security sandboxes.
 - SQLite process safety does not claim durability across power loss.

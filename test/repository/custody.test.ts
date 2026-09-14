@@ -247,6 +247,32 @@ void test("application accepts ignored destination artifacts and recovers struct
     assert.equal(fastCleaned.kind === "applied" ? fastCleaned.cleanupTip : "bad", undefined);
     await assert.rejects(git(fixture.root, "rev-parse", fast.outputRef));
 
+    let ignoredCollision = operation(fixture, "ignored-collision", initial(fastTip));
+    await Effect.runPromise(ensureDetachedWorktree(ignoredCollision));
+    await writeFile(join(ignoredCollision.worktreePath, "ignored.bin"), "candidate artifact\n");
+    await git(ignoredCollision.worktreePath, "add", "-f", "ignored.bin");
+    await git(ignoredCollision.worktreePath, "commit", "-m", "track ignored artifact");
+    const ignoredCollisionTip = await git(ignoredCollision.worktreePath, "rev-parse", "HEAD");
+    ignoredCollision = {
+      ...ignoredCollision,
+      output: await Effect.runPromise(classifyOutput(ignoredCollision)),
+    };
+    await writeFile(join(fixture.root, "ignored.bin"), "destination artifact\n");
+    const collisionHead = await git(fixture.root, "rev-parse", "HEAD");
+    const collisionPrepared = await Effect.runPromise(prepareApplication(ignoredCollision));
+    ignoredCollision = { ...ignoredCollision, output: collisionPrepared };
+    await assert.rejects(Effect.runPromise(applyOutput(ignoredCollision)), GitError);
+    assert.equal(await git(fixture.root, "rev-parse", "HEAD"), collisionHead);
+    assert.equal(
+      await readFile(join(fixture.root, "ignored.bin"), "utf8"),
+      "destination artifact\n",
+    );
+    assert.equal(
+      await git(fixture.root, "rev-parse", ignoredCollision.outputRef),
+      ignoredCollisionTip,
+    );
+    await rm(join(fixture.root, "ignored.bin"));
+
     const divergentBase = fastTip;
     let divergent = operation(fixture, "divergent", initial(divergentBase));
     await Effect.runPromise(ensureDetachedWorktree(divergent));

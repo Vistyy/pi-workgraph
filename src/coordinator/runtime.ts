@@ -328,6 +328,8 @@ export class SessionRuntime {
             "discard output",
             "An unclassified integration child pins this output.",
           );
+        if (self.store.hasUnplacedExtensionChild(attemptId))
+          return yield* fail("discard output", "An unplaced extension child pins this output.");
         const checkpoint = yield* prepareDiscard(self.repositoryOperation(attempt), reason).pipe(
           Effect.mapError((cause) => runtimeError("discard output", cause)),
         );

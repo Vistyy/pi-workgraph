@@ -243,6 +243,31 @@ export class RecordStore {
     );
   }
 
+  hasUnplacedExtensionChild(parentAttemptId: string): boolean {
+    validateAttemptId(parentAttemptId);
+    const database = this.existingOrUndefined("read extension children");
+    if (database === undefined) return false;
+    return (
+      integer(
+        database
+          .prepare(
+            `SELECT count(*) AS value FROM attempts child
+             WHERE child.session_id=?
+               AND json_extract(child.spec_json,'$.lineage.candidateOf.kind')='extend'
+               AND json_extract(child.spec_json,'$.lineage.candidateOf.attemptId')=?
+               AND child.worker_json IS NULL
+               AND child.outcome_json IS NULL
+               AND EXISTS (
+                 SELECT 1 FROM attempts parent
+                 WHERE parent.attempt_id=? AND parent.session_id=child.session_id
+               )`,
+          )
+          .get(this.sessionId, parentAttemptId, parentAttemptId) as Row | undefined,
+        "value",
+      ) > 0
+    );
+  }
+
   listTasks(offset: number, limit: number): TaskRecord[] {
     validatePage(offset, limit);
     const database = this.existingOrUndefined("list Tasks");
