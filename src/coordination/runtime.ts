@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/node-builtin-import, typescript/no-this-alias, anti-slop/no-conditional-empty-object-spread, effecttsgo/prefer-schema-over-json -- Effect owns serialization; omission and host presentation stay explicit at their narrow boundaries. */
+/* oxlint-disable effecttsgo/node-builtin-import, typescript/no-this-alias, anti-slop/no-conditional-empty-object-spread -- Effect owns serialization; omission and host presentation stay explicit at their narrow boundaries. */
 /* biome-ignore-all lint/complexity/noExcessiveCognitiveComplexity: lifecycle ordering is intentionally visible in cohesive flow owners. */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
