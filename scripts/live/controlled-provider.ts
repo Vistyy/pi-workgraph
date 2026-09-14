@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/async-function, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion */
+/* oxlint-disable effecttsgo/async-function, anti-slop/no-runtime-typeof, anti-slop/require-safety-comment-for-type-assertion -- The finite loopback provider owns Node HTTP callbacks and validates untyped OpenAI request payloads before use. */
 import { once } from "node:events";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Verification owns one loopback HTTP boundary.
 import { createServer, type IncomingMessage } from "node:http";

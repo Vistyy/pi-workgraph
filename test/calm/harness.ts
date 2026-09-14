@@ -132,7 +132,7 @@ export function fakePi() {
 }
 
 /** Feed a structurally partial fixture into a guarded host boundary. */
-// oxlint-disable-next-line anti-slop/no-unknown-parameters
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- The adapter, not the fixture type, owns validation of this partial host value.
 export function fixture<T>(value: unknown): T {
   // SAFETY: Fixtures supply only the fields Calm consumes; the adapter validates the rest.
   return value as T;

@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers, effecttsgo/new-promise, effecttsgo/node-builtin-import, effecttsgo/process-env, anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, typescript/strict-boolean-expressions, typescript/no-unsafe-return */
+/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers, effecttsgo/new-promise, effecttsgo/node-builtin-import, effecttsgo/process-env, anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, typescript/strict-boolean-expressions, typescript/no-unsafe-return -- This operator-controlled native boundary owns host resources, chronology, untyped Herdr envelopes, and bounded cleanup. */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -525,8 +525,6 @@ async function run(signal: AbortSignal): Promise<void> {
         "--no-focus",
         "--env",
         `PI_CODING_AGENT_DIR=${agentDir}`,
-        "--env",
-        "PI_WORKGRAPH_MODE=",
         "--env",
         "PI_OFFLINE=1",
       ),

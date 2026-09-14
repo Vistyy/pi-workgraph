@@ -1,7 +1,8 @@
-/* oxlint-disable effecttsgo/node-builtin-import -- These flows inspect real disposable Git repositories and bytes. */
 import assert from "node:assert/strict";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Real disposable repository bytes establish custody behavior.
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Exact disposable worktree and repository paths are test identities.
 import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 // oxlint-disable-next-line effecttsgo/node-builtin-import -- Test setup writes an isolated user policy fixture before loading the real extension boundary.
 import { mkdir, writeFile } from "node:fs/promises";
-// oxlint-disable-next-line effecttsgo/node-builtin-import -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
+// oxlint-disable-next-line effecttsgo/node-builtin-import -- Fixture paths identify isolated repositories, agent directories, policies, and sessions.
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionActions } from "@earendil-works/pi-coding-agent";
@@ -48,7 +48,7 @@ export const usage = {
   totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
-// oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
+// oxlint-disable-next-line effecttsgo/async-function -- Real Git fixture setup exposes the native Promise returned by execFile.
 export async function git(cwd: string, ...args: string[]): Promise<string> {
   const result = await execFilePromise("git", ["-C", cwd, ...args], { cwd });
   return result.stdout.trim();
@@ -76,7 +76,7 @@ export function persistentSession(root: string, sessionDir: string) {
 }
 
 /** Real Pi registration/context machinery; only session actions are replaced, never a model call. */
-// oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
+// oxlint-disable-next-line effecttsgo/async-function -- Pi resource and model loading expose native Promise boundaries.
 export async function extensionFixture(
   name: "coordinator" | "worker",
   root: string,
@@ -150,7 +150,7 @@ export async function extensionFixture(
       setThinkingLevel: (next) => {
         level = next;
       },
-      // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
+      // oxlint-disable-next-line effecttsgo/async-function -- ExtensionActions.setModel requires a Promise<boolean> callback.
       setModel: async (next) => {
         model = next;
         selected.push(`${next.provider}/${next.id}`);
@@ -206,7 +206,7 @@ export async function extensionFixture(
       return callWithId("fixture", toolName, params, signal);
     },
     callWithId,
-    // oxlint-disable-next-line effecttsgo/async-function -- This exact Node, Pi, or live smoke boundary preserves its native callback and payload contract; validation remains in the boundary body.
+    // oxlint-disable-next-line effecttsgo/async-function -- The Pi shutdown event must settle before fixture errors are asserted.
     async close() {
       await runner.emit({ type: "session_shutdown", reason: "quit" });
       assert.deepEqual(errors, []);

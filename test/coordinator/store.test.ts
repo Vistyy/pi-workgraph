@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion, typescript/no-floating-promises, typescript/require-array-sort-compare -- focused tests inspect native SQLite row shapes through node:sqlite's open row type. */
+/* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion, typescript/require-array-sort-compare -- focused tests inspect native SQLite row shapes through node:sqlite's open row type. */
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -64,7 +64,7 @@ function worker(overrides: Partial<WorkerState> = {}): WorkerState {
   };
 }
 
-test("record schemas accept exact current shapes and reject undeclared fields", () => {
+void test("record schemas accept exact current shapes and reject undeclared fields", () => {
   assert.equal(Value.Check(CommitSchema, "a".repeat(40)), true);
   assert.equal(Value.Check(CommitSchema, "a".repeat(64)), true);
   assert.equal(Value.Check(CommitSchema, "a".repeat(41)), false);
@@ -76,7 +76,7 @@ test("record schemas accept exact current shapes and reject undeclared fields", 
   assert.equal(Value.Check(WorkerStateSchema, { ...worker(), unexpected: true }), false);
 });
 
-test("RecordStore creates one exact database lazily", () => {
+void test("RecordStore creates one exact database lazily", () => {
   const { root, cleanup } = fixture();
   try {
     chmodSync(root, 0o751);
@@ -147,7 +147,7 @@ test("RecordStore creates one exact database lazily", () => {
   }
 });
 
-test("session partitions share one file without sharing records or relations", () => {
+void test("session partitions share one file without sharing records or relations", () => {
   const { root, cleanup } = fixture();
   try {
     const first = new RecordStore(root, "session-a");
@@ -173,7 +173,7 @@ test("session partitions share one file without sharing records or relations", (
   }
 });
 
-test("Task and initial Attempt are atomic and focused checkpoints preserve the spec", () => {
+void test("Task and initial Attempt are atomic and focused checkpoints preserve the spec", () => {
   const { root, cleanup } = fixture();
   try {
     const store = new RecordStore(root, "session-a");
@@ -206,7 +206,7 @@ test("Task and initial Attempt are atomic and focused checkpoints preserve the s
   }
 });
 
-test("Outcome is null-to-value once and validates report kind and distinct models", () => {
+void test("Outcome is null-to-value once and validates report kind and distinct models", () => {
   const { root, cleanup } = fixture();
   try {
     const store = new RecordStore(root, "session-a");
@@ -242,7 +242,7 @@ test("Outcome is null-to-value once and validates report kind and distinct model
   }
 });
 
-test("cancellation settles Worker and Outcome atomically", () => {
+void test("cancellation settles Worker and Outcome atomically", () => {
   const { root, cleanup } = fixture();
   try {
     const store = new RecordStore(root, "session-a");
@@ -277,7 +277,7 @@ test("cancellation settles Worker and Outcome atomically", () => {
   }
 });
 
-test("numeric rowid paging and settlement queries expose meaningful current state", () => {
+void test("numeric rowid paging and settlement queries expose meaningful current state", () => {
   const { root, cleanup } = fixture();
   try {
     const store = new RecordStore(root, "session-a");
