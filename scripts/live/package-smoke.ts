@@ -3,7 +3,6 @@ import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
-import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 const execFilePromise = promisify(execFile);
@@ -46,18 +45,45 @@ async function smokePackage(): Promise<void> {
     tarballPath,
   ]);
   const packageRoot = join(consumer, "node_modules/@vistyy/pi-workgraph");
-  const modules = ["extensions/coordinator.ts", "extensions/worker.ts"].map(
-    (path) => pathToFileURL(join(packageRoot, path)).href,
+  const agentDir = join(parent, "agent");
+  await mkdir(agentDir);
+  const modules = ["extensions/coordinator.ts", "extensions/worker.ts"].map((path) =>
+    join(packageRoot, path),
   );
   await command(consumer, "node", [
-    "--import",
-    "tsx",
     "--input-type=module",
     "--eval",
-    `for (const url of ${JSON.stringify(modules)}) { const loaded = await import(url); if (typeof loaded.default !== "function") throw new Error(\`Missing extension factory: \${url}\`); }`,
+    `
+      import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
+      const [coordinatorPath, workerPath] = ${JSON.stringify(modules)};
+      const agentDir = ${JSON.stringify(agentDir)};
+      const one = (result, label, path) => {
+        if (result.errors.length > 0)
+          throw new Error(label + " load failed: " + JSON.stringify(result.errors));
+        const loaded = result.extensions.find((extension) => extension.resolvedPath === path);
+        if (loaded === undefined) throw new Error(label + " factory was not loaded.");
+        return loaded;
+      };
+      delete process.env.PI_WORKGRAPH_ROLE;
+      const coordinator = one(
+        await discoverAndLoadExtensions([coordinatorPath], process.cwd(), agentDir),
+        "coordinator",
+        coordinatorPath,
+      );
+      if (!coordinator.tools.has("workgraph_implement") || !coordinator.commands.has("calm"))
+        throw new Error("Packaged coordinator factory did not register its extension surface.");
+      process.env.PI_WORKGRAPH_ROLE = "research";
+      const worker = one(
+        await discoverAndLoadExtensions([workerPath], process.cwd(), agentDir),
+        "Worker",
+        workerPath,
+      );
+      if (!worker.tools.has("workgraph_report") || worker.tools.has("workgraph_plan"))
+        throw new Error("Packaged Worker factory did not register its research surface.");
+    `,
   ]);
   process.stdout.write(
-    `${JSON.stringify({ status: "passed", boundary: "pack/install/import/extensions", totalMs: Date.now() - started })}\n`,
+    `${JSON.stringify({ status: "passed", boundary: "pack/install/load/extension-factories", totalMs: Date.now() - started })}\n`,
   );
 }
 
@@ -66,7 +92,7 @@ try {
 } catch (cause) {
   const failure: unknown = controller.signal.aborted ? controller.signal.reason : cause;
   process.stderr.write(
-    `verify:package failed at the pack/install/import/extensions boundary. Installation may require registry access for uncached peers and dependencies. ${failure instanceof Error ? failure.message : String(failure)}\n`,
+    `verify:package failed at the pack/install/load/extension-factories boundary. Installation may require registry access for uncached peers and dependencies. ${failure instanceof Error ? failure.message : String(failure)}\n`,
   );
   process.exitCode = 1;
 } finally {

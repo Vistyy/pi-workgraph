@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs"; // oxlint-disable-line effecttsgo/node-builtin-import -- The pre-mutation assertion observes the real Store path.
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Real isolated sessions and SQLite establish the registered boundary.
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"; // oxlint-disable-line effecttsgo/node-builtin-import -- Real isolated sessions and SQLite establish the registered boundary.
 import { tmpdir } from "node:os";
 import { join } from "node:path"; // oxlint-disable-line effecttsgo/node-builtin-import -- Fixture paths are exact disposable identities.
 import test from "node:test";
+import { Effect } from "effect";
 import { Value } from "typebox/value";
 import { RecordStore } from "../../src/coordinator/store.js";
+import type { AttemptSpec, Task } from "../../src/domain/records.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../support/decoders.js";
 import { extensionFixture, git } from "../support/helpers.js";
 
@@ -20,7 +22,11 @@ const accepted = [
   "workgraph_control",
   "workgraph_notepad",
 ] as const;
-async function fixture(available: boolean, workspaceId = available ? "workspace-exact" : null) {
+async function fixture(
+  available: boolean,
+  workspaceId = available ? "workspace-exact" : null,
+  role: string | null = null,
+) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-coordinator-"));
   const root = join(parent, "repo");
   await mkdir(root);
@@ -32,7 +38,7 @@ async function fixture(available: boolean, workspaceId = available ? "workspace-
   await git(root, "commit", "-m", "base");
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
-    PI_WORKGRAPH_ROLE: null,
+    PI_WORKGRAPH_ROLE: role,
     HERDR_ENV: available ? "1" : null,
     HERDR_WORKSPACE_ID: workspaceId,
     HERDR_TAB_ID: null,
@@ -94,6 +100,153 @@ void test("coordinator registers exactly nine strict tools", async () => {
       Value.Check(control.parameters, { action: "discard_output", attemptId: "a", reason: "old" }),
       true,
     );
+
+    const guidance = (
+      await readFile(new URL("../../COORDINATOR.md", import.meta.url), "utf8")
+    ).trim();
+    const injected = await f.runner.emitBeforeAgentStart(
+      "Coordinate the request",
+      undefined,
+      "Base coordinator prompt",
+      { cwd: f.root },
+    );
+    assert.equal(
+      injected?.systemPrompt,
+      `Base coordinator prompt\n\n${guidance}`,
+      "the loaded coordinator extension injects the packaged guidance",
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("coordinator extension remains inactive in Worker scope", async () => {
+  const f = await fixture(false, null, "research");
+  try {
+    assert.deepEqual(
+      f.runner
+        .getAllRegisteredTools()
+        .map((tool) => tool.definition.name)
+        .filter((name) => name.startsWith("workgraph_")),
+      [],
+    );
+    assert.equal(f.runner.getCommand("calm"), undefined);
+    assert.equal(
+      await f.runner.emitBeforeAgentStart("Work", undefined, "Worker prompt", { cwd: f.root }),
+      undefined,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("registered extension starts candidate extension from the exact retained tip", async () => {
+  const f = await fixture(true);
+  const sourceAttemptId = "attempt-source";
+  const sourceRef = `refs/pi-workgraph/outputs/${sourceAttemptId}`;
+  try {
+    const base = await git(f.root, "rev-parse", "HEAD");
+    await writeFile(join(f.root, "file.txt"), "candidate\n");
+    await git(f.root, "commit", "-am", "candidate");
+    const sourceTip = await git(f.root, "rev-parse", "HEAD");
+    await git(f.root, "update-ref", sourceRef, sourceTip);
+    await git(f.root, "reset", "--hard", base);
+
+    const sourceTask = {
+      target: {
+        kind: "repository",
+        checkoutRoot: await git(f.root, "rev-parse", "--show-toplevel"),
+        commonDir: await git(f.root, "rev-parse", "--path-format=absolute", "--git-common-dir"),
+      },
+      contract: {
+        kind: "implementation",
+        objective: "Produce the retained source Candidate",
+        acceptance: ["The committed candidate is retained"],
+      },
+    } satisfies Task;
+    const sourceSpec = {
+      selection: {
+        kind: "implementation",
+        guide: { model: "fixture/guide", thinking: "high" },
+        executor: { model: "fixture/executor", thinking: "xhigh" },
+      },
+      base: { kind: "repository", baseCommit: base },
+    } satisfies AttemptSpec;
+    const seed = new RecordStore(f.agentDir, f.session.getSessionId());
+    seed.createTaskWithAttempt("source", sourceTask, sourceAttemptId, sourceSpec);
+    seed.recordOutcome(sourceAttemptId, {
+      result: {
+        kind: "reported",
+        report: {
+          kind: "implementation",
+          status: "completed",
+          outcome: "changed",
+          summary: "Produced the source Candidate.",
+          evidence: [],
+          findings: [],
+        },
+      },
+      effectiveModels: [],
+    });
+    seed.checkpointOutput(sourceAttemptId, {
+      kind: "retained",
+      tip: sourceTip,
+      reason: "Committed implementation output",
+    });
+    seed.close();
+
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    await git(f.root, "update-ref", sourceRef, base);
+    await assert.rejects(
+      f.call("workgraph_implement", {
+        id: "invalid-extension",
+        objective: "Extend an inexact Candidate",
+        acceptance: ["Must not start"],
+        candidateOf: { attemptId: sourceAttemptId, mode: "extend" },
+      }),
+      /Private output ref is absent or was repointed/,
+    );
+    const afterRejection = await f.call("workgraph_inspect", { section: "overview" });
+    assert.deepEqual(
+      (afterRejection.details as { counts: { tasks: number; attempts: number } }).counts,
+      { tasks: 1, attempts: 1, activeWorkers: 0 },
+    );
+
+    await git(f.root, "update-ref", sourceRef, sourceTip);
+    const created = await f.call("workgraph_implement", {
+      id: "extension",
+      objective: "Extend the retained Candidate",
+      acceptance: ["The successor starts at the source tip"],
+      candidateOf: { attemptId: sourceAttemptId, mode: "extend" },
+    });
+    // SAFETY: The registered implementation tool returns this bounded creation receipt.
+    const receipt = created.details as {
+      attempts: { attemptId: string }[];
+    };
+    const successorId = receipt.attempts[0]?.attemptId;
+    assert.ok(successorId !== undefined);
+    const inspected = await f.call("workgraph_inspect", {
+      section: "attempt",
+      id: successorId,
+    });
+    // SAFETY: Exact Attempt inspection returns the strictly decoded persisted specification.
+    const successor = (inspected.details as { spec: AttemptSpec }).spec;
+    assert.deepEqual(successor.base, { kind: "repository", baseCommit: sourceTip });
+    assert.deepEqual(successor.lineage, {
+      candidateRoot: base,
+      candidateOf: { kind: "extend", attemptId: sourceAttemptId },
+    });
+
+    const worktree = join(f.agentDir, "workgraph", "worktrees", successorId);
+    let worktreeHead = "";
+    for (let index = 0; index < 100 && worktreeHead === ""; index += 1) {
+      worktreeHead = await git(worktree, "rev-parse", "HEAD").catch(() => "");
+      if (worktreeHead === "") await Effect.runPromise(Effect.sleep(10));
+    }
+    assert.equal(worktreeHead, sourceTip);
+    assert.equal(await git(f.root, "rev-parse", sourceRef), sourceTip);
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), base);
+    assert.equal(await readFile(join(f.root, "file.txt"), "utf8"), "base\n");
   } finally {
     await f.dispose();
   }

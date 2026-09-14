@@ -8,15 +8,11 @@ import { attachCalmProjection, type CalmProjection } from "../../src/calm/projec
  * Presentation fixtures and assertions shared by the Calm test suites.
  *
  * The fixture classes deliberately do not extend Pi's public message components, only the shared
- * Container. Classification must therefore go through the runtime-loaded classes: if the adapter
- * used a statically imported public class, every fixture row would be dropped. The
- * `Symbol.hasInstance` counters also make per-frame classification observable without a test-only
- * production counter.
+ * Container. Classification must therefore go through the supplied runtime classes: if the adapter
+ * used a statically imported public class, every fixture row would be dropped.
  */
 
-// SAFETY: These fixtures intentionally brand and inspect presentation instances to exercise the
-// guarded compatibility boundary without Pi's public class identities.
-// oxlint-disable anti-slop/no-object-parameters, anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, typescript/unbound-method
+// oxlint-disable anti-slop/no-object-parameters, anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, typescript/unbound-method
 
 export type ContentPart = AssistantMessage["content"][number];
 export type FakeMouseEvent = {
@@ -57,17 +53,6 @@ export function assistantMessage(content: AssistantMessage["content"]): Assistan
   };
 }
 
-const KIND = Symbol("calm-fixture-kind");
-
-function brand(value: object, kind: string): void {
-  Object.defineProperty(value, KIND, { configurable: true, value: kind });
-}
-
-function isBranded(value: unknown, kind: string): boolean {
-  if (typeof value !== "object" || value === null) return false;
-  return Object.getOwnPropertyDescriptor(value, KIND)?.value === kind;
-}
-
 export class FixtureContainer extends Container {
   handleMouse(event: FakeMouseEvent): FakeMouseEvent | undefined {
     if (event.y < 0 || event.y >= event.height) return undefined;
@@ -87,13 +72,7 @@ export class FixtureContainer extends Container {
 }
 
 export class FixtureAssistant extends FixtureContainer {
-  static checks = 0;
   static instances: FixtureAssistant[] = [];
-
-  static override [Symbol.hasInstance](value: unknown): boolean {
-    FixtureAssistant.checks += 1;
-    return isBranded(value, "assistant");
-  }
 
   lastMessage: AssistantMessage | undefined = undefined;
   isStreaming = false;
@@ -106,7 +85,6 @@ export class FixtureAssistant extends FixtureContainer {
 
   constructor(message?: AssistantMessage) {
     super();
-    brand(this, "assistant");
     FixtureAssistant.instances.push(this);
     if (message !== undefined) this.updateContent(message);
   }
@@ -134,19 +112,11 @@ export class FixtureAssistant extends FixtureContainer {
 }
 
 export class FixtureUser extends FixtureContainer {
-  static checks = 0;
-
-  static override [Symbol.hasInstance](value: unknown): boolean {
-    FixtureUser.checks += 1;
-    return isBranded(value, "user");
-  }
-
   invalidations = 0;
   readonly text: string;
 
   constructor(text: string) {
     super();
-    brand(this, "user");
     this.text = text;
   }
 
@@ -173,20 +143,12 @@ export interface CustomMessageFixture {
 }
 
 export class FixtureToolExecution extends FixtureContainer {
-  static checks = 0;
-
-  static override [Symbol.hasInstance](value: unknown): boolean {
-    FixtureToolExecution.checks += 1;
-    return isBranded(value, "tool");
-  }
-
   renders = 0;
   clicks = 0;
   readonly toolName: string;
 
   constructor(toolName = "read") {
     super();
-    brand(this, "tool");
     this.toolName = toolName;
   }
 
@@ -204,19 +166,11 @@ export class FixtureToolExecution extends FixtureContainer {
 }
 
 export class FixtureCustomMessage extends FixtureContainer {
-  static checks = 0;
-
-  static override [Symbol.hasInstance](value: unknown): boolean {
-    FixtureCustomMessage.checks += 1;
-    return isBranded(value, "custom");
-  }
-
   renders = 0;
   readonly message: CustomMessageFixture;
 
   constructor(message: CustomMessageFixture) {
     super();
-    brand(this, "custom");
     this.message = message;
   }
 
@@ -229,18 +183,10 @@ export class FixtureCustomMessage extends FixtureContainer {
 }
 
 export class FixtureSkill extends FixtureContainer {
-  static checks = 0;
-
-  static override [Symbol.hasInstance](value: unknown): boolean {
-    FixtureSkill.checks += 1;
-    return isBranded(value, "skill");
-  }
-
   readonly skillBlock: SkillBlockFixture;
 
   constructor(skillBlock: SkillBlockFixture) {
     super();
-    brand(this, "skill");
     this.skillBlock = skillBlock;
   }
 
@@ -326,14 +272,4 @@ export function projected(
 export function constructSkill(runtime: CalmChatRuntime, block: SkillBlockFixture): Component {
   const Skill = runtime.skill as unknown as new (skillBlock: SkillBlockFixture) => Component;
   return new Skill(block);
-}
-
-export function classificationChecks(): number {
-  return (
-    FixtureUser.checks +
-    FixtureSkill.checks +
-    FixtureAssistant.checks +
-    FixtureToolExecution.checks +
-    FixtureCustomMessage.checks
-  );
 }

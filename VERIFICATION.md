@@ -84,7 +84,7 @@ Representative render measurements are required for cost or responsiveness claim
 
 ## Extension and package smoke
 
-Start the registered coordinator and Worker extensions from the exact checkout to establish registration, role gating, guidance injection, and clean shutdown. Pack the exact revision, install it in a disposable consumer, and import both supported extension entry points outside the repository. Archive file inspection or build success alone does not establish packaged startup.
+Load the registered coordinator and Worker extensions from the exact checkout through Pi's extension runtime, then drive session startup and shutdown to establish registration, role gating, guidance injection, and clean release of session-owned resources. Pack the exact revision, install it in a disposable consumer, and load both supported entry-point factories through the installed Pi extension loader. This disposable-consumer check establishes packaged extension loading and registration, not session lifecycle; archive inspection, module import alone, or build success does not establish that boundary.
 
 [`package.json`](package.json) owns command definitions:
 

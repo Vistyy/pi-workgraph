@@ -8,7 +8,6 @@ import {
   calmActivityLines,
   createCalmActivityTracker,
   isCalmActivityActive,
-  isCoordinatorScope,
 } from "../../src/calm/index.js";
 import { discoverCalmChat } from "../../src/calm/projection.js";
 import {
@@ -363,10 +362,7 @@ void test("Calm on projects the chat while shutdown restores native presentation
   assert.equal(tui.requests, requests, "shutdown must stop the pulse timer");
 });
 
-void test("coordinator scope and activity state remain unchanged", () => {
-  assert.equal(isCoordinatorScope({}), true);
-  assert.equal(isCoordinatorScope({ PI_WORKGRAPH_ROLE: "" }), true);
-  assert.equal(isCoordinatorScope({ PI_WORKGRAPH_ROLE: "implementation" }), false);
+void test("activity state distinguishes coordinator and Worker execution", () => {
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 0 }), false);
   assert.equal(isCalmActivityActive({ coordinatorActive: true, activeWorkers: 0 }), true);
   assert.equal(isCalmActivityActive({ coordinatorActive: false, activeWorkers: 2 }), true);
