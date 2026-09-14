@@ -1,51 +1,46 @@
-# Glossary
+# Workgraph
 
-Canonical language for Pi Workgraph's session-owned coordination records and retained repository output.
+Canonical language for delegated Workgraph coordination and repository output.
 
-## Coordinator
+## Language
 
-The Pi session that decides what work to delegate, evaluates its evidence, and owns final synthesis and verification.
+**Coordinator**:
+The Pi session responsible for understanding the user's goal, making consequential decisions, delegating where useful, and accepting the final result. It owns its Tasks and Attempts.
 
-## Task
+**Task**:
+A durable assignment with one purpose and exact Target. A Task may have multiple Attempts.
 
-An immutable, decision-complete assignment contract and its exact target. A Task may have multiple Attempts.
+_Avoid_: Workstream
 
-## Attempt
+**Attempt**:
+One execution of a Task. Trying the same Task again creates a new Attempt rather than changing the existing one.
 
-One immutable execution specification for a Task, with mutable Worker and output facts and one optional write-once Outcome.
+_Avoid_: Run
 
-## Worker
+**Worker**:
+A delegated Pi session that executes one Attempt.
 
-The fresh delegated Pi session that executes one Attempt.
+**Outcome**:
+The semantic result of an Attempt: a report, an unreported ending, or cancellation. It is distinct from repository output.
 
-## Outcome
+_Avoid_: Output
 
-The Attempt's write-once semantic result and the models actually observed while producing it. An Outcome is distinct from repository output.
+**Target**:
+The directory or repository to which a Task applies. Every Attempt for that Task inherits the same Target.
 
-## Target
+**Candidate**:
+A clean retained implementation repository output for which Workgraph can prove the exact producing Attempt, root, tip, and lineage. It may be reviewed, used as the source of a successor Candidate, applied, or discarded.
 
-The resolved directory or repository recorded by a Task and inherited by every Attempt of that Task.
+**Candidate lineage**:
+The immutable relationship between a Candidate-producing Attempt and an exact source Candidate. Extension starts the successor Attempt at the source tip and preserves its root; integration starts from another explicit base and records the source tip to incorporate.
 
-## Selection
+**Repository output**:
+The repository changes, if any, produced by an Attempt together with Workgraph's custody state for them. Repository output may exist without qualifying as a Candidate and is separate from the Attempt's Outcome.
 
-The model target and thinking level frozen into an Attempt specification; implementation selections contain both guide and executor targets.
+_Avoid_: Outcome
 
-## `candidateOf: extend`
+**Calm**:
+The Coordinator's filtered presentation of Pi's live conversation. Calm changes presentation without changing the native transcript.
 
-Lineage that continues from an exact retained Attempt candidate and therefore inherits that candidate's tip as its base.
-
-## `candidateOf: integrate`
-
-Lineage that starts from an explicit base and incorporates an exact retained Attempt candidate identified by its source tip.
-
-## Output states
-
-The operational custody state of an Attempt's repository result: retained, applying, discarding, no output, applied, or discarded.
-
-## Calm
-
-A coordinator-only render-time projection of Pi's live chat that hides Workgraph noise while leaving the native transcript unchanged.
-
-## Notepad
-
-A bounded, branch-local memo for pending coordinator context; it is not authority, durable work state, or an acceptance record.
+**Notepad**:
+A bounded, branch-local memo for pending Coordinator context. It is not Task state, evidence, authority, or acceptance.

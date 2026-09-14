@@ -11,9 +11,9 @@ This document owns the integrated rationale and durable constraints for Workgrap
 
 The coordinator's exact Pi session is the unit of ownership. Its Tasks and Attempts are private coordination records, not a shared project board. Other sessions cannot enumerate or take over those records. Session shutdown releases coordinator-owned runtime activity while preserving independent Worker sessions, native resources, and repository output.
 
-Delegation is optional. The coordinator remains responsible for decisions, candidate evaluation, final synthesis, and verification. Task contracts externalize enough settled context for a Worker to act without reconstructing consequential design. Reports provide evidence; they do not create authority or prove acceptance.
+Delegation is optional. The coordinator remains responsible for decisions, Candidate evaluation, final synthesis, and verification. Task contracts externalize enough settled context for a Worker to act without reconstructing consequential design. Reports provide evidence; they do not create authority or prove acceptance.
 
-A Task is immutable and owns a contract plus one resolved target. An Attempt is one immutable execution specification for that Task: model selection, target-appropriate base, and optional candidate lineage. It embeds one optional write-once Outcome. Only operational facts about its Worker and repository output are mutable. This split keeps semantic evidence stable while allowing exact recovery checkpoints to advance.
+A Task is immutable and owns a contract plus one resolved target. An Attempt is one immutable execution specification for that Task: model selection, target-appropriate base, and optional Candidate lineage. It embeds one optional write-once Outcome. Only operational facts about its Worker and repository output are mutable. This split keeps semantic evidence stable while allowing exact recovery checkpoints to advance.
 
 An Outcome records a reported, unreported, or cancelled semantic result and the effective model targets observed in the Worker session. It does not represent repository custody or authorize a Git operation. Effective models may be empty when execution never established one, and may differ from the frozen selection when Pi's actual session trajectory differs.
 
@@ -56,11 +56,11 @@ The user-owned model policy is the only source of executable model IDs and think
 
 Actual effective models are derived from persisted Pi model events in trajectory order and written with the Outcome. Frozen selection explains what was requested; effective models explain what ran. Neither is inferred from report prose.
 
-## Targets and candidate lineage
+## Targets and Candidate lineage
 
 A Task resolves either an exact directory path or a repository identity consisting of checkout root and Git common directory. Every Attempt inherits that immutable target. The coordinator's current directory is only a resolution input, never later placement authority. This permits Tasks in several repositories within one session without distributed transactions, dependencies, rollback, or all-or-nothing application claims.
 
-Repository Attempt bases are exact commits. A root candidate starts at its explicit base. `candidateOf: extend` starts from the exact retained parent tip and continues the same candidate. `candidateOf: integrate` starts from a separately explicit base and records both the retained source Attempt and source tip to incorporate. Candidate lineage is immutable and checked against exact retained refs; session continuation is not content ancestry.
+Repository Attempt bases are exact commits. A root Candidate is rooted at its Attempt's explicit base. `candidateOf: extend` starts the successor Attempt from the exact retained source Candidate tip and preserves its root. `candidateOf: integrate` starts from a separately explicit base and records both the exact source Candidate-producing Attempt and source tip to incorporate. Candidate lineage is immutable and checked against exact retained refs; session continuation is not content ancestry.
 
 Directory Attempts have no Git output. Repository Attempts execute in detached worktrees at `<agentDir>/workgraph/worktrees/<attemptId>` and never borrow the destination checkout as execution state.
 
@@ -68,7 +68,7 @@ Directory Attempts have no Git output. Repository Attempts execute in detached w
 
 After exact Worker closure, clean unchanged repository work removes its detached worktree with no output. Clean changed work is anchored at `refs/pi-workgraph/outputs/<attemptId>` before checkout removal. Dirty, moved, foreign, missing, or ambiguous resources remain physically preserved and blocked because their postconditions cannot be proven.
 
-Apply and discard are serialized per exact Attempt and repository. Application first proves the private source ref, candidate root and lineage, attached destination identity, current destination ref and HEAD, cleanliness, ancestry, and conflicts without mutating destination state. It checkpoints the expected source and destination facts, re-proves them, then performs only the prepared fast-forward form. Recovery accepts application only when Git structure proves the exact expected result; an unrelated, switched, or advanced destination blocks without rollback or automatic retry. Output cleanup occurs only after application is recorded.
+Apply and discard are serialized per exact Attempt and repository. Application first proves the private source ref, Candidate root and lineage, attached destination identity, current destination ref and HEAD, cleanliness, ancestry, and conflicts without mutating destination state. It checkpoints the expected source and destination facts, re-proves them, then performs only the prepared fast-forward form. Recovery accepts application only when Git structure proves the exact expected result; an unrelated, switched, or advanced destination blocks without rollback or automatic retry. Output cleanup occurs only after application is recorded.
 
 Discard is explicitly destructive and requires a reason. It checkpoints the exact retained tip and disposition before deleting only the verified private ref or owned worktree. Interruption recovery accepts only proven postconditions and never removes foreign or uncertain resources. Semantic Outcomes and routine shutdown cannot discard output.
 
