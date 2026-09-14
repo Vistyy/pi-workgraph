@@ -1,6 +1,17 @@
 /* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion, typescript/require-array-sort-compare -- focused tests inspect native SQLite row shapes through node:sqlite's open row type. */
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -91,6 +102,8 @@ void test("RecordStore creates one exact database lazily", () => {
     assert.equal(store.path, join(root, "workgraph", "workgraph.sqlite"));
     assert.equal(existsSync(store.path), true);
     assert.equal(statSync(root).mode & 0o777, 0o751);
+    assert.equal(statSync(join(root, "workgraph")).mode & 0o777, 0o700);
+    assert.equal(statSync(store.path).mode & 0o777, 0o600);
     store.close();
 
     const database = new DatabaseSync(join(root, "workgraph", "workgraph.sqlite"), {
@@ -153,6 +166,7 @@ void test("session partitions share one file without sharing records or relation
     const first = new RecordStore(root, "session-a");
     const second = new RecordStore(root, "session-b");
     first.createTaskWithAttempt("same-task", directoryTask, "attempt-a", directorySpec);
+    first.createTaskWithAttempt("foreign-only", directoryTask, "attempt-foreign", directorySpec);
     second.createTaskWithAttempt("same-task", repositoryTask, "attempt-b", repositorySpec);
 
     assert.equal(first.path, second.path);
@@ -160,14 +174,155 @@ void test("session partitions share one file without sharing records or relation
     assert.equal(second.readTask("same-task").task.contract.kind, "implementation");
     assert.throws(() => first.readAttempt("attempt-b"), StoreError);
     assert.throws(
-      () => second.createAttempt("missing-task", "attempt-c", directorySpec),
+      () => second.createAttempt("foreign-only", "attempt-c", directorySpec),
       StoreError,
     );
+    assert.deepEqual(second.listAttempts(0, 10, "foreign-only"), []);
     assert.throws(() => second.createAttempt("same-task", "attempt-a", repositorySpec), StoreError);
-    assert.deepEqual(first.counts(), { tasks: 1, attempts: 1, activeWorkers: 0 });
+    assert.deepEqual(first.counts(), { tasks: 2, attempts: 2, activeWorkers: 0 });
     assert.deepEqual(second.counts(), { tasks: 1, attempts: 1, activeWorkers: 0 });
     first.close();
     second.close();
+  } finally {
+    cleanup();
+  }
+});
+
+void test("RecordStore permits only agentDir itself to redirect placement", () => {
+  const { root, cleanup } = fixture();
+  try {
+    const realAgent = join(root, "real-agent");
+    const linkedAgent = join(root, "linked-agent");
+    mkdirSync(realAgent);
+    symlinkSync(realAgent, linkedAgent, "dir");
+
+    const store = new RecordStore(linkedAgent, "session-a");
+    store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec);
+    assert.equal(store.path, join(realAgent, "workgraph", "workgraph.sqlite"));
+    assert.deepEqual(store.readTask("task"), { id: "task", task: directoryTask });
+    store.close();
+  } finally {
+    cleanup();
+  }
+});
+
+void test("RecordStore preserves and rejects a redirected Workgraph directory", () => {
+  const { root, cleanup } = fixture();
+  try {
+    const outside = join(root, "outside");
+    mkdirSync(outside, { mode: 0o751 });
+    symlinkSync(outside, join(root, "workgraph"), "dir");
+
+    const store = new RecordStore(root, "session-a");
+    assert.throws(
+      () => store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec),
+      StoreError,
+    );
+    assert.equal(lstatSync(join(root, "workgraph")).isSymbolicLink(), true);
+    assert.equal(existsSync(join(outside, "workgraph.sqlite")), false);
+    assert.equal(statSync(outside).mode & 0o777, 0o751);
+    store.close();
+  } finally {
+    cleanup();
+  }
+});
+
+void test("RecordStore preserves and rejects a redirected database file", () => {
+  const { root, cleanup } = fixture();
+  try {
+    const parent = join(root, "workgraph");
+    const outside = join(root, "outside.sqlite");
+    mkdirSync(parent, { mode: 0o700 });
+    writeFileSync(outside, "foreign bytes", { mode: 0o640 });
+    symlinkSync(outside, join(parent, "workgraph.sqlite"));
+
+    const store = new RecordStore(root, "session-a");
+    assert.throws(
+      () => store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec),
+      StoreError,
+    );
+    assert.equal(lstatSync(store.path).isSymbolicLink(), true);
+    assert.equal(readFileSync(outside, "utf8"), "foreign bytes");
+    assert.equal(statSync(outside).mode & 0o777, 0o640);
+    store.close();
+  } finally {
+    cleanup();
+  }
+});
+
+void test("RecordStore resumes an interrupted empty initialization", () => {
+  const { root, cleanup } = fixture();
+  try {
+    const parent = join(root, "workgraph");
+    const path = join(parent, "workgraph.sqlite");
+    mkdirSync(parent, { mode: 0o700 });
+    writeFileSync(path, "", { mode: 0o600 });
+
+    const store = new RecordStore(root, "session-a");
+    assert.deepEqual(store.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
+    store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec);
+    assert.deepEqual(store.readTask("task"), { id: "task", task: directoryTask });
+    store.close();
+
+    const database = new DatabaseSync(path, { readOnly: true });
+    assert.equal(
+      (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+      1,
+    );
+    database.close();
+  } finally {
+    cleanup();
+  }
+});
+
+void test("RecordStore preserves and rejects a nonempty version-zero database", () => {
+  const { root, cleanup } = fixture();
+  try {
+    const parent = join(root, "workgraph");
+    const path = join(parent, "workgraph.sqlite");
+    mkdirSync(parent, { mode: 0o700 });
+    const database = new DatabaseSync(path);
+    database.exec("CREATE TABLE foreign_record(value TEXT) STRICT;");
+    database.close();
+
+    const store = new RecordStore(root, "session-a");
+    assert.throws(() => store.counts(), StoreError);
+    assert.throws(
+      () => store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec),
+      StoreError,
+    );
+    store.close();
+
+    const preserved = new DatabaseSync(path, { readOnly: true });
+    assert.deepEqual(
+      preserved
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
+        .all()
+        .map((row) => (row as { name: string }).name),
+      ["foreign_record"],
+    );
+    preserved.close();
+  } finally {
+    cleanup();
+  }
+});
+
+void test("supported reads strictly decode persisted JSON rows", () => {
+  const { root, cleanup } = fixture();
+  try {
+    const store = new RecordStore(root, "session-a");
+    store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec);
+    store.close();
+
+    const database = new DatabaseSync(join(root, "workgraph", "workgraph.sqlite"));
+    database
+      .prepare("UPDATE tasks SET task_json=? WHERE session_id=? AND task_id=?")
+      .run(JSON.stringify({ ...directoryTask, unexpected: true }), "session-a", "task");
+    database.close();
+
+    const restored = new RecordStore(root, "session-a");
+    assert.throws(() => restored.readTask("task"), StoreError);
+    restored.close();
   } finally {
     cleanup();
   }

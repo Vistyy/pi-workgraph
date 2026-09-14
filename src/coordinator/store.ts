@@ -1,6 +1,6 @@
 /* oxlint-disable effecttsgo/node-builtin-import, anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, typescript/no-unsafe-return -- node:sqlite rows and TypeBox outputs are decoded at this private host boundary. */
 /* biome-ignore-all lint/complexity/useLiteralKeys: SQLite rows require indexed access under noPropertyAccessFromIndexSignature. */
-import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
 import { Data } from "effect";
@@ -69,7 +69,13 @@ export class RecordStore {
     private readonly sessionId: string,
   ) {
     if (sessionId.length === 0) throw failure("construct Store", "Session id is empty.");
-    this.path = join(agentDir, "workgraph", "workgraph.sqlite");
+    const placement = host("resolve Store placement", () => {
+      const resolved = realpathSync(agentDir);
+      if (!lstatSync(resolved).isDirectory())
+        throw failure("resolve Store placement", "Agent directory is not a directory.");
+      return resolved;
+    });
+    this.path = join(placement, "workgraph", "workgraph.sqlite");
   }
 
   close(): void {
@@ -328,15 +334,17 @@ export class RecordStore {
     run: (database: DatabaseSync) => A,
   ): A {
     return host(operation, () => {
+      const acquired = mayInitialize && this.database === undefined;
       const database = mayInitialize ? this.forInitialMutation() : this.requireExisting(operation);
-      database.exec("BEGIN IMMEDIATE");
       try {
+        database.exec("BEGIN IMMEDIATE");
         if (mayInitialize) initializeOrValidate(database);
         const result = run(database);
         database.exec("COMMIT");
+        if (acquired) this.database = database;
         return result;
       } catch (cause) {
-        database.exec("ROLLBACK");
+        abandonTransaction(database, acquired);
         throw cause;
       }
     });
@@ -345,10 +353,9 @@ export class RecordStore {
   private forInitialMutation(): DatabaseSync {
     this.requireOpen();
     if (this.database !== undefined) return this.database;
-    privateParent(this.path);
-    this.database = configure(new DatabaseSync(this.path));
-    chmodSync(this.path, 0o600);
-    return this.database;
+    prepareParent(this.path, true, "initialize Store");
+    prepareDatabase(this.path, true, "initialize Store");
+    return openDatabase(this.path);
   }
 
   private requireExisting(operation: string): DatabaseSync {
@@ -360,14 +367,34 @@ export class RecordStore {
   private existingOrUndefined(operation: string): DatabaseSync | undefined {
     this.requireOpen();
     if (this.database !== undefined) return this.database;
-    if (!existsSync(this.path)) return undefined;
-    this.database = configure(new DatabaseSync(this.path));
-    requireVersion(this.database, operation);
-    return this.database;
+    return host(operation, () => {
+      if (!prepareParent(this.path, false, operation)) return undefined;
+      if (!prepareDatabase(this.path, false, operation)) return undefined;
+      const database = openDatabase(this.path);
+      try {
+        if (isInitialized(database, operation)) {
+          this.database = database;
+          return database;
+        }
+        database.close();
+        return undefined;
+      } catch (cause) {
+        database.close();
+        throw cause;
+      }
+    });
   }
 
   private requireOpen(): void {
     if (this.closed) throw failure("use Store", "Record Store is closed.");
+  }
+}
+
+function abandonTransaction(database: DatabaseSync, close: boolean): void {
+  try {
+    if (database.isTransaction) database.exec("ROLLBACK");
+  } finally {
+    if (close) database.close();
   }
 }
 
@@ -377,23 +404,73 @@ function configure(database: DatabaseSync): DatabaseSync {
 }
 
 function initializeOrValidate(database: DatabaseSync): void {
-  const version = userVersion(database);
-  if (version === 1) return;
-  if (version !== 0) throw failure("initialize Store", "Unsupported database schema version.");
-  database.exec(SCHEMA);
+  if (!isInitialized(database, "initialize Store")) database.exec(SCHEMA);
 }
 
-function requireVersion(database: DatabaseSync, operation: string): void {
-  if (userVersion(database) !== 1) throw failure(operation, "Unsupported database schema version.");
+function isInitialized(database: DatabaseSync, operation: string): boolean {
+  const version = userVersion(database);
+  if (version === 1) return true;
+  if (version === 0 && schemaObjectCount(database) === 0) return false;
+  throw failure(operation, "Unsupported database schema version.");
 }
 
 function userVersion(database: DatabaseSync): number {
   return integer(database.prepare("PRAGMA user_version").get() as Row | undefined, "user_version");
 }
 
-function privateParent(path: string): void {
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  chmodSync(dirname(path), 0o700);
+function schemaObjectCount(database: DatabaseSync): number {
+  return integer(
+    database.prepare("SELECT count(*) AS value FROM sqlite_schema").get() as Row | undefined,
+    "value",
+  );
+}
+
+function prepareParent(path: string, create: boolean, operation: string): boolean {
+  const parent = dirname(path);
+  let entry = lstatSync(parent, { throwIfNoEntry: false });
+  if (entry === undefined) {
+    if (!create) return false;
+    try {
+      mkdirSync(parent, { mode: 0o700 });
+    } catch (cause) {
+      if (!hasCode(cause, "EEXIST")) throw cause;
+    }
+    entry = lstatSync(parent);
+  }
+  if (!entry.isDirectory())
+    throw failure(operation, "Workgraph data directory is not an owned directory.");
+  chmodSync(parent, 0o700);
+  return true;
+}
+
+function prepareDatabase(path: string, create: boolean, operation: string): boolean {
+  let entry = lstatSync(path, { throwIfNoEntry: false });
+  if (entry === undefined) {
+    if (!create) return false;
+    try {
+      closeSync(openSync(path, "wx", 0o600));
+    } catch (cause) {
+      if (!hasCode(cause, "EEXIST")) throw cause;
+    }
+    entry = lstatSync(path);
+  }
+  if (!entry.isFile()) throw failure(operation, "Record Store path is not an owned regular file.");
+  chmodSync(path, 0o600);
+  return true;
+}
+
+function openDatabase(path: string): DatabaseSync {
+  const database = new DatabaseSync(path);
+  try {
+    return configure(database);
+  } catch (cause) {
+    database.close();
+    throw cause;
+  }
+}
+
+function hasCode(cause: unknown, code: string): boolean {
+  return cause instanceof Error && "code" in cause && cause.code === code;
 }
 
 function taskRecord(row: Row): TaskRecord {
