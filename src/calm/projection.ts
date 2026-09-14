@@ -44,16 +44,9 @@ type AssistantContentPart = AssistantMessage["content"][number];
 
 type AssistantTextPart = Extract<AssistantContentPart, { readonly type: "text" }>;
 
-interface MouseEventLike {
-  readonly y: number;
-  readonly height: number;
-  readonly width: number;
-}
+type MouseEvent = Parameters<Container["handleMouse"]>[0];
 
-/** The published Container type omits Pi's runtime mouse member, which the live chat owns. */
-interface MouseDelegatingContainer extends Container {
-  handleMouse?: (event: MouseEventLike) => MouseEventLike | undefined;
-}
+type MouseResult = ReturnType<Container["handleMouse"]>;
 
 interface NativeAssistantState {
   readonly message: AssistantMessage | undefined;
@@ -256,14 +249,14 @@ export function attachCalmProjection(
 }
 
 class ChatProjectionAdapter implements CalmProjection {
-  readonly #chat: MouseDelegatingContainer;
+  readonly #chat: Container;
   readonly #runtime: CalmChatRuntime;
   readonly #styleSeparator: SeparatorStyle;
   readonly #onIncompatible: Diagnostic;
-  readonly #projection: MouseDelegatingContainer;
+  readonly #projection: Container;
   readonly #nativeRender: (width: number) => string[];
   readonly #nativeInvalidate: () => void;
-  readonly #nativeMouse: (event: MouseEventLike) => MouseEventLike | undefined;
+  readonly #nativeMouse: (event: MouseEvent) => MouseResult;
   readonly #assistantCache = new WeakMap<AssistantMessageComponent, CachedAssistant>();
   readonly #skillUsers = new WeakMap<SkillInvocationMessageComponent, UserMessageComponent>();
   readonly #originals: Record<OwnedSeam["key"], PropertyDescriptor | undefined>;
@@ -295,11 +288,11 @@ class ChatProjectionAdapter implements CalmProjection {
     }
   };
 
-  readonly #wrappedMouse = (event: MouseEventLike): MouseEventLike | undefined => {
+  readonly #wrappedMouse = (event: MouseEvent): MouseResult => {
     if (!this.#enabled) return this.#nativeMouse(event);
 
     try {
-      return this.#projection.handleMouse?.(event);
+      return this.#projection.handleMouse(event);
     } catch (error) {
       this.#fail(error);
 
@@ -308,18 +301,16 @@ class ChatProjectionAdapter implements CalmProjection {
   };
 
   constructor(chat: Container, options: CalmProjectionOptions) {
-    const surface: MouseDelegatingContainer = chat;
-
-    if (typeof surface.handleMouse !== "function")
+    if (typeof chat.handleMouse !== "function")
       throw new Error("the Pi live chat handleMouse seam is missing.");
-    this.#chat = surface;
+    this.#chat = chat;
     this.#runtime = options.runtime;
     this.#styleSeparator = options.styleSeparator;
     this.#onIncompatible = options.onIncompatible;
     this.#projection = new options.runtime.container();
     this.#nativeRender = chat.render.bind(chat);
     this.#nativeInvalidate = chat.invalidate.bind(chat);
-    this.#nativeMouse = surface.handleMouse.bind(surface);
+    this.#nativeMouse = chat.handleMouse.bind(chat);
     this.#originals = {
       render: Object.getOwnPropertyDescriptor(chat, "render"),
       invalidate: Object.getOwnPropertyDescriptor(chat, "invalidate"),

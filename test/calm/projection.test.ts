@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { type Component, visibleWidth } from "@earendil-works/pi-tui";
+import { type Component, type TuiMouseEvent, visibleWidth } from "@earendil-works/pi-tui";
 
 import {
   calmActivityLines,
@@ -68,6 +68,22 @@ class MouseUser extends FixtureUser {
 
     return undefined;
   }
+}
+
+function mouseEvent(y: number, height: number): TuiMouseEvent {
+  return {
+    type: "click",
+    button: "left",
+    x: 0,
+    y,
+    screenX: 0,
+    screenY: y,
+    width: 80,
+    height,
+    shift: false,
+    alt: false,
+    ctrl: false,
+  };
 }
 
 void test("Calm projects the current visible transcript with final exclusions and adjacency", () => {
@@ -165,7 +181,7 @@ void test("toggle, mouse routing, invalidate freshness, and detach preserve nati
   const projection = projected(chat);
   assert.deepEqual(renderedLines(chat), ["click me", "answer"]);
   const height = chat.render(80).length;
-  chat.handleMouse({ y: 0, height, width: 80 });
+  chat.handleMouse(mouseEvent(0, height));
   assert.equal(user.clicks, 1);
   assert.equal(tool.clicks, 0);
 
@@ -177,7 +193,7 @@ void test("toggle, mouse routing, invalidate freshness, and detach preserve nati
   projection.setEnabled(false);
   assert.deepEqual(renderedLines(chat), ["click me", "native", "answer", "[tool] read"]);
   const nativeHeight = chat.render(80).length;
-  chat.handleMouse({ y: nativeHeight - 1, height: nativeHeight, width: 80 });
+  chat.handleMouse(mouseEvent(nativeHeight - 1, nativeHeight));
   assert.equal(tool.clicks, 1);
   projection.setEnabled(true);
   assert.deepEqual(renderedLines(chat), ["click me", "answer"]);

@@ -12,15 +12,9 @@ import { attachCalmProjection, type CalmProjection } from "../../src/calm/projec
  * used a statically imported public class, every fixture row would be dropped.
  */
 
-// oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion, typescript/unbound-method
+// oxlint-disable anti-slop/no-chained-type-assertions, anti-slop/require-safety-comment-for-type-assertion
 
 export type ContentPart = AssistantMessage["content"][number];
-
-export type FakeMouseEvent = {
-  readonly y: number;
-  readonly height: number;
-  readonly width: number;
-};
 
 export function textPart(value: string): ContentPart {
   return { type: "text", text: value };
@@ -54,28 +48,7 @@ export function assistantMessage(content: AssistantMessage["content"]): Assistan
   };
 }
 
-export class FixtureContainer extends Container {
-  handleMouse(event: FakeMouseEvent): FakeMouseEvent | undefined {
-    if (event.y < 0 || event.y >= event.height) return undefined;
-    let childY = 0;
-
-    for (const child of this.children) {
-      const height = child.render(event.width).length;
-
-      if (event.y >= childY && event.y < childY + height) {
-        const handler = (
-          child as { handleMouse?(event: FakeMouseEvent): FakeMouseEvent | undefined }
-        ).handleMouse;
-
-        return handler?.call(child, { ...event, y: event.y - childY, height });
-      }
-
-      childY += height;
-    }
-
-    return undefined;
-  }
-}
+export class FixtureContainer extends Container {}
 
 export class FixtureAssistant extends FixtureContainer {
   static instances: FixtureAssistant[] = [];
