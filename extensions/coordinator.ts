@@ -79,6 +79,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   if (!isCoordinatorScope(process.env)) return;
   const guidance = readFileSync(new URL("../COORDINATOR.md", import.meta.url), "utf8").trim();
   const agentDir = options.agentDir ?? getAgentDir();
+  const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
   const calm = installCalmMode(pi);
   let attached: SessionRuntime | undefined;
   let scope: Scope.Scope | undefined;
@@ -148,9 +149,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     async execute(_id, params) {
-      const policy = await loadModelPolicy(options.policyPath);
+      const policy = await loadModelPolicy(policyPath);
       return result({
-        path: options.policyPath ?? modelPolicyPath(agentDir),
+        path: policyPath,
         role: params.role,
         targets: policy.roles[params.role],
       });
@@ -191,7 +192,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
               permittedEffects: params.experiment.permittedEffects,
               stopCondition: params.experiment.stopCondition,
             };
-      return createTask(runtime(), ctx, options, {
+      return createTask(runtime(), ctx, policyPath, {
         id: params.id,
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: params.experiment === undefined ? "directory" : "repository",
@@ -216,12 +217,12 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     async (params, ctx) => {
-      const policy = await loadModelPolicy(options.policyPath);
+      const policy = await loadModelPolicy(policyPath);
       const contract: TaskContract =
         params.context === undefined
           ? { kind: "consultation", question: params.question }
           : { kind: "consultation", question: params.question, context: params.context };
-      return createTask(runtime(), ctx, options, {
+      return createTask(runtime(), ctx, policyPath, {
         id: params.id,
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "directory",
@@ -253,9 +254,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     async (params, ctx) => {
       if (params.candidateOf?.mode === "extend" && params.baseRevision !== undefined)
         throw new Error("Candidate extension forbids baseRevision.");
-      const policy = await loadModelPolicy(options.policyPath);
+      const policy = await loadModelPolicy(policyPath);
       const selected = implementationTargets(policy, params.useEscalationExecutor ?? false);
-      return createTask(runtime(), ctx, options, {
+      return createTask(runtime(), ctx, policyPath, {
         id: params.id,
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "repository",
@@ -291,7 +292,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     async (params, ctx) =>
-      createTask(runtime(), ctx, options, {
+      createTask(runtime(), ctx, policyPath, {
         id: params.id,
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: params.subject.kind === "revision" ? "repository" : "directory",
@@ -322,7 +323,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     ),
     execute(_id, params) {
       return serialize(async () =>
-        result(attemptReceipt(await createAttempt(runtime(), options, params))),
+        result(attemptReceipt(await createAttempt(runtime(), policyPath, params))),
       );
     },
   });
@@ -420,7 +421,7 @@ type CreateTaskInput = {
 async function createTask(
   runtime: SessionRuntime,
   ctx: ExtensionContext,
-  options: CoordinatorOptions,
+  policyPath: string,
   input: CreateTaskInput,
 ): Promise<object> {
   const revision =
@@ -435,7 +436,7 @@ async function createTask(
       ...(input.targetKind === "repository" && revision !== undefined ? { revision } : {}),
     }),
   );
-  const selections = await selectionsFor(input, options);
+  const selections = await selectionsFor(input, policyPath);
   const first = selections[0];
   if (first === undefined) throw new Error("Task requires at least one model selection.");
   const initial = await Effect.runPromise(
@@ -467,10 +468,10 @@ async function createTask(
 
 async function selectionsFor(
   input: CreateTaskInput,
-  options: CoordinatorOptions,
+  policyPath: string,
 ): Promise<AttemptSelection[]> {
   if (input.fixedSelection !== undefined) return [input.fixedSelection];
-  const policy = await loadModelPolicy(options.policyPath);
+  const policy = await loadModelPolicy(policyPath);
   const role = input.contract.kind === "review" ? "review" : "research";
   return resolveSelection(role, input.selection, policy).selected.map((target) => ({
     kind: "target",
@@ -480,7 +481,7 @@ async function selectionsFor(
 
 async function createAttempt(
   runtime: SessionRuntime,
-  options: CoordinatorOptions,
+  policyPath: string,
   params: {
     readonly taskId: string;
     readonly candidateOf?: CandidateRequest;
@@ -493,7 +494,11 @@ async function createAttempt(
   const task = runtime.store.readTask(params.taskId).task;
   if (params.candidateOf !== undefined && task.contract.kind !== "implementation")
     throw new Error("candidateOf is supported only for implementation Attempts.");
-  const policy = await loadModelPolicy(options.policyPath);
+  if (params.useEscalationExecutor !== undefined && task.contract.kind !== "implementation")
+    throw new Error("useEscalationExecutor is supported only for implementation Attempts.");
+  if (params.baseRevision !== undefined && task.target.kind !== "repository")
+    throw new Error("baseRevision is supported only for repository Attempts.");
+  const policy = await loadModelPolicy(policyPath);
   const selection = selectionForAttempt(task.contract, policy, params.useEscalationExecutor);
   const baseCommit = await baseForAttempt(task, params.candidateOf, params.baseRevision);
   return Effect.runPromise(

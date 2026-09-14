@@ -191,12 +191,12 @@ installedRuntimeTest(
       assistant.updateContent(assistantMessage([textPart("streamed")]), true);
       chat.children.splice(0, 0, new Text("direct splice", 0, 0));
       chat.addChild(new CustomMessage(customMessage("pi-workgraph-outcome", "hidden")));
-      chat.addChild(new CustomMessage(customMessage("pi-workgraph-workstream", "visible")));
+      chat.addChild(new CustomMessage(customMessage("pi-workgraph-unknown", "visible")));
       chat.addChild(
         new ToolExecution("hidden-tool", "call-1", {}, undefined, undefined, stubUi, "/tmp"),
       );
       assert.match(renderedLines(chat).join("\n"), /direct splice/);
-      assert.match(renderedLines(chat).join("\n"), /pi-workgraph-workstream/);
+      assert.match(renderedLines(chat).join("\n"), /pi-workgraph-unknown/);
       assert.doesNotMatch(renderedLines(chat).join("\n"), /pi-workgraph-outcome|hidden-tool/);
       chat.invalidate();
       assert.match(renderedLines(chat).join("\n"), /streamed/);

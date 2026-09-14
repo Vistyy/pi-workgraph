@@ -89,7 +89,7 @@ export const AttemptSpecSchema = strict({
 
 export const WorkerStateSchema = strict({
   sessionFile: Text,
-  workspaceId: Text,
+  workspaceId: NonBlankText,
   tab: Type.Optional(
     Type.Union([
       strict({ state: Type.Literal("uncertain") }),

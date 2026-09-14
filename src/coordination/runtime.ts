@@ -909,7 +909,7 @@ export class SessionRuntime {
           { deliverAs: "followUp", triggerTurn: true },
         );
       } catch {
-        /* Best-effort, one-shot notification has no persisted delivery state. */
+        /* Best-effort, one-shot notification is not retried. */
       }
     });
   }
@@ -960,7 +960,7 @@ export class SessionRuntime {
     return Effect.forever(tick);
   }
   private requireLaunchAvailable(operation: string): Effect.Effect<void, RuntimeError> {
-    return this.herdr.available
+    return this.herdr.available && this.workspaceId.trim().length > 0
       ? Effect.void
       : fail(operation, "Herdr runtime and exact workspace identity are unavailable.");
   }

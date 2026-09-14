@@ -78,7 +78,7 @@ void test("Calm projects the current visible transcript with final exclusions an
   chat.addChild(new FixtureToolExecution("read"));
   chat.addChild(new FixtureAssistant(assistantMessage([textPart("second")])));
   chat.addChild(new FixtureCustomMessage(customMessage("pi-workgraph-outcome")));
-  chat.addChild(new FixtureCustomMessage(customMessage("pi-workgraph-workstream")));
+  chat.addChild(new FixtureCustomMessage(customMessage("pi-workgraph-unknown")));
   chat.addChild(new FixtureCustomMessage(customMessage("pi-workgraph-attention")));
   const projection = projected(chat);
   try {
@@ -87,7 +87,7 @@ void test("Calm projects the current visible transcript with final exclusions an
       "first",
       "---",
       "second",
-      "[pi-workgraph-workstream] payload",
+      "[pi-workgraph-unknown] payload",
       "[pi-workgraph-attention] payload",
     ]);
   } finally {

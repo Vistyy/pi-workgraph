@@ -8,14 +8,13 @@ import { type ExtensionActions, SessionManager } from "@earendil-works/pi-coding
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { readWorkerSession, type WorkerObjective } from "../src/pi-session.js";
-import { WorkerPlanState } from "../src/worker-plan.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "./decoders.js";
 import { extensionFixture, persistentSession, usage } from "./helpers.js";
 
 const defaultExecutor = { model: "openai/gpt-4o", thinking: "high" as const };
 const objective: WorkerObjective = {
   content:
-    "[WORKGRAPH WORKER OBJECTIVE]\nIntent: exercise the Worker\nObjective: change only the fixture",
+    "[WORKGRAPH WORKER OBJECTIVE]\nPurpose: exercise the Worker\nObjective: change only the fixture",
   details: {
     taskId: "worker",
     attemptId: "attempt",
@@ -139,23 +138,6 @@ function assistant(session: SessionManager, model = "gpt-4o") {
 }
 
 void test("plan tool keeps one strict nonblank 1–9 item current snapshot", async () => {
-  const legacy = new WorkerPlanState();
-  legacy.restore([
-    {
-      type: "message",
-      message: {
-        role: "toolResult",
-        toolName: "workgraph_plan",
-        details: {
-          action: "set",
-          todos: todo,
-          attempt: { workstreamId: "fixture", taskId: "worker", attemptId: "attempt" },
-        },
-      },
-    },
-  ]);
-  assert.equal(legacy.todos, undefined);
-
   const f = await fixture();
   try {
     const tool = f.runner.getToolDefinition("workgraph_plan");
@@ -537,7 +519,7 @@ void test("genuine compaction restores the authoritative objective and current T
     const Content = Type.String();
     assert.equal(Value.Check(Content, recovery.content), true);
     const content = Value.Decode(Content, recovery.content);
-    assert.match(content, /Intent: exercise the Worker/);
+    assert.match(content, /Purpose: exercise the Worker/);
     assert.match(content, /Current TODO/);
   } finally {
     await f.dispose();

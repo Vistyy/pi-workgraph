@@ -17,7 +17,7 @@ import {
 
 const objective: WorkerObjective = {
   content:
-    "[WORKGRAPH WORKER OBJECTIVE]\nIntent: verify exact session ownership\nObjective: exercise readback",
+    "[WORKGRAPH WORKER OBJECTIVE]\nPurpose: verify exact session ownership\nObjective: exercise readback",
   details: {
     taskId: "session",
     attemptId: "session-1",
@@ -33,7 +33,7 @@ void test("Worker session creation uses the Attempt id and recovers only the exa
   try {
     assert.equal(Value.Check(WorkerObjectiveDetailsSchema, objective.details), true);
     assert.equal(
-      Value.Check(WorkerObjectiveDetailsSchema, { ...objective.details, workstreamId: "removed" }),
+      Value.Check(WorkerObjectiveDetailsSchema, { ...objective.details, extra: "rejected" }),
       false,
     );
     const first = await runNodePlatformPromise(

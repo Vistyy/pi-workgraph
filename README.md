@@ -27,27 +27,29 @@ Before using Workgraph, create `~/.pi/agent/workgraph/models.json`. Workgraph su
 
 ```json
 {
-  "research": [
-    { "model": "provider/research-model", "thinking": "high" }
-  ],
-  "implementation.guide": {
-    "model": "provider/guide-model",
-    "thinking": "medium"
-  },
-  "implementation.executor": {
-    "model": "provider/executor-model",
-    "thinking": "high"
-  },
-  "implementation.escalationExecutor": {
-    "model": "provider/escalation-model",
-    "thinking": "max"
-  },
-  "review": [
-    { "model": "provider/review-model", "thinking": "high" }
-  ],
-  "consultation.advisor": [
-    { "model": "provider/advisor-model", "thinking": "medium" }
-  ]
+  "roles": {
+    "research": [
+      { "model": "provider/research-model", "thinking": "high" }
+    ],
+    "implementation.guide": {
+      "model": "provider/guide-model",
+      "thinking": "medium"
+    },
+    "implementation.executor": {
+      "model": "provider/executor-model",
+      "thinking": "high"
+    },
+    "implementation.escalationExecutor": {
+      "model": "provider/escalation-model",
+      "thinking": "max"
+    },
+    "review": [
+      { "model": "provider/review-model", "thinking": "high" }
+    ],
+    "consultation.advisor": [
+      { "model": "provider/advisor-model", "thinking": "medium" }
+    ]
+  }
 }
 ```
 

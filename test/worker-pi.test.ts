@@ -110,7 +110,7 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
     const manager = SessionManager.create(cwd, join(parent, "sessions"), { id: "attempt" });
     manager.appendCustomMessageEntry(
       "pi-workgraph-objective",
-      "[WORKGRAPH WORKER OBJECTIVE]\nIntent: exercise real Pi\nObjective: change value.txt",
+      "[WORKGRAPH WORKER OBJECTIVE]\nPurpose: exercise real Pi\nObjective: change value.txt",
       true,
       {
         taskId: "worker",
@@ -262,7 +262,7 @@ void test("real Pi restores the exact guide before continuing after executor sel
     const manager = SessionManager.create(cwd, join(parent, "sessions"), { id: "attempt" });
     manager.appendCustomMessageEntry(
       "pi-workgraph-objective",
-      "[WORKGRAPH WORKER OBJECTIVE]\nIntent: exercise failed cutover\nObjective: change value.txt",
+      "[WORKGRAPH WORKER OBJECTIVE]\nPurpose: exercise failed cutover\nObjective: change value.txt",
       true,
       {
         taskId: "worker",

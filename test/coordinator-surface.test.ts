@@ -30,7 +30,7 @@ const retired = [
   "workgraph_continue",
 ] as const;
 
-async function fixture(available: boolean) {
+async function fixture(available: boolean, workspaceId = available ? "workspace-exact" : null) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-coordinator-"));
   const root = join(parent, "repo");
   await mkdir(root);
@@ -44,7 +44,7 @@ async function fixture(available: boolean) {
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_ROLE: null,
     HERDR_ENV: available ? "1" : null,
-    HERDR_WORKSPACE_ID: available ? "workspace-exact" : null,
+    HERDR_WORKSPACE_ID: workspaceId,
     HERDR_TAB_ID: null,
     PI_WORKGRAPH_HERDR_BIN: "/bin/false",
   });
@@ -156,6 +156,23 @@ void test("one session creates frozen Task and Attempt records and inspects them
     // SAFETY: The notepad read action returns its bounded text field.
     assert.equal((note.details as { text: string }).text, "Keep the target frozen.");
 
+    await f.call("workgraph_research", {
+      id: "read-only",
+      question: "What is here?",
+      expectedEvidence: ["Direct inspection"],
+    });
+    await assert.rejects(
+      f.call("workgraph_attempt", { taskId: "read-only", baseRevision: base }),
+      /baseRevision is supported only for repository Attempts/,
+    );
+    await assert.rejects(
+      f.call("workgraph_attempt", { taskId: "read-only", useEscalationExecutor: true }),
+      /useEscalationExecutor is supported only for implementation Attempts/,
+    );
+    const overview = await f.call("workgraph_inspect", { section: "overview" });
+    // SAFETY: Overview returns exact session-local record counts.
+    assert.equal((overview.details as { counts: { attempts: number } }).counts.attempts, 2);
+
     const other = new RecordStore(f.agentDir, "other-session");
     assert.deepEqual(other.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
     other.close();
@@ -170,30 +187,35 @@ void test("one session creates frozen Task and Attempt records and inspects them
   }
 });
 
-void test("without exact Herdr availability inspection remains usable and creation mutates nothing", async () => {
-  const f = await fixture(false);
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    const overview = await f.call("workgraph_inspect", { section: "overview" });
-    // SAFETY: Overview inspection returns the RecordStore count projection.
-    assert.deepEqual((overview.details as { counts: object }).counts, {
-      tasks: 0,
-      attempts: 0,
-      activeWorkers: 0,
-    });
-    const models = await f.call("workgraph_models", { role: "research" });
-    // SAFETY: Model inspection returns the strictly decoded configured target list.
-    assert.equal((models.details as { targets: unknown[] }).targets.length, 2);
-    await assert.rejects(
-      f.call("workgraph_research", {
-        id: "blocked",
-        question: "What changed?",
-        expectedEvidence: ["Direct inspection"],
-      }),
-      /Herdr runtime and exact workspace identity are unavailable/,
-    );
-    assert.equal(existsSync(join(f.agentDir, "workgraph", "workgraph.sqlite")), false);
-  } finally {
-    await f.dispose();
+void test("without exact Herdr launch identity inspection remains usable and creation mutates nothing", async () => {
+  for (const [available, workspaceId] of [
+    [false, null],
+    [true, ""],
+  ] as const) {
+    const f = await fixture(available, workspaceId);
+    try {
+      await f.runner.emit({ type: "session_start", reason: "startup" });
+      const overview = await f.call("workgraph_inspect", { section: "overview" });
+      // SAFETY: Overview inspection returns the RecordStore count projection.
+      assert.deepEqual((overview.details as { counts: object }).counts, {
+        tasks: 0,
+        attempts: 0,
+        activeWorkers: 0,
+      });
+      const models = await f.call("workgraph_models", { role: "research" });
+      // SAFETY: Model inspection returns the strictly decoded configured target list.
+      assert.equal((models.details as { targets: unknown[] }).targets.length, 2);
+      await assert.rejects(
+        f.call("workgraph_research", {
+          id: "blocked",
+          question: "What changed?",
+          expectedEvidence: ["Direct inspection"],
+        }),
+        /Herdr runtime and exact workspace identity are unavailable/,
+      );
+      assert.equal(existsSync(join(f.agentDir, "workgraph", "workgraph.sqlite")), false);
+    } finally {
+      await f.dispose();
+    }
   }
 });

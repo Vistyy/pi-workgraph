@@ -39,7 +39,7 @@ await test("loads only the complete strict user policy shape", async () => {
     assert.deepEqual(await loadModelPolicy(path), valid);
     for (const invalid of [
       undefined,
-      { ...valid, version: 6 },
+      { ...valid, extra: true },
       { ...valid, roles: { ...valid.roles, research: [] } },
       { ...valid, roles: { ...valid.roles, "extra.role": valid.roles.research } },
       {
