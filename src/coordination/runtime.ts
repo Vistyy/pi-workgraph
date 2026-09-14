@@ -899,10 +899,15 @@ export class SessionRuntime {
   private notify(attempt: AttemptRecord): Effect.Effect<void> {
     return Effect.sync(() => {
       try {
+        const outcome = attempt.outcome?.result;
+        const summary =
+          outcome?.kind === "reported"
+            ? outcome.report.summary
+            : (outcome?.reason ?? "unavailable");
         this.pi.sendMessage(
           {
             customType: "pi-workgraph-outcome",
-            content: `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: ${JSON.stringify(attempt.outcome?.result)}`,
+            content: `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: ${outcome?.kind ?? "unknown"}: ${summary.replace(/\s+/g, " ").slice(0, 500)}`,
             display: true,
             details: { taskId: attempt.taskId, attemptId: attempt.id },
           },

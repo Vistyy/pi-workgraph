@@ -267,6 +267,7 @@ void test("Outcome is written before one close and reload duplicates neither clo
     name: workerName("settle", attempt.id),
   });
   let notifications = 0;
+  let notification = "";
   let outcomeWasDurableAtNotification = false;
   let scope = await Effect.runPromise(Scope.make());
   try {
@@ -276,8 +277,10 @@ void test("Outcome is written before one close and reload duplicates neither clo
         agentDir: root,
         workspaceId: "workspace-new",
         pi: {
-          sendMessage() {
+          sendMessage(message) {
             notifications += 1;
+            notification =
+              typeof message.content === "string" ? message.content : "<non-text notification>";
             outcomeWasDurableAtNotification = store.readAttempt(attempt.id).outcome !== undefined;
           },
         },
@@ -304,6 +307,8 @@ void test("Outcome is written before one close and reload duplicates neither clo
     await Effect.runPromise(Effect.sleep(400));
     assert.equal(notifications, 1);
     assert.equal(outcomeWasDurableAtNotification, true);
+    assert.match(notification, /reported: settled$/);
+    assert.doesNotMatch(notification, /evidence|findings|status/);
     assert.equal(
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
       1,
