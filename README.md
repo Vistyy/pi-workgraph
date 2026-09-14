@@ -6,8 +6,16 @@ Pi Workgraph lets a Pi coordinator delegate repository and directory work to vis
 
 Requirements: Node.js 24+, Git, Pi, and a Herdr-managed Pi pane with Herdr's Pi state integration.
 
+Install the published npm release:
+
 ```bash
-pi install git:github.com/Vistyy/pi-workgraph
+pi install npm:@vistyy/pi-workgraph@0.1.0
+```
+
+Or install the matching GitHub release:
+
+```bash
+pi install git:github.com/Vistyy/pi-workgraph@v0.1.0
 ```
 
 For a development checkout:
