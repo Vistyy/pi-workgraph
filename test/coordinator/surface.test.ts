@@ -469,6 +469,62 @@ void test("unchanged checkout applies as a no-op after destination advancement",
   }
 });
 
+void test("pre-request external removal blocks both dispositions and preserves branches", async () => {
+  for (const mode of ["apply", "discard"] as const) {
+    const f = await fixture(false);
+
+    try {
+      await f.runner.emit({ type: "session_start", reason: "startup" });
+      const created = await f.call("workgraph_checkout", { action: "create" });
+
+      // SAFETY: Create returns exact managed resource identity.
+      const facts = created.details as {
+        checkoutId: string;
+        managedPath: string;
+        ownedBranch: string;
+      };
+
+      if (mode === "apply") {
+        await writeFile(join(facts.managedPath, "applied.txt"), "applied before release\n");
+        await git(facts.managedPath, "add", "applied.txt");
+        await git(facts.managedPath, "commit", "-m", "applied before release");
+      }
+
+      const store = new RecordStore(f.agentDir, f.session.getSessionId());
+      let checkout = store.readCoordinatorCheckout(facts.checkoutId);
+
+      if (mode === "apply") {
+        checkout = await Effect.runPromise(prepareCoordinatorApplication(checkout));
+        checkout = store.checkpointCoordinatorCheckout(checkout);
+        checkout = await Effect.runPromise(applyCoordinatorCheckout(checkout));
+      } else checkout = await Effect.runPromise(prepareCoordinatorDiscard(checkout, "Discard"));
+      checkout = store.checkpointCoordinatorCheckout(checkout);
+      store.close();
+
+      await git(f.root, "worktree", "remove", "--force", facts.managedPath);
+      await assert.rejects(
+        f.call(
+          "workgraph_checkout",
+          mode === "apply"
+            ? { action: "apply", checkoutId: facts.checkoutId }
+            : { action: "discard", checkoutId: facts.checkoutId, reason: "Discard" },
+        ),
+        /exact registered worktree/,
+      );
+      assert.equal((await git(f.root, "show-ref", "--verify", facts.ownedBranch)) !== "", true);
+
+      const preserved = new RecordStore(f.agentDir, f.session.getSessionId());
+      const state = preserved.readCoordinatorCheckout(facts.checkoutId).state;
+
+      assert.equal(state.kind, mode === "apply" ? "applied" : "discarding");
+      assert.equal("worktreeRemoval" in state, false);
+      preserved.close();
+    } finally {
+      await f.dispose();
+    }
+  }
+});
+
 void test("externally missing worktree blocks release and preserves the owned branch", async () => {
   const f = await fixture(false);
 

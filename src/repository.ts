@@ -430,6 +430,31 @@ export function applyCoordinatorCheckout(
   });
 }
 
+/** Prove exact live source ownership before authorizing uncertain worktree removal. */
+export function validateCoordinatorWorktreeRemoval(
+  checkout: CoordinatorCheckout,
+): Effect.Effect<void, GitError> {
+  const state = checkout.state;
+
+  if (
+    (state.kind !== "applied" && state.kind !== "discarding") ||
+    state.worktreeRemoval !== undefined
+  )
+    return fail("release Coordinator checkout", "Worktree removal cannot be requested.");
+
+  return Effect.gen(function* () {
+    yield* revalidate(checkout.target);
+
+    const source = yield* coordinatorCheckoutState(checkout);
+
+    if (source.head !== state.sourceTip)
+      return yield* fail(
+        "release Coordinator checkout",
+        "Managed checkout HEAD differs from its disposition checkpoint.",
+      );
+  });
+}
+
 /** Remove only the exact clean worktree after application is durably established. */
 export function removeAppliedCoordinatorWorktree(
   checkout: CoordinatorCheckout,

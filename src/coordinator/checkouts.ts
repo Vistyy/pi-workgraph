@@ -14,6 +14,7 @@ import {
   removeDiscardedCoordinatorWorktree,
   resolveCoordinatorRepository,
   validateCoordinatorDestination,
+  validateCoordinatorWorktreeRemoval,
 } from "../repository.js";
 import { type RecordStore, StoreError } from "./store.js";
 
@@ -159,11 +160,13 @@ export function applyCheckout(
     if (checkout.state.kind !== "applied")
       return yield* Effect.die("Applied Coordinator checkout lost its lifecycle state.");
 
-    if (checkout.state.worktreeRemoval === undefined)
+    if (checkout.state.worktreeRemoval === undefined) {
+      yield* validateCoordinatorWorktreeRemoval(checkout);
       checkout = yield* checkpoint(storeOwner, {
         ...checkout,
         state: { ...checkout.state, worktreeRemoval: "requested" },
       });
+    }
 
     if (checkout.state.kind !== "applied")
       return yield* Effect.die("Applied Coordinator checkout lost its lifecycle state.");
@@ -215,11 +218,13 @@ export function discardCheckout(
     if (checkout.state.kind !== "discarding")
       return yield* Effect.die("Discarding Coordinator checkout lost its lifecycle state.");
 
-    if (checkout.state.worktreeRemoval === undefined)
+    if (checkout.state.worktreeRemoval === undefined) {
+      yield* validateCoordinatorWorktreeRemoval(checkout);
       checkout = yield* checkpoint(storeOwner, {
         ...checkout,
         state: { ...checkout.state, worktreeRemoval: "requested" },
       });
+    }
 
     if (checkout.state.kind !== "discarding")
       return yield* Effect.die("Discarding Coordinator checkout lost its lifecycle state.");
