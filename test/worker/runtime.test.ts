@@ -170,8 +170,22 @@ void test("plan tool keeps one strict nonblank 1–9 item current snapshot", asy
       f.call("workgraph_plan", { action: "set", todos: [setTodo[0], setTodo[0]] }),
       /ids must be unique/,
     );
-    const set = await f.call("workgraph_plan", { action: "set", todos: setTodo });
-    assert.deepEqual(set.details, { action: "set", todos: todo });
+
+    const second = {
+      id: "verify",
+      text: "Verify the bounded fixture change.",
+      validation: "The supported Worker flow is observed.",
+    };
+
+    const set = await f.call("workgraph_plan", {
+      action: "set",
+      todos: [...setTodo, second],
+    });
+
+    assert.deepEqual(set.details, {
+      action: "set",
+      todos: [...todo, { ...second, status: "pending" }],
+    });
 
     const update = await f.call("workgraph_plan", {
       action: "update",

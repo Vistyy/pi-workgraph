@@ -363,7 +363,8 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   pi.registerTool({
     name: "workgraph_attempt",
     label: "Workgraph Attempt",
-    description: "Create one fresh Attempt inheriting its immutable Task target.",
+    description:
+      "Create another execution of the same immutable Task under current model policy and a fresh applicable base. Create a new Task instead when the assignment or authority changes.",
     parameters: Type.Object(
       {
         taskId: TaskIdSchema,
@@ -509,7 +510,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
             return result({
               action: params.action,
-              promptSubmitted: params.instruction,
+              delivery: "submitted",
               attempt: inspectedAttempt(current, current.store.readAttempt(params.attemptId)),
             });
           }
@@ -872,7 +873,7 @@ function registerTask<S extends TSchema>(
   pi.registerTool({
     name,
     label: `Workgraph ${label}`,
-    description: `Create one immutable ${label} Task and its initial Attempt.${contractNote === undefined ? "" : ` ${contractNote}`}`,
+    description: `Create one immutable ${label} Task and its initial Attempt(s).${contractNote === undefined ? "" : ` ${contractNote}`}`,
     parameters,
     execute(_id, params, _signal, _update, ctx) {
       return serialize(() => run(params as Static<S>, ctx).then(result));

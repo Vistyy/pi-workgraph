@@ -563,7 +563,7 @@ async function run(signal: AbortSignal): Promise<void> {
         review: [{ model: "controlled/research", thinking: "off" }],
         "implementation.guide": { model: "controlled/research", thinking: "off" },
         "implementation.executor": { model: "controlled/research", thinking: "off" },
-        "consultation.advisor": [{ model: "controlled/research", thinking: "off" }],
+        "consultation.advisor": { model: "controlled/research", thinking: "off" },
       },
     }),
   );
