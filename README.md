@@ -1,6 +1,6 @@
 # Pi Workgraph
 
-Pi Workgraph lets a Pi coordinator delegate repository and directory work to visible Workers in Herdr tabs. It can gather evidence, consult another model, implement in isolated Git worktrees, review exact results, and retain useful repository output for a deliberate local decision.
+Pi Workgraph lets a Pi coordinator work across repositories in session-owned checkouts and delegate repository or directory work to visible Workers in Herdr tabs. It can gather evidence, consult another model, implement in isolated Git worktrees, review exact results, and retain useful repository output for a deliberate local decision.
 
 ## Install
 
@@ -67,11 +67,12 @@ Research, review, and consultation roles are ordered nonempty lists; their first
 
 ## Coordinator tools
 
-Workgraph exposes exactly nine coordinator tools:
+Workgraph exposes exactly ten coordinator tools:
 
 | Tool | Purpose |
 | --- | --- |
 | `workgraph_models` | List configured targets for a selectable role. |
+| `workgraph_checkout` | Create, inspect, list, locally apply, or discard session-owned Coordinator checkouts. |
 | `workgraph_research` | Create evidence-seeking research or a bounded repository experiment. |
 | `workgraph_consult` | Ask one configured advisor a precise, evidence-only question. |
 | `workgraph_implement` | Create an implementation Task and its first Attempt. |
@@ -81,13 +82,17 @@ Workgraph exposes exactly nine coordinator tools:
 | `workgraph_control` | Steer or cancel a Worker, or apply or discard exact repository output. |
 | `workgraph_notepad` | Read, replace, or clear the current branch's bounded coordinator memo. |
 
-Each coordinator Pi session owns its own records. All sessions share one private SQLite database under the Pi agent data directory, partitioned by exact session identity; records are not globally discoverable from other sessions.
+Each coordinator Pi session owns its own records and Coordinator checkouts. All sessions share one private SQLite database under the Pi agent data directory, partitioned by exact session identity; records are not globally discoverable from other sessions.
+
+Read-only work needs no Coordinator checkout. Before the first direct repository change or implementation delegation for a repository, the Coordinator explicitly creates one from the intended destination checkout. Workgraph requires that destination to be a clean attached branch, creates a separate branch-backed worktree at its exact `HEAD`, and returns the managed path. Repeated creation in that session reuses the same exact checkout for the repository; another Coordinator session receives another path and branch.
+
+Direct changes and verification run in the managed path. Repository implementation Tasks also use that path as their target, so their detached Worker Candidates apply back into the Coordinator checkout. The original checkout remains the destination for an explicit final local application. The managed branch may instead be pushed and proposed with ordinary Git and `gh`; Workgraph does not publish or track pull requests.
 
 A Task has one immutable resolved target. Directory targets record an exact path. Repository targets record the checkout root and Git common directory, so Tasks in one session may safely address different repositories without implying a transaction across them. Every Attempt inherits its Task target and starts one fresh Worker Pi session.
 
-Repository Attempts execute in detached worktrees. On a completed report, only commits survive; commit intended output before reporting. Changed commits are retained at `refs/pi-workgraph/outputs/<attemptId>`, while non-completed dirty worktrees and uncertain resources are preserved. Implementation Attempts can start independently, extend a retained Candidate, or integrate one onto another base. Applying and discarding remain explicit local operations, and Workgraph never pushes.
+Repository Attempts execute in detached worktrees. On a completed report, only commits survive; commit intended output before reporting. Changed commits are retained at `refs/pi-workgraph/outputs/<attemptId>`, while non-completed dirty worktrees and uncertain resources are preserved. Implementation Attempts can start independently, extend a retained Candidate, or integrate one onto another base. Candidate and Coordinator-checkout application and discard remain explicit local operations.
 
-Stopping or reloading the coordinator stops only coordinator-owned activity. Independent Worker sessions, Herdr tabs, retained refs, and uncertain resources remain available for inspection or deliberate action.
+Stopping or reloading the coordinator stops only coordinator-owned activity. Coordinator checkouts, independent Worker sessions, Herdr tabs, retained refs, and uncertain resources remain available for inspection or deliberate action.
 
 The notepad stores at most 4,000 characters in the current Pi branch and restores that memo after genuine context compaction. It is pending-memory only: it grants no authority and does not establish acceptance or correctness.
 
