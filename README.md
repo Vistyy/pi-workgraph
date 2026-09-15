@@ -1,6 +1,6 @@
 # Pi Workgraph
 
-Pi Workgraph lets a Pi coordinator work across repositories in session-owned checkouts and delegate repository or directory work to visible Workers in Herdr tabs. It can gather evidence, consult another model, implement in isolated Git worktrees, review exact results, and retain useful repository output for a deliberate local decision.
+Pi Workgraph lets a Pi coordinator delegate repository and directory work to visible Workers in Herdr tabs. It can gather evidence, consult another model, implement in isolated Git worktrees, review exact results, and retain useful repository output for a deliberate local decision.
 
 ## Install
 
@@ -82,13 +82,9 @@ Workgraph exposes these coordinator tools:
 | `workgraph_control` | Steer or cancel a Worker, or apply or discard exact repository output. |
 | `workgraph_notepad` | Read, replace, or clear the current branch's bounded coordinator memo. |
 
-Each coordinator Pi session owns its own records and deterministic Coordinator checkout identities. All sessions share one private SQLite database under the Pi agent data directory, partitioned by exact session identity; records are not globally discoverable from other sessions. Coordinator checkouts are Git resources, not database records.
+Each coordinator Pi session owns its own records. All sessions share one private SQLite database under the Pi agent data directory, partitioned by exact session identity; records are not globally discoverable from other sessions.
 
-Read-only work creates no checkout. For mutating repository work, the Coordinator explicitly calls `workgraph_checkout` and uses its returned path for direct changes, verification, commits, and repository implementation Tasks. The identity combines the exact session and repository, producing one path under `<agentDir>/workgraph/coordinator-checkouts/` and one `refs/heads/pi-workgraph/coordinators/` branch. Calls from linked worktrees of the same repository converge; separate sessions do not.
-
-Creation starts at the source checkout's exact committed `HEAD`, including when that source is detached or contains tracked, untracked, or ignored changes. Those working-tree bytes are neither copied nor mutated. A repeated call preserves modified or advanced managed content while validating the exact path, repository, branch, registration, and worktree backlinks. Partial, foreign, duplicated, locked, or unreadable resources block without repair or replacement.
-
-Worker Candidates return to the managed branch through `workgraph_control {action:"apply"}`. Final local integration, publication, and checkout cleanup use normal Git or forge tooling; Workgraph neither tracks those actions nor publishes remote state.
+Before mutating a repository, the Coordinator calls `workgraph_checkout` and uses the returned isolated checkout for edits, verification, commits, and repository implementation Tasks. It starts from committed `HEAD` without changing the source checkout or carrying over its uncommitted files. Worker Candidates apply into this managed checkout through `workgraph_control`; final integration, publication, and cleanup use normal repository tooling.
 
 A Task has one immutable resolved target. Directory targets record an exact path. Repository targets record the checkout root and Git common directory, so Tasks in one session may safely address different repositories without implying a transaction across them. Every Attempt inherits its Task target and starts one fresh Worker Pi session.
 
