@@ -42,10 +42,21 @@ export interface ModelPolicy {
 
 export const SelectionRequestSchema = Type.Object(
   {
-    count: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })),
-    distinctModels: Type.Optional(Type.Boolean()),
+    count: Type.Optional(
+      Type.Integer({
+        minimum: 1,
+        maximum: 32,
+        description: "Number of initial Attempts to create; defaults to one.",
+      }),
+    ),
+    distinctModels: Type.Optional(
+      Type.Boolean({ description: "Require each selected Attempt to use a distinct model." }),
+    ),
   },
-  { additionalProperties: false },
+  {
+    additionalProperties: false,
+    description: "Optional initial Attempt selection policy.",
+  },
 );
 
 export type SelectionRequest = Static<typeof SelectionRequestSchema>;

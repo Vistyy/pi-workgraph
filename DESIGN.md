@@ -9,13 +9,13 @@ This document owns the integrated rationale and durable constraints for Workgrap
 
 ## Source ownership
 
-Production source is grouped by cohesive feature ownership rather than generic technical layers. `src/coordinator/` owns coordinator-session orchestration, record persistence, model policy, pending memory, and native Worker placement. `src/worker/` owns Worker policy, execution trajectory, TODO state, and Pi session behavior. `src/calm/` owns the complete presentation feature and its Pi compatibility seam. Shared structural vocabulary lives in `src/domain/`; repository custody remains one cohesive `src/repository.ts` boundary; and the small shared Effect/Node bridge remains `src/node-platform.ts`. The two files in `extensions/` are thin Pi host entry points.
+Production source is grouped by cohesive feature ownership rather than generic technical layers. `src/coordinator/` owns coordinator-session orchestration, record persistence, deterministic Coordinator checkout identity, model policy, pending memory, and native Worker placement. `src/worker/` owns Worker policy, execution trajectory, TODO state, and Pi session behavior. `src/calm/` owns the complete presentation feature and its Pi compatibility seam. Shared structural vocabulary lives in `src/domain/`; repository custody remains one cohesive `src/repository.ts` boundary; and the small shared Effect/Node bridge remains `src/node-platform.ts`. The two files in `extensions/` are thin Pi host entry points.
 
 Tests are grouped by the supported responsibility they exercise rather than mechanically mirroring each source module. Shared test construction lives only under `test/support/`.
 
 ## Coordination ownership
 
-The coordinator's exact Pi session is the unit of ownership. Its Tasks and Attempts are private coordination records, not a shared project board. Other sessions cannot enumerate or take over those records. Session shutdown releases coordinator-owned runtime activity while preserving independent Worker sessions, native resources, and repository output.
+The coordinator's exact Pi session is the unit of ownership. Its Tasks and Attempts are private coordination records, not a shared project board. Its session identity also contributes to deterministic Coordinator checkout placement, so another session receives different Git resources for the same repository. Other sessions cannot enumerate or take over its records. Session shutdown releases coordinator-owned runtime activity while preserving Coordinator checkouts, independent Worker sessions, native resources, and repository output.
 
 Delegation is optional. The coordinator remains responsible for decisions, Candidate evaluation, final synthesis, and verification. Task contracts externalize enough settled context for a Worker to act without reconstructing consequential design. Reports provide evidence; they do not create authority or prove acceptance.
 
@@ -25,14 +25,14 @@ An Outcome records a reported, unreported, or cancelled semantic result and the 
 
 ## Record store
 
-All coordinator sessions share one private `<agentDir>/workgraph/workgraph.sqlite` file. Exact session identity partitions every supported query and mutation. The database has only two strict tables:
+All coordinator sessions share one private `<agentDir>/workgraph/workgraph.sqlite` file. Exact session identity partitions every supported query and mutation. The database stores two strict session record types:
 
 - `tasks` stores immutable Task JSON under `(session_id, task_id)`;
 - `attempts` stores immutable specification JSON and nullable Worker, output, and Outcome JSON, linked to its session's Task.
 
 Creating a Task and its first Attempt is one SQLite transaction. Creating another Attempt first proves the Task in the same session. Recording an Outcome uses a write-once predicate. Each JSON column is decoded against its strict TypeBox record schema whenever a supported read uses it; SQL row shape and scalar types are checked at the same boundary.
 
-The store has no aggregate mirror, global revision, cached frontier, ownership registry, or process coordination state. It opens the one current schema and fails closed on an unknown schema version. Operational updates write only the owned record field, so unrelated Attempts and sessions need no reconstruction.
+The store has no Coordinator checkout records, aggregate mirror, global revision, cached frontier, cross-session lease, or process coordination state. It opens schema version 1 and fails closed on an unknown version; it does not migrate another format. Operational updates write only the owned record field, so unrelated Attempts and sessions need no reconstruction.
 
 ## Worker lifecycle and recovery
 
@@ -44,7 +44,17 @@ Normal settlement derives a semantic Outcome from the Worker session independent
 
 Cancellation is definitive rather than graceful steering. A queued Attempt records a cancelled Outcome without creating a Worker. An active Attempt first checkpoints the cancellation reason, issues close at most once, proves exact absence, and then records the closed Worker and cancelled Outcome together. Recovery after either close checkpoint observes only; it never repeats close. Steering remains a separate prompt to an exact active Worker.
 
-Coordinator shutdown interrupts and joins only owned coordination fibers and closes its store handle. It does not close independent Workers, remove session files, classify unfinished repositories, or delete retained or uncertain output.
+Coordinator shutdown interrupts and joins only owned coordination fibers and closes its store handle. It does not close independent Workers, remove session files or Coordinator checkouts, classify unfinished repositories, or delete retained or uncertain output.
+
+## Coordinator checkout allocation
+
+Read-only work creates no repository resource. Before direct repository mutation or implementation delegation, the model explicitly requests a Coordinator checkout from the intended repository. Creation accepts an attached or detached source worktree with a committed `HEAD`; tracked, untracked, and ignored source changes are neither copied nor mutated. The exact source commit seeds a new linked worktree and normal branch.
+
+A collision-resistant identity derived from the exact Pi session and canonical Git common directory determines one private path and branch. Complete resource absence permits creation. Complete exact identity permits reuse, including when the managed branch or working tree has changed. Reuse proves the real path, repository common directory, one direct owned branch, one matching unlocked worktree registration, attached `HEAD`, and bidirectional worktree backlinks. Partial, duplicated, locked, symlinked, foreign, or unreadable state blocks without retry, repair, pruning, reset, deletion, or alternate placement. A failed native creation response is accepted only when immediate observation proves the exact requested commit and identity; an interrupted initialization remains locked and blocked.
+
+The managed path is the session's mutable integration destination. The Coordinator edits, commits, and verifies there, and repository implementation Tasks target it so detached Worker Candidates apply there through the existing Candidate flow. Workgraph does not intercept or redirect file operations, inject checkout state into prompts, persist checkout state, or reconcile resources in a background loop.
+
+Final local integration and publication use normal repository or forge tooling. Workgraph does not apply, discard, remove, or track publication of a Coordinator checkout. Cleanup waits until no Worker or pending Candidate decision depends on the checkout and uses ordinary non-force Git operations; refusal or uncertainty preserves remaining resources for explicit reporting. Complete later absence permits deterministic creation at the same path, while routine shutdown preserves the checkout.
 
 ## Worker Pi trajectory
 
@@ -62,7 +72,7 @@ Actual effective models are derived from persisted Pi model events in trajectory
 
 ## Targets and Candidate lineage
 
-A Task resolves either an exact directory path or a repository identity consisting of checkout root and Git common directory. Every Attempt inherits that immutable target. The coordinator's current directory is only a resolution input, never later placement authority. This permits Tasks in several repositories within one session without distributed transactions, dependencies, rollback, or all-or-nothing application claims.
+A Task resolves either an exact directory path or a repository identity consisting of checkout root and Git common directory. Every Attempt inherits that immutable target. The coordinator's current directory is only a resolution input, never later placement authority. Repository implementation Tasks resolve the Coordinator checkout passed as `cwd`, so their Candidates return to that attached branch rather than the original destination. This permits Tasks in several repositories within one session without distributed transactions, dependencies, rollback, or all-or-nothing application claims.
 
 Repository Attempt bases are exact commits. A root Candidate is rooted at its Attempt's explicit base. `candidateOf: extend` starts the successor Attempt from the exact retained source Candidate tip, preserves its root, and prevents source discard until successor placement. `candidateOf: integrate` starts from a separately explicit base and records both the exact source Candidate-producing Attempt and source tip to incorporate. Candidate lineage is immutable and checked against exact retained refs; session continuation is not content ancestry.
 
@@ -70,13 +80,15 @@ Directory Attempts have no Git output. Repository Attempts execute in detached w
 
 ## Repository custody
 
+`src/repository.ts` is the single Git custody owner for both Worker Candidates and Coordinator checkout allocation. They share target revalidation, Git process ownership, and worktree registration parsing; each resource adds only the identity checks its supported lifecycle requires. `src/coordinator/checkouts.ts` owns deterministic checkout identity and the thin Pi Promise boundary.
+
 After exact Worker closure, a completed report retains only committed HEAD and removes the worktree; unchanged HEAD produces no output. Non-completed Attempts preserve dirty worktrees. Complete absence recovers compacted output; external deletion or pruning of Workgraph-managed resources is unsupported. One-sided, moved, foreign, unrelated, or otherwise ambiguous resources block.
 
 Repository custody is serialized within one coordinator session, not across sessions or processes. Concurrent mutation of the same destination checkout is unsupported. Application proves the private source ref, Candidate lineage, destination identity and state, ancestry, and tree mergeability before its checkpointed fast-forward. The merge preserves unrelated ignored artifacts and refuses to overwrite an ignored destination path. Recovery accepts only the exact expected Git structure; changed destination state blocks without rollback or automatic retry. Output cleanup occurs only after application is recorded.
 
 Discard is explicitly destructive and requires a reason. It checkpoints the exact retained tip and disposition before deleting only the verified private ref or owned worktree. An unplaced extension child and an unclassified integration child pin their source output. Interruption recovery accepts only proven postconditions and never removes foreign or uncertain resources. Semantic Outcomes and routine shutdown cannot discard output.
 
-Applying changes a local repository only. Workgraph never pushes or publishes; any later publication remains an external, deliberate action.
+Applying a Candidate changes its recorded local destination only. Workgraph never publishes or finally integrates a Coordinator checkout; the Coordinator uses external repository or forge tooling from its managed branch as a separate deliberate action.
 
 ## Calm and pending memory
 

@@ -21,6 +21,12 @@ Every surviving responsibility and proposed mechanism must answer a current requ
 
 Use signatures, examples, diagrams, or prose according to what makes the boundary concrete. Do not manufacture ceremony for a local change beneath stable contracts, but do not call a cross-boundary change “local” merely because it was split into small assignments.
 
+## Isolate mutating repository work
+
+Read and research in the user's checkout without creating resources. Before the first direct repository mutation or implementation delegation for one repository, explicitly create or reuse its session-owned Coordinator checkout with `workgraph_checkout`. This routine model decision needs no user confirmation. Use the returned managed path for direct edits, verification, commits, and the `cwd` of repository implementation Tasks. Repeated calls for the same session and repository validate and reuse that exact checkout.
+
+Apply Worker Candidates into the Coordinator checkout with `workgraph_control`; this is distinct from final repository integration. After accepting the managed branch, use normal repository or forge tooling to merge it locally or publish it. Do not clean up or recreate the checkout while Workers or pending Candidate decisions still depend on it. When cleanup is appropriate, use ordinary non-force Git operations sequentially. If a step refuses or the result is uncertain, stop, preserve the remaining resources, and report completed and pending steps rather than forcing or repairing them.
+
 ## Delegate decided work
 
 Use Workgraph when bounded delegation is likely to improve evidence, implementation focus, or elapsed time enough to repay assignment, supervision, review, and integration. Handle straightforward local work directly; do not create Tasks merely to follow a workflow.

@@ -5,7 +5,12 @@ Canonical language for delegated Workgraph coordination and repository output.
 ## Language
 
 **Coordinator**:
-The Pi session responsible for understanding the user's goal, making consequential decisions, delegating where useful, and accepting the final result. It owns its Tasks and Attempts.
+The Pi session responsible for understanding the user's goal, making consequential decisions, delegating where useful, and accepting the final result. It owns its Tasks, Attempts, and Coordinator checkouts.
+
+**Coordinator checkout**:
+A deterministically named branch-backed Git worktree created or exactly reused on a Coordinator's explicit request as that session's mutable integration destination for one repository. Direct Coordinator changes and Worker Candidates converge there before integration or publication through normal repository tooling; it is not a persisted Workgraph record.
+
+_Avoid_: Workspace
 
 **Task**:
 A durable assignment with one purpose and exact Target. A Task may have multiple Attempts.

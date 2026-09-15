@@ -13,6 +13,7 @@ import { extensionFixture, git } from "../support/helpers.js";
 
 const accepted = [
   "workgraph_models",
+  "workgraph_checkout",
   "workgraph_research",
   "workgraph_consult",
   "workgraph_implement",
@@ -73,6 +74,15 @@ void test("coordinator registers exactly nine strict tools", async () => {
       .sort();
 
     assert.deepEqual(registered, [...accepted].sort());
+    const checkout = f.runner.getToolDefinition("workgraph_checkout");
+    assert.ok(checkout !== undefined);
+    assert.equal(Value.Check(checkout.parameters, {}), true);
+    assert.equal(Value.Check(checkout.parameters, { cwd: "." }), true);
+    assert.equal(Value.Check(checkout.parameters, { cwd: " " }), false);
+    assert.equal(Value.Check(checkout.parameters, { action: "create" }), false);
+    assert.equal(Value.Check(checkout.parameters, { checkoutId: "old" }), false);
+    assert.match(JSON.stringify(checkout.parameters), /defaults to the session cwd/);
+
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(

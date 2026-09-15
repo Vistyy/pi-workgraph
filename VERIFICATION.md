@@ -6,7 +6,7 @@ This document owns project-specific evidence requirements. Begin with the suppor
 
 Exercise the native SQLite store through separate exact-session instances. Establish that:
 
-- the private agent-wide database is created with only `tasks` and `attempts` tables;
+- `tasks` and `attempts` are strict tables with their required relationships;
 - Task plus first Attempt creation is atomic;
 - failed creation leaves neither half-record;
 - another Attempt can reference only a Task in the same session;
@@ -17,7 +17,7 @@ Exercise the native SQLite store through separate exact-session instances. Estab
 
 Use actual rows and transaction failure, not only TypeBox value checks. A decoder test should mutate the one field whose supported-read rejection is being established, then remove the disposable database. Do not build a durable corruption matrix: arbitrary external database tampering is not a supported recovery interface.
 
-Do not add migration, aggregate-reconstruction, cross-session-discovery, lease, or concurrent same-session process fixtures unless those become supported responsibilities.
+Do not add migration, aggregate-reconstruction, cross-session-discovery, lease, or concurrent same-session process fixtures unless those become supported responsibilities. The current schema is version 1 and must fail closed on unknown existing versions.
 
 ## Worker lifecycle
 
@@ -25,7 +25,7 @@ Drive orchestration through the real session runtime and deterministic Herdr tra
 
 At each effect boundary, simulate a lost response or interruption and re-enter through the supported runtime. The evidence must show no replay of a possibly completed workspace placement, tab creation, agent start, kickoff prompt, steering prompt, or close request. Ambiguous, partial, and foreign identity must produce a bounded blocker rather than a replacement Worker or guessed settlement.
 
-Normal settlement must record the semantic Outcome before checkpointing or requesting close, issue close at most once, and mark the Worker closed only after exact absence. A permanently missing Worker must become a bounded unreported Outcome. Cancellation of an active Worker must checkpoint its reason before one close, prove absence, and then atomically record closed Worker state with a cancelled Outcome. Cancelling a queued Attempt must not launch a Worker. Runtime shutdown must interrupt owned coordination activity while preserving independent Worker sessions, Herdr resources, and repository resources.
+Normal settlement must record the semantic Outcome before checkpointing or requesting close, issue close at most once, and mark the Worker closed only after exact absence. A permanently missing Worker must become a bounded unreported Outcome. Cancellation of an active Worker must checkpoint its reason before one close, prove absence, and then atomically record closed Worker state with a cancelled Outcome. Cancelling a queued Attempt must not launch a Worker. Runtime shutdown must interrupt owned coordination activity while preserving Coordinator checkouts, independent Worker sessions, Herdr resources, and repository resources.
 
 Assert ordering from persisted records and transport observations. Private helper call counts alone do not establish the supported flow.
 
@@ -54,6 +54,16 @@ Application preparation must leave destination bytes, HEAD, and ref unchanged wh
 
 Explicit discard must checkpoint its reason before deleting exact verified output. Separately prove that completed reports remove only their exact worktree, including uncommitted scratch, while non-completed Outcomes and failed cleanup preserve dirty or uncertain resources. No supported flow pushes or publishes.
 
+## Coordinator checkouts
+
+Drive `workgraph_checkout` through the registered Coordinator tool and real disposable Git repositories. Establish that read-only session startup creates nothing; explicit creation snapshots the exact committed `HEAD` of an attached or detached source without copying or mutating tracked, untracked, or ignored working-tree bytes; repeated calls from the same session and Git common directory converge across linked worktrees and reloads; and separate sessions receive distinct paths and branches.
+
+Observe the filesystem entry, direct branch ref, exhaustive worktree registrations, attached managed `HEAD`, repository common directory, and both directions of the linked-worktree backlink. Exact unlocked identity may reuse modified, deleted, untracked, ignored, advanced, or rewritten managed content. One-sided, duplicated, moved, symlinked, foreign, wrong-branch, wrong-repository, locked, and unreadable resources must remain present and blocked rather than being replaced or repaired. Model interrupted population with Git's locked initialization state.
+
+Simulate a native creation command that returns failure after creating the exact worktree: only the exact requested commit and complete identity may recover as successful creation with a bounded diagnostic. A wrong post-create commit and every partial or uncertain postcondition must block without retry. Ordinary shutdown preserves the checkout; no database row, startup reconstruction, cache, background reconciliation, automatic cleanup, or path interception is involved.
+
+Make direct committed changes in the managed checkout and target a repository implementation Task at that path. Prove that its detached Worker Candidate applies into the Coordinator checkout rather than the source checkout. Final integration, publication, and cleanup belong to native repository or forge tooling and are not Workgraph checkout operations; do not retain lifecycle fixtures for them.
+
 ## Worker behavior
 
 Exercise each role through a real Worker Pi session and installed Worker extension. Verify role-specific tool gates, immutable assignment context, report schema, report readback, model markers, and compaction recovery from genuine Pi branch history.
@@ -64,7 +74,7 @@ Restore assignment and current TODO after actual context compaction, not ordinar
 
 ## Coordinator tools and notepad
 
-Invoke all nine registered coordinator tools through Pi's extension surface. Verify strict tool inputs, failure before record creation for invalid policy or selection, Task/Attempt receipts, exact bounded inspection, and explicit control effects. Confirm that one fresh Worker session is associated with each Attempt and that inspection cannot enumerate another coordinator session's records.
+Invoke every registered coordinator tool through Pi's extension surface. Verify strict tool inputs, failure before record creation for invalid policy or selection, Task/Attempt and Coordinator-checkout receipts, exact bounded inspection, and explicit control effects. Confirm that one fresh Worker session is associated with each Attempt and that inspection cannot enumerate another coordinator session's records.
 
 Exercise the branch notepad through `read`, `replace`, and `clear`, including its 4,000-character bound and latest-snapshot behavior. Genuine compaction should inject a nonempty current memo once for recovery; normal message traffic and reload should not. The notepad must not mutate Task, Attempt, Outcome, or repository state.
 
