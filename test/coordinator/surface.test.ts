@@ -12,9 +12,9 @@ import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../suppo
 import { extensionFixture, git } from "../support/helpers.js";
 
 const accepted = [
-  "workgraph_models",
   "workgraph_checkout",
   "workgraph_research",
+  "workgraph_experiment",
   "workgraph_consult",
   "workgraph_implement",
   "workgraph_review",
@@ -63,7 +63,7 @@ async function fixture(
   };
 }
 
-void test("coordinator registers exactly nine strict tools", async () => {
+void test("coordinator registers the exact strict tool surface", async () => {
   const f = await fixture(false);
 
   try {
@@ -82,6 +82,36 @@ void test("coordinator registers exactly nine strict tools", async () => {
     assert.equal(Value.Check(checkout.parameters, { action: "create" }), false);
     assert.equal(Value.Check(checkout.parameters, { checkoutId: "old" }), false);
     assert.match(JSON.stringify(checkout.parameters), /defaults to the session cwd/);
+
+    assert.equal(f.runner.getToolDefinition("workgraph_models"), undefined);
+    const research = f.runner.getToolDefinition("workgraph_research");
+    const experiment = f.runner.getToolDefinition("workgraph_experiment");
+    const consult = f.runner.getToolDefinition("workgraph_consult");
+    assert.ok(research !== undefined && experiment !== undefined && consult !== undefined);
+    assert.equal(
+      Value.Check(research.parameters, {
+        id: "research",
+        question: "Question?",
+        expectedEvidence: ["Evidence"],
+        experiment: { permittedEffects: ["write"], stopCondition: "done" },
+      }),
+      false,
+    );
+    assert.equal(
+      Value.Check(experiment.parameters, {
+        id: "experiment",
+        question: "Question?",
+        expectedEvidence: ["Evidence"],
+        permittedEffects: ["write"],
+        stopCondition: "done",
+        selection: { count: 2, distinctModels: true },
+      }),
+      true,
+    );
+    assert.equal(
+      Value.Check(consult.parameters, { id: "consult", question: "Question?", advisor: "old" }),
+      false,
+    );
 
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
@@ -299,11 +329,14 @@ void test("one session creates frozen Task and Attempt records and inspects them
 
     // SAFETY: The registered implementation tool returns this bounded creation receipt.
     const details = created.details as {
-      taskId: string;
-      attempts: { taskId: string; attemptId: string }[];
+      task: { id: string; kind: string; target: { kind: string } };
+      attempts: { taskId: string; attemptId: string; spec: AttemptSpec }[];
     };
 
-    assert.equal(details.taskId, "change");
+    assert.deepEqual(
+      { id: details.task.id, kind: details.task.kind, targetKind: details.task.target.kind },
+      { id: "change", kind: "implementation", targetKind: "repository" },
+    );
     assert.equal(details.attempts.length, 1);
     const attemptId = details.attempts[0]?.attemptId;
     assert.ok(attemptId !== undefined);
@@ -320,8 +353,8 @@ void test("one session creates frozen Task and Attempt records and inspects them
       (attempt.details as { spec: { base: { baseCommit: string } } }).spec.base.baseCommit,
       base,
     );
-    // SAFETY: Pi tool details are object-shaped for every registered Workgraph result.
-    assert.equal("report" in (attempt.details as object), false);
+    // SAFETY: Exact inspection includes bounded report and blocker facts even before settlement.
+    assert.equal((attempt.details as { reportPreview: null; blocker: null }).reportPreview, null);
 
     const page = await f.call("workgraph_inspect", {
       section: "attempt",
@@ -350,9 +383,41 @@ void test("one session creates frozen Task and Attempt records and inspects them
       f.call("workgraph_attempt", { taskId: "read-only", useEscalationExecutor: true }),
       /useEscalationExecutor is supported only for implementation Attempts/,
     );
+
+    const experiment = await f.call("workgraph_experiment", {
+      id: "bounded-experiment",
+      cwd: ".",
+      question: "Can the probe run?",
+      expectedEvidence: ["Probe output"],
+      permittedEffects: ["Create probe.tmp in the assigned worktree"],
+      stopCondition: "Stop after one probe",
+      selection: { count: 2, distinctModels: true },
+    });
+
+    // SAFETY: The registered Experiment tool returns a bounded creation receipt.
+    assert.equal(
+      (experiment.details as { attempts: unknown[] }).attempts.length,
+      2,
+      "Experiment creates independently specified Attempts",
+    );
+
+    const experimentTask = await f.call("workgraph_inspect", {
+      section: "task",
+      id: "bounded-experiment",
+    });
+
+    // SAFETY: Exact Task inspection returns the strictly decoded persisted Task record.
+    assert.deepEqual((experimentTask.details as { task: Task }).task.contract, {
+      kind: "experiment",
+      question: "Can the probe run?",
+      expectedEvidence: ["Probe output"],
+      permittedEffects: ["Create probe.tmp in the assigned worktree"],
+      stopCondition: "Stop after one probe",
+    });
+
     const overview = await f.call("workgraph_inspect", { section: "overview" });
     // SAFETY: Overview returns exact session-local record counts.
-    assert.equal((overview.details as { counts: { attempts: number } }).counts.attempts, 2);
+    assert.equal((overview.details as { counts: { attempts: number } }).counts.attempts, 4);
 
     const other = new RecordStore(f.agentDir, "other-session");
     assert.deepEqual(other.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
@@ -384,9 +449,6 @@ void test("without exact Herdr launch identity inspection remains usable and cre
         attempts: 0,
         activeWorkers: 0,
       });
-      const models = await f.call("workgraph_models", { role: "research" });
-      // SAFETY: Model inspection returns the strictly decoded configured target list.
-      assert.equal((models.details as { targets: unknown[] }).targets.length, 2);
       await assert.rejects(
         f.call("workgraph_research", {
           id: "blocked",

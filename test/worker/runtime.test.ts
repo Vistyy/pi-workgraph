@@ -29,9 +29,11 @@ const todo = [
     id: "implement",
     text: "Implement the bounded fixture change.",
     validation: "The supported Worker flow passes.",
-    status: "pending" as const,
+    status: "in_progress" as const,
   },
 ];
+
+const setTodo = todo.map(({ status: _status, ...item }) => item);
 
 async function fixture(
   role: WorkerObjective["details"]["role"] = "implementation",
@@ -156,14 +158,19 @@ void test("plan tool keeps one strict nonblank 1–9 item current snapshot", asy
   try {
     const tool = f.runner.getToolDefinition("workgraph_plan");
     assert.ok(tool);
-    assert.equal(Value.Check(tool.parameters, { action: "set", todos: todo }), true);
+    assert.equal(Value.Check(tool.parameters, { action: "set", todos: setTodo }), true);
+    assert.equal(Value.Check(tool.parameters, { action: "get" }), false);
     assert.equal(
-      Value.Check(tool.parameters, { action: "set", todos: [{ ...todo[0], text: " " }] }),
+      Value.Check(tool.parameters, { action: "set", todos: [{ ...setTodo[0], text: " " }] }),
       false,
     );
     assert.equal(Value.Check(tool.parameters, { action: "set", todos: [] }), false);
-    assert.equal(Value.Check(tool.parameters, { action: "add", todo: todo[0] }), false);
-    const set = await f.call("workgraph_plan", { action: "set", todos: todo });
+    assert.equal(Value.Check(tool.parameters, { action: "add", todo: setTodo[0] }), false);
+    await assert.rejects(
+      f.call("workgraph_plan", { action: "set", todos: [setTodo[0], setTodo[0]] }),
+      /ids must be unique/,
+    );
+    const set = await f.call("workgraph_plan", { action: "set", todos: setTodo });
     assert.deepEqual(set.details, { action: "set", todos: todo });
 
     const update = await f.call("workgraph_plan", {
@@ -175,8 +182,8 @@ void test("plan tool keeps one strict nonblank 1–9 item current snapshot", asy
     // SAFETY: The registered plan tool returned schema-validated snapshot details.
     assert.equal((update.details as { todos: typeof todo }).todos[0]?.status, "done");
     await assert.rejects(
-      f.call("workgraph_plan", { action: "set", todos: [todo[0], todo[0]] }),
-      /ids must be unique/,
+      f.call("workgraph_plan", { action: "set", todos: setTodo }),
+      /already initialized.*update/,
     );
   } finally {
     await f.dispose();
@@ -189,7 +196,7 @@ void test("TODO and successful direct edit trigger one executor cutover in eithe
 
     try {
       if (order === "plan-first") {
-        await f.call("workgraph_plan", { action: "set", todos: todo });
+        await f.call("workgraph_plan", { action: "set", todos: setTodo });
         await endTool(f, "workgraph_plan");
         await endTool(f, "bash");
         await endTool(f, "write", true);
@@ -198,7 +205,7 @@ void test("TODO and successful direct edit trigger one executor cutover in eithe
       } else {
         await endTool(f, "write");
         assert.deepEqual(f.selected, []);
-        await f.call("workgraph_plan", { action: "set", todos: todo });
+        await f.call("workgraph_plan", { action: "set", todos: setTodo });
         await endTool(f, "workgraph_plan");
       }
 
@@ -253,7 +260,7 @@ void test("selection failure remains guide-owned, blocks mutation, never retries
   session = f.session;
 
   try {
-    await f.call("workgraph_plan", { action: "set", todos: todo });
+    await f.call("workgraph_plan", { action: "set", todos: setTodo });
     await endTool(f, "workgraph_plan");
     await endTool(f, "edit");
     assert.equal(calls, 1);
@@ -538,7 +545,7 @@ void test("genuine compaction restores the authoritative objective and current T
   const f = await fixture();
 
   try {
-    await f.call("workgraph_plan", { action: "set", todos: todo });
+    await f.call("workgraph_plan", { action: "set", todos: setTodo });
     appendPlan(f.session);
 
     const kept = f.session.appendMessage({

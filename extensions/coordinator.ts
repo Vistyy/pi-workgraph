@@ -15,7 +15,6 @@ import {
   configuredTarget,
   implementationTargets,
   loadModelPolicy,
-  MODEL_LIST_ROLES,
   type ModelPolicy,
   modelPolicyPath,
   resolveSelection,
@@ -151,29 +150,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   installNotepad(pi);
 
   pi.registerTool({
-    name: "workgraph_models",
-    label: "Workgraph Models",
-    description: "List exact configured Workgraph model targets for one selectable role.",
-    parameters: Type.Object(
-      {
-        role: StringEnum(MODEL_LIST_ROLES, {
-          description: "Configured role whose exact model targets should be listed.",
-        }),
-      },
-      { additionalProperties: false },
-    ),
-    async execute(_id, params) {
-      const policy = await loadModelPolicy(policyPath);
-
-      return result({
-        path: policyPath,
-        role: params.role,
-        targets: policy.roles[params.role],
-      });
-    },
-  });
-
-  pi.registerTool({
     name: "workgraph_checkout",
     label: "Workgraph Checkout",
     description: "Create or exactly reuse this session's deterministic branch-backed checkout.",
@@ -212,49 +188,59 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           description: "Evidence the Research Outcome must provide.",
         }),
         selection: Selection,
-        experiment: Type.Optional(
-          Type.Object(
-            {
-              permittedEffects: Type.Array(Text, {
-                minItems: 1,
-                description: "Effects the experiment is authorized to perform.",
-              }),
-              stopCondition: nonBlank("Condition that ends the experiment."),
-            },
-            {
-              additionalProperties: false,
-              description: "Optional bounded experiment authority for repository research.",
-            },
-          ),
-        ),
       },
       { additionalProperties: false },
     ),
     async (params, ctx) => {
-      const contract: TaskContract =
-        params.experiment === undefined
-          ? {
-              kind: "research",
-              question: params.question,
-              expectedEvidence: params.expectedEvidence,
-            }
-          : {
-              kind: "experiment",
-              question: params.question,
-              expectedEvidence: params.expectedEvidence,
-              permittedEffects: params.experiment.permittedEffects,
-              stopCondition: params.experiment.stopCondition,
-            };
-
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
-        targetKind: params.experiment === undefined ? "directory" : "repository",
-        contract,
+        targetKind: "directory",
+        contract: {
+          kind: "research",
+          question: params.question,
+          expectedEvidence: params.expectedEvidence,
+        },
         ...(params.selection === undefined ? {} : { selection: params.selection }),
       });
     },
     serialize,
+  );
+
+  registerTask(
+    pi,
+    "workgraph_experiment",
+    "Experiment",
+    Type.Object(
+      {
+        ...TaskFields,
+        question: nonBlank("Question the Experiment Task must answer."),
+        expectedEvidence: Type.Array(Text, { minItems: 1 }),
+        permittedEffects: Type.Array(Text, {
+          minItems: 1,
+          description: "Effects independently permitted for every selected Attempt.",
+        }),
+        stopCondition: nonBlank("Stop condition independently binding every selected Attempt."),
+        selection: Selection,
+      },
+      { additionalProperties: false },
+    ),
+    async (params, ctx) =>
+      createTask(runtime(), ctx, policyPath, {
+        id: params.id,
+        ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
+        targetKind: "repository",
+        contract: {
+          kind: "experiment",
+          question: params.question,
+          expectedEvidence: params.expectedEvidence,
+          permittedEffects: params.permittedEffects,
+          stopCondition: params.stopCondition,
+        },
+        ...(params.selection === undefined ? {} : { selection: params.selection }),
+      }),
+    serialize,
+    "Each selected Attempt independently receives the permitted effects and stop condition. Use one Attempt unless parallel external effects are independent or explicitly coordinated.",
   );
 
   registerTask(
@@ -271,7 +257,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
             description: "Relevant context not already available in the target directory.",
           }),
         ),
-        advisor: Type.Optional(nonBlank("Exact configured advisor model ID override.")),
       },
       { additionalProperties: false },
     ),
@@ -290,7 +275,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         contract,
         fixedSelection: {
           kind: "target",
-          target: configuredTarget(policy, "consultation.advisor", params.advisor),
+          target: { ...policy.roles["consultation.advisor"] },
         },
       });
     },
@@ -391,9 +376,12 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     execute(_id, params) {
-      return serialize(async () =>
-        result(attemptReceipt(await createAttempt(runtime(), policyPath, params))),
-      );
+      return serialize(async () => {
+        const current = runtime();
+        const attempt = await createAttempt(current, policyPath, params);
+
+        return result(attemptReceipt(attempt));
+      });
     },
   });
 
@@ -515,26 +503,37 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       return serialize(async () => {
         const current = runtime();
 
-        if (params.action === "steer") {
-          await Effect.runPromise(current.steer(params.attemptId, params.instruction));
+        try {
+          if (params.action === "steer") {
+            await Effect.runPromise(current.steer(params.attemptId, params.instruction));
 
-          return result({ attemptId: params.attemptId, steered: true });
+            return result({
+              action: params.action,
+              promptSubmitted: params.instruction,
+              attempt: inspectedAttempt(current, current.store.readAttempt(params.attemptId)),
+            });
+          }
+
+          const operation = Match.value(params).pipe(
+            Match.when({ action: "cancel" }, ({ attemptId, reason }) =>
+              current.cancel(attemptId, reason),
+            ),
+            Match.when({ action: "apply" }, ({ attemptId }) => current.apply(attemptId)),
+            Match.when({ action: "discard_output" }, ({ attemptId, reason }) =>
+              current.discard(attemptId, reason),
+            ),
+            Match.exhaustive,
+          );
+
+          const attempt = await Effect.runPromise(operation);
+
+          return result({ action: params.action, attempt: inspectedAttempt(current, attempt) });
+        } catch (cause) {
+          throw new Error(
+            `${publicMessage(cause)} Inspect exact Attempt ${params.attemptId} persisted state before retrying.`,
+            { cause },
+          );
         }
-
-        const operation = Match.value(params).pipe(
-          Match.when({ action: "cancel" }, ({ attemptId, reason }) =>
-            current.cancel(attemptId, reason),
-          ),
-          Match.when({ action: "apply" }, ({ attemptId }) => current.apply(attemptId)),
-          Match.when({ action: "discard_output" }, ({ attemptId, reason }) =>
-            current.discard(attemptId, reason),
-          ),
-          Match.exhaustive,
-        );
-
-        const attempt = await Effect.runPromise(operation);
-
-        return result(attemptReceipt(attempt));
       });
     },
   });
@@ -591,19 +590,29 @@ async function createTask(
 
   const attempts = [initial];
 
-  for (const selection of selections.slice(1)) {
-    attempts.push(
-      await Effect.runPromise(
-        runtime.createAttempt({
-          taskId: input.id,
-          selection,
-          ...("commit" in resolved ? { baseCommit: resolved.commit } : {}),
-        }),
-      ),
+  try {
+    for (const selection of selections.slice(1)) {
+      attempts.push(
+        await Effect.runPromise(
+          runtime.createAttempt({
+            taskId: input.id,
+            selection,
+            ...("commit" in resolved ? { baseCommit: resolved.commit } : {}),
+          }),
+        ),
+      );
+    }
+  } catch (cause) {
+    throw new Error(
+      `Task ${input.id} was durably created with ${attempts.length} Attempt(s) before creation failed. Inspect the Task and Attempts; do not retry blindly. ${publicMessage(cause)}`,
+      { cause },
     );
   }
 
-  return { taskId: input.id, attempts: attempts.map(attemptReceipt) };
+  return {
+    task: { id: input.id, kind: input.contract.kind, target: resolved.target },
+    attempts: attempts.map(attemptReceipt),
+  };
 }
 
 async function selectionsFor(
@@ -667,13 +676,15 @@ function selectionForAttempt(
     return { kind: "implementation", guide: selected.guide, executor: selected.executor };
   }
 
+  if (contract.kind === "consultation")
+    return { kind: "target", target: { ...policy.roles["consultation.advisor"] } };
+
   return {
     kind: "target",
     target: configuredTarget(
       policy,
       Match.value(contract.kind).pipe(
         Match.when("review", () => "review" as const),
-        Match.when("consultation", () => "consultation.advisor" as const),
         Match.orElse(() => "research" as const),
       ),
     ),
@@ -771,7 +782,7 @@ function inspectAttempts(
   runtime: SessionRuntime,
   input: Extract<InspectInput, { section: "attempt" }>,
 ) {
-  if (input.id !== undefined) return inspectedAttempt(runtime.store.readAttempt(input.id));
+  if (input.id !== undefined) return inspectedAttempt(runtime, runtime.store.readAttempt(input.id));
   const offset = input.offset ?? 0;
   const limit = input.limit ?? 20;
 
@@ -807,27 +818,45 @@ function inspectReport(
   };
 }
 
-function inspectedAttempt(attempt: AttemptRecord) {
+function inspectedAttempt(runtime: SessionRuntime, attempt: AttemptRecord) {
   const outcome = attempt.outcome;
+  const task = runtime.store.readTask(attempt.taskId).task;
 
   return {
     attemptId: attempt.id,
     taskId: attempt.taskId,
+    task: { target: task.target, contract: task.contract },
     spec: attempt.spec,
-    ...(attempt.worker === undefined ? {} : { worker: attempt.worker }),
-    ...(attempt.output === undefined ? {} : { output: attempt.output }),
-    ...(outcome === undefined
-      ? {}
-      : {
-          outcome: {
-            kind: outcome.result.kind,
-            summary:
-              outcome.result.kind === "reported"
-                ? outcome.result.report.summary
-                : outcome.result.reason,
-            effectiveModels: outcome.effectiveModels,
-          },
-        }),
+    worker: attempt.worker ?? null,
+    output: attempt.output ?? null,
+    blocker: runtime.blockerFor(attempt.id) ?? null,
+    effectiveModels: outcome?.effectiveModels ?? [],
+    outcome:
+      outcome === undefined
+        ? null
+        : outcome.result.kind === "reported"
+          ? {
+              kind: outcome.result.kind,
+              reportStatus: outcome.result.report.status,
+              ...(outcome.result.report.kind === "implementation" &&
+              "outcome" in outcome.result.report
+                ? { reportOutcome: outcome.result.report.outcome }
+                : {}),
+              summary: outcome.result.report.summary,
+            }
+          : { kind: outcome.result.kind, summary: outcome.result.reason },
+    reportPreview:
+      outcome?.result.kind === "reported" ? previewReport(outcome.result.report) : null,
+  };
+}
+
+function previewReport(report: object, maxChars = 2_000) {
+  const text = JSON.stringify(report);
+
+  return {
+    text: text.slice(0, maxChars),
+    totalChars: text.length,
+    truncated: text.length > maxChars,
   };
 }
 
@@ -838,11 +867,12 @@ function registerTask<S extends TSchema>(
   parameters: S,
   run: (params: Static<S>, ctx: ExtensionContext) => Promise<object>,
   serialize: <A>(run: () => Promise<A>) => Promise<A>,
+  contractNote?: string,
 ): void {
   pi.registerTool({
     name,
     label: `Workgraph ${label}`,
-    description: `Create one immutable ${label} Task and its initial Attempt.`,
+    description: `Create one immutable ${label} Task and its initial Attempt.${contractNote === undefined ? "" : ` ${contractNote}`}`,
     parameters,
     execute(_id, params, _signal, _update, ctx) {
       return serialize(() => run(params as Static<S>, ctx).then(result));
@@ -851,7 +881,7 @@ function registerTask<S extends TSchema>(
 }
 
 function attemptReceipt(record: AttemptRecord) {
-  return { taskId: record.taskId, attemptId: record.id };
+  return { taskId: record.taskId, attemptId: record.id, spec: record.spec };
 }
 
 function result(value: object) {

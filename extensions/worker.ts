@@ -66,10 +66,10 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       name: "workgraph_plan",
       label: "Workgraph Plan",
       description:
-        "Get, initialize, or update the current 1–9 item implementation TODO. TODO status guides work but is not proof of completion.",
-      promptSnippet: "Get, set, or update the current implementation TODO",
+        "Initialize the current 1–9 item implementation TODO once, then update it. TODO status guides work but is not proof of completion.",
+      promptSnippet: "Set once, then update the current implementation TODO",
       promptGuidelines: [
-        "Use workgraph_plan set once to initialize a concise TODO with explicit validation, then get or update it as evidence changes.",
+        "Use workgraph_plan set once to initialize a concise TODO with explicit validation, then update it as evidence changes.",
       ],
       parameters: WorkerPlanToolSchema,
       execute(_id, params: WorkerPlanToolInput) {

@@ -25,7 +25,7 @@ const valid: ModelPolicy = {
     review: [{ model: "fixture/review", thinking: "medium" }],
     "implementation.guide": { model: "fixture/guide", thinking: "low" },
     "implementation.executor": { model: "fixture/executor", thinking: "xhigh" },
-    "consultation.advisor": [{ model: "fixture/advisor", thinking: "off" }],
+    "consultation.advisor": { model: "fixture/advisor", thinking: "off" },
   },
 };
 
@@ -69,6 +69,18 @@ await test("loads only the complete strict user policy shape", async () => {
         await assert.rejects(loadModelPolicy(path), /Invalid Workgraph model policy/);
       }
     }
+
+    await writeFile(
+      path,
+      JSON.stringify({
+        ...valid,
+        roles: { ...valid.roles, "consultation.advisor": [valid.roles["consultation.advisor"]] },
+      }),
+    );
+    await assert.rejects(
+      loadModelPolicy(path),
+      /select one target.*array to a ModelTarget object/i,
+    );
 
     const { review: _review, ...rolesWithoutReview } = valid.roles;
     await writeFile(path, JSON.stringify({ ...valid, roles: rolesWithoutReview }));
