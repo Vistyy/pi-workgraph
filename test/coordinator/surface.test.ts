@@ -6,6 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
+import type { CheckoutFacts } from "../../src/coordinator/checkouts.js";
 import { RecordStore } from "../../src/coordinator/store.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
 import {
@@ -17,6 +18,17 @@ import {
 } from "../../src/repository.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../support/decoders.js";
 import { extensionFixture, git, persistentSession } from "../support/helpers.js";
+
+type CreatedCheckoutFacts = CheckoutFacts & {
+  readonly created: boolean;
+  readonly reused: boolean;
+};
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Pi tool details are external until decoded by the registered tool contract.
+function createdCheckout(details: unknown): CreatedCheckoutFacts {
+  // SAFETY: All callers pass details returned by a successful checkout create action.
+  return details as CreatedCheckoutFacts;
+}
 
 const accepted = [
   "workgraph_models",
@@ -70,17 +82,26 @@ async function fixture(
   };
 }
 
-void test("coordinator registers exactly ten strict tools", async () => {
+void test("coordinator registers the exact strict tool surface", async () => {
   const f = await fixture(false);
 
   try {
-    const registered = f.runner
+    const tools = f.runner
       .getAllRegisteredTools()
-      .map((tool) => tool.definition.name)
-      .filter((name) => name.startsWith("workgraph_"))
-      .sort();
+      .filter((tool) => tool.definition.name.startsWith("workgraph_"));
+
+    const registered = tools.map((tool) => tool.definition.name).sort();
 
     assert.deepEqual(registered, [...accepted].sort());
+
+    for (const tool of tools) {
+      assert.match(
+        JSON.stringify(tool.definition.parameters),
+        /"description":/,
+        `${tool.definition.name} retains parameter descriptions in its registered JSON Schema`,
+      );
+    }
+
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(
@@ -117,6 +138,10 @@ void test("coordinator registers exactly ten strict tools", async () => {
     const checkout = f.runner.getToolDefinition("workgraph_checkout");
     assert.ok(checkout !== undefined);
     assert.equal(Value.Check(checkout.parameters, { action: "create", cwd: "." }), true);
+    assert.match(
+      JSON.stringify(checkout.parameters),
+      /Create or reuse this repository's checkout from committed HEAD/,
+    );
     assert.equal(
       Value.Check(checkout.parameters, { action: "discard", checkoutId: "a", reason: " " }),
       false,
@@ -155,34 +180,22 @@ void test("checkout create reuses one session placement and isolates another ses
   try {
     await f.runner.emit({ type: "session_start", reason: "startup" });
     await other.runner.emit({ type: "session_start", reason: "startup" });
+    await writeFile(join(f.root, "destination-dirty.txt"), "not part of the checkout\n");
+
     const first = await f.call("workgraph_checkout", { action: "create" });
     const repeated = await f.call("workgraph_checkout", { action: "create", cwd: "." });
     const second = await other.call("workgraph_checkout", { action: "create" });
-    await writeFile(join(f.root, "destination-dirty.txt"), "not part of the checkout\n");
     const dirtyDestinationReuse = await f.call("workgraph_checkout", { action: "create" });
 
-    // SAFETY: Checkout tool results own these exact identity and lifecycle fields.
-    const firstFacts = first.details as {
-      checkoutId: string;
-      managedPath: string;
-      ownedBranch: string;
-      lifecycle: string;
-      created: boolean;
-    };
-
-    // SAFETY: The repeated create has the same checkout receipt plus the reuse fact.
-    const repeatedFacts = repeated.details as typeof firstFacts & { reused: boolean };
-
-    // SAFETY: Reuse reports the existing identity and observed dirty destination.
-    const dirtyReuseFacts = dirtyDestinationReuse.details as typeof repeatedFacts & {
-      destinationDirty: boolean;
-    };
-
-    // SAFETY: The second session returns the same strict checkout receipt shape.
-    const secondFacts = second.details as typeof firstFacts;
+    const firstFacts = createdCheckout(first.details);
+    const repeatedFacts = createdCheckout(repeated.details);
+    const dirtyReuseFacts = createdCheckout(dirtyDestinationReuse.details);
+    const secondFacts = createdCheckout(second.details);
 
     assert.equal(firstFacts.created, true);
     assert.equal(firstFacts.lifecycle, "ready");
+    assert.equal(firstFacts.destinationDirty, true);
+    assert.equal(existsSync(join(firstFacts.managedPath, "destination-dirty.txt")), false);
     assert.equal(repeatedFacts.checkoutId, firstFacts.checkoutId);
     assert.equal(repeatedFacts.managedPath, firstFacts.managedPath);
     assert.equal(repeatedFacts.reused, true);
@@ -237,13 +250,7 @@ void test("checkout applies committed direct work after destination advancement"
     await f.runner.emit({ type: "session_start", reason: "startup" });
     const created = await f.call("workgraph_checkout", { action: "create" });
 
-    // SAFETY: Create returns exact managed placement and branch identity.
-    const facts = created.details as {
-      checkoutId: string;
-      managedPath: string;
-      ownedBranch: string;
-      baseCommit: string;
-    };
+    const facts = createdCheckout(created.details);
 
     await writeFile(join(f.root, ".git", "info", "exclude"), "ignored.bin\n");
     await writeFile(join(facts.managedPath, "ignored.bin"), "allowed ignored artifact\n");
@@ -293,12 +300,7 @@ void test("apply resumes after uncertain integration and worktree-removal respon
     await f.runner.emit({ type: "session_start", reason: "startup" });
     const created = await f.call("workgraph_checkout", { action: "create" });
 
-    // SAFETY: Create returns exact managed placement identity.
-    const facts = created.details as {
-      checkoutId: string;
-      managedPath: string;
-      ownedBranch: string;
-    };
+    const facts = createdCheckout(created.details);
 
     await writeFile(join(facts.managedPath, "resumed.txt"), "resumed apply\n");
     await git(facts.managedPath, "add", "resumed.txt");
@@ -350,12 +352,7 @@ void test("implementation Candidate converges through the Coordinator checkout b
     await f.runner.emit({ type: "session_start", reason: "startup" });
     const created = await f.call("workgraph_checkout", { action: "create" });
 
-    // SAFETY: Create returns exact managed placement identity.
-    const facts = created.details as {
-      checkoutId: string;
-      managedPath: string;
-      baseCommit: string;
-    };
+    const facts = createdCheckout(created.details);
 
     const attemptId = "attempt-checkout-candidate";
     const outputRef = `refs/pi-workgraph/outputs/${attemptId}`;
@@ -443,8 +440,7 @@ void test("unchanged checkout applies as a no-op after destination advancement",
     await f.runner.emit({ type: "session_start", reason: "startup" });
     const created = await f.call("workgraph_checkout", { action: "create" });
 
-    // SAFETY: Create returns exact managed placement identity.
-    const facts = created.details as { checkoutId: string; managedPath: string };
+    const facts = createdCheckout(created.details);
 
     await writeFile(join(f.root, "destination.txt"), "advanced\n");
     await git(f.root, "add", "destination.txt");
@@ -476,13 +472,7 @@ void test("pre-request external removal blocks both dispositions and preserves b
     try {
       await f.runner.emit({ type: "session_start", reason: "startup" });
       const created = await f.call("workgraph_checkout", { action: "create" });
-
-      // SAFETY: Create returns exact managed resource identity.
-      const facts = created.details as {
-        checkoutId: string;
-        managedPath: string;
-        ownedBranch: string;
-      };
+      const facts = createdCheckout(created.details);
 
       if (mode === "apply") {
         await writeFile(join(facts.managedPath, "applied.txt"), "applied before release\n");
@@ -531,13 +521,7 @@ void test("externally missing worktree blocks release and preserves the owned br
   try {
     await f.runner.emit({ type: "session_start", reason: "startup" });
     const created = await f.call("workgraph_checkout", { action: "create" });
-
-    // SAFETY: Create returns exact managed resource identity.
-    const facts = created.details as {
-      checkoutId: string;
-      managedPath: string;
-      ownedBranch: string;
-    };
+    const facts = createdCheckout(created.details);
 
     await git(f.root, "worktree", "remove", "--force", facts.managedPath);
     await assert.rejects(
@@ -565,13 +549,7 @@ void test("discard resumes after worktree removal succeeds without confirmation"
   try {
     await f.runner.emit({ type: "session_start", reason: "startup" });
     const created = await f.call("workgraph_checkout", { action: "create" });
-
-    // SAFETY: Create returns exact managed resource identity.
-    const facts = created.details as {
-      checkoutId: string;
-      managedPath: string;
-      ownedBranch: string;
-    };
+    const facts = createdCheckout(created.details);
 
     const store = new RecordStore(f.agentDir, f.session.getSessionId());
     let checkout = store.readCoordinatorCheckout(facts.checkoutId);
@@ -616,12 +594,7 @@ void test("checkout refuses dirty apply, discards dirty bytes, and preserves for
     await f.runner.emit({ type: "session_start", reason: "startup" });
     const dirtyCreated = await f.call("workgraph_checkout", { action: "create" });
 
-    // SAFETY: Create returns exact managed placement identity.
-    const dirty = dirtyCreated.details as {
-      checkoutId: string;
-      managedPath: string;
-      ownedBranch: string;
-    };
+    const dirty = createdCheckout(dirtyCreated.details);
 
     await writeFile(join(f.root, ".git", "info", "exclude"), "ignored.bin\n");
     await writeFile(join(dirty.managedPath, "file.txt"), "dirty\n");
@@ -640,8 +613,7 @@ void test("checkout refuses dirty apply, discards dirty bytes, and preserves for
     await assert.rejects(git(f.root, "show-ref", "--verify", dirty.ownedBranch));
 
     const foreignCreated = await f.call("workgraph_checkout", { action: "create" });
-    // SAFETY: This create returns the same strict managed placement identity.
-    const foreign = foreignCreated.details as typeof dirty;
+    const foreign = createdCheckout(foreignCreated.details);
 
     await git(foreign.managedPath, "switch", "-c", "foreign-branch");
     const listed = await f.call("workgraph_checkout", { action: "list" });

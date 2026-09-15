@@ -292,6 +292,7 @@ function checkoutIdentity(checkout: CoordinatorCheckout): CheckoutIdentity {
   };
 }
 
+/** Read one strict durable record inside the checkout Effect sequence. */
 function read(
   storeOwner: RecordStore,
   checkoutId: string,
@@ -299,6 +300,7 @@ function read(
   return store("read Coordinator checkout", () => storeOwner.readCoordinatorCheckout(checkoutId));
 }
 
+/** Persist the next custody state before its dependent native effect. */
 function checkpoint(
   storeOwner: RecordStore,
   checkout: CoordinatorCheckout,
@@ -308,6 +310,7 @@ function checkpoint(
   );
 }
 
+/** Lift the synchronous SQLite boundary into the typed Effect error channel. */
 function store<A>(operation: string, run: () => A): Effect.Effect<A, StoreError> {
   return Effect.try({
     try: run,

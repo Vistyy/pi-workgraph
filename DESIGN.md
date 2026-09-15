@@ -25,7 +25,7 @@ An Outcome records a reported, unreported, or cancelled semantic result and the 
 
 ## Record store
 
-All coordinator sessions share one private `<agentDir>/workgraph/workgraph.sqlite` file. Exact session identity partitions every supported query and mutation. The database has three strict tables:
+All coordinator sessions share one private `<agentDir>/workgraph/workgraph.sqlite` file. Exact session identity partitions every supported query and mutation. The database stores these strict session records:
 
 - `tasks` stores immutable Task JSON under `(session_id, task_id)`;
 - `attempts` stores immutable specification JSON and nullable Worker, output, and Outcome JSON, linked to its session's Task;
@@ -49,13 +49,13 @@ Coordinator shutdown interrupts and joins only owned coordination fibers and clo
 
 ## Coordinator checkout lifecycle
 
-Read-only work creates no repository resource. Before direct repository mutation or implementation delegation, the model explicitly requests a Coordinator checkout from the intended destination. The destination must be a clean attached branch checkout. Workgraph records exact placement before creating a normal owned branch and worktree at the destination's exact `HEAD`; one session reuses its one live checkout for that repository, while another session receives independent resources.
+Read-only work creates no repository resource. Before direct repository mutation or implementation delegation, the model explicitly requests a Coordinator checkout from the intended destination. The destination must be an attached branch, but it may contain uncommitted work: the managed checkout starts from committed `HEAD` and leaves those working-tree bytes untouched. One session reuses its live checkout for that repository, while another session receives independent resources.
 
-The managed path is the session's mutable integration destination. The Coordinator edits and verifies there, and repository implementation Tasks target it so detached Worker Candidates apply there through the existing Candidate flow. Workgraph does not intercept edits or shell commands, redirect paths, inject checkout state into prompts, cache checkout records, or reconcile them in a background loop. Every checkout operation reads its session-partitioned record and validates the referenced Git identity before acting.
+The managed path is the session's mutable integration destination. The Coordinator edits and verifies there, and repository implementation Tasks target it so detached Worker Candidates apply there through the existing Candidate flow. Workgraph does not intercept or redirect file operations, inject checkout state into prompts, cache checkout records, or reconcile them in a background loop. Every checkout operation reads its session-partitioned record and validates the referenced repository resource before acting.
 
-Local application requires committed clean source state on the exact owned branch. It permits the recorded destination branch to advance from the checkout base, preserves an already-contained destination without creating a commit, proves any required fast-forward or merge, checkpoints preparation before mutation, and then removes only the exact managed worktree and branch after the destination result is established. Explicit discard checkpoints the exact source before destructive disposition. Both dispositions prove the exact live worktree before recording its removal request, confirm established absence after the native effect, then delete the branch and remove the live record last. Missing, moved, one-sided, foreign, or mismatched resources block without repair, replacement, or cleanup. Routine shutdown preserves the checkout exactly.
+Local application has stricter requirements because it changes the original checkout: the managed checkout must contain only committed work, and the original destination must be clean, remain on its recorded branch, and still descend from the recorded base. The destination branch may have advanced; Workgraph preserves an already-contained result or creates the required fast-forward or clean merge. Application and explicit discard release only exact owned resources, with durable checkpoints around uncertain native effects. Missing, moved, foreign, or mismatched resources block without repair or cleanup. Routine shutdown preserves the checkout exactly.
 
-The Coordinator may instead publish the managed branch with ordinary Git and `gh`. Publication, pull-request state, remote safety, and post-publication cleanup remain outside Workgraph.
+The Coordinator may instead publish the managed branch through external repository or forge tooling. Publication state, remote safety, and post-publication cleanup remain outside Workgraph.
 
 ## Worker Pi trajectory
 
@@ -87,7 +87,7 @@ Repository custody is serialized within one coordinator session, not across sess
 
 Discard is explicitly destructive and requires a reason. It checkpoints the exact retained tip and disposition before deleting only the verified private ref or owned worktree. An unplaced extension child and an unclassified integration child pin their source output. Interruption recovery accepts only proven postconditions and never removes foreign or uncertain resources. Semantic Outcomes and routine shutdown cannot discard output.
 
-Applying a Candidate or Coordinator checkout changes a local repository only. Workgraph never pushes or publishes; a Coordinator may use ordinary Git and `gh` from its managed branch as a separate deliberate action.
+Applying a Candidate or Coordinator checkout changes a local repository only. Workgraph never publishes; the Coordinator may use external repository or forge tooling from its managed branch as a separate deliberate action.
 
 ## Calm and pending memory
 

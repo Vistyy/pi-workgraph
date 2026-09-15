@@ -1,13 +1,12 @@
 /* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
 import { readFileSync } from "node:fs";
-import { StringEnum } from "@earendil-works/pi-ai";
 import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { Effect, Exit, Match, Scope } from "effect";
-import { type Static, type TSchema, Type } from "typebox";
+import type { Static, TSchema } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
 import {
   applyCheckout,
@@ -21,43 +20,26 @@ import {
   configuredTarget,
   implementationTargets,
   loadModelPolicy,
-  MODEL_LIST_ROLES,
   type ModelPolicy,
   modelPolicyPath,
   resolveSelection,
-  SelectionRequestSchema,
 } from "../src/coordinator/model-policy.js";
 import { installNotepad } from "../src/coordinator/notepad.js";
 import { type CandidateRequest, RuntimeError, SessionRuntime } from "../src/coordinator/runtime.js";
 import { RecordStore } from "../src/coordinator/store.js";
 import {
-  type AttemptRecord,
-  type AttemptSelection,
-  CommitSchema,
-  ReviewSubjectSchema,
-  type Task,
-  type TaskContract,
-  TaskIdSchema,
-} from "../src/domain/records.js";
+  AttemptParameters,
+  CheckoutParameters,
+  ConsultParameters,
+  ControlParameters,
+  ImplementParameters,
+  InspectParameters,
+  ModelsParameters,
+  ResearchParameters,
+  ReviewParameters,
+} from "../src/coordinator/tool-parameters.js";
+import type { AttemptRecord, AttemptSelection, Task, TaskContract } from "../src/domain/records.js";
 import { resolveRevision, resolveTaskTarget } from "../src/repository.js";
-
-const Text = Type.String({ minLength: 1, pattern: "\\S" });
-
-const CandidateOf = Type.Optional(
-  Type.Object(
-    { attemptId: Text, mode: StringEnum(["extend", "integrate"] as const) },
-    { additionalProperties: false },
-  ),
-);
-
-const Selection = Type.Optional(SelectionRequestSchema);
-
-const TaskFields = { id: TaskIdSchema, cwd: Type.Optional(Text) };
-
-const PageFields = {
-  offset: Type.Optional(Type.Integer({ minimum: 0 })),
-  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
-};
 
 export interface CoordinatorOptions {
   readonly agentDir?: string;
@@ -143,10 +125,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     name: "workgraph_models",
     label: "Workgraph Models",
     description: "List exact configured Workgraph model targets for one selectable role.",
-    parameters: Type.Object(
-      { role: StringEnum(MODEL_LIST_ROLES) },
-      { additionalProperties: false },
-    ),
+    parameters: ModelsParameters,
     async execute(_id, params) {
       const policy = await loadModelPolicy(policyPath);
 
@@ -161,27 +140,8 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   pi.registerTool({
     name: "workgraph_checkout",
     label: "Workgraph Checkout",
-    description:
-      "Manage this session's branch-backed Coordinator checkouts. create requires a clean attached destination only for new placement and otherwise reuses the repository's checkout; inspect validates one exact record and list reports each blocked record; apply locally integrates clean committed work into the original branch; discard destructively removes the verified checkout for a nonblank reason. Successful disposition releases the owned worktree, branch, and live record. Identity mismatches block without cleanup. No action publishes remotely.",
-    parameters: Type.Union([
-      Type.Object(
-        { action: Type.Literal("create"), cwd: Type.Optional(Text) },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        { action: Type.Literal("inspect"), checkoutId: TaskIdSchema },
-        { additionalProperties: false },
-      ),
-      Type.Object({ action: Type.Literal("list"), ...PageFields }, { additionalProperties: false }),
-      Type.Object(
-        { action: Type.Literal("apply"), checkoutId: TaskIdSchema },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        { action: Type.Literal("discard"), checkoutId: TaskIdSchema, reason: Text },
-        { additionalProperties: false },
-      ),
-    ]),
+    description: "Manage this session's branch-backed Coordinator checkouts.",
+    parameters: CheckoutParameters,
     execute(_id, params, _signal, _update, ctx) {
       return serialize(async () => result(await checkoutAction(runtime(), ctx, params)));
     },
@@ -191,21 +151,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     pi,
     "workgraph_research",
     "Research",
-    Type.Object(
-      {
-        ...TaskFields,
-        question: Text,
-        expectedEvidence: Type.Array(Text, { minItems: 1 }),
-        selection: Selection,
-        experiment: Type.Optional(
-          Type.Object(
-            { permittedEffects: Type.Array(Text, { minItems: 1 }), stopCondition: Text },
-            { additionalProperties: false },
-          ),
-        ),
-      },
-      { additionalProperties: false },
-    ),
+    ResearchParameters,
     async (params, ctx) => {
       const contract: TaskContract =
         params.experiment === undefined
@@ -237,15 +183,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     pi,
     "workgraph_consult",
     "Consult",
-    Type.Object(
-      {
-        ...TaskFields,
-        question: Text,
-        context: Type.Optional(Type.String({ maxLength: 20_000 })),
-        advisor: Type.Optional(Text),
-      },
-      { additionalProperties: false },
-    ),
+    ConsultParameters,
     async (params, ctx) => {
       const policy = await loadModelPolicy(policyPath);
 
@@ -272,17 +210,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     pi,
     "workgraph_implement",
     "Implement",
-    Type.Object(
-      {
-        ...TaskFields,
-        objective: Text,
-        acceptance: Type.Array(Text, { minItems: 1 }),
-        useEscalationExecutor: Type.Optional(Type.Boolean()),
-        candidateOf: CandidateOf,
-        baseRevision: Type.Optional(CommitSchema),
-      },
-      { additionalProperties: false },
-    ),
+    ImplementParameters,
     async (params, ctx) => {
       if (params.candidateOf?.mode === "extend" && params.baseRevision !== undefined)
         throw new Error("Candidate extension forbids baseRevision.");
@@ -314,16 +242,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     pi,
     "workgraph_review",
     "Review",
-    Type.Object(
-      {
-        ...TaskFields,
-        objective: Text,
-        concern: Text,
-        subject: ReviewSubjectSchema,
-        selection: Selection,
-      },
-      { additionalProperties: false },
-    ),
+    ReviewParameters,
     async (params, ctx) =>
       createTask(runtime(), ctx, policyPath, {
         id: params.id,
@@ -345,15 +264,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     name: "workgraph_attempt",
     label: "Workgraph Attempt",
     description: "Create one fresh Attempt inheriting its immutable Task target.",
-    parameters: Type.Object(
-      {
-        taskId: TaskIdSchema,
-        candidateOf: CandidateOf,
-        baseRevision: Type.Optional(CommitSchema),
-        useEscalationExecutor: Type.Optional(Type.Boolean()),
-      },
-      { additionalProperties: false },
-    ),
+    parameters: AttemptParameters,
     execute(_id, params) {
       return serialize(async () =>
         result(attemptReceipt(await createAttempt(runtime(), policyPath, params))),
@@ -365,35 +276,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     name: "workgraph_inspect",
     label: "Workgraph Inspect",
     description: "Inspect bounded records for this Pi session.",
-    parameters: Type.Union([
-      Type.Object({ section: Type.Literal("overview") }, { additionalProperties: false }),
-      Type.Object(
-        { section: Type.Literal("task"), id: TaskIdSchema },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        { section: Type.Literal("task"), ...PageFields },
-        { additionalProperties: false },
-      ),
-      Type.Object({ section: Type.Literal("attempt"), id: Text }, { additionalProperties: false }),
-      Type.Object(
-        {
-          section: Type.Literal("attempt"),
-          taskId: Type.Optional(TaskIdSchema),
-          ...PageFields,
-        },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        {
-          section: Type.Literal("report"),
-          attemptId: Text,
-          offset: Type.Optional(Type.Integer({ minimum: 0 })),
-          maxChars: Type.Optional(Type.Integer({ minimum: 1, maximum: 20_000 })),
-        },
-        { additionalProperties: false },
-      ),
-    ]),
+    parameters: InspectParameters,
     execute(_id, params) {
       return serialize(async () => result(inspect(runtime(), params)));
     },
@@ -403,24 +286,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     name: "workgraph_control",
     label: "Workgraph Control",
     description: "Cancel, steer, apply, or explicitly discard output for one exact Attempt.",
-    parameters: Type.Union([
-      Type.Object(
-        { action: Type.Literal("cancel"), attemptId: Text, reason: Text },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        { action: Type.Literal("steer"), attemptId: Text, instruction: Text },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        { action: Type.Literal("apply"), attemptId: Text },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        { action: Type.Literal("discard_output"), attemptId: Text, reason: Text },
-        { additionalProperties: false },
-      ),
-    ]),
+    parameters: ControlParameters,
     execute(_id, params) {
       return serialize(async () => {
         const current = runtime();
@@ -450,21 +316,11 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   });
 }
 
-type CheckoutInput =
-  | { readonly action: "create"; readonly cwd?: string }
-  | { readonly action: "inspect"; readonly checkoutId: string }
-  | { readonly action: "list"; readonly offset?: number; readonly limit?: number }
-  | { readonly action: "apply"; readonly checkoutId: string }
-  | { readonly action: "discard"; readonly checkoutId: string; readonly reason: string };
-
 async function checkoutAction(
   runtime: SessionRuntime,
   ctx: ExtensionContext,
-  params: Static<TSchema>,
+  input: Static<typeof CheckoutParameters>,
 ): Promise<object> {
-  // SAFETY: Values are decoded by the strict registered checkout action union.
-  const input = params as CheckoutInput;
-
   switch (input.action) {
     case "create":
       return Effect.runPromise(
@@ -677,8 +533,8 @@ type InspectInput =
       readonly maxChars?: number;
     };
 
-function inspect(runtime: SessionRuntime, params: Static<TSchema>) {
-  // SAFETY: this helper receives only values decoded by the registered inspection union.
+function inspect(runtime: SessionRuntime, params: Static<typeof InspectParameters>) {
+  // SAFETY: Collapse the schema's same-section variants into optional fields for dispatch.
   const input = params as InspectInput;
 
   switch (input.section) {

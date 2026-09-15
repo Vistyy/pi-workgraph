@@ -9,12 +9,16 @@ const NonBlankText = Type.String({ minLength: 1, pattern: "\\S" });
 const strict = <const Fields extends Parameters<typeof Type.Object>[0]>(fields: Fields) =>
   Type.Object(fields, { additionalProperties: false });
 
-export const CommitSchema = Type.String({ pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" });
+export const CommitSchema = Type.String({
+  pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+  description: "Full lowercase 40- or 64-character commit ID.",
+});
 
 export const TaskIdSchema = Type.String({
   minLength: 1,
   maxLength: 64,
   pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$",
+  description: "Exact Workgraph Task or Coordinator checkout identifier.",
 });
 
 const TaskTargetSchema = Type.Union([
@@ -23,12 +27,21 @@ const TaskTargetSchema = Type.Union([
 ]);
 
 export const ReviewSubjectSchema = Type.Union([
-  strict({ kind: Type.Literal("attempt"), attemptId: Text }),
   strict({
-    kind: Type.Literal("comparison"),
-    attemptIds: Type.Array(Text, { minItems: 2 }),
+    kind: Type.Literal("attempt", { description: "Review one exact Attempt." }),
+    attemptId: Type.String({ minLength: 1, description: "Exact Attempt ID." }),
   }),
-  strict({ kind: Type.Literal("revision"), revision: CommitSchema }),
+  strict({
+    kind: Type.Literal("comparison", { description: "Compare two or more exact Attempts." }),
+    attemptIds: Type.Array(Text, {
+      minItems: 2,
+      description: "Attempt IDs to compare.",
+    }),
+  }),
+  strict({
+    kind: Type.Literal("revision", { description: "Review one exact repository revision." }),
+    revision: CommitSchema,
+  }),
 ]);
 
 const TaskContractSchema = Type.Union([

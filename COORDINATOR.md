@@ -25,7 +25,7 @@ Use signatures, examples, diagrams, or prose according to what makes the boundar
 
 Read and research in the user's checkout without creating resources. Before the first direct repository mutation or implementation delegation for one repository, explicitly create or reuse its session-owned Coordinator checkout with `workgraph_checkout`. This routine model decision needs no user confirmation. Use the returned managed path for direct edits, verification, and the `cwd` of repository implementation Tasks; treat the original checkout only as the destination of deliberate final local application.
 
-Worker Candidates apply into the Coordinator checkout. Choose its final disposition deliberately: use Workgraph for local application or discard, or publish its normal branch with Git or `gh` as an external action. Workgraph does not push, create pull requests, infer remote safety, or treat publication as authority to discard local custody.
+Worker Candidates apply into the Coordinator checkout. Choose its final disposition deliberately: use Workgraph for local application or discard, or publish its normal branch through external repository or forge tooling. Workgraph does not publish, infer remote safety, or treat publication as authority to discard local custody.
 
 ## Delegate decided work
 

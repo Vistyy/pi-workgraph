@@ -6,7 +6,7 @@ This document owns project-specific evidence requirements. Begin with the suppor
 
 Exercise the native SQLite store through separate exact-session instances. Establish that:
 
-- the private agent-wide database is created with only `tasks`, `attempts`, and `coordinator_checkouts` tables;
+- `tasks`, `attempts`, and `coordinator_checkouts` are strict tables with their required relationships;
 - Task plus first Attempt creation is atomic;
 - failed creation leaves neither half-record;
 - another Attempt can reference only a Task in the same session;
@@ -57,7 +57,7 @@ Explicit discard must checkpoint its reason before deleting exact verified outpu
 
 ## Coordinator checkouts
 
-Drive checkout operations through the registered Coordinator tool and real disposable Git repositories. Establish that read-only session startup creates nothing; explicit creation requires a clean attached destination and records placement before the native Git effect; repeated creation in one session reuses its exact checkout; and separate sessions receive distinct paths and branches. One-sided, moved, foreign, wrong-branch, and wrong-repository resources must remain present and blocked rather than being replaced or removed.
+Drive checkout operations through the registered Coordinator tool and real disposable Git repositories. Establish that read-only session startup creates nothing; explicit creation starts from the committed `HEAD` of an attached destination without requiring or mutating its clean or dirty working tree; placement is recorded before the native Git effect; repeated creation in one session reuses its exact checkout; and separate sessions receive distinct paths and branches. One-sided, moved, foreign, wrong-branch, and wrong-repository resources must remain present and blocked rather than being replaced or removed.
 
 Make direct committed changes in the managed checkout and target a repository implementation Task at that path. Prove that its detached Worker Candidate applies into the Coordinator checkout rather than the original destination. Final local application must require clean committed source state, preserve unrelated ignored destination artifacts, accept clean descendant destination advancement, preserve an already-contained destination without creating a commit, produce only the proved fast-forward or merge result otherwise, and remove only the exact managed worktree, branch, and live record after success.
 
@@ -73,7 +73,7 @@ Restore assignment and current TODO after actual context compaction, not ordinar
 
 ## Coordinator tools and notepad
 
-Invoke all ten registered coordinator tools through Pi's extension surface. Verify strict tool inputs, failure before record creation for invalid policy or selection, Task/Attempt and Coordinator-checkout receipts, exact bounded inspection, and explicit control effects. Confirm that one fresh Worker session is associated with each Attempt and that inspection cannot enumerate another coordinator session's records.
+Invoke every registered coordinator tool through Pi's extension surface. Verify strict tool inputs, failure before record creation for invalid policy or selection, Task/Attempt and Coordinator-checkout receipts, exact bounded inspection, and explicit control effects. Confirm that one fresh Worker session is associated with each Attempt and that inspection cannot enumerate another coordinator session's records.
 
 Exercise the branch notepad through `read`, `replace`, and `clear`, including its 4,000-character bound and latest-snapshot behavior. Genuine compaction should inject a nonempty current memo once for recovery; normal message traffic and reload should not. The notepad must not mutate Task, Attempt, Outcome, or repository state.
 

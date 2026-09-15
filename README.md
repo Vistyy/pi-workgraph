@@ -67,7 +67,7 @@ Research, review, and consultation roles are ordered nonempty lists; their first
 
 ## Coordinator tools
 
-Workgraph exposes exactly ten coordinator tools:
+Workgraph exposes these coordinator tools:
 
 | Tool | Purpose |
 | --- | --- |
@@ -84,9 +84,7 @@ Workgraph exposes exactly ten coordinator tools:
 
 Each coordinator Pi session owns its own records and Coordinator checkouts. All sessions share one private SQLite database under the Pi agent data directory, partitioned by exact session identity; records are not globally discoverable from other sessions.
 
-Read-only work needs no Coordinator checkout. Before the first direct repository change or implementation delegation for a repository, the Coordinator explicitly creates one from the intended destination checkout. Workgraph requires that destination to be a clean attached branch, creates a separate branch-backed worktree at its exact `HEAD`, and returns the managed path. Repeated creation in that session reuses the same exact checkout for the repository; another Coordinator session receives another path and branch.
-
-Direct changes and verification run in the managed path. Repository implementation Tasks also use that path as their target, so their detached Worker Candidates apply back into the Coordinator checkout. The original checkout remains the destination for an explicit final local application. The managed branch may instead be pushed and proposed with ordinary Git and `gh`; Workgraph does not publish or track pull requests.
+Read-only work creates no checkout. For mutating repository work, the Coordinator explicitly creates a managed checkout and uses its returned path for direct changes, verification, and repository implementation Tasks. Worker Candidates therefore return to the managed branch before deliberate local application or publication through external repository or forge tooling; Workgraph does not publish or track remote state.
 
 A Task has one immutable resolved target. Directory targets record an exact path. Repository targets record the checkout root and Git common directory, so Tasks in one session may safely address different repositories without implying a transaction across them. Every Attempt inherits its Task target and starts one fresh Worker Pi session.
 

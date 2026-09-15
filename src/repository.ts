@@ -11,6 +11,7 @@ import type {
 } from "./domain/records.js";
 import { childProcessLayer } from "./node-platform.js";
 
+// Worker Candidates and Coordinator checkouts share this Git custody boundary.
 type RepositoryTarget = Extract<TaskTarget, { kind: "repository" }>;
 
 export interface RepositoryOperation {
@@ -176,10 +177,10 @@ export function validateCoordinatorDestination(input: {
   return Effect.gen(function* () {
     const destination = yield* destinationState(input.target);
 
-    if (destination.head !== input.commit || destination.dirty)
+    if (destination.head !== input.commit)
       return yield* fail(
         "resolve Coordinator checkout",
-        "Destination checkout is dirty or changed.",
+        "Destination HEAD changed during resolution.",
       );
 
     return { destinationRef: destination.ref };
@@ -231,10 +232,10 @@ function ensureCoordinatorPlacementResources(
         "Coordinator checkout placement is one-sided, foreign, or incomplete.",
       );
 
-    if (destination.head !== checkout.baseCommit || destination.dirty)
+    if (destination.head !== checkout.baseCommit)
       return yield* fail(
         "create Coordinator checkout",
-        "Destination changed before worktree placement.",
+        "Destination HEAD changed before worktree placement.",
       );
     yield* filesystem("create Coordinator checkout directory", () =>
       mkdir(dirname(checkout.managedPath), { recursive: true, mode: 0o700 }),

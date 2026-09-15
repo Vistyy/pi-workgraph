@@ -14,15 +14,25 @@ const NotepadEntrySchema = Type.Object(
 );
 
 const NotepadParameters = Type.Union([
-  Type.Object({ action: Type.Literal("read") }, { additionalProperties: false }),
+  Type.Object(
+    { action: Type.Literal("read", { description: "Read the current branch memo." }) },
+    { additionalProperties: false },
+  ),
   Type.Object(
     {
-      action: Type.Literal("replace"),
-      text: Type.String({ minLength: 1, maxLength: MAX_TEXT_LENGTH }),
+      action: Type.Literal("replace", { description: "Replace the current branch memo." }),
+      text: Type.String({
+        minLength: 1,
+        maxLength: MAX_TEXT_LENGTH,
+        description: "Complete replacement memo, limited to 4,000 characters.",
+      }),
     },
     { additionalProperties: false },
   ),
-  Type.Object({ action: Type.Literal("clear") }, { additionalProperties: false }),
+  Type.Object(
+    { action: Type.Literal("clear", { description: "Clear the current branch memo." }) },
+    { additionalProperties: false },
+  ),
 ]);
 
 type NotepadEntry = Static<typeof NotepadEntrySchema>;
@@ -49,7 +59,7 @@ export function installNotepad(pi: ExtensionAPI): void {
     name: "workgraph_notepad",
     label: "Workgraph Notepad",
     description:
-      "Read, replace, or clear the current branch's coordinator memo for pending context. It is not Task state, evidence, authority, or acceptance; replacement text is limited to 4,000 characters.",
+      "Manage the current branch's pending-context memo; it is not Task state, evidence, authority, or acceptance.",
     parameters: NotepadParameters,
     // oxlint-disable-next-line effecttsgo/async-function -- Pi's tool boundary requires a Promise; notepad persistence itself is synchronous.
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
