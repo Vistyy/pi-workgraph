@@ -12,6 +12,8 @@ import {
   type AttemptRecord,
   type AttemptSpec,
   AttemptSpecSchema,
+  type CoordinatorCheckout,
+  CoordinatorCheckoutSchema,
   type Outcome,
   OutcomeSchema,
   type Task,
@@ -43,7 +45,14 @@ CREATE TABLE attempts (
   outcome_json TEXT,
   FOREIGN KEY(session_id,task_id) REFERENCES tasks(session_id,task_id)
 ) STRICT;
-PRAGMA user_version=1;
+CREATE TABLE coordinator_checkouts (
+  checkout_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  common_dir TEXT NOT NULL,
+  checkout_json TEXT NOT NULL,
+  UNIQUE(session_id,common_dir)
+) STRICT;
+PRAGMA user_version=2;
 `;
 
 type Row = Record<string, SQLOutputValue>;
@@ -52,6 +61,7 @@ export interface RecordCounts {
   readonly tasks: number;
   readonly attempts: number;
   readonly activeWorkers: number;
+  readonly coordinatorCheckouts: number;
 }
 
 export class StoreError extends Data.TaggedError("StoreError")<{
@@ -299,6 +309,97 @@ export class RecordStore {
     );
   }
 
+  createCoordinatorCheckout(checkout: CoordinatorCheckout): {
+    readonly checkout: CoordinatorCheckout;
+    readonly created: boolean;
+  } {
+    decode(CoordinatorCheckoutSchema, checkout, "Coordinator checkout");
+
+    return this.transaction("create Coordinator checkout", true, (database) => {
+      const existing = database
+        .prepare("SELECT * FROM coordinator_checkouts WHERE session_id=? AND common_dir=?")
+        .get(this.sessionId, checkout.target.commonDir);
+
+      if (existing !== undefined)
+        return { checkout: coordinatorCheckout(existing), created: false };
+      database
+        .prepare(
+          "INSERT INTO coordinator_checkouts(checkout_id,session_id,common_dir,checkout_json) VALUES(?,?,?,?)",
+        )
+        .run(checkout.checkoutId, this.sessionId, checkout.target.commonDir, json(checkout));
+
+      return { checkout, created: true };
+    });
+  }
+
+  readCoordinatorCheckout(checkoutId: string): CoordinatorCheckout {
+    validateAttemptId(checkoutId);
+    const database = this.requireExisting("read Coordinator checkout");
+
+    const row = database
+      .prepare("SELECT * FROM coordinator_checkouts WHERE session_id=? AND checkout_id=?")
+      .get(this.sessionId, checkoutId);
+
+    if (row === undefined)
+      throw failure("read Coordinator checkout", "Required Coordinator checkout is absent.");
+
+    return coordinatorCheckout(row);
+  }
+
+  checkpointCoordinatorCheckout(checkout: CoordinatorCheckout): CoordinatorCheckout {
+    decode(CoordinatorCheckoutSchema, checkout, "Coordinator checkout");
+
+    return this.transaction("checkpoint Coordinator checkout", false, (database) => {
+      const prior = this.readCoordinatorCheckout(checkout.checkoutId);
+
+      if (
+        prior.checkoutId !== checkout.checkoutId ||
+        prior.target.checkoutRoot !== checkout.target.checkoutRoot ||
+        prior.target.commonDir !== checkout.target.commonDir ||
+        prior.managedPath !== checkout.managedPath ||
+        prior.branchRef !== checkout.branchRef ||
+        prior.baseCommit !== checkout.baseCommit ||
+        prior.destinationRef !== checkout.destinationRef
+      )
+        throw failure("checkpoint Coordinator checkout", "Coordinator checkout identity changed.");
+      database
+        .prepare(
+          "UPDATE coordinator_checkouts SET checkout_json=? WHERE session_id=? AND checkout_id=?",
+        )
+        .run(json(checkout), this.sessionId, checkout.checkoutId);
+
+      return checkout;
+    });
+  }
+
+  removeCoordinatorCheckout(checkout: CoordinatorCheckout): void {
+    decode(CoordinatorCheckoutSchema, checkout, "Coordinator checkout");
+    this.transaction("remove Coordinator checkout", false, (database) => {
+      const prior = this.readCoordinatorCheckout(checkout.checkoutId);
+
+      if (json(prior) !== json(checkout))
+        throw failure("remove Coordinator checkout", "Coordinator checkout checkpoint changed.");
+      database
+        .prepare("DELETE FROM coordinator_checkouts WHERE session_id=? AND checkout_id=?")
+        .run(this.sessionId, checkout.checkoutId);
+    });
+  }
+
+  listCoordinatorCheckouts(offset: number, limit: number): CoordinatorCheckout[] {
+    validatePage(offset, limit);
+    const database = this.existingOrUndefined("list Coordinator checkouts");
+
+    if (database === undefined) return [];
+
+    return (
+      database
+        .prepare(
+          "SELECT * FROM coordinator_checkouts WHERE session_id=? ORDER BY rowid LIMIT ? OFFSET ?",
+        )
+        .all(this.sessionId, limit, offset) as Row[]
+    ).map(coordinatorCheckout);
+  }
+
   listTasks(offset: number, limit: number): TaskRecord[] {
     validatePage(offset, limit);
     const database = this.existingOrUndefined("list Tasks");
@@ -337,12 +438,14 @@ export class RecordStore {
   counts(): RecordCounts {
     const database = this.existingOrUndefined("count records");
 
-    if (database === undefined) return { tasks: 0, attempts: 0, activeWorkers: 0 };
+    if (database === undefined)
+      return { tasks: 0, attempts: 0, activeWorkers: 0, coordinatorCheckouts: 0 };
 
     const row = database
       .prepare(
         `SELECT
            (SELECT count(*) FROM tasks WHERE session_id=?) AS tasks,
+           (SELECT count(*) FROM coordinator_checkouts WHERE session_id=?) AS coordinator_checkouts,
            count(*) AS attempts,
            coalesce(sum(CASE
              WHEN worker_json IS NOT NULL AND json_extract(worker_json,'$.closed') IS NOT 1 THEN 1
@@ -350,12 +453,13 @@ export class RecordStore {
            END),0) AS active_workers
          FROM attempts WHERE session_id=?`,
       )
-      .get(this.sessionId, this.sessionId);
+      .get(this.sessionId, this.sessionId, this.sessionId);
 
     return {
       tasks: integer(row, "tasks"),
       attempts: integer(row, "attempts"),
       activeWorkers: integer(row, "active_workers"),
+      coordinatorCheckouts: integer(row, "coordinator_checkouts"),
     };
   }
 
@@ -497,7 +601,7 @@ function initializeOrValidate(database: DatabaseSync): void {
 function isInitialized(database: DatabaseSync, operation: string): boolean {
   const version = userVersion(database);
 
-  if (version === 1) return true;
+  if (version === 2) return true;
 
   if (version === 0 && schemaObjectCount(database) === 0) return false;
   throw failure(operation, "Unsupported database schema version.");
@@ -568,6 +672,18 @@ function openDatabase(path: string): DatabaseSync {
 
 function hasCode(cause: unknown, code: string): boolean {
   return cause instanceof Error && "code" in cause && cause.code === code;
+}
+
+function coordinatorCheckout(row: Row): CoordinatorCheckout {
+  const checkout = parse(CoordinatorCheckoutSchema, row["checkout_json"], "Coordinator checkout");
+
+  if (
+    text(row, "checkout_id") !== checkout.checkoutId ||
+    text(row, "common_dir") !== checkout.target.commonDir
+  )
+    throw failure("decode Coordinator checkout", "Coordinator checkout row identity is malformed.");
+
+  return checkout;
 }
 
 function taskRecord(row: Row): TaskRecord {

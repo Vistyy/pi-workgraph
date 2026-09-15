@@ -22,6 +22,8 @@ import {
   type AttemptSpec,
   AttemptSpecSchema,
   CommitSchema,
+  type CoordinatorCheckout,
+  CoordinatorCheckoutSchema,
   type Outcome,
   type Task,
   TaskSchema,
@@ -69,6 +71,18 @@ const unreported: Outcome = {
   effectiveModels: [],
 };
 
+function checkout(id: string, commonDir = "/tmp/repo/.git"): CoordinatorCheckout {
+  return {
+    checkoutId: id,
+    target: { kind: "repository", checkoutRoot: "/tmp/repo", commonDir },
+    managedPath: `/tmp/agent/workgraph/coordinator-checkouts/${id}`,
+    branchRef: `refs/heads/pi-workgraph/coordinators/${id}`,
+    baseCommit: commit,
+    destinationRef: "refs/heads/main",
+    state: { kind: "placing" },
+  };
+}
+
 function fixture(): { root: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "record-store-"));
 
@@ -93,6 +107,11 @@ void test("record schemas accept exact current shapes and reject undeclared fiel
   assert.equal(Value.Check(AttemptSpecSchema, { ...directorySpec, unexpected: true }), false);
   assert.equal(Value.Check(WorkerStateSchema, worker({ closed: true })), true);
   assert.equal(Value.Check(WorkerStateSchema, { ...worker(), unexpected: true }), false);
+  assert.equal(Value.Check(CoordinatorCheckoutSchema, checkout("checkout-a")), true);
+  assert.equal(
+    Value.Check(CoordinatorCheckoutSchema, { ...checkout("checkout-a"), unexpected: true }),
+    false,
+  );
 });
 
 void test("RecordStore creates one exact database lazily", () => {
@@ -104,7 +123,12 @@ void test("RecordStore creates one exact database lazily", () => {
     assert.equal(existsSync(store.path), false);
     assert.deepEqual(store.listTasks(0, 10), []);
     assert.deepEqual(store.unsettled(), []);
-    assert.deepEqual(store.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
+    assert.deepEqual(store.counts(), {
+      tasks: 0,
+      attempts: 0,
+      activeWorkers: 0,
+      coordinatorCheckouts: 0,
+    });
     assert.equal(existsSync(store.path), false);
 
     store.createTaskWithAttempt("task", directoryTask, "attempt-a", directorySpec);
@@ -121,14 +145,14 @@ void test("RecordStore creates one exact database lazily", () => {
 
     assert.equal(
       (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-      1,
+      2,
     );
     assert.deepEqual(
       database
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
         .all()
         .map((row) => (row as { name: string }).name),
-      ["attempts", "tasks"],
+      ["attempts", "coordinator_checkouts", "tasks"],
     );
     assert.deepEqual(
       database
@@ -136,6 +160,13 @@ void test("RecordStore creates one exact database lazily", () => {
         .all()
         .map((row) => (row as { name: string }).name),
       ["session_id", "task_id", "task_json"],
+    );
+    assert.deepEqual(
+      database
+        .prepare("PRAGMA table_info(coordinator_checkouts)")
+        .all()
+        .map((row) => (row as { name: string }).name),
+      ["checkout_id", "session_id", "common_dir", "checkout_json"],
     );
     assert.deepEqual(
       database
@@ -156,11 +187,14 @@ void test("RecordStore creates one exact database lazily", () => {
       database
         .prepare("PRAGMA table_list")
         .all()
-        .filter((row) => ["tasks", "attempts"].includes((row as { name: string }).name))
+        .filter((row) =>
+          ["tasks", "attempts", "coordinator_checkouts"].includes((row as { name: string }).name),
+        )
         .map((row) => [(row as { name: string }).name, (row as { strict: number }).strict])
         .sort(),
       [
         ["attempts", 1],
+        ["coordinator_checkouts", 1],
         ["tasks", 1],
       ],
     );
@@ -190,10 +224,65 @@ void test("session partitions share one file without sharing records or relation
     );
     assert.deepEqual(second.listAttempts(0, 10, "foreign-only"), []);
     assert.throws(() => second.createAttempt("same-task", "attempt-a", repositorySpec), StoreError);
-    assert.deepEqual(first.counts(), { tasks: 2, attempts: 2, activeWorkers: 0 });
-    assert.deepEqual(second.counts(), { tasks: 1, attempts: 1, activeWorkers: 0 });
+    assert.deepEqual(first.counts(), {
+      tasks: 2,
+      attempts: 2,
+      activeWorkers: 0,
+      coordinatorCheckouts: 0,
+    });
+    assert.deepEqual(second.counts(), {
+      tasks: 1,
+      attempts: 1,
+      activeWorkers: 0,
+      coordinatorCheckouts: 0,
+    });
     first.close();
     second.close();
+  } finally {
+    cleanup();
+  }
+});
+
+void test("Coordinator checkouts initialize v2 and remain strictly session isolated", () => {
+  const { root, cleanup } = fixture();
+
+  try {
+    const first = new RecordStore(root, "session-a");
+    const second = new RecordStore(root, "session-b");
+    const created = first.createCoordinatorCheckout(checkout("checkout-a"));
+
+    assert.equal(created.created, true);
+    assert.deepEqual(first.createCoordinatorCheckout(checkout("unused-id")), {
+      checkout: checkout("checkout-a"),
+      created: false,
+    });
+    assert.deepEqual(second.listCoordinatorCheckouts(0, 10), []);
+    second.createCoordinatorCheckout(checkout("checkout-b"));
+    assert.throws(() => second.readCoordinatorCheckout("checkout-a"), StoreError);
+    assert.deepEqual(first.counts(), {
+      tasks: 0,
+      attempts: 0,
+      activeWorkers: 0,
+      coordinatorCheckouts: 1,
+    });
+    assert.deepEqual(second.counts(), {
+      tasks: 0,
+      attempts: 0,
+      activeWorkers: 0,
+      coordinatorCheckouts: 1,
+    });
+    first.close();
+    second.close();
+
+    const database = new DatabaseSync(join(root, "workgraph", "workgraph.sqlite"));
+    database
+      .prepare("UPDATE coordinator_checkouts SET checkout_json=? WHERE checkout_id=?")
+      .run(JSON.stringify({ ...checkout("checkout-a"), unexpected: true }), "checkout-a");
+    database.close();
+
+    const restored = new RecordStore(root, "session-a");
+    assert.throws(() => restored.readCoordinatorCheckout("checkout-a"), StoreError);
+    restored.close();
   } finally {
     cleanup();
   }
@@ -274,7 +363,12 @@ void test("RecordStore resumes an interrupted empty initialization", () => {
     writeFileSync(path, "", { mode: 0o600 });
 
     const store = new RecordStore(root, "session-a");
-    assert.deepEqual(store.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
+    assert.deepEqual(store.counts(), {
+      tasks: 0,
+      attempts: 0,
+      activeWorkers: 0,
+      coordinatorCheckouts: 0,
+    });
     store.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec);
     assert.deepEqual(store.readTask("task"), { id: "task", task: directoryTask });
     store.close();
@@ -282,7 +376,7 @@ void test("RecordStore resumes an interrupted empty initialization", () => {
     const database = new DatabaseSync(path, { readOnly: true });
     assert.equal(
       (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
-      1,
+      2,
     );
     database.close();
   } finally {
@@ -548,7 +642,12 @@ void test("numeric rowid paging and settlement queries expose meaningful current
     store.recordOutcome("attempt-d", unreported);
     store.checkpointOutput("attempt-d", { kind: "no_output" });
 
-    assert.deepEqual(store.counts(), { tasks: 2, attempts: 4, activeWorkers: 1 });
+    assert.deepEqual(store.counts(), {
+      tasks: 2,
+      attempts: 4,
+      activeWorkers: 1,
+      coordinatorCheckouts: 0,
+    });
     assert.deepEqual(
       store.unsettled().map((record) => record.id),
       ["attempt-a", "attempt-c"],
@@ -557,7 +656,12 @@ void test("numeric rowid paging and settlement queries expose meaningful current
       "attempt-a",
       worker({ agent: "ready", closing: { kind: "settled" }, closed: true }),
     );
-    assert.deepEqual(store.counts(), { tasks: 2, attempts: 4, activeWorkers: 0 });
+    assert.deepEqual(store.counts(), {
+      tasks: 2,
+      attempts: 4,
+      activeWorkers: 0,
+      coordinatorCheckouts: 0,
+    });
     store.close();
   } finally {
     cleanup();
