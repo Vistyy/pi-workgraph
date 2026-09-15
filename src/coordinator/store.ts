@@ -332,8 +332,20 @@ export class RecordStore {
     });
   }
 
+  findCoordinatorCheckout(commonDir: string): CoordinatorCheckout | undefined {
+    const database = this.existingOrUndefined("find Coordinator checkout");
+
+    if (database === undefined) return undefined;
+
+    const row = database
+      .prepare("SELECT * FROM coordinator_checkouts WHERE session_id=? AND common_dir=?")
+      .get(this.sessionId, commonDir);
+
+    return row === undefined ? undefined : coordinatorCheckout(row);
+  }
+
   readCoordinatorCheckout(checkoutId: string): CoordinatorCheckout {
-    validateAttemptId(checkoutId);
+    decode(TaskIdSchema, checkoutId, "Coordinator checkout id");
     const database = this.requireExisting("read Coordinator checkout");
 
     const row = database

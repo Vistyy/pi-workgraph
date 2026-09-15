@@ -42,6 +42,13 @@ interface AttachedCheckoutState extends CheckoutState {
   readonly ref: string;
 }
 
+interface ApplicationCheckpoint {
+  readonly sourceTip: string;
+  readonly destinationRef: string;
+  readonly destinationHead: string;
+  readonly replanned?: true;
+}
+
 export type ResolvedTaskTarget =
   | { readonly target: Extract<TaskTarget, { kind: "directory" }> }
   | {
@@ -146,13 +153,10 @@ export function coordinatorPlacement(input: { agentDir: string; checkoutId: stri
   };
 }
 
-export function resolveCoordinatorTarget(
+export function resolveCoordinatorRepository(
   cwd: string,
   path?: string,
-): Effect.Effect<
-  { readonly target: RepositoryTarget; readonly commit: string; readonly destinationRef: string },
-  GitError
-> {
+): Effect.Effect<{ readonly target: RepositoryTarget; readonly commit: string }, GitError> {
   return Effect.gen(function* () {
     const resolved = yield* path === undefined
       ? resolveTaskTarget({ cwd, kind: "repository" })
@@ -160,16 +164,25 @@ export function resolveCoordinatorTarget(
 
     if (resolved.target.kind !== "repository" || !("commit" in resolved))
       return yield* fail("resolve Coordinator checkout", "Repository target resolution failed.");
-    const destination = yield* destinationState(resolved.target);
 
-    if (destination.dirty)
-      return yield* fail("resolve Coordinator checkout", "Destination checkout is dirty.");
+    return resolved;
+  });
+}
 
-    return {
-      target: resolved.target,
-      commit: resolved.commit,
-      destinationRef: destination.ref,
-    };
+export function validateCoordinatorDestination(input: {
+  readonly target: RepositoryTarget;
+  readonly commit: string;
+}): Effect.Effect<{ readonly destinationRef: string }, GitError> {
+  return Effect.gen(function* () {
+    const destination = yield* destinationState(input.target);
+
+    if (destination.head !== input.commit || destination.dirty)
+      return yield* fail(
+        "resolve Coordinator checkout",
+        "Destination checkout is dirty or changed.",
+      );
+
+    return { destinationRef: destination.ref };
   });
 }
 
@@ -241,6 +254,7 @@ export function inspectCoordinatorCheckout(checkout: CoordinatorCheckout): Effec
   {
     readonly head: string;
     readonly dirty: boolean;
+    readonly sourcePresent: boolean;
     readonly destinationHead: string;
     readonly destinationDirty: boolean;
   },
@@ -248,7 +262,15 @@ export function inspectCoordinatorCheckout(checkout: CoordinatorCheckout): Effec
 > {
   return Effect.gen(function* () {
     yield* revalidate(checkout.target);
-    const source = yield* coordinatorCheckoutState(checkout);
+
+    const removed =
+      (checkout.state.kind === "applied" || checkout.state.kind === "discarding") &&
+      checkout.state.worktreeRemoved === true;
+
+    const source = removed
+      ? yield* inspectRemovedCoordinatorSource(checkout, checkout.state.sourceTip)
+      : { ...(yield* coordinatorCheckoutState(checkout)), present: true as const };
+
     const destination = yield* destinationState(checkout.target);
 
     if (destination.ref !== checkout.destinationRef)
@@ -257,6 +279,7 @@ export function inspectCoordinatorCheckout(checkout: CoordinatorCheckout): Effec
     return {
       head: source.head,
       dirty: source.dirty,
+      sourcePresent: source.present,
       destinationHead: destination.head,
       destinationDirty: destination.dirty,
     };
@@ -338,7 +361,7 @@ function prepareCoordinatorApplicationRetry(
 
     if (
       destination.head === prior.destinationHead ||
-      (yield* isCoordinatorApplied(checkout.target.commonDir, prior, destination.head))
+      (yield* isAppliedStructure(checkout.target.commonDir, prior, destination.head))
     )
       return checkout;
 
@@ -364,6 +387,7 @@ export function applyCoordinatorCheckout(
   checkout: CoordinatorCheckout,
 ): Effect.Effect<CoordinatorCheckout, GitError> {
   return Effect.gen(function* () {
+    yield* revalidate(checkout.target);
     const prepared = checkout.state;
 
     if (prepared.kind !== "applying")
@@ -376,14 +400,29 @@ export function applyCoordinatorCheckout(
 
     if (destination.ref !== prepared.destinationRef || destination.dirty)
       return yield* fail("apply Coordinator checkout", "Destination changed after preparation.");
-    const revision = yield* coordinatorApplicationRevision(checkout, prepared, destination.head);
+
+    const revision = yield* preparedApplicationRevision({
+      commonDir: checkout.target.commonDir,
+      destinationPath: checkout.target.checkoutRoot,
+      checkpoint: prepared,
+      destinationHead: destination.head,
+      mergeMessage: `Integrate Coordinator checkout ${checkout.checkoutId}`,
+    });
+
+    yield* revalidate(checkout.target);
+
     const final = yield* destinationState(checkout.target);
+    const exactResult = yield* isAppliedStructure(checkout.target.commonDir, prepared, revision);
+
+    const noOp =
+      revision === prepared.destinationHead &&
+      (yield* ancestry(checkout.target.commonDir, prepared.sourceTip, revision));
 
     if (
       final.ref !== prepared.destinationRef ||
       final.head !== revision ||
       final.dirty ||
-      !(yield* isCoordinatorApplied(checkout.target.commonDir, prepared, revision))
+      (!exactResult && !noOp)
     )
       return yield* fail(
         "apply Coordinator checkout",
@@ -397,68 +436,28 @@ export function applyCoordinatorCheckout(
   });
 }
 
-function coordinatorApplicationRevision(
-  checkout: CoordinatorCheckout,
-  prepared: Extract<CoordinatorCheckout["state"], { kind: "applying" }>,
-  destinationHead: string,
-): Effect.Effect<string, GitError> {
-  return Effect.gen(function* () {
-    if (yield* isCoordinatorApplied(checkout.target.commonDir, prepared, destinationHead))
-      return destinationHead;
-
-    if (destinationHead !== prepared.destinationHead)
-      return yield* fail(
-        "apply Coordinator checkout",
-        "Destination changed after application preparation.",
-      );
-    let revision = prepared.sourceTip;
-
-    if (!(yield* ancestry(checkout.target.commonDir, destinationHead, prepared.sourceTip))) {
-      const tree = yield* proveMergeable(
-        checkout.target.commonDir,
-        destinationHead,
-        prepared.sourceTip,
-      );
-
-      revision = yield* gitDir(checkout.target.commonDir, [
-        "commit-tree",
-        tree,
-        "-p",
-        prepared.destinationHead,
-        "-p",
-        prepared.sourceTip,
-        "-m",
-        `Integrate Coordinator checkout ${checkout.checkoutId}`,
-      ]);
-    }
-
-    yield* mergeIntoDestination(checkout.target.checkoutRoot, revision);
-
-    return revision;
-  });
-}
-
-/** Remove only the exact applied managed worktree and owned branch. */
-export function cleanupCoordinatorCheckout(
+/** Remove only the exact clean worktree after application is durably established. */
+export function removeAppliedCoordinatorWorktree(
   checkout: CoordinatorCheckout,
 ): Effect.Effect<void, GitError> {
-  if (checkout.state.kind !== "applied")
-    return fail("cleanup Coordinator checkout", "Application success is not checkpointed.");
+  if (checkout.state.kind !== "applied" || checkout.state.worktreeRemoved === true)
+    return fail("cleanup Coordinator checkout", "Applied worktree removal is not pending.");
   const applied = checkout.state;
 
   return Effect.gen(function* () {
+    yield* revalidate(checkout.target);
     const destination = yield* destinationState(checkout.target);
 
     if (
       destination.ref !== checkout.destinationRef ||
-      destination.head !== applied.revision ||
-      destination.dirty
+      destination.dirty ||
+      !(yield* ancestry(checkout.target.commonDir, applied.revision, destination.head))
     )
       return yield* fail(
         "cleanup Coordinator checkout",
-        "Applied destination no longer has the exact checkpointed state.",
+        "Applied destination no longer contains the checkpointed result.",
       );
-    yield* releaseCoordinatorResources(checkout, applied.sourceTip, false);
+    yield* removeCoordinatorWorktree(checkout, applied.sourceTip, false);
   });
 }
 
@@ -482,32 +481,64 @@ export function prepareCoordinatorDiscard(
   );
 }
 
-/** Destructively release exact checkpointed source bytes and branch, preserving mismatches. */
-export function discardCoordinatorCheckout(
+/** Destructively remove exact checkpointed source bytes while preserving mismatches. */
+export function removeDiscardedCoordinatorWorktree(
   checkout: CoordinatorCheckout,
 ): Effect.Effect<void, GitError> {
-  if (checkout.state.kind !== "discarding")
-    return fail("discard Coordinator checkout", "Discard is not checkpointed.");
+  if (checkout.state.kind !== "discarding" || checkout.state.worktreeRemoved === true)
+    return fail("discard Coordinator checkout", "Discard worktree removal is not pending.");
 
-  return releaseCoordinatorResources(checkout, checkout.state.sourceTip, true);
+  return removeCoordinatorWorktree(checkout, checkout.state.sourceTip, true);
 }
 
-function releaseCoordinatorResources(
+/** Delete the exact owned branch only after worktree absence has a durable checkpoint. */
+export function removeCoordinatorBranch(
+  checkout: CoordinatorCheckout,
+): Effect.Effect<void, GitError> {
+  const state = checkout.state;
+
+  if ((state.kind !== "applied" && state.kind !== "discarding") || state.worktreeRemoved !== true)
+    return fail("release Coordinator checkout", "Worktree removal is not checkpointed.");
+
+  return Effect.gen(function* () {
+    yield* revalidate(checkout.target);
+    const registered = yield* registeredWorktree(checkout.target.commonDir, checkout.managedPath);
+    const exists = yield* pathExists(checkout.managedPath);
+
+    if (registered !== undefined || exists)
+      return yield* fail(
+        "release Coordinator checkout",
+        "Managed worktree remains after its removal checkpoint.",
+      );
+    const branch = yield* readRef(checkout.target.commonDir, checkout.branchRef);
+
+    if (branch === undefined) return;
+
+    if (branch !== state.sourceTip)
+      return yield* fail(
+        "release Coordinator checkout",
+        "Owned branch was repointed; nothing was deleted.",
+      );
+    yield* deleteExactRef(checkout.target.commonDir, checkout.branchRef, state.sourceTip);
+  });
+}
+
+function removeCoordinatorWorktree(
   checkout: CoordinatorCheckout,
   tip: string,
   destructive: boolean,
 ): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(checkout.target);
-    const placement = yield* coordinatorReleasePlacement(checkout, tip);
+    const registered = yield* registeredWorktree(checkout.target.commonDir, checkout.managedPath);
+    const exists = yield* pathExists(checkout.managedPath);
+    const branch = yield* readRef(checkout.target.commonDir, checkout.branchRef);
 
-    if (placement === "branch-only") {
-      yield* deleteExactRef(checkout.target.commonDir, checkout.branchRef, tip);
-
-      return;
-    }
-
-    if (placement === "absent") return;
+    if (registered === undefined || !exists || branch !== tip)
+      return yield* fail(
+        "release Coordinator checkout",
+        "Coordinator checkout resources are foreign, moved, or incomplete.",
+      );
     const source = yield* coordinatorCheckoutState(checkout);
 
     if (source.head !== tip)
@@ -515,7 +546,6 @@ function releaseCoordinatorResources(
         "release Coordinator checkout",
         "Managed checkout HEAD differs from its checkpoint.",
       );
-
     yield* cleanCoordinatorSource(checkout, source, tip, destructive);
     yield* git(
       checkout.target.checkoutRoot,
@@ -531,37 +561,28 @@ function releaseCoordinatorResources(
         "release Coordinator checkout",
         "Managed checkout removal could not be established.",
       );
-    yield* deleteExactRef(checkout.target.commonDir, checkout.branchRef, tip);
   });
 }
 
-function coordinatorReleasePlacement(
+function inspectRemovedCoordinatorSource(
   checkout: CoordinatorCheckout,
   tip: string,
-): Effect.Effect<"absent" | "branch-only" | "present", GitError> {
+): Effect.Effect<
+  { readonly head: string; readonly dirty: false; readonly present: false },
+  GitError
+> {
   return Effect.gen(function* () {
     const registered = yield* registeredWorktree(checkout.target.commonDir, checkout.managedPath);
     const exists = yield* pathExists(checkout.managedPath);
     const branch = yield* readRef(checkout.target.commonDir, checkout.branchRef);
 
-    if (registered === undefined && !exists) {
-      if (branch === undefined) return "absent";
-
-      if (branch === tip) return "branch-only";
-
+    if (registered !== undefined || exists || (branch !== undefined && branch !== tip))
       return yield* fail(
-        "release Coordinator checkout",
-        "Owned branch was repointed; nothing was deleted.",
-      );
-    }
-
-    if (registered === undefined || !exists || branch !== tip)
-      return yield* fail(
-        "release Coordinator checkout",
-        "Coordinator checkout resources are foreign, moved, or incomplete.",
+        "inspect Coordinator checkout",
+        "Resources do not match the checkpointed worktree removal.",
       );
 
-    return "present";
+    return { head: tip, dirty: false as const, present: false as const };
   });
 }
 
@@ -633,32 +654,6 @@ function coordinatorCheckoutState(
       ),
       dirty: yield* destinationDirty(checkout.managedPath),
     };
-  });
-}
-
-function isCoordinatorApplied(
-  commonDir: string,
-  state: Extract<CoordinatorCheckout["state"], { kind: "applying" }>,
-  revision: string,
-): Effect.Effect<boolean, GitError> {
-  return Effect.gen(function* () {
-    if (
-      revision === state.sourceTip &&
-      (yield* ancestry(commonDir, state.destinationHead, revision))
-    )
-      return true;
-    const parentsText = yield* gitDir(commonDir, ["show", "-s", "--format=%P", revision], true);
-    const parents = parentsText.length === 0 ? [] : parentsText.split(" ");
-
-    if (
-      parents.length !== 2 ||
-      parents[0] !== state.destinationHead ||
-      parents[1] !== state.sourceTip
-    )
-      return false;
-    const tree = yield* proveMergeable(commonDir, state.destinationHead, state.sourceTip);
-
-    return (yield* gitDir(commonDir, ["show", "-s", "--format=%T", revision])) === tree;
   });
 }
 
@@ -931,34 +926,58 @@ function applicationRevision(
   output: Extract<AttemptOutput, { kind: "applying" }>,
   head: string,
 ): Effect.Effect<string, GitError> {
-  return Effect.gen(function* () {
-    if (yield* isAppliedStructure(operation.target.commonDir, output, head)) return head;
+  return preparedApplicationRevision({
+    commonDir: operation.target.commonDir,
+    destinationPath: operation.target.checkoutRoot,
+    checkpoint: output,
+    destinationHead: head,
+    mergeMessage: `Integrate Workgraph output ${operation.attemptId}`,
+  });
+}
 
-    if (head !== output.destinationHead)
+function preparedApplicationRevision(input: {
+  readonly commonDir: string;
+  readonly destinationPath: string;
+  readonly checkpoint: ApplicationCheckpoint;
+  readonly destinationHead: string;
+  readonly mergeMessage: string;
+}): Effect.Effect<string, GitError> {
+  return Effect.gen(function* () {
+    const { checkpoint } = input;
+
+    if (yield* isAppliedStructure(input.commonDir, checkpoint, input.destinationHead))
+      return input.destinationHead;
+
+    if (input.destinationHead !== checkpoint.destinationHead)
       return yield* fail("apply output", "Destination changed after application preparation.");
 
-    if (yield* ancestry(operation.target.commonDir, output.sourceTip, head)) return head;
+    if (yield* ancestry(input.commonDir, checkpoint.sourceTip, input.destinationHead))
+      return input.destinationHead;
 
-    if (yield* ancestry(operation.target.commonDir, head, output.sourceTip)) {
-      yield* mergeIntoDestination(operation.target.checkoutRoot, output.sourceTip);
+    if (yield* ancestry(input.commonDir, input.destinationHead, checkpoint.sourceTip)) {
+      yield* mergeIntoDestination(input.destinationPath, checkpoint.sourceTip);
 
-      return output.sourceTip;
+      return checkpoint.sourceTip;
     }
 
-    const tree = yield* proveMergeable(operation.target.commonDir, head, output.sourceTip);
+    const tree = yield* proveMergeable(
+      input.commonDir,
+      input.destinationHead,
+      checkpoint.sourceTip,
+    );
 
-    const merge = yield* gitDir(operation.target.commonDir, [
+    const merge = yield* gitDir(input.commonDir, [
       "commit-tree",
       tree,
       "-p",
-      head,
+      input.destinationHead,
       "-p",
-      output.sourceTip,
+      checkpoint.sourceTip,
       "-m",
-      `Integrate Workgraph output ${operation.attemptId}`,
+      input.mergeMessage,
     ]);
 
-    yield* mergeIntoDestination(operation.target.checkoutRoot, merge);
+    yield* mergeIntoDestination(input.destinationPath, merge);
 
     return merge;
   });
@@ -1122,7 +1141,7 @@ function destinationState(
 
 function isAppliedStructure(
   commonDir: string,
-  output: Extract<AttemptOutput, { kind: "applying" }>,
+  output: ApplicationCheckpoint,
   revision: string,
 ): Effect.Effect<boolean, GitError> {
   return Effect.gen(function* () {

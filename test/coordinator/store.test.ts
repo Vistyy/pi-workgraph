@@ -417,6 +417,61 @@ void test("RecordStore preserves and rejects a nonempty version-zero database", 
   }
 });
 
+void test("RecordStore preserves and rejects the unsupported version-one schema", () => {
+  const { root, cleanup } = fixture();
+
+  try {
+    const parent = join(root, "workgraph");
+    const path = join(parent, "workgraph.sqlite");
+    mkdirSync(parent, { mode: 0o700 });
+    const database = new DatabaseSync(path);
+    database.exec("CREATE TABLE legacy(value TEXT) STRICT; PRAGMA user_version=1;");
+    database.close();
+
+    const store = new RecordStore(root, "session-a");
+    assert.throws(() => store.counts(), StoreError);
+    store.close();
+
+    const preserved = new DatabaseSync(path, { readOnly: true });
+    assert.equal(
+      (preserved.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
+      1,
+    );
+    assert.deepEqual(
+      preserved
+        .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
+        .all()
+        .map((row) => (row as { name: string }).name),
+      ["legacy"],
+    );
+    preserved.close();
+  } finally {
+    cleanup();
+  }
+});
+
+void test("Coordinator checkout reads reject mismatched relational identity", () => {
+  const { root, cleanup } = fixture();
+
+  try {
+    const store = new RecordStore(root, "session-a");
+    store.createCoordinatorCheckout(checkout("checkout-a"));
+    store.close();
+
+    const database = new DatabaseSync(join(root, "workgraph", "workgraph.sqlite"));
+    database
+      .prepare("UPDATE coordinator_checkouts SET common_dir=? WHERE checkout_id=?")
+      .run("/tmp/foreign/.git", "checkout-a");
+    database.close();
+
+    const restored = new RecordStore(root, "session-a");
+    assert.throws(() => restored.readCoordinatorCheckout("checkout-a"), StoreError);
+    restored.close();
+  } finally {
+    cleanup();
+  }
+});
+
 void test("supported reads strictly decode persisted JSON rows", () => {
   const { root, cleanup } = fixture();
 
