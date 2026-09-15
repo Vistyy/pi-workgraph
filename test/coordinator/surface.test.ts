@@ -6,56 +6,10 @@ import { join } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
-import type { CheckoutFacts } from "../../src/coordinator/checkouts.js";
 import { RecordStore } from "../../src/coordinator/store.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
-import {
-  applyCoordinatorCheckout,
-  prepareCoordinatorApplication,
-  prepareCoordinatorDiscard,
-  removeAppliedCoordinatorWorktree,
-  removeDiscardedCoordinatorWorktree,
-} from "../../src/repository.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../support/decoders.js";
-import { extensionFixture, git, persistentSession } from "../support/helpers.js";
-
-type CreatedCheckoutFacts = CheckoutFacts & {
-  readonly created: boolean;
-  readonly reused: boolean;
-};
-
-// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Pi tool details are external until decoded by the registered tool contract.
-function createdCheckout(details: unknown): CreatedCheckoutFacts {
-  // SAFETY: All callers pass details returned by a successful checkout create action.
-  return details as CreatedCheckoutFacts;
-}
-
-type JsonSchemaNode = {
-  readonly description?: string;
-  readonly properties?: Readonly<Record<string, JsonSchemaNode>>;
-  readonly anyOf?: readonly JsonSchemaNode[];
-  readonly items?: JsonSchemaNode;
-};
-
-function undocumentedParameters(schema: JsonSchemaNode, path = "parameters"): string[] {
-  const missing: string[] = [];
-
-  for (const [name, property] of Object.entries(schema.properties ?? {})) {
-    const propertyPath = `${path}.${name}`;
-
-    if (property.description === undefined || property.description.trim() === "")
-      missing.push(propertyPath);
-    missing.push(...undocumentedParameters(property, propertyPath));
-  }
-
-  for (const [index, variant] of (schema.anyOf ?? []).entries())
-    missing.push(...undocumentedParameters(variant, `${path}.anyOf[${index}]`));
-
-  if (schema.items !== undefined)
-    missing.push(...undocumentedParameters(schema.items, `${path}.items`));
-
-  return missing;
-}
+import { extensionFixture, git } from "../support/helpers.js";
 
 const accepted = [
   "workgraph_models",
@@ -109,28 +63,25 @@ async function fixture(
   };
 }
 
-void test("coordinator registers the exact strict tool surface", async () => {
+void test("coordinator registers exactly nine strict tools", async () => {
   const f = await fixture(false);
 
   try {
-    const tools = f.runner
+    const registered = f.runner
       .getAllRegisteredTools()
-      .filter((tool) => tool.definition.name.startsWith("workgraph_"));
-
-    const registered = tools.map((tool) => tool.definition.name).sort();
+      .map((tool) => tool.definition.name)
+      .filter((name) => name.startsWith("workgraph_"))
+      .sort();
 
     assert.deepEqual(registered, [...accepted].sort());
-
-    for (const tool of tools) {
-      // SAFETY: Pi's registered TypeBox parameters serialize as this bounded JSON Schema shape.
-      const schema = tool.definition.parameters as JsonSchemaNode;
-
-      assert.deepEqual(
-        undocumentedParameters(schema),
-        [],
-        `${tool.definition.name} describes every registered parameter`,
-      );
-    }
+    const checkout = f.runner.getToolDefinition("workgraph_checkout");
+    assert.ok(checkout !== undefined);
+    assert.equal(Value.Check(checkout.parameters, {}), true);
+    assert.equal(Value.Check(checkout.parameters, { cwd: "." }), true);
+    assert.equal(Value.Check(checkout.parameters, { cwd: " " }), false);
+    assert.equal(Value.Check(checkout.parameters, { action: "create" }), false);
+    assert.equal(Value.Check(checkout.parameters, { checkoutId: "old" }), false);
+    assert.match(JSON.stringify(checkout.parameters), /defaults to the session cwd/);
 
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
@@ -165,21 +116,6 @@ void test("coordinator registers the exact strict tool surface", async () => {
       Value.Check(control.parameters, { action: "discard_output", attemptId: "a", reason: "old" }),
       true,
     );
-    const checkout = f.runner.getToolDefinition("workgraph_checkout");
-    assert.ok(checkout !== undefined);
-    assert.equal(Value.Check(checkout.parameters, { action: "create", cwd: "." }), true);
-    assert.match(
-      JSON.stringify(checkout.parameters),
-      /Create or reuse this repository's checkout from committed HEAD/,
-    );
-    assert.equal(
-      Value.Check(checkout.parameters, { action: "discard", checkoutId: "a", reason: " " }),
-      false,
-    );
-    assert.equal(
-      Value.Check(checkout.parameters, { action: "inspect", checkoutId: "a", extra: true }),
-      false,
-    );
 
     const guidance = (
       await readFile(new URL("../../COORDINATOR.md", import.meta.url), "utf8")
@@ -197,502 +133,6 @@ void test("coordinator registers the exact strict tool surface", async () => {
       `Base coordinator prompt\n\n${guidance}`,
       "the loaded coordinator extension injects the packaged guidance",
     );
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("checkout create reuses one session placement and isolates another session", async () => {
-  const f = await fixture(false);
-  const otherSession = persistentSession(f.root, join(f.parent, "other-sessions"));
-  const other = await extensionFixture("coordinator", f.root, f.parent, {}, [], otherSession);
-
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    await other.runner.emit({ type: "session_start", reason: "startup" });
-    const destinationHead = await git(f.root, "rev-parse", "HEAD");
-
-    await writeFile(join(f.root, "file.txt"), "dirty tracked destination bytes\n");
-    await writeFile(join(f.root, "destination-dirty.txt"), "dirty untracked destination bytes\n");
-
-    const destinationStatus = await git(
-      f.root,
-      "status",
-      "--porcelain=v1",
-      "--untracked-files=all",
-    );
-
-    const first = await f.call("workgraph_checkout", { action: "create" });
-    const repeated = await f.call("workgraph_checkout", { action: "create", cwd: "." });
-    const second = await other.call("workgraph_checkout", { action: "create" });
-    const dirtyDestinationReuse = await f.call("workgraph_checkout", { action: "create" });
-
-    const firstFacts = createdCheckout(first.details);
-    const repeatedFacts = createdCheckout(repeated.details);
-    const dirtyReuseFacts = createdCheckout(dirtyDestinationReuse.details);
-    const secondFacts = createdCheckout(second.details);
-
-    assert.equal(firstFacts.created, true);
-    assert.equal(firstFacts.lifecycle, "ready");
-    assert.equal(firstFacts.destinationDirty, true);
-    assert.equal(firstFacts.baseCommit, destinationHead);
-    assert.equal(await readFile(join(firstFacts.managedPath, "file.txt"), "utf8"), "base\n");
-    assert.equal(existsSync(join(firstFacts.managedPath, "destination-dirty.txt")), false);
-    assert.equal(
-      await readFile(join(f.root, "file.txt"), "utf8"),
-      "dirty tracked destination bytes\n",
-    );
-    assert.equal(
-      await readFile(join(f.root, "destination-dirty.txt"), "utf8"),
-      "dirty untracked destination bytes\n",
-    );
-    assert.equal(
-      await git(f.root, "status", "--porcelain=v1", "--untracked-files=all"),
-      destinationStatus,
-    );
-    assert.equal(repeatedFacts.checkoutId, firstFacts.checkoutId);
-    assert.equal(repeatedFacts.managedPath, firstFacts.managedPath);
-    assert.equal(repeatedFacts.reused, true);
-    assert.equal(dirtyReuseFacts.checkoutId, firstFacts.checkoutId);
-    assert.equal(dirtyReuseFacts.destinationDirty, true);
-    assert.notEqual(secondFacts.checkoutId, firstFacts.checkoutId);
-    assert.notEqual(secondFacts.managedPath, firstFacts.managedPath);
-    assert.notEqual(secondFacts.ownedBranch, firstFacts.ownedBranch);
-    assert.equal(existsSync(firstFacts.managedPath), true);
-    assert.equal(existsSync(secondFacts.managedPath), true);
-    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
-    assert.equal(existsSync(firstFacts.managedPath), true);
-    assert.equal((await git(f.root, "show-ref", "--verify", firstFacts.ownedBranch)) !== "", true);
-    await f.runner.emit({ type: "session_start", reason: "resume" });
-
-    const resumed = await f.call("workgraph_checkout", {
-      action: "inspect",
-      checkoutId: firstFacts.checkoutId,
-    });
-
-    // SAFETY: Inspect returns the exact recorded checkout lifecycle.
-    assert.equal((resumed.details as { lifecycle: string }).lifecycle, "ready");
-
-    const listed = await f.call("workgraph_checkout", { action: "list", limit: 10 });
-    // SAFETY: List returns the exact session's verified checkout projections.
-    assert.deepEqual(
-      (listed.details as { checkouts: Array<{ checkoutId: string }> }).checkouts.map(
-        (entry) => entry.checkoutId,
-      ),
-      [firstFacts.checkoutId],
-    );
-    await f.call("workgraph_checkout", {
-      action: "discard",
-      checkoutId: firstFacts.checkoutId,
-      reason: "Fixture cleanup",
-    });
-    await other.call("workgraph_checkout", {
-      action: "discard",
-      checkoutId: secondFacts.checkoutId,
-      reason: "Fixture cleanup",
-    });
-  } finally {
-    await other.close();
-    await f.dispose();
-  }
-});
-
-void test("checkout applies committed direct work after destination advancement", async () => {
-  const f = await fixture(false);
-
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    const created = await f.call("workgraph_checkout", { action: "create" });
-
-    const facts = createdCheckout(created.details);
-
-    await writeFile(join(f.root, ".git", "info", "exclude"), "ignored.bin\n");
-    await writeFile(join(facts.managedPath, "ignored.bin"), "allowed ignored artifact\n");
-    await writeFile(join(facts.managedPath, "direct.txt"), "coordinator\n");
-    await git(facts.managedPath, "add", "direct.txt");
-    await git(facts.managedPath, "commit", "-m", "direct work");
-    await writeFile(join(f.root, "destination.txt"), "advanced\n");
-    await git(f.root, "add", "destination.txt");
-    await git(f.root, "commit", "-m", "destination advancement");
-
-    const applied = await f.call("workgraph_checkout", {
-      action: "apply",
-      checkoutId: facts.checkoutId,
-    });
-
-    // SAFETY: Apply returns the established destination revision and release status.
-    const appliedFacts = applied.details as {
-      lifecycle: string;
-      revision: string;
-      released: boolean;
-    };
-
-    assert.equal(appliedFacts.lifecycle, "applied");
-    assert.equal(appliedFacts.released, true);
-    assert.equal(await git(f.root, "rev-parse", "HEAD"), appliedFacts.revision);
-    assert.equal(await readFile(join(f.root, "direct.txt"), "utf8"), "coordinator\n");
-    assert.equal(await readFile(join(f.root, "destination.txt"), "utf8"), "advanced\n");
-    assert.equal(existsSync(facts.managedPath), false);
-    await assert.rejects(git(f.root, "show-ref", "--verify", facts.ownedBranch));
-    const overview = await f.call("workgraph_inspect", { section: "overview" });
-
-    // SAFETY: Overview returns the strict session-local counts projection.
-    assert.equal(
-      (overview.details as { counts: { coordinatorCheckouts: number } }).counts
-        .coordinatorCheckouts,
-      0,
-    );
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("apply resumes after uncertain integration and worktree-removal responses", async () => {
-  const f = await fixture(false);
-
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    const created = await f.call("workgraph_checkout", { action: "create" });
-
-    const facts = createdCheckout(created.details);
-
-    await writeFile(join(facts.managedPath, "resumed.txt"), "resumed apply\n");
-    await git(facts.managedPath, "add", "resumed.txt");
-    await git(facts.managedPath, "commit", "-m", "resumed apply");
-
-    const store = new RecordStore(f.agentDir, f.session.getSessionId());
-    let checkout = store.readCoordinatorCheckout(facts.checkoutId);
-
-    checkout = await Effect.runPromise(prepareCoordinatorApplication(checkout));
-    checkout = store.checkpointCoordinatorCheckout(checkout);
-    const uncertainApplied = await Effect.runPromise(applyCoordinatorCheckout(checkout));
-
-    assert.equal(uncertainApplied.state.kind, "applied");
-    checkout = store.readCoordinatorCheckout(facts.checkoutId);
-    checkout = await Effect.runPromise(prepareCoordinatorApplication(checkout));
-    checkout = store.checkpointCoordinatorCheckout(checkout);
-    checkout = await Effect.runPromise(applyCoordinatorCheckout(checkout));
-    checkout = store.checkpointCoordinatorCheckout(checkout);
-
-    if (checkout.state.kind !== "applied") throw new Error("Apply checkpoint was not retained.");
-    checkout = store.checkpointCoordinatorCheckout({
-      ...checkout,
-      state: { ...checkout.state, worktreeRemoval: "requested" },
-    });
-    await Effect.runPromise(removeAppliedCoordinatorWorktree(checkout));
-    store.close();
-
-    const applied = await f.call("workgraph_checkout", {
-      action: "apply",
-      checkoutId: facts.checkoutId,
-    });
-
-    // SAFETY: Apply reports the exact recovered revision and release result.
-    const appliedFacts = applied.details as { revision: string; released: boolean };
-
-    assert.equal(appliedFacts.released, true);
-    assert.equal(await readFile(join(f.root, "resumed.txt"), "utf8"), "resumed apply\n");
-    assert.equal(existsSync(facts.managedPath), false);
-    await assert.rejects(git(f.root, "show-ref", "--verify", facts.ownedBranch));
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("implementation Candidate converges through the Coordinator checkout before final apply", async () => {
-  const f = await fixture(false);
-
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    const created = await f.call("workgraph_checkout", { action: "create" });
-
-    const facts = createdCheckout(created.details);
-
-    const attemptId = "attempt-checkout-candidate";
-    const outputRef = `refs/pi-workgraph/outputs/${attemptId}`;
-    const workerPath = join(f.parent, "candidate-worktree");
-
-    await git(f.root, "worktree", "add", "--detach", workerPath, facts.baseCommit);
-    await writeFile(join(workerPath, "candidate.txt"), "worker candidate\n");
-    await git(workerPath, "add", "candidate.txt");
-    await git(workerPath, "commit", "-m", "worker candidate");
-
-    const candidateTip = await git(workerPath, "rev-parse", "HEAD");
-    await git(f.root, "worktree", "remove", workerPath);
-    await git(f.root, "update-ref", outputRef, candidateTip);
-
-    const store = new RecordStore(f.agentDir, f.session.getSessionId());
-
-    const task = {
-      target: {
-        kind: "repository",
-        checkoutRoot: facts.managedPath,
-        commonDir: await git(
-          facts.managedPath,
-          "rev-parse",
-          "--path-format=absolute",
-          "--git-common-dir",
-        ),
-      },
-      contract: {
-        kind: "implementation",
-        objective: "Produce a Candidate in the Coordinator checkout.",
-        acceptance: ["Candidate reaches the Coordinator checkout first."],
-      },
-    } satisfies Task;
-
-    const spec = {
-      selection: {
-        kind: "implementation",
-        guide: { model: "fixture/guide", thinking: "high" },
-        executor: { model: "fixture/executor", thinking: "high" },
-      },
-      base: { kind: "repository", baseCommit: facts.baseCommit },
-    } satisfies AttemptSpec;
-
-    store.createTaskWithAttempt("checkout-candidate", task, attemptId, spec);
-    store.recordOutcome(attemptId, {
-      result: {
-        kind: "reported",
-        report: {
-          kind: "implementation",
-          status: "completed",
-          outcome: "changed",
-          summary: "Produced the Candidate.",
-          evidence: [],
-          findings: [],
-        },
-      },
-      effectiveModels: [],
-    });
-    store.checkpointOutput(attemptId, {
-      kind: "retained",
-      tip: candidateTip,
-      reason: "Committed implementation output",
-    });
-    store.close();
-
-    await f.call("workgraph_control", { action: "apply", attemptId });
-    assert.equal(
-      await readFile(join(facts.managedPath, "candidate.txt"), "utf8"),
-      "worker candidate\n",
-    );
-    assert.equal(existsSync(join(f.root, "candidate.txt")), false);
-
-    await f.call("workgraph_checkout", { action: "apply", checkoutId: facts.checkoutId });
-    assert.equal(await readFile(join(f.root, "candidate.txt"), "utf8"), "worker candidate\n");
-    assert.equal(existsSync(facts.managedPath), false);
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("unchanged checkout applies as a no-op after destination advancement", async () => {
-  const f = await fixture(false);
-
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    const created = await f.call("workgraph_checkout", { action: "create" });
-
-    const facts = createdCheckout(created.details);
-
-    await writeFile(join(f.root, "destination.txt"), "advanced\n");
-    await git(f.root, "add", "destination.txt");
-    await git(f.root, "commit", "-m", "destination advancement");
-
-    const destinationHead = await git(f.root, "rev-parse", "HEAD");
-
-    const applied = await f.call("workgraph_checkout", {
-      action: "apply",
-      checkoutId: facts.checkoutId,
-    });
-
-    // SAFETY: Apply returns the established destination revision and release status.
-    const appliedFacts = applied.details as { revision: string; released: boolean };
-
-    assert.equal(appliedFacts.revision, destinationHead);
-    assert.equal(await git(f.root, "rev-parse", "HEAD"), destinationHead);
-    assert.equal(appliedFacts.released, true);
-    assert.equal(existsSync(facts.managedPath), false);
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("pre-request external removal blocks both dispositions and preserves branches", async () => {
-  for (const mode of ["apply", "discard"] as const) {
-    const f = await fixture(false);
-
-    try {
-      await f.runner.emit({ type: "session_start", reason: "startup" });
-      const created = await f.call("workgraph_checkout", { action: "create" });
-      const facts = createdCheckout(created.details);
-
-      if (mode === "apply") {
-        await writeFile(join(facts.managedPath, "applied.txt"), "applied before release\n");
-        await git(facts.managedPath, "add", "applied.txt");
-        await git(facts.managedPath, "commit", "-m", "applied before release");
-      }
-
-      const store = new RecordStore(f.agentDir, f.session.getSessionId());
-      let checkout = store.readCoordinatorCheckout(facts.checkoutId);
-
-      if (mode === "apply") {
-        checkout = await Effect.runPromise(prepareCoordinatorApplication(checkout));
-        checkout = store.checkpointCoordinatorCheckout(checkout);
-        checkout = await Effect.runPromise(applyCoordinatorCheckout(checkout));
-      } else checkout = await Effect.runPromise(prepareCoordinatorDiscard(checkout, "Discard"));
-      checkout = store.checkpointCoordinatorCheckout(checkout);
-      store.close();
-
-      await git(f.root, "worktree", "remove", "--force", facts.managedPath);
-      await assert.rejects(
-        f.call(
-          "workgraph_checkout",
-          mode === "apply"
-            ? { action: "apply", checkoutId: facts.checkoutId }
-            : { action: "discard", checkoutId: facts.checkoutId, reason: "Discard" },
-        ),
-        /exact registered worktree/,
-      );
-      assert.equal((await git(f.root, "show-ref", "--verify", facts.ownedBranch)) !== "", true);
-
-      const preserved = new RecordStore(f.agentDir, f.session.getSessionId());
-      const state = preserved.readCoordinatorCheckout(facts.checkoutId).state;
-
-      assert.equal(state.kind, mode === "apply" ? "applied" : "discarding");
-      assert.equal("worktreeRemoval" in state, false);
-      preserved.close();
-    } finally {
-      await f.dispose();
-    }
-  }
-});
-
-void test("externally missing worktree blocks release and preserves the owned branch", async () => {
-  const f = await fixture(false);
-
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    const created = await f.call("workgraph_checkout", { action: "create" });
-    const facts = createdCheckout(created.details);
-
-    await git(f.root, "worktree", "remove", "--force", facts.managedPath);
-    await assert.rejects(
-      f.call("workgraph_checkout", {
-        action: "discard",
-        checkoutId: facts.checkoutId,
-        reason: "Must not infer ownership",
-      }),
-      /exact registered worktree/,
-    );
-    assert.equal((await git(f.root, "show-ref", "--verify", facts.ownedBranch)) !== "", true);
-
-    const store = new RecordStore(f.agentDir, f.session.getSessionId());
-
-    assert.equal(store.readCoordinatorCheckout(facts.checkoutId).state.kind, "ready");
-    store.close();
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("discard resumes after worktree removal succeeds without confirmation", async () => {
-  const f = await fixture(false);
-
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    const created = await f.call("workgraph_checkout", { action: "create" });
-    const facts = createdCheckout(created.details);
-
-    const store = new RecordStore(f.agentDir, f.session.getSessionId());
-    let checkout = store.readCoordinatorCheckout(facts.checkoutId);
-
-    checkout = await Effect.runPromise(prepareCoordinatorDiscard(checkout, "Persisted reason"));
-    checkout = store.checkpointCoordinatorCheckout(checkout);
-
-    if (checkout.state.kind !== "discarding")
-      throw new Error("Discard checkpoint was not retained.");
-    checkout = store.checkpointCoordinatorCheckout({
-      ...checkout,
-      state: { ...checkout.state, worktreeRemoval: "requested" },
-    });
-    await Effect.runPromise(removeDiscardedCoordinatorWorktree(checkout));
-    store.close();
-
-    const discarded = await f.call("workgraph_checkout", {
-      action: "discard",
-      checkoutId: facts.checkoutId,
-      reason: "Replacement reason",
-    });
-
-    // SAFETY: Discard reports the exact persisted disposition and release result.
-    const discardedFacts = discarded.details as {
-      reason: string;
-      released: boolean;
-    };
-
-    assert.equal(discardedFacts.reason, "Persisted reason");
-    assert.equal(discardedFacts.released, true);
-    assert.equal(existsSync(facts.managedPath), false);
-    await assert.rejects(git(f.root, "show-ref", "--verify", facts.ownedBranch));
-  } finally {
-    await f.dispose();
-  }
-});
-
-void test("checkout refuses dirty apply, discards dirty bytes, and preserves foreign placement", async () => {
-  const f = await fixture(false);
-
-  try {
-    await f.runner.emit({ type: "session_start", reason: "startup" });
-    const dirtyCreated = await f.call("workgraph_checkout", { action: "create" });
-
-    const dirty = createdCheckout(dirtyCreated.details);
-
-    await writeFile(join(f.root, ".git", "info", "exclude"), "ignored.bin\n");
-    await writeFile(join(dirty.managedPath, "file.txt"), "dirty\n");
-    await writeFile(join(dirty.managedPath, "untracked.txt"), "untracked\n");
-    await writeFile(join(dirty.managedPath, "ignored.bin"), "ignored\n");
-    await assert.rejects(
-      f.call("workgraph_checkout", { action: "apply", checkoutId: dirty.checkoutId }),
-      /Managed checkout is dirty/,
-    );
-    await f.call("workgraph_checkout", {
-      action: "discard",
-      checkoutId: dirty.checkoutId,
-      reason: "Abandon direct scratch",
-    });
-    assert.equal(existsSync(dirty.managedPath), false);
-    await assert.rejects(git(f.root, "show-ref", "--verify", dirty.ownedBranch));
-
-    const foreignCreated = await f.call("workgraph_checkout", { action: "create" });
-    const foreign = createdCheckout(foreignCreated.details);
-
-    await git(foreign.managedPath, "switch", "-c", "foreign-branch");
-    const listed = await f.call("workgraph_checkout", { action: "list" });
-
-    // SAFETY: List identifies each blocked durable record without failing enumeration.
-    const blocked = (
-      listed.details as { checkouts: Array<{ checkoutId: string; blocked?: string }> }
-    ).checkouts[0];
-
-    assert.equal(blocked?.checkoutId, foreign.checkoutId);
-    assert.match(blocked?.blocked ?? "", /exact owned branch/);
-    await assert.rejects(
-      f.call("workgraph_checkout", {
-        action: "discard",
-        checkoutId: foreign.checkoutId,
-        reason: "Must preserve mismatch",
-      }),
-      /exact owned branch/,
-    );
-    assert.equal(existsSync(foreign.managedPath), true);
-    assert.equal(
-      await git(foreign.managedPath, "symbolic-ref", "HEAD"),
-      "refs/heads/foreign-branch",
-    );
-    assert.equal((await git(f.root, "show-ref", "--verify", foreign.ownedBranch)) !== "", true);
   } finally {
     await f.dispose();
   }
@@ -792,7 +232,7 @@ void test("registered extension starts candidate extension from the exact retain
     // SAFETY: The registered inspect tool owns this successful overview detail shape.
     assert.deepEqual(
       (afterRejection.details as { counts: { tasks: number; attempts: number } }).counts,
-      { tasks: 1, attempts: 1, activeWorkers: 0, coordinatorCheckouts: 0 },
+      { tasks: 1, attempts: 1, activeWorkers: 0 },
     );
 
     await git(f.root, "update-ref", sourceRef, sourceTip);
@@ -915,12 +355,7 @@ void test("one session creates frozen Task and Attempt records and inspects them
     assert.equal((overview.details as { counts: { attempts: number } }).counts.attempts, 2);
 
     const other = new RecordStore(f.agentDir, "other-session");
-    assert.deepEqual(other.counts(), {
-      tasks: 0,
-      attempts: 0,
-      activeWorkers: 0,
-      coordinatorCheckouts: 0,
-    });
+    assert.deepEqual(other.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
     other.close();
 
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
@@ -948,7 +383,6 @@ void test("without exact Herdr launch identity inspection remains usable and cre
         tasks: 0,
         attempts: 0,
         activeWorkers: 0,
-        coordinatorCheckouts: 0,
       });
       const models = await f.call("workgraph_models", { role: "research" });
       // SAFETY: Model inspection returns the strictly decoded configured target list.

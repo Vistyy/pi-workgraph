@@ -1,0 +1,264 @@
+/* oxlint-disable anti-slop/require-readable-spacing -- Fixture setup and assertions remain grouped by observable flow. */
+import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { RecordStore } from "../../src/coordinator/store.js";
+import type { AttemptSpec, Task } from "../../src/domain/records.js";
+import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../support/decoders.js";
+import { extensionFixture, git, persistentSession } from "../support/helpers.js";
+
+type Facts = {
+  readonly checkoutId: string;
+  readonly managedPath: string;
+  readonly repositoryCommonDir: string;
+  readonly ownedBranch: string;
+  readonly sourceHead: string;
+  readonly created: boolean;
+  readonly reused: boolean;
+};
+
+async function fixture() {
+  const parent = await mkdtemp(join(tmpdir(), "workgraph-checkout-"));
+  const root = join(parent, "repo");
+  await mkdir(root);
+  await git(root, "init", "-b", "main");
+  await git(root, "config", "user.name", "Workgraph Test");
+  await git(root, "config", "user.email", "workgraph@example.invalid");
+  await writeFile(join(root, ".gitignore"), "ignored.txt\n");
+  await writeFile(join(root, "tracked.txt"), "base\n");
+  await git(root, "add", ".");
+  await git(root, "commit", "-m", "base");
+  const previous = configureFixtureEnvironment({
+    PI_CODING_AGENT_DIR: join(parent, "agent"),
+    PI_WORKGRAPH_ROLE: null,
+    HERDR_ENV: null,
+    HERDR_WORKSPACE_ID: null,
+    HERDR_TAB_ID: null,
+    PI_WORKGRAPH_HERDR_BIN: "/bin/false",
+  });
+  const pi = await extensionFixture("coordinator", root, parent);
+
+  await pi.runner.emit({ type: "session_start", reason: "startup" });
+
+  return {
+    ...pi,
+    parent,
+    root,
+    agentDir: join(parent, "agent"),
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Registered TypeBox validation guards tool details before this test projection.
+    facts: (details: unknown) => {
+      // SAFETY: Every caller projects details returned by a successful workgraph_checkout invocation.
+      return details as Facts;
+    },
+    async dispose() {
+      await pi.close();
+      restoreFixtureEnvironment(previous);
+      await rm(parent, { recursive: true, force: true });
+    },
+  };
+}
+
+void test("checkout startup is read-only and allocation is stable across linked checkouts and reloads", async () => {
+  const f = await fixture();
+  const linked = join(f.parent, "linked");
+
+  try {
+    assert.equal(existsSync(join(f.agentDir, "workgraph", "coordinator-checkouts")), false);
+    await git(f.root, "worktree", "add", "-b", "linked", linked);
+    const first = f.facts((await f.call("workgraph_checkout", {})).details);
+    const linkedReuse = f.facts((await f.call("workgraph_checkout", { cwd: linked })).details);
+
+    assert.equal(first.created, true);
+    assert.equal(linkedReuse.reused, true);
+    assert.equal(linkedReuse.checkoutId, first.checkoutId);
+    assert.equal(linkedReuse.managedPath, first.managedPath);
+
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    assert.equal(existsSync(first.managedPath), true);
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    const afterReload = f.facts((await f.call("workgraph_checkout", {})).details);
+    assert.equal(afterReload.reused, true);
+    assert.equal(afterReload.checkoutId, first.checkoutId);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("different sessions receive isolated deterministic checkouts", async () => {
+  const f = await fixture();
+  const otherSession = persistentSession(f.root, join(f.parent, "other-sessions"));
+  const other = await extensionFixture("coordinator", f.root, f.parent, {}, [], otherSession);
+
+  try {
+    await other.runner.emit({ type: "session_start", reason: "startup" });
+    const first = f.facts((await f.call("workgraph_checkout", {})).details);
+    const second = f.facts((await other.call("workgraph_checkout", {})).details);
+
+    assert.notEqual(second.checkoutId, first.checkoutId);
+    assert.notEqual(second.managedPath, first.managedPath);
+    assert.notEqual(second.ownedBranch, first.ownedBranch);
+  } finally {
+    await other.close();
+    await f.dispose();
+  }
+});
+
+void test("dirty detached source snapshots only committed HEAD", async () => {
+  const f = await fixture();
+
+  try {
+    const committed = await git(f.root, "rev-parse", "HEAD");
+    await git(f.root, "checkout", "--detach", committed);
+    await writeFile(join(f.root, "tracked.txt"), "dirty tracked\n");
+    await writeFile(join(f.root, "untracked.txt"), "untracked\n");
+    await writeFile(join(f.root, "ignored.txt"), "ignored\n");
+    const created = f.facts((await f.call("workgraph_checkout", {})).details);
+
+    assert.equal(created.sourceHead, committed);
+    assert.equal(await readFile(join(created.managedPath, "tracked.txt"), "utf8"), "base\n");
+    assert.equal(existsSync(join(created.managedPath, "untracked.txt")), false);
+    assert.equal(existsSync(join(created.managedPath, "ignored.txt")), false);
+    assert.equal(await readFile(join(f.root, "tracked.txt"), "utf8"), "dirty tracked\n");
+    assert.equal(await readFile(join(f.root, "untracked.txt"), "utf8"), "untracked\n");
+    assert.equal(await readFile(join(f.root, "ignored.txt"), "utf8"), "ignored\n");
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("exact modified and advanced managed checkout reuses without mutation", async () => {
+  const f = await fixture();
+
+  try {
+    const first = f.facts((await f.call("workgraph_checkout", {})).details);
+    await writeFile(join(first.managedPath, "advanced.txt"), "committed\n");
+    await git(first.managedPath, "add", "advanced.txt");
+    await git(first.managedPath, "commit", "-m", "advance managed checkout");
+    const advanced = await git(first.managedPath, "rev-parse", "HEAD");
+    await writeFile(join(first.managedPath, "tracked.txt"), "managed dirty\n");
+    await writeFile(join(first.managedPath, "untracked.txt"), "managed untracked\n");
+    await writeFile(join(first.managedPath, "ignored.txt"), "managed ignored\n");
+
+    const reused = f.facts((await f.call("workgraph_checkout", {})).details);
+    assert.equal(reused.reused, true);
+    assert.equal(await git(first.managedPath, "rev-parse", "HEAD"), advanced);
+    assert.equal(await readFile(join(first.managedPath, "tracked.txt"), "utf8"), "managed dirty\n");
+    assert.equal(
+      await readFile(join(first.managedPath, "untracked.txt"), "utf8"),
+      "managed untracked\n",
+    );
+    assert.equal(
+      await readFile(join(first.managedPath, "ignored.txt"), "utf8"),
+      "managed ignored\n",
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("partial and switched resources remain present and block", async () => {
+  const partial = await fixture();
+
+  try {
+    const facts = partial.facts((await partial.call("workgraph_checkout", {})).details);
+    await git(partial.root, "worktree", "remove", facts.managedPath);
+    await assert.rejects(
+      partial.call("workgraph_checkout", {}),
+      /partial or have the wrong identity/,
+    );
+    assert.equal(
+      await git(partial.root, "rev-parse", "--verify", facts.ownedBranch),
+      facts.sourceHead,
+    );
+  } finally {
+    await partial.dispose();
+  }
+
+  const switched = await fixture();
+
+  try {
+    const facts = switched.facts((await switched.call("workgraph_checkout", {})).details);
+    await git(facts.managedPath, "switch", "-c", "foreign-branch");
+    await assert.rejects(
+      switched.call("workgraph_checkout", {}),
+      /does not match its owned branch/,
+    );
+    assert.equal(existsSync(facts.managedPath), true);
+    assert.equal(await git(facts.managedPath, "branch", "--show-current"), "foreign-branch");
+  } finally {
+    await switched.dispose();
+  }
+});
+
+void test("retained implementation Candidate applies only into the managed checkout", async () => {
+  const f = await fixture();
+
+  try {
+    const facts = f.facts((await f.call("workgraph_checkout", {})).details);
+    const attemptId = "attempt-checkout-candidate";
+    const outputRef = `refs/pi-workgraph/outputs/${attemptId}`;
+    const workerPath = join(f.parent, "candidate-worktree");
+    await git(f.root, "worktree", "add", "--detach", workerPath, facts.sourceHead);
+    await writeFile(join(workerPath, "candidate.txt"), "worker candidate\n");
+    await git(workerPath, "add", "candidate.txt");
+    await git(workerPath, "commit", "-m", "worker candidate");
+    const candidateTip = await git(workerPath, "rev-parse", "HEAD");
+    await git(f.root, "worktree", "remove", workerPath);
+    await git(f.root, "update-ref", outputRef, candidateTip);
+    const store = new RecordStore(f.agentDir, f.session.getSessionId());
+    const task = {
+      target: {
+        kind: "repository",
+        checkoutRoot: facts.managedPath,
+        commonDir: facts.repositoryCommonDir,
+      },
+      contract: {
+        kind: "implementation",
+        objective: "Apply one retained Candidate.",
+        acceptance: ["Candidate reaches only the managed checkout."],
+      },
+    } satisfies Task;
+    const spec = {
+      selection: {
+        kind: "implementation",
+        guide: { model: "fixture/guide", thinking: "high" },
+        executor: { model: "fixture/executor", thinking: "high" },
+      },
+      base: { kind: "repository", baseCommit: facts.sourceHead },
+    } satisfies AttemptSpec;
+
+    store.createTaskWithAttempt("checkout-candidate", task, attemptId, spec);
+    store.recordOutcome(attemptId, {
+      result: {
+        kind: "reported",
+        report: {
+          kind: "implementation",
+          status: "completed",
+          outcome: "changed",
+          summary: "Produced the Candidate.",
+          evidence: [],
+          findings: [],
+        },
+      },
+      effectiveModels: [],
+    });
+    store.checkpointOutput(attemptId, {
+      kind: "retained",
+      tip: candidateTip,
+      reason: "Committed implementation output",
+    });
+    store.close();
+
+    await f.call("workgraph_control", { action: "apply", attemptId });
+    assert.equal(
+      await readFile(join(facts.managedPath, "candidate.txt"), "utf8"),
+      "worker candidate\n",
+    );
+    assert.equal(existsSync(join(f.root, "candidate.txt")), false);
+  } finally {
+    await f.dispose();
+  }
+});

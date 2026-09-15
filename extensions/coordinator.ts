@@ -8,13 +8,7 @@ import {
 import { Effect, Exit, Match, Scope } from "effect";
 import type { Static, TSchema } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
-import {
-  applyCheckout,
-  createCheckout,
-  discardCheckout,
-  inspectCheckout,
-  listCheckouts,
-} from "../src/coordinator/checkouts.js";
+import { createCheckout } from "../src/coordinator/checkouts.js";
 import type { HerdrCliRuntime } from "../src/coordinator/herdr.js";
 import {
   configuredTarget,
@@ -140,10 +134,19 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   pi.registerTool({
     name: "workgraph_checkout",
     label: "Workgraph Checkout",
-    description: "Manage this session's branch-backed Coordinator checkouts.",
+    description: "Create or exactly reuse this session's deterministic branch-backed checkout.",
     parameters: CheckoutParameters,
     execute(_id, params, _signal, _update, ctx) {
-      return serialize(async () => result(await checkoutAction(runtime(), ctx, params)));
+      return serialize(async () =>
+        result(
+          await createCheckout({
+            agentDir: runtime().agentDir,
+            sessionId: ctx.sessionManager.getSessionId(),
+            cwd: ctx.cwd,
+            ...(params.cwd === undefined ? {} : { path: params.cwd }),
+          }),
+        ),
+      );
     },
   });
 
@@ -314,36 +317,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       });
     },
   });
-}
-
-async function checkoutAction(
-  runtime: SessionRuntime,
-  ctx: ExtensionContext,
-  input: Static<typeof CheckoutParameters>,
-): Promise<object> {
-  switch (input.action) {
-    case "create":
-      return Effect.runPromise(
-        createCheckout({ store: runtime.store, agentDir: runtime.agentDir }, ctx.cwd, input.cwd),
-      );
-    case "inspect":
-      return Effect.runPromise(inspectCheckout(runtime.store, input.checkoutId));
-    case "list": {
-      const offset = input.offset ?? 0;
-      const limit = input.limit ?? 20;
-
-      return {
-        offset,
-        limit,
-        checkouts: await Effect.runPromise(listCheckouts(runtime.store, offset, limit)),
-      };
-    }
-
-    case "apply":
-      return Effect.runPromise(applyCheckout(runtime.store, input.checkoutId));
-    case "discard":
-      return Effect.runPromise(discardCheckout(runtime.store, input.checkoutId, input.reason));
-  }
 }
 
 type CreateTaskInput = {

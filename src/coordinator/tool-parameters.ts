@@ -47,56 +47,14 @@ export const ModelsParameters = Type.Object(
   { additionalProperties: false },
 );
 
-export const CheckoutParameters = Type.Union([
-  Type.Object(
-    {
-      action: Type.Literal("create", {
-        description:
-          "Create or reuse this repository's checkout from committed HEAD; leave destination working files untouched.",
-      }),
-      cwd: Type.Optional(nonBlank("Destination checkout; defaults to the session cwd.")),
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      action: Type.Literal("inspect", {
-        description: "Validate and report one exact recorded checkout.",
-      }),
-      checkoutId: TaskIdSchema,
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      action: Type.Literal("list", {
-        description: "List this session's checkouts and report blocked records individually.",
-      }),
-      ...PageFields,
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      action: Type.Literal("apply", {
-        description:
-          "Integrate clean committed work into the recorded clean local destination, then release exact owned resources.",
-      }),
-      checkoutId: TaskIdSchema,
-    },
-    { additionalProperties: false },
-  ),
-  Type.Object(
-    {
-      action: Type.Literal("discard", {
-        description: "Destructively remove the verified managed checkout and branch.",
-      }),
-      checkoutId: TaskIdSchema,
-      reason: nonBlank("Why the checkout is being discarded."),
-    },
-    { additionalProperties: false },
-  ),
-]);
+export const CheckoutParameters = Type.Object(
+  {
+    cwd: Type.Optional(
+      nonBlank("Repository checkout to allocate from; defaults to the session cwd."),
+    ),
+  },
+  { additionalProperties: false },
+);
 
 export const ResearchParameters = Type.Object(
   {
