@@ -17,7 +17,10 @@ const CandidateOf = Type.Optional(
           "extend continues from the parent's Candidate; integrate starts from the destination and includes the parent's retained output.",
       }),
     },
-    { additionalProperties: false },
+    {
+      additionalProperties: false,
+      description: "Optional parent Candidate relationship for the new Attempt.",
+    },
   ),
 );
 

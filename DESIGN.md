@@ -81,6 +81,8 @@ Directory Attempts have no Git output. Repository Attempts execute in detached w
 
 ## Repository custody
 
+`src/repository.ts` is the single Git custody owner for both Worker Candidates and Coordinator checkouts. They share target revalidation, ref and worktree identity, application, and removal primitives so those safety rules cannot diverge behind separate repository adapters; coordinator lifecycle sequencing remains in `src/coordinator/checkouts.ts`.
+
 After exact Worker closure, a completed report retains only committed HEAD and removes the worktree; unchanged HEAD produces no output. Non-completed Attempts preserve dirty worktrees. Complete absence recovers compacted output; external deletion or pruning of Workgraph-managed resources is unsupported. One-sided, moved, foreign, unrelated, or otherwise ambiguous resources block.
 
 Repository custody is serialized within one coordinator session, not across sessions or processes. Concurrent mutation of the same destination checkout is unsupported. Application proves the private source ref, Candidate lineage, destination identity and state, ancestry, and tree mergeability before its checkpointed fast-forward. The merge preserves unrelated ignored artifacts and refuses to overwrite an ignored destination path. Recovery accepts only the exact expected Git structure; changed destination state blocks without rollback or automatic retry. Output cleanup occurs only after application is recorded.

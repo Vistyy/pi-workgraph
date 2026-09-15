@@ -26,23 +26,26 @@ const TaskTargetSchema = Type.Union([
   strict({ kind: Type.Literal("repository"), checkoutRoot: Text, commonDir: Text }),
 ]);
 
-export const ReviewSubjectSchema = Type.Union([
-  strict({
-    kind: Type.Literal("attempt", { description: "Review one exact Attempt." }),
-    attemptId: Type.String({ minLength: 1, description: "Exact Attempt ID." }),
-  }),
-  strict({
-    kind: Type.Literal("comparison", { description: "Compare two or more exact Attempts." }),
-    attemptIds: Type.Array(Text, {
-      minItems: 2,
-      description: "Attempt IDs to compare.",
+export const ReviewSubjectSchema = Type.Union(
+  [
+    strict({
+      kind: Type.Literal("attempt", { description: "Review one exact Attempt." }),
+      attemptId: Type.String({ minLength: 1, description: "Exact Attempt ID." }),
     }),
-  }),
-  strict({
-    kind: Type.Literal("revision", { description: "Review one exact repository revision." }),
-    revision: CommitSchema,
-  }),
-]);
+    strict({
+      kind: Type.Literal("comparison", { description: "Compare two or more exact Attempts." }),
+      attemptIds: Type.Array(Text, {
+        minItems: 2,
+        description: "Attempt IDs to compare.",
+      }),
+    }),
+    strict({
+      kind: Type.Literal("revision", { description: "Review one exact repository revision." }),
+      revision: CommitSchema,
+    }),
+  ],
+  { description: "Exact Attempt, comparison, or repository revision to review." },
+);
 
 const TaskContractSchema = Type.Union([
   strict({

@@ -10,7 +10,7 @@ Workgraph is a Pi extension that accepts tool input, persists coordination recor
 
 TypeBox is the single owner of structural JSON contracts. It defines Pi tool parameters, model policy, Worker reports, Task and Attempt specifications, and mutable Worker, output, and Outcome records. The same strict schemas decode every persisted JSON field when a supported read uses it. Relational and lifecycle invariants remain explicit domain logic rather than being encoded as a second schema system.
 
-Persistence is one native SQLite file partitioned by exact Pi session. It contains only strict `tasks` and `attempts` tables. Task creation with its first Attempt, focused operational checkpoints, and write-once Outcome insertion use narrow transactions. The store has no in-memory aggregate copy, revision protocol, or lifecycle authority outside those rows.
+Persistence is one native SQLite file partitioned by exact Pi session. Strict tables store Tasks, Attempts, and session-owned Coordinator checkouts. Task creation with its first Attempt, focused operational checkpoints, and write-once Outcome insertion use narrow transactions. The store has no in-memory aggregate copy, revision protocol, or lifecycle authority outside those rows.
 
 Effect owns asynchronous control flow, typed operational failure, interruption, serialization, scoped acquisition and release, fibers, queues, and resource finalization. The core remains Effect-native; Pi callbacks are the narrow Promise boundary.
 
@@ -22,7 +22,7 @@ Direct host APIs are confined to adapters with a concrete guarantee:
 - Pi session and Herdr adapters own their exact native protocols;
 - synchronous host utilities provide paths, cryptographic IDs, and hashes where a lifecycle abstraction would add no guarantee.
 
-Each direct Node use documents the guarantee that keeps it at that boundary. Workgraph does not add Effect Schema or an SQLite framework around the two-table store.
+Each direct Node use documents the guarantee that keeps it at that boundary. Workgraph does not add Effect Schema or an SQLite framework around the small fixed record store.
 
 ## Consequences
 
@@ -34,4 +34,4 @@ Each direct Node use documents the guarantee that keeps it at that boundary. Wor
 
 ## Alternatives
 
-Effect Schema plus TypeBox at the Pi boundary would retain two schema systems and add conversion obligations without owning relational invariants. A general SQLite layer would add client and resource plumbing around two fixed tables while leaving file ownership checks in application code. Direct Node APIs throughout would weaken structured interruption and resource lifetime ownership.
+Effect Schema plus TypeBox at the Pi boundary would retain two schema systems and add conversion obligations without owning relational invariants. A general SQLite layer would add client and resource plumbing around a small fixed set of tables while leaving file ownership checks in application code. Direct Node APIs throughout would weaken structured interruption and resource lifetime ownership.

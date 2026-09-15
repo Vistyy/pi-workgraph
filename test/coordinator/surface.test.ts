@@ -30,6 +30,33 @@ function createdCheckout(details: unknown): CreatedCheckoutFacts {
   return details as CreatedCheckoutFacts;
 }
 
+type JsonSchemaNode = {
+  readonly description?: string;
+  readonly properties?: Readonly<Record<string, JsonSchemaNode>>;
+  readonly anyOf?: readonly JsonSchemaNode[];
+  readonly items?: JsonSchemaNode;
+};
+
+function undocumentedParameters(schema: JsonSchemaNode, path = "parameters"): string[] {
+  const missing: string[] = [];
+
+  for (const [name, property] of Object.entries(schema.properties ?? {})) {
+    const propertyPath = `${path}.${name}`;
+
+    if (property.description === undefined || property.description.trim() === "")
+      missing.push(propertyPath);
+    missing.push(...undocumentedParameters(property, propertyPath));
+  }
+
+  for (const [index, variant] of (schema.anyOf ?? []).entries())
+    missing.push(...undocumentedParameters(variant, `${path}.anyOf[${index}]`));
+
+  if (schema.items !== undefined)
+    missing.push(...undocumentedParameters(schema.items, `${path}.items`));
+
+  return missing;
+}
+
 const accepted = [
   "workgraph_models",
   "workgraph_checkout",
@@ -95,10 +122,13 @@ void test("coordinator registers the exact strict tool surface", async () => {
     assert.deepEqual(registered, [...accepted].sort());
 
     for (const tool of tools) {
-      assert.match(
-        JSON.stringify(tool.definition.parameters),
-        /"description":/,
-        `${tool.definition.name} retains parameter descriptions in its registered JSON Schema`,
+      // SAFETY: Pi's registered TypeBox parameters serialize as this bounded JSON Schema shape.
+      const schema = tool.definition.parameters as JsonSchemaNode;
+
+      assert.deepEqual(
+        undocumentedParameters(schema),
+        [],
+        `${tool.definition.name} describes every registered parameter`,
       );
     }
 
@@ -180,7 +210,17 @@ void test("checkout create reuses one session placement and isolates another ses
   try {
     await f.runner.emit({ type: "session_start", reason: "startup" });
     await other.runner.emit({ type: "session_start", reason: "startup" });
-    await writeFile(join(f.root, "destination-dirty.txt"), "not part of the checkout\n");
+    const destinationHead = await git(f.root, "rev-parse", "HEAD");
+
+    await writeFile(join(f.root, "file.txt"), "dirty tracked destination bytes\n");
+    await writeFile(join(f.root, "destination-dirty.txt"), "dirty untracked destination bytes\n");
+
+    const destinationStatus = await git(
+      f.root,
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all",
+    );
 
     const first = await f.call("workgraph_checkout", { action: "create" });
     const repeated = await f.call("workgraph_checkout", { action: "create", cwd: "." });
@@ -195,7 +235,21 @@ void test("checkout create reuses one session placement and isolates another ses
     assert.equal(firstFacts.created, true);
     assert.equal(firstFacts.lifecycle, "ready");
     assert.equal(firstFacts.destinationDirty, true);
+    assert.equal(firstFacts.baseCommit, destinationHead);
+    assert.equal(await readFile(join(firstFacts.managedPath, "file.txt"), "utf8"), "base\n");
     assert.equal(existsSync(join(firstFacts.managedPath, "destination-dirty.txt")), false);
+    assert.equal(
+      await readFile(join(f.root, "file.txt"), "utf8"),
+      "dirty tracked destination bytes\n",
+    );
+    assert.equal(
+      await readFile(join(f.root, "destination-dirty.txt"), "utf8"),
+      "dirty untracked destination bytes\n",
+    );
+    assert.equal(
+      await git(f.root, "status", "--porcelain=v1", "--untracked-files=all"),
+      destinationStatus,
+    );
     assert.equal(repeatedFacts.checkoutId, firstFacts.checkoutId);
     assert.equal(repeatedFacts.managedPath, firstFacts.managedPath);
     assert.equal(repeatedFacts.reused, true);
