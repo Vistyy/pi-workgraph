@@ -18,7 +18,7 @@ export const TaskIdSchema = Type.String({
   minLength: 1,
   maxLength: 64,
   pattern: "^[A-Za-z0-9][A-Za-z0-9_-]*$",
-  description: "Exact Workgraph Task or Coordinator checkout identifier.",
+  description: "Exact Workgraph Task identifier.",
 });
 
 const TaskTargetSchema = Type.Union([

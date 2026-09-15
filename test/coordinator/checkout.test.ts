@@ -1,7 +1,7 @@
 /* oxlint-disable anti-slop/require-readable-spacing -- Fixture setup and assertions remain grouped by observable flow. */
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -15,10 +15,18 @@ type Facts = {
   readonly managedPath: string;
   readonly repositoryCommonDir: string;
   readonly ownedBranch: string;
-  readonly sourceHead: string;
+  readonly head: string;
   readonly created: boolean;
   readonly reused: boolean;
 };
+
+async function administrationDir(managedPath: string): Promise<string> {
+  const backlink = await readFile(join(managedPath, ".git"), "utf8");
+  const match = /^gitdir: (.+)\r?\n?$/.exec(backlink);
+
+  assert.ok(match?.[1] !== undefined);
+  return match[1];
+}
 
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-checkout-"));
@@ -117,7 +125,7 @@ void test("dirty detached source snapshots only committed HEAD", async () => {
     await writeFile(join(f.root, "ignored.txt"), "ignored\n");
     const created = f.facts((await f.call("workgraph_checkout", {})).details);
 
-    assert.equal(created.sourceHead, committed);
+    assert.equal(created.head, committed);
     assert.equal(await readFile(join(created.managedPath, "tracked.txt"), "utf8"), "base\n");
     assert.equal(existsSync(join(created.managedPath, "untracked.txt")), false);
     assert.equal(existsSync(join(created.managedPath, "ignored.txt")), false);
@@ -144,6 +152,7 @@ void test("exact modified and advanced managed checkout reuses without mutation"
 
     const reused = f.facts((await f.call("workgraph_checkout", {})).details);
     assert.equal(reused.reused, true);
+    assert.equal(reused.head, advanced);
     assert.equal(await git(first.managedPath, "rev-parse", "HEAD"), advanced);
     assert.equal(await readFile(join(first.managedPath, "tracked.txt"), "utf8"), "managed dirty\n");
     assert.equal(
@@ -159,20 +168,126 @@ void test("exact modified and advanced managed checkout reuses without mutation"
   }
 });
 
+void test("locked, duplicate-branch, and reverse-backlink identities block without repair", async () => {
+  const locked = await fixture();
+
+  try {
+    const facts = locked.facts((await locked.call("workgraph_checkout", {})).details);
+    await git(locked.root, "worktree", "lock", "--reason", "initializing", facts.managedPath);
+    await assert.rejects(locked.call("workgraph_checkout", {}), /registration is locked/);
+    assert.equal(existsSync(facts.managedPath), true);
+    assert.match(
+      await readFile(join(await administrationDir(facts.managedPath), "locked"), "utf8"),
+      /initializing/,
+    );
+  } finally {
+    await locked.dispose();
+  }
+
+  const duplicate = await fixture();
+
+  try {
+    const facts = duplicate.facts((await duplicate.call("workgraph_checkout", {})).details);
+    const otherPath = join(duplicate.parent, "other-worktree");
+    await git(duplicate.root, "worktree", "add", "--detach", otherPath, facts.head);
+    await writeFile(
+      join(await administrationDir(otherPath), "HEAD"),
+      `ref: ${facts.ownedBranch}\n`,
+    );
+    await assert.rejects(duplicate.call("workgraph_checkout", {}), /partial or duplicated/);
+    assert.equal(existsSync(facts.managedPath), true);
+    assert.equal(existsSync(otherPath), true);
+  } finally {
+    await duplicate.dispose();
+  }
+
+  const reverse = await fixture();
+
+  try {
+    const facts = reverse.facts((await reverse.call("workgraph_checkout", {})).details);
+    const adminDir = await administrationDir(facts.managedPath);
+    await writeFile(join(adminDir, "gitdir"), `${join(reverse.root, ".git")}\n`);
+    await assert.rejects(reverse.call("workgraph_checkout", {}), /partial or duplicated/);
+    assert.equal(existsSync(facts.managedPath), true);
+  } finally {
+    await reverse.dispose();
+  }
+});
+
+void test("failed native creation is recovered only at the exact requested commit", async () => {
+  // SAFETY: This only gives names to optional process environment keys used by this bounded fixture.
+  const environment = process.env as NodeJS.ProcessEnv & {
+    PATH: string | undefined;
+    WORKGRAPH_TEST_REAL_GIT: string | undefined;
+    WORKGRAPH_TEST_GIT_MODE: string | undefined;
+  };
+  const originalPath = environment.PATH;
+  const originalRealGit = environment.WORKGRAPH_TEST_REAL_GIT;
+  const originalMode = environment.WORKGRAPH_TEST_GIT_MODE;
+  const realGit = originalPath
+    ?.split(":")
+    .map((directory) => join(directory, "git"))
+    .find((candidate) => existsSync(candidate));
+  assert.ok(realGit !== undefined);
+
+  async function installWrapper(parent: string) {
+    const bin = join(parent, "bin");
+    const wrapper = join(bin, "git");
+    await mkdir(bin);
+    await writeFile(
+      wrapper,
+      `#!/bin/sh\nprev=""\nlast=""\nfor arg do prev="$last"; last="$arg"; done\n"$WORKGRAPH_TEST_REAL_GIT" "$@"\nstatus=$?\n[ $status -eq 0 ] || exit $status\ncase " $* " in\n  *" worktree add "*)\n    if [ "$WORKGRAPH_TEST_GIT_MODE" = wrong ]; then\n      printf 'wrong\\n' > "$prev/wrong.txt"\n      "$WORKGRAPH_TEST_REAL_GIT" -C "$prev" add wrong.txt\n      "$WORKGRAPH_TEST_REAL_GIT" -C "$prev" commit -m wrong-post-create >/dev/null\n    fi\n    exit 17\n    ;;
+esac\n`,
+    );
+    await chmod(wrapper, 0o700);
+    environment.WORKGRAPH_TEST_REAL_GIT = realGit;
+    environment.PATH = `${bin}:${originalPath ?? ""}`;
+  }
+
+  const recovered = await fixture();
+
+  try {
+    await installWrapper(recovered.parent);
+    environment.WORKGRAPH_TEST_GIT_MODE = "failed-exact";
+    const facts = recovered.facts((await recovered.call("workgraph_checkout", {})).details);
+    assert.equal(facts.created, true);
+    assert.equal(facts.head, await git(recovered.root, "rev-parse", "main"));
+  } finally {
+    environment.PATH = originalPath;
+    environment.WORKGRAPH_TEST_REAL_GIT = originalRealGit;
+    environment.WORKGRAPH_TEST_GIT_MODE = originalMode;
+    await recovered.dispose();
+  }
+
+  const mismatched = await fixture();
+
+  try {
+    await installWrapper(mismatched.parent);
+    environment.WORKGRAPH_TEST_GIT_MODE = "wrong";
+    await assert.rejects(
+      mismatched.call("workgraph_checkout", {}),
+      /does not match the exact requested commit/,
+    );
+    const checkoutRoot = join(mismatched.agentDir, "workgraph", "coordinator-checkouts");
+    const [managed] = await readdir(checkoutRoot);
+    assert.ok(managed !== undefined);
+    assert.equal(existsSync(join(checkoutRoot, managed, "wrong.txt")), true);
+  } finally {
+    environment.PATH = originalPath;
+    environment.WORKGRAPH_TEST_REAL_GIT = originalRealGit;
+    environment.WORKGRAPH_TEST_GIT_MODE = originalMode;
+    await mismatched.dispose();
+  }
+});
+
 void test("partial and switched resources remain present and block", async () => {
   const partial = await fixture();
 
   try {
     const facts = partial.facts((await partial.call("workgraph_checkout", {})).details);
     await git(partial.root, "worktree", "remove", facts.managedPath);
-    await assert.rejects(
-      partial.call("workgraph_checkout", {}),
-      /partial or have the wrong identity/,
-    );
-    assert.equal(
-      await git(partial.root, "rev-parse", "--verify", facts.ownedBranch),
-      facts.sourceHead,
-    );
+    await assert.rejects(partial.call("workgraph_checkout", {}), /partial or duplicated/);
+    assert.equal(await git(partial.root, "rev-parse", "--verify", facts.ownedBranch), facts.head);
   } finally {
     await partial.dispose();
   }
@@ -182,10 +297,7 @@ void test("partial and switched resources remain present and block", async () =>
   try {
     const facts = switched.facts((await switched.call("workgraph_checkout", {})).details);
     await git(facts.managedPath, "switch", "-c", "foreign-branch");
-    await assert.rejects(
-      switched.call("workgraph_checkout", {}),
-      /does not match its owned branch/,
-    );
+    await assert.rejects(switched.call("workgraph_checkout", {}), /partial or duplicated/);
     assert.equal(existsSync(facts.managedPath), true);
     assert.equal(await git(facts.managedPath, "branch", "--show-current"), "foreign-branch");
   } finally {
@@ -201,7 +313,7 @@ void test("retained implementation Candidate applies only into the managed check
     const attemptId = "attempt-checkout-candidate";
     const outputRef = `refs/pi-workgraph/outputs/${attemptId}`;
     const workerPath = join(f.parent, "candidate-worktree");
-    await git(f.root, "worktree", "add", "--detach", workerPath, facts.sourceHead);
+    await git(f.root, "worktree", "add", "--detach", workerPath, facts.head);
     await writeFile(join(workerPath, "candidate.txt"), "worker candidate\n");
     await git(workerPath, "add", "candidate.txt");
     await git(workerPath, "commit", "-m", "worker candidate");
@@ -227,7 +339,7 @@ void test("retained implementation Candidate applies only into the managed check
         guide: { model: "fixture/guide", thinking: "high" },
         executor: { model: "fixture/executor", thinking: "high" },
       },
-      base: { kind: "repository", baseCommit: facts.sourceHead },
+      base: { kind: "repository", baseCommit: facts.head },
     } satisfies AttemptSpec;
 
     store.createTaskWithAttempt("checkout-candidate", task, attemptId, spec);
