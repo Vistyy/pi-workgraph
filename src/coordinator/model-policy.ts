@@ -7,13 +7,23 @@ import { Value } from "typebox/value";
 import { type ModelTarget, ModelTargetSchema } from "../domain/model-target.js";
 import { runNodePlatformPromise } from "../node-platform.js";
 
-export const MODEL_LIST_ROLES = ["research", "review", "consultation.advisor"] as const;
+const MODEL_LIST_ROLES = ["research", "review"] as const;
 
 export type ListModelRole = (typeof MODEL_LIST_ROLES)[number];
 
 type ModelTargetList = [ModelTarget, ...ModelTarget[]];
 
 const ModelTargetListSchema = Type.Array(ModelTargetSchema, { minItems: 1 });
+
+const ObsoleteAdvisorArrayPolicySchema = Type.Object(
+  {
+    roles: Type.Object(
+      { "consultation.advisor": Type.Array(Type.Unknown()) },
+      { additionalProperties: true },
+    ),
+  },
+  { additionalProperties: true },
+);
 
 const ModelPolicySchema = Type.Object(
   {
@@ -24,7 +34,7 @@ const ModelPolicySchema = Type.Object(
         "implementation.executor": ModelTargetSchema,
         "implementation.escalationExecutor": Type.Optional(ModelTargetSchema),
         review: ModelTargetListSchema,
-        "consultation.advisor": ModelTargetListSchema,
+        "consultation.advisor": ModelTargetSchema,
       },
       { additionalProperties: false },
     ),
@@ -37,6 +47,7 @@ export interface ModelPolicy {
     "implementation.guide": ModelTarget;
     "implementation.executor": ModelTarget;
     "implementation.escalationExecutor"?: ModelTarget;
+    "consultation.advisor": ModelTarget;
   };
 }
 
@@ -134,6 +145,10 @@ function decodeModelPolicyEffect(
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Policy JSON is unknown until this strict boundary accepts it.
 function decodeModelPolicy(value: unknown): ModelPolicy {
+  if (Value.Check(ObsoleteAdvisorArrayPolicySchema, value))
+    throw new Error(
+      "Invalid Workgraph model policy: consultation.advisor must be exactly one target. Select one target and convert the array to a ModelTarget object.",
+    );
   const issue = Value.Errors(ModelPolicySchema, value)[0];
 
   if (issue !== undefined) {
