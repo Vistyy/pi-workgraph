@@ -154,6 +154,38 @@ export const OutcomeSchema = strict({
   effectiveModels: Type.Array(ModelTargetSchema, { uniqueItems: true }),
 });
 
+const CoordinatorCheckoutStateSchema = Type.Union([
+  strict({ kind: Type.Literal("placing") }),
+  strict({ kind: Type.Literal("ready") }),
+  strict({
+    kind: Type.Literal("applying"),
+    sourceTip: CommitSchema,
+    destinationRef: Text,
+    destinationHead: CommitSchema,
+    replanned: Type.Optional(Type.Literal(true)),
+  }),
+  strict({
+    kind: Type.Literal("applied"),
+    sourceTip: CommitSchema,
+    revision: CommitSchema,
+  }),
+  strict({
+    kind: Type.Literal("discarding"),
+    sourceTip: CommitSchema,
+    reason: NonBlankText,
+  }),
+]);
+
+export const CoordinatorCheckoutSchema = strict({
+  checkoutId: TaskIdSchema,
+  target: strict({ kind: Type.Literal("repository"), checkoutRoot: Text, commonDir: Text }),
+  managedPath: Text,
+  branchRef: Text,
+  baseCommit: CommitSchema,
+  destinationRef: Text,
+  state: CoordinatorCheckoutStateSchema,
+});
+
 export type TaskTarget = Static<typeof TaskTargetSchema>;
 
 export type TaskContract = Static<typeof TaskContractSchema>;
@@ -169,6 +201,8 @@ export type WorkerState = Static<typeof WorkerStateSchema>;
 export type AttemptOutput = Static<typeof AttemptOutputSchema>;
 
 export type Outcome = Static<typeof OutcomeSchema>;
+
+export type CoordinatorCheckout = Static<typeof CoordinatorCheckoutSchema>;
 
 export interface TaskRecord {
   readonly id: string;

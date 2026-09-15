@@ -1,4 +1,5 @@
 /* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -27,12 +28,25 @@ import {
   type AttemptRecord,
   type AttemptSelection,
   CommitSchema,
+  type CoordinatorCheckout,
   ReviewSubjectSchema,
   type Task,
   type TaskContract,
   TaskIdSchema,
 } from "../src/domain/records.js";
-import { resolveRevision, resolveTaskTarget } from "../src/repository.js";
+import {
+  applyCoordinatorCheckout,
+  cleanupCoordinatorCheckout,
+  coordinatorPlacement,
+  discardCoordinatorCheckout,
+  ensureCoordinatorCheckout,
+  inspectCoordinatorCheckout,
+  prepareCoordinatorApplication,
+  prepareCoordinatorDiscard,
+  resolveCoordinatorTarget,
+  resolveRevision,
+  resolveTaskTarget,
+} from "../src/repository.js";
 
 const Text = Type.String({ minLength: 1, pattern: "\\S" });
 
@@ -148,6 +162,35 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         role: params.role,
         targets: policy.roles[params.role],
       });
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_checkout",
+    label: "Workgraph Checkout",
+    description:
+      "Own direct Coordinator repository work durably for this exact session. create lazily places or verifies one clean attached branch checkout per repository (cwd resolves like Task cwd); inspect and list verify/report durable lifecycle facts; apply requires a clean source and original clean destination branch, prepares then locally merges and releases only exact owned resources; discard requires a nonblank reason and destructively removes verified managed bytes and branch. Moved, foreign, one-sided, wrong-repository, wrong-branch, dirty-apply, or ambiguous resources block without replacement or deletion. No action publishes remotely.",
+    parameters: Type.Union([
+      Type.Object(
+        { action: Type.Literal("create"), cwd: Type.Optional(Text) },
+        { additionalProperties: false },
+      ),
+      Type.Object(
+        { action: Type.Literal("inspect"), checkoutId: Text },
+        { additionalProperties: false },
+      ),
+      Type.Object({ action: Type.Literal("list"), ...PageFields }, { additionalProperties: false }),
+      Type.Object(
+        { action: Type.Literal("apply"), checkoutId: Text },
+        { additionalProperties: false },
+      ),
+      Type.Object(
+        { action: Type.Literal("discard"), checkoutId: Text, reason: Text },
+        { additionalProperties: false },
+      ),
+    ]),
+    execute(_id, params, _signal, _update, ctx) {
+      return serialize(async () => result(await checkoutAction(runtime(), ctx, params)));
     },
   });
 
@@ -412,6 +455,137 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       });
     },
   });
+}
+
+type CheckoutInput =
+  | { readonly action: "create"; readonly cwd?: string }
+  | { readonly action: "inspect"; readonly checkoutId: string }
+  | { readonly action: "list"; readonly offset?: number; readonly limit?: number }
+  | { readonly action: "apply"; readonly checkoutId: string }
+  | { readonly action: "discard"; readonly checkoutId: string; readonly reason: string };
+
+async function checkoutAction(
+  runtime: SessionRuntime,
+  ctx: ExtensionContext,
+  params: Static<TSchema>,
+): Promise<object> {
+  // SAFETY: Values are decoded by the strict registered checkout action union.
+  const input = params as CheckoutInput;
+
+  if (input.action === "create") {
+    const resolved = await Effect.runPromise(resolveCoordinatorTarget(ctx.cwd, input.cwd));
+    const checkoutId = randomUUID();
+    const placement = coordinatorPlacement({ agentDir: runtime.agentDir, checkoutId });
+
+    const proposed: CoordinatorCheckout = {
+      checkoutId,
+      target: resolved.target,
+      managedPath: placement.managedPath,
+      branchRef: placement.branchRef,
+      baseCommit: resolved.commit,
+      destinationRef: resolved.destinationRef,
+      state: { kind: "placing" },
+    };
+
+    const stored = runtime.store.createCoordinatorCheckout(proposed);
+    let checkout = stored.checkout;
+
+    if (stored.created || checkout.state.kind === "placing") {
+      await Effect.runPromise(ensureCoordinatorCheckout(checkout));
+      checkout = runtime.store.checkpointCoordinatorCheckout({
+        ...checkout,
+        state: { kind: "ready" },
+      });
+    }
+
+    return checkoutFacts(checkout, await Effect.runPromise(inspectCoordinatorCheckout(checkout)), {
+      created: stored.created,
+      reused: !stored.created,
+    });
+  }
+
+  if (input.action === "list") {
+    const offset = input.offset ?? 0;
+    const limit = input.limit ?? 20;
+    const checkouts = runtime.store.listCoordinatorCheckouts(offset, limit);
+
+    return {
+      offset,
+      limit,
+      checkouts: await Promise.all(
+        checkouts.map(async (checkout) =>
+          checkoutFacts(checkout, await Effect.runPromise(inspectCoordinatorCheckout(checkout))),
+        ),
+      ),
+    };
+  }
+
+  let checkout = runtime.store.readCoordinatorCheckout(input.checkoutId);
+
+  if (input.action === "inspect")
+    return checkoutFacts(checkout, await Effect.runPromise(inspectCoordinatorCheckout(checkout)));
+
+  if (input.action === "apply") {
+    if (checkout.state.kind !== "applied") {
+      const prepared = await Effect.runPromise(prepareCoordinatorApplication(checkout));
+      checkout = runtime.store.checkpointCoordinatorCheckout(prepared);
+      const applied = await Effect.runPromise(applyCoordinatorCheckout(checkout));
+      checkout = runtime.store.checkpointCoordinatorCheckout(applied);
+    }
+
+    await Effect.runPromise(cleanupCoordinatorCheckout(checkout));
+    runtime.store.removeCoordinatorCheckout(checkout);
+
+    return checkoutIdentity(checkout, {
+      lifecycle: "applied",
+      revision: checkout.state.kind === "applied" ? checkout.state.revision : undefined,
+      released: true,
+    });
+  }
+
+  const prepared = await Effect.runPromise(prepareCoordinatorDiscard(checkout, input.reason));
+  checkout = runtime.store.checkpointCoordinatorCheckout(prepared);
+  await Effect.runPromise(discardCoordinatorCheckout(checkout));
+  runtime.store.removeCoordinatorCheckout(checkout);
+
+  return checkoutIdentity(checkout, {
+    lifecycle: "discarded",
+    reason: input.reason,
+    released: true,
+  });
+}
+
+function checkoutFacts(
+  checkout: CoordinatorCheckout,
+  facts: {
+    readonly head: string;
+    readonly dirty: boolean;
+    readonly destinationHead: string;
+    readonly destinationDirty: boolean;
+  },
+  additional: object = {},
+) {
+  return checkoutIdentity(checkout, {
+    lifecycle: checkout.state.kind,
+    sourceHead: facts.head,
+    sourceDirty: facts.dirty,
+    destinationHead: facts.destinationHead,
+    destinationDirty: facts.destinationDirty,
+    ...additional,
+  });
+}
+
+function checkoutIdentity(checkout: CoordinatorCheckout, facts: object) {
+  return {
+    checkoutId: checkout.checkoutId,
+    managedPath: checkout.managedPath,
+    destinationCheckout: checkout.target.checkoutRoot,
+    repositoryCommonDir: checkout.target.commonDir,
+    baseCommit: checkout.baseCommit,
+    ownedBranch: checkout.branchRef,
+    destinationBranch: checkout.destinationRef,
+    ...facts,
+  };
 }
 
 type CreateTaskInput = {
