@@ -364,12 +364,47 @@ void test("retained implementation Candidate applies only into the managed check
     });
     store.close();
 
-    await f.call("workgraph_control", { action: "apply", attemptId });
+    const applied = await f.call("workgraph_control", { action: "apply", attemptId });
+    // SAFETY: Successful control receipts expose the exact post-operation Attempt view.
+    assert.deepEqual(
+      {
+        action: (applied.details as { action: string }).action,
+        target: (applied.details as { attempt: { task: { target: Task["target"] } } }).attempt.task
+          .target,
+        output: (applied.details as { attempt: { output: unknown } }).attempt.output,
+      },
+      {
+        action: "apply",
+        target: task.target,
+        output: { kind: "applied", revision: candidateTip },
+      },
+    );
+
+    // SAFETY: The successful control receipt contains the exact reported Outcome preview.
+    const attemptView = applied.details as {
+      attempt: {
+        outcome: { kind: string; reportStatus: string; reportOutcome: string; summary: string };
+        reportPreview: { text: string; totalChars: number; truncated: boolean };
+      };
+    };
+    assert.deepEqual(attemptView.attempt.outcome, {
+      kind: "reported",
+      reportStatus: "completed",
+      reportOutcome: "changed",
+      summary: "Produced the Candidate.",
+    });
+    assert.match(attemptView.attempt.reportPreview.text, /Produced the Candidate/);
+    assert.ok(attemptView.attempt.reportPreview.totalChars > 0);
+    assert.equal(attemptView.attempt.reportPreview.truncated, false);
     assert.equal(
       await readFile(join(facts.managedPath, "candidate.txt"), "utf8"),
       "worker candidate\n",
     );
     assert.equal(existsSync(join(f.root, "candidate.txt")), false);
+    await assert.rejects(
+      f.call("workgraph_control", { action: "apply", attemptId }),
+      new RegExp(`Inspect exact Attempt ${attemptId} persisted state before retrying`),
+    );
   } finally {
     await f.dispose();
   }

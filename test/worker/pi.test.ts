@@ -41,6 +41,10 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
     (request) => {
       assert.equal(request.model, "guide");
       assert.match(request.raw, /IMPLEMENTATION GUIDE POLICY/);
+      assert.match(
+        request.raw,
+        /may change only its assigned worktree and the Git state needed to commit that worktree/,
+      );
       assert.doesNotMatch(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
 
       return {
@@ -66,6 +70,10 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
     (request) => {
       assert.equal(request.model, "executor");
       assert.match(request.raw, /IMPLEMENTATION EXECUTOR POLICY/);
+      assert.match(
+        request.raw,
+        /may change only its assigned worktree and the Git state needed to commit that worktree/,
+      );
       assert.match(request.raw, /EXECUTOR COMPLETION CHECKLIST/);
       assert.doesNotMatch(request.raw, /IMPLEMENTATION GUIDE POLICY/);
 

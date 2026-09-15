@@ -176,20 +176,8 @@ function rejectDuplicateModels(role: ListModelRole, targets: ModelTargetList): v
   }
 }
 
-export function configuredTarget(
-  policy: ModelPolicy,
-  role: ListModelRole,
-  model?: string,
-): ModelTarget {
-  const targets = policy.roles[role];
-
-  if (model === undefined) return exactTarget(targets[0]);
-  const target = targets.find((candidate) => candidate.model === model);
-
-  if (target === undefined)
-    throw new Error(`Model ${model} is not configured for Workgraph role ${role}.`);
-
-  return exactTarget(target);
+export function configuredTarget(policy: ModelPolicy, role: ListModelRole): ModelTarget {
+  return exactTarget(policy.roles[role][0]);
 }
 
 export function resolveSelection<Role extends ListModelRole>(

@@ -113,6 +113,14 @@ void test("coordinator registers the exact strict tool surface", async () => {
       false,
     );
 
+    assert.match(experiment.description, /initial Attempt\(s\)/);
+    const anotherAttempt = f.runner.getToolDefinition("workgraph_attempt");
+    assert.ok(anotherAttempt !== undefined);
+    assert.match(
+      anotherAttempt.description,
+      /same immutable Task.*current model policy.*fresh applicable base.*new Task.*assignment or authority/,
+    );
+
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(
@@ -353,8 +361,32 @@ void test("one session creates frozen Task and Attempt records and inspects them
       (attempt.details as { spec: { base: { baseCommit: string } } }).spec.base.baseCommit,
       base,
     );
-    // SAFETY: Exact inspection includes bounded report and blocker facts even before settlement.
-    assert.equal((attempt.details as { reportPreview: null; blocker: null }).reportPreview, null);
+    // SAFETY: Exact inspection includes bounded report facts even before settlement.
+    assert.equal((attempt.details as { reportPreview: null }).reportPreview, null);
+
+    // SAFETY: Exact Attempt inspection returns nullable Worker and blocker fields.
+    let launched = attempt.details as {
+      worker: null | { sessionFile: string };
+      blocker: null | string;
+    };
+
+    for (
+      let index = 0;
+      index < 100 && (launched.worker === null || launched.blocker === null);
+      index += 1
+    ) {
+      await Effect.runPromise(Effect.sleep(10));
+      // SAFETY: Repeated exact Attempt inspection preserves the same decoded projection.
+      launched = (await f.call("workgraph_inspect", { section: "attempt", id: attemptId }))
+        .details as typeof launched;
+    }
+
+    assert.ok(launched.worker !== null);
+    assert.match(
+      await readFile(launched.worker.sessionFile, "utf8"),
+      /target \(destination identity, not the Worker's execution location\)/,
+    );
+    assert.ok(launched.blocker !== null, "exact Attempt inspection exposes its runtime blocker");
 
     const page = await f.call("workgraph_inspect", {
       section: "attempt",
@@ -384,6 +416,37 @@ void test("one session creates frozen Task and Attempt records and inspects them
       /useEscalationExecutor is supported only for implementation Attempts/,
     );
 
+    const consultation = await f.call("workgraph_consult", {
+      id: "advice",
+      question: "Which bounded option is preferable?",
+    });
+
+    const consultationAttempt = await f.call("workgraph_attempt", { taskId: "advice" });
+
+    const advisorSelection = {
+      kind: "target",
+      target: { model: "fixture/advisor", thinking: "low" },
+    };
+
+    // SAFETY: Creation receipts expose each exact immutable Attempt specification.
+    assert.deepEqual(
+      (consultation.details as { attempts: { spec: AttemptSpec }[] }).attempts[0]?.spec.selection,
+      advisorSelection,
+    );
+
+    // SAFETY: Another-Attempt receipts contain the exact persisted identifiers and specification.
+    const consultationReceipt = consultationAttempt.details as {
+      taskId: string;
+      attemptId: string;
+      spec: AttemptSpec;
+    };
+
+    assert.deepEqual(consultationReceipt, {
+      taskId: "advice",
+      attemptId: consultationReceipt.attemptId,
+      spec: { selection: advisorSelection, base: { kind: "directory" } },
+    });
+
     const experiment = await f.call("workgraph_experiment", {
       id: "bounded-experiment",
       cwd: ".",
@@ -394,11 +457,22 @@ void test("one session creates frozen Task and Attempt records and inspects them
       selection: { count: 2, distinctModels: true },
     });
 
-    // SAFETY: The registered Experiment tool returns a bounded creation receipt.
-    assert.equal(
-      (experiment.details as { attempts: unknown[] }).attempts.length,
-      2,
-      "Experiment creates independently specified Attempts",
+    // SAFETY: The registered Experiment tool returns exact bounded creation receipts.
+    assert.deepEqual(
+      (experiment.details as { attempts: { spec: AttemptSpec }[] }).attempts.map(
+        (item) => item.spec.selection,
+      ),
+      [
+        {
+          kind: "target",
+          target: { model: "fixture/research", thinking: "high" },
+        },
+        {
+          kind: "target",
+          target: { model: "fixture/research-2", thinking: "medium" },
+        },
+      ],
+      "Experiment uses the ordered research model list",
     );
 
     const experimentTask = await f.call("workgraph_inspect", {
@@ -417,7 +491,7 @@ void test("one session creates frozen Task and Attempt records and inspects them
 
     const overview = await f.call("workgraph_inspect", { section: "overview" });
     // SAFETY: Overview returns exact session-local record counts.
-    assert.equal((overview.details as { counts: { attempts: number } }).counts.attempts, 4);
+    assert.equal((overview.details as { counts: { attempts: number } }).counts.attempts, 6);
 
     const other = new RecordStore(f.agentDir, "other-session");
     assert.deepEqual(other.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
