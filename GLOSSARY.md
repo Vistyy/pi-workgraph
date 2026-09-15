@@ -17,6 +17,9 @@ A durable assignment with one purpose and exact Target. A Task may have multiple
 
 _Avoid_: Workstream
 
+**Experiment**:
+An evidence-seeking Task whose contract grants each Attempt explicit bounded effects and a stop condition. It shares research model selection and reporting, but executes in a repository worktree and does not produce an applicable Candidate.
+
 **Attempt**:
 One execution of a Task. Trying the same Task again creates a new Attempt rather than changing the existing one.
 
@@ -24,6 +27,9 @@ _Avoid_: Run
 
 **Worker**:
 A delegated Pi session that executes one Attempt.
+
+**Worker worktree**:
+The detached repository worktree assigned as one repository Attempt's execution root. An Implementation Worker changes and commits only that worktree; its Task Target remains the Candidate's destination identity rather than an execution checkout.
 
 **Outcome**:
 The semantic result of an Attempt: a report, an unreported ending, or cancellation. It is distinct from repository output.
