@@ -72,7 +72,7 @@ Workgraph exposes these coordinator tools:
 | Tool | Purpose |
 | --- | --- |
 | `workgraph_models` | List configured targets for a selectable role. |
-| `workgraph_checkout` | Create, inspect, list, locally apply, or discard session-owned Coordinator checkouts. |
+| `workgraph_checkout` | Create or exactly reuse this session's deterministic branch-backed checkout. |
 | `workgraph_research` | Create evidence-seeking research or a bounded repository experiment. |
 | `workgraph_consult` | Ask one configured advisor a precise, evidence-only question. |
 | `workgraph_implement` | Create an implementation Task and its first Attempt. |
@@ -82,13 +82,17 @@ Workgraph exposes these coordinator tools:
 | `workgraph_control` | Steer or cancel a Worker, or apply or discard exact repository output. |
 | `workgraph_notepad` | Read, replace, or clear the current branch's bounded coordinator memo. |
 
-Each coordinator Pi session owns its own records and Coordinator checkouts. All sessions share one private SQLite database under the Pi agent data directory, partitioned by exact session identity; records are not globally discoverable from other sessions.
+Each coordinator Pi session owns its own records and deterministic Coordinator checkout identities. All sessions share one private SQLite database under the Pi agent data directory, partitioned by exact session identity; records are not globally discoverable from other sessions. Coordinator checkouts are Git resources, not database records.
 
-Read-only work creates no checkout. For mutating repository work, the Coordinator explicitly creates a managed checkout and uses its returned path for direct changes, verification, and repository implementation Tasks. Worker Candidates therefore return to the managed branch before deliberate local application or publication through external repository or forge tooling; Workgraph does not publish or track remote state.
+Read-only work creates no checkout. For mutating repository work, the Coordinator explicitly calls `workgraph_checkout` and uses its returned path for direct changes, verification, commits, and repository implementation Tasks. The identity combines the exact session and repository, producing one path under `<agentDir>/workgraph/coordinator-checkouts/` and one `refs/heads/pi-workgraph/coordinators/` branch. Calls from linked worktrees of the same repository converge; separate sessions do not.
+
+Creation starts at the source checkout's exact committed `HEAD`, including when that source is detached or contains tracked, untracked, or ignored changes. Those working-tree bytes are neither copied nor mutated. A repeated call preserves modified or advanced managed content while validating the exact path, repository, branch, registration, and worktree backlinks. Partial, foreign, duplicated, locked, or unreadable resources block without repair or replacement.
+
+Worker Candidates return to the managed branch through `workgraph_control {action:"apply"}`. Final local integration, publication, and checkout cleanup use normal Git or forge tooling; Workgraph neither tracks those actions nor publishes remote state.
 
 A Task has one immutable resolved target. Directory targets record an exact path. Repository targets record the checkout root and Git common directory, so Tasks in one session may safely address different repositories without implying a transaction across them. Every Attempt inherits its Task target and starts one fresh Worker Pi session.
 
-Repository Attempts execute in detached worktrees. On a completed report, only commits survive; commit intended output before reporting. Changed commits are retained at `refs/pi-workgraph/outputs/<attemptId>`, while non-completed dirty worktrees and uncertain resources are preserved. Implementation Attempts can start independently, extend a retained Candidate, or integrate one onto another base. Candidate and Coordinator-checkout application and discard remain explicit local operations.
+Repository Attempts execute in detached worktrees. On a completed report, only commits survive; commit intended output before reporting. Changed commits are retained at `refs/pi-workgraph/outputs/<attemptId>`, while non-completed dirty worktrees and uncertain resources are preserved. Implementation Attempts can start independently, extend a retained Candidate, or integrate one onto another base. Candidate application and discard remain explicit Workgraph operations.
 
 Stopping or reloading the coordinator stops only coordinator-owned activity. Coordinator checkouts, independent Worker sessions, Herdr tabs, retained refs, and uncertain resources remain available for inspection or deliberate action.
 

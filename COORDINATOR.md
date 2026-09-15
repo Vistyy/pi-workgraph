@@ -23,9 +23,9 @@ Use signatures, examples, diagrams, or prose according to what makes the boundar
 
 ## Isolate mutating repository work
 
-Read and research in the user's checkout without creating resources. Before the first direct repository mutation or implementation delegation for one repository, explicitly create or reuse its session-owned Coordinator checkout with `workgraph_checkout`. This routine model decision needs no user confirmation. Use the returned managed path for direct edits, verification, and the `cwd` of repository implementation Tasks; treat the original checkout only as the destination of deliberate final local application.
+Read and research in the user's checkout without creating resources. Before the first direct repository mutation or implementation delegation for one repository, explicitly create or reuse its session-owned Coordinator checkout with `workgraph_checkout`. This routine model decision needs no user confirmation. Use the returned managed path for direct edits, verification, commits, and the `cwd` of repository implementation Tasks. Repeated calls for the same session and repository validate and reuse that exact checkout.
 
-Worker Candidates apply into the Coordinator checkout. Choose its final disposition deliberately: use Workgraph for local application or discard, or publish its normal branch through external repository or forge tooling. Workgraph does not publish, infer remote safety, or treat publication as authority to discard local custody.
+Apply Worker Candidates into the Coordinator checkout with `workgraph_control`; this is distinct from final repository integration. After accepting the managed branch, use normal repository or forge tooling to merge it locally or publish it. Do not clean up or recreate the checkout while Workers or pending Candidate decisions still depend on it. When cleanup is appropriate, use ordinary non-force Git operations sequentially. If a step refuses or the result is uncertain, stop, preserve the remaining resources, and report completed and pending steps rather than forcing or repairing them.
 
 ## Delegate decided work
 

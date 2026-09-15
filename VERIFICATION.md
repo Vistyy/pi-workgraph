@@ -6,19 +6,18 @@ This document owns project-specific evidence requirements. Begin with the suppor
 
 Exercise the native SQLite store through separate exact-session instances. Establish that:
 
-- `tasks`, `attempts`, and `coordinator_checkouts` are strict tables with their required relationships;
+- `tasks` and `attempts` are strict tables with their required relationships;
 - Task plus first Attempt creation is atomic;
 - failed creation leaves neither half-record;
 - another Attempt can reference only a Task in the same session;
 - identical Task IDs in separate sessions remain isolated;
 - Task and Attempt specifications cannot be replaced;
-- Outcome insertion is write-once;
-- one session can own only one live Coordinator checkout per repository while separate sessions remain isolated; and
+- Outcome insertion is write-once; and
 - each persisted JSON field and SQL scalar used by a supported read is strictly decoded at that use.
 
 Use actual rows and transaction failure, not only TypeBox value checks. A decoder test should mutate the one field whose supported-read rejection is being established, then remove the disposable database. Do not build a durable corruption matrix: arbitrary external database tampering is not a supported recovery interface.
 
-Do not add migration, aggregate-reconstruction, cross-session-discovery, lease, or concurrent same-session process fixtures unless those become supported responsibilities. The current schema starts fresh at version 2 and must fail closed on older or unknown existing versions.
+Do not add migration, aggregate-reconstruction, cross-session-discovery, lease, or concurrent same-session process fixtures unless those become supported responsibilities. The current schema is version 1 and must fail closed on unknown existing versions.
 
 ## Worker lifecycle
 
@@ -57,11 +56,13 @@ Explicit discard must checkpoint its reason before deleting exact verified outpu
 
 ## Coordinator checkouts
 
-Drive checkout operations through the registered Coordinator tool and real disposable Git repositories. Establish that read-only session startup creates nothing; explicit creation starts from the committed `HEAD` of an attached destination without requiring or mutating its clean or dirty working tree; placement is recorded before the native Git effect; repeated creation in one session reuses its exact checkout; and separate sessions receive distinct paths and branches. One-sided, moved, foreign, wrong-branch, and wrong-repository resources must remain present and blocked rather than being replaced or removed.
+Drive `workgraph_checkout` through the registered Coordinator tool and real disposable Git repositories. Establish that read-only session startup creates nothing; explicit creation snapshots the exact committed `HEAD` of an attached or detached source without copying or mutating tracked, untracked, or ignored working-tree bytes; repeated calls from the same session and Git common directory converge across linked worktrees and reloads; and separate sessions receive distinct paths and branches.
 
-Make direct committed changes in the managed checkout and target a repository implementation Task at that path. Prove that its detached Worker Candidate applies into the Coordinator checkout rather than the original destination. Final local application must require clean committed source state, preserve unrelated ignored destination artifacts, accept clean descendant destination advancement, preserve an already-contained destination without creating a commit, produce only the proved fast-forward or merge result otherwise, and remove only the exact managed worktree, branch, and live record after success.
+Observe the filesystem entry, direct branch ref, exhaustive worktree registrations, attached managed `HEAD`, repository common directory, and both directions of the linked-worktree backlink. Exact unlocked identity may reuse modified, deleted, untracked, ignored, advanced, or rewritten managed content. One-sided, duplicated, moved, symlinked, foreign, wrong-branch, wrong-repository, locked, and unreadable resources must remain present and blocked rather than being replaced or repaired. Model interrupted population with Git's locked initialization state.
 
-Explicit checkout discard must persist its nonblank reason and exact source tip before destructively removing dirty, untracked, and ignored bytes from only the verified managed checkout. For both apply and discard, prove that an exact live worktree is required immediately before recording removal intent. Simulate a lost response after native worktree removal but before confirmation: the requested checkpoint may accept only the exact absent worktree plus exact owned branch, persist confirmation, and then delete that branch. Absence before the request checkpoint must preserve the branch and block. Re-enter preparation, application, cleanup, and discard at their durable checkpoints to establish exact postcondition acceptance without repeating an uncertain mutation. Routine shutdown must preserve live checkouts. Do not add dynamic prompt state, checkout caches, startup reconstruction, background checkout reconciliation, automatic repair, publication, or pull-request fixtures.
+Simulate a native creation command that returns failure after creating the exact worktree: only the exact requested commit and complete identity may recover as successful creation with a bounded diagnostic. A wrong post-create commit and every partial or uncertain postcondition must block without retry. Ordinary shutdown preserves the checkout; no database row, startup reconstruction, cache, background reconciliation, automatic cleanup, or path interception is involved.
+
+Make direct committed changes in the managed checkout and target a repository implementation Task at that path. Prove that its detached Worker Candidate applies into the Coordinator checkout rather than the source checkout. Final integration, publication, and cleanup belong to native repository or forge tooling and are not Workgraph checkout operations; do not retain lifecycle fixtures for them.
 
 ## Worker behavior
 
