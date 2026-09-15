@@ -263,13 +263,7 @@ export function inspectCoordinatorCheckout(checkout: CoordinatorCheckout): Effec
   return Effect.gen(function* () {
     yield* revalidate(checkout.target);
 
-    const removed =
-      (checkout.state.kind === "applied" || checkout.state.kind === "discarding") &&
-      checkout.state.worktreeRemoved === true;
-
-    const source = removed
-      ? yield* inspectRemovedCoordinatorSource(checkout, checkout.state.sourceTip)
-      : { ...(yield* coordinatorCheckoutState(checkout)), present: true as const };
+    const source = yield* inspectCoordinatorSource(checkout);
 
     const destination = yield* destinationState(checkout.target);
 
@@ -440,8 +434,8 @@ export function applyCoordinatorCheckout(
 export function removeAppliedCoordinatorWorktree(
   checkout: CoordinatorCheckout,
 ): Effect.Effect<void, GitError> {
-  if (checkout.state.kind !== "applied" || checkout.state.worktreeRemoved === true)
-    return fail("cleanup Coordinator checkout", "Applied worktree removal is not pending.");
+  if (checkout.state.kind !== "applied" || checkout.state.worktreeRemoval !== "requested")
+    return fail("cleanup Coordinator checkout", "Applied worktree removal is not requested.");
   const applied = checkout.state;
 
   return Effect.gen(function* () {
@@ -485,8 +479,8 @@ export function prepareCoordinatorDiscard(
 export function removeDiscardedCoordinatorWorktree(
   checkout: CoordinatorCheckout,
 ): Effect.Effect<void, GitError> {
-  if (checkout.state.kind !== "discarding" || checkout.state.worktreeRemoved === true)
-    return fail("discard Coordinator checkout", "Discard worktree removal is not pending.");
+  if (checkout.state.kind !== "discarding" || checkout.state.worktreeRemoval !== "requested")
+    return fail("discard Coordinator checkout", "Discard worktree removal is not requested.");
 
   return removeCoordinatorWorktree(checkout, checkout.state.sourceTip, true);
 }
@@ -497,8 +491,11 @@ export function removeCoordinatorBranch(
 ): Effect.Effect<void, GitError> {
   const state = checkout.state;
 
-  if ((state.kind !== "applied" && state.kind !== "discarding") || state.worktreeRemoved !== true)
-    return fail("release Coordinator checkout", "Worktree removal is not checkpointed.");
+  if (
+    (state.kind !== "applied" && state.kind !== "discarding") ||
+    state.worktreeRemoval !== "confirmed"
+  )
+    return fail("release Coordinator checkout", "Worktree removal is not confirmed.");
 
   return Effect.gen(function* () {
     yield* revalidate(checkout.target);
@@ -534,11 +531,14 @@ function removeCoordinatorWorktree(
     const exists = yield* pathExists(checkout.managedPath);
     const branch = yield* readRef(checkout.target.commonDir, checkout.branchRef);
 
+    if (registered === undefined && !exists && branch === tip) return;
+
     if (registered === undefined || !exists || branch !== tip)
       return yield* fail(
         "release Coordinator checkout",
         "Coordinator checkout resources are foreign, moved, or incomplete.",
       );
+
     const source = yield* coordinatorCheckoutState(checkout);
 
     if (source.head !== tip)
@@ -561,6 +561,45 @@ function removeCoordinatorWorktree(
         "release Coordinator checkout",
         "Managed checkout removal could not be established.",
       );
+  });
+}
+
+function inspectCoordinatorSource(
+  checkout: CoordinatorCheckout,
+): Effect.Effect<
+  { readonly head: string; readonly dirty: boolean; readonly present: boolean },
+  GitError
+> {
+  const state = checkout.state;
+
+  if (state.kind !== "applied" && state.kind !== "discarding")
+    return coordinatorCheckoutState(checkout).pipe(
+      Effect.map((source) => ({ ...source, present: true })),
+    );
+
+  if (state.worktreeRemoval === "confirmed")
+    return inspectRemovedCoordinatorSource(checkout, state.sourceTip);
+
+  if (state.worktreeRemoval !== "requested")
+    return coordinatorCheckoutState(checkout).pipe(
+      Effect.map((source) => ({ ...source, present: true })),
+    );
+
+  return Effect.gen(function* () {
+    const registered = yield* registeredWorktree(checkout.target.commonDir, checkout.managedPath);
+    const exists = yield* pathExists(checkout.managedPath);
+    const branch = yield* readRef(checkout.target.commonDir, checkout.branchRef);
+
+    if (registered === undefined && !exists && branch === state.sourceTip)
+      return { head: state.sourceTip, dirty: false, present: false };
+
+    if (registered === undefined || !exists || branch !== state.sourceTip)
+      return yield* fail(
+        "inspect Coordinator checkout",
+        "Resources do not match the requested worktree removal.",
+      );
+
+    return { ...(yield* coordinatorCheckoutState(checkout)), present: true };
   });
 }
 

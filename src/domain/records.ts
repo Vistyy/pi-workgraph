@@ -168,13 +168,17 @@ const CoordinatorCheckoutStateSchema = Type.Union([
     kind: Type.Literal("applied"),
     sourceTip: CommitSchema,
     revision: CommitSchema,
-    worktreeRemoved: Type.Optional(Type.Literal(true)),
+    worktreeRemoval: Type.Optional(
+      Type.Union([Type.Literal("requested"), Type.Literal("confirmed")]),
+    ),
   }),
   strict({
     kind: Type.Literal("discarding"),
     sourceTip: CommitSchema,
     reason: NonBlankText,
-    worktreeRemoved: Type.Optional(Type.Literal(true)),
+    worktreeRemoval: Type.Optional(
+      Type.Union([Type.Literal("requested"), Type.Literal("confirmed")]),
+    ),
   }),
 ]);
 

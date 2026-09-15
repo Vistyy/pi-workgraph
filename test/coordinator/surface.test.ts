@@ -9,7 +9,10 @@ import { Value } from "typebox/value";
 import { RecordStore } from "../../src/coordinator/store.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
 import {
+  applyCoordinatorCheckout,
+  prepareCoordinatorApplication,
   prepareCoordinatorDiscard,
+  removeAppliedCoordinatorWorktree,
   removeDiscardedCoordinatorWorktree,
 } from "../../src/repository.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../support/decoders.js";
@@ -283,6 +286,63 @@ void test("checkout applies committed direct work after destination advancement"
   }
 });
 
+void test("apply resumes after uncertain integration and worktree-removal responses", async () => {
+  const f = await fixture(false);
+
+  try {
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    const created = await f.call("workgraph_checkout", { action: "create" });
+
+    // SAFETY: Create returns exact managed placement identity.
+    const facts = created.details as {
+      checkoutId: string;
+      managedPath: string;
+      ownedBranch: string;
+    };
+
+    await writeFile(join(facts.managedPath, "resumed.txt"), "resumed apply\n");
+    await git(facts.managedPath, "add", "resumed.txt");
+    await git(facts.managedPath, "commit", "-m", "resumed apply");
+
+    const store = new RecordStore(f.agentDir, f.session.getSessionId());
+    let checkout = store.readCoordinatorCheckout(facts.checkoutId);
+
+    checkout = await Effect.runPromise(prepareCoordinatorApplication(checkout));
+    checkout = store.checkpointCoordinatorCheckout(checkout);
+    const uncertainApplied = await Effect.runPromise(applyCoordinatorCheckout(checkout));
+
+    assert.equal(uncertainApplied.state.kind, "applied");
+    checkout = store.readCoordinatorCheckout(facts.checkoutId);
+    checkout = await Effect.runPromise(prepareCoordinatorApplication(checkout));
+    checkout = store.checkpointCoordinatorCheckout(checkout);
+    checkout = await Effect.runPromise(applyCoordinatorCheckout(checkout));
+    checkout = store.checkpointCoordinatorCheckout(checkout);
+
+    if (checkout.state.kind !== "applied") throw new Error("Apply checkpoint was not retained.");
+    checkout = store.checkpointCoordinatorCheckout({
+      ...checkout,
+      state: { ...checkout.state, worktreeRemoval: "requested" },
+    });
+    await Effect.runPromise(removeAppliedCoordinatorWorktree(checkout));
+    store.close();
+
+    const applied = await f.call("workgraph_checkout", {
+      action: "apply",
+      checkoutId: facts.checkoutId,
+    });
+
+    // SAFETY: Apply reports the exact recovered revision and release result.
+    const appliedFacts = applied.details as { revision: string; released: boolean };
+
+    assert.equal(appliedFacts.released, true);
+    assert.equal(await readFile(join(f.root, "resumed.txt"), "utf8"), "resumed apply\n");
+    assert.equal(existsSync(facts.managedPath), false);
+    await assert.rejects(git(f.root, "show-ref", "--verify", facts.ownedBranch));
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("implementation Candidate converges through the Coordinator checkout before final apply", async () => {
   const f = await fixture(false);
 
@@ -443,7 +503,7 @@ void test("externally missing worktree blocks release and preserves the owned br
   }
 });
 
-void test("checkpointed worktree removal resumes exact branch cleanup with persisted reason", async () => {
+void test("discard resumes after worktree removal succeeds without confirmation", async () => {
   const f = await fixture(false);
 
   try {
@@ -462,14 +522,14 @@ void test("checkpointed worktree removal resumes exact branch cleanup with persi
 
     checkout = await Effect.runPromise(prepareCoordinatorDiscard(checkout, "Persisted reason"));
     checkout = store.checkpointCoordinatorCheckout(checkout);
-    await Effect.runPromise(removeDiscardedCoordinatorWorktree(checkout));
 
     if (checkout.state.kind !== "discarding")
       throw new Error("Discard checkpoint was not retained.");
     checkout = store.checkpointCoordinatorCheckout({
       ...checkout,
-      state: { ...checkout.state, worktreeRemoved: true },
+      state: { ...checkout.state, worktreeRemoval: "requested" },
     });
+    await Effect.runPromise(removeDiscardedCoordinatorWorktree(checkout));
     store.close();
 
     const discarded = await f.call("workgraph_checkout", {

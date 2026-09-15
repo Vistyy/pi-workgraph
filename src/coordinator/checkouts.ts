@@ -159,11 +159,20 @@ export function applyCheckout(
     if (checkout.state.kind !== "applied")
       return yield* Effect.die("Applied Coordinator checkout lost its lifecycle state.");
 
-    if (checkout.state.worktreeRemoved !== true) {
+    if (checkout.state.worktreeRemoval === undefined)
+      checkout = yield* checkpoint(storeOwner, {
+        ...checkout,
+        state: { ...checkout.state, worktreeRemoval: "requested" },
+      });
+
+    if (checkout.state.kind !== "applied")
+      return yield* Effect.die("Applied Coordinator checkout lost its lifecycle state.");
+
+    if (checkout.state.worktreeRemoval === "requested") {
       yield* removeAppliedCoordinatorWorktree(checkout);
       checkout = yield* checkpoint(storeOwner, {
         ...checkout,
-        state: { ...checkout.state, worktreeRemoved: true },
+        state: { ...checkout.state, worktreeRemoval: "confirmed" },
       });
     }
 
@@ -206,11 +215,20 @@ export function discardCheckout(
     if (checkout.state.kind !== "discarding")
       return yield* Effect.die("Discarding Coordinator checkout lost its lifecycle state.");
 
-    if (checkout.state.worktreeRemoved !== true) {
+    if (checkout.state.worktreeRemoval === undefined)
+      checkout = yield* checkpoint(storeOwner, {
+        ...checkout,
+        state: { ...checkout.state, worktreeRemoval: "requested" },
+      });
+
+    if (checkout.state.kind !== "discarding")
+      return yield* Effect.die("Discarding Coordinator checkout lost its lifecycle state.");
+
+    if (checkout.state.worktreeRemoval === "requested") {
       yield* removeDiscardedCoordinatorWorktree(checkout);
       checkout = yield* checkpoint(storeOwner, {
         ...checkout,
-        state: { ...checkout.state, worktreeRemoved: true },
+        state: { ...checkout.state, worktreeRemoval: "confirmed" },
       });
     }
 
