@@ -194,7 +194,7 @@ Workgraph does not intercept file operations, redirect paths, inject checkout st
 
 ### Delivery boundary
 
-Final local integration and publication use ordinary repository, forge, or session capabilities. The Coordinator contract owns route selection and authority; the packaged reference owns the selected pull-request procedure.
+Final local integration and publication use ordinary repository, forge, or session capabilities. The Coordinator contract owns route selection and authority; the packaged delivery reference owns the selected route's procedure.
 
 For a pull-request route, the reference guides initial publication, exact-result verification, and establishment of continued observation when a capability is available.
 
