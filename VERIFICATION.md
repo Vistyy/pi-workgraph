@@ -54,7 +54,7 @@ Use real disposable Git repositories through the registered coordinator/runtime 
 
 Application preparation must leave destination bytes, HEAD, and ref unchanged while proving source ref, base, Candidate lineage, destination identity, cleanliness, ancestry, and tree mergeability. The explicit apply flow must produce only the prepared structural result, record its exact revision, then release output. It must refuse to overwrite an ignored destination path tracked by the Candidate while allowing and preserving unrelated ignored artifacts. Recovery accepts only the exact expected Git structure; a switched, unrelated, or advanced destination blocks without rollback or automatic retry.
 
-Explicit discard must checkpoint its reason before deleting exact verified output. Separately prove that completed reports remove only their exact worktree, including uncommitted scratch, while non-completed Outcomes and failed cleanup preserve dirty or uncertain resources. No supported flow pushes or publishes.
+Explicit discard must checkpoint its reason before deleting exact verified output. Separately prove that completed reports remove only their exact worktree, including uncommitted scratch, while non-completed Outcomes and failed cleanup preserve dirty or uncertain resources. No repository-custody operation pushes or publishes.
 
 ## Coordinator checkouts
 
@@ -64,7 +64,7 @@ Observe the filesystem entry, direct branch ref, exhaustive worktree registratio
 
 Simulate a native creation command that returns failure after creating the exact worktree: only the exact requested commit and complete identity may recover as successful creation with a bounded diagnostic. A wrong post-create commit and every partial or uncertain postcondition must block without retry. Ordinary shutdown preserves the checkout; no database row, startup reconstruction, cache, background reconciliation, automatic cleanup, or path interception is involved.
 
-Make direct committed changes in the managed checkout and target a repository implementation Task at that path. Prove that its detached Worker Candidate applies into the Coordinator checkout rather than the source checkout. Final integration, publication, and cleanup belong to native repository or forge tooling and are not Workgraph checkout operations; do not retain lifecycle fixtures for them.
+Make direct committed changes in the managed checkout and target a repository implementation Task at that path. Prove that its detached Worker Candidate applies into the Coordinator checkout rather than the source checkout. Final integration, publication, and cleanup belong to native repository or forge tooling and are not Workgraph checkout operations; do not retain lifecycle fixtures for their native effects. Inspect the packaged Coordinator contract to establish that an accepted change without an explicit route stops for a delivery choice, and that only an already-selected pull-request route triggers the publication reference.
 
 ## Worker behavior
 
@@ -100,7 +100,7 @@ Representative render measurements are required for cost or responsiveness claim
 
 ## Extension and package smoke
 
-Load the registered coordinator and Worker extensions from the exact checkout through Pi's extension runtime, then drive session startup and shutdown to establish registration, role gating, guidance injection, and clean release of session-owned resources. Pack the exact revision, install it in a disposable consumer, and load both supported entry-point factories through the installed Pi extension loader. This disposable-consumer check establishes packaged extension loading and registration, not session lifecycle; archive inspection, module import alone, or build success does not establish that boundary.
+Load the registered coordinator and Worker extensions from the exact checkout through Pi's extension runtime, then drive session startup and shutdown to establish registration, role gating, guidance injection with the exact packaged publication-reference path, and clean release of session-owned resources. Pack the exact revision, install it in a disposable consumer, load both supported entry-point factories through the installed Pi extension loader, and read the installed publication reference. This disposable-consumer check establishes packaged extension loading, registration, and reference availability—not session lifecycle or a live forge publication; archive inspection, module import alone, or build success does not establish that boundary.
 
 [`package.json`](package.json) owns command definitions:
 

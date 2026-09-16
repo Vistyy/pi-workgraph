@@ -1,6 +1,6 @@
 /* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers -- This disposable consumer owns native package commands, timing, deadline, and cleanup. */
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -50,7 +50,17 @@ async function smokePackage(): Promise<void> {
     "--no-fund",
     tarballPath,
   ]);
+
   const packageRoot = join(consumer, "node_modules/@syzom/pi-workgraph");
+
+  const publicationReference = await readFile(
+    join(packageRoot, "references/publish-pr.md"),
+    "utf8",
+  );
+
+  if (!publicationReference.includes("# Publish an accepted change as a pull request"))
+    throw new Error("Packaged publication reference is missing or invalid.");
+
   const agentDir = join(parent, "agent");
   await mkdir(agentDir);
 
@@ -91,7 +101,7 @@ async function smokePackage(): Promise<void> {
     `,
   ]);
   process.stdout.write(
-    `${JSON.stringify({ status: "passed", boundary: "pack/install/load/extension-factories", totalMs: Date.now() - started })}\n`,
+    `${JSON.stringify({ status: "passed", boundary: "pack/install/load/extensions-and-reference", totalMs: Date.now() - started })}\n`,
   );
 }
 

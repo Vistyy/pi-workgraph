@@ -1,5 +1,6 @@
 /* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   type ExtensionAPI,
@@ -76,7 +77,19 @@ export interface CoordinatorOptions {
 
 export default function coordinator(pi: ExtensionAPI, options: CoordinatorOptions = {}): void {
   if (!isCoordinatorScope(process.env)) return;
-  const guidance = readFileSync(new URL("../COORDINATOR.md", import.meta.url), "utf8").trim();
+
+  const publicationReferencePath = fileURLToPath(
+    new URL("../references/publish-pr.md", import.meta.url),
+  );
+
+  const coordinatorContract = readFileSync(
+    new URL("../COORDINATOR.md", import.meta.url),
+    "utf8",
+  ).trim();
+
+  // Keep the optional procedure out of the system prompt; expose only where to read it.
+  const guidance = `${coordinatorContract}\n\nPR publication reference path (content not loaded): ${publicationReferencePath}`;
+
   const agentDir = options.agentDir ?? getAgentDir();
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
   const calm = installCalmMode(pi);

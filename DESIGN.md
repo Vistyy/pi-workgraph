@@ -10,9 +10,25 @@ This document owns the integrated rationale and durable constraints for Workgrap
 
 ## Source ownership
 
-Production source is grouped by cohesive feature ownership rather than generic technical layers. `src/coordinator/` owns coordinator-session orchestration, record persistence, deterministic Coordinator checkout identity, model policy, pending memory, and native Worker placement. `src/worker/` owns Worker policy, execution trajectory, TODO state, and Pi session behavior. `src/calm/` owns the complete presentation feature and its Pi compatibility seam. Shared structural vocabulary lives in `src/domain/`; repository custody remains one cohesive `src/repository.ts` boundary; and the small shared Effect/Node bridge remains `src/node-platform.ts`. The two files in `extensions/` are thin Pi host entry points.
+Files follow cohesive feature ownership rather than generic technical layers:
 
-Tests are grouped by the supported responsibility they exercise rather than mechanically mirroring each source module. Shared test construction lives only under `test/support/`.
+```text
+extensions/                 # thin Pi host entry points
+src/
+├── coordinator/            # session orchestration, records, models, checkouts, Worker placement
+├── worker/                 # Worker policy, execution trajectory, TODO state, Pi session behavior
+├── calm/                   # complete presentation feature and Pi compatibility seam
+├── domain/                 # shared structural vocabulary
+├── repository.ts           # all Git custody
+└── node-platform.ts        # small shared Effect/Node bridge
+references/
+└── publish-pr.md           # post-choice PR publication procedure
+
+test/
+└── support/                # shared test construction only
+```
+
+Tests are grouped by the supported responsibility they exercise rather than mechanically mirroring source modules.
 
 ## Coordination ownership
 
@@ -57,7 +73,7 @@ A collision-resistant identity derived from the exact Pi session and canonical G
 
 The managed path is the session's mutable integration destination. The Coordinator edits, commits, and verifies there, and repository implementation Tasks target it so detached Worker Candidates apply there through the existing Candidate flow. Workgraph does not intercept or redirect file operations, inject checkout state into prompts, persist checkout state, or reconcile resources in a background loop.
 
-Final local integration and publication use normal repository or forge tooling. Workgraph does not apply, discard, remove, or track publication of a Coordinator checkout. Cleanup waits until no Worker or pending Candidate decision depends on the checkout and uses ordinary non-force Git operations; refusal or uncertainty preserves remaining resources for explicit reporting. Complete later absence permits deterministic creation at the same path, while routine shutdown preserves the checkout.
+Final local integration and publication use normal repository or forge tooling rather than Workgraph repository operations. After accepting a change, the Coordinator classifies human-review need and recommends a delivery route, but stops for the user's choice unless that route was already explicit. Pull-request choice triggers the packaged publication reference; the reference guides one-time push and pull-request creation or update without discovery outside that contract, Workgraph publication state, merge authority, or monitoring. Cleanup waits until no Worker, pending Candidate decision, or delivery choice depends on the checkout and uses ordinary non-force Git operations; refusal or uncertainty preserves remaining resources for explicit reporting. Complete later absence permits deterministic creation at the same path, while routine shutdown preserves the checkout.
 
 ## Worker Pi trajectory
 
@@ -95,7 +111,7 @@ Repository custody is serialized within one coordinator session, not across sess
 
 Discard is explicitly destructive and requires a reason. It checkpoints the exact retained tip and disposition before deleting only the verified private ref or owned worktree. An unplaced extension child and an unclassified integration child pin their source output. Interruption recovery accepts only proven postconditions and never removes foreign or uncertain resources. Semantic Outcomes and routine shutdown cannot discard output.
 
-Applying a Candidate changes its recorded local destination only. Workgraph never publishes or finally integrates a Coordinator checkout; the Coordinator uses external repository or forge tooling from its managed branch as a separate deliberate action.
+Applying a Candidate changes its recorded local destination only. Workgraph repository operations never publish or finally integrate a Coordinator checkout; after the deliberate delivery choice, the Coordinator uses external repository or forge tooling from its managed branch.
 
 Coordinator mutation tools return persisted post-operation Attempt facts rather than a generic success flag, and exact Attempt inspection combines durable semantic and repository state with any current runtime blocker. Operations that may have partially persisted state do not roll back or create an operation ledger; failures identify the affected record for inspection before retry.
 

@@ -9,6 +9,6 @@ Keep guidance with its owning document instead of duplicating it.
 - `GLOSSARY.md` owns canonical project language. Read it before changing domain terms, relationships, or ownership.
 - `docs/adr/` records focused architectural decisions and their rationale. Read the relevant ADR before changing its decision.
 
-Keep `AGENTS.md`, `DESIGN.md`, `VERIFICATION.md`, `GLOSSARY.md`, and `docs/adr/` out of the npm package. Runtime source, `COORDINATOR.md`, and `README.md` belong in the package.
+Package only what installed operation needs: runtime entry points and source, injected Coordinator guidance and its references, and the human-facing guide. Keep contributor instructions, design rationale, verification policy, domain language, and decision records in the repository rather than the npm package.
 
 Production names and comments describe durable responsibilities, contracts, invariants, or safety facts, never delivery phases or change history.

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
@@ -127,9 +127,15 @@ void test("coordinator registers the exact strict tool surface", async () => {
       true,
     );
 
-    const guidance = (
+    const coordinatorContract = (
       await readFile(new URL("../../COORDINATOR.md", import.meta.url), "utf8")
     ).trim();
+
+    const publicationReferencePath = resolve("references/publish-pr.md");
+
+    const guidance = `${coordinatorContract}\n\nPR publication reference path (content not loaded): ${publicationReferencePath}`;
+
+    assert.equal(existsSync(publicationReferencePath), true);
 
     const injected = await f.runner.emitBeforeAgentStart(
       "Coordinate the request",
@@ -141,7 +147,12 @@ void test("coordinator registers the exact strict tool surface", async () => {
     assert.equal(
       injected?.systemPrompt,
       `Base coordinator prompt\n\n${guidance}`,
-      "the loaded coordinator extension injects the packaged guidance",
+      "the loaded coordinator extension injects the packaged guidance and reference path",
+    );
+    assert.equal(
+      injected?.systemPrompt.includes("# Publish an accepted change as a pull request"),
+      false,
+      "publication-reference content stays out of the system prompt",
     );
   } finally {
     await f.dispose();
