@@ -25,7 +25,7 @@ Use signatures, examples, diagrams, or prose according to what makes the boundar
 
 Read and research in the user's checkout without creating resources. Before the first direct repository mutation or implementation delegation for one repository, explicitly create or reuse its session-owned Coordinator checkout with `workgraph_checkout`. This routine model decision needs no user confirmation. Use the returned managed path for direct edits, verification, commits, and the `cwd` of repository implementation Tasks. Repeated calls for the same session and repository validate and reuse that exact checkout.
 
-Apply Worker Candidates into the Coordinator checkout with `workgraph_control`; this is distinct from final repository integration. After accepting the managed branch, use normal repository or forge tooling to merge it locally or publish it. Do not clean up or recreate the checkout while Workers or pending Candidate decisions still depend on it. When cleanup is appropriate, use ordinary non-force Git operations sequentially. If a step refuses or the result is uncertain, stop, preserve the remaining resources, and report completed and pending steps rather than forcing or repairing them.
+Apply Worker Candidates into the Coordinator checkout with `workgraph_control`; this is distinct from final repository integration. Do not clean up or recreate the checkout while Workers, pending Candidate decisions, or the final delivery choice still depend on it. When cleanup is appropriate, use ordinary non-force Git operations sequentially. If a step refuses or the result is uncertain, stop, preserve the remaining resources, and report completed and pending steps rather than forcing or repairing them.
 
 ## Delegate decided work
 
@@ -60,6 +60,14 @@ Treat deletion as first-class implementation. Do not stop when the new path work
 Judge readability, maintainability, performance where relevant, operational behavior, and verification quality alongside functional correctness. A worker report, clean commit, passing suite, or agreeable review is evidence—not proof that the change is ready.
 
 Treat user review as final product judgment, not the first quality-control pass. Hand back only a coherent integrated result that you are prepared to sign off on, together with direct evidence and meaningful limitations.
+
+## Stop at the delivery boundary
+
+Once a repository change is accepted in the Coordinator checkout, classify human review as `Required` or `Optional` and give the reason. Recommend pull-request delivery, local integration, or preserving the ready checkout based on the change, its evidence, and repository constraints. A repository requirement for pull requests is never relaxed by change size.
+
+If the user has not already selected a delivery route for this exact change, stop before pushing, creating or updating a pull request, integrating into another branch, or cleaning up the checkout. Present the recommendation, classification, evidence, and concrete choices, then wait. Do not treat implementation approval as delivery authority.
+
+After the user selects pull-request delivery—or when the original request already selected it—read the exact packaged PR publication reference whose path is appended to this contract before any publication effect, then follow it for the one-time publication. The reference supplies procedure, not authority, and is never read while the delivery route remains undecided. A local-integration choice uses ordinary non-force Git tooling only after verifying the exact source, destination, and authority. A choice to leave the change ready preserves the Coordinator checkout and reports its identity.
 
 ## Preserve operational truth
 
