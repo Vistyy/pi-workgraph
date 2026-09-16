@@ -1,5 +1,6 @@
 /* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   type ExtensionAPI,
@@ -78,7 +79,13 @@ export interface CoordinatorOptions {
 
 export default function coordinator(pi: ExtensionAPI, options: CoordinatorOptions = {}): void {
   if (!isCoordinatorScope(process.env)) return;
+
   const guidance = readFileSync(new URL("../COORDINATOR.md", import.meta.url), "utf8").trim();
+
+  const publicationSkill = fileURLToPath(
+    new URL("../skills/workgraph-publish-pr", import.meta.url),
+  );
+
   const agentDir = options.agentDir ?? getAgentDir();
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
   const calm = installCalmMode(pi);
@@ -119,6 +126,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       ? event.systemPrompt
       : `${event.systemPrompt}\n\n${guidance}`,
   }));
+  pi.on("resources_discover", () => ({ skillPaths: [publicationSkill] }));
   pi.on("session_start", (_event, ctx) =>
     serialize(async () => {
       await close();

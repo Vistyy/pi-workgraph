@@ -9,6 +9,6 @@ Keep guidance with its owning document instead of duplicating it.
 - `GLOSSARY.md` owns canonical project language. Read it before changing domain terms, relationships, or ownership.
 - `docs/adr/` records focused architectural decisions and their rationale. Read the relevant ADR before changing its decision.
 
-Keep `AGENTS.md`, `DESIGN.md`, `VERIFICATION.md`, `GLOSSARY.md`, and `docs/adr/` out of the npm package. Runtime source, `COORDINATOR.md`, and `README.md` belong in the package.
+Keep `AGENTS.md`, `DESIGN.md`, `VERIFICATION.md`, `GLOSSARY.md`, and `docs/adr/` out of the npm package. Runtime source, Coordinator-only skills, `COORDINATOR.md`, and `README.md` belong in the package.
 
 Production names and comments describe durable responsibilities, contracts, invariants, or safety facts, never delivery phases or change history.

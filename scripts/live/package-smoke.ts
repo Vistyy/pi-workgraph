@@ -62,7 +62,11 @@ async function smokePackage(): Promise<void> {
     "--input-type=module",
     "--eval",
     `
-      import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
+      import {
+        discoverAndLoadExtensions,
+        loadSkillsFromDir,
+      } from "@earendil-works/pi-coding-agent";
+      import { join } from "node:path";
       const [coordinatorPath, workerPath] = ${JSON.stringify(modules)};
       const agentDir = ${JSON.stringify(agentDir)};
       const one = (result, label, path) => {
@@ -88,10 +92,18 @@ async function smokePackage(): Promise<void> {
       );
       if (!worker.tools.has("workgraph_report") || worker.tools.has("workgraph_plan"))
         throw new Error("Packaged Worker factory did not register its research surface.");
+      const skills = loadSkillsFromDir({
+        dir: join(${JSON.stringify(packageRoot)}, "skills/workgraph-publish-pr"),
+        source: "installed-pi-workgraph",
+      });
+      if (skills.diagnostics.length > 0)
+        throw new Error("Packaged publication skill is invalid: " + JSON.stringify(skills.diagnostics));
+      if (skills.skills.length !== 1 || skills.skills[0]?.name !== "workgraph-publish-pr")
+        throw new Error("Packaged publication skill was not discovered exactly.");
     `,
   ]);
   process.stdout.write(
-    `${JSON.stringify({ status: "passed", boundary: "pack/install/load/extension-factories", totalMs: Date.now() - started })}\n`,
+    `${JSON.stringify({ status: "passed", boundary: "pack/install/load/extensions-and-skill", totalMs: Date.now() - started })}\n`,
   );
 }
 
