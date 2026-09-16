@@ -94,9 +94,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     coordinatorContractUrl,
   ).trim();
 
-  // References remain unloaded until the contract directs the Coordinator to read them.
-  const guidance = coordinatorContract;
-
   const agentDir = options.agentDir ?? getAgentDir();
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
   const calm = installCalmMode(pi);
@@ -133,9 +130,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   };
 
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: event.systemPrompt.endsWith(guidance)
+    systemPrompt: event.systemPrompt.endsWith(coordinatorContract)
       ? event.systemPrompt
-      : `${event.systemPrompt}\n\n${guidance}`,
+      : `${event.systemPrompt}\n\n${coordinatorContract}`,
   }));
   pi.on("session_start", (_event, ctx) =>
     serialize(async () => {
