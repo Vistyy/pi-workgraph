@@ -1,9 +1,4 @@
----
-name: workgraph-publish-pr
-description: Publish an accepted Workgraph Coordinator change as a pull request. Use only after pull-request delivery has already been explicitly selected; never use it to choose or authorize a delivery route.
----
-
-# Publish a Workgraph change as a pull request
+# Publish an accepted change as a pull request
 
 The explicit pull-request choice authorizes one-time publication of the accepted change. It does not authorize merging the pull request, monitoring it, responding to later activity, or changing the agreed scope.
 

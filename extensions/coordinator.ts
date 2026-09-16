@@ -80,11 +80,16 @@ export interface CoordinatorOptions {
 export default function coordinator(pi: ExtensionAPI, options: CoordinatorOptions = {}): void {
   if (!isCoordinatorScope(process.env)) return;
 
-  const guidance = readFileSync(new URL("../COORDINATOR.md", import.meta.url), "utf8").trim();
-
-  const publicationSkill = fileURLToPath(
-    new URL("../skills/workgraph-publish-pr", import.meta.url),
+  const publicationReference = fileURLToPath(
+    new URL("../references/publish-pr.md", import.meta.url),
   );
+
+  const coordinatorContract = readFileSync(
+    new URL("../COORDINATOR.md", import.meta.url),
+    "utf8",
+  ).trim();
+
+  const guidance = `${coordinatorContract}\n\nPR publication reference: ${publicationReference}`;
 
   const agentDir = options.agentDir ?? getAgentDir();
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
@@ -126,7 +131,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       ? event.systemPrompt
       : `${event.systemPrompt}\n\n${guidance}`,
   }));
-  pi.on("resources_discover", () => ({ skillPaths: [publicationSkill] }));
   pi.on("session_start", (_event, ctx) =>
     serialize(async () => {
       await close();

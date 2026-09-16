@@ -9,9 +9,25 @@ This document owns the integrated rationale and durable constraints for Workgrap
 
 ## Source ownership
 
-Production source is grouped by cohesive feature ownership rather than generic technical layers. `src/coordinator/` owns coordinator-session orchestration, record persistence, deterministic Coordinator checkout identity, model policy, pending memory, and native Worker placement. `src/worker/` owns Worker policy, execution trajectory, TODO state, and Pi session behavior. `src/calm/` owns the complete presentation feature and its Pi compatibility seam. Shared structural vocabulary lives in `src/domain/`; repository custody remains one cohesive `src/repository.ts` boundary; and the small shared Effect/Node bridge remains `src/node-platform.ts`. The two files in `extensions/` are thin Pi host entry points. `skills/workgraph-publish-pr/` owns the optional post-choice publication procedure and is discovered only by the Coordinator extension.
+Files follow cohesive feature ownership rather than generic technical layers:
 
-Tests are grouped by the supported responsibility they exercise rather than mechanically mirroring each source module. Shared test construction lives only under `test/support/`.
+```text
+extensions/                 # thin Pi host entry points
+src/
+├── coordinator/            # session orchestration, records, models, checkouts, Worker placement
+├── worker/                 # Worker policy, execution trajectory, TODO state, Pi session behavior
+├── calm/                   # complete presentation feature and Pi compatibility seam
+├── domain/                 # shared structural vocabulary
+├── repository.ts           # all Git custody
+└── node-platform.ts        # small shared Effect/Node bridge
+references/
+└── publish-pr.md           # post-choice PR publication procedure
+
+test/
+└── support/                # shared test construction only
+```
+
+Tests are grouped by the supported responsibility they exercise rather than mechanically mirroring source modules.
 
 ## Coordination ownership
 
@@ -54,7 +70,7 @@ A collision-resistant identity derived from the exact Pi session and canonical G
 
 The managed path is the session's mutable integration destination. The Coordinator edits, commits, and verifies there, and repository implementation Tasks target it so detached Worker Candidates apply there through the existing Candidate flow. Workgraph does not intercept or redirect file operations, inject checkout state into prompts, persist checkout state, or reconcile resources in a background loop.
 
-Final local integration and publication use normal repository or forge tooling rather than Workgraph repository operations. After accepting a change, the Coordinator classifies human-review need and recommends a delivery route, but stops for the user's choice unless that route was already explicit. Pull-request choice loads the packaged publication skill; the skill guides one-time push and pull-request creation or update without adding Workgraph publication state, merge authority, or monitoring. Cleanup waits until no Worker, pending Candidate decision, or delivery choice depends on the checkout and uses ordinary non-force Git operations; refusal or uncertainty preserves remaining resources for explicit reporting. Complete later absence permits deterministic creation at the same path, while routine shutdown preserves the checkout.
+Final local integration and publication use normal repository or forge tooling rather than Workgraph repository operations. After accepting a change, the Coordinator classifies human-review need and recommends a delivery route, but stops for the user's choice unless that route was already explicit. Pull-request choice triggers the packaged publication reference; the reference guides one-time push and pull-request creation or update without discovery outside that contract, Workgraph publication state, merge authority, or monitoring. Cleanup waits until no Worker, pending Candidate decision, or delivery choice depends on the checkout and uses ordinary non-force Git operations; refusal or uncertainty preserves remaining resources for explicit reporting. Complete later absence permits deterministic creation at the same path, while routine shutdown preserves the checkout.
 
 ## Worker Pi trajectory
 

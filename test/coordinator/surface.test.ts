@@ -4,7 +4,6 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
-import { loadSkillsFromDir } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
 import { RecordStore } from "../../src/coordinator/store.js";
@@ -118,9 +117,15 @@ void test("coordinator registers exactly nine strict tools", async () => {
       true,
     );
 
-    const guidance = (
+    const coordinatorContract = (
       await readFile(new URL("../../COORDINATOR.md", import.meta.url), "utf8")
     ).trim();
+
+    const publicationReference = resolve("references/publish-pr.md");
+
+    const guidance = `${coordinatorContract}\n\nPR publication reference: ${publicationReference}`;
+
+    assert.equal(existsSync(publicationReference), true);
 
     const injected = await f.runner.emitBeforeAgentStart(
       "Coordinate the request",
@@ -132,24 +137,7 @@ void test("coordinator registers exactly nine strict tools", async () => {
     assert.equal(
       injected?.systemPrompt,
       `Base coordinator prompt\n\n${guidance}`,
-      "the loaded coordinator extension injects the packaged guidance",
-    );
-
-    const resources = await f.runner.emitResourcesDiscover(f.root, "startup");
-    const skillPath = resolve("skills/workgraph-publish-pr");
-    assert.deepEqual(
-      resources.skillPaths.map((entry) => entry.path),
-      [skillPath],
-      "the Coordinator alone exposes the on-demand publication skill",
-    );
-    const skills = loadSkillsFromDir({ dir: skillPath, source: "pi-workgraph-test" });
-    assert.deepEqual(skills.diagnostics, []);
-    assert.deepEqual(
-      skills.skills.map((skill) => ({
-        name: skill.name,
-        disableModelInvocation: skill.disableModelInvocation,
-      })),
-      [{ name: "workgraph-publish-pr", disableModelInvocation: false }],
+      "the loaded coordinator extension injects the packaged guidance and reference path",
     );
   } finally {
     await f.dispose();
@@ -172,11 +160,6 @@ void test("coordinator extension remains inactive in Worker scope", async () => 
       await f.runner.emitBeforeAgentStart("Work", undefined, "Worker prompt", { cwd: f.root }),
       undefined,
     );
-    assert.deepEqual(await f.runner.emitResourcesDiscover(f.root, "startup"), {
-      skillPaths: [],
-      promptPaths: [],
-      themePaths: [],
-    });
   } finally {
     await f.dispose();
   }

@@ -67,7 +67,7 @@ Once a repository change is accepted in the Coordinator checkout, classify human
 
 If the user has not already selected a delivery route for this exact change, stop before pushing, creating or updating a pull request, integrating into another branch, or cleaning up the checkout. Present the recommendation, classification, evidence, and concrete choices, then wait. Do not treat implementation approval as delivery authority.
 
-After the user selects pull-request delivery—or when the original request already selected it—load the packaged `workgraph-publish-pr` skill before any publication effect and follow it for the one-time publication. A local-integration choice uses ordinary non-force Git tooling only after verifying the exact source, destination, and authority. A choice to leave the change ready preserves the Coordinator checkout and reports its identity.
+After the user selects pull-request delivery—or when the original request already selected it—read the exact packaged PR publication reference whose path is appended to this contract before any publication effect, then follow it for the one-time publication. The reference supplies procedure, not authority, and is never read while the delivery route remains undecided. A local-integration choice uses ordinary non-force Git tooling only after verifying the exact source, destination, and authority. A choice to leave the change ready preserves the Coordinator checkout and reports its identity.
 
 ## Preserve operational truth
 
