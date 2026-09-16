@@ -53,13 +53,10 @@ async function smokePackage(): Promise<void> {
 
   const packageRoot = join(consumer, "node_modules/@syzom/pi-workgraph");
 
-  const publicationReference = await readFile(
-    join(packageRoot, "references/publish-pr.md"),
-    "utf8",
-  );
+  const deliveryReference = await readFile(join(packageRoot, "references/delivery.md"), "utf8");
 
-  if (!publicationReference.includes("# Publish an accepted change as a pull request"))
-    throw new Error("Packaged publication reference is missing or invalid.");
+  if (!deliveryReference.includes("# Deliver an accepted repository change"))
+    throw new Error("Packaged delivery reference is missing or invalid.");
 
   const agentDir = join(parent, "agent");
   await mkdir(agentDir);

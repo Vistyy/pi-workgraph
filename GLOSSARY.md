@@ -27,7 +27,7 @@ A read-only advice Task with a question and optional context, executed by the po
 A read-only Task expressed as a natural-language request with optional context. It may assess relevant accessible material without requiring a typed subject, provenance chain, or exact revision unless its request depends on one.
 
 **Human sign-off**:
-The Maintainer's final delivery judgment. `Required` means the change must receive that judgment before delivery completes; `Optional` means the Coordinator considers its evidence sufficient without requiring it.
+The Maintainer's judgment that an accepted repository change may be finally integrated. `Required` means final integration must wait for that judgment; `Optional` means the Coordinator considers its evidence sufficient without requiring it. The classification does not itself authorize or perform integration.
 
 _Avoid_: Human review
 

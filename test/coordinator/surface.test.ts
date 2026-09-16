@@ -165,11 +165,11 @@ void test("coordinator registers the exact strict tool surface", async () => {
       await readFile(new URL("../../COORDINATOR.md", import.meta.url), "utf8")
     ).trim();
 
-    const publicationReferencePath = resolve("references/publish-pr.md");
+    const deliveryReferencePath = resolve("references/delivery.md");
 
-    const guidance = `${coordinatorContract}\n\nPR publication reference path (content not loaded): ${publicationReferencePath}`;
+    const guidance = `${coordinatorContract}\n\nDelivery reference path (content not loaded): ${deliveryReferencePath}`;
 
-    assert.equal(existsSync(publicationReferencePath), true);
+    assert.equal(existsSync(deliveryReferencePath), true);
 
     const injected = await f.runner.emitBeforeAgentStart(
       "Coordinate the request",
