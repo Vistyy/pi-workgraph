@@ -1,5 +1,5 @@
 import { existsSync, lstatSync } from "node:fs";
-import { isAbsolute, relative, sep } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MarkdownLink = /\[([^\]\n]+)\]\(([^)\s]+)\)/gu;
@@ -15,6 +15,23 @@ function codeSpan(value: string): string {
   return `${delimiter}${value}${delimiter}`;
 }
 
+function isPackageFile(packageRoot: string, packagePath: string): boolean {
+  const segments = packagePath.split(sep);
+  let current = packageRoot;
+
+  return segments.every((segment, index) => {
+    current = join(current, segment);
+
+    if (!existsSync(current)) return false;
+
+    const status = lstatSync(current);
+
+    if (status.isSymbolicLink()) return false;
+
+    return index === segments.length - 1 ? status.isFile() : status.isDirectory();
+  });
+}
+
 function resolvePackagePath(target: string, source: URL, packageRoot: string) {
   if (target.startsWith("/") || UriScheme.test(target))
     throw new Error(`Coordinator reference is not package-relative: ${target}`);
@@ -28,7 +45,7 @@ function resolvePackagePath(target: string, source: URL, packageRoot: string) {
   if (packagePath === ".." || packagePath.startsWith(`..${sep}`) || isAbsolute(packagePath))
     throw new Error(`Coordinator reference escapes its package: ${target}`);
 
-  if (!existsSync(resolvedPath) || !lstatSync(resolvedPath).isFile())
+  if (!isPackageFile(packageRoot, packagePath))
     throw new Error(`Coordinator reference is not a packaged file: ${resolvedPath}`);
 
   if (/[\r\n]/u.test(resolvedPath))

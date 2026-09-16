@@ -12,13 +12,18 @@ void test("packaged guidance resolves only package-local regular files", async (
   const references = join(packageRoot, "references");
   const delivery = join(references, "delivery.md");
   const outside = join(parent, "outside.md");
+  const outsideReferences = join(parent, "outside-references");
   const linkedOutside = join(references, "linked.md");
+  const linkedReferences = join(packageRoot, "linked-references");
 
   try {
     await mkdir(references, { recursive: true });
+    await mkdir(outsideReferences);
     await writeFile(delivery, "# Delivery\n");
     await writeFile(outside, "# Outside\n");
+    await writeFile(join(outsideReferences, "delivery.md"), "# Outside delivery\n");
     await symlink(outside, linkedOutside);
+    await symlink(outsideReferences, linkedReferences);
 
     const source = pathToFileURL(join(packageRoot, "COORDINATOR.md"));
 
@@ -47,6 +52,10 @@ void test("packaged guidance resolves only package-local regular files", async (
     );
     assert.throws(
       () => resolvePackagedLinks("[symlink](references/linked.md)", source),
+      /is not a packaged file/,
+    );
+    assert.throws(
+      () => resolvePackagedLinks("[ancestor](linked-references/delivery.md)", source),
       /is not a packaged file/,
     );
     assert.throws(
