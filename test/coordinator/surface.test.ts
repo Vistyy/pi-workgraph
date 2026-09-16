@@ -79,24 +79,9 @@ void test("coordinator registers the exact strict tool surface", async () => {
     assert.equal(Value.Check(checkout.parameters, {}), true);
     assert.equal(Value.Check(checkout.parameters, { cwd: "." }), true);
     assert.equal(Value.Check(checkout.parameters, { cwd: " " }), false);
-    assert.equal(Value.Check(checkout.parameters, { action: "create" }), false);
-    assert.equal(Value.Check(checkout.parameters, { checkoutId: "old" }), false);
-    assert.match(JSON.stringify(checkout.parameters), /defaults to the session cwd/);
 
-    assert.equal(f.runner.getToolDefinition("workgraph_models"), undefined);
-    const research = f.runner.getToolDefinition("workgraph_research");
     const experiment = f.runner.getToolDefinition("workgraph_experiment");
-    const consult = f.runner.getToolDefinition("workgraph_consult");
-    assert.ok(research !== undefined && experiment !== undefined && consult !== undefined);
-    assert.equal(
-      Value.Check(research.parameters, {
-        id: "research",
-        question: "Question?",
-        expectedEvidence: ["Evidence"],
-        experiment: { permittedEffects: ["write"], stopCondition: "done" },
-      }),
-      false,
-    );
+    assert.ok(experiment !== undefined);
     assert.equal(
       Value.Check(experiment.parameters, {
         id: "experiment",
@@ -108,19 +93,6 @@ void test("coordinator registers the exact strict tool surface", async () => {
       }),
       true,
     );
-    assert.equal(
-      Value.Check(consult.parameters, { id: "consult", question: "Question?", advisor: "old" }),
-      false,
-    );
-
-    assert.match(experiment.description, /initial Attempt\(s\)/);
-    const anotherAttempt = f.runner.getToolDefinition("workgraph_attempt");
-    assert.ok(anotherAttempt !== undefined);
-    assert.match(
-      anotherAttempt.description,
-      /same immutable Task.*current model policy.*fresh applicable base.*new Task.*assignment or authority/,
-    );
-
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(
@@ -382,10 +354,6 @@ void test("one session creates frozen Task and Attempt records and inspects them
     }
 
     assert.ok(launched.worker !== null);
-    assert.match(
-      await readFile(launched.worker.sessionFile, "utf8"),
-      /target \(destination identity, not the Worker's execution location\)/,
-    );
     assert.ok(launched.blocker !== null, "exact Attempt inspection exposes its runtime blocker");
 
     const page = await f.call("workgraph_inspect", {

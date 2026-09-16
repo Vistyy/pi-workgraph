@@ -66,8 +66,6 @@ Replace every example ID with a model configured in Pi. Thinking may be `off`, `
 
 Research and review roles are ordered nonempty lists; their first target is the default, and additional entries permit model-diverse initial Attempts. Consultation has one advisor target. The implementation guide and executor are also single targets. `implementation.escalationExecutor` may be omitted; it is used only when the coordinator explicitly requests it, and such a request fails before Task creation when the role is absent. Model and thinking choices are frozen into each Attempt, while its Outcome records the models Pi actually used.
 
-The policy is strict executable configuration, not a migrated data format. An older array-shaped `consultation.advisor` is invalid: choose one advisor and replace the array with that target object. Workgraph never selects from or rewrites an obsolete policy shape.
-
 ## Coordinator tools
 
 Workgraph exposes these coordinator tools:

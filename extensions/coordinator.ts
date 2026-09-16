@@ -12,7 +12,6 @@ import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
 import { createCheckout } from "../src/coordinator/checkouts.js";
 import type { HerdrCliRuntime } from "../src/coordinator/herdr.js";
 import {
-  configuredTarget,
   implementationTargets,
   loadModelPolicy,
   type ModelPolicy,
@@ -240,7 +239,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         ...(params.selection === undefined ? {} : { selection: params.selection }),
       }),
     serialize,
-    "Each selected Attempt independently receives the permitted effects and stop condition. Use one Attempt unless parallel external effects are independent or explicitly coordinated.",
   );
 
   registerTask(
@@ -680,16 +678,12 @@ function selectionForAttempt(
   if (contract.kind === "consultation")
     return { kind: "target", target: { ...policy.roles["consultation.advisor"] } };
 
-  return {
-    kind: "target",
-    target: configuredTarget(
-      policy,
-      Match.value(contract.kind).pipe(
-        Match.when("review", () => "review" as const),
-        Match.orElse(() => "research" as const),
-      ),
-    ),
-  };
+  const role = Match.value(contract.kind).pipe(
+    Match.when("review", () => "review" as const),
+    Match.orElse(() => "research" as const),
+  );
+
+  return { kind: "target", target: { ...policy.roles[role][0] } };
 }
 
 async function baseForAttempt(
@@ -868,12 +862,11 @@ function registerTask<S extends TSchema>(
   parameters: S,
   run: (params: Static<S>, ctx: ExtensionContext) => Promise<object>,
   serialize: <A>(run: () => Promise<A>) => Promise<A>,
-  contractNote?: string,
 ): void {
   pi.registerTool({
     name,
     label: `Workgraph ${label}`,
-    description: `Create one immutable ${label} Task and its initial Attempt(s).${contractNote === undefined ? "" : ` ${contractNote}`}`,
+    description: `Create one immutable ${label} Task with its selected initial Attempts.`,
     parameters,
     execute(_id, params, _signal, _update, ctx) {
       return serialize(() => run(params as Static<S>, ctx).then(result));

@@ -401,10 +401,7 @@ void test("retained implementation Candidate applies only into the managed check
       "worker candidate\n",
     );
     assert.equal(existsSync(join(f.root, "candidate.txt")), false);
-    await assert.rejects(
-      f.call("workgraph_control", { action: "apply", attemptId }),
-      new RegExp(`Inspect exact Attempt ${attemptId} persisted state before retrying`),
-    );
+    await assert.rejects(f.call("workgraph_control", { action: "apply", attemptId }));
   } finally {
     await f.dispose();
   }

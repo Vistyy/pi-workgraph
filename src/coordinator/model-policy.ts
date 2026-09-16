@@ -15,16 +15,6 @@ type ModelTargetList = [ModelTarget, ...ModelTarget[]];
 
 const ModelTargetListSchema = Type.Array(ModelTargetSchema, { minItems: 1 });
 
-const ObsoleteAdvisorArrayPolicySchema = Type.Object(
-  {
-    roles: Type.Object(
-      { "consultation.advisor": Type.Array(Type.Unknown()) },
-      { additionalProperties: true },
-    ),
-  },
-  { additionalProperties: true },
-);
-
 const ModelPolicySchema = Type.Object(
   {
     roles: Type.Object(
@@ -145,10 +135,6 @@ function decodeModelPolicyEffect(
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Policy JSON is unknown until this strict boundary accepts it.
 function decodeModelPolicy(value: unknown): ModelPolicy {
-  if (Value.Check(ObsoleteAdvisorArrayPolicySchema, value))
-    throw new Error(
-      "Invalid Workgraph model policy: consultation.advisor must be exactly one target. Select one target and convert the array to a ModelTarget object.",
-    );
   const issue = Value.Errors(ModelPolicySchema, value)[0];
 
   if (issue !== undefined) {
@@ -176,10 +162,6 @@ function rejectDuplicateModels(role: ListModelRole, targets: ModelTargetList): v
   }
 }
 
-export function configuredTarget(policy: ModelPolicy, role: ListModelRole): ModelTarget {
-  return exactTarget(policy.roles[role][0]);
-}
-
 export function resolveSelection<Role extends ListModelRole>(
   role: Role,
   request: SelectionRequest | undefined,
@@ -202,8 +184,7 @@ export function resolveSelection<Role extends ListModelRole>(
       );
     selected = configured.slice(0, count).map(exactTarget);
   } else {
-    const target = configuredTarget(policy, role);
-    selected = Array.from({ length: count }, () => exactTarget(target));
+    selected = Array.from({ length: count }, () => exactTarget(policy.roles[role][0]));
   }
 
   return { role, count, distinctModels, selected };

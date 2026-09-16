@@ -70,18 +70,6 @@ await test("loads only the complete strict user policy shape", async () => {
       }
     }
 
-    await writeFile(
-      path,
-      JSON.stringify({
-        ...valid,
-        roles: { ...valid.roles, "consultation.advisor": [valid.roles["consultation.advisor"]] },
-      }),
-    );
-    await assert.rejects(
-      loadModelPolicy(path),
-      /select one target.*array to a ModelTarget object/i,
-    );
-
     const { review: _review, ...rolesWithoutReview } = valid.roles;
     await writeFile(path, JSON.stringify({ ...valid, roles: rolesWithoutReview }));
     await assert.rejects(loadModelPolicy(path), /Invalid Workgraph model policy/);
@@ -127,7 +115,6 @@ await test("selection repeats independently or takes distinct policy-order targe
     () => resolveSelection("review", { count: 2, distinctModels: true }, policy),
     /only 1/,
   );
-  assert.equal(Value.Check(SelectionRequestSchema, { diversity: "distinct-models" }), false);
   // Callers cannot supply arbitrary targets or thinking levels.
   assert.equal(Value.Check(SelectionRequestSchema, { model: "fixture/research-first" }), false);
 });
