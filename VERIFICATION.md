@@ -25,7 +25,9 @@ The record contract is defined by [Record store](DESIGN.md#record-store) and [St
 
 Exercise the native SQLite store through separate instances for exact Coordinator sessions. Establish transaction rollback, session partitioning, immutable Task and Attempt specifications, write-once Outcomes, and strict decoding from actual persisted rows. A focused mutation of one persisted field should make the supported read reject that field; TypeBox acceptance of supplied values does not establish this boundary.
 
-Worker report consistency must be checked where the runtime-injected role meets persisted Outcome insertion. Arbitrary external database tampering is not a supported recovery interface, so do not maintain a general corruption matrix. Likewise, do not add migration, aggregate-reconstruction, lease, or cross-session-discovery fixtures unless those become supported responsibilities.
+Worker report consistency must be checked where the runtime-injected role meets persisted Outcome insertion. A nonempty database with an unsupported schema version must reject before initialization; this focused version gate is distinct from arbitrary corruption or migration coverage.
+
+Arbitrary external database tampering is not a supported recovery interface, so do not maintain a general corruption matrix. Likewise, do not add migration, aggregate-reconstruction, lease, or cross-session-discovery fixtures unless those become supported responsibilities.
 
 ### Worker lifecycle, reports, and models
 
@@ -77,6 +79,8 @@ Exercise the [Implementation trajectory](DESIGN.md#implementation-trajectory) in
 
 For guide-to-executor cutover, distinguish the two required facts—a valid TODO and a successful direct edit or write—from shell commands, observations, failed mutations, and Git dirtiness. Observe exact model and thinking selection, one executor marker, guide-policy replacement on the next provider request, and an executor assistant message before changed completion. Selection failure must stay guide-owned, block further direct mutation, remain reportable, and never retry automatically.
 
+When an executor becomes idle with actionable TODOs and no report, establish through the Worker session that it receives at most two continuation reminders and may still report truthfully; TODO status is navigation, not a completion gate.
+
 Synthetic event-handler calls are useful component checks, but they do not establish the real provider-request trajectory or compaction boundary.
 
 ### Coordinator surface and notepad
@@ -95,7 +99,7 @@ Projection fixtures establish classification and caching, not compatibility with
 
 ### Extension and package
 
-Load Coordinator and Worker extensions from the exact checkout through Pi's extension runtime to establish registration, role gating, guidance injection with the delivery-reference path, and clean release of session-owned resources.
+Load Coordinator and Worker extensions from the exact checkout through Pi's extension runtime to establish registration, role gating, guidance injection with resolved package-local reference links, and clean release of session-owned resources.
 
 Pack the exact revision, install it in a disposable consumer, load both supported extension entry points, and read the installed delivery reference. Archive inspection, source-tree import, or build success does not establish installed package loading. The package check does not establish real Worker lifecycle, native integration, or forge publication.
 

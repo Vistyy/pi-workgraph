@@ -1,5 +1,6 @@
 /* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { isAbsolute, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
@@ -84,20 +85,43 @@ export interface CoordinatorOptions {
   readonly herdr?: HerdrCliRuntime;
 }
 
+const MarkdownLinkTarget = /(?<=\]\()[^)\s]+(?=\))/gu;
+
+function resolvePackagedLinks(markdown: string, source: URL): string {
+  const packageRoot = fileURLToPath(new URL(".", source));
+
+  return markdown.replace(MarkdownLinkTarget, (target) => {
+    if (target.startsWith("#") || target.startsWith("/") || /^[a-z][a-z\d+.-]*:/iu.test(target))
+      return target;
+
+    const resolvedUrl = new URL(target, source);
+    const fragment = resolvedUrl.hash;
+    resolvedUrl.hash = "";
+    const resolvedPath = fileURLToPath(resolvedUrl);
+    const packagePath = relative(packageRoot, resolvedPath);
+
+    if (packagePath === ".." || packagePath.startsWith(`..${sep}`) || isAbsolute(packagePath))
+      throw new Error(`Coordinator reference escapes its package: ${target}`);
+
+    if (!existsSync(resolvedPath))
+      throw new Error(`Coordinator reference does not exist: ${resolvedPath}`);
+
+    return `${resolvedPath}${fragment}`;
+  });
+}
+
 export default function coordinator(pi: ExtensionAPI, options: CoordinatorOptions = {}): void {
   if (!isCoordinatorScope(process.env)) return;
 
-  const deliveryReferencePath = fileURLToPath(
-    new URL("../references/delivery.md", import.meta.url),
-  );
+  const coordinatorContractUrl = new URL("../COORDINATOR.md", import.meta.url);
 
-  const coordinatorContract = readFileSync(
-    new URL("../COORDINATOR.md", import.meta.url),
-    "utf8",
+  const coordinatorContract = resolvePackagedLinks(
+    readFileSync(coordinatorContractUrl, "utf8"),
+    coordinatorContractUrl,
   ).trim();
 
-  // Keep the optional procedure out of the system prompt; expose only where to read it.
-  const guidance = `${coordinatorContract}\n\nDelivery reference path (content not loaded): ${deliveryReferencePath}`;
+  // References remain unloaded until the contract directs the Coordinator to read them.
+  const guidance = coordinatorContract;
 
   const agentDir = options.agentDir ?? getAgentDir();
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);

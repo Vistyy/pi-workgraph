@@ -1,8 +1,24 @@
 # Deliver an accepted repository change
 
-Read this procedure only after the user has selected a delivery route for the exact accepted change, or when a later delivered observation returns the Coordinator to its pull request.
+Read this procedure only when an accepted repository change reaches the delivery boundary, or when a later delivered observation returns the Coordinator to its pull request.
 
-This procedure supplies mechanics, not authority. Each route permits only its stated effects under the existing task authority.
+This procedure supplies mechanics, not authority.
+
+## Choose a delivery route
+
+Human sign-off is the repository maintainer's judgment that an accepted change may be finally integrated. `Required` means final integration waits for that judgment; `Optional` means the Coordinator considers its evidence sufficient without requiring it. Classification itself grants no repository authority, and a Worker Review is not Human sign-off.
+
+After accepting a repository change:
+
+1. Classify Human sign-off as `Required` or `Optional`, and give the reason.
+2. Recommend pull-request delivery, local integration, or preserving the ready checkout.
+3. If the user has not already selected a route for this exact change, stop before publishing, integrating, or cleaning up and wait.
+
+A repository requirement for pull requests is never relaxed by change size. Implementation approval is not delivery authority.
+
+## Route authority
+
+Each route permits only its stated effects under the existing task authority.
 
 | Selected route | Authorizes | Does not authorize |
 | --- | --- | --- |
@@ -10,7 +26,7 @@ This procedure supplies mechanics, not authority. Each route permits only its st
 | Local integration | Integrate the exact accepted change into the exact authorized local destination with ordinary non-force Git operations. | Publish remotely, force, add unrelated work, or change the destination or scope. |
 | Preserve checkout | Retain the exact Coordinator checkout and report its identity and state. | Commit, integrate, publish, or clean up merely to make the handback neater. |
 
-A pull request requests Maintainer consideration. It does not satisfy `Required` Human sign-off for final integration.
+A pull request requests repository maintainer consideration. It does not satisfy `Required` Human sign-off for final integration.
 
 ## Confirm the accepted source
 
@@ -70,7 +86,7 @@ Do not:
 
 - claim evidence that was not observed;
 - expose local paths, credentials, private logs, or unpublished local artifacts; or
-- link screenshots or other media without a deliberate Maintainer-accessible destination.
+- link screenshots or other media without a deliberate destination accessible to the repository maintainer.
 
 ### Publish and verify
 

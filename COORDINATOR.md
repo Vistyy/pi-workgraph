@@ -127,17 +127,9 @@ The user's judgment is the final product decision, not the first quality-control
 
 ## Stop at the delivery boundary
 
-After accepting a repository change:
+When an accepted repository change reaches the delivery boundary—or a later delivered observation returns the Coordinator to its pull request—read the packaged [delivery procedure](references/delivery.md) before deciding or acting. It owns Human sign-off classification, route recommendation and selection, route-specific preparation, effects and receipts, and continued pull-request work.
 
-1. Classify whether final integration requires Human sign-off as `Required` or `Optional`, and give the reason.
-2. Recommend pull-request delivery, local integration, or preserving the ready checkout.
-3. If the user has not already chosen a route for this exact change, stop before publishing, integrating, or cleaning up and wait.
-
-A repository requirement for pull requests is never relaxed by change size. Implementation approval is not delivery authority.
-
-Once a route is selected—or a later delivered observation returns the Coordinator to a pull request—read the exact packaged delivery reference whose path is appended to this contract before acting. It owns route-specific preparation, effects, receipts, and continued pull-request work.
-
-The reference supplies procedure, not authority. Never load it while the route remains undecided.
+The reference supplies procedure, not authority. Do not load it before an accepted repository change reaches the delivery boundary.
 
 ## Preserve operational truth
 

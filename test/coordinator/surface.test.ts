@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
@@ -165,9 +166,11 @@ void test("coordinator registers the exact strict tool surface", async () => {
       await readFile(new URL("../../COORDINATOR.md", import.meta.url), "utf8")
     ).trim();
 
-    const deliveryReferencePath = resolve("references/delivery.md");
+    const deliveryReferencePath = fileURLToPath(
+      new URL("../../references/delivery.md", import.meta.url),
+    );
 
-    const guidance = `${coordinatorContract}\n\nDelivery reference path (content not loaded): ${deliveryReferencePath}`;
+    const guidance = coordinatorContract.replace("references/delivery.md", deliveryReferencePath);
 
     assert.equal(existsSync(deliveryReferencePath), true);
 
@@ -181,12 +184,13 @@ void test("coordinator registers the exact strict tool surface", async () => {
     assert.equal(
       injected?.systemPrompt,
       `Base coordinator prompt\n\n${guidance}`,
-      "the loaded coordinator extension injects the packaged guidance and reference path",
+      "the loaded coordinator extension resolves the contract's package-local reference",
     );
+    assert.equal(injected?.systemPrompt.includes("Delivery reference path"), false);
     assert.equal(
-      injected?.systemPrompt.includes("# Publish an accepted change as a pull request"),
+      injected?.systemPrompt.includes("# Deliver an accepted repository change"),
       false,
-      "publication-reference content stays out of the system prompt",
+      "delivery-procedure content stays out of the system prompt",
     );
   } finally {
     await f.dispose();

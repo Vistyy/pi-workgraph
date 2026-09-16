@@ -92,18 +92,7 @@ Before repository mutation, the Coordinator calls `workgraph_checkout`. The retu
 
 Implementation Workers use detached worktrees. Their committed results can become retained Candidates, which the Coordinator may apply into its managed checkout with `workgraph_control`.
 
-Workgraph does not perform final integration or publication. When no delivery route is already explicit, the Coordinator:
-
-1. classifies whether final integration requires Human sign-off;
-2. recommends pull-request delivery, local integration, or preserving the ready checkout; and
-3. waits for the user's choice.
-
-For pull-request delivery:
-
-- publish the exact accepted change;
-- establish continued observation when a suitable capability is available;
-- treat later observations as information, not new authority; and
-- allow same-scope updates to the same pull request, but never merging, force-pushing, unrelated work, or expanded scope.
+Workgraph does not perform final integration or publication. When an accepted change reaches the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to classify [Human sign-off](references/delivery.md#choose-a-delivery-route), recommend a route, and carry out only the selected route's authorized effects. Without an explicit route, it waits for the user's choice.
 
 ## Task types
 
