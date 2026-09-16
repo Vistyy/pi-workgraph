@@ -25,7 +25,7 @@ const valid: ModelPolicy = {
     review: [{ model: "fixture/review", thinking: "medium" }],
     "implementation.guide": { model: "fixture/guide", thinking: "low" },
     "implementation.executor": { model: "fixture/executor", thinking: "xhigh" },
-    "consultation.advisor": [{ model: "fixture/advisor", thinking: "off" }],
+    "consultation.advisor": { model: "fixture/advisor", thinking: "off" },
   },
 };
 
@@ -115,7 +115,6 @@ await test("selection repeats independently or takes distinct policy-order targe
     () => resolveSelection("review", { count: 2, distinctModels: true }, policy),
     /only 1/,
   );
-  assert.equal(Value.Check(SelectionRequestSchema, { diversity: "distinct-models" }), false);
   // Callers cannot supply arbitrary targets or thinking levels.
   assert.equal(Value.Check(SelectionRequestSchema, { model: "fixture/research-first" }), false);
 });

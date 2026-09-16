@@ -54,16 +54,17 @@ Before using Workgraph, create `~/.pi/agent/workgraph/models.json`. Workgraph su
     "review": [
       { "model": "provider/review-model", "thinking": "high" }
     ],
-    "consultation.advisor": [
-      { "model": "provider/advisor-model", "thinking": "medium" }
-    ]
+    "consultation.advisor": {
+      "model": "provider/advisor-model",
+      "thinking": "medium"
+    }
   }
 }
 ```
 
 Replace every example ID with a model configured in Pi. Thinking may be `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`.
 
-Research, review, and consultation roles are ordered nonempty lists; their first target is the default. The implementation guide and executor are single targets. `implementation.escalationExecutor` may be omitted; it is used only when the coordinator explicitly requests it, and such a request fails before Task creation when the role is absent. Additional list entries let the coordinator request model diversity. Model and thinking choices are frozen into each Attempt, while its Outcome records the models Pi actually used.
+Research and review roles are ordered nonempty lists; their first target is the default, and additional entries permit model-diverse initial Attempts. Consultation has one advisor target. The implementation guide and executor are also single targets. `implementation.escalationExecutor` may be omitted; it is used only when the coordinator explicitly requests it, and such a request fails before Task creation when the role is absent. Model and thinking choices are frozen into each Attempt, while its Outcome records the models Pi actually used.
 
 ## Coordinator tools
 
@@ -71,10 +72,10 @@ Workgraph exposes these coordinator tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `workgraph_models` | List configured targets for a selectable role. |
 | `workgraph_checkout` | Create or exactly reuse this session's deterministic branch-backed checkout. |
-| `workgraph_research` | Create evidence-seeking research or a bounded repository experiment. |
-| `workgraph_consult` | Ask one configured advisor a precise, evidence-only question. |
+| `workgraph_research` | Create a read-only evidence-seeking Research Task. |
+| `workgraph_experiment` | Create a repository Experiment with explicit permitted effects and a stop condition. |
+| `workgraph_consult` | Ask the configured advisor a precise, evidence-only question. |
 | `workgraph_implement` | Create an implementation Task and its first Attempt. |
 | `workgraph_review` | Review an exact Attempt, comparison, or repository revision. |
 | `workgraph_attempt` | Create another fresh Attempt for an existing Task. |
@@ -88,9 +89,13 @@ Before mutating a repository, the Coordinator calls `workgraph_checkout` and use
 
 When an accepted change has no explicit delivery route, the Coordinator stops before those final effects, classifies whether human review is required, recommends pull-request delivery, local integration, or preserving the ready checkout, and waits for the user's choice. If pull-request delivery is selected, the Coordinator then reads its packaged publication reference for a concise visual explanation, claim-appropriate evidence, and one-time publication with the complete resulting URL; it does not merge or monitor the pull request.
 
-A Task has one immutable resolved target. Directory targets record an exact path. Repository targets record the checkout root and Git common directory, so Tasks in one session may safely address different repositories without implying a transaction across them. Every Attempt inherits its Task target and starts one fresh Worker Pi session.
+A Task has one immutable resolved target. Directory targets record an exact path. Repository targets record the checkout root and Git common directory, so Tasks in one session may safely address different repositories without implying a transaction across them. Every Attempt inherits its Task target and starts one fresh Worker Pi session. `workgraph_attempt` creates another execution of that unchanged assignment; a changed objective, acceptance condition, or authority requires a new Task.
+
+Research is read-only. An Experiment is evidence-seeking research with explicit effects and a stop condition, executed in a repository worktree. Those limits apply independently to every selected Attempt; use one Attempt unless parallel external effects are independent or explicitly coordinated. Experiment commits may remain as retained repository output for inspection or discard, but they are not applicable implementation Candidates. A completed Experiment relinquishes uncommitted worktree scratch, so durable observations belong in its report, a commit, or an explicitly permitted artifact.
 
 Repository Attempts execute in detached worktrees. On a completed report, only commits survive; commit intended output before reporting. Changed commits are retained at `refs/pi-workgraph/outputs/<attemptId>`, while non-completed dirty worktrees and uncertain resources are preserved. Implementation Attempts can start independently, extend a retained Candidate, or integrate one onto another base. Candidate application and discard remain explicit Workgraph operations.
+
+An Implementation Worker may change only its fixed assigned worktree and the Git state needed to commit that worktree; changing shell directories does not change that authority. Repository paths in its assignment refer to corresponding paths in the assigned worktree. It may inspect elsewhere, but must not modify another checkout or publish. Worktrees and tool policy establish custody rather than a security sandbox.
 
 Stopping or reloading the coordinator stops only coordinator-owned activity. Coordinator checkouts, independent Worker sessions, Herdr tabs, retained refs, and uncertain resources remain available for inspection or deliberate action.
 

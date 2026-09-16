@@ -26,6 +26,18 @@ const TodoSchema = Type.Object(
 
 const TodoListSchema = Type.Array(TodoSchema, { minItems: 1, maxItems: 9 });
 
+const TodoSetItemSchema = Type.Object(
+  {
+    id: TodoIdSchema,
+    text: NonBlank,
+    validation: NonBlank,
+    note: Type.Optional(Type.String()),
+  },
+  { additionalProperties: false },
+);
+
+const TodoSetListSchema = Type.Array(TodoSetItemSchema, { minItems: 1, maxItems: 9 });
+
 const TodoPatchSchema = Type.Object(
   {
     text: Type.Optional(NonBlank),
@@ -38,9 +50,8 @@ const TodoPatchSchema = Type.Object(
 
 export const WorkerPlanToolSchema = Type.Union(
   [
-    Type.Object({ action: Type.Literal("get") }, { additionalProperties: false }),
     Type.Object(
-      { action: Type.Literal("set"), todos: TodoListSchema },
+      { action: Type.Literal("set"), todos: TodoSetListSchema },
       { additionalProperties: false },
     ),
     Type.Object(
@@ -53,7 +64,7 @@ export const WorkerPlanToolSchema = Type.Union(
 
 const PlanResultDetailsSchema = Type.Object(
   {
-    action: Type.Union([Type.Literal("get"), Type.Literal("set"), Type.Literal("update")]),
+    action: Type.Union([Type.Literal("set"), Type.Literal("update")]),
     todos: Type.Optional(TodoListSchema),
   },
   { additionalProperties: false },
@@ -86,7 +97,7 @@ export function contractFailure(message: string) {
   return Effect.fail(new WorkerContractError({ message }));
 }
 
-function validTodos(todos: readonly WorkerTodo[]): boolean {
+function validTodos(todos: readonly { readonly id: string }[]): boolean {
   return new Set(todos.map((todo) => todo.id)).size === todos.length;
 }
 
@@ -114,12 +125,18 @@ export class WorkerPlanState {
   }
 
   execute(input: WorkerPlanToolInput): Effect.Effect<WorkerPlanToolResult, WorkerContractError> {
-    if (input.action === "get") return Effect.succeed(this.result("get"));
-
     if (input.action === "set") {
+      if (this.todos !== undefined)
+        return contractFailure(
+          "TODO is already initialized; use workgraph_plan update thereafter.",
+        );
+
       if (!validTodos(input.todos))
         return contractFailure("TODO ids must be unique; no changes were made.");
-      this.todos = structuredClone(input.todos);
+      this.todos = input.todos.map((todo, index) => ({
+        ...structuredClone(todo),
+        status: index === 0 ? "in_progress" : "pending",
+      }));
 
       return Effect.succeed(this.result("set"));
     }
@@ -163,7 +180,7 @@ export class WorkerPlanState {
     );
   }
 
-  private result(action: "get" | "set" | "update"): WorkerPlanToolResult {
+  private result(action: "set" | "update"): WorkerPlanToolResult {
     const details: WorkerPlanToolResult["details"] = { action };
 
     if (this.todos !== undefined) details.todos = structuredClone(this.todos);

@@ -141,6 +141,10 @@ export class SessionRuntime {
     };
   }
 
+  blockerFor(attemptId: string): string | undefined {
+    return this.blockers.get(attemptId)?.detail;
+  }
+
   createTask(input: {
     readonly id: string;
     readonly target: TaskTarget;
@@ -885,7 +889,9 @@ export class SessionRuntime {
 
     const lines = [
       "[WORKGRAPH WORKER OBJECTIVE]",
-      `Task ${task.id} target: ${JSON.stringify(task.task.target)}`,
+      contract.kind === "implementation"
+        ? `Task ${task.id} target (destination identity, not the Worker's execution location): ${JSON.stringify(task.task.target)}`
+        : `Task ${task.id} target: ${JSON.stringify(task.task.target)}`,
     ];
 
     if (contract.kind === "research")

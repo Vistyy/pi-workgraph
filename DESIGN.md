@@ -6,6 +6,7 @@ This document owns the integrated rationale and durable constraints for Workgrap
 
 - [ADR 0001: Own record schemas, effects, and host adapters](docs/adr/0001-own-schemas-effects-and-host-adapters.md)
 - [ADR 0002: Project Calm over the live Pi chat](docs/adr/0002-project-calm-over-the-live-pi-chat.md)
+- [ADR 0003: Keep Prewalk in one live Worker trajectory](docs/adr/0003-keep-prewalk-in-one-live-worker-trajectory.md)
 
 ## Source ownership
 
@@ -38,6 +39,8 @@ Delegation is optional. The coordinator remains responsible for decisions, Candi
 A Task is immutable and owns a contract plus one resolved target. An Attempt is one immutable execution specification for that Task: model selection, target-appropriate base, and optional Candidate lineage. It embeds one optional write-once Outcome. Only operational facts about its Worker and repository output are mutable. This split keeps semantic evidence stable while allowing exact recovery checkpoints to advance.
 
 An Outcome records a reported, unreported, or cancelled semantic result and the effective model targets observed in the Worker session. It does not represent repository custody or authorize a Git operation. Effective models may be empty when execution never established one, and may differ from the frozen selection when Pi's actual session trajectory differs.
+
+Research and Experiment are separate Task contracts. Research is read-only. Experiment retains the same evidence-seeking purpose, model pool, and report shape while granting each Attempt explicit effects and a stop condition in a repository worktree. Experiment commits may remain as retained repository output for inspection or discard but never become applicable Candidates; uncommitted worktree bytes are scratch. Multiple initial Attempts receive independent copies of the authority and therefore require independent or explicitly coordinated external effects.
 
 ## Record store
 
@@ -76,13 +79,17 @@ Final local integration and publication use normal repository or forge tooling r
 
 Worker behavior is enforced through the real Pi session, role policy, tool gates, and one terminal report. Research, consultation, and review are read-only. Repository experiments may make only their explicitly permitted changes. Implementation uses one same-session Prewalk trajectory from guide to executor.
 
-The guide receives the immutable assignment and a strict 1–9 item TODO tool. TODO status is navigation, not evidence or an acceptance gate. Executor cutover becomes eligible only after both a valid initialized TODO and a successful direct edit or write, in either order. Shell commands, observations, and failed mutations do not qualify. The selected executor target and thinking level are recorded in one exact session marker; the next provider request replaces guide policy with executor policy while preserving the assignment and session history. Selection failure remains guide-owned, blocks further direct mutation, is not retried automatically, and still permits a truthful failure or escalation report. A changed implementation result requires an executor assistant message after cutover.
+The guide receives the immutable assignment and initializes one strict 1–9 item TODO without caller-supplied statuses. The runtime marks the first item `in_progress` and the rest `pending`; subsequent progress uses focused item updates. Items name meaningful implementation or verification work with explicit validation, not reporting, bookkeeping, or padding. TODO status is navigation, not evidence or an acceptance gate.
 
-Reports contain semantic result, concrete evidence, findings, and uncertainty. Git revisions, changed-file observations, cleanliness, and ownership remain runtime facts rather than Worker assertions. Compaction recovery restores assignment context and current TODO from the Worker session's real branch entries without maintaining a second phase record.
+Executor cutover becomes eligible only after both a valid initialized TODO and a successful direct edit or write, in either order. Shell commands, observations, and failed mutations do not qualify. The selected executor target and thinking level are recorded in one exact session marker; the next provider request replaces guide policy with executor policy while preserving the assignment and session history. Selection failure remains guide-owned, blocks further direct mutation, is not retried automatically, and still permits a truthful failure or escalation report. A changed implementation result requires an executor assistant message after cutover. If the executor settles without a report while `pending` or `in_progress` items remain, at most two follow-up reminders ask it to continue useful work or report truthfully.
+
+An Implementation Worker's fixed assigned worktree is its mutable execution root. Assignment repository paths map into that worktree; changing shell cwd does not expand authority. The Worker may inspect elsewhere and may change the Git state needed to commit its worktree, but it may not modify another checkout or publish. A request that inherently requires another mutation is reported as a conflict. This is a behavioral custody contract, not sandbox enforcement, and does not replace repository validation.
+
+Reports contain semantic result, concrete evidence, findings, and uncertainty. Git revisions, changed-file observations, cleanliness, and ownership remain runtime facts rather than Worker assertions. Compaction recovery restores assignment context and current TODO from the Worker session's real branch entries without maintaining a second phase record. [ADR 0003](docs/adr/0003-keep-prewalk-in-one-live-worker-trajectory.md) owns the retained Prewalk trade-off.
 
 ## Models
 
-The user-owned model policy is the only source of executable model IDs and thinking levels. Research, review, and consultation have ordered nonempty target lists; implementation freezes one guide and one default or explicitly requested escalation executor into each Attempt. Invalid policy or selection fails before record creation.
+The user-owned model policy is the only source of executable model IDs and thinking levels. Research and review have ordered nonempty target lists; Experiment shares the research list. Consultation has one advisor target. Implementation freezes one guide and one default or explicitly requested escalation executor into each Attempt. Tool calls never name a concrete model. Invalid policy or selection fails before record creation, and frozen Attempts remain inspectable without loading current policy.
 
 Actual effective models are derived from persisted Pi model events in trajectory order and written with the Outcome. Frozen selection explains what was requested; effective models explain what ran. Neither is inferred from report prose.
 
@@ -105,6 +112,8 @@ Repository custody is serialized within one coordinator session, not across sess
 Discard is explicitly destructive and requires a reason. It checkpoints the exact retained tip and disposition before deleting only the verified private ref or owned worktree. An unplaced extension child and an unclassified integration child pin their source output. Interruption recovery accepts only proven postconditions and never removes foreign or uncertain resources. Semantic Outcomes and routine shutdown cannot discard output.
 
 Applying a Candidate changes its recorded local destination only. Workgraph repository operations never publish or finally integrate a Coordinator checkout; after the deliberate delivery choice, the Coordinator uses external repository or forge tooling from its managed branch.
+
+Coordinator mutation tools return persisted post-operation Attempt facts rather than a generic success flag, and exact Attempt inspection combines durable semantic and repository state with any current runtime blocker. Operations that may have partially persisted state do not roll back or create an operation ledger; failures identify the affected record for inspection before retry.
 
 ## Calm and pending memory
 

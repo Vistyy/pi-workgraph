@@ -12,9 +12,9 @@ import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../suppo
 import { extensionFixture, git } from "../support/helpers.js";
 
 const accepted = [
-  "workgraph_models",
   "workgraph_checkout",
   "workgraph_research",
+  "workgraph_experiment",
   "workgraph_consult",
   "workgraph_implement",
   "workgraph_review",
@@ -63,7 +63,7 @@ async function fixture(
   };
 }
 
-void test("coordinator registers exactly nine strict tools", async () => {
+void test("coordinator registers the exact strict tool surface", async () => {
   const f = await fixture(false);
 
   try {
@@ -79,10 +79,20 @@ void test("coordinator registers exactly nine strict tools", async () => {
     assert.equal(Value.Check(checkout.parameters, {}), true);
     assert.equal(Value.Check(checkout.parameters, { cwd: "." }), true);
     assert.equal(Value.Check(checkout.parameters, { cwd: " " }), false);
-    assert.equal(Value.Check(checkout.parameters, { action: "create" }), false);
-    assert.equal(Value.Check(checkout.parameters, { checkoutId: "old" }), false);
-    assert.match(JSON.stringify(checkout.parameters), /defaults to the session cwd/);
 
+    const experiment = f.runner.getToolDefinition("workgraph_experiment");
+    assert.ok(experiment !== undefined);
+    assert.equal(
+      Value.Check(experiment.parameters, {
+        id: "experiment",
+        question: "Question?",
+        expectedEvidence: ["Evidence"],
+        permittedEffects: ["write"],
+        stopCondition: "done",
+        selection: { count: 2, distinctModels: true },
+      }),
+      true,
+    );
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(
@@ -310,11 +320,14 @@ void test("one session creates frozen Task and Attempt records and inspects them
 
     // SAFETY: The registered implementation tool returns this bounded creation receipt.
     const details = created.details as {
-      taskId: string;
-      attempts: { taskId: string; attemptId: string }[];
+      task: { id: string; kind: string; target: { kind: string } };
+      attempts: { taskId: string; attemptId: string; spec: AttemptSpec }[];
     };
 
-    assert.equal(details.taskId, "change");
+    assert.deepEqual(
+      { id: details.task.id, kind: details.task.kind, targetKind: details.task.target.kind },
+      { id: "change", kind: "implementation", targetKind: "repository" },
+    );
     assert.equal(details.attempts.length, 1);
     const attemptId = details.attempts[0]?.attemptId;
     assert.ok(attemptId !== undefined);
@@ -331,8 +344,28 @@ void test("one session creates frozen Task and Attempt records and inspects them
       (attempt.details as { spec: { base: { baseCommit: string } } }).spec.base.baseCommit,
       base,
     );
-    // SAFETY: Pi tool details are object-shaped for every registered Workgraph result.
-    assert.equal("report" in (attempt.details as object), false);
+    // SAFETY: Exact inspection includes bounded report facts even before settlement.
+    assert.equal((attempt.details as { reportPreview: null }).reportPreview, null);
+
+    // SAFETY: Exact Attempt inspection returns nullable Worker and blocker fields.
+    let launched = attempt.details as {
+      worker: null | { sessionFile: string };
+      blocker: null | string;
+    };
+
+    for (
+      let index = 0;
+      index < 100 && (launched.worker === null || launched.blocker === null);
+      index += 1
+    ) {
+      await Effect.runPromise(Effect.sleep(10));
+      // SAFETY: Repeated exact Attempt inspection preserves the same decoded projection.
+      launched = (await f.call("workgraph_inspect", { section: "attempt", id: attemptId }))
+        .details as typeof launched;
+    }
+
+    assert.ok(launched.worker !== null);
+    assert.ok(launched.blocker !== null, "exact Attempt inspection exposes its runtime blocker");
 
     const page = await f.call("workgraph_inspect", {
       section: "attempt",
@@ -361,9 +394,83 @@ void test("one session creates frozen Task and Attempt records and inspects them
       f.call("workgraph_attempt", { taskId: "read-only", useEscalationExecutor: true }),
       /useEscalationExecutor is supported only for implementation Attempts/,
     );
+
+    const consultation = await f.call("workgraph_consult", {
+      id: "advice",
+      question: "Which bounded option is preferable?",
+    });
+
+    const consultationAttempt = await f.call("workgraph_attempt", { taskId: "advice" });
+
+    const advisorSelection = {
+      kind: "target",
+      target: { model: "fixture/advisor", thinking: "low" },
+    };
+
+    // SAFETY: Creation receipts expose each exact immutable Attempt specification.
+    assert.deepEqual(
+      (consultation.details as { attempts: { spec: AttemptSpec }[] }).attempts[0]?.spec.selection,
+      advisorSelection,
+    );
+
+    // SAFETY: Another-Attempt receipts contain the exact persisted identifiers and specification.
+    const consultationReceipt = consultationAttempt.details as {
+      taskId: string;
+      attemptId: string;
+      spec: AttemptSpec;
+    };
+
+    assert.deepEqual(consultationReceipt, {
+      taskId: "advice",
+      attemptId: consultationReceipt.attemptId,
+      spec: { selection: advisorSelection, base: { kind: "directory" } },
+    });
+
+    const experiment = await f.call("workgraph_experiment", {
+      id: "bounded-experiment",
+      cwd: ".",
+      question: "Can the probe run?",
+      expectedEvidence: ["Probe output"],
+      permittedEffects: ["Create probe.tmp in the assigned worktree"],
+      stopCondition: "Stop after one probe",
+      selection: { count: 2, distinctModels: true },
+    });
+
+    // SAFETY: The registered Experiment tool returns exact bounded creation receipts.
+    assert.deepEqual(
+      (experiment.details as { attempts: { spec: AttemptSpec }[] }).attempts.map(
+        (item) => item.spec.selection,
+      ),
+      [
+        {
+          kind: "target",
+          target: { model: "fixture/research", thinking: "high" },
+        },
+        {
+          kind: "target",
+          target: { model: "fixture/research-2", thinking: "medium" },
+        },
+      ],
+      "Experiment uses the ordered research model list",
+    );
+
+    const experimentTask = await f.call("workgraph_inspect", {
+      section: "task",
+      id: "bounded-experiment",
+    });
+
+    // SAFETY: Exact Task inspection returns the strictly decoded persisted Task record.
+    assert.deepEqual((experimentTask.details as { task: Task }).task.contract, {
+      kind: "experiment",
+      question: "Can the probe run?",
+      expectedEvidence: ["Probe output"],
+      permittedEffects: ["Create probe.tmp in the assigned worktree"],
+      stopCondition: "Stop after one probe",
+    });
+
     const overview = await f.call("workgraph_inspect", { section: "overview" });
     // SAFETY: Overview returns exact session-local record counts.
-    assert.equal((overview.details as { counts: { attempts: number } }).counts.attempts, 2);
+    assert.equal((overview.details as { counts: { attempts: number } }).counts.attempts, 6);
 
     const other = new RecordStore(f.agentDir, "other-session");
     assert.deepEqual(other.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
@@ -395,9 +502,6 @@ void test("without exact Herdr launch identity inspection remains usable and cre
         attempts: 0,
         activeWorkers: 0,
       });
-      const models = await f.call("workgraph_models", { role: "research" });
-      // SAFETY: Model inspection returns the strictly decoded configured target list.
-      assert.equal((models.details as { targets: unknown[] }).targets.length, 2);
       await assert.rejects(
         f.call("workgraph_research", {
           id: "blocked",

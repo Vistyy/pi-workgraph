@@ -7,7 +7,7 @@ import { Value } from "typebox/value";
 import { type ModelTarget, ModelTargetSchema } from "../domain/model-target.js";
 import { runNodePlatformPromise } from "../node-platform.js";
 
-export const MODEL_LIST_ROLES = ["research", "review", "consultation.advisor"] as const;
+const MODEL_LIST_ROLES = ["research", "review"] as const;
 
 export type ListModelRole = (typeof MODEL_LIST_ROLES)[number];
 
@@ -24,7 +24,7 @@ const ModelPolicySchema = Type.Object(
         "implementation.executor": ModelTargetSchema,
         "implementation.escalationExecutor": Type.Optional(ModelTargetSchema),
         review: ModelTargetListSchema,
-        "consultation.advisor": ModelTargetListSchema,
+        "consultation.advisor": ModelTargetSchema,
       },
       { additionalProperties: false },
     ),
@@ -37,6 +37,7 @@ export interface ModelPolicy {
     "implementation.guide": ModelTarget;
     "implementation.executor": ModelTarget;
     "implementation.escalationExecutor"?: ModelTarget;
+    "consultation.advisor": ModelTarget;
   };
 }
 
@@ -161,22 +162,6 @@ function rejectDuplicateModels(role: ListModelRole, targets: ModelTargetList): v
   }
 }
 
-export function configuredTarget(
-  policy: ModelPolicy,
-  role: ListModelRole,
-  model?: string,
-): ModelTarget {
-  const targets = policy.roles[role];
-
-  if (model === undefined) return exactTarget(targets[0]);
-  const target = targets.find((candidate) => candidate.model === model);
-
-  if (target === undefined)
-    throw new Error(`Model ${model} is not configured for Workgraph role ${role}.`);
-
-  return exactTarget(target);
-}
-
 export function resolveSelection<Role extends ListModelRole>(
   role: Role,
   request: SelectionRequest | undefined,
@@ -199,8 +184,7 @@ export function resolveSelection<Role extends ListModelRole>(
       );
     selected = configured.slice(0, count).map(exactTarget);
   } else {
-    const target = configuredTarget(policy, role);
-    selected = Array.from({ length: count }, () => exactTarget(target));
+    selected = Array.from({ length: count }, () => exactTarget(policy.roles[role][0]));
   }
 
   return { role, count, distinctModels, selected };
