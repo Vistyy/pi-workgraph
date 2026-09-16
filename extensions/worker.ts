@@ -81,10 +81,11 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "workgraph_report",
     label: "Workgraph Report",
-    description: "Return the terminal report for this bounded assignment.",
+    description:
+      "Return a strict terminal status, summary, and narrative details; the runtime adds the immutable Worker role.",
     promptSnippet: "Finish assigned work with a typed report",
     promptGuidelines: [
-      "Use workgraph_report as the final action. Report actual evidence and limitations; use escalated only for missing decisions or authority.",
+      "Use workgraph_report as the final action. Report actual evidence and limitations; use needs_decision only for a missing consequential decision or additional authority.",
     ],
     parameters: runtime.reportParameters(),
     execute(_id, params: WorkerReportInput, _signal, _update, ctx) {

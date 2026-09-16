@@ -42,7 +42,7 @@ const task = (root: string, id: string): Task => ({
 const objective = (taskId: string, attemptId: string, value: Task): WorkerObjective => ({
   content: [
     "[WORKGRAPH WORKER OBJECTIVE]",
-    `Task ${taskId} target: ${JSON.stringify(value.target)}`,
+    `Task ${taskId} resolved starting context (not evidence scope or authority): ${JSON.stringify(value.target)}`,
     `Question: Research ${taskId}`,
     "Expected evidence: Direct observation",
   ].join("\n"),
@@ -130,7 +130,11 @@ async function session(root: string, taskId: string, attemptId: string, value: T
   );
 }
 
-function appendSettledReport(sessionFile: string, summary: string): void {
+function appendSettledReport(
+  sessionFile: string,
+  summary: string,
+  role: "research" | "experiment" = "research",
+): void {
   const manager = SessionManager.open(sessionFile);
   manager.appendCustomEntry("pi-workgraph-effective-model", target);
   manager.appendMessage({
@@ -140,11 +144,10 @@ function appendSettledReport(sessionFile: string, summary: string): void {
     content: [{ type: "text", text: "done" }],
     details: {
       report: {
-        kind: "research",
+        role,
         status: "completed",
         summary,
-        evidence: [],
-        findings: [],
+        details: "The requested evidence was inspected and summarized.",
       },
     },
     isError: false,
@@ -433,6 +436,23 @@ void test("completed repository reports settle through mutable scratch and retai
 
     await waitFor(() => store.readAttempt(attempt.id).worker?.kickoff === "confirmed");
     const running = store.readAttempt(attempt.id);
+    const runningSession = running.worker?.sessionFile;
+    assert.ok(runningSession !== undefined);
+
+    const assignment = SessionManager.open(runningSession)
+      .getBranch()
+      .find(
+        (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
+      );
+
+    assert.ok(assignment?.type === "custom_message");
+    assert.equal(Array.isArray(assignment.content), false);
+    // SAFETY: The objective's non-array custom-message content is text under Pi's content union.
+    const content = assignment.content as string;
+
+    assert.match(content, /repository seed identity/);
+    assert.match(content, /Permitted effect: Install dependencies and inspect files/);
+    assert.match(content, /Hard stop cutoff: Stop after reporting/);
     const worktree = join(root, "workgraph", "worktrees", attempt.id);
     mkdirSync(join(worktree, "node_modules"));
     writeFileSync(join(worktree, "node_modules", "artifact.js"), "scratch\n");
@@ -451,7 +471,7 @@ void test("completed repository reports settle through mutable scratch and retai
 
     const sessionFile = running.worker?.sessionFile;
     assert.ok(sessionFile !== undefined);
-    appendSettledReport(sessionFile, "Experiment completed");
+    appendSettledReport(sessionFile, "Experiment completed", "experiment");
 
     await waitFor(() => {
       const settled = store.readAttempt(attempt.id);
@@ -665,7 +685,7 @@ void test("queued cancellation makes no Herdr call and active cancellation close
   }
 });
 
-void test("creation uses global Attempt IDs and rejects unsettled review sources before mutation", async () => {
+void test("creation uses global Attempt IDs", async () => {
   const root = temporary();
   const store = new RecordStore(root, "session-create");
   const native = fixture(root);
@@ -695,22 +715,6 @@ void test("creation uses global Attempt IDs and rejects unsettled review sources
     assert.match(first.id, /^attempt-[0-9a-f-]{36}$/);
     assert.match(second.id, /^attempt-[0-9a-f-]{36}$/);
     assert.notEqual(first.id, second.id);
-    await assert.rejects(
-      Effect.runPromise(
-        runtime.createTask({
-          id: "review",
-          target: task(root, "review").target,
-          contract: {
-            kind: "review",
-            objective: "Review source",
-            concern: "Evidence",
-            subject: { kind: "attempt", attemptId: first.id },
-          },
-          selection,
-        }),
-      ),
-      RuntimeError,
-    );
     assert.equal(store.counts().tasks, 1);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));

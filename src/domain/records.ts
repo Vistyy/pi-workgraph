@@ -26,44 +26,40 @@ const TaskTargetSchema = Type.Union([
   strict({ kind: Type.Literal("repository"), checkoutRoot: Text, commonDir: Text }),
 ]);
 
-export const ReviewSubjectSchema = Type.Union(
-  [
-    strict({
-      kind: Type.Literal("attempt", { description: "Review one exact Attempt." }),
-      attemptId: Type.String({ minLength: 1, description: "Exact Attempt ID." }),
-    }),
-    strict({
-      kind: Type.Literal("comparison", { description: "Compare two or more exact Attempts." }),
-      attemptIds: Type.Array(Text, {
-        minItems: 2,
-        description: "Attempt IDs to compare.",
-      }),
-    }),
-    strict({
-      kind: Type.Literal("revision", { description: "Review one exact repository revision." }),
-      revision: CommitSchema,
-    }),
-  ],
-  { description: "Exact Attempt, comparison, or repository revision to review." },
-);
+export const AssignmentContextSchema = Type.String({
+  maxLength: 20_000,
+  description:
+    "Optional settled context, references, scope, or constraints. At most 20,000 characters; cannot grant authority.",
+});
+
+export const ExpectedEvidenceSchema = Type.Array(NonBlankText, {
+  minItems: 1,
+  description: "Evidence the Outcome should provide.",
+});
+
+const OptionalContext = Type.Optional(AssignmentContextSchema);
+
+const OptionalExpectedEvidence = Type.Optional(ExpectedEvidenceSchema);
 
 const TaskContractSchema = Type.Union([
   strict({
     kind: Type.Literal("research"),
     question: NonBlankText,
-    expectedEvidence: Type.Array(Text, { minItems: 1 }),
+    context: OptionalContext,
+    expectedEvidence: OptionalExpectedEvidence,
   }),
   strict({
     kind: Type.Literal("experiment"),
     question: NonBlankText,
-    expectedEvidence: Type.Array(Text, { minItems: 1 }),
-    permittedEffects: Type.Array(Text, { minItems: 1 }),
+    context: OptionalContext,
+    expectedEvidence: OptionalExpectedEvidence,
+    permittedEffects: Type.Array(NonBlankText, { minItems: 1 }),
     stopCondition: NonBlankText,
   }),
   strict({
     kind: Type.Literal("consultation"),
     question: NonBlankText,
-    context: Type.Optional(Type.String({ maxLength: 20_000 })),
+    context: OptionalContext,
   }),
   strict({
     kind: Type.Literal("implementation"),
@@ -72,9 +68,8 @@ const TaskContractSchema = Type.Union([
   }),
   strict({
     kind: Type.Literal("review"),
-    objective: NonBlankText,
-    concern: NonBlankText,
-    subject: ReviewSubjectSchema,
+    request: NonBlankText,
+    context: OptionalContext,
   }),
 ]);
 

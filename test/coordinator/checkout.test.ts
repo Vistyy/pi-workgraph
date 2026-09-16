@@ -347,12 +347,11 @@ void test("retained implementation Candidate applies only into the managed check
       result: {
         kind: "reported",
         report: {
-          kind: "implementation",
+          role: "implementation",
           status: "completed",
           outcome: "changed",
           summary: "Produced the Candidate.",
-          evidence: [],
-          findings: [],
+          details: "The Candidate was committed and verified.",
         },
       },
       effectiveModels: [],

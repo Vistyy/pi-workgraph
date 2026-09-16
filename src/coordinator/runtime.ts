@@ -159,7 +159,6 @@ export class SessionRuntime {
       "create Task",
       Effect.gen(function* () {
         yield* self.requireLaunchAvailable("create Task");
-        yield* self.validateReview(input.contract);
         const task: Task = { target: input.target, contract: input.contract };
 
         const spec = yield* self.newAttemptSpec(
@@ -511,25 +510,6 @@ export class SessionRuntime {
         });
       }),
     );
-  }
-
-  private validateReview(contract: TaskContract): Effect.Effect<void, RuntimeError> {
-    if (contract.kind !== "review" || contract.subject.kind === "revision") return Effect.void;
-
-    const ids =
-      contract.subject.kind === "attempt"
-        ? [contract.subject.attemptId]
-        : contract.subject.attemptIds;
-
-    return Effect.forEach(ids, (id) =>
-      Effect.sync(() => this.store.readAttempt(id)).pipe(
-        Effect.flatMap((attempt) =>
-          attempt.outcome === undefined
-            ? fail("create Task", `Review source Attempt ${id} has no Outcome.`)
-            : Effect.void,
-        ),
-      ),
-    ).pipe(Effect.asVoid);
   }
 
   private reconcileAttempt(id: string): Effect.Effect<void, RuntimeError> {
@@ -887,24 +867,30 @@ export class SessionRuntime {
   private objective(task: TaskRecord, attempt: AttemptRecord): WorkerObjective {
     const contract = task.task.contract;
 
-    const lines = [
-      "[WORKGRAPH WORKER OBJECTIVE]",
-      contract.kind === "implementation"
-        ? `Task ${task.id} target (destination identity, not the Worker's execution location): ${JSON.stringify(task.task.target)}`
-        : `Task ${task.id} target: ${JSON.stringify(task.task.target)}`,
-    ];
+    let targetDescription: string;
+
+    if (contract.kind === "implementation")
+      targetDescription = `Task ${task.id} target (destination identity, not the Worker's execution location): ${JSON.stringify(task.task.target)}`;
+    else if (contract.kind === "experiment")
+      targetDescription = `Task ${task.id} repository seed identity (cwd is the owned detached worktree): ${JSON.stringify(task.task.target)}`;
+    else
+      targetDescription = `Task ${task.id} resolved starting context (not evidence scope or authority): ${JSON.stringify(task.task.target)}`;
+
+    const lines = ["[WORKGRAPH WORKER OBJECTIVE]", targetDescription];
 
     if (contract.kind === "research")
       lines.push(
         `Question: ${contract.question}`,
-        ...contract.expectedEvidence.map((value) => `Expected evidence: ${value}`),
+        ...(contract.context === undefined ? [] : [`Context: ${contract.context}`]),
+        ...(contract.expectedEvidence ?? []).map((value) => `Expected evidence: ${value}`),
       );
     else if (contract.kind === "experiment")
       lines.push(
         `Question: ${contract.question}`,
-        ...contract.expectedEvidence.map((value) => `Expected evidence: ${value}`),
+        ...(contract.context === undefined ? [] : [`Context: ${contract.context}`]),
+        ...(contract.expectedEvidence ?? []).map((value) => `Expected evidence: ${value}`),
         ...contract.permittedEffects.map((value) => `Permitted effect: ${value}`),
-        `Stop condition: ${contract.stopCondition}`,
+        `Hard stop cutoff: ${contract.stopCondition}`,
       );
     else if (contract.kind === "consultation")
       lines.push(
@@ -916,20 +902,11 @@ export class SessionRuntime {
         `Objective: ${contract.objective}`,
         ...contract.acceptance.map((value) => `Acceptance: ${value}`),
       );
-    else {
-      lines.push(`Objective: ${contract.objective}`, `Concern: ${contract.concern}`);
-
-      if (contract.subject.kind === "revision")
-        lines.push(`Review revision: ${contract.subject.revision}`);
-      else {
-        const ids =
-          contract.subject.kind === "attempt"
-            ? [contract.subject.attemptId]
-            : contract.subject.attemptIds;
-
-        for (const id of ids) lines.push(this.reviewSource(id));
-      }
-    }
+    else
+      lines.push(
+        `Request: ${contract.request}`,
+        ...(contract.context === undefined ? [] : [`Context: ${contract.context}`]),
+      );
 
     if (attempt.spec.base.kind === "repository")
       lines.push(`Base revision: ${attempt.spec.base.baseCommit}`);
@@ -949,33 +926,6 @@ export class SessionRuntime {
           : {}),
       },
     };
-  }
-
-  private reviewSource(id: string): string {
-    const attempt = this.store.readAttempt(id);
-
-    if (attempt.outcome === undefined)
-      throw new RuntimeError({
-        operation: "build review objective",
-        message: `Review source Attempt ${id} has no Outcome.`,
-      });
-    const task = this.store.readTask(attempt.taskId);
-
-    const summary =
-      attempt.outcome.result.kind === "reported"
-        ? attempt.outcome.result.report.summary
-        : attempt.outcome.result.reason;
-
-    const revision =
-      attempt.output?.kind === "retained"
-        ? `retained=${attempt.output.tip}`
-        : attempt.output?.kind === "applied"
-          ? `applied=${attempt.output.revision}`
-          : attempt.spec.base.kind === "repository"
-            ? `base=${attempt.spec.base.baseCommit}`
-            : "revision=none";
-
-    return `Review source Attempt ${id}: taskTarget=${JSON.stringify(task.task.target)} summary=${JSON.stringify(summary)} session=${attempt.worker?.sessionFile ?? "none"} ${revision}`;
   }
 
   private models(attempt: AttemptRecord): ModelTarget[] {

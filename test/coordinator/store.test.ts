@@ -379,7 +379,7 @@ void test("Task and initial Attempt are atomic and focused checkpoints preserve 
   }
 });
 
-void test("Outcome is null-to-value once and validates report kind and distinct models", () => {
+void test("Outcome is null-to-value once and validates exact report role and distinct models", () => {
   const { root, cleanup } = fixture();
 
   try {
@@ -390,11 +390,10 @@ void test("Outcome is null-to-value once and validates report kind and distinct 
       result: {
         kind: "reported",
         report: {
-          kind: "review",
+          role: "review",
           status: "completed",
           summary: "Reviewed.",
-          evidence: [],
-          findings: [],
+          details: "Reviewed the bounded material with zero findings.",
         },
       },
       effectiveModels: [model],

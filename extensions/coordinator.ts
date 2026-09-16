@@ -24,10 +24,11 @@ import { installNotepad } from "../src/coordinator/notepad.js";
 import { type CandidateRequest, RuntimeError, SessionRuntime } from "../src/coordinator/runtime.js";
 import { RecordStore } from "../src/coordinator/store.js";
 import {
+  AssignmentContextSchema,
   type AttemptRecord,
   type AttemptSelection,
   CommitSchema,
-  ReviewSubjectSchema,
+  ExpectedEvidenceSchema,
   type Task,
   type TaskContract,
   TaskIdSchema,
@@ -57,9 +58,17 @@ const CandidateOf = Type.Optional(
 
 const Selection = Type.Optional(SelectionRequestSchema);
 
+const Context = Type.Optional(AssignmentContextSchema);
+
+const ExpectedEvidence = Type.Optional(ExpectedEvidenceSchema);
+
 const TaskFields = {
   id: TaskIdSchema,
-  cwd: Type.Optional(nonBlank("Directory or repository that owns the Task target.")),
+  cwd: Type.Optional(
+    nonBlank(
+      "Resolved starting directory for read-only roles, repository seed for Experiment, or destination identity for Implementation; defaults to session cwd and never widens role authority.",
+    ),
+  ),
 };
 
 const PageFields = {
@@ -195,10 +204,8 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       {
         ...TaskFields,
         question: nonBlank("Question the Research Task must answer."),
-        expectedEvidence: Type.Array(Text, {
-          minItems: 1,
-          description: "Evidence the Research Outcome must provide.",
-        }),
+        context: Context,
+        expectedEvidence: ExpectedEvidence,
         selection: Selection,
       },
       { additionalProperties: false },
@@ -211,7 +218,10 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         contract: {
           kind: "research",
           question: params.question,
-          expectedEvidence: params.expectedEvidence,
+          ...(params.context === undefined ? {} : { context: params.context }),
+          ...(params.expectedEvidence === undefined
+            ? {}
+            : { expectedEvidence: params.expectedEvidence }),
         },
         ...(params.selection === undefined ? {} : { selection: params.selection }),
       });
@@ -227,12 +237,17 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       {
         ...TaskFields,
         question: nonBlank("Question the Experiment Task must answer."),
-        expectedEvidence: Type.Array(Text, { minItems: 1 }),
-        permittedEffects: Type.Array(Text, {
-          minItems: 1,
-          description: "Effects independently permitted for every selected Attempt.",
-        }),
-        stopCondition: nonBlank("Stop condition independently binding every selected Attempt."),
+        context: Context,
+        expectedEvidence: ExpectedEvidence,
+        permittedEffects: Type.Array(
+          nonBlank(
+            "Authorized effect kind, scope, and lifetime independently granted to each Attempt.",
+          ),
+          { minItems: 1 },
+        ),
+        stopCondition: nonBlank(
+          "Hard cutoff by which effects and authorized teardown must be complete; a success-dependent cutoff must include bounded exhaustion, and Workgraph does not automatically enforce it.",
+        ),
         selection: Selection,
       },
       { additionalProperties: false },
@@ -245,7 +260,10 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         contract: {
           kind: "experiment",
           question: params.question,
-          expectedEvidence: params.expectedEvidence,
+          ...(params.context === undefined ? {} : { context: params.context }),
+          ...(params.expectedEvidence === undefined
+            ? {}
+            : { expectedEvidence: params.expectedEvidence }),
           permittedEffects: params.permittedEffects,
           stopCondition: params.stopCondition,
         },
@@ -262,12 +280,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       {
         ...TaskFields,
         question: nonBlank("Question for the consultation advisor."),
-        context: Type.Optional(
-          Type.String({
-            maxLength: 20_000,
-            description: "Relevant context not already available in the target directory.",
-          }),
-        ),
+        context: Context,
       },
       { additionalProperties: false },
     ),
@@ -347,9 +360,10 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     Type.Object(
       {
         ...TaskFields,
-        objective: nonBlank("Outcome or behavior the review should assess."),
-        concern: nonBlank("Specific risk or quality concern to investigate."),
-        subject: ReviewSubjectSchema,
+        request: nonBlank(
+          "Natural-language request for material the Review should assess; exact revisions are required only when the request depends on them.",
+        ),
+        context: Context,
         selection: Selection,
       },
       { additionalProperties: false },
@@ -358,15 +372,13 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       createTask(runtime(), ctx, policyPath, {
         id: params.id,
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
-        targetKind: params.subject.kind === "revision" ? "repository" : "directory",
+        targetKind: "directory",
         contract: {
           kind: "review",
-          objective: params.objective,
-          concern: params.concern,
-          subject: params.subject,
+          request: params.request,
+          ...(params.context === undefined ? {} : { context: params.context }),
         },
         ...(params.selection === undefined ? {} : { selection: params.selection }),
-        ...(params.subject.kind === "revision" ? { baseRevision: params.subject.revision } : {}),
       }),
     serialize,
   );
@@ -706,13 +718,7 @@ async function baseForAttempt(
 ): Promise<string | undefined> {
   if (task.target.kind !== "repository" || candidateOf?.mode === "extend") return undefined;
 
-  const requested =
-    baseRevision ??
-    (task.contract.kind === "review" && task.contract.subject.kind === "revision"
-      ? task.contract.subject.revision
-      : "HEAD");
-
-  return Effect.runPromise(resolveRevision(task.target, requested));
+  return Effect.runPromise(resolveRevision(task.target, baseRevision ?? "HEAD"));
 }
 
 function retainedTip(runtime: SessionRuntime, attemptId: string): string {
@@ -846,7 +852,7 @@ function inspectedAttempt(runtime: SessionRuntime, attempt: AttemptRecord) {
           ? {
               kind: outcome.result.kind,
               reportStatus: outcome.result.report.status,
-              ...(outcome.result.report.kind === "implementation" &&
+              ...(outcome.result.report.role === "implementation" &&
               "outcome" in outcome.result.report
                 ? { reportOutcome: outcome.result.report.outcome }
                 : {}),

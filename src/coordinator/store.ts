@@ -3,7 +3,7 @@
 import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
-import { Data, Match } from "effect";
+import { Data } from "effect";
 import type { Static, TSchema } from "typebox";
 import { Value } from "typebox/value";
 import {
@@ -582,14 +582,8 @@ function validateOutcome(outcome: Outcome, task: Task): void {
 
   if (outcome.result.kind !== "reported") return;
 
-  const expected = Match.value(task.contract.kind).pipe(
-    Match.when("implementation", () => "implementation" as const),
-    Match.when("review", () => "review" as const),
-    Match.orElse(() => "research" as const),
-  );
-
-  if (outcome.result.report.kind !== expected)
-    throw failure("decode Outcome", "Report kind does not match its Task.");
+  if (outcome.result.report.role !== task.contract.kind)
+    throw failure("decode Outcome", "Report role does not match its Task.");
 }
 
 function validateAttemptId(attemptId: string): void {

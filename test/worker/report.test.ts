@@ -1,75 +1,79 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Value } from "typebox/value";
-import {
-  reportSchemaForMode,
-  type WorkerMode,
-  WorkerReportSchema,
-} from "../../src/domain/report.js";
+import { reportSchemaForMode, WorkerReportSchema } from "../../src/domain/report.js";
+import { workerSystemPolicy } from "../../src/worker/context.js";
 
-const reportContent = {
+const narrative = {
+  status: "completed" as const,
   summary: "Bounded result",
-  evidence: [{ label: "Boundary", observation: "Observed" }],
-  findings: [
-    {
-      severity: "info",
-      title: "No concern",
-      detail: "No actionable concern was found.",
-    },
-  ],
-} as const;
+  details: "Observed the requested boundary and found no actionable issue.",
+};
 
-function reportForMode(mode: WorkerMode) {
-  return {
-    kind: mode,
-    status: "failed" as const,
-    ...reportContent,
-  };
-}
-
-void test("changed implementation reports remain semantic and exclude host-owned Git metadata", () => {
-  const input = {
-    kind: "implementation",
-    status: "completed",
-    outcome: "changed",
-    ...reportContent,
-  } as const;
-
-  const inputSchema = reportSchemaForMode("implementation");
-  assert.equal(Value.Check(inputSchema, input), true);
-  assert.equal(Value.Check(WorkerReportSchema, input), true);
-
-  for (const extra of [{ commit: "a".repeat(40) }, { changedFiles: ["change.ts"] }]) {
-    assert.equal(Value.Check(inputSchema, { ...input, ...extra }), false);
-    assert.equal(Value.Check(WorkerReportSchema, { ...input, ...extra }), false);
+void test("every exact role has a strict narrative input and persisted runtime role", () => {
+  for (const role of ["research", "experiment", "consultation", "review"] as const) {
+    const input = reportSchemaForMode(role);
+    assert.equal(Value.Check(input, { ...narrative, role }), false, `${role} cannot supply role`);
+    assert.equal(
+      Value.Check(WorkerReportSchema, { role, ...narrative }),
+      true,
+      `${role} persisted`,
+    );
   }
 });
 
-void test("live report schemas reject undeclared top-level and nested sensitive fields in every mode", () => {
-  for (const mode of ["research", "review", "implementation"] as const) {
-    const schema = reportSchemaForMode(mode);
-    const report = reportForMode(mode);
-    assert.equal(Value.Check(schema, report), true, `${mode} baseline`);
-    assert.equal(
-      Value.Check(schema, { ...report, authorization: "Bearer retained-secret" }),
-      false,
-      `${mode} top-level extra`,
-    );
-    assert.equal(
-      Value.Check(schema, {
-        ...report,
-        evidence: [{ ...report.evidence[0], rawProviderError: "credential-bearing failure" }],
-      }),
-      false,
-      `${mode} evidence extra`,
-    );
-    assert.equal(
-      Value.Check(schema, {
-        ...report,
-        findings: [{ ...report.findings[0], apiKey: "retained-secret" }],
-      }),
-      false,
-      `${mode} finding extra`,
-    );
+void test("implementation completed requires outcome while noncompleted forbids it", () => {
+  const schema = reportSchemaForMode("implementation");
+  assert.equal(Value.Check(schema, { ...narrative, outcome: "changed" }), true);
+  assert.equal(Value.Check(schema, narrative), false);
+  assert.equal(
+    Value.Check(schema, {
+      status: "needs_decision",
+      summary: "Decision required",
+      details: "Choose A or B because the authority differs.",
+    }),
+    true,
+  );
+  assert.equal(
+    Value.Check(schema, {
+      status: "failed",
+      outcome: "no_change",
+      summary: "Blocked",
+      details: "The runtime was unavailable.",
+    }),
+    false,
+  );
+});
+
+void test("Experiment and Review policies preserve their redesigned authority boundaries", () => {
+  const experiment = workerSystemPolicy("experiment", "guide");
+  assert.match(experiment, /Each Attempt independently receives/);
+  assert.match(experiment, /hard cutoff on the whole effectful lifetime/);
+  assert.match(experiment, /authorized cancellation or teardown/);
+  assert.match(
+    experiment,
+    /no automatic deadline enforcement, rollback, or post-cutoff cleanup exception/,
+  );
+
+  const review = workerSystemPolicy("review", "guide");
+  assert.match(review, /uncommitted, mutable, partial, conceptual, report, Attempt-related/);
+  assert.match(review, /exact revision only when the request depends on one/);
+  assert.doesNotMatch(review, /exact stated base and candidate revisions/);
+});
+
+void test("schemas reject blanks and undeclared or obsolete structured fields", () => {
+  for (const role of [
+    "research",
+    "experiment",
+    "consultation",
+    "review",
+    "implementation",
+  ] as const) {
+    const schema = reportSchemaForMode(role);
+    const report = role === "implementation" ? { ...narrative, outcome: "no_change" } : narrative;
+    assert.equal(Value.Check(schema, report), true, `${role} baseline`);
+    assert.equal(Value.Check(schema, { ...report, summary: " " }), false, `${role} blank summary`);
+    assert.equal(Value.Check(schema, { ...report, details: "\n" }), false, `${role} blank details`);
+    assert.equal(Value.Check(schema, { ...report, extra: true }), false, `${role} extra`);
   }
 });

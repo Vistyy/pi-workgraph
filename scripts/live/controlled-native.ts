@@ -318,11 +318,9 @@ async function responseFor(
       id: "research-report",
       name: "workgraph_report",
       arguments: {
-        kind: "research",
         status: "completed",
         summary: "Controlled research completed after coordinator settlement.",
-        evidence: [{ label: "fixture", observation: "The controlled fixture is unchanged." }],
-        findings: [],
+        details: "The controlled fixture is unchanged; no contrary evidence was observed.",
       },
     },
   };
