@@ -1,134 +1,102 @@
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
+const NonBlankText = Type.String({ minLength: 1, pattern: "\\S" });
+
 const ReportStatusSchema = Type.Union([
   Type.Literal("completed"),
-  Type.Literal("escalated"),
+  Type.Literal("needs_decision"),
   Type.Literal("failed"),
 ]);
 
-const EvidenceSchema = Type.Object(
-  {
-    label: Type.String(),
-    observation: Type.String(),
-    class: Type.Optional(
-      Type.Union([
-        Type.Literal("direct"),
-        Type.Literal("inference"),
-        Type.Literal("conflict"),
-        Type.Literal("unknown"),
-      ]),
-    ),
-    command: Type.Optional(Type.String()),
-    artifact: Type.Optional(Type.String()),
-  },
-  { additionalProperties: false },
-);
+const ReadOnlyOrExperimentRoleSchema = Type.Union([
+  Type.Literal("research"),
+  Type.Literal("experiment"),
+  Type.Literal("consultation"),
+  Type.Literal("review"),
+]);
 
-const FindingSchema = Type.Object(
-  {
-    severity: Type.Union([
-      Type.Literal("info"),
-      Type.Literal("warning"),
-      Type.Literal("error"),
-      Type.Literal("blocker"),
-    ]),
-    title: Type.String(),
-    detail: Type.String(),
-  },
-  { additionalProperties: false },
-);
+const WorkerRoleSchema = Type.Union([
+  ReadOnlyOrExperimentRoleSchema,
+  Type.Literal("implementation"),
+]);
 
-const ReportContentFields = {
-  summary: Type.String(),
-  uncertainty: Type.Optional(Type.Array(Type.String(), { maxItems: 20 })),
-  evidence: Type.Array(EvidenceSchema, { maxItems: 20 }),
-  findings: Type.Array(FindingSchema, { maxItems: 20 }),
+const NarrativeFields = {
+  status: ReportStatusSchema,
+  summary: NonBlankText,
+  details: NonBlankText,
 };
 
-function readOnlyReportSchema<const Kind extends "research" | "review">(kind: Kind) {
-  return Type.Object(
-    {
-      kind: Type.Literal(kind),
-      status: ReportStatusSchema,
-      ...ReportContentFields,
-    },
-    { additionalProperties: false },
-  );
-}
+const NarrativeInputSchema = Type.Object(NarrativeFields, { additionalProperties: false });
 
-const ResearchReportSchema = readOnlyReportSchema("research");
-
-const ReviewReportSchema = readOnlyReportSchema("review");
-
-const ImplementationNoChangeReportSchema = Type.Object(
+const ImplementationCompletedInputSchema = Type.Object(
   {
-    kind: Type.Literal("implementation"),
     status: Type.Literal("completed"),
-    outcome: Type.Literal("no_change"),
-    ...ReportContentFields,
-    reason: Type.String({ minLength: 1 }),
+    outcome: Type.Union([Type.Literal("changed"), Type.Literal("no_change")]),
+    summary: NonBlankText,
+    details: NonBlankText,
   },
   { additionalProperties: false },
 );
 
-const ImplementationIncompleteReportSchema = Type.Object(
+const ImplementationIncompleteInputSchema = Type.Object(
   {
-    kind: Type.Literal("implementation"),
-    status: Type.Union([Type.Literal("escalated"), Type.Literal("failed")]),
-    ...ReportContentFields,
+    status: Type.Union([Type.Literal("needs_decision"), Type.Literal("failed")]),
+    summary: NonBlankText,
+    details: NonBlankText,
   },
   { additionalProperties: false },
 );
 
-const ImplementationChangedInputSchema = Type.Object(
-  {
-    kind: Type.Literal("implementation"),
-    status: Type.Literal("completed"),
-    outcome: Type.Literal("changed"),
-    ...ReportContentFields,
-  },
-  { additionalProperties: false },
-);
-
-const ImplementationReportSchema = Type.Union(
-  [
-    ImplementationChangedInputSchema,
-    ImplementationNoChangeReportSchema,
-    ImplementationIncompleteReportSchema,
-  ],
+const ImplementationReportInputSchema = Type.Union(
+  [ImplementationCompletedInputSchema, ImplementationIncompleteInputSchema],
   { type: "object" },
 );
 
-const WorkerReportInputSchema = Type.Union([
-  ResearchReportSchema,
-  ReviewReportSchema,
-  ImplementationReportSchema,
-]);
+const WorkerReportInputSchema = Type.Union(
+  [NarrativeInputSchema, ImplementationReportInputSchema],
+  { type: "object" },
+);
 
-export const WorkerReportSchema = WorkerReportInputSchema;
+export const WorkerReportSchema = Type.Union(
+  [
+    Type.Object(
+      { role: ReadOnlyOrExperimentRoleSchema, ...NarrativeFields },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      {
+        role: Type.Literal("implementation"),
+        status: Type.Literal("completed"),
+        outcome: Type.Union([Type.Literal("changed"), Type.Literal("no_change")]),
+        summary: NonBlankText,
+        details: NonBlankText,
+      },
+      { additionalProperties: false },
+    ),
+    Type.Object(
+      {
+        role: Type.Literal("implementation"),
+        status: Type.Union([Type.Literal("needs_decision"), Type.Literal("failed")]),
+        summary: NonBlankText,
+        details: NonBlankText,
+      },
+      { additionalProperties: false },
+    ),
+  ],
+  { type: "object" },
+);
 
 export type WorkerReportInput = Static<typeof WorkerReportInputSchema>;
 
 export type WorkerReport = Static<typeof WorkerReportSchema>;
 
-export type WorkerMode = WorkerReportInput["kind"];
+type WorkerRole = Static<typeof WorkerRoleSchema>;
 
-export type WorkerSessionMode = WorkerMode;
+export type WorkerSessionMode = WorkerRole;
 
 export function reportSchemaForMode(mode: WorkerSessionMode) {
-  switch (mode) {
-    case "research":
-      return ResearchReportSchema;
-    case "review":
-      return ReviewReportSchema;
-    case "implementation":
-      return ImplementationReportSchema;
-  }
-}
-
-export function isWorkerReportInput(value: unknown): value is WorkerReportInput {
-  return Value.Check(WorkerReportInputSchema, value);
+  return mode === "implementation" ? ImplementationReportInputSchema : NarrativeInputSchema;
 }
 
 export function isWorkerReport(value: unknown): value is WorkerReport {

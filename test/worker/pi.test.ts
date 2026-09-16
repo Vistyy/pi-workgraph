@@ -80,12 +80,10 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
           id: "report",
           name: "workgraph_report",
           arguments: {
-            kind: "implementation",
             status: "completed",
             outcome: "changed",
             summary: "Changed value.txt.",
-            evidence: [{ label: "bytes", observation: "value.txt contains after newline." }],
-            findings: [],
+            details: "value.txt contains the verified after newline.",
           },
         },
       };
@@ -251,11 +249,9 @@ void test("real Pi restores the exact guide before continuing after executor sel
           id: "report",
           name: "workgraph_report",
           arguments: {
-            kind: "implementation",
             status: "failed",
             summary: "The frozen executor target was unavailable.",
-            evidence: [],
-            findings: [],
+            details: "Executor model selection failed before execution.",
           },
         },
       };

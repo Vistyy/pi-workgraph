@@ -287,11 +287,9 @@ void test("selection failure remains guide-owned, blocks mutation, never retries
     );
 
     const report = await f.call("workgraph_report", {
-      kind: "implementation",
       status: "failed",
       summary: "Executor target could not be selected.",
-      evidence: [],
-      findings: [],
+      details: "The configured executor target could not be selected.",
     });
 
     assert.equal(report.terminate, true);
@@ -311,34 +309,29 @@ void test("recovery derives cutover and changed proof from the exact trajectory"
     await endTool(f, "bash");
     await assert.rejects(
       f.call("workgraph_report", {
-        kind: "implementation",
         status: "completed",
         outcome: "changed",
         summary: "Changed.",
-        evidence: [],
-        findings: [],
+        details: "Changed and verified the bounded target.",
       }),
       /later successful executor assistant message/,
     );
     assistant(f.session);
 
     const report = await f.call("workgraph_report", {
-      kind: "implementation",
       status: "completed",
       outcome: "changed",
       summary: "Changed.",
-      evidence: [],
-      findings: [],
+      details: "Changed and verified the bounded target.",
     });
 
     assert.deepEqual(report.details, {
       report: {
-        kind: "implementation",
+        role: "implementation",
         status: "completed",
         outcome: "changed",
         summary: "Changed.",
-        evidence: [],
-        findings: [],
+        details: "Changed and verified the bounded target.",
       },
     });
   } finally {
@@ -375,16 +368,22 @@ void test("guide terminal paths and role-owned edit gates are independent", asyn
 
   try {
     const noChange = await guide.call("workgraph_report", {
-      kind: "implementation",
       status: "completed",
       outcome: "no_change",
       summary: "Already satisfied.",
-      reason: "Direct inspection found no needed change.",
-      evidence: [],
-      findings: [],
+      details: "Direct inspection found no needed change.",
     });
 
     assert.equal(noChange.terminate, true);
+    assert.deepEqual(noChange.details, {
+      report: {
+        role: "implementation",
+        status: "completed",
+        outcome: "no_change",
+        summary: "Already satisfied.",
+        details: "Direct inspection found no needed change.",
+      },
+    });
   } finally {
     await guide.dispose();
   }
@@ -397,6 +396,21 @@ void test("guide terminal paths and role-owned edit gates are independent", asyn
       assert.equal(worker.activeTools().includes("bash"), true);
       assert.equal(worker.activeTools().includes("edit"), false);
       assert.equal(worker.activeTools().includes("write"), false);
+
+      const report = await worker.call("workgraph_report", {
+        status: "completed",
+        summary: "Bounded result.",
+        details: "Inspected the requested material and recorded uncertainty.",
+      });
+
+      assert.deepEqual(report.details, {
+        report: {
+          role,
+          status: "completed",
+          summary: "Bounded result.",
+          details: "Inspected the requested material and recorded uncertainty.",
+        },
+      });
     } finally {
       await worker.dispose();
     }
@@ -407,6 +421,21 @@ void test("guide terminal paths and role-owned edit gates are independent", asyn
   try {
     assert.equal(experiment.activeTools().includes("edit"), true);
     assert.equal(experiment.activeTools().includes("write"), true);
+
+    const report = await experiment.call("workgraph_report", {
+      status: "completed",
+      summary: "Experiment complete.",
+      details: "No effects were needed; the cutoff was respected.",
+    });
+
+    assert.deepEqual(report.details, {
+      report: {
+        role: "experiment",
+        status: "completed",
+        summary: "Experiment complete.",
+        details: "No effects were needed; the cutoff was respected.",
+      },
+    });
   } finally {
     await experiment.dispose();
   }
@@ -461,11 +490,9 @@ void test("malformed objective fails closed but retains actual-model and settled
     await loaded.runner.emit({ type: "agent_settled" });
 
     const report = await loaded.call("workgraph_report", {
-      kind: "implementation",
       status: "failed",
       summary: "The authoritative objective was malformed.",
-      evidence: [],
-      findings: [],
+      details: "The objective role conflicts with the configured Worker role.",
     });
 
     assert.equal(report.terminate, true);
@@ -525,21 +552,17 @@ void test("unreadable or protected settings fail closed before requests and pres
       );
       await assert.rejects(
         f.call("workgraph_report", {
-          kind: "implementation",
-          status: "escalated",
+          status: "needs_decision",
           summary: "Not a missing decision.",
-          evidence: [],
-          findings: [],
+          details: "No Coordinator decision is actually missing.",
         }),
         /only a truthful failed report/,
       );
 
       const failed = await f.call("workgraph_report", {
-        kind: "implementation",
         status: "failed",
         summary: "Worker settings could not be trusted.",
-        evidence: [],
-        findings: [],
+        details: "The protected Worker settings were unreadable or invalid.",
       });
 
       assert.equal(failed.terminate, true);

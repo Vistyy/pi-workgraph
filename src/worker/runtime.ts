@@ -1,9 +1,8 @@
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
-import { Data, Effect, Match, Result } from "effect";
+import { Data, Effect, Result } from "effect";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
 import {
-  isWorkerReportInput,
   reportSchemaForMode,
   type WorkerReportInput,
   type WorkerSessionMode,
@@ -321,15 +320,16 @@ export class WorkerRuntime {
   completeReport(params: WorkerReportInput, branch: readonly WorkerEntry[]) {
     const mode = reportMode(this.role);
 
-    if (!isWorkerReportInput(params) || params.kind !== mode)
+    if (!Value.Check(this.reportParameters(), params))
       return contractFailure(`Report must satisfy the ${mode} contract.`);
 
     if (this.settingsError !== undefined && params.status !== "failed")
       return contractFailure("Unreadable Worker settings permit only a truthful failed report.");
 
     if (
-      params.kind === "implementation" &&
+      mode === "implementation" &&
       params.status === "completed" &&
+      "outcome" in params &&
       params.outcome === "changed"
     ) {
       const scoped = this.attemptBranch(branch);
@@ -344,10 +344,8 @@ export class WorkerRuntime {
     }
 
     return Effect.succeed({
-      content: [
-        { type: "text" as const, text: `${params.kind} ${params.status}: ${params.summary}` },
-      ],
-      details: { report: params },
+      content: [{ type: "text" as const, text: `${mode} ${params.status}: ${params.summary}` }],
+      details: { report: { role: mode, ...params } },
       terminate: true,
     });
   }
@@ -392,11 +390,7 @@ export class WorkerRuntime {
 }
 
 function reportMode(role: WorkerRole): WorkerSessionMode {
-  return Match.value(role).pipe(
-    Match.when("review", () => "review" as const),
-    Match.when("implementation", () => "implementation" as const),
-    Match.orElse(() => "research" as const),
-  );
+  return role;
 }
 
 function hasEntry(

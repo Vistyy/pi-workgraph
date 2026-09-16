@@ -1,6 +1,6 @@
 # Pi Workgraph
 
-Pi Workgraph lets a Pi coordinator delegate repository and directory work to visible Workers in Herdr tabs. It can gather evidence, consult another model, implement in isolated Git worktrees, review exact results, and retain useful repository output for a deliberate local decision.
+Pi Workgraph lets a Pi coordinator delegate repository and directory work to visible Workers in Herdr tabs. It can gather evidence, consult another model, implement in isolated Git worktrees, review relevant material, and retain useful repository output for a deliberate local decision.
 
 ## Install
 
@@ -77,7 +77,7 @@ Workgraph exposes these coordinator tools:
 | `workgraph_experiment` | Create a repository Experiment with explicit permitted effects and a stop condition. |
 | `workgraph_consult` | Ask the configured advisor a precise, evidence-only question. |
 | `workgraph_implement` | Create an implementation Task and its first Attempt. |
-| `workgraph_review` | Review an exact Attempt, comparison, or repository revision. |
+| `workgraph_review` | Assess a natural-language request against relevant accessible material. |
 | `workgraph_attempt` | Create another fresh Attempt for an existing Task. |
 | `workgraph_inspect` | Inspect this Pi session's Task, Attempt, Outcome, and operational records. |
 | `workgraph_control` | Steer or cancel a Worker, or apply or discard exact repository output. |
@@ -91,9 +91,13 @@ When an accepted change has no explicit delivery route, the Coordinator stops be
 
 A Task has one immutable resolved target. Directory targets record an exact path. Repository targets record the checkout root and Git common directory, so Tasks in one session may safely address different repositories without implying a transaction across them. Every Attempt inherits its Task target and starts one fresh Worker Pi session. `workgraph_attempt` creates another execution of that unchanged assignment; a changed objective, acceptance condition, or authority requires a new Task.
 
-Research is read-only. An Experiment is evidence-seeking research with explicit effects and a stop condition, executed in a repository worktree. Those limits apply independently to every selected Attempt; use one Attempt unless parallel external effects are independent or explicitly coordinated. Experiment commits may remain as retained repository output for inspection or discard, but they are not applicable implementation Candidates. A completed Experiment relinquishes uncommitted worktree scratch, so durable observations belong in its report, a commit, or an explicitly permitted artifact.
+Research, consultation, and review are read-only. Their resolved `cwd` is Worker placement and starting context, not an evidence boundary, semantic subject, provenance claim, or added authority. Review may assess accessible uncommitted, mutable, partial, conceptual, report, Attempt-related, comparative, or committed material; it needs an exact revision only when its request depends on one.
 
-Repository Attempts execute in detached worktrees. On a completed report, only commits survive; commit intended output before reporting. Changed commits are retained at `refs/pi-workgraph/outputs/<attemptId>`, while non-completed dirty worktrees and uncertain resources are preserved. Implementation Attempts can start independently, extend a retained Candidate, or integrate one onto another base. Candidate application and discard remain explicit Workgraph operations.
+An Experiment is evidence-seeking work with explicit effects and a hard stop cutoff, executed in a detached repository worktree seeded from the resolved repository's committed base. Authority is granted independently to every selected Attempt. `permittedEffects` defines effect kind, scope, and lifetime. An effect may begin only when its full lifetime—including authorized cancellation or teardown—can finish by the cutoff. Workgraph does not automatically enforce a runtime deadline, roll effects back, or grant cleanup authority after cutoff. A success-only condition also needs a bounded exhaustion cutoff when necessary to bound effects. Experiment commits may remain as retained repository output for inspection or discard, but they are not applicable implementation Candidates. A completed Experiment relinquishes uncommitted worktree scratch, so durable observations belong in its report, a commit, or an explicitly permitted artifact.
+
+Worker reports contain strict nonblank `status`, `summary`, and narrative `details`; the runtime adds the immutable exact role. Status is `completed`, `needs_decision`, or `failed`. `completed` means a truthful bounded terminal result—including a negative, inconclusive, or zero-finding result—not approval. `needs_decision` is terminal for that Attempt and identifies a missing consequential Coordinator decision or additional authority. `failed` identifies an operational or contract inability. Completed Implementation reports additionally state `changed` or `no_change`.
+
+Repository Attempts execute in detached worktrees. On a completed report, only commits survive; commit intended output before reporting. Noncompleted dirty worktrees and uncertain resources are preserved under repository custody, while clean placement may compact normally. Changed commits are retained at `refs/pi-workgraph/outputs/<attemptId>`. Implementation Attempts can start independently, extend a retained Candidate, or integrate one onto another base. Candidate application and discard remain explicit Workgraph operations.
 
 An Implementation Worker may change only its fixed assigned worktree and the Git state needed to commit that worktree; changing shell directories does not change that authority. Repository paths in its assignment refer to corresponding paths in the assigned worktree. It may inspect elsewhere, but must not modify another checkout or publish. Worktrees and tool policy establish custody rather than a security sandbox.
 

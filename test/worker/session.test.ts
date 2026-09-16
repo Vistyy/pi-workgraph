@@ -115,12 +115,11 @@ void test("Worker session readback derives ordered actual models, settlement, an
       content: [{ type: "text", text: "done" }],
       details: {
         report: {
-          kind: "implementation",
+          role: "implementation",
           status: "completed",
           outcome: "changed",
           summary: "Changed the bounded target.",
-          evidence: [],
-          findings: [],
+          details: "The target was changed and verified.",
         },
       },
       isError: false,
@@ -138,7 +137,7 @@ void test("Worker session readback derives ordered actual models, settlement, an
       { model: "fixture/executor", thinking: "high" },
     ]);
 
-    if (!read.unreadable) assert.equal(read.report?.kind, "implementation");
+    if (!read.unreadable) assert.equal(read.report?.role, "implementation");
 
     const wrong = readWorkerSession(file, join(parent, "wrong"), objective);
     assert.equal(wrong.unreadable, true);

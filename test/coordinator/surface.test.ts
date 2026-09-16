@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
 import { RecordStore } from "../../src/coordinator/store.js";
@@ -80,18 +81,60 @@ void test("coordinator registers the exact strict tool surface", async () => {
     assert.equal(Value.Check(checkout.parameters, { cwd: "." }), true);
     assert.equal(Value.Check(checkout.parameters, { cwd: " " }), false);
 
+    const research = f.runner.getToolDefinition("workgraph_research");
+    assert.ok(research !== undefined);
+    assert.equal(Value.Check(research.parameters, { id: "research", question: "Question?" }), true);
+    assert.equal(
+      Value.Check(research.parameters, {
+        id: "research-context",
+        question: "Question?",
+        context: "Settled scope",
+        expectedEvidence: ["Evidence"],
+      }),
+      true,
+    );
+
     const experiment = f.runner.getToolDefinition("workgraph_experiment");
     assert.ok(experiment !== undefined);
     assert.equal(
       Value.Check(experiment.parameters, {
         id: "experiment",
         question: "Question?",
-        expectedEvidence: ["Evidence"],
+        context: "Settled scope",
         permittedEffects: ["write"],
         stopCondition: "done",
         selection: { count: 2, distinctModels: true },
       }),
       true,
+    );
+    assert.equal(
+      Value.Check(experiment.parameters, {
+        id: "experiment-blank",
+        question: "Question?",
+        permittedEffects: [" "],
+        stopCondition: "done",
+      }),
+      false,
+    );
+
+    const review = f.runner.getToolDefinition("workgraph_review");
+    assert.ok(review !== undefined);
+    assert.equal(
+      Value.Check(review.parameters, {
+        id: "review",
+        request: "Assess the live directory.",
+        context: "Include partial material.",
+      }),
+      true,
+    );
+    assert.equal(
+      Value.Check(review.parameters, {
+        id: "obsolete-review",
+        objective: "Assess",
+        concern: "Risk",
+        subject: { kind: "revision", revision: "a".repeat(40) },
+      }),
+      false,
     );
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
@@ -159,6 +202,58 @@ void test("coordinator registers the exact strict tool surface", async () => {
   }
 });
 
+void test("Review accepts a live dirty directory without Attempt provenance or revision", async () => {
+  const f = await fixture(true);
+
+  try {
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    await writeFile(join(f.root, "live-uncommitted.txt"), "partial\n");
+
+    const created = await f.call("workgraph_review", {
+      id: "live-review",
+      cwd: ".",
+      request: "Assess the live partial material.",
+      context: "Prioritize actionable correctness findings.",
+    });
+
+    // SAFETY: The registered Review tool returns the bounded creation receipt.
+    const receipt = created.details as { attempts: { attemptId: string }[] };
+    const attemptId = receipt.attempts[0]?.attemptId;
+    assert.ok(attemptId !== undefined);
+
+    let sessionFile: string | undefined;
+
+    for (let index = 0; index < 100 && sessionFile === undefined; index += 1) {
+      const inspected = await f.call("workgraph_inspect", { section: "attempt", id: attemptId });
+      // SAFETY: Exact Attempt inspection exposes its nullable decoded Worker state.
+      sessionFile = (inspected.details as { worker: null | { sessionFile: string } }).worker
+        ?.sessionFile;
+
+      if (sessionFile === undefined) await Effect.runPromise(Effect.sleep(10));
+    }
+
+    assert.ok(sessionFile !== undefined);
+
+    const objective = SessionManager.open(sessionFile)
+      .getBranch()
+      .find(
+        (entry) => entry.type === "custom_message" && entry.customType === "pi-workgraph-objective",
+      );
+
+    assert.ok(objective?.type === "custom_message");
+    assert.equal(Array.isArray(objective.content), false);
+    // SAFETY: The objective's non-array custom-message content is text under Pi's content union.
+    const content = objective.content as string;
+
+    assert.match(content, /resolved starting context/);
+    assert.match(content, /Request: Assess the live partial material\./);
+    assert.match(content, /Context: Prioritize actionable correctness findings\./);
+    assert.equal(existsSync(join(f.root, "live-uncommitted.txt")), true);
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("coordinator extension remains inactive in Worker scope", async () => {
   const f = await fixture(false, null, "research");
 
@@ -221,12 +316,11 @@ void test("registered extension starts candidate extension from the exact retain
       result: {
         kind: "reported",
         report: {
-          kind: "implementation",
+          role: "implementation",
           status: "completed",
           outcome: "changed",
           summary: "Produced the source Candidate.",
-          evidence: [],
-          findings: [],
+          details: "The Candidate was committed and verified.",
         },
       },
       effectiveModels: [],
@@ -384,7 +478,19 @@ void test("one session creates frozen Task and Attempt records and inspects them
     await f.call("workgraph_research", {
       id: "read-only",
       question: "What is here?",
-      expectedEvidence: ["Direct inspection"],
+      context: "Inspect only relevant current material.",
+    });
+
+    const researchTask = await f.call("workgraph_inspect", {
+      section: "task",
+      id: "read-only",
+    });
+
+    // SAFETY: Exact Task inspection returns the strictly decoded persisted Task record.
+    assert.deepEqual((researchTask.details as { task: Task }).task.contract, {
+      kind: "research",
+      question: "What is here?",
+      context: "Inspect only relevant current material.",
     });
     await assert.rejects(
       f.call("workgraph_attempt", { taskId: "read-only", baseRevision: base }),
@@ -430,6 +536,7 @@ void test("one session creates frozen Task and Attempt records and inspects them
       id: "bounded-experiment",
       cwd: ".",
       question: "Can the probe run?",
+      context: "Use one bounded probe per Attempt.",
       expectedEvidence: ["Probe output"],
       permittedEffects: ["Create probe.tmp in the assigned worktree"],
       stopCondition: "Stop after one probe",
@@ -463,6 +570,7 @@ void test("one session creates frozen Task and Attempt records and inspects them
     assert.deepEqual((experimentTask.details as { task: Task }).task.contract, {
       kind: "experiment",
       question: "Can the probe run?",
+      context: "Use one bounded probe per Attempt.",
       expectedEvidence: ["Probe output"],
       permittedEffects: ["Create probe.tmp in the assigned worktree"],
       stopCondition: "Stop after one probe",

@@ -17,8 +17,17 @@ A durable assignment with one purpose and exact Target. A Task may have multiple
 
 _Avoid_: Workstream
 
+**Research**:
+A read-only evidence-seeking Task with a question and optional context and expected evidence.
+
+**Consultation**:
+A read-only advice Task with a question and optional context, executed by the policy-selected advisor frozen into its Attempt.
+
+**Review**:
+A read-only Task expressed as a natural-language request with optional context. It may assess relevant accessible material without requiring a typed subject, provenance chain, or exact revision unless its request depends on one.
+
 **Experiment**:
-An evidence-seeking Task whose contract grants each Attempt explicit bounded effects and a stop condition. It shares research model selection and reporting, but executes in a repository worktree and does not produce an applicable Candidate.
+An evidence-seeking Task whose contract independently grants each Attempt explicit effect kind, scope, and lifetime plus a hard stop cutoff. It shares research model selection, executes in a repository worktree, and does not produce an applicable Candidate.
 
 **Attempt**:
 One execution of a Task. Trying the same Task again creates a new Attempt rather than changing the existing one.
@@ -34,10 +43,13 @@ The detached repository worktree assigned as one repository Attempt's execution 
 **Outcome**:
 The semantic result of an Attempt: a report, an unreported ending, or cancellation. It is distinct from repository output.
 
+**Worker report**:
+A strict terminal narrative containing status, summary, details, and a runtime-injected exact role. `completed` is a bounded result rather than approval; `needs_decision` identifies missing consequential Coordinator choice or authority; `failed` identifies operational or contract inability.
+
 _Avoid_: Output
 
 **Target**:
-The directory or repository to which a Task applies. Every Attempt for that Task inherits the same Target.
+The directory or repository to which a Task applies. Every Attempt for that Task inherits the same Target. For read-only roles, its resolved cwd is starting context rather than evidence scope, subject, provenance, or authority. For Experiment it identifies the repository whose committed base seeds the owned detached worktree.
 
 **Candidate**:
 A clean retained implementation repository output for which Workgraph can prove the exact producing Attempt, root, tip, and lineage. It may be reviewed, used as the source of a successor Candidate, applied, or discarded.

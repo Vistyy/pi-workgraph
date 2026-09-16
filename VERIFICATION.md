@@ -15,7 +15,7 @@ Exercise the native SQLite store through separate exact-session instances. Estab
 - Outcome insertion is write-once; and
 - each persisted JSON field and SQL scalar used by a supported read is strictly decoded at that use.
 
-Use actual rows and transaction failure, not only TypeBox value checks. A decoder test should mutate the one field whose supported-read rejection is being established, then remove the disposable database. Do not build a durable corruption matrix: arbitrary external database tampering is not a supported recovery interface.
+Use actual rows and transaction failure, not only TypeBox value checks. Establish that every reported Outcome carries the runtime-injected exact Research, Experiment, Consultation, Review, or Implementation role and that store-side consistency rejects a mismatch. A decoder test should mutate the one field whose supported-read rejection is being established, then remove the disposable database. Do not build a durable corruption matrix: arbitrary external database tampering is not a supported recovery interface.
 
 Do not add migration, aggregate-reconstruction, cross-session-discovery, lease, or concurrent same-session process fixtures unless those become supported responsibilities. The current schema is version 1 and must fail closed on unknown existing versions.
 
@@ -31,7 +31,7 @@ Assert ordering from persisted records and transport observations. Private helpe
 
 ## Semantic Outcome and models
 
-Read the actual Worker Pi session used by an Attempt. Establish that a valid terminal report becomes a reported Outcome, malformed or unavailable terminal evidence becomes a truthful bounded unreported result, and cancellation remains distinct. The Outcome must be immutable once present.
+Read the actual Worker Pi session used by an Attempt. Establish that each role exposes the correct strict report input, the model cannot submit a role, missing or blank summary/details and undeclared fields reject, and runtime injects the exact immutable role. A valid terminal report must become an exactly persisted and readable reported Outcome; malformed or unavailable terminal evidence becomes a truthful bounded unreported result, and cancellation remains distinct. Verify `completed | needs_decision | failed`, Implementation's completed-only `changed | no_change`, failed-only startup, and changed completion only after executor cutover. The Outcome must be immutable once present.
 
 Use controlled providers to emit real Pi model-change entries. Verify that the Attempt freezes requested targets before launch while `effectiveModels` comes from actual ordered session markers, deduplicates exact targets, can differ from selection, and is empty when no effective model was observed. Never infer model use from report prose or from the requested policy alone.
 
@@ -48,7 +48,7 @@ Use real disposable Git repositories through the registered coordinator/runtime 
 - `candidateOf: extend` requires the exact retained source Candidate ref, preserves its root, starts from its tip, and prevents source discard until successor placement;
 - `candidateOf: integrate` preserves an explicit base, exact source Candidate-producing Attempt, and source tip;
 - a completed report retains only commits: unchanged HEAD produces no output, changed HEAD creates `refs/pi-workgraph/outputs/<attemptId>`, and the whole worktree is removed in either case;
-- failed, escalated, unreported, and cancelled Attempts preserve dirty, ignored, and untracked bytes while compacting clean commit state normally;
+- `needs_decision`, failed, unreported, and cancelled Attempts preserve dirty, ignored, and untracked bytes while compacting clean commit state normally;
 - complete absence recovers compacted output, while external deletion or pruning remains unsupported; and
 - moved, foreign, incomplete, unrelated, or ambiguous resources remain physically present and blocked.
 
@@ -68,7 +68,7 @@ Make direct committed changes in the managed checkout and target a repository im
 
 ## Worker behavior
 
-Exercise each role through a real Worker Pi session and installed Worker extension. Verify role-specific tool gates, immutable assignment context, report schema, report readback, model markers, and compaction recovery from genuine Pi branch history.
+Exercise each role through a real Worker Pi session and installed Worker extension. Verify role-specific tool gates, immutable assignment context, narrative report schema and exact role injection, report readback, model markers, and compaction recovery from genuine Pi branch history. Assignment policy must preserve relevant evidence beyond read-only cwd and the Experiment hard lifetime cutoff language, including authorized teardown and the absence of automatic enforcement or post-cutoff cleanup authority.
 
 For implementation, establish one guide-to-executor Prewalk in the same session. The one-shot TODO initialization input has no statuses; establish first-item `in_progress`, remaining-item `pending`, full-state set/update receipts, and duplicate initialization refusal. Cutover requires both a valid 1–9 item TODO and a successful direct edit or write, in either order. Failed mutations, shell commands, and observations do not qualify. Verify exact executor model and thinking selection, one executor-start marker, guide-policy replacement on the next provider request, stable assignment context, and an executor assistant message before a changed terminal report. Selection failure must remain guide-owned, emit one diagnostic, block further mutation, permit truthful failure or escalation, and never retry automatically. If an executor becomes idle with actionable items and no report, verify at most two continuation reminders without turning TODO state into a report gate.
 
@@ -76,7 +76,7 @@ Restore assignment and current TODO after actual context compaction, not ordinar
 
 ## Coordinator tools and notepad
 
-Invoke every registered coordinator tool through Pi's extension surface. Verify the current strict schemas for separate read-only Research, effectful Experiment, and configured consultation. Experiment authority and stop conditions apply per Attempt; use a real repository placement to distinguish it from directory Research without treating its scratch as a Candidate.
+Invoke every registered coordinator tool through Pi's extension surface. Verify the current strict schemas for separate read-only Research, effectful Experiment, configured consultation, and flexible Review. Optional context and expected evidence must survive or omit exactly; Experiment permitted-effect entries are nonblank and its hard cutoff semantics reach immutable assignment and policy. Create Review against a live dirty directory without an Attempt, source Outcome, or revision, and observe resolved starting context plus request and optional context. Experiment authority applies independently per Attempt; use a real repository placement to distinguish it from directory Research without treating its scratch as a Candidate.
 
 Verify failure before record creation for invalid policy or selection, Task/Attempt and Coordinator-checkout receipts, exact bounded inspection, and explicit control effects. Creation receipts identify immutable specifications. Successful control receipts expose the requested action and persisted post-operation Outcome, Worker, and repository facts without claiming acceptance. Exact Attempt inspection includes its Task contract and target, report status and bounded preview, and its exact blocker even beyond overview pagination. For operations that can fail after a durable checkpoint, use the smallest boundary that establishes preserved partial facts and an inspect-before-retry response; do not add rollback or ledger fixtures. Confirm that one fresh Worker session is associated with each Attempt and that inspection cannot enumerate another coordinator session's records.
 
