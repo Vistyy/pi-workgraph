@@ -121,11 +121,11 @@ void test("coordinator registers exactly nine strict tools", async () => {
       await readFile(new URL("../../COORDINATOR.md", import.meta.url), "utf8")
     ).trim();
 
-    const publicationReference = resolve("references/publish-pr.md");
+    const publicationReferencePath = resolve("references/publish-pr.md");
 
-    const guidance = `${coordinatorContract}\n\nPR publication reference: ${publicationReference}`;
+    const guidance = `${coordinatorContract}\n\nPR publication reference path (content not loaded): ${publicationReferencePath}`;
 
-    assert.equal(existsSync(publicationReference), true);
+    assert.equal(existsSync(publicationReferencePath), true);
 
     const injected = await f.runner.emitBeforeAgentStart(
       "Coordinate the request",
@@ -138,6 +138,11 @@ void test("coordinator registers exactly nine strict tools", async () => {
       injected?.systemPrompt,
       `Base coordinator prompt\n\n${guidance}`,
       "the loaded coordinator extension injects the packaged guidance and reference path",
+    );
+    assert.equal(
+      injected?.systemPrompt.includes("# Publish an accepted change as a pull request"),
+      false,
+      "publication-reference content stays out of the system prompt",
     );
   } finally {
     await f.dispose();

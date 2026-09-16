@@ -80,7 +80,7 @@ export interface CoordinatorOptions {
 export default function coordinator(pi: ExtensionAPI, options: CoordinatorOptions = {}): void {
   if (!isCoordinatorScope(process.env)) return;
 
-  const publicationReference = fileURLToPath(
+  const publicationReferencePath = fileURLToPath(
     new URL("../references/publish-pr.md", import.meta.url),
   );
 
@@ -89,7 +89,8 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     "utf8",
   ).trim();
 
-  const guidance = `${coordinatorContract}\n\nPR publication reference: ${publicationReference}`;
+  // Keep the optional procedure out of the system prompt; expose only where to read it.
+  const guidance = `${coordinatorContract}\n\nPR publication reference path (content not loaded): ${publicationReferencePath}`;
 
   const agentDir = options.agentDir ?? getAgentDir();
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
