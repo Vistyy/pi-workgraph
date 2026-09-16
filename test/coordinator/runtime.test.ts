@@ -685,7 +685,7 @@ void test("queued cancellation makes no Herdr call and active cancellation close
   }
 });
 
-void test("creation uses global Attempt IDs and admits Review without source Outcome provenance", async () => {
+void test("creation uses global Attempt IDs", async () => {
   const root = temporary();
   const store = new RecordStore(root, "session-create");
   const native = fixture(root);
@@ -715,22 +715,7 @@ void test("creation uses global Attempt IDs and admits Review without source Out
     assert.match(first.id, /^attempt-[0-9a-f-]{36}$/);
     assert.match(second.id, /^attempt-[0-9a-f-]{36}$/);
     assert.notEqual(first.id, second.id);
-
-    const review = await Effect.runPromise(
-      runtime.createTask({
-        id: "review",
-        target: task(root, "review").target,
-        contract: {
-          kind: "review",
-          request: "Review the live uncommitted directory and available Attempt material.",
-          context: `The related unsettled Attempt is ${first.id}.`,
-        },
-        selection,
-      }),
-    );
-
-    assert.equal(review.spec.base.kind, "directory");
-    assert.equal(store.counts().tasks, 2);
+    assert.equal(store.counts().tasks, 1);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });

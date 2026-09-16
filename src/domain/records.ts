@@ -26,9 +26,20 @@ const TaskTargetSchema = Type.Union([
   strict({ kind: Type.Literal("repository"), checkoutRoot: Text, commonDir: Text }),
 ]);
 
-const OptionalContext = Type.Optional(Type.String({ maxLength: 20_000 }));
+export const AssignmentContextSchema = Type.String({
+  maxLength: 20_000,
+  description:
+    "Optional settled context, references, scope, or constraints. At most 20,000 characters; cannot grant authority.",
+});
 
-const OptionalExpectedEvidence = Type.Optional(Type.Array(NonBlankText, { minItems: 1 }));
+export const ExpectedEvidenceSchema = Type.Array(NonBlankText, {
+  minItems: 1,
+  description: "Evidence the Outcome should provide.",
+});
+
+const OptionalContext = Type.Optional(AssignmentContextSchema);
+
+const OptionalExpectedEvidence = Type.Optional(ExpectedEvidenceSchema);
 
 const TaskContractSchema = Type.Union([
   strict({

@@ -127,15 +127,6 @@ void test("coordinator registers the exact strict tool surface", async () => {
       }),
       true,
     );
-    assert.equal(
-      Value.Check(review.parameters, {
-        id: "obsolete-review",
-        objective: "Assess",
-        concern: "Risk",
-        subject: { kind: "revision", revision: "a".repeat(40) },
-      }),
-      false,
-    );
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(

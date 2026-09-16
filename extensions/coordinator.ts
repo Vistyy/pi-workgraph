@@ -24,9 +24,11 @@ import { installNotepad } from "../src/coordinator/notepad.js";
 import { type CandidateRequest, RuntimeError, SessionRuntime } from "../src/coordinator/runtime.js";
 import { RecordStore } from "../src/coordinator/store.js";
 import {
+  AssignmentContextSchema,
   type AttemptRecord,
   type AttemptSelection,
   CommitSchema,
+  ExpectedEvidenceSchema,
   type Task,
   type TaskContract,
   TaskIdSchema,
@@ -55,6 +57,10 @@ const CandidateOf = Type.Optional(
 );
 
 const Selection = Type.Optional(SelectionRequestSchema);
+
+const Context = Type.Optional(AssignmentContextSchema);
+
+const ExpectedEvidence = Type.Optional(ExpectedEvidenceSchema);
 
 const TaskFields = {
   id: TaskIdSchema,
@@ -198,19 +204,8 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       {
         ...TaskFields,
         question: nonBlank("Question the Research Task must answer."),
-        context: Type.Optional(
-          Type.String({
-            maxLength: 20_000,
-            description:
-              "Settled context, references, scope, or constraints; does not widen Worker authority.",
-          }),
-        ),
-        expectedEvidence: Type.Optional(
-          Type.Array(Text, {
-            minItems: 1,
-            description: "Evidence the Research Outcome should provide.",
-          }),
-        ),
+        context: Context,
+        expectedEvidence: ExpectedEvidence,
         selection: Selection,
       },
       { additionalProperties: false },
@@ -242,14 +237,8 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       {
         ...TaskFields,
         question: nonBlank("Question the Experiment Task must answer."),
-        context: Type.Optional(
-          Type.String({
-            maxLength: 20_000,
-            description:
-              "Settled context, references, scope, or constraints; does not widen Worker authority.",
-          }),
-        ),
-        expectedEvidence: Type.Optional(Type.Array(Text, { minItems: 1 })),
+        context: Context,
+        expectedEvidence: ExpectedEvidence,
         permittedEffects: Type.Array(
           nonBlank(
             "Authorized effect kind, scope, and lifetime independently granted to each Attempt.",
@@ -291,13 +280,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       {
         ...TaskFields,
         question: nonBlank("Question for the consultation advisor."),
-        context: Type.Optional(
-          Type.String({
-            maxLength: 20_000,
-            description:
-              "Settled context, references, scope, or constraints; does not widen advisor authority.",
-          }),
-        ),
+        context: Context,
       },
       { additionalProperties: false },
     ),
@@ -380,13 +363,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         request: nonBlank(
           "Natural-language request for material the Review should assess; exact revisions are required only when the request depends on them.",
         ),
-        context: Type.Optional(
-          Type.String({
-            maxLength: 20_000,
-            description:
-              "Settled context, references, scope, or constraints; does not narrow accessible read-only evidence or widen authority.",
-          }),
-        ),
+        context: Context,
         selection: Selection,
       },
       { additionalProperties: false },

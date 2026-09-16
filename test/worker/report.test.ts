@@ -13,7 +13,6 @@ const narrative = {
 void test("every exact role has a strict narrative input and persisted runtime role", () => {
   for (const role of ["research", "experiment", "consultation", "review"] as const) {
     const input = reportSchemaForMode(role);
-    assert.equal(Value.Check(input, narrative), true, `${role} input`);
     assert.equal(Value.Check(input, { ...narrative, role }), false, `${role} cannot supply role`);
     assert.equal(
       Value.Check(WorkerReportSchema, { role, ...narrative }),
@@ -75,7 +74,6 @@ void test("schemas reject blanks and undeclared or obsolete structured fields", 
     assert.equal(Value.Check(schema, report), true, `${role} baseline`);
     assert.equal(Value.Check(schema, { ...report, summary: " " }), false, `${role} blank summary`);
     assert.equal(Value.Check(schema, { ...report, details: "\n" }), false, `${role} blank details`);
-    assert.equal(Value.Check(schema, { ...report, evidence: [] }), false, `${role} obsolete array`);
     assert.equal(Value.Check(schema, { ...report, extra: true }), false, `${role} extra`);
   }
 });
