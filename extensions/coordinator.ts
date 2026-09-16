@@ -257,7 +257,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           { minItems: 1 },
         ),
         stopCondition: nonBlank(
-          "Hard cutoff by which effects and authorized teardown must be complete; it is not automatically enforced.",
+          "Hard cutoff by which effects and authorized teardown must be complete; a success-dependent cutoff must include bounded exhaustion, and Workgraph does not automatically enforce it.",
         ),
         selection: Selection,
       },
