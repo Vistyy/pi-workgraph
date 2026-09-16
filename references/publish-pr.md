@@ -8,9 +8,9 @@ Work from the exact Coordinator checkout and accepted change. Reinspect its fina
 
 Determine whether the accepted head already has an open pull request. Update that exact pull request instead of creating a duplicate. Never force-push. If an operation fails or returns an uncertain result after it may have changed the remote, inspect the remote state before doing anything else and do not automatically repeat it.
 
-## Show the change to the reviewer
+## Show the change to the maintainer
 
-Open with why the change exists and its observable result, then show the smallest view that makes the important change obvious. Visuals are explanations, not decoration; omit anything that does not help the reviewer understand behavior, structure, risk, or evidence.
+Open with why the change exists and its observable result, then show the smallest view that makes the important change obvious. Visuals are explanations, not decoration; omit anything that does not help the maintainer understand behavior, structure, risk, or evidence.
 
 Choose the visual language that matches the change:
 
@@ -30,7 +30,7 @@ For example, show a changed flow as a diff rather than describing each step in p
 ```diff
  accepted change
 -  → merge or publish through ordinary tooling
-+  → classify human review
++  → classify Human sign-off
 +  → recommend a delivery route
 +  → stop when no route was selected
 +  → read publication procedure only after PR choice
@@ -63,14 +63,14 @@ Place each visual beside the text it supports. Prefer one strong visual over sev
 
 After the visual explanation:
 
-- state the Coordinator's already-decided `Human review: Required` or `Human review: Optional`, including a short reason and, when required, the specific review focus;
+- state the Coordinator's already-decided `Human sign-off: Required` or `Human sign-off: Optional`, including a short reason and, when required, the specific sign-off focus;
 - present evidence that directly supports the affected promises, such as an exercised workflow, before/after screenshot, measurement, or relevant checks;
 - include limitations only when they are material.
 
-Omit empty sections and implementation chronology. Do not claim evidence that was not observed. Do not expose local paths, credentials, private logs, or unpublished local artifacts. Screenshots and other media must have a deliberate reviewer-accessible destination before they are linked.
+Omit empty sections and implementation chronology. Do not claim evidence that was not observed. Do not expose local paths, credentials, private logs, or unpublished local artifacts. Screenshots and other media must have a deliberate maintainer-accessible destination before they are linked.
 
 Adapt the body to the change instead of forcing a fixed template.
 
 ## Publish once
 
-Push the accepted branch with ordinary Git and forge tooling, then create or update the pull request with the prepared title and body. Verify that the resulting pull request targets the intended base and exact accepted head. Report the complete pull-request URL, the published revision, the human-review classification, and any evidence limitation. Stop after this one-time publication.
+Push the accepted branch with ordinary Git and forge tooling, then create or update the pull request with the prepared title and body. Verify that the resulting pull request targets the intended base and exact accepted head. Report the complete pull-request URL, the published revision, the Human sign-off classification, and any evidence limitation. Stop after this one-time publication.

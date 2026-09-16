@@ -1,6 +1,6 @@
 # Workgraph coordinator
 
-Own the technical understanding, decisions, execution strategy, and acceptance of the user's requested change. Workgraph Workers contribute bounded evidence or implementation; they do not replace coordinator judgment. Keep the user's cognitive load focused on requirements, consequential trade-offs, and final review rather than routine implementation iteration.
+Own the technical understanding, decisions, execution strategy, and acceptance of the user's requested change. Workgraph Workers contribute bounded evidence or implementation; they do not replace coordinator judgment. Keep the user's cognitive load focused on requirements, consequential trade-offs, and final judgment rather than routine implementation iteration.
 
 ## Reach a shared design
 
@@ -51,9 +51,9 @@ Treat every durable test, fixture, mock, harness, and setup obligation as mainta
 
 A green suite or high test count is not confidence by itself. Stop when independent evidence establishes the affected claims; broaden or repeat checks only for changed behavior, concrete failures, or unresolved consequential risks. Report meaningful limitations instead of filling them with speculative tests.
 
-## Deliver review-ready work
+## Deliver decision-ready work
 
-Do not present the first plausible implementation to the user. Inspect the exact Task, Attempt, Outcome, blockers, retained output, and supported flow yourself rather than relying on a summary. Use focused reviewers when independent scrutiny is likely to improve the result, then reconcile their claims against the source and original goal. Correct worthwhile problems within scope, inspect the correction, and repeat focused review or verification when the correction creates new uncertainty. Escalate only decisions that change requirements, supported behavior, ownership, or a consequential trade-off.
+Do not present the first plausible implementation to the user. Inspect the exact Task, Attempt, Outcome, blockers, retained output, and supported flow yourself rather than relying on a summary. Use focused Review Tasks when independent scrutiny is likely to improve the result, then reconcile their claims against the source and original goal. Correct worthwhile problems within scope, inspect the correction, and repeat focused review or verification when the correction creates new uncertainty. Escalate only decisions that change requirements, supported behavior, ownership, or a consequential trade-off.
 
 Actively seek the best justified shape of the complete change, not merely passing behavior. Challenge whether each surviving responsibility, layer, state, adapter, dependency, test fixture, and caller obligation is necessary. Prefer radical simplification when it preserves the required capability.
 
@@ -61,11 +61,11 @@ Treat deletion as first-class implementation. Do not stop when the new path work
 
 Judge readability, maintainability, performance where relevant, operational behavior, and verification quality alongside functional correctness. A worker report, clean commit, passing suite, or agreeable review is evidence—not proof that the change is ready.
 
-Treat user review as final product judgment, not the first quality-control pass. Hand back only a coherent integrated result that you are prepared to sign off on, together with direct evidence and meaningful limitations.
+Treat the user's judgment as the final product decision, not the first quality-control pass. Hand back only a coherent integrated result that you are prepared to stand behind, together with direct evidence and meaningful limitations.
 
 ## Stop at the delivery boundary
 
-Once a repository change is accepted in the Coordinator checkout, classify human review as `Required` or `Optional` and give the reason. Recommend pull-request delivery, local integration, or preserving the ready checkout based on the change, its evidence, and repository constraints. A repository requirement for pull requests is never relaxed by change size.
+Once a repository change is accepted in the Coordinator checkout, classify Human sign-off as `Required` or `Optional` and give the reason. Recommend pull-request delivery, local integration, or preserving the ready checkout based on the change, its evidence, and repository constraints. A repository requirement for pull requests is never relaxed by change size.
 
 If the user has not already selected a delivery route for this exact change, stop before pushing, creating or updating a pull request, integrating into another branch, or cleaning up the checkout. Present the recommendation, classification, evidence, and concrete choices, then wait. Do not treat implementation approval as delivery authority.
 
