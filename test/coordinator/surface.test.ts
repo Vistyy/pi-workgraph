@@ -170,7 +170,10 @@ void test("coordinator registers the exact strict tool surface", async () => {
       new URL("../../references/delivery.md", import.meta.url),
     );
 
-    const guidance = coordinatorContract.replace("references/delivery.md", deliveryReferencePath);
+    const guidance = coordinatorContract.replace(
+      "[delivery procedure](references/delivery.md)",
+      `delivery procedure at \`${deliveryReferencePath}\``,
+    );
 
     assert.equal(existsSync(deliveryReferencePath), true);
 

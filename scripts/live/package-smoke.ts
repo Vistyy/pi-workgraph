@@ -33,7 +33,7 @@ async function command(cwd: string, file: string, args: string[]): Promise<strin
 }
 
 async function smokePackage(): Promise<void> {
-  parent = await mkdtemp(join(tmpdir(), "workgraph-package-smoke-"));
+  parent = await mkdtemp(join(tmpdir(), "workgraph package smoke ()-"));
   const packed = await command(checkout, "pnpm", ["pack", "--pack-destination", parent]);
   const tarball = packed.split("\n").at(-1);
 
@@ -118,8 +118,8 @@ async function smokePackage(): Promise<void> {
         "Base coordinator prompt",
         { cwd: process.cwd() },
       );
-      const expectedLink = "[delivery procedure](" + deliveryReferencePath + ")";
-      if (!injected?.systemPrompt?.includes(expectedLink))
+      const expectedReference = "delivery procedure at \`" + deliveryReferencePath + "\`";
+      if (!injected?.systemPrompt?.includes(expectedReference))
         throw new Error("Packaged coordinator prompt did not resolve its delivery reference.");
       if (injected.systemPrompt.includes("](references/delivery.md)"))
         throw new Error("Packaged coordinator prompt retained its source-relative delivery link.");
