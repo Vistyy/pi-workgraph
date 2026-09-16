@@ -52,13 +52,14 @@ async function smokePackage(): Promise<void> {
   ]);
 
   const packageRoot = join(consumer, "node_modules/@syzom/pi-workgraph");
-
-  const deliveryReference = await readFile(join(packageRoot, "references/delivery.md"), "utf8");
+  const deliveryReferencePath = join(packageRoot, "references/delivery.md");
+  const deliveryReference = await readFile(deliveryReferencePath, "utf8");
 
   if (!deliveryReference.includes("# Deliver an accepted repository change"))
     throw new Error("Packaged delivery reference is missing or invalid.");
 
   const agentDir = join(parent, "agent");
+  const sessionDir = join(parent, "sessions");
   await mkdir(agentDir);
 
   const modules = ["extensions/coordinator.ts", "extensions/worker.ts"].map((path) =>
@@ -69,9 +70,17 @@ async function smokePackage(): Promise<void> {
     "--input-type=module",
     "--eval",
     `
-      import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
+      import {
+        discoverAndLoadExtensions,
+        ExtensionRunner,
+        ModelRegistry,
+        ModelRuntime,
+        SessionManager,
+      } from "@earendil-works/pi-coding-agent";
       const [coordinatorPath, workerPath] = ${JSON.stringify(modules)};
       const agentDir = ${JSON.stringify(agentDir)};
+      const sessionDir = ${JSON.stringify(sessionDir)};
+      const deliveryReferencePath = ${JSON.stringify(deliveryReferencePath)};
       const one = (result, label, path) => {
         if (result.errors.length > 0)
           throw new Error(label + " load failed: " + JSON.stringify(result.errors));
@@ -80,13 +89,43 @@ async function smokePackage(): Promise<void> {
         return loaded;
       };
       delete process.env.PI_WORKGRAPH_ROLE;
-      const coordinator = one(
-        await discoverAndLoadExtensions([coordinatorPath], process.cwd(), agentDir),
-        "coordinator",
-        coordinatorPath,
+      const coordinatorResult = await discoverAndLoadExtensions(
+        [coordinatorPath],
+        process.cwd(),
+        agentDir,
       );
+      const coordinator = one(coordinatorResult, "coordinator", coordinatorPath);
       if (!coordinator.tools.has("workgraph_implement") || !coordinator.commands.has("calm"))
         throw new Error("Packaged coordinator factory did not register its extension surface.");
+
+      const modelRuntime = await ModelRuntime.create({
+        authPath: ${JSON.stringify(join(parent, "auth.json"))},
+        modelsPath: null,
+        modelsStorePath: ${JSON.stringify(join(parent, "catalog.json"))},
+        refreshOnCreate: false,
+        allowModelNetwork: false,
+      });
+      const runner = new ExtensionRunner(
+        coordinatorResult.extensions,
+        coordinatorResult.runtime,
+        process.cwd(),
+        SessionManager.create(process.cwd(), sessionDir),
+        new ModelRegistry(modelRuntime),
+      );
+      const injected = await runner.emitBeforeAgentStart(
+        "Coordinate the request",
+        undefined,
+        "Base coordinator prompt",
+        { cwd: process.cwd() },
+      );
+      const expectedLink = "[delivery procedure](" + deliveryReferencePath + ")";
+      if (!injected?.systemPrompt?.includes(expectedLink))
+        throw new Error("Packaged coordinator prompt did not resolve its delivery reference.");
+      if (injected.systemPrompt.includes("](references/delivery.md)"))
+        throw new Error("Packaged coordinator prompt retained its source-relative delivery link.");
+      if (injected.systemPrompt.includes("# Deliver an accepted repository change"))
+        throw new Error("Packaged coordinator prompt eagerly included the delivery procedure.");
+
       process.env.PI_WORKGRAPH_ROLE = "research";
       const worker = one(
         await discoverAndLoadExtensions([workerPath], process.cwd(), agentDir),
@@ -98,7 +137,7 @@ async function smokePackage(): Promise<void> {
     `,
   ]);
   process.stdout.write(
-    `${JSON.stringify({ status: "passed", boundary: "pack/install/load/extensions-and-reference", totalMs: Date.now() - started })}\n`,
+    `${JSON.stringify({ status: "passed", boundary: "pack/install/load/inject/extensions-and-reference", totalMs: Date.now() - started })}\n`,
   );
 }
 

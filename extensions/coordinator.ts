@@ -1,7 +1,5 @@
 /* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
-import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, relative, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   type ExtensionAPI,
@@ -12,6 +10,7 @@ import { Effect, Exit, Match, Scope } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
 import { createCheckout } from "../src/coordinator/checkouts.js";
+import { resolvePackagedLinks } from "../src/coordinator/guidance.js";
 import type { HerdrCliRuntime } from "../src/coordinator/herdr.js";
 import {
   implementationTargets,
@@ -83,31 +82,6 @@ export interface CoordinatorOptions {
   readonly agentDir?: string;
   readonly policyPath?: string;
   readonly herdr?: HerdrCliRuntime;
-}
-
-const MarkdownLinkTarget = /(?<=\]\()[^)\s]+(?=\))/gu;
-
-function resolvePackagedLinks(markdown: string, source: URL): string {
-  const packageRoot = fileURLToPath(new URL(".", source));
-
-  return markdown.replace(MarkdownLinkTarget, (target) => {
-    if (target.startsWith("#") || target.startsWith("/") || /^[a-z][a-z\d+.-]*:/iu.test(target))
-      return target;
-
-    const resolvedUrl = new URL(target, source);
-    const fragment = resolvedUrl.hash;
-    resolvedUrl.hash = "";
-    const resolvedPath = fileURLToPath(resolvedUrl);
-    const packagePath = relative(packageRoot, resolvedPath);
-
-    if (packagePath === ".." || packagePath.startsWith(`..${sep}`) || isAbsolute(packagePath))
-      throw new Error(`Coordinator reference escapes its package: ${target}`);
-
-    if (!existsSync(resolvedPath))
-      throw new Error(`Coordinator reference does not exist: ${resolvedPath}`);
-
-    return `${resolvedPath}${fragment}`;
-  });
 }
 
 export default function coordinator(pi: ExtensionAPI, options: CoordinatorOptions = {}): void {

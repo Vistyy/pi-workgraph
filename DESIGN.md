@@ -27,7 +27,7 @@ src/
 ├── repository.ts           # Git custody
 └── node-platform.ts        # shared Effect/Node bridge
 references/
-└── delivery.md             # post-choice delivery procedures
+└── delivery.md             # delivery classification, route choice, and procedures
 
 test/
 └── support/                # shared test construction
