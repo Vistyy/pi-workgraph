@@ -118,7 +118,7 @@ async function smokePackage(): Promise<void> {
         "Base coordinator prompt",
         { cwd: process.cwd() },
       );
-      const expectedReference = "delivery procedure at \`" + deliveryReferencePath + "\`";
+      const expectedReference = "delivery procedure at " + JSON.stringify(deliveryReferencePath);
       if (!injected?.systemPrompt?.includes(expectedReference))
         throw new Error("Packaged coordinator prompt did not resolve its delivery reference.");
       if (injected.systemPrompt.includes("](references/delivery.md)"))

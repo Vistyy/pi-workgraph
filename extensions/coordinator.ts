@@ -1,5 +1,6 @@
 /* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   type ExtensionAPI,
@@ -10,7 +11,6 @@ import { Effect, Exit, Match, Scope } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
 import { createCheckout } from "../src/coordinator/checkouts.js";
-import { resolvePackagedLinks } from "../src/coordinator/guidance.js";
 import type { HerdrCliRuntime } from "../src/coordinator/herdr.js";
 import {
   implementationTargets,
@@ -89,10 +89,13 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
   const coordinatorContractUrl = new URL("../COORDINATOR.md", import.meta.url);
 
-  const coordinatorContract = resolvePackagedLinks(
-    readFileSync(coordinatorContractUrl, "utf8"),
-    coordinatorContractUrl,
-  ).trim();
+  const coordinatorContract = readFileSync(coordinatorContractUrl, "utf8")
+    .replace(
+      /\[([^\]\n]+)\]\((references\/[^)\s]+)\)/gu,
+      (_link, label: string, target: string) =>
+        `${label} at ${JSON.stringify(fileURLToPath(new URL(target, coordinatorContractUrl)))}`,
+    )
+    .trim();
 
   const agentDir = options.agentDir ?? getAgentDir();
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
