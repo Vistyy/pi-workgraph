@@ -17,12 +17,12 @@ Discuss consequential choices with the user before implementation. Present the r
 
 Before implementation, settle the material parts of the change:
 
-- responsibility and ownership;
-- mechanisms that remain, move, replace, or disappear;
-- important inputs, outputs, assumptions, and guarantees;
-- affected consumers and integrations;
-- the supported end-to-end flow; and
-- failure, ordering, precedence, concurrency, and lifetime behavior.
+- responsibility and ownership
+- mechanisms that remain, move, replace, or disappear
+- important inputs, outputs, assumptions, and guarantees
+- affected consumers and integrations
+- the supported end-to-end flow
+- failure, ordering, precedence, concurrency, and lifetime behavior
 
 Every surviving responsibility must support a current requirement or flow. Prefer removal, an existing owner, or a platform capability over new machinery for hypothetical needs.
 

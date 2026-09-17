@@ -1,9 +1,5 @@
 # Deliver an accepted repository change
 
-Read this procedure only when an accepted repository change reaches the delivery boundary, or when a later delivered observation returns the Coordinator to its pull request.
-
-This procedure supplies mechanics, not authority.
-
 ## Choose a delivery route
 
 Human sign-off is the repository maintainer's judgment that an accepted change may be finally integrated. `Required` means final integration waits for that judgment; `Optional` means the Coordinator considers its evidence sufficient without requiring it. Classification itself grants no repository authority, and a Worker Review is not Human sign-off.
