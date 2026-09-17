@@ -1,6 +1,13 @@
 # Workgraph design
 
-This document owns the integrated rationale and durable constraints for Workgraph's session-owned coordination design. Public operation belongs in [`README.md`](README.md), domain definitions in [`GLOSSARY.md`](GLOSSARY.md), verification boundaries in [`VERIFICATION.md`](VERIFICATION.md), and focused trade-offs in [`docs/adr/`](docs/adr/).
+This document owns Workgraph's integrated architecture and durable constraints.
+
+| Subject | Owner |
+| --- | --- |
+| Installation and public operation | [`README.md`](README.md) |
+| Domain language | [`GLOSSARY.md`](GLOSSARY.md) |
+| Verification boundaries | [`VERIFICATION.md`](VERIFICATION.md) |
+| Focused trade-offs | [`docs/adr/`](docs/adr/) |
 
 ## Decision records
 
@@ -10,129 +17,381 @@ This document owns the integrated rationale and durable constraints for Workgrap
 
 ## Source ownership
 
-Files follow cohesive feature ownership rather than generic technical layers:
-
 ```text
 extensions/                 # thin Pi host entry points
 src/
-├── coordinator/            # session orchestration, records, models, checkouts, Worker placement
-├── worker/                 # Worker policy, execution trajectory, TODO state, Pi session behavior
-├── calm/                   # complete presentation feature and Pi compatibility seam
+├── coordinator/            # records, models, checkouts, orchestration, Worker placement
+├── worker/                 # policy, execution trajectory, TODO state, Pi session behavior
+├── calm/                   # presentation feature and guarded Pi compatibility seam
 ├── domain/                 # shared structural vocabulary
-├── repository.ts           # all Git custody
-└── node-platform.ts        # small shared Effect/Node bridge
+├── repository.ts           # Git custody
+└── node-platform.ts        # shared Effect/Node bridge
 references/
-└── publish-pr.md           # post-choice PR publication procedure
+└── delivery.md             # delivery classification, route choice, and procedures
 
 test/
-└── support/                # shared test construction only
+└── support/                # shared test construction
 ```
 
-Tests are grouped by the supported responsibility they exercise rather than mechanically mirroring source modules.
+Tests are grouped by supported responsibility rather than by individual source module.
 
-## Coordination ownership
+## Coordination model
 
-The coordinator's exact Pi session is the unit of ownership. Its Tasks and Attempts are private coordination records, not a shared project board. Its session identity also contributes to deterministic Coordinator checkout placement, so another session receives different Git resources for the same repository. Other sessions cannot enumerate or take over its records. Session shutdown releases coordinator-owned runtime activity while preserving Coordinator checkouts, independent Worker sessions, native resources, and repository output.
+The exact Coordinator Pi session is the unit of ownership.
 
-Delegation is optional. The coordinator remains responsible for decisions, Candidate evaluation, final synthesis, and verification. Task contracts are decision-complete and method-light: they externalize the desired contribution, settled context, references, scope, constraints, known options, and evidence expectations at enough fidelity that a Worker need not reconstruct consequential decisions, while leaving local method and conclusions to the Worker. Optional context never expands role authority. Reports provide evidence; they do not create authority, approval, or acceptance.
+```text
+Coordinator session
+├── Coordinator checkout per repository
+├── Task
+│   ├── Attempt → Outcome
+│   └── Attempt → Outcome + retained Candidate
+└── Task
+    └── Attempt → Outcome
+```
 
-A Task is immutable and owns a contract plus one resolved target. An Attempt is one immutable execution specification for that Task: model selection, target-appropriate base, and optional Candidate lineage. It embeds one optional write-once Outcome. Only operational facts about its Worker and repository output are mutable. This split keeps semantic evidence stable while allowing exact recovery checkpoints to advance.
+Another session cannot enumerate or take over these records. Session identity also contributes to deterministic Coordinator checkout placement, so separate sessions receive separate Git resources for the same repository.
 
-An Outcome records a reported, unreported, or cancelled semantic result and the effective model targets observed in the Worker session. It does not represent repository custody or authorize a Git operation. Effective models may be empty when execution never established one, and may differ from the frozen selection when Pi's actual session trajectory differs.
+Delegation is optional. The Coordinator remains responsible for:
 
-Research and Experiment are separate Task contracts. Research is read-only and keeps a question with optional context and expected evidence. Consultation keeps a question and optional context; its advisor remains policy-selected and frozen in the Attempt. Review is a read-only natural-language request with optional context and may assess any relevant accessible material without typed subjects, source-Outcome gates, revision pins, snapshots, or provenance and reproducibility promises.
+- consequential decisions;
+- Candidate evaluation;
+- final synthesis;
+- verification; and
+- the delivery choice.
 
-Experiment keeps a question, optional context and expected evidence, nonblank permitted effects, and a hard stop cutoff in a repository worktree. Each Attempt independently receives authority defining effect kind, scope, and lifetime. An operation may begin only when its complete effectful lifetime, including authorized cancellation or teardown, fits the cutoff. Workgraph claims no automatic deadline enforcement, rollback, or post-cutoff cleanup exception. Experiment commits may remain as retained repository output for inspection or discard but never become applicable Candidates; uncommitted worktree bytes are scratch.
+Worker reports provide evidence. They do not create authority, approval, or acceptance.
+
+### Stable and mutable state
+
+| Record | Stable state | Mutable operational state |
+| --- | --- | --- |
+| Task | Contract and resolved Target | None |
+| Attempt | Task, model selection, repository base when applicable, optional Candidate lineage | Worker, repository output, write-once Outcome |
+| Outcome | Reported, unreported, or cancelled result; observed effective models | None after insertion |
+
+Effective models may be absent when execution never established one. They may differ from the frozen selection when Pi's actual session trajectory differs.
+
+### Task roles
+
+| Role | Authority and result |
+| --- | --- |
+| Research | Read-only evidence gathering. |
+| Consultation | Read-only advice from the policy-selected advisor. |
+| Review | Read-only assessment of relevant accessible material; exact revision only when the request requires it. |
+| Experiment | Explicit effect kind, scope, lifetime, and hard cutoff in a detached repository worktree. Output is inspectable but never an applicable Candidate. |
+| Implementation | Repository change that may produce a Candidate. |
+
+A read-only Task's `cwd` is placement and starting context—not evidence scope, subject, provenance, or authority.
+
+Experiment authority is granted independently to every Attempt. The complete effect lifetime, including authorized teardown, must fit the cutoff.
+
+Workgraph provides no automatic deadline enforcement, rollback, or post-cutoff cleanup exception.
 
 ## Record store
 
-All coordinator sessions share one private `<agentDir>/workgraph/workgraph.sqlite` file. Exact session identity partitions every supported query and mutation. The database stores two strict session record types:
+All Coordinator sessions share one private database:
 
-- `tasks` stores immutable Task JSON under `(session_id, task_id)`;
-- `attempts` stores immutable specification JSON and nullable Worker, output, and Outcome JSON, linked to its session's Task.
+```text
+<agentDir>/workgraph/workgraph.sqlite
+```
 
-Creating a Task and its first Attempt is one SQLite transaction. Creating another Attempt first proves the Task in the same session. Recording an Outcome uses a write-once predicate. Each JSON column is decoded against its strict TypeBox record schema whenever a supported read uses it; SQL row shape and scalar types are checked at the same boundary.
+Exact session identity partitions every supported query and mutation.
 
-The store has no Coordinator checkout records, aggregate mirror, global revision, cached frontier, cross-session lease, or process coordination state. It opens schema version 1 and fails closed on an unknown version; it does not migrate another format. Operational updates write only the owned record field, so unrelated Attempts and sessions need no reconstruction.
+| Table | Content |
+| --- | --- |
+| `tasks` | Immutable Task JSON under `(session_id, task_id)` |
+| `attempts` | Immutable Attempt specification plus nullable Worker, output, and Outcome JSON |
 
-## Worker lifecycle and recovery
+The store guarantees:
 
-Every Attempt receives a fresh Worker Pi session under `<agentDir>/workgraph/worker-sessions/`. The Worker session file is its durable execution history; Herdr owns current workspace, tab, pane, and agent observations. The runtime serializes commands and reconciliation for one coordinator session with Effect primitives.
+- Task creation and its first Attempt are one transaction;
+- another Attempt can reference only a Task from the same session;
+- Outcome insertion is write-once;
+- every JSON field is decoded with its strict TypeBox schema when a supported read uses it; and
+- SQL row shape and scalar types are checked at that boundary.
 
-Launching establishes the exact clean workspace placement, persists the Worker session, creates the tab, starts the agent, persists the kickoff, then submits it. Placement must remain at the clean Attempt base until agent start is checkpointed as uncertain; afterward mutable worktree state no longer gates Worker reconciliation. Recovery observes exact persisted and native identity without replaying uncertain effects or guessing ownership.
+The store has no aggregate mirror, global revision, cached frontier, cross-session lease, or process-coordination state. Coordinator checkouts have no database record.
 
-Normal settlement derives a semantic Outcome from the Worker session independently of repository state and records it before checkpointing and issuing one exact close. It then observes exact absence before marking the Worker closed. A missing Worker that can no longer report becomes a bounded unreported Outcome rather than an endless wait.
+Schema version 1 fails closed on an unknown version. Workgraph does not migrate another format. Operational updates replace only their owned field, so unrelated records require no reconstruction.
 
-Cancellation is definitive rather than graceful steering. A queued Attempt records a cancelled Outcome without creating a Worker. An active Attempt first checkpoints the cancellation reason, issues close at most once, proves exact absence, and then records the closed Worker and cancelled Outcome together. Recovery after either close checkpoint observes only; it never repeats close. Steering remains a separate prompt to an exact active Worker.
+## Worker lifecycle
 
-Coordinator shutdown interrupts and joins only owned coordination fibers and closes its store handle. It does not close independent Workers, remove session files or Coordinator checkouts, classify unfinished repositories, or delete retained or uncertain output.
+Every Attempt receives a fresh Pi session under:
 
-## Coordinator checkout allocation
+```text
+<agentDir>/workgraph/worker-sessions/
+```
 
-Read-only work creates no repository resource. Before direct repository mutation or implementation delegation, the model explicitly requests a Coordinator checkout from the intended repository. Creation accepts an attached or detached source worktree with a committed `HEAD`; tracked, untracked, and ignored source changes are neither copied nor mutated. The exact source commit seeds a new linked worktree and normal branch.
+The session file is durable execution history. Herdr owns live workspace, tab, pane, and agent observations. Effect serializes command handling and reconciliation for one Coordinator session.
 
-A collision-resistant identity derived from the exact Pi session and canonical Git common directory determines one private path and branch. Complete resource absence permits creation. Complete exact identity permits reuse, including when the managed branch or working tree has changed. Reuse proves the real path, repository common directory, one direct owned branch, one matching unlocked worktree registration, attached `HEAD`, and bidirectional worktree backlinks. Partial, duplicated, locked, symlinked, foreign, or unreadable state blocks without retry, repair, pruning, reset, deletion, or alternate placement. A failed native creation response is accepted only when immediate observation proves the exact requested commit and identity; an interrupted initialization remains locked and blocked.
+### Launch order
 
-The managed path is the session's mutable integration destination. The Coordinator edits, commits, and verifies there, and repository implementation Tasks target it so detached Worker Candidates apply there through the existing Candidate flow. Workgraph does not intercept or redirect file operations, inject checkout state into prompts, persist checkout state, or reconcile resources in a background loop.
+```text
+place clean workspace
+  → persist Worker session
+  → create tab
+  → start agent
+  → persist kickoff
+  → submit kickoff
+```
 
-Final local integration and publication use normal repository or forge tooling rather than Workgraph repository operations. After accepting a change, the Coordinator classifies human-review need and recommends a delivery route, but stops for the user's choice unless that route was already explicit. Pull-request choice triggers the packaged publication reference; the reference guides one-time push and pull-request creation or update without discovery outside that contract, Workgraph publication state, merge authority, or monitoring. Cleanup waits until no Worker, pending Candidate decision, or delivery choice depends on the checkout and uses ordinary non-force Git operations; refusal or uncertainty preserves remaining resources for explicit reporting. Complete later absence permits deterministic creation at the same path, while routine shutdown preserves the checkout.
+Before agent start becomes uncertain, placement must remain at the exact clean Attempt base. After that checkpoint, execution dirtiness no longer blocks reconciliation.
 
-## Worker Pi trajectory
+Recovery observes persisted and native identity. It does not replay a possibly completed effect or guess ownership.
 
-Worker behavior is enforced through the real Pi session, role policy, tool gates, and one terminal report. Research, consultation, and review are read-only. Repository experiments may make only their explicitly permitted changes. Implementation uses one same-session Prewalk trajectory from guide to executor.
+### Settlement and cancellation
 
-The guide receives the immutable assignment and initializes one strict 1–9 item TODO without caller-supplied statuses. The runtime marks the first item `in_progress` and the rest `pending`; subsequent progress uses focused item updates. Items name meaningful implementation or verification work with explicit validation, not reporting, bookkeeping, or padding. TODO status is navigation, not evidence or an acceptance gate.
+Normal settlement derives its semantic Outcome independently of repository state, then follows this order:
 
-Executor cutover becomes eligible only after both a valid initialized TODO and a successful direct edit or write, in either order. Shell commands, observations, and failed mutations do not qualify. The selected executor target and thinking level are recorded in one exact session marker; the next provider request replaces guide policy with executor policy while preserving the assignment and session history. Selection failure remains guide-owned, blocks further direct mutation, is not retried automatically, and still permits a truthful `failed` or `needs_decision` report. A changed implementation result requires an executor assistant message after cutover. If the executor settles without a report while `pending` or `in_progress` items remain, at most two follow-up reminders ask it to continue useful work or report truthfully.
+1. Derive the semantic Outcome from the Worker session.
+2. Record the Outcome.
+3. Checkpoint and issue one exact close.
+4. Observe exact absence.
+5. Mark the Worker closed.
 
-An Implementation Worker's fixed assigned worktree is its mutable execution root. Assignment repository paths map into that worktree; changing shell cwd does not expand authority. The Worker may inspect elsewhere and may change the Git state needed to commit its worktree, but it may not modify another checkout or publish. A request that inherently requires another mutation is reported as a conflict. This is a behavioral custody contract, not sandbox enforcement, and does not replace repository validation.
+A missing Worker that can no longer report becomes a bounded unreported Outcome.
 
-Workers submit strict nonblank status, summary, and narrative details. Status is `completed`, `needs_decision`, or `failed`; completed Implementation reports additionally state `changed` or `no_change`. The runtime injects the immutable exact Worker role into the persisted self-describing report, and the store validates all five roles against their Task. Narrative details carry role-appropriate result, evidence, tradeoffs or findings, actual effects, verification, and uncertainty. `completed` is a truthful bounded terminal result rather than approval; `needs_decision` is terminal for a missing consequential Coordinator decision or additional authority; `failed` is an operational or contract inability. Git revisions, changed-file observations, cleanliness, and ownership remain runtime facts rather than Worker assertions. Compaction recovery restores assignment context and current TODO from the Worker session's real branch entries without maintaining a second phase record. [ADR 0003](docs/adr/0003-keep-prewalk-in-one-live-worker-trajectory.md) owns the retained Prewalk trade-off.
+Cancellation differs by state:
+
+| Worker state | Cancellation behavior |
+| --- | --- |
+| Queued | Record a cancelled Outcome without launching. |
+| Active | Checkpoint the reason, close at most once, prove absence, then record closed Worker state and cancelled Outcome together. |
+
+After a close checkpoint, recovery only observes; it never repeats close. Steering remains a separate prompt to an exact active Worker.
+
+Coordinator shutdown interrupts and joins only owned coordination fibers and closes its database handle. It does not close Workers, remove sessions or checkouts, classify unfinished repositories, or delete retained or uncertain output.
+
+## Coordinator checkout lifecycle
+
+Read-only work creates no repository resource. The model must explicitly request a checkout before direct repository mutation or implementation delegation.
+
+Creation snapshots the source checkout's committed `HEAD`. Tracked, untracked, and ignored source changes are neither copied nor changed.
+
+A collision-resistant identity derived from exact Pi session and canonical Git common directory determines one private path and branch.
+
+| Observed resource state | Result |
+| --- | --- |
+| Complete absence | Create a linked worktree and normal branch at the requested commit. |
+| Complete exact identity | Reuse it, including modified or advanced managed content. |
+| Partial, duplicate, locked, symlinked, foreign, moved, or unreadable state | Block without repair, reset, pruning, deletion, retry, or alternate placement. |
+
+Exact reuse proves:
+
+- real path and Git common directory;
+- one direct owned branch;
+- one matching unlocked worktree registration;
+- attached `HEAD`; and
+- both worktree backlinks.
+
+A failed native creation response counts as success only when immediate observation proves the complete requested identity at the exact commit. An interrupted initialization remains locked and blocked.
+
+Complete later absence permits deterministic creation at the same path. Routine shutdown preserves the checkout.
+
+The managed checkout is the Coordinator's mutable integration destination.
+
+Workgraph does not intercept file operations, redirect paths, inject checkout state into prompts, persist checkout records, or reconcile checkouts in a background loop.
+
+### Delivery boundary
+
+Final local integration and publication use ordinary repository, forge, or session capabilities. The Coordinator contract owns the delivery-boundary trigger; the packaged delivery reference owns Human sign-off classification, route recommendation and selection, and each selected route's procedure. Neither expands existing authority.
+
+The contract names packaged references with source-relative Markdown links. When injecting the contract, the extension renders each reference at its use site as an installed absolute path while leaving the referenced content unloaded until the contract directs the Coordinator to read it.
+
+For a pull-request route, the reference guides initial publication, exact-result verification, and establishment of continued observation when a capability is available.
+
+Delivered observations return the Coordinator to the same work under its existing authority.
+
+Workgraph owns no publication or observation state, merge authority, independent state checking, or observation-availability reporting.
+
+Cleanup waits until no Worker, Candidate decision, or delivery choice depends on the checkout. It uses ordinary non-force Git operations and preserves resources after refusal or uncertainty.
+
+## Implementation trajectory
+
+Implementation uses the Prewalk design: one live Worker trajectory moves from guide to executor without a summary handoff.
+
+Worker behavior is enforced through the real Pi session, role policy, tool gates, and one terminal report. Research, Consultation, and Review are read-only. Experiment effects remain limited to their assignment.
+
+Implementation uses one Worker trajectory with two policy phases:
+
+```text
+Guide
+  ├── inspect assignment
+  ├── initialize TODO
+  └── make first useful edit/write
+       ↓ both conditions satisfied
+Executor
+  ├── continue same history and assignment
+  ├── maintain TODO as navigation
+  ├── complete and verify
+  └── report
+```
+
+### Guide and cutover
+
+The guide initializes one concise TODO with 1–9 meaningful implementation or verification items. The runtime marks the first item `in_progress` and the rest `pending`.
+
+Cutover requires both:
+
+- a valid initialized TODO; and
+- one successful direct edit or write.
+
+Shell commands, observations, dirtiness, and failed mutations do not qualify.
+
+On cutover, Workgraph records the selected executor and replaces guide policy on the next provider request. It preserves the assignment, messages, tool results, TODO, and first edit.
+
+Selection failure remains guide-owned, blocks further direct mutation, is not retried automatically, and still permits a truthful `failed` or `needs_decision` report.
+
+### Executor and report
+
+TODO status is navigation, not evidence or a completion gate. If the executor settles without a report while actionable items remain, Workgraph sends at most two reminders to continue useful work or report truthfully.
+
+A changed completion requires an executor assistant message after cutover. Genuine context compaction restores the immutable assignment and current TODO from session history.
+
+Reports contain strict nonblank status, summary, and narrative details. The runtime injects the immutable role and validates it against the Task.
+
+| Status | Meaning |
+| --- | --- |
+| `completed` | Truthful bounded result, not approval. |
+| `needs_decision` | Missing consequential Coordinator decision or authority. |
+| `failed` | Operational or contractual inability. |
+
+Completed Implementation reports also state `changed` or `no_change`. Git revisions, cleanliness, and custody remain runtime facts rather than Worker assertions.
+
+An Implementation Worker's fixed worktree is its only mutable execution root. Repository paths in the assignment map there.
+
+The Worker may inspect elsewhere and modify Git state needed to commit its own worktree. It may not change another checkout or publish. A request that inherently requires another mutation is reported as a conflict.
+
+[ADR 0003](docs/adr/0003-keep-prewalk-in-one-live-worker-trajectory.md) owns the retained one-trajectory trade-off.
 
 ## Models
 
-The user-owned model policy is the only source of executable model IDs and thinking levels. Research and review have ordered nonempty target lists; Experiment shares the research list. Consultation has one advisor target. Implementation freezes one guide and one default or explicitly requested escalation executor into each Attempt. Tool calls never name a concrete model. Invalid policy or selection fails before record creation, and frozen Attempts remain inspectable without loading current policy.
+The user-owned model policy is the only executable source of model IDs and thinking levels.
 
-Actual effective models are derived from persisted Pi model events in trajectory order and written with the Outcome. Frozen selection explains what was requested; effective models explain what ran. Neither is inferred from report prose.
+| Role | Policy shape |
+| --- | --- |
+| Research and Review | Ordered nonempty target lists |
+| Experiment | Research target list |
+| Consultation | One advisor |
+| Implementation | One guide and one default or explicitly requested escalation executor |
+
+Tool calls never name a model. Invalid policy or selection fails before record creation. Frozen Attempts remain inspectable without loading current policy.
+
+The Outcome derives effective models from persisted Pi model events in trajectory order. It never infers them from requested policy or report prose.
 
 ## Targets and Candidate lineage
 
-A Task resolves either an exact directory path or a repository identity consisting of checkout root and Git common directory. Every Attempt inherits that immutable target. The coordinator's current directory is only a resolution input, never later placement authority. For read-only roles, resolved cwd is Worker placement and starting context—not evidence scope, semantic subject, provenance, or authority. For Experiment, cwd is the owned detached worktree seeded from the resolved repository's committed base and does not authorize source-checkout mutation. Repository implementation Tasks resolve the Coordinator checkout passed as `cwd`, so their Candidates return to that attached branch rather than the original destination. This permits Tasks in several repositories within one session without distributed transactions, dependencies, rollback, or all-or-nothing application claims.
+A Task resolves either:
 
-Repository Attempt bases are exact commits. A root Candidate is rooted at its Attempt's explicit base. `candidateOf: extend` starts the successor Attempt from the exact retained source Candidate tip, preserves its root, and prevents source discard until successor placement. `candidateOf: integrate` starts from a separately explicit base and records both the exact source Candidate-producing Attempt and source tip to incorporate. Candidate lineage is immutable and checked against exact retained refs; session continuation is not content ancestry.
+- one exact directory path; or
+- a repository identity containing checkout root and Git common directory.
 
-Directory Attempts have no Git output. Repository Attempts execute in detached worktrees at `<agentDir>/workgraph/worktrees/<attemptId>` and never borrow the destination checkout as execution state.
+Every Attempt inherits that Target. The Coordinator's current directory is only a resolution input.
+
+Repository Attempts freeze an exact base commit and execute in detached worktrees under:
+
+```text
+<agentDir>/workgraph/worktrees/<attemptId>
+```
+
+Directory Attempts have no Git output.
+
+Candidate lineage supports two explicit relationships:
+
+| Mode | Starting point | Preserved relationship |
+| --- | --- | --- |
+| `extend` | Exact retained source Candidate tip | Preserve the Candidate root; pin source until successor placement. |
+| `integrate` | A separately explicit base | Record the source-producing Attempt and exact source tip to incorporate. |
+
+A root Candidate is rooted at its Attempt's explicit base. Lineage is immutable and checked against retained refs. Session continuation is not content ancestry.
+
+Repository implementation Tasks target the Coordinator checkout passed as `cwd`. Their Candidates therefore return to that managed destination rather than the original source checkout.
 
 ## Repository custody
 
-`src/repository.ts` is the single Git custody owner for both Worker Candidates and Coordinator checkout allocation. They share target revalidation, Git process ownership, and worktree registration parsing; each resource adds only the identity checks its supported lifecycle requires. `src/coordinator/checkouts.ts` owns deterministic checkout identity and the thin Pi Promise boundary.
+`src/repository.ts` owns shared Git custody for Worker output and Coordinator checkout allocation. `src/coordinator/checkouts.ts` owns deterministic checkout identity and the thin Pi Promise boundary.
 
-After exact Worker closure, a completed report retains only committed HEAD and removes the worktree; unchanged HEAD produces no output. Noncompleted Attempts preserve dirty worktrees, while clean placement may compact under the existing classification rules. Complete absence recovers compacted output; external deletion or pruning of Workgraph-managed resources is unsupported. One-sided, moved, foreign, unrelated, or otherwise ambiguous resources block.
+The two paths share target revalidation, Git process ownership, and worktree-registration parsing while keeping each resource's identity checks separate.
 
-Repository custody is serialized within one coordinator session, not across sessions or processes. Concurrent mutation of the same destination checkout is unsupported. Application proves the private source ref, Candidate lineage, destination identity and state, ancestry, and tree mergeability before its checkpointed fast-forward. The merge preserves unrelated ignored artifacts and refuses to overwrite an ignored destination path. Recovery accepts only the exact expected Git structure; changed destination state blocks without rollback or automatic retry. Output cleanup occurs only after application is recorded.
+### Classifying output
 
-Discard is explicitly destructive and requires a reason. It checkpoints the exact retained tip and disposition before deleting only the verified private ref or owned worktree. An unplaced extension child and an unclassified integration child pin their source output. Interruption recovery accepts only proven postconditions and never removes foreign or uncertain resources. Semantic Outcomes and routine shutdown cannot discard output.
+After exact Worker closure:
 
-Applying a Candidate changes its recorded local destination only. Workgraph repository operations never publish or finally integrate a Coordinator checkout; after the deliberate delivery choice, the Coordinator uses external repository or forge tooling from its managed branch.
+| Outcome and Git state | Custody result |
+| --- | --- |
+| Completed, unchanged `HEAD` | No output; remove worktree. |
+| Completed, changed committed `HEAD` | Retain private ref; remove worktree. |
+| Noncompleted, dirty worktree | Preserve it. |
+| Clean compactable placement | Compact under current classification rules. |
+| Missing, moved, foreign, partial, or ambiguous resource | Preserve or block; never guess. |
 
-Coordinator mutation tools return persisted post-operation Attempt facts rather than a generic success flag, and exact Attempt inspection combines durable semantic and repository state with any current runtime blocker. Operations that may have partially persisted state do not roll back or create an operation ledger; failures identify the affected record for inspection before retry.
+A completed report relinquishes ignored, untracked, and uncommitted scratch. External deletion or pruning of managed resources is unsupported.
+
+### Applying a Candidate
+
+Application is serialized within one Coordinator session. Concurrent destination mutation by another session or process is unsupported.
+
+Before the checkpointed fast-forward, Workgraph proves:
+
+- private source ref and exact Candidate lineage;
+- destination identity and state;
+- ancestry and tree mergeability; and
+- that no Candidate path would overwrite an ignored destination artifact.
+
+Unrelated ignored artifacts remain intact. Recovery accepts only the exact expected Git structure. A changed destination blocks without rollback or automatic retry. Output is released only after application is recorded.
+
+### Discarding output
+
+Discard is explicit and requires a reason. Workgraph checkpoints the exact retained tip and disposition before deleting only the verified private ref or owned worktree.
+
+An unplaced extension child or unclassified integration child pins its source. Recovery accepts only proven postconditions and never removes foreign or uncertain resources. Outcomes and shutdown cannot discard output.
+
+Applying a Candidate changes only its recorded local destination. Workgraph never publishes or finally integrates a Coordinator checkout.
+
+Mutation tools return persisted Attempt facts, not a generic success flag. Exact Attempt inspection combines semantic and repository state with any runtime blocker.
+
+After a failure that may follow a durable checkpoint, callers inspect the affected record before retrying.
 
 ## Calm and pending memory
 
-Calm is a coordinator-only projection over the running Pi instance's live chat. On each render it classifies the current source children, reuses native pass-through rows, and builds filtered assistant and skill components from WeakMap caches. It hides exact model tool-execution instances and `pi-workgraph-outcome` rows, filters thinking and tool-call parts, retains terminal notices, inserts separators between adjacent projected assistant answers, and routes mouse interaction through projected layout. Native chat state remains Pi-owned. The adapter fails back to native rendering as one unit when its validated seams become incompatible. [ADR 0002](docs/adr/0002-project-calm-over-the-live-pi-chat.md) owns the internal seam trade-offs.
+Calm is a Coordinator-only projection over Pi's live chat. It:
 
-The notepad is a bounded latest-snapshot entry on the current Pi branch. It provides only read, replace, and clear, and is injected after genuine compaction when nonempty. It is pending-memory rather than Task state, authority, evidence, or acceptance.
+- classifies the current source children on every render;
+- hides exact model tool-execution and `pi-workgraph-outcome` rows;
+- removes thinking and tool-call parts from projected assistant messages;
+- preserves prose, terminal notices, and unknown rows;
+- reuses native pass-through components;
+- inserts separators only between adjacent projected assistant answers; and
+- routes mouse input through projected geometry.
+
+Pi retains the native chat state. If discovery, classification, rendering, invalidation, or mouse handling becomes incompatible, Calm restores native presentation as one unit.
+
+[ADR 0002](docs/adr/0002-project-calm-over-the-live-pi-chat.md) owns this seam trade-off.
+
+The notepad is a bounded latest-snapshot entry on the current Pi branch. It supports read, replace, and clear, and restores a nonempty memo after genuine compaction. It is not Task state, evidence, authority, or acceptance.
 
 ## Effect and host boundaries
 
-Effect owns serialized application flow, interruption, scoped acquisition and release, fibers, queues, semaphores, filesystem services, and typed operational failures. Promise conversion occurs only at Pi host callbacks. Direct Node and native adapters are narrow boundaries for SQLite, no-follow private-file ownership, cryptographic identity, Git child processes, Pi session files, and Herdr requests whose guarantees are not more simply provided by Effect. TypeBox owns strict external and persisted record shapes. [ADR 0001](docs/adr/0001-own-schemas-effects-and-host-adapters.md) owns the dependency and boundary trade-offs.
+Effect owns:
+
+- serialized application flow;
+- interruption and resource finalization;
+- fibers, queues, and semaphores;
+- filesystem services; and
+- typed operational failures.
+
+Promise conversion occurs only at Pi host callbacks.
+
+Direct native adapters remain narrow owners for SQLite, no-follow private-file checks, cryptographic identity, Git child processes, Pi session files, and Herdr requests. TypeBox owns strict external and persisted record shapes.
+
+[ADR 0001](docs/adr/0001-own-schemas-effects-and-host-adapters.md) owns the dependency and boundary rationale.
 
 ## Supported limits
 
-- One coordinator process may operate a given Pi session at a time.
-- Concurrent mutation of a destination checkout or ref by another session, process, or user during application is unsupported and causes a blocked result when detected.
-- Multi-repository Tasks have independent effects; Workgraph provides no cross-repository transaction or rollback.
+- One Coordinator process may operate a Pi session at a time.
+- Concurrent mutation of a destination checkout or ref is unsupported and blocks when detected.
+- Multi-repository effects have no shared transaction or rollback.
 - Worktrees and tool gates are ownership boundaries, not security sandboxes.
-- SQLite process safety does not claim durability across power loss.
-- Native behavior depends on the observed Pi, Herdr, Git, operating system, provider, and model versions; uncertainty is preserved when exact identity or postconditions cannot be established.
-- Calm depends on guarded Pi presentation internals and deliberately falls back to the native transcript when those seams change.
+- SQLite process safety does not establish power-loss durability.
+- Native behavior depends on the observed Pi, Herdr, Git, operating system, provider, and model versions.
+- Calm deliberately falls back to native presentation when its guarded Pi seams change.

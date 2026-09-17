@@ -1,131 +1,127 @@
 # Workgraph verification boundaries
 
-This document owns project-specific evidence requirements. Begin with the supported promise and use the smallest real boundary that distinguishes correct behavior from consequential failure. A component check establishes only its local contract; it does not establish that the registered extension, real Pi session, installed Calm adapter, or packaged consumer works.
+[`DESIGN.md`](DESIGN.md) owns the behavior Workgraph promises, and [`package.json`](package.json) owns executable checks. This document records only the project-specific evidence distinctions that contributors could otherwise miss or establish at an unnecessarily expensive boundary.
 
-## Session records
+Use the smallest real boundary that distinguishes the supported promise from consequential failure. A component check establishes only its local contract; it does not establish that the registered extension, native store, real Pi session, Git resource, installed Calm adapter, or packed consumer works.
 
-Exercise the native SQLite store through separate exact-session instances. Establish that:
+## Assurance map
 
-- `tasks` and `attempts` are strict tables with their required relationships;
-- Task plus first Attempt creation is atomic;
-- failed creation leaves neither half-record;
-- another Attempt can reference only a Task in the same session;
-- identical Task IDs in separate sessions remain isolated;
-- Task and Attempt specifications cannot be replaced;
-- Outcome insertion is write-once; and
-- each persisted JSON field and SQL scalar used by a supported read is strictly decoded at that use.
+| Claim area | Smallest meaningful boundary |
+| --- | --- |
+| Persisted records and Outcomes | Native SQLite store through separate exact-session instances |
+| Worker lifecycle, reports, and observed models | Real Worker Pi session with deterministic Herdr transport |
+| Repository output, Candidates, and Coordinator checkouts | Disposable real Git repositories through registered tools |
+| Coordinator surface | Pi extension registration and returned persisted facts |
+| Implementation trajectory | Real Pi Worker session with controlled providers |
+| Calm | Installed Pi using the running CLI's component constructors |
+| Package | Packed artifact installed in a disposable consumer |
+| Installed-native integration | Explicit operator-controlled live check |
 
-Use actual rows and transaction failure, not only TypeBox value checks. Establish that every reported Outcome carries the runtime-injected exact Research, Experiment, Consultation, Review, or Implementation role and that store-side consistency rejects a mismatch. A decoder test should mutate the one field whose supported-read rejection is being established, then remove the disposable database. Do not build a durable corruption matrix: arbitrary external database tampering is not a supported recovery interface.
+## Persisted and external coordination state
 
-Do not add migration, aggregate-reconstruction, cross-session-discovery, lease, or concurrent same-session process fixtures unless those become supported responsibilities. The current schema is version 1 and must fail closed on unknown existing versions.
+### Records and Outcomes
 
-## Worker lifecycle
+The record contract is defined by [Record store](DESIGN.md#record-store) and [Stable and mutable state](DESIGN.md#stable-and-mutable-state).
 
-Drive orchestration through the real session runtime and deterministic Herdr transport. Observe the staged native effects and their persisted checkpoints for Worker session creation, workspace, tab, agent, kickoff persistence, kickoff submission, close, and exact absence.
+Exercise the native SQLite store through separate instances for exact Coordinator sessions. Establish transaction rollback, session partitioning, immutable Task and Attempt specifications, write-once Outcomes, and strict decoding from actual persisted rows. A focused mutation of one persisted field should make the supported read reject that field; TypeBox acceptance of supplied values does not establish this boundary.
 
-At each effect boundary, simulate a lost response or interruption and re-enter through the supported runtime. The evidence must show no replay of a possibly completed workspace placement, tab creation, agent start, kickoff prompt, steering prompt, or close request. Ambiguous, partial, and foreign identity must produce a bounded blocker rather than a replacement Worker or guessed settlement.
+Worker report consistency must be checked where the runtime-injected role meets persisted Outcome insertion. A nonempty database with an unsupported schema version must reject before initialization; this focused version gate is distinct from arbitrary corruption or migration coverage.
 
-Normal settlement must record the semantic Outcome before checkpointing or requesting close, issue close at most once, and mark the Worker closed only after exact absence. A permanently missing Worker must become a bounded unreported Outcome. Cancellation of an active Worker must checkpoint its reason before one close, prove absence, and then atomically record closed Worker state with a cancelled Outcome. Cancelling a queued Attempt must not launch a Worker. Runtime shutdown must interrupt owned coordination activity while preserving Coordinator checkouts, independent Worker sessions, Herdr resources, and repository resources.
+Arbitrary external database tampering is not a supported recovery interface, so do not maintain a general corruption matrix. Likewise, do not add migration, aggregate-reconstruction, lease, or cross-session-discovery fixtures unless those become supported responsibilities.
 
-Assert ordering from persisted records and transport observations. Private helper call counts alone do not establish the supported flow.
+### Worker lifecycle, reports, and models
 
-## Semantic Outcome and models
+Drive the [Worker lifecycle](DESIGN.md#worker-lifecycle) through the real session runtime and deterministic Herdr transport. At each checkpointed external effect—placement, tab creation, agent start, kickoff submission, and close—simulate a lost response or interruption, re-enter through the supported runtime, and observe persisted facts plus native identity. Adapter call tests do not establish that a possibly completed effect is not replayed.
 
-Read the actual Worker Pi session used by an Attempt. Establish that each role exposes the correct strict report input, the model cannot submit a role, missing or blank summary/details and undeclared fields reject, and runtime injects the exact immutable role. A valid terminal report must become an exactly persisted and readable reported Outcome; malformed or unavailable terminal evidence becomes a truthful bounded unreported result, and cancellation remains distinct. Verify `completed | needs_decision | failed`, Implementation's completed-only `changed | no_change`, failed-only startup, and changed completion only after executor cutover. The Outcome must be immutable once present.
+Meaningful lifecycle evidence includes:
 
-Use controlled providers to emit real Pi model-change entries. Verify that the Attempt freezes requested targets before launch while `effectiveModels` comes from actual ordered session markers, deduplicates exact targets, can differ from selection, and is empty when no effective model was observed. Never infer model use from report prose or from the requested policy alone.
+- semantic Outcome recorded before one checkpointed close;
+- exact absence established before a Worker becomes closed;
+- queued cancellation launching nothing;
+- active cancellation checkpointing its reason and closing at most once; and
+- runtime shutdown preserving Worker sessions, checkouts, Herdr resources, and repository output.
 
-Decode the strict current model policy: research and review are duplicate-free nonempty lists, while consultation is one target. Invalid policy or selection must fail before Task creation. Inspection and control of already frozen Attempts must not depend on loading current policy.
+Read reports and effective models from the actual Worker session. Use controlled providers to produce real model-change entries and establish that observed models come from session markers rather than requested policy or report prose. Malformed terminal evidence must remain distinguishable from cancellation and operational failure.
 
-## Repository targets and output
+A deterministic Herdr transport establishes runtime recovery behavior, not compatibility with the operator's installed Herdr configuration.
 
-Use real disposable Git repositories through the registered coordinator/runtime boundary. Verify the exact filesystem and Git facts rather than a mocked status summary:
+## Repository custody
 
-- directory targets resolve to one real path and never create Git output;
-- repository targets freeze checkout root and common directory;
-- each repository Attempt freezes an exact base commit and runs in its exact detached worktree;
-- placement recovery requires the clean exact base before agent start, while later execution dirtiness cannot prevent reported or unreported settlement;
-- `candidateOf: extend` requires the exact retained source Candidate ref, preserves its root, starts from its tip, and prevents source discard until successor placement;
-- `candidateOf: integrate` preserves an explicit base, exact source Candidate-producing Attempt, and source tip;
-- a completed report retains only commits: unchanged HEAD produces no output, changed HEAD creates `refs/pi-workgraph/outputs/<attemptId>`, and the whole worktree is removed in either case;
-- `needs_decision`, failed, unreported, and cancelled Attempts preserve dirty, ignored, and untracked bytes while compacting clean commit state normally;
-- complete absence recovers compacted output, while external deletion or pruning remains unsupported; and
-- moved, foreign, incomplete, unrelated, or ambiguous resources remain physically present and blocked.
+Use disposable real Git repositories through registered Workgraph entry points. Inspect commits, refs, `HEAD`, status, ignored files, worktree registrations, backlinks, and preserved bytes. A parser or isolated classification predicate establishes only its own result.
 
-Application preparation must leave destination bytes, HEAD, and ref unchanged while proving source ref, base, Candidate lineage, destination identity, cleanliness, ancestry, and tree mergeability. The explicit apply flow must produce only the prepared structural result, record its exact revision, then release output. It must refuse to overwrite an ignored destination path tracked by the Candidate while allowing and preserving unrelated ignored artifacts. Recovery accepts only the exact expected Git structure; a switched, unrelated, or advanced destination blocks without rollback or automatic retry.
+### Worker output and Candidates
 
-Explicit discard must checkpoint its reason before deleting exact verified output. Separately prove that completed reports remove only their exact worktree, including uncommitted scratch, while non-completed Outcomes and failed cleanup preserve dirty or uncertain resources. No repository-custody operation pushes or publishes.
+The current contracts are [Targets and Candidate lineage](DESIGN.md#targets-and-candidate-lineage) and [Repository custody](DESIGN.md#repository-custody).
 
-## Coordinator checkouts
+Exercise exact-base placement and both Candidate lineage modes before testing output classification. Classification must occur only after exact Worker closure. Distinguish unchanged completion, committed changed completion, relinquished scratch, preserved noncompletion, and ambiguous or foreign resources by observing native Git state—not Worker report claims.
 
-Drive `workgraph_checkout` through the registered Coordinator tool and real disposable Git repositories. Establish that read-only session startup creates nothing; explicit creation snapshots the exact committed `HEAD` of an attached or detached source without copying or mutating tracked, untracked, or ignored working-tree bytes; repeated calls from the same session and Git common directory converge across linked worktrees and reloads; and separate sessions receive distinct paths and branches.
+Application preparation must leave destination bytes, `HEAD`, and refs unchanged while proving source lineage, destination identity, ancestry, mergeability, and ignored-path safety. The applied result must match the prepared Git structure before output is released. Recovery may accept only that exact structure; a changed destination or uncertain effect blocks without rollback or automatic retry.
 
-Observe the filesystem entry, direct branch ref, exhaustive worktree registrations, attached managed `HEAD`, repository common directory, and both directions of the linked-worktree backlink. Exact unlocked identity may reuse modified, deleted, untracked, ignored, advanced, or rewritten managed content. One-sided, duplicated, moved, symlinked, foreign, wrong-branch, wrong-repository, locked, and unreadable resources must remain present and blocked rather than being replaced or repaired. Model interrupted population with Git's locked initialization state.
+Discard evidence must show the reason and exact retained tip checkpointed before deletion, with foreign, pinned, moved, dirty, or uncertain resources preserved. No repository-custody check should push or publish.
 
-Simulate a native creation command that returns failure after creating the exact worktree: only the exact requested commit and complete identity may recover as successful creation with a bounded diagnostic. A wrong post-create commit and every partial or uncertain postcondition must block without retry. Ordinary shutdown preserves the checkout; no database row, startup reconstruction, cache, background reconciliation, automatic cleanup, or path interception is involved.
+### Coordinator checkouts
 
-Make direct committed changes in the managed checkout and target a repository implementation Task at that path. Prove that its detached Worker Candidate applies into the Coordinator checkout rather than the source checkout. Final integration, publication, and cleanup belong to native repository or forge tooling and are not Workgraph checkout operations; do not retain lifecycle fixtures for their native effects. Inspect the packaged Coordinator contract to establish that an accepted change without an explicit route stops for a delivery choice, and that only an already-selected pull-request route triggers the publication reference.
+Drive `workgraph_checkout` through the registered tool. For [Coordinator checkout lifecycle](DESIGN.md#coordinator-checkout-lifecycle), observe the filesystem path, direct branch ref, exhaustive worktree registrations, attached `HEAD`, Git common directory, and both backlinks.
 
-## Worker behavior
+Establish that identity is deterministic for one session and repository, isolated across sessions, and based on committed source `HEAD` without copying or changing source checkout bytes. Exact owned state may be reused even when managed content changed; partial, duplicate, locked, symlinked, foreign, moved, or unreadable state must remain blocked rather than repaired.
 
-Exercise each role through a real Worker Pi session and installed Worker extension. Verify role-specific tool gates, immutable assignment context, narrative report schema and exact role injection, report readback, model markers, and compaction recovery from genuine Pi branch history. Assignment policy must preserve relevant evidence beyond read-only cwd and the Experiment hard lifetime cutoff language, including authorized teardown and the absence of automatic enforcement or post-cutoff cleanup authority.
+A failed native creation response counts as recovered success only when immediate observation proves the complete requested identity at the exact commit. Wrong-commit or partial state must remain visible and blocked.
 
-For implementation, establish one guide-to-executor Prewalk in the same session. The one-shot TODO initialization input has no statuses; establish first-item `in_progress`, remaining-item `pending`, full-state set/update receipts, and duplicate initialization refusal. Cutover requires both a valid 1–9 item TODO and a successful direct edit or write, in either order. Failed mutations, shell commands, and observations do not qualify. Verify exact executor model and thinking selection, one executor-start marker, guide-policy replacement on the next provider request, stable assignment context, and an executor assistant message before a changed terminal report. Selection failure must remain guide-owned, emit one diagnostic, block further mutation, permit a truthful `failed` or `needs_decision` report, and never retry automatically. If an executor becomes idle with actionable items and no report, verify at most two continuation reminders without turning TODO state into a report gate.
+The supported end-to-end flow is: create the managed checkout, make a direct committed change there, target an Implementation Task there, and apply its Candidate back into that managed destination. This distinguishes Coordinator checkout custody from ordinary Worker output and from the original source checkout.
 
-Restore assignment and current TODO after actual context compaction, not ordinary reload or message traffic. A TODO status is not a correctness oracle or report gate.
+Delivery and cleanup use native repository, forge, and session capabilities. Inspection of the packaged Coordinator contract and delivery reference establishes their authority boundary; it does not establish live forge publication or continued observation.
 
-## Coordinator tools and notepad
+## Installed Pi surfaces
 
-Invoke every registered coordinator tool through Pi's extension surface. Verify the current strict schemas for separate read-only Research, effectful Experiment, configured consultation, and flexible Review. Optional context and expected evidence must survive or omit exactly; Experiment permitted-effect entries are nonblank and its hard cutoff semantics reach immutable assignment and policy. Create Review against a live dirty directory without an Attempt, source Outcome, or revision, and observe resolved starting context plus request and optional context. Experiment authority applies independently per Attempt; use a real repository placement to distinguish it from directory Research without treating its scratch as a Candidate.
+### Worker trajectory
 
-Verify failure before record creation for invalid policy or selection, Task/Attempt and Coordinator-checkout receipts, exact bounded inspection, and explicit control effects. Creation receipts identify immutable specifications. Successful control receipts expose the requested action and persisted post-operation Outcome, Worker, and repository facts without claiming acceptance. Exact Attempt inspection includes its Task contract and target, report status and bounded preview, and its exact blocker even beyond overview pagination. For operations that can fail after a durable checkpoint, use the smallest boundary that establishes preserved partial facts and an inspect-before-retry response; do not add rollback or ledger fixtures. Confirm that one fresh Worker session is associated with each Attempt and that inspection cannot enumerate another coordinator session's records.
+Exercise the [Implementation trajectory](DESIGN.md#implementation-trajectory) in one real Pi Worker session with the installed Worker extension. Establish role-specific tool gates, immutable assignment context, report readback, and genuine compaction restoration from Pi branch history.
 
-Exercise the branch notepad through `read`, `replace`, and `clear`, including its 4,000-character bound and latest-snapshot behavior. Genuine compaction should inject a nonempty current memo once for recovery; normal message traffic and reload should not. The notepad must not mutate Task, Attempt, Outcome, or repository state.
+For guide-to-executor cutover, distinguish the two required facts—a valid TODO and a successful direct edit or write—from shell commands, observations, failed mutations, and Git dirtiness. Observe exact model and thinking selection, one executor marker, guide-policy replacement on the next provider request, and an executor assistant message before changed completion. Selection failure must stay guide-owned, block further direct mutation, remain reportable, and never retry automatically.
 
-## Calm
+When an executor becomes idle with actionable TODOs and no report, establish through the Worker session that it receives at most two continuation reminders and may still report truthfully; TODO status is navigation, not a completion gate.
 
-Claims about Calm require an installed Pi instance using the running CLI's own component constructors. Drive rendered interaction through the live chat seam and observe:
+Synthetic event-handler calls are useful component checks, but they do not establish the real provider-request trajectory or compaction boundary.
 
-- Calm is coordinator-only and defaults on;
-- each render reflects the current live children, including a row inserted by direct child splice;
-- exact tool-execution and `pi-workgraph-outcome` rows are absent;
-- assistant thinking and tool-call parts are absent while prose and terminal notices remain;
-- unpaired and paired skill presentation, assistant separators, and visible-row adjacency are correct;
-- streaming source updates appear in projection and remain current after Calm is disabled;
-- theme, width, invalidation, and mouse interaction use projected presentation;
-- toggling, preference changes, attachment replacement, and shutdown restore native presentation; and
-- any validated-seam incompatibility falls back to the complete native chat rather than partial filtering.
+### Coordinator surface and notepad
 
-Representative render measurements are required for cost or responsiveness claims. Unit projection fixtures establish classification and caching behavior, not compatibility with the installed Pi build.
+Invoke Coordinator behavior through Pi's registered extension surface. Establish role gating, strict public inputs, failure before record creation when policy or selection is invalid, and receipts that expose persisted facts without claiming acceptance.
 
-## Extension and package smoke
+Use live dirty material for Review and a real repository placement for Experiment so those roles are not accidentally constrained to Attempt provenance or confused with Candidate-producing implementation. For Experiment, establish that each Attempt receives its frozen permitted effects and hard cutoff in Worker policy; repository placement alone grants no general mutation or post-cutoff cleanup authority. For any control effect that may fail after a checkpoint, inspect the exact Attempt and preserved partial facts before retrying.
 
-Load the registered coordinator and Worker extensions from the exact checkout through Pi's extension runtime, then drive session startup and shutdown to establish registration, role gating, guidance injection with the exact packaged publication-reference path, and clean release of session-owned resources. Pack the exact revision, install it in a disposable consumer, load both supported entry-point factories through the installed Pi extension loader, and read the installed publication reference. This disposable-consumer check establishes packaged extension loading, registration, and reference availability—not session lifecycle or a live forge publication; archive inspection, module import alone, or build success does not establish that boundary.
+Notepad evidence needs only its bounded latest-snapshot behavior, branch locality, and one restoration after genuine compaction. Ordinary reload or message traffic must not inject it, and notepad operations must not alter Task, Attempt, Outcome, or repository state.
 
-[`package.json`](package.json) owns command definitions:
+### Calm
 
-- `pnpm check` runs the maintained static, export, and deterministic checks;
-- `pnpm typecheck` is an independent compiler diagnostic;
-- `pnpm verify:package` runs the disposable-consumer package check; and
-- `pnpm verify:native` is an opt-in bounded check against operator-provided Pi, Herdr, provider, and model configuration.
+Claims about [Calm](DESIGN.md#calm-and-pending-memory) require an installed Pi instance using the running CLI's component constructors. Observe live projection, streaming updates, adjacency, mouse and invalidation behavior, preference changes, toggling, attachment replacement, shutdown restoration, and complete native fallback after a validated-seam incompatibility.
 
-## Test design and resource safety
+Projection fixtures establish classification and caching, not compatibility with the installed Pi build. Cost or responsiveness claims require representative render measurements rather than callback counts.
 
-Prefer complete supported flows and focused boundary checks that expose a distinct failure. Delete obsolete fixtures and adapters with their responsibility. Do not maintain exhaustive host simulations, hypothetical database-tampering suites, removed-format fixtures, or tests that duplicate production classification, lineage, or transition logic as their expected-value oracle. Use a temporary probe when evidence is needed once.
+### Extension and package
 
-A complete flow should observe positive results, forbidden effects, and consequential order. Stable assertions target records, native identities, Git structure, rendered output, and externally visible errors—not private helper calls, incidental wording, collection positions, or internal scheduling.
+Load Coordinator and Worker extensions from the exact checkout through Pi's extension runtime to establish registration, role gating, guidance injection with resolved package-local reference links, and clean release of session-owned resources.
 
-Live native and destructive checks are operator-controlled. Use uniquely named disposable sessions, tabs, worktrees, refs, repositories, and temporary agent directories; bound every wait; verify exact identity before close or deletion; and clean up only resources created by that check. Preserve unrelated and pre-existing resources after success, failure, interruption, or uncertain response.
+Pack the exact revision, install it in a disposable consumer, load both supported extension entry points, emit the installed Coordinator's guidance injection, and read the installed delivery reference. Assert that the injected link resolves inside the installed package while the reference body stays unloaded. Archive inspection, source-tree import, or build success does not establish installed package loading. The package check does not establish real Worker lifecycle, native integration, or forge publication.
 
-## Limits on evidence
+## Suite and resource policy
 
-- One coordinator process per Pi session is supported; concurrent use of the same session is not.
-- Concurrent mutation of the destination checkout or destination ref by another session, process, or user during apply is unsupported; no repository-wide lock is claimed.
-- Multi-repository effects are independent and have no cross-repository transaction or rollback.
-- Worktrees and tool gates are not security sandboxes.
-- SQLite process safety does not establish power-loss durability.
-- Deterministic Herdr transport does not establish installed native behavior.
-- Native evidence applies only to the tested Pi, Herdr, Git, operating system, provider, model, and settings configuration.
-- One autonomous model run is evidence about that exact run, not a deterministic oracle.
+Prefer complete supported flows and retain focused component checks only when they expose a distinct consequential failure more clearly or cheaply. Observe positive results, forbidden effects, and ordering where the promise depends on them. Assert persisted records, native identities, Git structure, rendered output, and external errors rather than private helper calls, incidental wording, or collection position.
 
-Verification reports should identify the exact revision checked, direct observations, preserved resources, unresolved uncertainty, and the boundary each observation establishes. Do not accumulate run history here.
+Do not build exhaustive host simulations, hypothetical tampering suites, removed-format fixtures, or duplicated production logic as an oracle. Delete obsolete fixtures and adapters with the responsibility they served; use temporary probes for one-off uncertainty.
+
+Live and destructive checks are operator-controlled. Use uniquely named disposable sessions, tabs, worktrees, refs, repositories, and agent directories; bound every wait; verify exact identity before deletion; and clean up only task-owned resources. Preserve unrelated or uncertain resources after success, failure, interruption, or an ambiguous response.
+
+## Evidence limits
+
+Do not claim beyond these boundaries:
+
+- one Coordinator process per Pi session;
+- no support for concurrent destination or ref mutation;
+- no transaction or rollback across repositories;
+- no security sandbox from worktrees or tool gates;
+- no power-loss durability claim from SQLite process safety;
+- no installed-native claim from deterministic Herdr transport;
+- native evidence applies only to the tested Pi, Herdr, Git, operating system, provider, model, and settings configuration; and
+- no general model reliability claim from one autonomous run.
+
+Verification reports identify the exact revision, direct observations, preserved resources, unresolved uncertainty, and the boundary each observation establishes. Do not accumulate run history here.

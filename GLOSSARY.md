@@ -26,6 +26,14 @@ A read-only advice Task with a question and optional context, executed by the po
 **Review**:
 A read-only Task expressed as a natural-language request with optional context. It may assess relevant accessible material without requiring a typed subject, provenance chain, or exact revision unless its request depends on one.
 
+**Human sign-off**:
+The final-integration classification defined by the packaged [delivery procedure](references/delivery.md#choose-a-delivery-route).
+
+_Avoid_: Human review
+
+**Maintainer**:
+The human who gives or withholds Human sign-off. It is distinct from a Worker performing a Review.
+
 **Experiment**:
 An evidence-seeking Task whose contract independently grants each Attempt explicit effect kind, scope, and lifetime plus a hard stop cutoff. It shares research model selection, executes in a repository worktree, and does not produce an applicable Candidate.
 

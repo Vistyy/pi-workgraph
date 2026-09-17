@@ -56,6 +56,10 @@ void test("Experiment and Review policies preserve their redesigned authority bo
   );
 
   const review = workerSystemPolicy("review", "guide");
+  assert.match(review, /independent perspective/);
+  assert.match(review, /best justified complete result/);
+  assert.match(review, /Prioritize simplification and total maintained complexity/);
+  assert.match(review, /focused request supports only a focused conclusion/);
   assert.match(review, /uncommitted, mutable, partial, conceptual, report, Attempt-related/);
   assert.match(review, /exact revision only when the request depends on one/);
   assert.doesNotMatch(review, /exact stated base and candidate revisions/);

@@ -87,17 +87,15 @@ export interface CoordinatorOptions {
 export default function coordinator(pi: ExtensionAPI, options: CoordinatorOptions = {}): void {
   if (!isCoordinatorScope(process.env)) return;
 
-  const publicationReferencePath = fileURLToPath(
-    new URL("../references/publish-pr.md", import.meta.url),
-  );
+  const coordinatorContractUrl = new URL("../COORDINATOR.md", import.meta.url);
 
-  const coordinatorContract = readFileSync(
-    new URL("../COORDINATOR.md", import.meta.url),
-    "utf8",
-  ).trim();
-
-  // Keep the optional procedure out of the system prompt; expose only where to read it.
-  const guidance = `${coordinatorContract}\n\nPR publication reference path (content not loaded): ${publicationReferencePath}`;
+  const coordinatorContract = readFileSync(coordinatorContractUrl, "utf8")
+    .replace(
+      /\[([^\]\n]+)\]\((references\/[^)\s]+)\)/gu,
+      (_link, label: string, target: string) =>
+        `${label} at ${JSON.stringify(fileURLToPath(new URL(target, coordinatorContractUrl)))}`,
+    )
+    .trim();
 
   const agentDir = options.agentDir ?? getAgentDir();
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
@@ -135,9 +133,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   };
 
   pi.on("before_agent_start", (event) => ({
-    systemPrompt: event.systemPrompt.endsWith(guidance)
+    systemPrompt: event.systemPrompt.endsWith(coordinatorContract)
       ? event.systemPrompt
-      : `${event.systemPrompt}\n\n${guidance}`,
+      : `${event.systemPrompt}\n\n${coordinatorContract}`,
   }));
   pi.on("session_start", (_event, ctx) =>
     serialize(async () => {
@@ -319,7 +317,10 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           description: "Observable acceptance conditions for the Candidate.",
         }),
         useEscalationExecutor: Type.Optional(
-          Type.Boolean({ description: "Use the configured escalation executor." }),
+          Type.Boolean({
+            description:
+              "Require the configured escalation executor; Task creation fails if it is unavailable.",
+          }),
         ),
         candidateOf: CandidateOf,
         baseRevision: Type.Optional(CommitSchema),
@@ -394,7 +395,10 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         candidateOf: CandidateOf,
         baseRevision: Type.Optional(CommitSchema),
         useEscalationExecutor: Type.Optional(
-          Type.Boolean({ description: "Use the configured escalation executor." }),
+          Type.Boolean({
+            description:
+              "Require the configured escalation executor; Attempt creation fails if it is unavailable.",
+          }),
         ),
       },
       { additionalProperties: false },
@@ -885,7 +889,7 @@ function registerTask<S extends TSchema>(
   pi.registerTool({
     name,
     label: `Workgraph ${label}`,
-    description: `Create one immutable ${label} Task with its selected initial Attempts.`,
+    description: `Create one immutable ${label} Task with one or more selected initial Attempts.`,
     parameters,
     execute(_id, params, _signal, _update, ctx) {
       return serialize(() => run(params as Static<S>, ctx).then(result));
