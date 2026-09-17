@@ -26,13 +26,19 @@ A read-only advice Task with a question and optional context, executed by the po
 **Review**:
 A read-only Task expressed as a natural-language request with optional context. It may assess relevant accessible material without requiring a typed subject, provenance chain, or exact revision unless its request depends on one.
 
+**Maintainer inspection**:
+A Maintainer's examination of an accepted change through a local or remote review surface to inform Human sign-off. Completion produces feedback; it is not itself sign-off.
+
+**Human sign-off requirement**:
+The Coordinator's delivery-boundary classification of whether final integration waits for Human sign-off. The packaged [delivery procedure](references/delivery.md#resolve-human-sign-off) defines `Required` and `Optional`.
+
 **Human sign-off**:
-The final-integration classification defined by the packaged [delivery procedure](references/delivery.md#choose-a-delivery-route).
+A Maintainer's explicit judgment that the exact accepted change may be finally integrated. It is distinct from Maintainer inspection and delivery-route authority.
 
 _Avoid_: Human review
 
 **Maintainer**:
-The human who gives or withholds Human sign-off. It is distinct from a Worker performing a Review.
+The human who performs Maintainer inspection and gives or withholds Human sign-off. It is distinct from a Worker performing a Review.
 
 **Experiment**:
 An evidence-seeking Task whose contract independently grants each Attempt explicit effect kind, scope, and lifetime plus a hard stop cutoff. It shares research model selection, executes in a repository worktree, and does not produce an applicable Candidate.

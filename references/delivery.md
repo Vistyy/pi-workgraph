@@ -1,20 +1,30 @@
 # Deliver an accepted repository change
 
-## Choose a delivery route
+## Resolve Human sign-off
 
-Human sign-off is the repository maintainer's judgment that an accepted change may be finally integrated. `Required` means final integration waits for that judgment; `Optional` means the Coordinator considers its evidence sufficient without requiring it. Classification itself grants no repository authority, and a Worker Review is not Human sign-off.
+Human sign-off is the repository Maintainer's explicit judgment that the exact accepted change may be finally integrated. Classify its requirement as `Required` when final integration must wait for that judgment or `Optional` when the Coordinator considers its evidence sufficient without requiring it. The classification grants no repository authority, and neither a Worker Review nor completed Maintainer inspection is Human sign-off.
 
 After accepting a repository change:
 
-1. Classify Human sign-off as `Required` or `Optional`, and give the reason.
-2. Recommend pull-request delivery, local integration, or preserving the ready checkout.
-3. If the user has not already selected a route for this exact change, stop before publishing, integrating, or cleaning up and wait.
+1. Classify the Human sign-off requirement as `Required` or `Optional`, and give the reason.
+2. When it is `Required` and `tuicr_review` is available, use it as the designated local Maintainer-inspection capability before recommending a delivery route unless the user directs otherwise. Another available capability is designated only by the user.
+3. Treat delivered inspection comments as feedback, not authority. Resolve them, reaccept the complete result, and repeat inspection when material changes warrant it.
+4. Obtain explicit Human sign-off for the exact accepted change before final integration.
+
+When no local capability is designated, a pull-request route may be selected and published to seek Human sign-off remotely. Publication is not final integration.
+
+## Choose a delivery route
+
+After applicable local sign-off handling:
+
+1. Recommend pull-request delivery, local integration, or preserving the ready checkout.
+2. If the user has not already selected a route for this exact change, stop before publishing, integrating, or cleaning up and wait.
 
 A repository requirement for pull requests is never relaxed by change size. Implementation approval is not delivery authority.
 
 ## Route authority
 
-Each route permits only its stated effects under the existing task authority.
+Each route permits only its stated effects under the existing task authority. A selected route remains constrained by unresolved `Required` Human sign-off; route choice is sign-off only when the Maintainer explicitly accepts the exact change in the same instruction.
 
 | Selected route | Authorizes | Does not authorize |
 | --- | --- | --- |
@@ -70,7 +80,7 @@ Use one strong visual rather than several representations of the same point. Use
 
 After the explanation, include:
 
-- `Human sign-off: Required` or `Human sign-off: Optional`;
+- `Human sign-off requirement: Required` or `Human sign-off requirement: Optional`;
 - a short reason for that classification;
 - the specific sign-off focus when sign-off is required;
 - evidence that directly supports the affected promises; and
@@ -101,7 +111,7 @@ Report:
 
 - the complete pull-request URL;
 - the published revision;
-- the Human sign-off classification;
+- the Human sign-off requirement;
 - whether observation was established; and
 - material evidence limitations.
 

@@ -196,7 +196,7 @@ Workgraph does not intercept file operations, redirect paths, inject checkout st
 
 ### Delivery boundary
 
-Final local integration and publication use ordinary repository, forge, or session capabilities. The Coordinator contract owns the delivery-boundary trigger; the packaged delivery reference owns Human sign-off classification, route recommendation and selection, and each selected route's procedure. Neither expands existing authority.
+Final local integration and publication use ordinary repository, forge, or session capabilities. The Coordinator contract owns the delivery-boundary trigger; the packaged delivery reference owns the Human sign-off requirement and handling, route recommendation and selection, and each selected route's procedure. A designated local session capability may support Maintainer inspection without becoming Workgraph state or authority. Neither the capability nor the procedure expands existing authority.
 
 The contract names packaged references with source-relative Markdown links. When injecting the contract, the extension renders each reference at its use site as an installed absolute path while leaving the referenced content unloaded until the contract directs the Coordinator to read it.
 
