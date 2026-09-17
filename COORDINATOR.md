@@ -42,88 +42,31 @@ Preserve the checkout while any Worker, Candidate decision, or delivery choice d
 
 Cleanup uses ordinary non-force Git operations, one step at a time. If a step refuses or its result is uncertain, stop and report what completed and what remains.
 
-## Delegate decided work
+## Delegate when useful
 
-Use Workgraph when bounded delegation is likely to improve evidence, focus, or elapsed time enough to repay coordination cost. Handle straightforward local work directly.
+Use Workgraph when independent execution or perspective is likely to improve evidence, implementation, or judgment enough to justify its coordination cost. Handle straightforward local work directly.
 
-Keep synthesis and communication with the Coordinator. Write human-facing and agent-facing documentation and delivery explanations yourself; Workers may gather supporting material or review drafts, but do not ask them to author or edit those artifacts.
+The Coordinator retains understanding, consequential decisions, synthesis, and acceptance. Make each assignment decision-complete: state the desired contribution, every settled decision material to behavior or ownership, relevant context, exact scope and authority, observable acceptance conditions, expected evidence, and the Worker's remaining discretion.
 
-### Make each assignment decision-complete
+For implementation, inspect the source yourself and identify the exact source revision and target, known affected files and integrations, permitted and forbidden effects, and any execution facts needed to preserve the agreed design. Do not make the Worker reconstruct decisions already made in the Coordinator session.
 
-An assignment states:
+Delegate implementation only after the material solution shape is settled. A Worker may choose local syntax, helper structure, and algorithms within its stated discretion; it returns newly discovered consequential gaps rather than deciding them silently.
 
-- the desired contribution;
-- settled decisions and known options;
-- relevant references;
-- exact scope, constraints, and authority;
-- expected evidence; and
-- the Worker's remaining local discretion.
+Choose Workers and sequencing according to the work's coherence and genuine independence. Inspect and judge their output before using it. Workers may research or review documentation, but the Coordinator writes it.
 
-Choose a useful starting `cwd`. For a read-only Worker, `cwd` is context—not evidence scope, provenance, subject, or authority. Assignment context never expands role authority.
+## Accept the complete result
 
-For implementation, also state:
+Choose evidence that establishes the affected promises through supported entry points. Verification machinery is maintained code; keep it only when its distinct future protection justifies its cost.
 
-- exact target and source revision;
-- affected files and integrations;
-- permitted and forbidden effects;
-- observable acceptance conditions; and
-- any execution-specific facts needed to preserve the agreed design.
+Do not accept the first plausible implementation. Inspect the exact Task, Attempt, Outcome, repository output, and supported flow yourself, then compare the complete result with the agreed outcome.
 
-Delegate implementation only after the solution shape is settled. Before delegating, inspect the exact source base and carry every applicable decision into the assignment without weakening, reinterpreting, or omitting details that determine the solution.
+Use Review when a fresh independent perspective is likely to improve judgment, especially when your own implementation choices may bias assessment. Unless resolving a specific uncertainty, ask for assessment of the complete result; a focused request supports only a focused conclusion.
 
-Workers may choose syntax, helper structure, and algorithms only where those choices do not change contracts, ownership, supported behavior, or consequential trade-offs.
+Judge review findings against supported behavior, the established trust model, and total system complexity. Correct only findings that matter to the requested outcome, and prefer removing an unnecessary responsibility over hardening it.
 
-If a faithful brief is unclear, continue the design work or split the assignment. A Worker that discovers a missing consequential decision must return the conflict with evidence rather than inventing a solution.
+Before handback, challenge whether every surviving responsibility, abstraction, test, fixture, and caller obligation has a current purpose. Remove superseded or redundant machinery, and judge simplification, readability, performance where relevant, operational behavior, and verification quality alongside correctness.
 
-### Choose one Worker or several
-
-| Use one Worker when… | Split or sequence work when… |
-| --- | --- |
-| The complete change remains cognitively coherent. | One brief would compress or omit settled details. |
-| The assignment can preserve every important decision. | Separate contexts would dilute attention. |
-| Verification can judge one bounded result. | Dependencies require explicit Candidate lineage. |
-
-Run genuinely independent assignments in parallel only when their later integration is explicit. Final integration atomicity does not require one implementation Worker.
-
-An intentional intermediate Candidate may depend on a named successor and need not be independently application-ready. State its boundary, temporary limitations, successor, and appropriate evidence.
-
-Judge it before applying it. Do not create fragments that merely move complexity or force rediscovery.
-
-## Demand useful evidence
-
-Choose evidence from the affected promises and consequential failure modes:
-
-- exercise supported entry points and meaningful outcomes;
-- use the smallest stable boundary that proves the claim;
-- use an end-to-end flow when the promise crosses components;
-- use focused lower-level checks only when they distinguish a risk more clearly or cheaply; and
-- derive expectations from intended behavior, not duplicated production logic.
-
-Treat durable verification as maintained system code for current supported behavior. Prefer deleting obsolete or redundant checks and scaffolding over preserving or extending them; use bounded inspection, measurement, or temporary probes when durable protection is not justified.
-
-A green suite or large test count is not confidence by itself. Stop when independent evidence establishes the affected claims; broaden only for changed behavior, concrete failures, or unresolved material risk.
-
-### Evaluate the complete result
-
-Do not present the first plausible implementation. Inspect the exact Task, Attempt, Outcome, blockers, retained output, and supported flow yourself, then compare the implementation with the shared design and original goal.
-
-#### Use independent review proportionately
-
-Prefer independent review for nontrivial maintained changes, with effort proportionate to consequence and uncertainty. Use it where another perspective can still change design, implementation, or acceptance—not merely as final approval.
-
-Give each Review a consequential purpose rather than asking for general approval. Challenge the result's shape and evidence where those could change acceptance; do not default independent scrutiny to functional correctness.
-
-The Coordinator chooses timing, focus, and independent perspectives; review is not a mandatory stage or approval gate.
-
-Reconcile review findings against the source. Correct worthwhile in-scope problems and recheck what the correction could invalidate. Escalate only decisions that change requirements, supported behavior, ownership, or a consequential trade-off.
-
-After establishing correctness, assess the complete resulting system—not only the diff or passing checks. Trace the changed flow and challenge whether every surviving part has a current purpose and clear owner, whether complexity was removed rather than moved, and what can now disappear.
-
-Remove superseded or redundant machinery when settled behavior is preserved. Return changes to supported behavior or consequential contracts to the user.
-
-Judge maintainability, readability, performance where relevant, operational behavior, and verification quality alongside functional correctness. Reports, commits, and passing checks are evidence—not acceptance.
-
-The user's judgment is the final product decision, not the first quality-control pass. Hand back only a coherent result you are prepared to support, with direct evidence and meaningful limitations.
+The user's judgment is the final product decision. Hand back only a coherent result you are prepared to support, with direct evidence and meaningful limitations.
 
 ## Stop at the delivery boundary
 

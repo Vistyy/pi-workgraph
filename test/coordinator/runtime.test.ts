@@ -30,24 +30,34 @@ const selection = { kind: "target" as const, target };
 
 const spec: AttemptSpec = { selection, base: { kind: "directory" } };
 
-const task = (root: string, id: string): Task => ({
+type ReadOnlyTestRole = "research" | "review";
+
+const task = (root: string, id: string, role: ReadOnlyTestRole = "research"): Task => ({
   target: { kind: "directory", path: join(root, id) },
-  contract: {
-    kind: "research",
-    question: `Research ${id}`,
-    expectedEvidence: ["Direct observation"],
-  },
+  contract:
+    role === "review"
+      ? { kind: "review", request: `Review ${id}` }
+      : {
+          kind: "research",
+          question: `Research ${id}`,
+          expectedEvidence: ["Direct observation"],
+        },
 });
 
-const objective = (taskId: string, attemptId: string, value: Task): WorkerObjective => ({
-  content: [
-    "[WORKGRAPH WORKER OBJECTIVE]",
-    `Task ${taskId} resolved starting context (not evidence scope or authority): ${JSON.stringify(value.target)}`,
-    `Question: Research ${taskId}`,
-    "Expected evidence: Direct observation",
-  ].join("\n"),
-  details: { taskId, attemptId, role: "research" },
-});
+const objective = (taskId: string, attemptId: string, value: Task): WorkerObjective => {
+  if (value.contract.kind !== "research" && value.contract.kind !== "review")
+    throw new Error("Runtime fixture supports only research and review Tasks.");
+
+  return {
+    content: [
+      "[WORKGRAPH WORKER OBJECTIVE]",
+      `Task ${taskId} resolved starting context (not evidence scope or authority): ${JSON.stringify(value.target)}`,
+      `${value.contract.kind === "review" ? "Request: Review" : "Question: Research"} ${taskId}`,
+      ...(value.contract.kind === "research" ? ["Expected evidence: Direct observation"] : []),
+    ].join("\n"),
+    details: { taskId, attemptId, role: value.contract.kind },
+  };
+};
 
 function temporary(): string {
   return mkdtempSync(join(tmpdir(), "session-runtime-"));
@@ -116,8 +126,12 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   assert.fail("timed out");
 }
 
-function workerName(taskId: string, attemptId: string): string {
-  return herdrWorkerName({ taskId, attemptId, role: "research" });
+function workerName(
+  taskId: string,
+  attemptId: string,
+  role: ReadOnlyTestRole = "research",
+): string {
+  return herdrWorkerName({ taskId, attemptId, role });
 }
 
 async function session(root: string, taskId: string, attemptId: string, value: Task) {
@@ -133,7 +147,7 @@ async function session(root: string, taskId: string, attemptId: string, value: T
 function appendSettledReport(
   sessionFile: string,
   summary: string,
-  role: "research" | "experiment" = "research",
+  role: "research" | "experiment" | "review" = "research",
 ): void {
   const manager = SessionManager.open(sessionFile);
   manager.appendCustomEntry("pi-workgraph-effective-model", target);
@@ -301,10 +315,10 @@ void test("uncertain tab, agent, and kickoff recover from persisted facts withou
 void test("Outcome is written before one close and reload duplicates neither close nor notification", async () => {
   const root = temporary();
   let store = new RecordStore(root, "session-settle");
-  const value = task(root, "settle");
+  const value = task(root, "settle", "review");
   const attempt = store.createTaskWithAttempt("settle", value, "attempt-settle", spec).attempt;
   const created = await session(root, "settle", attempt.id, value);
-  appendSettledReport(created.sessionFile, "settled");
+  appendSettledReport(created.sessionFile, "settled", "review");
   store.checkpointWorker(attempt.id, {
     sessionFile: created.sessionFile,
     workspaceId: "workspace-owner",
@@ -320,7 +334,7 @@ void test("Outcome is written before one close and reload duplicates neither clo
     workspace: "workspace-owner",
     cwd: value.target.kind === "directory" ? value.target.path : "",
     session: created.sessionFile,
-    name: workerName("settle", attempt.id),
+    name: workerName("settle", attempt.id, "review"),
   });
 
   let notifications = 0;
@@ -366,7 +380,7 @@ void test("Outcome is written before one close and reload duplicates neither clo
     assert.equal(outcomeWasDurableAtNotification, true);
     assert.equal(
       notification,
-      `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: reported: settled`,
+      `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: reported: settled Review output is independent evidence; it neither approves the result nor turns its findings into requirements.`,
     );
     assert.equal(
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,

@@ -1024,10 +1024,16 @@ export class SessionRuntime {
             ? outcome.report.summary
             : (outcome?.reason ?? "unavailable");
 
+        const reviewNotice =
+          outcome?.kind === "reported" &&
+          this.store.readTask(attempt.taskId).task.contract.kind === "review"
+            ? " Review output is independent evidence; it neither approves the result nor turns its findings into requirements."
+            : "";
+
         this.pi.sendMessage(
           {
             customType: "pi-workgraph-outcome",
-            content: `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: ${outcome?.kind ?? "unknown"}: ${summary.replace(/\s+/g, " ").slice(0, 500)}`,
+            content: `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: ${outcome?.kind ?? "unknown"}: ${summary.replace(/\s+/g, " ").slice(0, 500)}${reviewNotice}`,
             display: true,
             details: { taskId: attempt.taskId, attemptId: attempt.id },
           },
