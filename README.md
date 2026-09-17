@@ -85,6 +85,7 @@ user request
                                  → Task and Attempt
                                  → retained Candidate
   → Coordinator evaluation
+  → applicable Maintainer inspection and Human sign-off
   → explicit delivery route
 ```
 
@@ -92,7 +93,7 @@ Before repository mutation, the Coordinator calls `workgraph_checkout`. The retu
 
 Implementation Workers use detached worktrees. Their committed results can become retained Candidates, which the Coordinator may apply into its managed checkout with `workgraph_control`.
 
-Workgraph does not perform final integration or publication. When an accepted change reaches the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to classify [Human sign-off](references/delivery.md#choose-a-delivery-route), recommend a route, and carry out only the selected route's authorized effects. Without an explicit route, it waits for the user's choice.
+Workgraph does not perform final integration or publication. When an accepted change reaches the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to classify the [Human sign-off requirement](references/delivery.md#resolve-human-sign-off), use a designated local Maintainer-inspection capability when applicable, recommend a route, and carry out only the selected route's authorized effects. Without an explicit route, it waits for the user's choice.
 
 ## Task types
 
