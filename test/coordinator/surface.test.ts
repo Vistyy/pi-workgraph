@@ -171,8 +171,8 @@ void test("coordinator registers the exact strict tool surface", async () => {
     );
 
     const guidance = coordinatorContract.replace(
-      "[delivery procedure](references/delivery.md)",
-      `delivery procedure at ${JSON.stringify(deliveryReferencePath)}`,
+      "[Delivery procedure](references/delivery.md)",
+      `Delivery procedure at ${JSON.stringify(deliveryReferencePath)}`,
     );
 
     assert.equal(existsSync(deliveryReferencePath), true);

@@ -35,6 +35,8 @@ test/
 
 Tests are grouped by supported responsibility rather than by individual source module.
 
+Independent Pi extensions are peers. Workgraph governs Worker capabilities through Workgraph-owned tool policy; cross-extension lifecycle, configuration, or environment dependencies require an explicitly designed shared contract.
+
 ## Coordination model
 
 The exact Coordinator Pi session is the unit of ownership.

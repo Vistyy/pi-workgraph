@@ -68,11 +68,11 @@ Before handback, challenge whether every surviving responsibility, abstraction, 
 
 The user's judgment is the final product decision. Hand back only a coherent result you are prepared to support, with direct evidence and meaningful limitations.
 
-## Stop at the delivery boundary
+## Reach the delivery boundary
 
-When an accepted repository change reaches the delivery boundary—or a later delivered observation returns the Coordinator to its pull request—read the packaged [delivery procedure](references/delivery.md) before deciding or acting. It owns Human sign-off classification, route recommendation and selection, route-specific preparation, effects and receipts, and continued pull-request work.
+A repository change reaches the delivery boundary when the Coordinator has accepted the complete result and its supporting evidence, with no further implementation or verification needed before the user's delivery judgment. Final integration or publication requires authority separate from implementation.
 
-The reference supplies procedure, not authority. Do not load it before an accepted repository change reaches the delivery boundary.
+- [Delivery procedure](references/delivery.md) — Read at this boundary before deciding or acting on delivery, or when a later delivered observation returns the Coordinator to its pull request. It owns Human sign-off, route selection, route-specific preparation, effects and receipts, and continued pull-request work.
 
 ## Preserve operational truth
 
