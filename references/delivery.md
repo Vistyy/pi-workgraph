@@ -30,7 +30,7 @@ Each route permits only its stated effects under the existing task authority. A 
 | --- | --- | --- |
 | Pull request | Commit accepted content or same-scope corrections, non-force push the accepted branch, create or update the exact pull request, and establish continued observation. | Merge or finally integrate, force-push, add unrelated work, or expand scope. |
 | Local integration | Integrate the exact accepted change into the exact authorized local destination with ordinary non-force Git operations. | Publish remotely, force, add unrelated work, or change the destination or scope. |
-| Preserve checkout | Retain the exact Coordinator checkout and report its identity and state. | Commit, integrate, publish, or clean up merely to make the handback neater. |
+| Preserve checkout | Retain the exact Coordinator checkout and report its identity and state. | Integrate, publish, or clean up merely to make the handback neater. |
 
 A pull request requests repository maintainer consideration. It does not satisfy `Required` Human sign-off for final integration.
 
