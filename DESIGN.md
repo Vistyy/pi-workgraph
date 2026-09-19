@@ -162,6 +162,8 @@ Cancellation differs by state:
 
 After a close checkpoint, recovery only observes; it never repeats close. Steering remains a separate prompt to an exact active Worker.
 
+Each recorded Outcome produces one best-effort `followUp` notification that triggers a Coordinator turn, including reported, unreported, and cancelled results. Notification failure does not change the durable Outcome and is not retried. After durable insertion, the runtime queries the exact Coordinator session for pending Outcomes. When another Attempt remains pending, the notification reserves the turn for useful coordination and prohibits substantive user-facing synthesis unless the user explicitly requested partial results. When none remain pending, it requires inspection of all relevant persisted Outcomes and one complete standalone response that restates the relevant conclusions without relying on earlier incremental assistant messages. There is no grouping, cached count, transient scheduling state, or in-memory aggregate state.
+
 Coordinator shutdown interrupts and joins only owned coordination fibers and closes its database handle. It does not close Workers, remove sessions or checkouts, classify unfinished repositories, or delete retained or uncertain output.
 
 ## Coordinator checkout lifecycle

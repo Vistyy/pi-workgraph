@@ -78,6 +78,8 @@ A repository change reaches the delivery boundary when the Coordinator has accep
 
 After queuing work, continue useful independent inspection, design, or verification. Otherwise end the turn so Outcome notifications can resume coordination; do not poll Workers or wait in a loop.
 
+Every Outcome notification starts a follow-up turn. When it says other Attempts still await Outcomes, use that turn for useful coordination such as inspecting evidence, arranging follow-on work, cancellation, or asking for a necessary decision. Do not provide a substantive user-facing synthesis unless the user explicitly requested partial results. When it says no Attempts await Outcomes, inspect all relevant persisted Outcomes and provide one complete standalone response that restates the relevant conclusions without assuming the user read earlier incremental assistant messages.
+
 When a tool response is missing or failed after a possible effect:
 
 1. Treat the result as uncertain.
