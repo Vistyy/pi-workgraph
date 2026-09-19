@@ -78,6 +78,8 @@ A repository change reaches the delivery boundary when the Coordinator has accep
 
 After queuing work, continue useful independent inspection, design, or verification. Otherwise end the turn so Outcome notifications can resume coordination; do not poll Workers or wait in a loop.
 
+Unless the user requests partial results, use intermediate Outcome turns for coordination rather than substantive synthesis. When the relevant work settles, give one self-contained response based on the persisted Outcomes.
+
 When a tool response is missing or failed after a possible effect:
 
 1. Treat the result as uncertain.

@@ -223,6 +223,23 @@ export class RecordStore {
     });
   }
 
+  hasPendingOutcomes(): boolean {
+    const database = this.existingOrUndefined("read pending Outcomes");
+
+    if (database === undefined) return false;
+
+    return (
+      integer(
+        database
+          .prepare(
+            "SELECT EXISTS(SELECT 1 FROM attempts WHERE session_id=? AND outcome_json IS NULL) AS value",
+          )
+          .get(this.sessionId),
+        "value",
+      ) === 1
+    );
+  }
+
   unsettled(): AttemptRecord[] {
     const database = this.existingOrUndefined("read unsettled Attempts");
 

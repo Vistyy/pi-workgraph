@@ -1030,10 +1030,16 @@ export class SessionRuntime {
             ? " Review output is independent evidence; it neither approves the result nor turns its findings into requirements."
             : "";
 
+        const pending = this.store.hasPendingOutcomes();
+
+        const pendingNotice = pending
+          ? " Other Attempts in this Coordinator session still await Outcomes. Use this turn for coordination only, such as inspecting evidence, arranging follow-on work, cancellation, or asking for a necessary decision. Do not provide a substantive user-facing synthesis unless the user explicitly requested partial results."
+          : " No Attempts in this Coordinator session await Outcomes. Inspect all relevant persisted Outcomes and provide one complete standalone response that restates the relevant conclusions without assuming the user read earlier incremental assistant messages.";
+
         this.pi.sendMessage(
           {
             customType: "pi-workgraph-outcome",
-            content: `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: ${outcome?.kind ?? "unknown"}: ${summary.replace(/\s+/g, " ").slice(0, 500)}${reviewNotice}`,
+            content: `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: ${outcome?.kind ?? "unknown"}: ${summary.replace(/\s+/g, " ").slice(0, 500)}${reviewNotice}${pendingNotice}`,
             display: true,
             details: { taskId: attempt.taskId, attemptId: attempt.id },
           },

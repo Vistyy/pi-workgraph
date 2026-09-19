@@ -104,6 +104,7 @@ void test("RecordStore creates one exact database lazily", () => {
     assert.equal(existsSync(store.path), false);
     assert.deepEqual(store.listTasks(0, 10), []);
     assert.deepEqual(store.unsettled(), []);
+    assert.equal(store.hasPendingOutcomes(), false);
     assert.deepEqual(store.counts(), { tasks: 0, attempts: 0, activeWorkers: 0 });
     assert.equal(existsSync(store.path), false);
 
@@ -190,6 +191,12 @@ void test("session partitions share one file without sharing records or relation
     );
     assert.deepEqual(second.listAttempts(0, 10, "foreign-only"), []);
     assert.throws(() => second.createAttempt("same-task", "attempt-a", repositorySpec), StoreError);
+    assert.equal(first.hasPendingOutcomes(), true);
+    assert.equal(second.hasPendingOutcomes(), true);
+    first.recordOutcome("attempt-a", unreported);
+    first.recordOutcome("attempt-foreign", unreported);
+    assert.equal(first.hasPendingOutcomes(), false);
+    assert.equal(second.hasPendingOutcomes(), true);
     assert.deepEqual(first.counts(), { tasks: 2, attempts: 2, activeWorkers: 0 });
     assert.deepEqual(second.counts(), { tasks: 1, attempts: 1, activeWorkers: 0 });
     first.close();
