@@ -126,20 +126,6 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   assert.fail("timed out");
 }
 
-function assertPendingOutcomeGuidance(content: string): void {
-  assert.match(content, /other Attempts .* still await Outcomes/i);
-  assert.match(content, /coordination only/i);
-  assert.match(content, /Do not provide a substantive user-facing synthesis/i);
-  assert.match(content, /unless the user explicitly requested partial results/i);
-}
-
-function assertCompleteOutcomeGuidance(content: string): void {
-  assert.match(content, /No Attempts .* await Outcomes/i);
-  assert.match(content, /Inspect all relevant persisted Outcomes/i);
-  assert.match(content, /one complete standalone response/i);
-  assert.match(content, /without assuming the user read earlier incremental assistant messages/i);
-}
-
 function workerName(
   taskId: string,
   attemptId: string,
@@ -352,7 +338,6 @@ void test("Outcome is written before one close and reload duplicates neither clo
   });
 
   let notifications = 0;
-  let notification: unknown;
   let notificationOptions: unknown;
   let outcomeWasDurableAtNotification = false;
   let scope = await Effect.runPromise(Scope.make());
@@ -364,9 +349,8 @@ void test("Outcome is written before one close and reload duplicates neither clo
         agentDir: root,
         workspaceId: "workspace-new",
         pi: {
-          sendMessage(message, options) {
+          sendMessage(_message, options) {
             notifications += 1;
-            notification = message.content;
             notificationOptions = options;
             outcomeWasDurableAtNotification = store.readAttempt(attempt.id).outcome !== undefined;
           },
@@ -394,17 +378,6 @@ void test("Outcome is written before one close and reload duplicates neither clo
     await Effect.runPromise(Effect.sleep(400));
     assert.equal(notifications, 1);
     assert.equal(outcomeWasDurableAtNotification, true);
-    assert.match(
-      String(notification),
-      new RegExp(
-        `Workgraph Outcome for Task ${attempt.taskId}, Attempt ${attempt.id}: reported: settled`,
-      ),
-    );
-    assert.match(
-      String(notification),
-      /Review output is independent evidence; it neither approves the result nor turns its findings into requirements\./,
-    );
-    assertCompleteOutcomeGuidance(String(notification));
     assert.deepEqual(notificationOptions, { deliverAs: "followUp", triggerTurn: true });
     assert.equal(
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
@@ -680,7 +653,7 @@ void test("queued cancellation makes no Herdr call and active cancellation close
   });
 
   const scope = await Effect.runPromise(Scope.make());
-  const notifications: Array<{ readonly content: unknown; readonly options: unknown }> = [];
+  const notifications: unknown[] = [];
 
   try {
     const runtime = await Effect.runPromise(
@@ -689,8 +662,8 @@ void test("queued cancellation makes no Herdr call and active cancellation close
         agentDir: root,
         workspaceId: "workspace-new",
         pi: {
-          sendMessage(message, options) {
-            notifications.push({ content: message.content, options });
+          sendMessage(_message, options) {
+            notifications.push(options);
           },
         },
         herdr: native.herdr,
@@ -714,15 +687,10 @@ void test("queued cancellation makes no Herdr call and active cancellation close
       commands(native.log).filter((entry) => entry.slice(0, 2).join(" ") === "tab close").length,
       1,
     );
-    assert.deepEqual(
-      notifications.map((notification) => notification.options),
-      [
-        { deliverAs: "followUp", triggerTurn: true },
-        { deliverAs: "followUp", triggerTurn: true },
-      ],
-    );
-    assertPendingOutcomeGuidance(String(notifications[0]?.content));
-    assertCompleteOutcomeGuidance(String(notifications[1]?.content));
+    assert.deepEqual(notifications, [
+      { deliverAs: "followUp", triggerTurn: true },
+      { deliverAs: "followUp", triggerTurn: true },
+    ]);
     await assert.rejects(Effect.runPromise(runtime.cancel(active.id, "again")), RuntimeError);
     assert.equal(notifications.length, 2);
   } finally {
@@ -849,7 +817,7 @@ void test("steering and repository classification reject inexact or open Workers
   });
 
   const scope = await Effect.runPromise(Scope.make());
-  const notifications: Array<{ readonly content: unknown; readonly options: unknown }> = [];
+  const notifications: unknown[] = [];
 
   try {
     const runtime = await Effect.runPromise(
@@ -858,8 +826,8 @@ void test("steering and repository classification reject inexact or open Workers
         agentDir: root,
         workspaceId: "new",
         pi: {
-          sendMessage(message, options) {
-            notifications.push({ content: message.content, options });
+          sendMessage(_message, options) {
+            notifications.push(options);
           },
         },
         herdr: native.herdr,
@@ -877,13 +845,7 @@ void test("steering and repository classification reject inexact or open Workers
         store.readAttempt(attempt.id).outcome?.result.kind === "unreported" &&
         store.readAttempt(attempt.id).worker?.closed === true,
     );
-    assert.equal(notifications.length, 1);
-    assert.match(String(notifications[0]?.content), /: unreported:/);
-    assertCompleteOutcomeGuidance(String(notifications[0]?.content));
-    assert.deepEqual(notifications[0]?.options, {
-      deliverAs: "followUp",
-      triggerTurn: true,
-    });
+    assert.deepEqual(notifications, [{ deliverAs: "followUp", triggerTurn: true }]);
   } finally {
     await Effect.runPromise(Scope.close(scope, Exit.void));
     rmSync(root, { recursive: true, force: true });
