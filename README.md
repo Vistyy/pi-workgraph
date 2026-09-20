@@ -87,13 +87,20 @@ user request
   → Coordinator evaluation
   → applicable Maintainer inspection and Human sign-off
   → explicit delivery route
+      ├── local integration → verify → clean up
+      ├── pull request → observe merge → reconcile local → clean up
+      └── preserve → retain deliberately
 ```
 
 Before repository mutation, the Coordinator calls `workgraph_checkout`. The returned branch-backed checkout starts from committed `HEAD` without changing the source checkout or copying its uncommitted files.
 
 Implementation Workers use detached worktrees. Their committed results can become retained Candidates, which the Coordinator may apply into its managed checkout with `workgraph_control`.
 
-Workgraph does not perform final integration or publication. When an accepted change reaches the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to classify the [Human sign-off requirement](references/delivery.md#resolve-human-sign-off), use a designated local Maintainer-inspection capability when applicable, recommend a route, and carry out only the selected route's authorized effects. Without an explicit route, it waits for the user's choice.
+When an accepted change reaches the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to handle [Human sign-off](references/delivery.md#resolve-human-sign-off) and obtain the route choice. Workgraph performs the authorized local integration, verification, and owned cleanup; the Coordinator still publishes through ordinary forge tools. A local or PR route includes its housekeeping, so a completed merge does not require another cleanup request.
+
+PR preparation uses the same owned branch, based on the intended remote target and re-verified before publication. After merge, Workgraph verifies the exact accepted PR head and merged result, safely reconciles the local destination, and removes the owned checkout and branches. A changed published branch is preserved rather than deleted. A PR closed without merge retains its undelivered work.
+
+After cleanup, the same session may request a fresh checkout from current committed local `main`. It need not keep an old checkout alive merely because the conversation continues.
 
 ## Task types
 
@@ -153,14 +160,16 @@ A Worker may modify only its assigned worktree and the Git state needed to commi
 
 | Tool | Purpose |
 | --- | --- |
-| `workgraph_checkout` | Create or exactly reuse this session's deterministic Coordinator checkout. |
+| `workgraph_checkout` | Allocate or reuse this session's current Coordinator checkout; begin fresh after completed cleanup. |
+| `workgraph_load_delivery_tools` | Expose the delivery capability and configured peer tools at the delivery boundary. |
+| `workgraph_deliver` | Integrate, register PR delivery, preserve, or reconcile the recorded checkout lifecycle. Available after loading delivery tools. |
 | `workgraph_research` | Create a read-only Research Task. |
 | `workgraph_experiment` | Create an Experiment with explicit effects and a hard cutoff. |
 | `workgraph_consult` | Ask the configured advisor a question. |
 | `workgraph_implement` | Create an Implementation Task and its first Attempt. |
 | `workgraph_review` | Assess a natural-language request against accessible material. |
 | `workgraph_attempt` | Create another Attempt for an unchanged Task. |
-| `workgraph_inspect` | Inspect bounded Task, Attempt, Outcome, and operational records. |
+| `workgraph_inspect` | Inspect bounded Task, Attempt, Outcome, checkout, and delivery records. |
 | `workgraph_control` | Cancel or steer a Worker, or apply or discard exact repository output. |
 | `workgraph_notepad` | Read, replace, or clear the current branch's bounded Coordinator memo. |
 
@@ -168,12 +177,9 @@ A Worker may modify only its assigned worktree and the Git state needed to commi
 
 Each Coordinator session owns its records. Sessions share one private SQLite database under the Pi agent directory, partitioned by exact session identity; one session cannot enumerate another's records.
 
-Stopping or reloading the Coordinator stops only its coordination activity. It preserves:
+Stopping the Coordinator preserves unfinished checkouts, delivery records, independent Workers, retained output, and uncertain resources. Completion remains session-owned: there is no background janitor or takeover by another session.
 
-- Coordinator checkouts;
-- independent Worker sessions and Herdr tabs;
-- retained repository output; and
-- uncertain resources.
+On resume, recorded unfinished delivery is reconciled against actual repository state. Interrupted worktree or branch removal remains tracked cleanup rather than an unexplained allocation collision. A completed checkout is not recreated until explicitly requested for new work.
 
 The notepad stores at most 4,000 characters on the current Pi branch and restores a nonempty memo after genuine context compaction. It is pending memory only: it grants no authority and establishes neither acceptance nor correctness.
 
@@ -195,7 +201,7 @@ Mouse interaction follows the projected layout. If Calm cannot safely use Pi's p
 
 ## Defer delivery tools
 
-List the tools to keep out of the Coordinator's initial context in `~/.pi/agent/settings.json`:
+`workgraph_deliver` is deferred until the delivery boundary. To defer additional peer tools, list them in `~/.pi/agent/settings.json`:
 
 ```json
 {
@@ -207,7 +213,7 @@ List the tools to keep out of the Coordinator's initial context in `~/.pi/agent/
 }
 ```
 
-At the delivery boundary, `workgraph_load_delivery_tools` activates the configured tools that are installed and reports any that are missing. An absent or empty list changes nothing. Invalid settings leave the tools active and produce a warning.
+At the delivery boundary, `workgraph_load_delivery_tools` activates Workgraph delivery and the configured peers that are installed, reporting missing names. An absent or empty peer list leaves peer tools unchanged. Invalid peer settings warn without hiding those peers or disabling the core delivery capability.
 
 ## Disable Worker tools
 

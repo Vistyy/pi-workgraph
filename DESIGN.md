@@ -43,7 +43,7 @@ The exact Coordinator Pi session is the unit of ownership.
 
 ```text
 Coordinator session
-├── Coordinator checkout per repository
+├── Current Coordinator checkout lifecycle per repository
 ├── Task
 │   ├── Attempt → Outcome
 │   └── Attempt → Outcome + retained Candidate
@@ -70,6 +70,7 @@ Worker reports provide evidence. They do not create authority, approval, or acce
 | Task | Contract and resolved Target | None |
 | Attempt | Task, model selection, repository base when applicable, optional Candidate lineage | Worker, repository output, write-once Outcome |
 | Outcome | Reported, unreported, or cancelled result; observed effective models | None after insertion |
+| Coordinator checkout | Exact session and repository ownership | Allocation, selected delivery, verified integration, and cleanup progress |
 
 Effective models may be absent when execution never established one. They may differ from the frozen selection when Pi's actual session trajectory differs.
 
@@ -103,6 +104,7 @@ Exact session identity partitions every supported query and mutation.
 | --- | --- |
 | `tasks` | Immutable Task JSON under `(session_id, task_id)` |
 | `attempts` | Immutable Attempt specification plus nullable Worker, output, and Outcome JSON |
+| Coordinator checkout records | Current session-owned checkout lifecycle and delivery progress, created only on explicit mutation |
 
 The store guarantees:
 
@@ -112,9 +114,9 @@ The store guarantees:
 - every JSON field is decoded with its strict TypeBox schema when a supported read uses it; and
 - SQL row shape and scalar types are checked at that boundary.
 
-The store has no aggregate mirror, global revision, cached frontier, cross-session lease, or process-coordination state. Coordinator checkouts have no database record.
+The store has no aggregate mirror, global revision, cached frontier, cross-session lease, or process-coordination state. Checkout lifecycle records belong to the same exact-session partition as Tasks and Attempts; they are not a cross-session resource registry.
 
-Schema version 1 fails closed on an unknown version. Workgraph does not migrate another format. Operational updates replace only their owned field, so unrelated records require no reconstruction.
+The checkout table is an additive, lazily initialized part of schema version 1. Existing Task and Attempt records remain unchanged. Unsupported database versions fail closed; there is no general migration framework. Operational updates replace only their owned record or field.
 
 ## Worker lifecycle
 
@@ -172,13 +174,15 @@ Read-only work creates no repository resource. The model must explicitly request
 
 Creation snapshots the source checkout's committed `HEAD`. Tracked, untracked, and ignored source changes are neither copied nor changed.
 
-A collision-resistant identity derived from exact Pi session and canonical Git common directory determines one private path and branch.
+A collision-resistant identity derived from exact Pi session and canonical Git common directory determines one private path and branch. The recorded lifecycle also retains the original source checkout and branch so final delivery does not have to reconstruct its destination from conversation history.
 
 | Observed resource state | Result |
 | --- | --- |
-| Complete absence | Create a linked worktree and normal branch at the requested commit. |
-| Complete exact identity | Reuse it, including modified or advanced managed content. |
-| Partial, duplicate, locked, symlinked, foreign, moved, or unreadable state | Block without repair, reset, pruning, deletion, retry, or alternate placement. |
+| New explicit allocation with absent resources | Record ownership and create the linked worktree at the requested commit. |
+| Exact current checkout | Reuse it, including modified or advanced managed content. |
+| Known interrupted allocation or cleanup | Observe native state and reconcile the recorded operation. |
+| Completed lifecycle | Retain its receipt; only a new explicit checkout request starts another lifecycle. |
+| Unknown partial, duplicate, locked, symlinked, foreign, moved, or unreadable state | Preserve and block; a record is not permission to bypass native identity checks. |
 
 Exact reuse proves:
 
@@ -190,29 +194,29 @@ Exact reuse proves:
 
 A failed native creation response counts as success only when immediate observation proves the complete requested identity at the exact commit. An interrupted initialization remains locked and blocked.
 
-Complete later absence permits deterministic creation at the same path. Routine shutdown preserves the checkout.
+After verified cleanup, a later explicit request can reuse the same deterministic path and branch name for a fresh checkout from the source's current committed HEAD. Resuming a session does not resurrect completed checkouts. Shutdown preserves unfinished resources.
 
-The managed checkout is the Coordinator's mutable integration destination.
-
-Workgraph does not intercept file operations, redirect paths, inject checkout state into prompts, persist checkout records, or reconcile checkouts in a background loop.
+The managed checkout remains the Coordinator's mutable integration destination. Its unfinished lifecycle is available through inspection and restored Coordinator context. Workgraph does not intercept file operations, redirect paths, take over another session's resources, or run a background checkout janitor.
 
 ### Delivery boundary
 
-Final local integration and publication use ordinary repository, forge, or session capabilities. The Coordinator contract owns the delivery-boundary trigger; the packaged delivery reference owns the Human sign-off requirement and handling, route recommendation and selection, and each selected route's procedure. A designated local session capability may support Maintainer inspection without becoming Workgraph state or authority. Neither the capability nor the procedure expands existing authority.
+The Coordinator owns acceptance, Human sign-off handling, route selection, unpublished branch preparation, and PR publication. `workgraph_deliver` owns authorized final local integration, verification, and cleanup. A selected local or PR route includes its housekeeping; publication alone is not completed delivery. Preservation is an explicit disposition, not inferred success.
 
-When `pi-workgraph.delivery.deferredTools` contains tool names, Workgraph hides them until the delivery boundary. `workgraph_load_delivery_tools` activates the configured names that Pi has registered and reports the names it cannot find. Invalid settings leave all tools active and produce a warning.
+The Coordinator contract owns the boundary trigger. The delivery reference owns the judgment and publication procedure; operation-specific Git inputs, checks, effects, and receipts belong to the delivery tool. A designated local inspection capability supplies Maintainer feedback, not authority.
+
+The delivery capability is registered but initially deferred. `workgraph_load_delivery_tools` activates it together with the explicitly configured peer names in `pi-workgraph.delivery.deferredTools`, reporting unavailable peers. Invalid peer settings warn and leave peer tools unchanged; they do not remove the core delivery capability.
 
 A successful loader result keeps those tools active on descendant conversation branches. Navigating to a point before that result hides them again. The loader is unavailable to Workers and does not change Worker tool policy or run peer extension behavior.
 
 The contract names packaged references with source-relative Markdown links. When injecting the contract, the extension renders each reference at its use site as an installed absolute path while leaving the referenced content unloaded until the contract directs the Coordinator to read it.
 
-For a pull-request route, the reference guides initial publication, exact-result verification, and establishment of continued observation when a capability is available.
+PR preparation keeps the same owned branch attached. Before publication, the Coordinator may prepare that unpublished branch on the intended remote base, then verify and accept the final range. This excludes unrelated local history without a second delivery branch or a runtime commit-transformation engine. Published corrections do not rewrite history.
 
-Delivered observations return the Coordinator to the same work under its existing authority.
+The registered PR delivery binds the accepted head, exact PR and remote, and authorized local destination. Existing observation capabilities return the Coordinator to that record; Workgraph adds no watcher, review collector, or merge authority. Resume and explicit reconciliation inspect current facts rather than replaying possibly completed publication effects.
 
-Workgraph owns no publication or observation state, merge authority, independent state checking, or observation-availability reporting.
+A merged PR must identify the exact accepted head and the forge's actual merged result. This supports merge, squash, and rebase delivery without pretending that original-commit ancestry is universal proof. Closed-unmerged work is preserved. After verified merge, local reconciliation preserves unrelated work, and remote deletion is conditional on the published branch still having its delivered tip.
 
-Cleanup waits until no Worker, Candidate decision, or delivery choice depends on the checkout. It uses ordinary non-force Git operations and preserves resources after refusal or uncertainty.
+Cleanup waits for dependent Workers and Candidate decisions and refuses unaccepted source changes. Checkpointed removal covers both worktree and branch: a leftover owned branch is unfinished cleanup, not an unexplained allocation collision. Exact-tip deletion follows verified delivery rather than `git branch -d`'s ancestry heuristic. Ignored build artifacts in an accepted completed checkout are scratch; foreign or uncertain resources remain protected.
 
 ## Implementation trajectory
 
@@ -339,14 +343,11 @@ A completed report relinquishes ignored, untracked, and uncommitted scratch. Ext
 
 Application is serialized within one Coordinator session. Concurrent destination mutation by another session or process is unsupported.
 
-Before the checkpointed fast-forward, Workgraph proves:
+Before the checkpointed advancement, Workgraph proves private source identity, Candidate lineage, destination identity, common Candidate-root ancestry, and tree mergeability. An extended Candidate includes its parent's history and can apply directly at the original root; applying the parent first is not required.
 
-- private source ref and exact Candidate lineage;
-- destination identity and state;
-- ancestry and tree mergeability; and
-- that no Candidate path would overwrite an ignored destination artifact.
+Git advancement checks are shared with delivery where their responsibilities match. Candidate custody remains separate: applying a Candidate still affects only its recorded Coordinator destination, not final delivery. Unrelated ignored artifacts remain intact, and overlapping artifacts cannot be overwritten.
 
-Unrelated ignored artifacts remain intact. Recovery accepts only the exact expected Git structure. A changed destination blocks without rollback or automatic retry. Output is released only after application is recorded.
+Recovery observes the exact prepared result before another effect. Background reconciliation does not silently replan against a moved destination. An explicit Coordinator retry may prepare again only after inspection establishes the source, destination, and prior effect; there is no arbitrary one-replan allowance. Output is released only after application is recorded.
 
 ### Discarding output
 
@@ -354,7 +355,7 @@ Discard is explicit and requires a reason. Workgraph checkpoints the exact retai
 
 An unplaced extension child or unclassified integration child pins its source. Recovery accepts only proven postconditions and never removes foreign or uncertain resources. Outcomes and shutdown cannot discard output.
 
-Applying a Candidate changes only its recorded local destination. Workgraph never publishes or finally integrates a Coordinator checkout.
+Applying a Candidate changes only its recorded local destination. Final integration is a separate authorized delivery operation; publication remains Coordinator-driven through ordinary forge tools.
 
 Mutation tools return persisted Attempt facts, not a generic success flag. Exact Attempt inspection combines semantic and repository state with any runtime blocker.
 

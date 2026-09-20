@@ -1,71 +1,48 @@
 # Deliver an accepted repository change
 
-If `workgraph_load_delivery_tools` reports a configured tool as missing, treat that tool as unavailable and use the fallback below. Loading tools does not grant delivery authority.
+Load `workgraph_load_delivery_tools`. Missing configured peer tools remain unavailable; loading tools grants no delivery authority.
 
 ## Resolve Human sign-off
 
-Human sign-off is the repository Maintainer's explicit judgment that the exact accepted change may be finally integrated. Classify its requirement as `Required` when final integration must wait for that judgment or `Optional` when the Coordinator considers its evidence sufficient without requiring it. The classification grants no repository authority, and neither a Worker Review nor completed Maintainer inspection is Human sign-off.
+Human sign-off is the Maintainer's explicit judgment that the exact accepted change may be finally integrated. Classify its requirement as `Required` when integration must wait for that judgment, or `Optional` when the Coordinator considers its evidence sufficient. Give the reason. Neither a Worker Review nor completed Maintainer inspection is Human sign-off.
 
-After accepting a repository change:
+When sign-off is required and `tuicr_review` is available, use it for local Maintainer inspection before recommending a route unless the user directs otherwise. Another local capability is designated only by the user. Resolve inspection feedback, reaccept the result, and repeat inspection when material changes warrant it.
 
-1. Classify the Human sign-off requirement as `Required` or `Optional`, and give the reason.
-2. When it is `Required` and `tuicr_review` is available, use it as the designated local Maintainer-inspection capability before recommending a delivery route unless the user directs otherwise. Another available capability is designated only by the user.
-3. Treat delivered inspection comments as feedback, not authority. Resolve them, reaccept the complete result, and repeat inspection when material changes warrant it.
-4. Obtain explicit Human sign-off for the exact accepted change before final integration.
+Required sign-off must precede final integration. When no local inspection capability is designated, an authorized pull request may be published to seek sign-off remotely; publication is not final integration.
 
-When no local capability is designated, a pull-request route may be selected and published to seek Human sign-off remotely. Publication is not final integration.
+## Choose the complete route
 
-## Choose a delivery route
+Recommend local integration, pull-request delivery, or deliberate preservation. If the user has not already selected the route for this change, ask once. A repository's pull-request requirement still applies.
 
-After applicable local sign-off handling:
+| Route | Authority |
+| --- | --- |
+| Local integration | Integrate the exact accepted revision into the authorized local destination, verify it, and clean up the owned checkout and local branch. No remote publication. |
+| Pull request | Prepare and publish the accepted branch, maintain the same-scope PR, and follow it. After a verified merge, reconcile the authorized local destination and remove the owned checkout, local branch, and unchanged published branch. No agent-initiated merge or rewriting published history. |
+| Preserve checkout | Deliberately retain the current checkout and its unfinished work. No integration, publication, or cleanup. |
 
-1. Recommend pull-request delivery, local integration, or preserving the ready checkout.
-2. If the user has not already selected a route for this exact change, stop before publishing, integrating, or cleaning up and wait.
+Implementation approval is not delivery authority. Route selection does not bypass required sign-off, but it includes that route's housekeeping: do not ask again merely to update the local destination or remove completed owned resources.
 
-A repository requirement for pull requests is never relaxed by change size. Implementation approval is not delivery authority.
+## Prepare the accepted source
 
-## Route authority
+Keep the exact owned branch attached to the Coordinator checkout. Settle Workers and Candidate decisions that depend on its current base before changing that base.
 
-Each route permits only its stated effects under the existing task authority. A selected route remains constrained by unresolved `Required` Human sign-off; route choice is sign-off only when the Maintainer explicitly accepts the exact change in the same instruction.
+For a PR, compare the proposed range against the intended remote base. If the checkout inherited unrelated unpublished local commits, prepare the same unpublished owned branch on the correct base using native Git. Do not create a second delivery branch or switch the managed checkout to another branch. Re-verify and reaccept the resulting complete diff before publication; a successful rebase is not acceptance. If the change depends on excluded work, resolve that dependency rather than silently omitting it.
 
-| Selected route | Authorizes | Does not authorize |
-| --- | --- | --- |
-| Pull request | Commit accepted content or same-scope corrections, non-force push the accepted branch, create or update the exact pull request, and establish continued observation. | Merge or finally integrate, force-push, add unrelated work, or expand scope. |
-| Local integration | Integrate the exact accepted change into the exact authorized local destination with ordinary non-force Git operations. | Publish remotely, force, add unrelated work, or change the destination or scope. |
-| Preserve checkout | Retain the exact Coordinator checkout and report its identity and state. | Integrate, publish, or clean up merely to make the handback neater. |
+Commit the accepted content. Preserve unaccepted or unrelated changes rather than including them to make delivery succeed. Published corrections remain non-force; rewriting published history requires a separate decision.
 
-A pull request requests repository maintainer consideration. It does not satisfy `Required` Human sign-off for final integration.
+## Local integration
 
-## Confirm the accepted source
+Use `workgraph_deliver` with the checkout identity, accepted revision, and selected local route. Confirm the recorded destination is the authorized one, or supply the explicit destination.
 
-Before any delivery effect:
+The operation owns Git preparation, integration, postcondition verification, and cleanup. Use its persisted receipt to distinguish integrated content from unfinished cleanup. Resolve a concrete blocker through inspection and, when needed, further verification before an explicit retry. Do not bypass the operation with cherry-picks, manual worktree removal, branch deletion, or detaching the original checkout.
 
-1. Work from the exact Coordinator checkout and accepted change.
-2. Reinspect the final diff, commits, status, verification evidence, and material limitations.
-3. Verify the selected route and every source, destination, branch, remote, or pull-request identity it will affect.
-
-Stop when you find unrelated changes, uncertain identity or authority, doubt about the accepted content, or an uncertain result from an operation that may have changed repository or remote state.
-
-After an uncertain effect, inspect current state before doing anything else. Never repeat the operation automatically.
+Report the source and destination revisions, completion or the exact remaining blocker, verification evidence, and material limitations. No further cleanup approval is needed.
 
 ## Pull-request delivery
 
-### Prepare the source
-
-1. Commit only accepted content that still needs a commit.
-2. Pin the resulting clean revision.
-3. Determine whether that head already has an open pull request.
-
-Update the exact existing pull request instead of creating a duplicate.
-
 ### Explain the change
 
-Open with:
-
-1. why the change exists; and
-2. its observable result.
-
-Then choose the smallest representation that makes the important behavior, structure, risk, or evidence clear.
+Open with why the change exists and its observable result. Choose one small representation that makes the important behavior, structure, risk, or evidence clear:
 
 | Change shape | Prefer |
 | --- | --- |
@@ -74,73 +51,40 @@ Then choose the smallest representation that makes the important behavior, struc
 | Ownership or file responsibility | Shallow annotated file tree |
 | Component structure | Component tree with relevant state and boundaries |
 | Interaction or data movement | Mermaid sequence or flow diagram |
-| Modification to an existing shape | Fenced `diff` with `-` and `+` |
+| Modification to an existing shape | Fenced `diff` |
 | Rendered behavior | Comparable before/after screenshots |
 | Quantitative claim | Small table with measured values |
 
-Use one strong visual rather than several representations of the same point. Use prose when it is clearer.
+Use prose when clearer. Include the Human sign-off classification and reason, its specific focus when required, direct verification evidence, and material limitations. Omit empty sections and implementation chronology.
 
-After the explanation, include:
+Do not claim unobserved evidence, expose private paths or logs, or link media without a deliberate destination accessible to the Maintainer.
 
-- `Human sign-off requirement: Required` or `Human sign-off requirement: Optional`;
-- a short reason for that classification;
-- the specific sign-off focus when sign-off is required;
-- evidence that directly supports the affected promises; and
-- material limitations.
+### Publish and register
 
-Omit empty sections and implementation chronology. Adapt the body to the change rather than forcing a fixed template.
+Use ordinary Git and forge tools to non-force push the accepted owned branch and create or update its exact PR. Reuse an existing matching PR rather than creating a duplicate. An uncertain publication result requires inspection, not automatic resubmission.
 
-Do not:
+Register the exact accepted revision, PR, remote, and authorized local destination with `workgraph_deliver`. Its verified receipt connects publication to the checkout's unfinished lifecycle. A URL or an assistant claim alone is not that receipt.
 
-- claim evidence that was not observed;
-- expose local paths, credentials, private logs, or unpublished local artifacts; or
-- link screenshots or other media without a deliberate destination accessible to the repository maintainer.
+Establish observation with an available session capability. If observation is unavailable, retain the registered delivery and report that limitation; do not start another watcher or polling loop.
 
-### Publish and verify
+Hand back the complete PR URL, published revision, sign-off requirement, observation availability, and material evidence limitations. Describe this as publication, not completed delivery.
 
-1. Push the accepted branch with ordinary Git and forge tooling.
-2. Create or update the exact pull request with the prepared title and body.
-3. Verify its intended base and exact accepted head.
-4. Establish continued observation through an available session capability that confirms the exact pull-request identity.
+### Continue to disposition
 
-If no observation capability is available or confirmation fails, preserve the published pull request and report the limitation.
+A delivered observation returns the Coordinator to the same work and authority. Reconcile the recorded delivery with `workgraph_deliver`, which obtains the current PR facts. Review comments and other evidence remain inputs to Coordinator judgment.
 
-Once observation is established, its availability may be reported directly to the user without starting an agent turn.
+For same-scope corrections, verify and accept the updated revision, non-force push the same owned branch, and update its recorded accepted head. Do not expand scope or merge the PR without separate authority.
 
-### Hand back publication
+After merge, the delivery operation verifies the exact accepted PR head and the forge's merged result, reconciles the local destination without overwriting unrelated work, and cleans up its resources. A squash or rebase merge is valid delivery even though the original commits are not ancestors of the destination. A published branch that no longer matches the delivered head is preserved, not deleted.
 
-Report:
+A PR closed without merge preserves its undelivered work. Do not interpret closure as permission to discard it.
 
-- the complete pull-request URL;
-- the published revision;
-- the Human sign-off requirement;
-- whether observation was established; and
-- material evidence limitations.
+Report the final disposition only after inspecting the receipt. If integration succeeded but housekeeping remains blocked, say so; neither publication nor a terminal PR notification alone completes the checkout lifecycle.
 
-Then stop the publication turn.
+## Preserve or resume
 
-### Continue observed work
+Use the preserve route to deliberately retain work. Report the checkout identity, current revision and status, and why it remains open. Preservation is not a claim of delivery.
 
-A later delivered observation returns the Coordinator to the same pull-request work under the existing task and delivery authority.
+Unfinished delivery remains owned by this session. On resume, inspect its recorded state and reconcile the authorized route; do not reconstruct authority from branch ancestry or assume that a missing worktree means success. A failed or interrupted effect must be observed before another mutation.
 
-1. Read current remote state once.
-2. Reconcile the observation with the accepted change and current evidence.
-3. When a same-scope correction is needed, commit only that correction and non-force push the same branch.
-4. Report a delivered merged or closed state, which ends the Coordinator's responsibility.
-
-Do not independently poll or keep observation available. The observation capability may report its own later availability failure directly to the user without starting an agent turn.
-
-If the needed response would merge, force-push, add unrelated work, or expand scope or authority, stop and return the decision to the user.
-
-## Local integration
-
-1. Verify the exact accepted source revision, destination repository and ref, current destination head, and authority to integrate them.
-2. Commit only accepted source content that must be committed for integration.
-3. Use ordinary non-force Git operations. If Git refuses, conflicts, or leaves the result uncertain, stop and preserve both source and destination state.
-4. Verify that the destination contains the exact accepted change and that no unrelated state changed.
-
-Report the source and resulting destination revisions, the observed integration result, verification evidence, and material limitations. Do not publish or clean up unless separately authorized.
-
-## Preserve the ready checkout
-
-Leave the accepted change and Coordinator checkout unchanged. Report the exact checkout path, current revision and status, verification evidence, material limitations, and anything still depending on the checkout.
+After verified cleanup, later work in the same session starts with a fresh `workgraph_checkout` request from the intended source checkout's current committed HEAD. Do not recreate a completed checkout merely because the session resumed.

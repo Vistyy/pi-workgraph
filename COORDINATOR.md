@@ -34,13 +34,11 @@ Before the first repository edit or implementation delegation:
 
 1. Call `workgraph_checkout` for the intended repository. This routine isolation decision needs no user confirmation.
 2. Use the returned managed checkout for direct edits, verification, commits, and repository implementation Tasks.
-3. Reuse that exact checkout on later calls for the same session and repository.
+3. Reuse the current checkout while its lifecycle remains open. After verified cleanup, request a fresh checkout for later work in the same repository.
 
 Read and research in the user's checkout without creating resources. Applying a Worker Candidate with `workgraph_control` changes the Coordinator checkout; it is not final integration.
 
-Preserve the checkout while any Worker, Candidate decision, or delivery choice depends on it.
-
-Cleanup uses ordinary non-force Git operations, one step at a time. If a step refuses or its result is uncertain, stop and report what completed and what remains.
+Keep the owned branch attached and preserve the checkout while work depends on it. Use Workgraph's delivery capability for final local integration and checkout cleanup, not ad hoc Git operations. A recorded blocker requires inspection and resolution; it is not permission to bypass custody checks.
 
 ## Delegate when useful
 
@@ -72,7 +70,7 @@ The user's judgment is the final product decision. Hand back only a coherent res
 
 A repository change reaches the delivery boundary when the Coordinator has accepted the complete result and its supporting evidence, with no further implementation or verification needed before the user's delivery judgment. Final integration or publication requires authority separate from implementation.
 
-- [Delivery procedure](references/delivery.md) — Read at this boundary before deciding or acting on delivery, or when a later delivered observation returns the Coordinator to its pull request. It owns the Human sign-off requirement and handling, route selection, route-specific preparation, effects and receipts, and continued pull-request work.
+- [Delivery procedure](references/delivery.md) — Read at this boundary, when resuming unfinished delivery, or when a pull-request observation returns the Coordinator to the work. It owns Human sign-off, the route choice, preparation, publication, and follow-through. A selected integration route includes its verified local reconciliation and owned cleanup; do not ask for separate housekeeping authorization or call publication alone complete.
 
 ## Preserve operational truth
 
@@ -83,7 +81,7 @@ Unless the user requests partial results, use intermediate Outcome turns for coo
 When a tool response is missing or failed after a possible effect:
 
 1. Treat the result as uncertain.
-2. Inspect the exact Attempt and current ownership or destination state.
+2. Inspect the exact affected Attempt or checkout record and current repository state.
 3. Do not automatically repeat a remote submission.
 4. Preserve resources whose identity or ownership cannot be proven.
 
