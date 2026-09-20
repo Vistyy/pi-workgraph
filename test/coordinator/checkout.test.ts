@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { Effect } from "effect";
 import coordinator from "../../extensions/coordinator.js";
@@ -162,6 +163,41 @@ async function mergePublishedPullRequest(
 
   return result;
 }
+
+void test("explicit checkout reuse records an exact pre-existing owned checkout without changing its work", async () => {
+  const f = await fixture();
+
+  try {
+    const owned = f.facts((await f.call("workgraph_checkout", {})).details);
+    await writeFile(join(owned.managedPath, "existing.txt"), "existing committed work\n");
+    await git(owned.managedPath, "add", "existing.txt");
+    await git(owned.managedPath, "commit", "-m", "existing owned change");
+    const head = await git(owned.managedPath, "rev-parse", "HEAD");
+    await writeFile(join(owned.managedPath, "tracked.txt"), "existing uncommitted work\n");
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    // Model the previous schema, which recorded Tasks and Attempts but not Coordinator checkouts.
+    const database = new DatabaseSync(join(f.agentDir, "workgraph", "workgraph.sqlite"));
+    database.exec("DROP TABLE coordinator_checkouts");
+    database.close();
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+
+    const reused = f.facts((await f.call("workgraph_checkout", {})).details);
+    assert.equal(reused.created, false);
+    assert.equal(reused.reused, true);
+    assert.equal(reused.head, head);
+    assert.equal(reused.sourceCheckoutRoot, f.root);
+    assert.equal(
+      await readFile(join(reused.managedPath, "existing.txt"), "utf8"),
+      "existing committed work\n",
+    );
+    assert.equal(
+      await readFile(join(reused.managedPath, "tracked.txt"), "utf8"),
+      "existing uncommitted work\n",
+    );
+  } finally {
+    await f.dispose();
+  }
+});
 
 void test("checkout startup is read-only and allocation is stable across linked checkouts and reloads", async () => {
   const f = await fixture();
@@ -544,12 +580,14 @@ void test("verified pull-request merge methods reconcile current remote base and
               route: string;
               revision: string;
               destinationRoot: string;
+              mergedRevision: string;
             };
           }
         ).disposition;
         assert.equal(disposition.kind, "complete");
         assert.equal(disposition.route, "pull_request");
         assert.equal(disposition.revision, accepted);
+        assert.equal(disposition.mergedRevision, merged);
         assert.equal(disposition.destinationRoot, f.root);
         assert.equal(await readFile(join(f.root, "accepted-pr.txt"), "utf8"), `${method}\n`);
         assert.equal(
@@ -1291,6 +1329,12 @@ void test("integrated destination proof and pending Candidate cleanup gate destr
       effectiveModels: [],
     });
     await git(f.root, "update-ref", "refs/pi-workgraph/outputs/attempt-pending-cleanup", accepted);
+    // Hold the native ref effect pending so background reconciliation cannot race the assertions.
+    const cleanupLock = join(
+      checkout.repositoryCommonDir,
+      "refs/pi-workgraph/outputs/attempt-pending-cleanup.lock",
+    );
+    await writeFile(cleanupLock, "fixture-owned pending ref transaction\n", { flag: "wx" });
     store.checkpointOutput("attempt-pending-cleanup", {
       kind: "applied",
       revision: accepted,
@@ -1324,6 +1368,7 @@ void test("integrated destination proof and pending Candidate cleanup gate destr
       checkoutId: checkout.checkoutId,
       route: "preserve",
     });
+    await rm(cleanupLock);
     await f.runner.emit({ type: "session_shutdown", reason: "reload" });
     await f.runner.emit({ type: "session_start", reason: "reload" });
     for (let index = 0; index < 40; index += 1) {
@@ -1338,6 +1383,9 @@ void test("integrated destination proof and pending Candidate cleanup gate destr
     cleaned.close();
     assert.equal(applied?.kind, "applied");
     assert.equal(applied?.kind === "applied" ? applied.cleanupTip : "unexpected", undefined);
+    await assert.rejects(
+      git(f.root, "rev-parse", "--verify", "refs/pi-workgraph/outputs/attempt-pending-cleanup"),
+    );
     await git(f.root, "reset", "--hard", original);
     await assert.rejects(
       f.call("workgraph_deliver", {
@@ -1349,7 +1397,11 @@ void test("integrated destination proof and pending Candidate cleanup gate destr
     );
     assert.equal(existsSync(checkout.managedPath), true);
     await git(f.root, "reset", "--hard", prepared);
-    await f.call("workgraph_deliver", { checkoutId: checkout.checkoutId });
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "local",
+      revision: accepted,
+    });
     assert.equal(existsSync(checkout.managedPath), false);
   } finally {
     await f.dispose();
@@ -1462,6 +1514,7 @@ void test("checkpointed branch-only creation resumes and explicit local retry re
       }),
       /Git refused the prepared advancement/,
     );
+    await f.call("workgraph_deliver", { checkoutId: checkout.checkoutId, route: "preserve" });
     await writeFile(join(f.root, "destination.txt"), "advanced\n");
     await git(f.root, "add", "destination.txt");
     await git(f.root, "commit", "-m", "advance destination");
@@ -1512,6 +1565,15 @@ void test("checkpointed branch-only creation resumes and explicit local retry re
     assert.equal(paused.paused, true);
     assert.equal(await git(retained.managedPath, "rev-parse", "HEAD"), drifted);
     assert.equal(existsSync(retained.managedPath), true);
+    environment.WORKGRAPH_TEST_GIT_MODE = "normal";
+    await f.call("workgraph_deliver", {
+      checkoutId: retained.checkoutId,
+      route: "local",
+      revision: drifted,
+    });
+    assert.equal(await readFile(join(f.root, "preserve-after-local.txt"), "utf8"), "retained\n");
+    assert.equal(await readFile(join(f.root, "source-drift.txt"), "utf8"), "drift\n");
+    assert.equal(existsSync(retained.managedPath), false);
   } finally {
     environment.PATH = originalPath;
     environment.WORKGRAPH_TEST_REAL_GIT = originalRealGit;

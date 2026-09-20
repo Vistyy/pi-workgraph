@@ -192,6 +192,7 @@ export const CheckoutRecordSchema = strict({
       destinationRef: NonBlankText,
       destinationRevision: CommitSchema,
       url: Type.Optional(NonBlankText),
+      mergedRevision: Type.Optional(CommitSchema),
     }),
   ]),
 });

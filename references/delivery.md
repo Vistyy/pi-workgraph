@@ -83,7 +83,7 @@ Report the final disposition only after inspecting the receipt. If integration s
 
 ## Preserve or resume
 
-Use the preserve route to deliberately retain work. Report the checkout identity, current revision and status, and why it remains open. Preservation is not a claim of delivery.
+Use the preserve route to deliberately retain work. It pauses further effects without erasing earlier integration or cleanup progress. Report the checkout identity, current revision and status, and why it remains open. Preservation is not a claim of delivery; continuing a paused delivery requires explicit route selection rather than reconciliation alone.
 
 Unfinished delivery remains owned by this session. On resume, inspect its recorded state and reconcile the authorized route; do not reconstruct authority from branch ancestry or assume that a missing worktree means success. A failed or interrupted effect must be observed before another mutation.
 

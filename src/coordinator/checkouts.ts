@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/async-function, anti-slop/require-readable-spacing -- This module is the thin Promise boundary around repository-owned Effects. */
+/* oxlint-disable effecttsgo/async-function, anti-slop/require-readable-spacing -- Pi-facing checkout orchestration sequences checkpoints around scoped Git effects and bounded forge reads. */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
@@ -13,6 +13,7 @@ import {
   authorizedCoordinatorDestination,
   type CoordinatorAdvancement,
   type CoordinatorCheckoutIdentity,
+  classifyCoordinatorCheckout,
   configuredRemoteUrl,
   coordinatorCheckoutHead,
   coordinatorSourceFacts,
@@ -24,7 +25,7 @@ import {
   remoteBranchTip,
   removeCoordinatorWorktree,
   requireAcceptedCoordinatorSource,
-  requireCoordinatorCheckoutAbsent,
+  requireCoordinatorAdvancementAbsent,
   requireRemoteContains,
   retryCoordinatorAdvancement,
   verifyCoordinatorAdvancement,
@@ -130,7 +131,7 @@ function boundedDiagnostic(message: string): string {
   return message.replace(/\s+/gu, " ").slice(0, 500);
 }
 
-/** Explicit allocation checkpoints identity only after proving absent or adopting a recorded resource. */
+/** Record exact owned reuse or creation intent before allocating new Git resources. */
 export async function createCheckout(input: {
   readonly agentDir: string;
   readonly sessionId: string;
@@ -167,7 +168,10 @@ export async function createCheckout(input: {
     return facts(active, receipt);
   }
 
-  await Effect.runPromise(requireCoordinatorCheckoutAbsent(identity));
+  const observed = await Effect.runPromise(classifyCoordinatorCheckout(identity));
+
+  if (prior !== undefined && observed.kind !== "absent")
+    throw new Error("Completed Coordinator checkout resources unexpectedly exist.");
 
   const creatingBase = {
     ...identity,
@@ -178,6 +182,15 @@ export async function createCheckout(input: {
 
   const creating: CheckoutRecord =
     source.ref === undefined ? creatingBase : { ...creatingBase, sourceRef: source.ref };
+
+  if (observed.kind === "exact") {
+    const active = input.store.checkpointCheckout({
+      ...creating,
+      disposition: { kind: "active", head: observed.head },
+    });
+
+    return facts(active, { head: observed.head, created: false, reused: true });
+  }
 
   input.store.checkpointCheckout(creating);
 
@@ -392,45 +405,43 @@ async function selectLocal(
       request.destination.ref !== record.disposition.destinationRef)
   )
     throw new Error("Local resume must keep the exact authorized destination.");
-  if (request.revision !== record.disposition.acceptedRevision) {
-    if (record.disposition.integrated !== true)
-      throw new Error("Local reacceptance requires the prior integration to be established.");
-    await Effect.runPromise(
-      verifyCoordinatorAdvancement({
-        identity: record,
-        acceptedRevision: record.disposition.acceptedRevision,
-        advancement: record.disposition,
-      }),
-    );
-    const prepared = await Effect.runPromise(
-      prepareCoordinatorAdvancement({
-        identity: record,
-        acceptedRevision: request.revision,
-        destinationRoot: record.disposition.destinationRoot,
-        destinationRef: record.disposition.destinationRef,
-      }),
-    );
+  const previous = {
+    identity: record,
+    acceptedRevision: record.disposition.acceptedRevision,
+    advancement: record.disposition,
+  };
+  let integrated = false;
+
+  try {
+    await Effect.runPromise(verifyCoordinatorAdvancement(previous));
+    integrated = true;
+  } catch (cause) {
+    // A recorded integration must remain proven; a retry cannot silently undo its receipt.
+    if (record.disposition.integrated === true) throw cause;
+    await Effect.runPromise(requireCoordinatorAdvancementAbsent(previous));
+  }
+
+  if (integrated && request.revision === record.disposition.acceptedRevision) {
+    const { paused: _paused, ...resumed } = record.disposition;
 
     return store.checkpointCheckout({
       ...record,
-      disposition: { kind: "local", acceptedRevision: request.revision, ...prepared },
+      disposition: { ...resumed, integrated: true },
     });
   }
-  const { paused, ...resumed } = record.disposition;
 
-  if (paused === true || record.disposition.integrated === true)
-    return store.checkpointCheckout({ ...record, disposition: resumed });
   const prepared = await Effect.runPromise(
-    retryCoordinatorAdvancement({
+    prepareCoordinatorAdvancement({
       identity: record,
-      acceptedRevision: record.disposition.acceptedRevision,
-      advancement: record.disposition,
+      acceptedRevision: request.revision,
+      destinationRoot: record.disposition.destinationRoot,
+      destinationRef: record.disposition.destinationRef,
     }),
   );
 
   return store.checkpointCheckout({
     ...record,
-    disposition: { ...resumed, ...prepared },
+    disposition: { kind: "local", acceptedRevision: request.revision, ...prepared },
   });
 }
 
@@ -756,7 +767,9 @@ async function cleanupPullRequest(
 ): Promise<CheckoutRecord> {
   let current = record;
   let pr = requirePullRequest(current);
+  const mergedRevision = pr.mergedRevision;
 
+  if (mergedRevision === undefined) throw new Error("Pull-request merge proof is absent.");
   if (pr.cleanup === undefined || pr.cleanup === "remote_branch")
     await Effect.runPromise(requireAcceptedCoordinatorSource(current, pr.acceptedRevision));
   const blocker = blockCleanup();
@@ -808,6 +821,7 @@ async function cleanupPullRequest(
       destinationRef: pr.destinationRef,
       destinationRevision,
       url: pr.url,
+      mergedRevision,
     },
   });
 }

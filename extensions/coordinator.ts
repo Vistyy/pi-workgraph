@@ -601,7 +601,11 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         { additionalProperties: false },
       ),
       Type.Object(
-        { checkoutId: nonBlank("Resume an already-recorded disposition without new authority.") },
+        {
+          checkoutId: nonBlank(
+            "Reconcile an unpaused recorded disposition. A paused delivery needs explicit route selection.",
+          ),
+        },
         { additionalProperties: false },
       ),
     ]),

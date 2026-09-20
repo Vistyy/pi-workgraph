@@ -14,6 +14,7 @@ This document owns Workgraph's integrated architecture and durable constraints.
 - [ADR 0001: Own record schemas, effects, and host adapters](docs/adr/0001-own-schemas-effects-and-host-adapters.md)
 - [ADR 0002: Project Calm over the live Pi chat](docs/adr/0002-project-calm-over-the-live-pi-chat.md)
 - [ADR 0003: Keep Prewalk in one live Worker trajectory](docs/adr/0003-keep-prewalk-in-one-live-worker-trajectory.md)
+- [ADR 0004: Own the checkout delivery lifecycle](docs/adr/0004-own-the-checkout-delivery-lifecycle.md)
 
 ## Source ownership
 
@@ -179,7 +180,7 @@ A collision-resistant identity derived from exact Pi session and canonical Git c
 | Observed resource state | Result |
 | --- | --- |
 | New explicit allocation with absent resources | Record ownership and create the linked worktree at the requested commit. |
-| Exact current checkout | Reuse it, including modified or advanced managed content. |
+| Exact current checkout | Reuse it, including modified or advanced managed content. An explicit request can record a fully proven existing checkout that predates lifecycle records. |
 | Known interrupted allocation or cleanup | Observe native state and reconcile the recorded operation. |
 | Completed lifecycle | Retain its receipt; only a new explicit checkout request starts another lifecycle. |
 | Unknown partial, duplicate, locked, symlinked, foreign, moved, or unreadable state | Preserve and block; a record is not permission to bypass native identity checks. |
@@ -192,7 +193,7 @@ Exact reuse proves:
 - attached `HEAD`; and
 - both worktree backlinks.
 
-A failed native creation response counts as success only when immediate observation proves the complete requested identity at the exact commit. An interrupted initialization remains locked and blocked.
+A failed native creation response counts as success only when observation proves the complete requested identity at the exact commit. Recorded branch-only creation can resume at that commit; an initialization lock or unknown partial placement remains blocked.
 
 After verified cleanup, a later explicit request can reuse the same deterministic path and branch name for a fresh checkout from the source's current committed HEAD. Resuming a session does not resurrect completed checkouts. Shutdown preserves unfinished resources.
 
@@ -214,7 +215,7 @@ PR preparation keeps the same owned branch attached. Before publication, the Coo
 
 The registered PR delivery binds the accepted head, exact PR and remote, and authorized local destination. Existing observation capabilities return the Coordinator to that record; Workgraph adds no watcher, review collector, or merge authority. Resume and explicit reconciliation inspect current facts rather than replaying possibly completed publication effects.
 
-A merged PR must identify the exact accepted head and the forge's actual merged result. This supports merge, squash, and rebase delivery without pretending that original-commit ancestry is universal proof. Closed-unmerged work is preserved. After verified merge, local reconciliation preserves unrelated work, and remote deletion is conditional on the published branch still having its delivered tip.
+A merged PR must identify the exact accepted head and the forge's actual merged result, both retained in the completed receipt. This supports merge, squash, and rebase delivery without pretending that original-commit ancestry is universal proof. Closed-unmerged work is preserved. After verified merge, local reconciliation preserves unrelated work, and remote deletion is conditional on the published branch still having its delivered tip.
 
 Cleanup waits for dependent Workers and Candidate decisions and refuses unaccepted source changes. Checkpointed removal covers both worktree and branch: a leftover owned branch is unfinished cleanup, not an unexplained allocation collision. Exact-tip deletion follows verified delivery rather than `git branch -d`'s ancestry heuristic. Ignored build artifacts in an accepted completed checkout are scratch; foreign or uncertain resources remain protected.
 

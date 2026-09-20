@@ -135,18 +135,6 @@ function resolveCoordinatorRepository(
   });
 }
 
-export function requireCoordinatorCheckoutAbsent(
-  identity: CoordinatorCheckoutIdentity,
-): Effect.Effect<void, GitError> {
-  return classifyCoordinatorCheckout(identity).pipe(
-    Effect.flatMap((classification) =>
-      classification.kind === "absent"
-        ? Effect.void
-        : fail("create Coordinator checkout", "Coordinator checkout resources already exist."),
-    ),
-  );
-}
-
 /** Allocate or reuse the one exact Coordinator-owned linked checkout. */
 export function ensureCoordinatorCheckout(input: {
   readonly target: RepositoryTarget;
@@ -280,7 +268,7 @@ export function coordinatorCheckoutHead(
   );
 }
 
-function classifyCoordinatorCheckout(
+export function classifyCoordinatorCheckout(
   identity: CoordinatorCheckoutIdentity,
   allowCheckpointedBranch = false,
 ): Effect.Effect<CoordinatorCheckoutClassification, GitError> {
@@ -581,7 +569,7 @@ export function prepareCoordinatorAdvancement(input: {
   });
 }
 
-function requireCoordinatorAdvancementAbsent(input: {
+export function requireCoordinatorAdvancementAbsent(input: {
   readonly identity: CoordinatorCheckoutIdentity;
   readonly acceptedRevision: string;
   readonly integrationRevision?: string;

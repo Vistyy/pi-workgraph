@@ -98,7 +98,7 @@ Implementation Workers use detached worktrees. Their committed results can becom
 
 When an accepted change reaches the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to handle [Human sign-off](references/delivery.md#resolve-human-sign-off) and obtain the route choice. Workgraph performs the authorized local integration, verification, and owned cleanup; the Coordinator still publishes through ordinary forge tools. A local or PR route includes its housekeeping, so a completed merge does not require another cleanup request.
 
-PR preparation uses the same owned branch, based on the intended remote target and re-verified before publication. After merge, Workgraph verifies the exact accepted PR head and merged result, safely reconciles the local destination, and removes the owned checkout and branches. A changed published branch is preserved rather than deleted. A PR closed without merge retains its undelivered work.
+PR delivery requires authenticated `gh` access and matching configured Git remotes. Preparation uses the same owned branch, based on the intended remote target and re-verified before publication. After merge, Workgraph verifies the exact accepted PR head and merged result, safely reconciles the local destination, and removes the owned checkout and branches. A changed published branch is preserved rather than deleted. A PR closed without merge retains its undelivered work.
 
 After cleanup, the same session may request a fresh checkout from current committed local `main`. It need not keep an old checkout alive merely because the conversation continues.
 
