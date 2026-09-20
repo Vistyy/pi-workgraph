@@ -584,6 +584,7 @@ export function prepareCoordinatorAdvancement(input: {
 function requireCoordinatorAdvancementAbsent(input: {
   readonly identity: CoordinatorCheckoutIdentity;
   readonly acceptedRevision: string;
+  readonly integrationRevision?: string;
   readonly advancement: CoordinatorAdvancement;
 }): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
@@ -599,7 +600,7 @@ function requireCoordinatorAdvancementAbsent(input: {
       destination.commit === input.advancement.preparedRevision ||
       (yield* ancestry(
         input.identity.repositoryCommonDir,
-        input.acceptedRevision,
+        input.integrationRevision ?? input.acceptedRevision,
         destination.commit,
       ))
     )
@@ -613,6 +614,7 @@ function requireCoordinatorAdvancementAbsent(input: {
 export function retryCoordinatorAdvancement(input: {
   readonly identity: CoordinatorCheckoutIdentity;
   readonly acceptedRevision: string;
+  readonly integrationRevision?: string;
   readonly advancement: CoordinatorAdvancement;
 }): Effect.Effect<CoordinatorAdvancement, GitError> {
   return Effect.gen(function* () {
@@ -621,6 +623,9 @@ export function retryCoordinatorAdvancement(input: {
     return yield* prepareCoordinatorAdvancement({
       identity: input.identity,
       acceptedRevision: input.acceptedRevision,
+      ...(input.integrationRevision === undefined
+        ? {}
+        : { integrationRevision: input.integrationRevision }),
       destinationRoot: input.advancement.destinationRoot,
       destinationRef: input.advancement.destinationRef,
     });
@@ -744,12 +749,12 @@ export function removeCoordinatorWorktree(input: {
   readonly expectedTip: string;
 }): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
-    const [exists, registration] = yield* Effect.all([
-      pathExists(input.identity.managedPath),
+    const [entry, registration] = yield* Effect.all([
+      optionalPathEntry(input.identity.managedPath),
       registeredWorktree(input.identity.repositoryCommonDir, input.identity.managedPath),
     ]);
 
-    if (!exists && registration === undefined) {
+    if (entry === undefined && registration === undefined) {
       yield* requireExactRef(
         input.identity.repositoryCommonDir,
         input.identity.ownedBranch,
@@ -758,7 +763,7 @@ export function removeCoordinatorWorktree(input: {
 
       return;
     }
-    if (!exists || registration === undefined)
+    if (entry === undefined || registration === undefined)
       return yield* fail("cleanup Coordinator checkout", "Owned worktree resources are partial.");
     const classification = yield* classifyCoordinatorCheckout(input.identity);
 
@@ -768,14 +773,15 @@ export function removeCoordinatorWorktree(input: {
         "Owned branch no longer has the accepted tip.",
       );
     yield* requireCleanCoordinatorCleanupSource(input.identity.managedPath);
-    yield* gitDir(
-      input.identity.repositoryCommonDir,
-      ["worktree", "remove", "--force", input.identity.managedPath],
-      true,
-    );
+    yield* gitDirResult(input.identity.repositoryCommonDir, [
+      "worktree",
+      "remove",
+      "--force",
+      input.identity.managedPath,
+    ]);
 
     if (
-      (yield* pathExists(input.identity.managedPath)) ||
+      (yield* optionalPathEntry(input.identity.managedPath)) !== undefined ||
       (yield* registeredWorktree(
         input.identity.repositoryCommonDir,
         input.identity.managedPath,
@@ -785,6 +791,7 @@ export function removeCoordinatorWorktree(input: {
         "cleanup Coordinator checkout",
         "Owned worktree removal was not established.",
       );
+    // A failed response is recovered when the exact absence postcondition is already established.
   });
 }
 
@@ -808,12 +815,12 @@ export function deleteCoordinatorBranch(input: {
   readonly expectedTip: string;
 }): Effect.Effect<void, GitError> {
   return Effect.gen(function* () {
-    const [exists, registrations] = yield* Effect.all([
-      pathExists(input.identity.managedPath),
+    const [entry, registrations] = yield* Effect.all([
+      optionalPathEntry(input.identity.managedPath),
       worktreeRegistrations(input.identity.repositoryCommonDir),
     ]);
 
-    if (exists || hasCoordinatorRegistration(registrations, input.identity))
+    if (entry !== undefined || hasCoordinatorRegistration(registrations, input.identity))
       return yield* fail(
         "cleanup Coordinator checkout",
         "Owned branch is still used by a worktree registration.",
@@ -831,12 +838,12 @@ export function configuredRemoteUrl(input: {
   readonly remote: string;
 }): Effect.Effect<string, GitError> {
   return Effect.gen(function* () {
-    const fetch = yield* gitResult(input.identity.managedPath, [
+    const fetch = yield* gitDirResult(input.identity.repositoryCommonDir, [
       "config",
       "--get-all",
       `remote.${input.remote}.url`,
     ]);
-    const push = yield* gitResult(input.identity.managedPath, [
+    const push = yield* gitDirResult(input.identity.repositoryCommonDir, [
       "config",
       "--get-all",
       `remote.${input.remote}.pushurl`,
@@ -868,12 +875,13 @@ export function fetchRemoteBranch(input: {
   readonly branch: string;
 }): Effect.Effect<string, GitError> {
   return Effect.gen(function* () {
-    yield* networkGit(input.identity.managedPath, [
+    const fetched = yield* networkGitResult(input.identity.managedPath, [
       "fetch",
       "--no-tags",
       input.remote,
       `refs/heads/${input.branch}`,
     ]);
+    yield* checked(["fetch", input.remote, input.branch], fetched, true);
 
     return yield* exactCommit(
       input.identity.repositoryCommonDir,
@@ -906,7 +914,7 @@ export function remoteBranchTip(input: {
   readonly remote: string;
   readonly branch: string;
 }): Effect.Effect<string | undefined, GitError> {
-  return networkGitResult(input.identity.managedPath, [
+  return networkGitDirResult(input.identity.repositoryCommonDir, [
     "ls-remote",
     "--heads",
     input.remote,
@@ -954,7 +962,7 @@ export function deleteRemoteBranchExpected(input: {
         "delete published branch",
         "Published branch changed after acceptance and was preserved.",
       );
-    const result = yield* networkGitResult(input.identity.managedPath, [
+    const result = yield* networkGitDirResult(input.identity.repositoryCommonDir, [
       "push",
       `--force-with-lease=refs/heads/${input.branch}:${input.expectedTip}`,
       input.remote,
@@ -1001,7 +1009,7 @@ export function requireAcceptedCoordinatorSource(
   });
 }
 
-function authorizedCoordinatorDestination(input: {
+export function authorizedCoordinatorDestination(input: {
   readonly identity: CoordinatorCheckoutIdentity;
   readonly destinationRoot: string;
   readonly destinationRef: string;
@@ -1910,7 +1918,24 @@ function deleteExactRef(
       if (actual !== tip)
         return fail("discard output", "Private output ref was repointed; nothing was deleted.");
 
-      return gitDir(commonDir, ["update-ref", "-d", ref, tip], true).pipe(Effect.asVoid);
+      return Effect.gen(function* () {
+        const deletion = yield* gitDirResult(commonDir, ["update-ref", "-d", ref, tip]);
+        const after = yield* readRef(commonDir, ref);
+
+        if (after === undefined) return;
+        if (after !== tip)
+          return yield* fail(
+            "discard output",
+            "Private output ref was repointed; nothing was deleted.",
+          );
+        if (deletion.code !== 0)
+          return yield* fail(
+            "discard output",
+            boundedDiagnostic(deletion.stderr || deletion.stdout || "Git ref deletion failed."),
+          );
+
+        return yield* fail("discard output", "Private output ref deletion was not established.");
+      });
     }),
   );
 }
@@ -1962,15 +1987,25 @@ function gitResult(cwd: string, args: string[]): Effect.Effect<CommandResult, Gi
   return command(["-C", cwd, ...args]);
 }
 
-function networkGit(cwd: string, args: string[]): Effect.Effect<string, GitError> {
-  return networkGitResult(cwd, args).pipe(Effect.flatMap((result) => checked(args, result, true)));
+function networkGitResult(cwd: string, args: string[]): Effect.Effect<CommandResult, GitError> {
+  return boundedNetworkCommand(["-C", cwd, ...args], args);
 }
 
-function networkGitResult(cwd: string, args: string[]): Effect.Effect<CommandResult, GitError> {
-  return command(["-C", cwd, ...args]).pipe(
+function networkGitDirResult(
+  commonDir: string,
+  args: string[],
+): Effect.Effect<CommandResult, GitError> {
+  return boundedNetworkCommand([`--git-dir=${commonDir}`, ...args], args);
+}
+
+function boundedNetworkCommand(
+  commandArgs: string[],
+  operationArgs: string[],
+): Effect.Effect<CommandResult, GitError> {
+  return command(commandArgs).pipe(
     Effect.timeoutOrElse({
       duration: "30 seconds",
-      orElse: () => fail(args.join(" "), "Git network operation timed out."),
+      orElse: () => fail(operationArgs.join(" "), "Git network operation timed out."),
     }),
   );
 }

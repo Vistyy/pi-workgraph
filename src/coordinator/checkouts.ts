@@ -10,6 +10,7 @@ import { Value } from "typebox/value";
 import { type CheckoutRecord, CommitSchema } from "../domain/records.js";
 import {
   applyCoordinatorAdvancement,
+  authorizedCoordinatorDestination,
   type CoordinatorAdvancement,
   type CoordinatorCheckoutIdentity,
   configuredRemoteUrl,
@@ -125,6 +126,10 @@ export interface GitHubReader {
 
 const executeFile = promisify(execFile);
 
+function boundedDiagnostic(message: string): string {
+  return message.replace(/\s+/gu, " ").slice(0, 500);
+}
+
 /** Explicit allocation checkpoints identity only after proving absent or adopting a recorded resource. */
 export async function createCheckout(input: {
   readonly agentDir: string;
@@ -138,19 +143,22 @@ export async function createCheckout(input: {
   const prior = input.store.readCheckout(source.target.commonDir);
 
   if (prior !== undefined && prior.disposition.kind !== "complete") {
+    if (prior.disposition.kind !== "creating") {
+      const head = await Effect.runPromise(coordinatorCheckoutHead(identity));
+
+      return facts(prior, { head, created: false, reused: true });
+    }
     const receipt = await Effect.runPromise(
       ensureCoordinatorCheckout({
         target: source.target,
         commit: prior.sourceHead,
         identity,
-        recoverCheckpointedBranch: prior.disposition.kind === "creating",
+        recoverCheckpointedBranch: true,
       }),
     );
 
-    if (prior.disposition.kind === "creating" && receipt.head !== prior.sourceHead)
+    if (receipt.head !== prior.sourceHead)
       throw new Error("Interrupted checkout creation does not match its recorded source HEAD.");
-
-    if (prior.disposition.kind !== "creating") return facts(prior, receipt);
     const active = input.store.checkpointCheckout({
       ...prior,
       disposition: { kind: "active", head: receipt.head },
@@ -378,14 +386,36 @@ async function selectLocal(
   }
   if (record.disposition.kind !== "local")
     throw new Error("A local route cannot replace the recorded pull-request route.");
-  if (request.revision !== record.disposition.acceptedRevision)
-    throw new Error("Local resume must keep the exact accepted revision.");
   if (
     request.destination !== undefined &&
     (request.destination.cwd !== record.disposition.destinationRoot ||
       request.destination.ref !== record.disposition.destinationRef)
   )
     throw new Error("Local resume must keep the exact authorized destination.");
+  if (request.revision !== record.disposition.acceptedRevision) {
+    if (record.disposition.integrated !== true)
+      throw new Error("Local reacceptance requires the prior integration to be established.");
+    await Effect.runPromise(
+      verifyCoordinatorAdvancement({
+        identity: record,
+        acceptedRevision: record.disposition.acceptedRevision,
+        advancement: record.disposition,
+      }),
+    );
+    const prepared = await Effect.runPromise(
+      prepareCoordinatorAdvancement({
+        identity: record,
+        acceptedRevision: request.revision,
+        destinationRoot: record.disposition.destinationRoot,
+        destinationRef: record.disposition.destinationRef,
+      }),
+    );
+
+    return store.checkpointCheckout({
+      ...record,
+      disposition: { kind: "local", acceptedRevision: request.revision, ...prepared },
+    });
+  }
   const { paused, ...resumed } = record.disposition;
 
   if (paused === true || record.disposition.integrated === true)
@@ -420,6 +450,13 @@ async function selectPullRequest(
   const prior = record.disposition.kind === "pull_request" ? record.disposition : undefined;
   validatePullRequestSelection(record, request, prior);
   const pr = await github.readPullRequest(request.url);
+
+  if (prior?.cleanup === "worktree" || prior?.cleanup === "branch") {
+    await reverifyStoredPullRequest(record, prior, pr);
+    const { paused: _paused, ...resumed } = prior;
+
+    return store.checkpointCheckout({ ...record, disposition: resumed });
+  }
   const binding = await verifyPullRequestBinding({
     record,
     request,
@@ -433,10 +470,17 @@ async function selectPullRequest(
           },
   });
 
-  return store.checkpointCheckout({
-    ...record,
-    disposition: retainPullRequestProgress(binding, prior),
-  });
+  if (prior !== undefined) requireSamePullRequestBinding(prior, binding);
+  let selected = retainPullRequestProgress(binding, prior);
+
+  if (
+    prior?.mergedRevision !== undefined &&
+    prior.remoteBaseRevision !== undefined &&
+    prior.integrated !== true
+  )
+    selected = await repreparePullRequest(record, selected);
+
+  return store.checkpointCheckout({ ...record, disposition: selected });
 }
 
 function validatePullRequestSelection(
@@ -471,6 +515,58 @@ function validatePullRequestSelection(
     throw new Error("Merged pull-request delivery cannot change its accepted revision.");
 }
 
+function requireSamePullRequestBinding(
+  prior: PullRequestDisposition,
+  binding: PullRequestDisposition,
+): void {
+  if (
+    binding.host !== prior.host ||
+    binding.repositoryOwner !== prior.repositoryOwner ||
+    binding.repositoryName !== prior.repositoryName ||
+    binding.number !== prior.number ||
+    binding.baseBranch !== prior.baseBranch ||
+    binding.headOwner !== prior.headOwner ||
+    binding.headRepository !== prior.headRepository ||
+    binding.headBranch !== prior.headBranch ||
+    binding.remoteUrl !== prior.remoteUrl ||
+    binding.baseRemoteUrl !== prior.baseRemoteUrl
+  )
+    throw new Error("Pull-request resume cannot rebind its recorded repository or branches.");
+}
+
+async function repreparePullRequest(
+  record: CheckoutRecord,
+  pr: PullRequestDisposition,
+): Promise<PullRequestDisposition> {
+  const advancement = requirePullRequestAdvancement(pr);
+  const integrationRevision = pr.remoteBaseRevision;
+
+  if (integrationRevision === undefined) return pr;
+  try {
+    await Effect.runPromise(
+      verifyCoordinatorAdvancement({
+        identity: record,
+        acceptedRevision: pr.acceptedRevision,
+        integrationRevision,
+        advancement,
+      }),
+    );
+
+    return { ...pr, integrated: true };
+  } catch {
+    const prepared = await Effect.runPromise(
+      retryCoordinatorAdvancement({
+        identity: record,
+        acceptedRevision: pr.acceptedRevision,
+        integrationRevision,
+        advancement,
+      }),
+    );
+
+    return { ...pr, ...prepared };
+  }
+}
+
 function retainPullRequestProgress(
   binding: PullRequestDisposition,
   prior: PullRequestDisposition | undefined,
@@ -500,6 +596,13 @@ async function verifyPullRequestBinding(input: {
 }): Promise<PullRequestDisposition> {
   const parsed = parsePullRequestUrl(input.request.url);
   await Effect.runPromise(requireAcceptedCoordinatorSource(input.record, input.request.revision));
+  const destination = await Effect.runPromise(
+    authorizedCoordinatorDestination({
+      identity: input.record,
+      destinationRoot: input.destination.cwd,
+      destinationRef: input.destination.ref,
+    }),
+  );
 
   if (
     input.pr.url !== input.request.url ||
@@ -553,7 +656,7 @@ async function verifyPullRequestBinding(input: {
     remoteUrl,
     baseRemote,
     baseRemoteUrl,
-    destinationRoot: input.destination.cwd,
+    destinationRoot: destination.target.checkoutRoot,
     destinationRef: input.destination.ref,
   };
 }
@@ -642,7 +745,20 @@ async function continuePullRequest(
       advancement: requirePullRequestAdvancement(pr),
     }),
   );
-  await Effect.runPromise(requireAcceptedCoordinatorSource(current, pr.acceptedRevision));
+  return cleanupPullRequest(current, store, blockCleanup, destinationRevision);
+}
+
+async function cleanupPullRequest(
+  record: CheckoutRecord,
+  store: RecordStore,
+  blockCleanup: () => string | undefined,
+  destinationRevision: string,
+): Promise<CheckoutRecord> {
+  let current = record;
+  let pr = requirePullRequest(current);
+
+  if (pr.cleanup === undefined || pr.cleanup === "remote_branch")
+    await Effect.runPromise(requireAcceptedCoordinatorSource(current, pr.acceptedRevision));
   const blocker = blockCleanup();
 
   if (blocker !== undefined) throw new Error(`Cleanup blocked: ${blocker}`);
@@ -720,12 +836,14 @@ async function reverifyStoredPullRequest(
 
   if (remoteUrl !== pr.remoteUrl || baseRemoteUrl !== pr.baseRemoteUrl)
     throw new Error("Recorded pull-request remote identity changed.");
-  const tip = await Effect.runPromise(
-    remoteBranchTip({ identity: record, remote: pr.remote, branch: pr.headBranch }),
-  );
+  if (!facts.merged && facts.state === "open") {
+    const tip = await Effect.runPromise(
+      remoteBranchTip({ identity: record, remote: pr.remote, branch: pr.headBranch }),
+    );
 
-  if (!facts.merged && tip !== pr.acceptedRevision)
-    throw new Error("Published branch no longer has the accepted revision.");
+    if (tip !== pr.acceptedRevision)
+      throw new Error("Published branch no longer has the accepted revision.");
+  }
 }
 
 function requirePullRequest(record: CheckoutRecord): PullRequestDisposition {
@@ -869,7 +987,7 @@ const nativeGitHubReader: GitHubReader = {
       ));
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : "GitHub CLI failed.";
-      throw new Error(`Unable to read pull request with gh: ${message}`);
+      throw new Error(`Unable to read pull request with gh: ${boundedDiagnostic(message)}`);
     }
     let value: unknown;
 

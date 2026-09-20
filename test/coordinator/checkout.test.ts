@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { Effect } from "effect";
 import coordinator from "../../extensions/coordinator.js";
 import type { GitHubReader, PullRequestFacts } from "../../src/coordinator/checkouts.js";
 import { RecordStore } from "../../src/coordinator/store.js";
@@ -116,6 +117,7 @@ function pullRequestFacts(input: {
   readonly branch: string;
   readonly merged?: string;
   readonly state?: "open" | "closed";
+  readonly baseBranch?: string;
 }): PullRequestFacts {
   const facts: PullRequestFacts = {
     url: input.url,
@@ -126,7 +128,7 @@ function pullRequestFacts(input: {
     headBranch: input.branch,
     headOwner: "upstream",
     headRepository: "project",
-    baseBranch: "main",
+    baseBranch: input.baseBranch ?? "main",
     baseOwner: "upstream",
     baseRepository: "project",
   };
@@ -782,6 +784,300 @@ void test("changed published tip blocks deletion after integration and preservat
   }
 });
 
+void test("integrated paused local delivery explicitly reaccepts new clean source work", async () => {
+  const f = await fixture();
+
+  try {
+    const checkout = f.facts((await f.call("workgraph_checkout", {})).details);
+    await writeFile(join(checkout.managedPath, "first.txt"), "first\n");
+    await git(checkout.managedPath, "add", "first.txt");
+    await git(checkout.managedPath, "commit", "-m", "first accepted change");
+    const first = await git(checkout.managedPath, "rev-parse", "HEAD");
+    const store = new RecordStore(f.agentDir, f.session.getSessionId());
+    store.createTaskWithAttempt(
+      "cleanup-blocker",
+      {
+        target: { kind: "directory", path: checkout.managedPath },
+        contract: { kind: "research", question: "Keep cleanup blocked." },
+      },
+      "attempt-cleanup-blocker",
+      {
+        selection: {
+          kind: "target",
+          target: { model: "fixture/research", thinking: "high" },
+        },
+        base: { kind: "directory" },
+      },
+    );
+    store.close();
+    await assert.rejects(
+      f.call("workgraph_deliver", {
+        checkoutId: checkout.checkoutId,
+        route: "local",
+        revision: first,
+      }),
+      /Cleanup blocked/,
+    );
+    await f.call("workgraph_deliver", { checkoutId: checkout.checkoutId, route: "preserve" });
+    await writeFile(join(checkout.managedPath, "second.txt"), "second\n");
+    await git(checkout.managedPath, "add", "second.txt");
+    await git(checkout.managedPath, "commit", "-m", "second accepted change");
+    const second = await git(checkout.managedPath, "rev-parse", "HEAD");
+    const settled = new RecordStore(f.agentDir, f.session.getSessionId());
+    settled.recordOutcome("attempt-cleanup-blocker", {
+      result: { kind: "cancelled", reason: "Cleanup may continue." },
+      effectiveModels: [],
+    });
+    settled.close();
+
+    const delivered = await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "local",
+      revision: second,
+    });
+    // SAFETY: Successful delivery details contain the persisted strict checkout record.
+    assert.equal(
+      (delivered.details as { disposition: { revision: string } }).disposition.revision,
+      second,
+    );
+    assert.equal(await readFile(join(f.root, "first.txt"), "utf8"), "first\n");
+    assert.equal(await readFile(join(f.root, "second.txt"), "utf8"), "second\n");
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("pull-request registration validates destination, freezes binding, and retains a closed PR with no branch", async () => {
+  const f = await pullRequestFixture();
+
+  try {
+    const checkout = f.facts((await f.call("workgraph_checkout", {})).details);
+    const branch = checkout.ownedBranch.slice("refs/heads/".length);
+    await writeFile(join(checkout.managedPath, "accepted-pr.txt"), "accepted\n");
+    await git(checkout.managedPath, "add", "accepted-pr.txt");
+    await git(checkout.managedPath, "commit", "-m", "accepted PR");
+    const accepted = await git(checkout.managedPath, "rev-parse", "HEAD");
+    await git(checkout.managedPath, "push", "origin", `${branch}:${branch}`);
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch }));
+    const foreign = join(f.parent, "foreign-destination");
+    await mkdir(foreign);
+    await git(foreign, "init", "-b", "main");
+    await git(foreign, "config", "user.name", "Workgraph Test");
+    await git(foreign, "config", "user.email", "workgraph@example.invalid");
+    await writeFile(join(foreign, "foreign.txt"), "foreign\n");
+    await git(foreign, "add", ".");
+    await git(foreign, "commit", "-m", "foreign");
+    await assert.rejects(
+      f.call("workgraph_deliver", {
+        checkoutId: checkout.checkoutId,
+        route: "pull_request",
+        revision: accepted,
+        url: f.url,
+        remote: "origin",
+        destination: { cwd: foreign, ref: "refs/heads/main" },
+      }),
+      /another repository/,
+    );
+    await git(f.root, "checkout", "--detach");
+    await assert.rejects(
+      f.call("workgraph_deliver", {
+        checkoutId: checkout.checkoutId,
+        route: "pull_request",
+        revision: accepted,
+        url: f.url,
+        remote: "origin",
+        destination: { cwd: f.root, ref: "refs/heads/main" },
+      }),
+      /not attached to the authorized ref/,
+    );
+    await git(f.root, "switch", "main");
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "pull_request",
+      revision: accepted,
+      url: f.url,
+      remote: "origin",
+    });
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch, baseBranch: "retargeted" }));
+    await assert.rejects(
+      f.call("workgraph_deliver", {
+        checkoutId: checkout.checkoutId,
+        route: "pull_request",
+        revision: accepted,
+        url: f.url,
+        remote: "origin",
+      }),
+      /cannot rebind its recorded repository or branches/,
+    );
+    await git(f.root, "push", "origin", `:refs/heads/${branch}`);
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch, state: "closed" }));
+    const retained = await f.call("workgraph_deliver", { checkoutId: checkout.checkoutId });
+    // SAFETY: Successful delivery details contain the persisted strict checkout record.
+    const disposition = (retained.details as { disposition: { retained?: string; paused?: true } })
+      .disposition;
+    assert.equal(disposition.retained, "closed_unmerged");
+    assert.equal(disposition.paused, true);
+    assert.equal(existsSync(checkout.managedPath), true);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("explicit pull-request retry replans an absent integration against the merged base", async () => {
+  // SAFETY: This fixture temporarily redirects Git only for its task-owned disposable repositories.
+  const environment = process.env as NodeJS.ProcessEnv & {
+    PATH: string | undefined;
+    WORKGRAPH_TEST_REAL_GIT: string | undefined;
+    WORKGRAPH_TEST_GIT_MODE: string | undefined;
+  };
+  const originalPath = environment.PATH;
+  const originalRealGit = environment.WORKGRAPH_TEST_REAL_GIT;
+  const originalMode = environment.WORKGRAPH_TEST_GIT_MODE;
+  const realGit = originalPath
+    ?.split(":")
+    .map((directory) => join(directory, "git"))
+    .find((candidate) => existsSync(candidate));
+  assert.ok(realGit !== undefined);
+  const f = await pullRequestFixture();
+
+  try {
+    const checkout = f.facts((await f.call("workgraph_checkout", {})).details);
+    const branch = checkout.ownedBranch.slice("refs/heads/".length);
+    await writeFile(join(checkout.managedPath, "accepted-pr.txt"), "accepted\n");
+    await git(checkout.managedPath, "add", "accepted-pr.txt");
+    await git(checkout.managedPath, "commit", "-m", "accepted PR");
+    const accepted = await git(checkout.managedPath, "rev-parse", "HEAD");
+    await git(checkout.managedPath, "push", "origin", `${branch}:${branch}`);
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch }));
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "pull_request",
+      revision: accepted,
+      url: f.url,
+      remote: "origin",
+    });
+    const merged = await mergePublishedPullRequest(f, branch, "squash");
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch, merged }));
+    const bin = join(f.parent, "retry-pr-bin");
+    await mkdir(bin);
+    await writeFile(
+      join(bin, "git"),
+      `#!/bin/sh\ncase " $* " in\n  *" merge --ff-only "*) [ "$WORKGRAPH_TEST_GIT_MODE" = fail ] && exit 17 ;;\nesac\nexec "$WORKGRAPH_TEST_REAL_GIT" "$@"\n`,
+    );
+    await chmod(join(bin, "git"), 0o700);
+    environment.WORKGRAPH_TEST_REAL_GIT = realGit;
+    environment.WORKGRAPH_TEST_GIT_MODE = "fail";
+    environment.PATH = `${bin}:${originalPath ?? ""}`;
+    await assert.rejects(
+      f.call("workgraph_deliver", { checkoutId: checkout.checkoutId }),
+      /Git refused the prepared advancement/,
+    );
+    await writeFile(join(f.root, "local-after-prepare.txt"), "local\n");
+    await git(f.root, "add", "local-after-prepare.txt");
+    await git(f.root, "commit", "-m", "advance destination after failed effect");
+    environment.WORKGRAPH_TEST_GIT_MODE = "normal";
+
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "pull_request",
+      revision: accepted,
+      url: f.url,
+      remote: "origin",
+    });
+    assert.equal(await readFile(join(f.root, "accepted-pr.txt"), "utf8"), "accepted\n");
+    assert.equal(await readFile(join(f.root, "local-after-prepare.txt"), "utf8"), "local\n");
+  } finally {
+    environment.PATH = originalPath;
+    environment.WORKGRAPH_TEST_REAL_GIT = originalRealGit;
+    environment.WORKGRAPH_TEST_GIT_MODE = originalMode;
+    await f.dispose();
+  }
+});
+
+void test("pull-request cleanup recovers failed removal responses without resurrection and blocks dangling paths", async () => {
+  // SAFETY: This fixture temporarily redirects Git only for its task-owned disposable repositories.
+  const environment = process.env as NodeJS.ProcessEnv & {
+    PATH: string | undefined;
+    WORKGRAPH_TEST_REAL_GIT: string | undefined;
+    WORKGRAPH_TEST_GIT_MODE: string | undefined;
+  };
+  const originalPath = environment.PATH;
+  const originalRealGit = environment.WORKGRAPH_TEST_REAL_GIT;
+  const originalMode = environment.WORKGRAPH_TEST_GIT_MODE;
+  const realGit = originalPath
+    ?.split(":")
+    .map((directory) => join(directory, "git"))
+    .find((candidate) => existsSync(candidate));
+  assert.ok(realGit !== undefined);
+  const f = await pullRequestFixture();
+
+  try {
+    const checkout = f.facts((await f.call("workgraph_checkout", {})).details);
+    const branch = checkout.ownedBranch.slice("refs/heads/".length);
+    await writeFile(join(checkout.managedPath, "accepted-pr.txt"), "accepted\n");
+    await git(checkout.managedPath, "add", "accepted-pr.txt");
+    await git(checkout.managedPath, "commit", "-m", "accepted PR");
+    const accepted = await git(checkout.managedPath, "rev-parse", "HEAD");
+    await git(checkout.managedPath, "push", "origin", `${branch}:${branch}`);
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch }));
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "pull_request",
+      revision: accepted,
+      url: f.url,
+      remote: "origin",
+    });
+    const merged = await mergePublishedPullRequest(f, branch, "merge");
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch, merged }));
+    const bin = join(f.parent, "cleanup-recovery-bin");
+    await mkdir(bin);
+    await writeFile(
+      join(bin, "git"),
+      `#!/bin/sh\ncase " $* " in\n  *" worktree remove --force "*)\n    if [ "$WORKGRAPH_TEST_GIT_MODE" = dangling ]; then\n      last=""; for arg do last="$arg"; done\n      "$WORKGRAPH_TEST_REAL_GIT" "$@" || exit $?\n      ln -s "$last-missing" "$last"\n      exit 17\n    fi\n    ;;\n  *" update-ref -d "*)\n    if [ "$WORKGRAPH_TEST_GIT_MODE" = branch-error ]; then\n      "$WORKGRAPH_TEST_REAL_GIT" "$@" || exit $?\n      exit 17\n    fi\n    ;;\nesac\nexec "$WORKGRAPH_TEST_REAL_GIT" "$@"\n`,
+    );
+    await chmod(join(bin, "git"), 0o700);
+    environment.WORKGRAPH_TEST_REAL_GIT = realGit;
+    environment.WORKGRAPH_TEST_GIT_MODE = "dangling";
+    environment.PATH = `${bin}:${originalPath ?? ""}`;
+    await assert.rejects(
+      f.call("workgraph_deliver", { checkoutId: checkout.checkoutId }),
+      /Owned worktree removal was not established/,
+    );
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "preserve",
+    });
+    assert.equal(existsSync(checkout.managedPath), false);
+    assert.equal(await git(f.root, "rev-parse", "--verify", checkout.ownedBranch), accepted);
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    await assert.rejects(f.call("workgraph_checkout", {}), /partial or duplicated|absent/);
+    assert.equal(await git(f.root, "rev-parse", "--verify", checkout.ownedBranch), accepted);
+    await rm(checkout.managedPath);
+    environment.WORKGRAPH_TEST_GIT_MODE = "branch-error";
+    const delivered = await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "pull_request",
+      revision: accepted,
+      url: f.url,
+      remote: "origin",
+    });
+    // SAFETY: Successful delivery details contain the persisted strict checkout record.
+    assert.equal(
+      (delivered.details as { disposition: { kind: string } }).disposition.kind,
+      "complete",
+    );
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    await assert.rejects(git(f.root, "rev-parse", "--verify", checkout.ownedBranch));
+  } finally {
+    environment.PATH = originalPath;
+    environment.WORKGRAPH_TEST_REAL_GIT = originalRealGit;
+    environment.WORKGRAPH_TEST_GIT_MODE = originalMode;
+    await f.dispose();
+  }
+});
+
 void test("retained implementation Candidate applies only into the managed checkout", async () => {
   const f = await fixture();
 
@@ -1024,14 +1320,31 @@ void test("integrated destination proof and pending Candidate cleanup gate destr
       f.call("workgraph_deliver", { checkoutId: checkout.checkoutId }),
       /Cleanup blocked: 1 Worker or Candidate disposition/,
     );
-    await f.call("workgraph_control", {
-      action: "discard_output",
-      attemptId: "attempt-pending-cleanup",
-      reason: "Release applied Candidate custody.",
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "preserve",
     });
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    for (let index = 0; index < 40; index += 1) {
+      const observed = new RecordStore(f.agentDir, f.session.getSessionId());
+      const output = observed.readAttempt("attempt-pending-cleanup").output;
+      observed.close();
+      if (output?.kind === "applied" && output.cleanupTip === undefined) break;
+      await Effect.runPromise(Effect.sleep("50 millis"));
+    }
+    const cleaned = new RecordStore(f.agentDir, f.session.getSessionId());
+    const applied = cleaned.readAttempt("attempt-pending-cleanup").output;
+    cleaned.close();
+    assert.equal(applied?.kind, "applied");
+    assert.equal(applied?.kind === "applied" ? applied.cleanupTip : "unexpected", undefined);
     await git(f.root, "reset", "--hard", original);
     await assert.rejects(
-      f.call("workgraph_deliver", { checkoutId: checkout.checkoutId }),
+      f.call("workgraph_deliver", {
+        checkoutId: checkout.checkoutId,
+        route: "local",
+        revision: accepted,
+      }),
       /no longer contains the recorded integrated revision/,
     );
     assert.equal(existsSync(checkout.managedPath), true);
