@@ -907,6 +907,11 @@ export class SessionRuntime {
     if (attempt.spec.lineage !== undefined)
       lines.push(`Candidate facts: ${JSON.stringify(attempt.spec.lineage)}`);
 
+    if (attempt.spec.lineage?.candidateOf?.kind === "integrate")
+      lines.push(
+        "Integrate the Candidate with a merge that retains both the base revision and sourceTip in HEAD's ancestry. Resolve content as required, but do not replace the merge with copied changes or squash away either parent history. Verify both ancestry relationships before reporting.",
+      );
+
     return {
       content: lines.join("\n"),
       details: {
