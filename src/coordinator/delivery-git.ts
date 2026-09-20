@@ -145,7 +145,8 @@ export function advanceDestination(
   return Effect.gen(function* () {
     const current = yield* destination(record);
 
-    if (current.head === state.destinationRevision) return;
+    if (yield* ancestry(record.repositoryCommonDir, state.destinationRevision, current.head))
+      return current.head;
 
     if (current.head !== state.destinationBefore)
       return yield* fail(
@@ -165,7 +166,8 @@ export function advanceDestination(
         "advance delivery destination",
         advancement.stderr || advancement.stdout || "Git refused destination advancement.",
       );
-    yield* proveDestination(record, state.destinationRevision);
+
+    return yield* proveDestination(record, state.destinationRevision);
   });
 }
 
@@ -173,11 +175,13 @@ export function proveDestination(record: CheckoutDeliveryRecord, revision: strin
   return Effect.gen(function* () {
     const current = yield* destination(record);
 
-    if (current.head !== revision)
+    if (!(yield* ancestry(record.repositoryCommonDir, revision, current.head)))
       return yield* fail(
         "prove destination integration",
         "Destination integration proof is absent.",
       );
+
+    return current.head;
   });
 }
 
@@ -204,7 +208,7 @@ export function verifyPullRequest(
       );
 
     const publicationRepository = facts.headRepository.nameWithOwner.toLowerCase();
-    yield* verifyRemoteRepository(record, remote, publicationRepository, true);
+    yield* verifyPublicationRemote(record, remote, publicationRepository);
     const baseRepository = facts.baseRepository.nameWithOwner.toLowerCase();
     const names = (yield* git(record.sourcePath, ["remote"], true)).split("\n").filter(Boolean);
     const matches: string[] = [];
@@ -272,11 +276,12 @@ export function prepareMergedPullRequest(
 export function deletePublishedHead(record: CheckoutDeliveryRecord, state: PullRequestIntegrated) {
   return Effect.gen(function* () {
     const branchRef = `refs/heads/${state.headBranch}`;
+    yield* verifyPublicationRemote(record, state.remote, state.publicationRepository);
     let tip = yield* publishedTip(record, state.remote, branchRef);
 
     if (tip === undefined) return;
     yield* observeAcceptedCheckout(record, state.acceptedRevision);
-    yield* verifyRemoteRepository(record, state.remote, state.publicationRepository, true);
+    yield* verifyPublicationRemote(record, state.remote, state.publicationRepository);
     tip = yield* publishedTip(record, state.remote, branchRef);
 
     if (tip === undefined) return;
@@ -313,6 +318,13 @@ export function deletePublishedHead(record: CheckoutDeliveryRecord, state: PullR
       deletion.stderr || deletion.stdout || "Published head deletion was not proven.",
     );
   });
+}
+
+function verifyPublicationRemote(record: CheckoutDeliveryRecord, remote: string, expected: string) {
+  return Effect.all([
+    verifyRemoteRepository(record, remote, expected, false),
+    verifyRemoteRepository(record, remote, expected, true),
+  ]).pipe(Effect.asVoid);
 }
 
 function verifyRemoteRepository(

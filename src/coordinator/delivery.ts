@@ -187,7 +187,7 @@ function completeLocal(
   state: Extract<CheckoutDeliveryState, { kind: "local_integrated" }>,
 ) {
   return Effect.gen(function* () {
-    yield* proveDestination(record, state.destinationRevision);
+    const destinationRevision = yield* proveDestination(record, state.destinationRevision);
     yield* requireCleanupAvailable(store, record);
     yield* cleanupCoordinatorCheckout(record, state.acceptedRevision);
 
@@ -195,7 +195,7 @@ function completeLocal(
       kind: "complete",
       route: "local",
       acceptedRevision: state.acceptedRevision,
-      destinationRevision: state.destinationRevision,
+      destinationRevision,
     });
   });
 }
@@ -206,7 +206,7 @@ function completePullRequest(
   state: Extract<CheckoutDeliveryState, { kind: "pull_request_integrated" }>,
 ) {
   return Effect.gen(function* () {
-    yield* proveDestination(record, state.destinationRevision);
+    const destinationRevision = yield* proveDestination(record, state.destinationRevision);
     yield* requireCleanupAvailable(store, record);
     yield* deletePublishedHead(record, state);
     yield* cleanupCoordinatorCheckout(record, state.acceptedRevision);
@@ -215,7 +215,7 @@ function completePullRequest(
       kind: "complete",
       route: "pull_request",
       acceptedRevision: state.acceptedRevision,
-      destinationRevision: state.destinationRevision,
+      destinationRevision,
       url: state.url,
       mergedRevision: state.mergedRevision,
     });
@@ -288,22 +288,22 @@ function integratePrepared(
 ): Effect.Effect<CheckoutDeliveryRecord, GitError> {
   return Effect.gen(function* () {
     if (record.state.kind === "local_prepared") {
-      yield* advanceDestination(record, record.state);
+      const destinationRevision = yield* advanceDestination(record, record.state);
 
       return checkpoint(store, record, {
         kind: "local_integrated",
         acceptedRevision: record.state.acceptedRevision,
-        destinationRevision: record.state.destinationRevision,
+        destinationRevision,
       });
     }
 
     if (record.state.kind !== "pull_request_prepared") return record;
-    yield* advanceDestination(record, record.state);
+    const destinationRevision = yield* advanceDestination(record, record.state);
 
     return checkpoint(store, record, {
       kind: "pull_request_integrated",
       acceptedRevision: record.state.acceptedRevision,
-      destinationRevision: record.state.destinationRevision,
+      destinationRevision,
       url: record.state.url,
       mergedRevision: record.state.mergedRevision,
       remote: record.state.remote,

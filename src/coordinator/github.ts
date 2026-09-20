@@ -5,6 +5,10 @@ import { Value } from "typebox/value";
 
 const exec = promisify(execFile);
 
+const GITHUB_READ_TIMEOUT_MS = 30_000;
+
+const GITHUB_READ_MAX_BUFFER = 1024 * 1024;
+
 const RepositorySchema = Type.Object(
   { nameWithOwner: Type.String({ minLength: 3, pattern: "^[^/]+/[^/]+$" }) },
   { additionalProperties: true },
@@ -38,13 +42,20 @@ export async function readPullRequest(url: string): Promise<PullRequestFacts> {
   let stdout: string;
 
   try {
-    ({ stdout } = await exec("gh", [
-      "pr",
-      "view",
-      url,
-      "--json",
-      "url,state,headRefOid,headRefName,headRepository,baseRefName,baseRepository,mergeCommit",
-    ]));
+    ({ stdout } = await exec(
+      "gh",
+      [
+        "pr",
+        "view",
+        url,
+        "--json",
+        "url,state,headRefOid,headRefName,headRepository,baseRefName,baseRepository,mergeCommit",
+      ],
+      {
+        timeout: GITHUB_READ_TIMEOUT_MS,
+        maxBuffer: GITHUB_READ_MAX_BUFFER,
+      },
+    ));
   } catch (cause) {
     throw new Error("GitHub pull request facts are unavailable or unauthenticated.", { cause });
   }

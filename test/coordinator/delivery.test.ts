@@ -359,6 +359,39 @@ void test("local continuation recovers completed integration and interrupted cle
   }
 });
 
+void test("local continuation preserves a later destination commit after integration response loss", async () => {
+  const f = await fixture();
+
+  try {
+    const allocated = await allocateAccepted(f, "descendant.txt");
+    const before = await git(f.root, "rev-parse", "HEAD");
+    await git(f.root, "merge", "--ff-only", allocated.accepted);
+    await writeFile(join(f.root, "later.txt"), "later\n");
+    await git(f.root, "add", "later.txt");
+    await git(f.root, "commit", "-m", "later destination commit");
+    const later = await git(f.root, "rev-parse", "HEAD");
+
+    checkpoint(f, allocated, {
+      kind: "local_prepared",
+      acceptedRevision: allocated.accepted,
+      destinationBefore: before,
+      destinationRevision: allocated.accepted,
+    });
+
+    // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+    const completed = (await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }))
+      .details as { state: { kind: string; destinationRevision: string } };
+
+    assert.equal(completed.state.kind, "complete");
+    assert.equal(completed.state.destinationRevision, later);
+    assert.equal(await git(f.root, "rev-parse", "HEAD"), later);
+    assert.equal(await readFile(join(f.root, "later.txt"), "utf8"), "later\n");
+    assert.equal(existsSync(allocated.managedPath), false);
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("cleanup waits for an unrelated current-session queued Worker then continues once settled", async () => {
   const f = await fixture();
 
@@ -507,8 +540,14 @@ void test("open and closed-unmerged pull requests continue as stable pending and
   }
 });
 
-void test("pull-request cleanup blocks changed tips, source drift, and changed push identity; absent tips recover", async () => {
-  for (const scenario of ["changed-tip", "source-drift", "push-identity", "absent"] as const) {
+void test("pull-request cleanup blocks changed tips, source drift, and changed remote identities; absent tips recover", async () => {
+  for (const scenario of [
+    "changed-tip",
+    "source-drift",
+    "push-identity",
+    "fetch-identity",
+    "absent",
+  ] as const) {
     const f = await fixture();
 
     try {
@@ -550,6 +589,9 @@ void test("pull-request cleanup blocks changed tips, source drift, and changed p
         await writeFile(join(allocated.managedPath, "dirty.txt"), "dirty\n");
       } else if (scenario === "push-identity") {
         await git(f.root, "config", "remote.fork.pushurl", "https://github.com/other/repo.git");
+      } else if (scenario === "fetch-identity") {
+        await git(f.root, "config", "remote.fork.pushurl", "https://github.com/fork/repo.git");
+        await git(f.root, "config", "remote.fork.url", "https://github.com/other/repo.git");
       } else {
         await git(f.root, "push", "fork", `:${allocated.ownedBranch}`);
       }
@@ -564,9 +606,11 @@ void test("pull-request cleanup blocks changed tips, source drift, and changed p
       } else {
         await assert.rejects(f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }));
         assert.equal(existsSync(allocated.managedPath), true);
-        assert.notEqual(
-          await git(f.root, "ls-remote", "--heads", "fork", allocated.ownedBranch),
-          "",
+        assert.equal(
+          await git(f.root, "--git-dir", forkBare, "rev-parse", "--verify", allocated.ownedBranch),
+          scenario === "changed-tip"
+            ? await git(f.root, "--git-dir", forkBare, "rev-parse", allocated.ownedBranch)
+            : allocated.accepted,
         );
       }
     } finally {
