@@ -290,6 +290,62 @@ void test("application accepts ignored destination artifacts and recovers struct
     );
     await rm(join(fixture.root, "ignored.bin"));
 
+    let untrackedCollision = operation(fixture, "untracked-collision", initial(fastTip));
+    await Effect.runPromise(ensureDetachedWorktree(untrackedCollision));
+    await writeFile(join(untrackedCollision.worktreePath, "untracked.txt"), "candidate bytes\n");
+    await git(untrackedCollision.worktreePath, "add", "untracked.txt");
+    await git(untrackedCollision.worktreePath, "commit", "-m", "track untracked collision");
+    untrackedCollision = {
+      ...untrackedCollision,
+      output: await Effect.runPromise(classifyOutput(untrackedCollision)),
+    };
+    await writeFile(join(fixture.root, "untracked.txt"), "destination bytes\n");
+    const untrackedHead = await git(fixture.root, "rev-parse", "HEAD");
+    const untrackedIndex = await git(fixture.root, "diff", "--cached", "--binary");
+    untrackedCollision = {
+      ...untrackedCollision,
+      output: await Effect.runPromise(prepareApplication(untrackedCollision)),
+    };
+    await assert.rejects(Effect.runPromise(applyOutput(untrackedCollision)), GitError);
+    assert.equal(await git(fixture.root, "rev-parse", "HEAD"), untrackedHead);
+    assert.equal(await git(fixture.root, "diff", "--cached", "--binary"), untrackedIndex);
+    assert.equal(
+      await readFile(join(fixture.root, "untracked.txt"), "utf8"),
+      "destination bytes\n",
+    );
+    await rm(join(fixture.root, "untracked.txt"));
+
+    await writeFile(join(fixture.root, "file.txt"), "staged destination bytes\n");
+    await git(fixture.root, "add", "file.txt");
+    const stagedIndex = await git(fixture.root, "diff", "--cached", "--binary");
+    await assert.rejects(Effect.runPromise(prepareApplication(untrackedCollision)), GitError);
+    assert.equal(await git(fixture.root, "rev-parse", "HEAD"), untrackedHead);
+    assert.equal(await git(fixture.root, "diff", "--cached", "--binary"), stagedIndex);
+    assert.equal(
+      await readFile(join(fixture.root, "file.txt"), "utf8"),
+      "staged destination bytes\n",
+    );
+    await git(fixture.root, "reset", "--hard", fastTip);
+
+    let changedDestination = operation(fixture, "changed-destination", initial(fastTip));
+    await Effect.runPromise(ensureDetachedWorktree(changedDestination));
+    await commit(changedDestination.worktreePath, "prepared source");
+    changedDestination = {
+      ...changedDestination,
+      output: await Effect.runPromise(classifyOutput(changedDestination)),
+    };
+    changedDestination = {
+      ...changedDestination,
+      output: await Effect.runPromise(prepareApplication(changedDestination)),
+    };
+    await writeFile(join(fixture.root, "changed-destination.txt"), "advanced\n");
+    await git(fixture.root, "add", "changed-destination.txt");
+    await git(fixture.root, "commit", "-m", "advance after preparation");
+    const advancedDestination = await git(fixture.root, "rev-parse", "HEAD");
+    await assert.rejects(Effect.runPromise(prepareApplication(changedDestination)), GitError);
+    await assert.rejects(Effect.runPromise(applyOutput(changedDestination)), GitError);
+    assert.equal(await git(fixture.root, "rev-parse", "HEAD"), advancedDestination);
+
     const divergentBase = fastTip;
     let divergent = operation(fixture, "divergent", initial(divergentBase));
     await Effect.runPromise(ensureDetachedWorktree(divergent));

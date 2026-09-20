@@ -136,7 +136,6 @@ export const AttemptOutputSchema = Type.Union([
     sourceTip: CommitSchema,
     destinationRef: Text,
     destinationHead: CommitSchema,
-    replanned: Type.Optional(Type.Literal(true)),
   }),
   strict({
     kind: Type.Literal("discarding"),

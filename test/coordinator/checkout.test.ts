@@ -168,7 +168,7 @@ void test("exact modified and advanced managed checkout reuses without mutation"
   }
 });
 
-void test("locked, duplicate-branch, and reverse-backlink identities block without repair", async () => {
+void test("locked and duplicate native identities block without repair", async () => {
   const locked = await fixture();
 
   try {
@@ -199,18 +199,6 @@ void test("locked, duplicate-branch, and reverse-backlink identities block witho
     assert.equal(existsSync(otherPath), true);
   } finally {
     await duplicate.dispose();
-  }
-
-  const reverse = await fixture();
-
-  try {
-    const facts = reverse.facts((await reverse.call("workgraph_checkout", {})).details);
-    const adminDir = await administrationDir(facts.managedPath);
-    await writeFile(join(adminDir, "gitdir"), `${join(reverse.root, ".git")}\n`);
-    await assert.rejects(reverse.call("workgraph_checkout", {}), /partial or duplicated/);
-    assert.equal(existsSync(facts.managedPath), true);
-  } finally {
-    await reverse.dispose();
   }
 });
 

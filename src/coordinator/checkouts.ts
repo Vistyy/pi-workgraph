@@ -1,9 +1,10 @@
-/* oxlint-disable effecttsgo/async-function, anti-slop/require-readable-spacing -- Pi callbacks are the Promise boundary around repository-owned Effects. */
+/* oxlint-disable effecttsgo/async-function -- Pi callbacks are the Promise boundary around repository-owned Effects. */
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect } from "effect";
-import { ensureCoordinatorCheckout, resolveCoordinatorRepository } from "../repository.js";
+import { canonicalFuturePath, fail, resolveTaskTarget } from "../repository/git.js";
+import { ensureCoordinatorCheckout } from "./checkout-git.js";
 
 export interface CheckoutFacts {
   readonly checkoutId: string;
@@ -25,12 +26,25 @@ export async function createCheckout(input: {
   readonly cwd: string;
   readonly path?: string;
 }): Promise<CheckoutFacts> {
-  const resolved = await Effect.runPromise(resolveCoordinatorRepository(input.cwd, input.path));
+  const resolved = await Effect.runPromise(
+    Effect.gen(function* () {
+      const target = yield* input.path === undefined
+        ? resolveTaskTarget({ cwd: input.cwd, kind: "repository" })
+        : resolveTaskTarget({ cwd: input.cwd, path: input.path, kind: "repository" });
+
+      if (target.target.kind !== "repository" || !("commit" in target))
+        return yield* fail("resolve Coordinator checkout", "Repository target resolution failed.");
+
+      return target;
+    }),
+  );
+
   const identity = await checkoutIdentity(
     input.agentDir,
     input.sessionId,
     resolved.target.commonDir,
   );
+
   const receipt = await Effect.runPromise(
     ensureCoordinatorCheckout({ target: resolved.target, commit: resolved.commit, identity }),
   );
@@ -44,13 +58,16 @@ async function checkoutIdentity(
   commonDir: string,
 ): Promise<Identity> {
   const canonicalAgentDir = await realpath(agentDir);
+
   const checkoutId = createHash("sha256")
     .update(JSON.stringify([sessionId, commonDir]))
     .digest("hex");
 
   return {
     checkoutId,
-    managedPath: join(canonicalAgentDir, "workgraph", "coordinator-checkouts", checkoutId),
+    managedPath: canonicalFuturePath(
+      join(canonicalAgentDir, "workgraph", "coordinator-checkouts", checkoutId),
+    ),
     repositoryCommonDir: commonDir,
     ownedBranch: `refs/heads/pi-workgraph/coordinators/${checkoutId}`,
   };
