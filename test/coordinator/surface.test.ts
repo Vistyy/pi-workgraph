@@ -150,6 +150,20 @@ void test("coordinator registers the exact strict tool surface", async () => {
 
     assert.equal(existsSync(deliveryReferencePath), true);
 
+    const structured = await f.runner.emitBeforeAgentStart("Coordinate the request", undefined, {
+      cwd: f.root,
+    });
+
+    assert.deepEqual(structured.messages, []);
+    const coordinatorSection = "workgraph_coordinator_contract";
+
+    assert.equal(
+      structured.systemPromptOptions.sections[coordinatorSection],
+      guidance,
+      "the ordinary Pi path uses one uniquely named structured section",
+    );
+    assert.equal(structured.systemPromptOptions.forceSystemPrompt, undefined);
+
     const systemPromptOptions = {
       forceSystemPrompt: "Base coordinator prompt",
       cwd: f.root,
@@ -161,17 +175,22 @@ void test("coordinator registers the exact strict tool surface", async () => {
       systemPromptOptions,
     );
 
-    const injectedPrompt = injected.systemPromptOptions.forceSystemPrompt;
+    const repeated = await f.runner.emitBeforeAgentStart(
+      "Coordinate the request again",
+      undefined,
+      injected.systemPromptOptions,
+    );
 
-    assert.deepEqual(injected.messages, []);
+    const injectedPrompt = repeated.systemPromptOptions.forceSystemPrompt;
+
     assert.equal(
       injectedPrompt,
       `Base coordinator prompt\n\n${guidance}`,
-      "the loaded coordinator extension resolves the contract's package-local reference",
+      "an earlier forced prompt receives the exact resolved contract once",
     );
-    assert.equal(injectedPrompt.includes("Delivery reference path"), false);
+    assert.equal(injectedPrompt?.includes("Delivery reference path"), false);
     assert.equal(
-      injectedPrompt.includes("# Deliver an accepted repository change"),
+      injectedPrompt?.includes("# Deliver an accepted repository change"),
       false,
       "delivery-procedure content stays out of the system prompt",
     );
@@ -205,7 +224,16 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
     const receipt = await coordinator.call("workgraph_load_delivery_tools", {});
     assert.deepEqual(receipt.details, { loaded: ["bash"], missing: ["absent_peer"] });
     assert.equal(coordinator.activeTools().includes("bash"), true);
-    assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), false);
+    assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
+    assert.equal(receipt.content[0]?.type, "text");
+    assert.equal(
+      receipt.content[0]?.type === "text" ? receipt.content[0].text : "",
+      JSON.stringify(receipt.details),
+    );
+
+    const repeated = await coordinator.call("workgraph_load_delivery_tools", {});
+    assert.deepEqual(repeated.details, { loaded: [], missing: ["absent_peer"] });
+    assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
 
     const afterLoader = coordinator.session.appendMessage({
       role: "toolResult",
@@ -233,7 +261,7 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
       newLeafId: afterLoader,
     });
     assert.equal(coordinator.activeTools().includes("bash"), true);
-    assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), false);
+    assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
   } finally {
     await coordinator.dispose();
   }
@@ -267,6 +295,92 @@ void test("invalid delivery settings fail open with a bounded warning", async ()
     assert.ok(warning !== undefined);
     assert.equal(warning.type, "warning");
     assert.ok(warning.message.length <= 550);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("report inspection returns complete evidence or explicit bounded slices", async () => {
+  const f = await fixture(false);
+  const attemptId = "attempt-report";
+
+  const report = {
+    role: "research" as const,
+    status: "completed" as const,
+    summary: "Bounded report.",
+    details: "evidence-".repeat(40),
+  };
+
+  try {
+    const store = new RecordStore(f.agentDir, f.session.getSessionId());
+    store.createTaskWithAttempt(
+      "report",
+      {
+        target: { kind: "directory", path: f.root },
+        contract: { kind: "research", question: "What evidence exists?" },
+      },
+      attemptId,
+      {
+        selection: {
+          kind: "target",
+          target: { model: "fixture/research", thinking: "high" },
+        },
+        base: { kind: "directory" },
+      },
+    );
+    store.recordOutcome(attemptId, {
+      result: { kind: "reported", report },
+      effectiveModels: [],
+    });
+    store.close();
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+
+    const text = JSON.stringify(report);
+    const complete = await f.call("workgraph_inspect", { section: "report", attemptId });
+    assert.deepEqual(complete.details, { attemptId, totalChars: text.length, report });
+    assert.equal(
+      complete.content[0]?.type === "text" ? complete.content[0].text : "",
+      JSON.stringify(complete.details),
+    );
+
+    const first = await f.call("workgraph_inspect", {
+      section: "report",
+      attemptId,
+      maxChars: 50,
+    });
+
+    assert.deepEqual(first.details, {
+      attemptId,
+      offset: 0,
+      maxChars: 50,
+      totalChars: text.length,
+      text: text.slice(0, 50),
+      nextOffset: 50,
+    });
+
+    const end = await f.call("workgraph_inspect", {
+      section: "report",
+      attemptId,
+      offset: text.length,
+    });
+
+    assert.deepEqual(end.details, {
+      attemptId,
+      offset: text.length,
+      maxChars: 20_000,
+      totalChars: text.length,
+      text: "",
+      nextOffset: null,
+    });
+
+    await assert.rejects(
+      f.call("workgraph_inspect", {
+        section: "report",
+        attemptId,
+        offset: text.length + 1,
+      }),
+      /exceeds totalChars/,
+    );
   } finally {
     await f.dispose();
   }

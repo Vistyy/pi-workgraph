@@ -364,37 +364,24 @@ void test("retained implementation Candidate applies only into the managed check
     store.close();
 
     const applied = await f.call("workgraph_control", { action: "apply", attemptId });
-    // SAFETY: Successful control receipts expose the exact post-operation Attempt view.
-    assert.deepEqual(
-      {
-        action: (applied.details as { action: string }).action,
-        target: (applied.details as { attempt: { task: { target: Task["target"] } } }).attempt.task
-          .target,
-        output: (applied.details as { attempt: { output: unknown } }).attempt.output,
+    assert.deepEqual(applied.details, {
+      action: "apply",
+      taskId: "checkout-candidate",
+      attemptId,
+      output: { kind: "applied", revision: candidateTip },
+      outcome: {
+        kind: "reported",
+        status: "completed",
+        summary: "Produced the Candidate.",
       },
-      {
-        action: "apply",
-        target: task.target,
-        output: { kind: "applied", revision: candidateTip },
-      },
-    );
-
-    // SAFETY: The successful control receipt contains the exact reported Outcome preview.
-    const attemptView = applied.details as {
-      attempt: {
-        outcome: { kind: string; reportStatus: string; reportOutcome: string; summary: string };
-        reportPreview: { text: string; totalChars: number; truncated: boolean };
-      };
-    };
-    assert.deepEqual(attemptView.attempt.outcome, {
-      kind: "reported",
-      reportStatus: "completed",
-      reportOutcome: "changed",
-      summary: "Produced the Candidate.",
+      blocker: null,
     });
-    assert.match(attemptView.attempt.reportPreview.text, /Produced the Candidate/);
-    assert.ok(attemptView.attempt.reportPreview.totalChars > 0);
-    assert.equal(attemptView.attempt.reportPreview.truncated, false);
+    assert.equal(
+      applied.content[0]?.type === "text" ? applied.content[0].text : "",
+      JSON.stringify(applied.details),
+    );
+    assert.equal(JSON.stringify(applied.details).includes("Candidate reaches only"), false);
+    assert.equal(JSON.stringify(applied.details).includes("reportPreview"), false);
     assert.equal(
       await readFile(join(facts.managedPath, "candidate.txt"), "utf8"),
       "worker candidate\n",
