@@ -195,7 +195,7 @@ Mouse interaction follows the projected layout. If Calm cannot safely use Pi's p
 
 ## Defer delivery tools
 
-Workgraph can keep explicitly named peer delivery tools out of the Coordinator's initial active set until delivery work needs them. Configure the exact tool names at `pi-workgraph.delivery.deferredTools` in `~/.pi/agent/settings.json`:
+List the tools to keep out of the Coordinator's initial context in `~/.pi/agent/settings.json`:
 
 ```json
 {
@@ -207,9 +207,7 @@ Workgraph can keep explicitly named peer delivery tools out of the Coordinator's
 }
 ```
 
-Workgraph supplies no peer defaults and does not import or manage peer extensions. A nonempty deduplicated list enables `workgraph_load_delivery_tools`; an absent delivery section or empty list leaves normal tool visibility unchanged and does not activate the loader. The Coordinator calls the loader at the accepted-change delivery boundary and for explicit requests for guided review or pull-request follow or unfollow.
-
-Loading is additive and changes visibility only. Its receipt distinguishes configured tools that were loaded, already active, or missing. Missing tools retain the delivery procedure's existing fallbacks. Invalid delivery settings fail open: peer visibility remains unchanged, the loader stays inactive, and Workgraph warns without blocking coordination. Loaded visibility follows the current conversation branch, so navigating before the successful loader result restores deferral while descendants may inherit it.
+At the delivery boundary, `workgraph_load_delivery_tools` activates the configured tools that are installed and reports any that are missing. An absent or empty list changes nothing. Invalid settings leave the tools active and produce a warning.
 
 ## Disable Worker tools
 

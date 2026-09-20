@@ -58,14 +58,11 @@ async function smokePackage(): Promise<void> {
 
   if (
     !deliveryReference.includes("# Deliver an accepted repository change") ||
-    !deliveryReference.includes("Visibility does not grant authority")
+    !deliveryReference.includes("Loading tools does not grant delivery authority")
   )
     throw new Error("Packaged delivery reference is missing or invalid.");
 
-  if (
-    !packagedReadme.includes("pi-workgraph.delivery") ||
-    !packagedReadme.includes("deferredTools")
-  )
+  if (!packagedReadme.includes('"delivery"') || !packagedReadme.includes('"deferredTools"'))
     throw new Error("Packaged README omits delivery-tool configuration.");
 
   const agentDir = join(parent, "agent");
@@ -120,9 +117,9 @@ async function smokePackage(): Promise<void> {
       )
         throw new Error("Packaged coordinator factory did not register its configured extension surface.");
       if (
-        !deliveryLoader.definition.description.includes("guided review and pull-request follow or unfollow") ||
-        !deliveryLoader.definition.description.includes("at the delivery boundary") ||
-        !deliveryLoader.definition.description.includes("does not authorize its actions")
+        !deliveryLoader.definition.description.includes("configured delivery tools") ||
+        !deliveryLoader.definition.description.includes("reaches the delivery boundary") ||
+        !deliveryLoader.definition.description.includes("does not authorize delivery actions")
       )
         throw new Error("Packaged delivery loader omits its trigger or authority boundary.");
 

@@ -165,7 +165,7 @@ export function installDeliveryTools(pi: ExtensionAPI, configured: readonly stri
     name: deliveryLoaderName,
     label: "Load Delivery Tools",
     description:
-      "Load configured tools for guided review and pull-request follow or unfollow. Use this at the delivery boundary or when the user asks for one of those capabilities. Loading a tool does not authorize its actions.",
+      "Load the configured delivery tools when an accepted repository change reaches the delivery boundary. Loading a tool does not authorize delivery actions.",
     parameters: Type.Object({}, { additionalProperties: false }),
     execute() {
       const receipt = activate();

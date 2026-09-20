@@ -1,6 +1,6 @@
 # Deliver an accepted repository change
 
-Delivery capabilities may have been made visible by Workgraph's Coordinator-only loader. Visibility does not grant authority. Treat a configured capability reported missing exactly as unavailable and use the fallbacks below.
+If `workgraph_load_delivery_tools` reports a configured tool as missing, treat that tool as unavailable and use the fallback below. Loading tools does not grant delivery authority.
 
 ## Resolve Human sign-off
 

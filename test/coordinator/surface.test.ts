@@ -253,9 +253,9 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
   try {
     const loader = coordinator.runner.getToolDefinition("workgraph_load_delivery_tools");
     assert.ok(loader !== undefined);
-    assert.match(loader.description, /guided review and pull-request follow or unfollow/);
-    assert.match(loader.description, /at the delivery boundary/);
-    assert.match(loader.description, /does not authorize its actions/);
+    assert.match(loader.description, /configured delivery tools/);
+    assert.match(loader.description, /reaches the delivery boundary/);
+    assert.match(loader.description, /does not authorize delivery actions/);
     assert.equal(Value.Check(loader.parameters, {}), true);
     assert.equal(Value.Check(loader.parameters, { unexpected: true }), false);
 
