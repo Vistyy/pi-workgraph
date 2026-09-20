@@ -130,15 +130,6 @@ export function installDeliveryTools(pi: ExtensionAPI, configured: readonly stri
     },
   });
 
-  const restoreIfAvailable = (ctx: ExtensionContext): void => {
-    try {
-      restore(ctx);
-    } catch (cause) {
-      if (!(cause instanceof Error && cause.message.includes("runtime not initialized")))
-        throw cause;
-    }
-  };
-
-  pi.on("session_start", (_event, ctx) => restoreIfAvailable(ctx));
-  pi.on("session_tree", (_event, ctx) => restoreIfAvailable(ctx));
+  pi.on("session_start", (_event, ctx) => restore(ctx));
+  pi.on("session_tree", (_event, ctx) => restore(ctx));
 }

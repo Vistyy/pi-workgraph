@@ -551,6 +551,7 @@ export interface CoordinatorAdvancement {
 export function prepareCoordinatorAdvancement(input: {
   readonly identity: CoordinatorCheckoutIdentity;
   readonly acceptedRevision: string;
+  readonly integrationRevision?: string;
   readonly destinationRoot: string;
   readonly destinationRef: string;
 }): Effect.Effect<CoordinatorAdvancement, GitError> {
@@ -561,7 +562,7 @@ export function prepareCoordinatorAdvancement(input: {
     const preparedRevision = yield* plannedRevision(
       input.identity.repositoryCommonDir,
       destinationHead,
-      input.acceptedRevision,
+      input.integrationRevision ?? input.acceptedRevision,
       "Integrate accepted Workgraph checkout",
     );
 
@@ -580,7 +581,7 @@ export function prepareCoordinatorAdvancement(input: {
   });
 }
 
-export function requireCoordinatorAdvancementAbsent(input: {
+function requireCoordinatorAdvancementAbsent(input: {
   readonly identity: CoordinatorCheckoutIdentity;
   readonly acceptedRevision: string;
   readonly advancement: CoordinatorAdvancement;
@@ -629,6 +630,7 @@ export function retryCoordinatorAdvancement(input: {
 export function verifyCoordinatorAdvancement(input: {
   readonly identity: CoordinatorCheckoutIdentity;
   readonly acceptedRevision: string;
+  readonly integrationRevision?: string;
   readonly advancement: CoordinatorAdvancement;
 }): Effect.Effect<string, GitError> {
   return Effect.gen(function* () {
@@ -653,7 +655,7 @@ export function verifyCoordinatorAdvancement(input: {
       )) ||
       !(yield* ancestry(
         input.identity.repositoryCommonDir,
-        input.acceptedRevision,
+        input.integrationRevision ?? input.acceptedRevision,
         destination.commit,
       ))
     )
@@ -669,6 +671,7 @@ export function verifyCoordinatorAdvancement(input: {
 export function applyCoordinatorAdvancement(input: {
   readonly identity: CoordinatorCheckoutIdentity;
   readonly acceptedRevision: string;
+  readonly integrationRevision?: string;
   readonly advancement: CoordinatorAdvancement;
 }): Effect.Effect<string, GitError> {
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Exact advancement observation and postconditions form one custody boundary.
@@ -723,13 +726,13 @@ export function applyCoordinatorAdvancement(input: {
     if (
       !(yield* ancestry(
         input.identity.repositoryCommonDir,
-        input.acceptedRevision,
+        input.integrationRevision ?? input.acceptedRevision,
         observed.commit,
       ))
     )
       return yield* fail(
         "apply local delivery",
-        "Destination does not contain the accepted revision.",
+        "Destination does not contain the recorded integration revision.",
       );
 
     return observed.commit;
@@ -823,7 +826,157 @@ export function deleteCoordinatorBranch(input: {
   });
 }
 
-function requireAcceptedCoordinatorSource(
+export function configuredRemoteUrl(input: {
+  readonly identity: CoordinatorCheckoutIdentity;
+  readonly remote: string;
+}): Effect.Effect<string, GitError> {
+  return Effect.gen(function* () {
+    const fetch = yield* gitResult(input.identity.managedPath, [
+      "config",
+      "--get-all",
+      `remote.${input.remote}.url`,
+    ]);
+    const push = yield* gitResult(input.identity.managedPath, [
+      "config",
+      "--get-all",
+      `remote.${input.remote}.pushurl`,
+    ]);
+    const fetchUrls = fetch.code === 0 ? fetch.stdout.split("\n").filter(Boolean) : [];
+    const pushUrls = push.code === 0 ? push.stdout.split("\n").filter(Boolean) : [];
+
+    if (fetchUrls.length !== 1 || pushUrls.length > 1)
+      return yield* fail(
+        "verify publication remote",
+        "Publication remote must have one unambiguous fetch and push destination.",
+      );
+    const fetchUrl = fetchUrls[0];
+    const effectivePush = pushUrls[0] ?? fetchUrl;
+
+    if (fetchUrl === undefined || effectivePush !== fetchUrl)
+      return yield* fail(
+        "verify publication remote",
+        "Publication remote fetch and push destinations must identify the same repository.",
+      );
+
+    return fetchUrl;
+  });
+}
+
+export function fetchRemoteBranch(input: {
+  readonly identity: CoordinatorCheckoutIdentity;
+  readonly remote: string;
+  readonly branch: string;
+}): Effect.Effect<string, GitError> {
+  return Effect.gen(function* () {
+    yield* networkGit(input.identity.managedPath, [
+      "fetch",
+      "--no-tags",
+      input.remote,
+      `refs/heads/${input.branch}`,
+    ]);
+
+    return yield* exactCommit(
+      input.identity.repositoryCommonDir,
+      "FETCH_HEAD",
+      "fetch current pull-request base",
+      input.identity.managedPath,
+    );
+  });
+}
+
+export function requireRemoteContains(input: {
+  readonly identity: CoordinatorCheckoutIdentity;
+  readonly revision: string;
+  readonly remoteRevision: string;
+}): Effect.Effect<void, GitError> {
+  return ancestry(input.identity.repositoryCommonDir, input.revision, input.remoteRevision).pipe(
+    Effect.flatMap((contained) =>
+      contained
+        ? Effect.void
+        : fail(
+            "verify pull-request merge",
+            "Actual merged result is not contained in the current remote base.",
+          ),
+    ),
+  );
+}
+
+export function remoteBranchTip(input: {
+  readonly identity: CoordinatorCheckoutIdentity;
+  readonly remote: string;
+  readonly branch: string;
+}): Effect.Effect<string | undefined, GitError> {
+  return networkGitResult(input.identity.managedPath, [
+    "ls-remote",
+    "--heads",
+    input.remote,
+    `refs/heads/${input.branch}`,
+  ]).pipe(
+    Effect.flatMap((result) => {
+      if (result.code !== 0)
+        return fail(
+          "inspect published branch",
+          boundedDiagnostic(result.stderr || result.stdout || "Git ls-remote failed."),
+        );
+      // oxlint-disable-next-line effecttsgo/effect-succeed-with-void -- This branch inhabits the explicit optional remote-tip result.
+      if (result.stdout.length === 0) return Effect.succeed<string | undefined>(undefined);
+      const lines = result.stdout.split("\n");
+
+      if (lines.length !== 1)
+        return fail("inspect published branch", "Published branch identity is ambiguous.");
+      const [revision, ref, extra] = lines[0]?.split(/\s+/u) ?? [];
+
+      if (
+        revision === undefined ||
+        ref !== `refs/heads/${input.branch}` ||
+        extra !== undefined ||
+        !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(revision)
+      )
+        return fail("inspect published branch", "Published branch identity is unreadable.");
+
+      return Effect.succeed<string | undefined>(revision);
+    }),
+  );
+}
+
+export function deleteRemoteBranchExpected(input: {
+  readonly identity: CoordinatorCheckoutIdentity;
+  readonly remote: string;
+  readonly branch: string;
+  readonly expectedTip: string;
+}): Effect.Effect<void, GitError> {
+  return Effect.gen(function* () {
+    const observed = yield* remoteBranchTip(input);
+
+    if (observed === undefined) return;
+    if (observed !== input.expectedTip)
+      return yield* fail(
+        "delete published branch",
+        "Published branch changed after acceptance and was preserved.",
+      );
+    const result = yield* networkGitResult(input.identity.managedPath, [
+      "push",
+      `--force-with-lease=refs/heads/${input.branch}:${input.expectedTip}`,
+      input.remote,
+      `:refs/heads/${input.branch}`,
+    ]);
+    const after = yield* remoteBranchTip(input);
+
+    if (after === undefined) return;
+    if (result.code !== 0)
+      return yield* fail(
+        "delete published branch",
+        boundedDiagnostic(result.stderr || result.stdout || "Conditional deletion was refused."),
+      );
+
+    return yield* fail(
+      "delete published branch",
+      "Conditional deletion returned success but the published branch remains.",
+    );
+  });
+}
+
+export function requireAcceptedCoordinatorSource(
   identity: CoordinatorCheckoutIdentity,
   acceptedRevision: string,
 ): Effect.Effect<void, GitError> {
@@ -1807,6 +1960,19 @@ function gitDirResult(commonDir: string, args: string[]): Effect.Effect<CommandR
 
 function gitResult(cwd: string, args: string[]): Effect.Effect<CommandResult, GitError> {
   return command(["-C", cwd, ...args]);
+}
+
+function networkGit(cwd: string, args: string[]): Effect.Effect<string, GitError> {
+  return networkGitResult(cwd, args).pipe(Effect.flatMap((result) => checked(args, result, true)));
+}
+
+function networkGitResult(cwd: string, args: string[]): Effect.Effect<CommandResult, GitError> {
+  return command(["-C", cwd, ...args]).pipe(
+    Effect.timeoutOrElse({
+      duration: "30 seconds",
+      orElse: () => fail(args.join(" "), "Git network operation timed out."),
+    }),
+  );
 }
 
 function command(args: string[]): Effect.Effect<CommandResult, GitError> {
