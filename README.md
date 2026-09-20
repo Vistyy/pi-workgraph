@@ -201,7 +201,7 @@ Workgraph can keep explicitly named peer delivery tools out of the Coordinator's
 {
   "pi-workgraph": {
     "delivery": {
-      "deferredTools": ["tuicr_review", "pull_request_follow"]
+      "deferredTools": ["tuicr_review", "follow_pr", "unfollow_pr"]
     }
   }
 }
