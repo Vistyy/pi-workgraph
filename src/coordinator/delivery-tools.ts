@@ -85,7 +85,7 @@ export function installDeliveryTools(pi: ExtensionAPI, configured: readonly stri
     const loaded = names.filter((name) => available.has(name) && !active.includes(name));
     const missing = names.filter((name) => !available.has(name));
 
-    setActiveTools([...active.filter((name) => name !== deliveryLoaderName), ...loaded]);
+    setActiveTools([...active, ...loaded]);
 
     return { loaded, missing };
   };
@@ -126,7 +126,7 @@ export function installDeliveryTools(pi: ExtensionAPI, configured: readonly stri
       const receipt = activate();
 
       return Promise.resolve({
-        content: [{ type: "text" as const, text: JSON.stringify(receipt, null, 2) }],
+        content: [{ type: "text" as const, text: JSON.stringify(receipt) }],
         details: receipt,
       });
     },

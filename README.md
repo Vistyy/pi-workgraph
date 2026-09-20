@@ -207,7 +207,7 @@ List the tools to keep out of the Coordinator's initial context in `~/.pi/agent/
 }
 ```
 
-At the delivery boundary, `workgraph_load_delivery_tools` activates the configured tools that are installed and reports any that are missing. An absent or empty list changes nothing. Invalid settings leave the tools active and produce a warning.
+At the delivery boundary, `workgraph_load_delivery_tools` activates the configured tools that are installed, remains available for repeat calls, and reports any that are missing. An absent or empty list changes nothing. Invalid settings leave the tools active and produce a warning.
 
 ## Disable Worker tools
 

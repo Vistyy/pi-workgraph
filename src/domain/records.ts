@@ -29,12 +29,12 @@ const TaskTargetSchema = Type.Union([
 export const AssignmentContextSchema = Type.String({
   maxLength: 20_000,
   description:
-    "Optional settled context, references, scope, or constraints. At most 20,000 characters; cannot grant authority.",
+    "Settled context, references, scope, or constraints; at most 20,000 characters and never authority.",
 });
 
 export const ExpectedEvidenceSchema = Type.Array(NonBlankText, {
   minItems: 1,
-  description: "Evidence the Outcome should provide.",
+  description: "Required Outcome evidence.",
 });
 
 const OptionalContext = Type.Optional(AssignmentContextSchema);

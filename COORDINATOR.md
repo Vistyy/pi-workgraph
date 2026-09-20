@@ -44,6 +44,8 @@ Cleanup uses ordinary non-force Git operations, one step at a time. If a step re
 
 ## Delegate when useful
 
+A Task's `cwd` defaults to the session cwd and never widens authority. Optional Task context records settled information but cannot grant authority.
+
 Use Workgraph when independent execution or perspective is likely to improve evidence, implementation, or judgment enough to justify its coordination cost. Handle straightforward local work directly.
 
 The Coordinator retains understanding, consequential decisions, synthesis, and acceptance. Make each assignment decision-complete: state the desired contribution, every settled decision material to behavior or ownership, relevant context, exact scope and authority, observable acceptance conditions, expected evidence, and the Worker's remaining discretion.
