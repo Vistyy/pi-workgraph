@@ -12,6 +12,8 @@ import {
   type AttemptRecord,
   type AttemptSpec,
   AttemptSpecSchema,
+  type CheckoutRecord,
+  CheckoutRecordSchema,
   type Outcome,
   OutcomeSchema,
   type Task,
@@ -351,6 +353,85 @@ export class RecordStore {
     return rows.map((row) => this.attemptRecord(database, row));
   }
 
+  readCheckout(repositoryCommonDir: string): CheckoutRecord | undefined {
+    const database = this.existingOrUndefined("read Coordinator checkout");
+
+    if (database === undefined || !hasCheckoutTable(database)) return undefined;
+
+    const row = database
+      .prepare(
+        "SELECT record_json FROM coordinator_checkouts WHERE session_id=? AND repository_common_dir=?",
+      )
+      .get(this.sessionId, repositoryCommonDir);
+
+    if (row === undefined) return undefined;
+
+    return parse(CheckoutRecordSchema, row["record_json"], "Coordinator checkout");
+  }
+
+  listCheckouts(): CheckoutRecord[] {
+    const database = this.existingOrUndefined("list Coordinator checkouts");
+
+    if (database === undefined || !hasCheckoutTable(database)) return [];
+
+    return (
+      database
+        .prepare("SELECT record_json FROM coordinator_checkouts WHERE session_id=? ORDER BY rowid")
+        .all(this.sessionId) as Row[]
+    ).map((row) => parse(CheckoutRecordSchema, row["record_json"], "Coordinator checkout"));
+  }
+
+  checkpointCheckout(record: CheckoutRecord): CheckoutRecord {
+    decode(CheckoutRecordSchema, record, "Coordinator checkout");
+
+    return this.transaction("checkpoint Coordinator checkout", true, (database) => {
+      ensureCheckoutTable(database);
+      database
+        .prepare(
+          `INSERT INTO coordinator_checkouts(session_id,repository_common_dir,record_json)
+           VALUES(?,?,?)
+           ON CONFLICT(session_id,repository_common_dir) DO UPDATE SET record_json=excluded.record_json`,
+        )
+        .run(this.sessionId, record.repositoryCommonDir, json(record));
+
+      return record;
+    });
+  }
+
+  checkoutDependencyCount(checkoutRoot: string): number {
+    const database = this.existingOrUndefined("read checkout dependencies");
+
+    if (database === undefined) return 0;
+
+    return integer(
+      database
+        .prepare(
+          `SELECT count(*) AS value
+           FROM attempts JOIN tasks
+             ON tasks.session_id=attempts.session_id AND tasks.task_id=attempts.task_id
+           WHERE attempts.session_id=?
+             AND (
+               attempts.outcome_json IS NULL OR
+               (attempts.worker_json IS NOT NULL AND json_extract(attempts.worker_json,'$.closed') IS NOT 1) OR
+               (
+                 json_extract(tasks.task_json,'$.target.kind')='repository'
+                 AND json_extract(tasks.task_json,'$.target.checkoutRoot')=?
+                 AND (
+                   attempts.output_json IS NULL OR
+                   json_extract(attempts.output_json,'$.kind') IN ('retained','applying','discarding') OR
+                   (
+                     json_extract(attempts.output_json,'$.kind')='applied'
+                     AND json_extract(attempts.output_json,'$.cleanupTip') IS NOT NULL
+                   )
+                 )
+               )
+             )`,
+        )
+        .get(this.sessionId, checkoutRoot),
+      "value",
+    );
+  }
+
   counts(): RecordCounts {
     const database = this.existingOrUndefined("count records");
 
@@ -408,10 +489,7 @@ export class RecordStore {
       taskId,
       spec: parse(AttemptSpecSchema, row["spec_json"], "Attempt specification"),
       ...optional("worker", nullableParse(WorkerStateSchema, row["worker_json"], "Worker state")),
-      ...optional(
-        "output",
-        nullableParse(AttemptOutputSchema, row["output_json"], "Attempt output"),
-      ),
+      ...optional("output", parseAttemptOutput(row["output_json"])),
       ...optional("outcome", outcome),
     };
   }
@@ -505,6 +583,28 @@ function configure(database: DatabaseSync): DatabaseSync {
   database.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
 
   return database;
+}
+
+function hasCheckoutTable(database: DatabaseSync): boolean {
+  return (
+    integer(
+      database
+        .prepare(
+          "SELECT count(*) AS value FROM sqlite_schema WHERE type='table' AND name='coordinator_checkouts'",
+        )
+        .get(),
+      "value",
+    ) === 1
+  );
+}
+
+function ensureCheckoutTable(database: DatabaseSync): void {
+  database.exec(`CREATE TABLE IF NOT EXISTS coordinator_checkouts (
+    session_id TEXT NOT NULL,
+    repository_common_dir TEXT NOT NULL,
+    record_json TEXT NOT NULL,
+    PRIMARY KEY(session_id,repository_common_dir)
+  ) STRICT;`);
 }
 
 function initializeOrValidate(database: DatabaseSync): void {
@@ -616,6 +716,36 @@ function validatePage(offset: number, limit: number): void {
     limit > MAX_PAGE
   )
     throw failure("list records", "Page boundary is outside the supported range.");
+}
+
+function parseAttemptOutput(value: unknown): AttemptOutput | undefined {
+  if (value === null) return undefined;
+
+  if (typeof value !== "string")
+    throw failure("decode Attempt output", "Attempt output JSON is not text.");
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(value);
+  } catch (cause) {
+    throw failure("decode Attempt output", "Attempt output JSON is malformed.", cause);
+  }
+
+  if (
+    typeof parsed === "object" &&
+    parsed !== null &&
+    "kind" in parsed &&
+    parsed.kind === "applying" &&
+    "replanned" in parsed &&
+    parsed.replanned === true
+  ) {
+    const { replanned: _replanned, ...current } = parsed;
+
+    return decode(AttemptOutputSchema, current, "Attempt output");
+  }
+
+  return decode(AttemptOutputSchema, parsed, "Attempt output");
 }
 
 function nullableParse<S extends TSchema>(

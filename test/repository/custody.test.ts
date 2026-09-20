@@ -327,6 +327,41 @@ void test("application accepts ignored destination artifacts and recovers struct
   }
 });
 
+void test("an extended Candidate applies directly to its original root", async () => {
+  const fixture = await repository();
+
+  try {
+    let first = operation(fixture, "extended-first", initial(fixture.base));
+    await Effect.runPromise(ensureDetachedWorktree(first));
+    const firstTip = await commit(first.worktreePath, "first candidate");
+    first = { ...first, output: await Effect.runPromise(classifyOutput(first)) };
+
+    let second = operation(fixture, "extended-second", {
+      ...initial(firstTip),
+      lineage: {
+        candidateRoot: fixture.base,
+        candidateOf: { kind: "extend", attemptId: first.attemptId },
+      },
+    });
+
+    await Effect.runPromise(ensureDetachedWorktree(second));
+
+    const secondTip = await commit(second.worktreePath, "second candidate");
+    second = { ...second, output: await Effect.runPromise(classifyOutput(second)) };
+
+    assert.equal(await git(fixture.root, "rev-parse", "HEAD"), fixture.base);
+
+    const prepared = await Effect.runPromise(prepareApplication(second));
+    const applied = await Effect.runPromise(applyOutput({ ...second, output: prepared }));
+
+    assert.equal(applied.kind === "applied" ? applied.revision : "", secondTip);
+    assert.equal(await git(fixture.root, "rev-parse", "HEAD"), secondTip);
+    assert.equal(await git(fixture.root, "show", "HEAD:file.txt"), "second candidate");
+  } finally {
+    await rm(fixture.parent, { recursive: true, force: true });
+  }
+});
+
 void test("integration ancestry, conflicts, and reasoned discard preserve foreign content", async () => {
   const fixture = await repository();
 

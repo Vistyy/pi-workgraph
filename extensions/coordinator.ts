@@ -10,7 +10,7 @@ import {
 import { Effect, Exit, Match, Scope } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
-import { createCheckout } from "../src/coordinator/checkouts.js";
+import { createCheckout, deliverCheckout } from "../src/coordinator/checkouts.js";
 import {
   deliverySettingsPath,
   installDeliveryTools,
@@ -150,12 +150,25 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     calm.setActiveWorkers(0);
   };
 
-  pi.on("before_agent_start", (event) => ({
-    systemPrompt: event.systemPrompt.endsWith(coordinatorContract)
+  pi.on("before_agent_start", (event) => {
+    const contract = event.systemPrompt.includes(coordinatorContract)
       ? event.systemPrompt
-      : `${event.systemPrompt}\n\n${coordinatorContract}`,
-  }));
+      : `${event.systemPrompt}\n\n${coordinatorContract}`;
+
+    const unfinished = attached?.store
+      .listCheckouts()
+      .filter(({ disposition }) => disposition.kind !== "complete")
+      .map(({ checkoutId, disposition }) => `${checkoutId}: ${disposition.kind}`);
+
+    return {
+      systemPrompt:
+        unfinished === undefined || unfinished.length === 0
+          ? contract
+          : `${contract}\n\nUnfinished session-owned Coordinator checkout lifecycle: ${unfinished.join(", ")}. Inspect it before deciding the next delivery action.`,
+    };
+  });
   pi.on("session_start", (_event, ctx) =>
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Session attachment and one authorized checkout reconciliation keep ordering visible.
     serialize(async () => {
       if (deliverySettingsWarning !== undefined)
         ctx.ui.notify(`Workgraph delivery tools unchanged: ${deliverySettingsWarning}`, "warning");
@@ -178,6 +191,20 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
         scope = nextScope;
         attached = next;
+
+        for (const checkout of store.listCheckouts()) {
+          if (checkout.disposition.kind !== "local") continue;
+
+          try {
+            await deliverCheckout({
+              request: { checkoutId: checkout.checkoutId },
+              store,
+              blockCleanup: () => checkoutCleanupBlocker(store, checkout.managedPath),
+            });
+          } catch (cause) {
+            ctx.ui.notify(`Workgraph checkout unfinished: ${publicMessage(cause)}`, "warning");
+          }
+        }
       } catch (cause) {
         await Effect.runPromise(Scope.close(nextScope, Exit.void));
         ctx.ui.notify(`Workgraph blocked: ${publicMessage(cause)}`, "warning");
@@ -208,6 +235,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
             sessionId: ctx.sessionManager.getSessionId(),
             cwd: ctx.cwd,
             ...(params.cwd === undefined ? {} : { path: params.cwd }),
+            store: runtime().store,
           }),
         ),
       );
@@ -479,6 +507,15 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       ),
       Type.Object(
         {
+          section: Type.Literal("checkout", {
+            description: "Read one exact Coordinator checkout lifecycle by ID.",
+          }),
+          id: nonBlank("Exact Coordinator checkout ID."),
+        },
+        { additionalProperties: false },
+      ),
+      Type.Object(
+        {
           section: Type.Literal("report", {
             description: "Read a bounded slice of one Attempt's Worker report.",
           }),
@@ -499,6 +536,64 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     ]),
     execute(_id, params) {
       return serialize(async () => result(inspect(runtime(), params)));
+    },
+  });
+
+  pi.registerTool({
+    name: "workgraph_deliver",
+    label: "Workgraph Deliver",
+    description:
+      "Record or resume the accepted Coordinator checkout disposition. Local delivery integrates only the exact accepted committed revision into the exact authorized attached destination and then verifies owned cleanup; preserve deliberately retains resources.",
+    parameters: Type.Union([
+      Type.Object(
+        {
+          checkoutId: nonBlank("Exact session-owned Coordinator checkout ID."),
+          route: Type.Literal("local"),
+          revision: CommitSchema,
+          destination: Type.Optional(
+            Type.Object(
+              {
+                cwd: nonBlank("Same-repository attached destination checkout."),
+                ref: nonBlank("Exact attached destination ref."),
+              },
+              { additionalProperties: false },
+            ),
+          ),
+        },
+        { additionalProperties: false },
+      ),
+      Type.Object(
+        {
+          checkoutId: nonBlank("Exact session-owned Coordinator checkout ID."),
+          route: Type.Literal("preserve"),
+        },
+        { additionalProperties: false },
+      ),
+      Type.Object(
+        { checkoutId: nonBlank("Resume an already-recorded disposition without new authority.") },
+        { additionalProperties: false },
+      ),
+    ]),
+    execute(_id, params) {
+      return serialize(async () => {
+        const current = runtime();
+
+        const checkout = await deliverCheckout({
+          request: params,
+          store: current.store,
+          blockCleanup: () => {
+            const record = current.store
+              .listCheckouts()
+              .find(({ checkoutId }) => checkoutId === params.checkoutId);
+
+            return record === undefined
+              ? "checkout record disappeared"
+              : checkoutCleanupBlocker(current.store, record.managedPath);
+          },
+        });
+
+        return result(checkout);
+      });
     },
   });
 
@@ -769,6 +864,7 @@ type InspectInput =
       readonly offset?: number;
       readonly limit?: number;
     }
+  | { readonly section: "checkout"; readonly id: string }
   | {
       readonly section: "report";
       readonly attemptId: string;
@@ -788,6 +884,7 @@ function inspect(runtime: SessionRuntime, params: Static<TSchema>) {
         counts: runtime.store.counts(),
         blockers: status.blockers,
         activeWorkers: status.activeWorkers,
+        checkouts: runtime.store.listCheckouts(),
       };
     }
 
@@ -795,6 +892,16 @@ function inspect(runtime: SessionRuntime, params: Static<TSchema>) {
       return inspectTasks(runtime, input);
     case "attempt":
       return inspectAttempts(runtime, input);
+    case "checkout": {
+      const checkout = runtime.store
+        .listCheckouts()
+        .find(({ checkoutId }) => checkoutId === input.id);
+
+      if (checkout === undefined) throw new Error("Coordinator checkout record is absent.");
+
+      return checkout;
+    }
+
     case "report":
       return inspectReport(runtime, input);
   }
@@ -919,6 +1026,14 @@ function registerTask<S extends TSchema>(
 
 function attemptReceipt(record: AttemptRecord) {
   return { taskId: record.taskId, attemptId: record.id, spec: record.spec };
+}
+
+function checkoutCleanupBlocker(store: RecordStore, managedPath: string): string | undefined {
+  const dependencies = store.checkoutDependencyCount(managedPath);
+
+  return dependencies === 0
+    ? undefined
+    : `${dependencies} Worker or Candidate disposition(s) still target this checkout`;
 }
 
 function result(value: object) {
