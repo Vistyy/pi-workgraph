@@ -30,7 +30,6 @@ import {
   prepareApplication,
   prepareDiscard,
   type RepositoryOperation,
-  retryApplication,
   validateRetainedCandidate,
 } from "../repository.js";
 import {
@@ -330,12 +329,14 @@ export class SessionRuntime {
         if (attempt.output?.kind !== "retained" && attempt.output?.kind !== "applying")
           return yield* fail("apply output", "Attempt has no retained or applying output.");
 
-        const prepared = yield* (
-          attempt.output.kind === "applying"
-            ? retryApplication(self.repositoryOperation(attempt))
-            : prepareApplication(self.repositoryOperation(attempt))
-        ).pipe(Effect.mapError((cause) => runtimeError("apply output", cause)));
+        let prepared = yield* prepareApplication(self.repositoryOperation(attempt)).pipe(
+          Effect.mapError((cause) => runtimeError("apply output", cause)),
+        );
 
+        attempt = self.store.checkpointOutput(attemptId, prepared);
+        prepared = yield* prepareApplication(self.repositoryOperation(attempt)).pipe(
+          Effect.mapError((cause) => runtimeError("apply output", cause)),
+        );
         attempt = self.store.checkpointOutput(attemptId, prepared);
 
         const applied = yield* applyOutput(self.repositoryOperation(attempt)).pipe(
@@ -816,7 +817,13 @@ export class SessionRuntime {
     const operation = this.repositoryOperation(attempt);
     let action: Effect.Effect<AttemptOutput, GitError>;
 
-    if (attempt.output?.kind === "applying") action = applyOutput(operation);
+    if (attempt.output?.kind === "applying")
+      action = prepareApplication(operation).pipe(
+        Effect.flatMap((output) =>
+          Effect.sync(() => this.store.checkpointOutput(attempt.id, output)),
+        ),
+        Effect.flatMap((saved) => applyOutput(this.repositoryOperation(saved))),
+      );
     else if (attempt.output?.kind === "discarding") action = discardOutput(operation);
     else if (attempt.output?.kind === "applied" && attempt.output.cleanupTip !== undefined) {
       if (this.store.hasUnclassifiedIntegrationChild(attempt.id)) return Effect.void;
@@ -906,11 +913,6 @@ export class SessionRuntime {
 
     if (attempt.spec.lineage !== undefined)
       lines.push(`Candidate facts: ${JSON.stringify(attempt.spec.lineage)}`);
-
-    if (attempt.spec.lineage?.candidateOf?.kind === "integrate")
-      lines.push(
-        "Integrate the Candidate with a merge that retains both the base revision and sourceTip in HEAD's ancestry. Resolve content as required, but do not replace the merge with copied changes or squash away either parent history. Verify both ancestry relationships before reporting.",
-      );
 
     return {
       content: lines.join("\n"),

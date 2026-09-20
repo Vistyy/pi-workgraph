@@ -29,12 +29,12 @@ const TaskTargetSchema = Type.Union([
 export const AssignmentContextSchema = Type.String({
   maxLength: 20_000,
   description:
-    "Optional settled context, references, scope, or constraints. At most 20,000 characters; cannot grant authority.",
+    "Settled context, references, scope, or constraints; at most 20,000 characters and never authority.",
 });
 
 export const ExpectedEvidenceSchema = Type.Array(NonBlankText, {
   minItems: 1,
-  description: "Evidence the Outcome should provide.",
+  description: "Required Outcome evidence.",
 });
 
 const OptionalContext = Type.Optional(AssignmentContextSchema);
@@ -128,75 +128,6 @@ export const WorkerStateSchema = strict({
   closed: Type.Optional(Type.Literal(true)),
 });
 
-export const CheckoutRecordSchema = strict({
-  checkoutId: NonBlankText,
-  managedPath: NonBlankText,
-  repositoryCommonDir: NonBlankText,
-  ownedBranch: NonBlankText,
-  sourceCheckoutRoot: NonBlankText,
-  sourceHead: CommitSchema,
-  sourceRef: Type.Optional(NonBlankText),
-  disposition: Type.Union([
-    strict({ kind: Type.Literal("creating") }),
-    strict({ kind: Type.Literal("active"), head: CommitSchema }),
-    strict({ kind: Type.Literal("preserved"), head: CommitSchema }),
-    strict({
-      kind: Type.Literal("local"),
-      acceptedRevision: CommitSchema,
-      destinationRoot: NonBlankText,
-      destinationRef: NonBlankText,
-      destinationHead: CommitSchema,
-      preparedRevision: CommitSchema,
-      integrated: Type.Optional(Type.Literal(true)),
-      paused: Type.Optional(Type.Literal(true)),
-      cleanup: Type.Optional(Type.Union([Type.Literal("worktree"), Type.Literal("branch")])),
-    }),
-    strict({
-      kind: Type.Literal("pull_request"),
-      acceptedRevision: CommitSchema,
-      url: NonBlankText,
-      host: NonBlankText,
-      repositoryOwner: NonBlankText,
-      repositoryName: NonBlankText,
-      number: Type.Integer({ minimum: 1 }),
-      baseBranch: NonBlankText,
-      headOwner: NonBlankText,
-      headRepository: NonBlankText,
-      headBranch: NonBlankText,
-      remote: NonBlankText,
-      remoteUrl: NonBlankText,
-      baseRemote: NonBlankText,
-      baseRemoteUrl: NonBlankText,
-      destinationRoot: NonBlankText,
-      destinationRef: NonBlankText,
-      mergedRevision: Type.Optional(CommitSchema),
-      remoteBaseRevision: Type.Optional(CommitSchema),
-      destinationHead: Type.Optional(CommitSchema),
-      preparedRevision: Type.Optional(CommitSchema),
-      integrated: Type.Optional(Type.Literal(true)),
-      paused: Type.Optional(Type.Literal(true)),
-      retained: Type.Optional(Type.Literal("closed_unmerged")),
-      cleanup: Type.Optional(
-        Type.Union([
-          Type.Literal("remote_branch"),
-          Type.Literal("worktree"),
-          Type.Literal("branch"),
-        ]),
-      ),
-    }),
-    strict({
-      kind: Type.Literal("complete"),
-      route: Type.Union([Type.Literal("local"), Type.Literal("pull_request")]),
-      revision: CommitSchema,
-      destinationRoot: NonBlankText,
-      destinationRef: NonBlankText,
-      destinationRevision: CommitSchema,
-      url: Type.Optional(NonBlankText),
-      mergedRevision: Type.Optional(CommitSchema),
-    }),
-  ]),
-});
-
 export const AttemptOutputSchema = Type.Union([
   strict({ kind: Type.Literal("retained"), tip: CommitSchema, reason: NonBlankText }),
   strict({
@@ -205,6 +136,7 @@ export const AttemptOutputSchema = Type.Union([
     sourceTip: CommitSchema,
     destinationRef: Text,
     destinationHead: CommitSchema,
+    replanned: Type.Optional(Type.Literal(true)),
   }),
   strict({
     kind: Type.Literal("discarding"),
@@ -244,8 +176,6 @@ export type AttemptSelection = Static<typeof AttemptSelectionSchema>;
 export type AttemptSpec = Static<typeof AttemptSpecSchema>;
 
 export type WorkerState = Static<typeof WorkerStateSchema>;
-
-export type CheckoutRecord = Static<typeof CheckoutRecordSchema>;
 
 export type AttemptOutput = Static<typeof AttemptOutputSchema>;
 

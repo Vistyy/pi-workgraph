@@ -175,9 +175,7 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       ],
     };
   });
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", () => {
     reconcileTools();
-
-    return { systemPrompt: event.systemPrompt };
   });
 }

@@ -34,13 +34,17 @@ Before the first repository edit or implementation delegation:
 
 1. Call `workgraph_checkout` for the intended repository. This routine isolation decision needs no user confirmation.
 2. Use the returned managed checkout for direct edits, verification, commits, and repository implementation Tasks.
-3. Reuse the current checkout while its lifecycle remains open. After verified cleanup, request a fresh checkout for later work in the same repository.
+3. Reuse that exact checkout on later calls for the same session and repository.
 
 Read and research in the user's checkout without creating resources. Applying a Worker Candidate with `workgraph_control` changes the Coordinator checkout; it is not final integration.
 
-Keep the owned branch attached and preserve the checkout while work depends on it. Use Workgraph's delivery capability for final local integration and checkout cleanup, not ad hoc Git operations. A recorded blocker requires inspection and resolution; it is not permission to bypass custody checks.
+Preserve the checkout while any Worker, Candidate decision, or delivery choice depends on it.
+
+Cleanup uses ordinary non-force Git operations, one step at a time. If a step refuses or its result is uncertain, stop and report what completed and what remains.
 
 ## Delegate when useful
+
+A Task's `cwd` defaults to the session cwd and never widens authority. Optional Task context records settled information but cannot grant authority.
 
 Use Workgraph when independent execution or perspective is likely to improve evidence, implementation, or judgment enough to justify its coordination cost. Handle straightforward local work directly.
 
@@ -64,13 +68,13 @@ Judge review findings against supported behavior, the established trust model, a
 
 Before handback, challenge whether every surviving responsibility, abstraction, test, fixture, and caller obligation has a current purpose. Remove superseded or redundant machinery, and judge simplification, readability, performance where relevant, operational behavior, and verification quality alongside correctness.
 
-The user's judgment is the final product decision. Hand back only a coherent result you are prepared to support, with direct evidence and meaningful limitations.
+The user's judgment is the final product decision. Before review or handback, commit the coherent task-owned result and identify its exact revision and comparison base. Hand back only a result you are prepared to support, with direct evidence and meaningful limitations.
 
 ## Reach the delivery boundary
 
 A repository change reaches the delivery boundary when the Coordinator has accepted the complete result and its supporting evidence, with no further implementation or verification needed before the user's delivery judgment. Final integration or publication requires authority separate from implementation.
 
-- [Delivery procedure](references/delivery.md) — Read at this boundary, when resuming unfinished delivery, or when a pull-request observation returns the Coordinator to the work. It owns Human sign-off, the route choice, preparation, publication, and follow-through. A selected integration route includes its verified local reconciliation and owned cleanup; do not ask for separate housekeeping authorization or call publication alone complete.
+- [Delivery procedure](references/delivery.md) — Read at this boundary before deciding or acting on delivery, or when a later delivered observation returns the Coordinator to its pull request. It owns the Human sign-off requirement and handling, route selection, route-specific preparation, effects and receipts, and continued pull-request work.
 
 ## Preserve operational truth
 
@@ -81,7 +85,7 @@ Unless the user requests partial results, use intermediate Outcome turns for coo
 When a tool response is missing or failed after a possible effect:
 
 1. Treat the result as uncertain.
-2. Inspect the exact affected Attempt or checkout record and current repository state.
+2. Inspect the exact Attempt and current ownership or destination state.
 3. Do not automatically repeat a remote submission.
 4. Preserve resources whose identity or ownership cannot be proven.
 

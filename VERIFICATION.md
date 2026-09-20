@@ -10,8 +10,7 @@ Use the smallest real boundary that distinguishes the supported promise from con
 | --- | --- |
 | Persisted records and Outcomes | Native SQLite store through separate exact-session instances |
 | Worker lifecycle, reports, and observed models | Real Worker Pi session with deterministic Herdr transport |
-| Repository output, Candidates, Coordinator checkouts, and local delivery | Disposable real Git repositories through registered tools |
-| PR completion | Registered delivery tool, controlled forge responses, and a real disposable bare remote |
+| Repository output, Candidates, and Coordinator checkouts | Disposable real Git repositories through registered tools |
 | Coordinator surface | Pi extension registration and returned persisted facts |
 | Implementation trajectory | Real Pi Worker session with controlled providers |
 | Calm | Installed Pi using the running CLI's component constructors |
@@ -54,9 +53,9 @@ Use disposable real Git repositories through registered Workgraph entry points. 
 
 The current contracts are [Targets and Candidate lineage](DESIGN.md#targets-and-candidate-lineage) and [Repository custody](DESIGN.md#repository-custody).
 
-Exercise exact-base placement and both Candidate lineage modes before testing output classification. An extension flow must reach application: place the child from the parent tip, then apply the child directly to the untouched original destination and observe both changes. Placement-only evidence misses an incorrect parent-first application requirement. Classification must occur only after exact Worker closure. Distinguish unchanged completion, committed changed completion, relinquished scratch, preserved noncompletion, and ambiguous or foreign resources by observing native Git state—not Worker report claims.
+Exercise exact-base placement and both Candidate lineage modes before testing output classification. Classification must occur only after exact Worker closure. Distinguish unchanged completion, committed changed completion, relinquished scratch, preserved noncompletion, and ambiguous or foreign resources by observing native Git state—not Worker report claims.
 
-Application preparation must leave destination bytes, `HEAD`, and branch refs unchanged while proving source lineage, destination identity, ancestry, mergeability, and ignored-path safety. The applied result must match the prepared advancement before output is released. Recovery must distinguish an effect that already completed from an effect still eligible to execute. A moved destination must not be silently replanned by background reconciliation; exercise the explicit retry path as well as its refusal conditions.
+Application preparation must leave destination bytes, `HEAD`, and refs unchanged while proving source lineage, destination identity, ancestry, mergeability, and ignored-path safety. The applied result must match the prepared Git structure before output is released. Recovery may accept only that exact structure; a changed destination or uncertain effect blocks without rollback or automatic retry.
 
 Discard evidence must show the reason and exact retained tip checkpointed before deletion, with foreign, pinned, moved, dirty, or uncertain resources preserved. No repository-custody check should push or publish.
 
@@ -64,25 +63,13 @@ Discard evidence must show the reason and exact retained tip checkpointed before
 
 Drive `workgraph_checkout` through the registered tool. For [Coordinator checkout lifecycle](DESIGN.md#coordinator-checkout-lifecycle), observe the filesystem path, direct branch ref, exhaustive worktree registrations, attached `HEAD`, Git common directory, and both backlinks.
 
-Establish that identity is deterministic for one session and repository, isolated across sessions, and based on committed source `HEAD` without copying or changing source checkout bytes. Exact current state may be reused even when managed content changed. Distinguish checkpointed partial operations from unknown partial, duplicate, locked, symlinked, foreign, moved, or unreadable state: durable intent permits only its own proven recovery, not general repair.
+Establish that identity is deterministic for one session and repository, isolated across sessions, and based on committed source `HEAD` without copying or changing source checkout bytes. Exact owned state may be reused even when managed content changed; partial, duplicate, locked, symlinked, foreign, moved, or unreadable state must remain blocked rather than repaired.
 
 A failed native creation response counts as recovered success only when immediate observation proves the complete requested identity at the exact commit. Wrong-commit or partial state must remain visible and blocked.
 
 The supported end-to-end flow is: create the managed checkout, make a direct committed change there, target an Implementation Task there, and apply its Candidate back into that managed destination. This distinguishes Coordinator checkout custody from ordinary Worker output and from the original source checkout.
 
-### Delivery and cleanup
-
-Exercise the whole lifecycle through registered tools: allocate, change, accept a revision, select local delivery, observe destination content and history, observe worktree and branch absence, then allocate again in the same session from an advanced source. A complete receipt must not hide a remaining resource, and a completed record must not recreate resources merely on session resume.
-
-Use independent native Store instances to establish session partitioning and durable progress. Interrupt around integration and each cleanup effect, resume through supported entry points, and inspect actual refs, registrations, and files. The worktree-removed/branch-remaining case is essential: it previously made later allocation fail. Records or helper calls alone do not prove cleanup.
-
-Observe preserved staged, unstaged, untracked, and ignored destination bytes for disjoint changes, and refusal without destructive effects for overlaps or conflicts. Also observe that an advanced or dirty source, active dependencies, or retained output prevents cleanup. Ignored build artifacts in an accepted completed source must not require manual housekeeping.
-
-For PR completion, combine controlled forge responses with real Git remotes and histories. Cover merge, squash, and rebase results, exact accepted-head mismatch, closed-unmerged preservation, already-absent published branches, and changed remote tips. A deletion must compare the expected delivered tip, not merely check it before an unconditional delete. Verify local reconciliation preserves pre-existing unpublished commits and publishes none of them.
-
-A forge response's base SHA is not necessarily the current remote base tip. Establish the actual merged result and current remote ancestry separately. Controlled responses establish adapter and lifecycle behavior, not live publication, authentication, or the independent observer's availability. No maintained test should create a live PR or mutate an installed session.
-
-Inspection of the packaged Coordinator contract and delivery reference establishes the remaining judgment and authority boundary. Do not duplicate runtime checks as prose-matching tests.
+Delivery and cleanup use native repository, forge, and session capabilities. Inspection of the packaged Coordinator contract and delivery reference establishes their authority boundary; it does not establish live forge publication or continued observation.
 
 ## Installed Pi surfaces
 
@@ -112,7 +99,7 @@ Projection fixtures establish classification and caching, not compatibility with
 
 ### Extension and package
 
-Load Coordinator and Worker extensions from the exact checkout through Pi's extension runtime to establish registration, role gating, guidance injection with resolved package-local reference links, and clean release of session-owned resources.
+Load Coordinator and Worker extensions from the exact checkout through Pi's extension runtime to establish registration, role gating, structured Coordinator guidance injection with resolved package-local reference links, forced-prompt fallback, Worker tool reconciliation without prompt forcing, and clean release of session-owned resources.
 
 Pack the exact revision, install it in a disposable consumer, load both supported extension entry points, emit the installed Coordinator's guidance injection, and read the installed delivery reference. Assert that the injected link resolves inside the installed package while the reference body stays unloaded. Archive inspection, source-tree import, or build success does not establish installed package loading. The package check does not establish real Worker lifecycle, native integration, or forge publication.
 

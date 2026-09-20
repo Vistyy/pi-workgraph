@@ -8,7 +8,7 @@ Canonical language for delegated Workgraph coordination and repository output.
 The Pi session responsible for understanding the user's goal, making consequential decisions, delegating where useful, and accepting the final result. It owns its Tasks, Attempts, and Coordinator checkouts.
 
 **Coordinator checkout**:
-A session-owned, branch-backed Git worktree where direct Coordinator changes and Worker Candidates converge before delivery. Its recorded lifecycle includes disposition and cleanup; after completion, the same Coordinator may allocate a fresh checkout for the repository.
+A deterministically named branch-backed Git worktree created or exactly reused on a Coordinator's explicit request as that session's mutable integration destination for one repository. Direct Coordinator changes and Worker Candidates converge there before integration or publication through normal repository tooling; it is not a persisted Workgraph record.
 
 _Avoid_: Workspace
 

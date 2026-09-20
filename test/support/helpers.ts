@@ -125,23 +125,6 @@ export async function extensionFixture(
   let model = registry.getAll()[0];
   const errors: string[] = [];
 
-  const allTools = loaded.extensions.flatMap((extension) =>
-    [...extension.tools.values()].map(({ definition, sourceInfo }) => {
-      const info = {
-        name: definition.name,
-        description: definition.description,
-        parameters: definition.parameters,
-        sourceInfo,
-      };
-
-      return definition.promptGuidelines === undefined
-        ? info
-        : { ...info, promptGuidelines: definition.promptGuidelines };
-    }),
-  );
-
-  let activeTools = allTools.map(({ name }) => name);
-
   const notifications: Array<{
     message: string;
     type?: "info" | "warning" | "error";
@@ -165,11 +148,6 @@ export async function extensionFixture(
       },
       sendMessage: (message) => {
         messages.push(message);
-      },
-      getActiveTools: () => [...activeTools],
-      getAllTools: () => [...allTools],
-      setActiveTools: (names) => {
-        activeTools = [...names];
       },
       getThinkingLevel: () => level,
       setThinkingLevel: (next) => {

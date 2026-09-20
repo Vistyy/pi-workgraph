@@ -10,11 +10,7 @@ import {
 import { Effect, Exit, Match, Scope } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
-import {
-  createCheckout,
-  deliverCheckout,
-  type GitHubReader,
-} from "../src/coordinator/checkouts.js";
+import { createCheckout } from "../src/coordinator/checkouts.js";
 import {
   deliverySettingsPath,
   installDeliveryTools,
@@ -46,22 +42,21 @@ import { resolveRevision, resolveTaskTarget } from "../src/repository.js";
 
 const Text = Type.String({ minLength: 1, pattern: "\\S" });
 
+const COORDINATOR_SECTION = "workgraph_coordinator_contract";
+
 const nonBlank = (description: string) =>
   Type.String({ minLength: 1, pattern: "\\S", description });
 
 const CandidateOf = Type.Optional(
   Type.Object(
     {
-      attemptId: nonBlank("Exact parent Attempt ID."),
+      attemptId: nonBlank("Parent Candidate Attempt ID."),
       mode: StringEnum(["extend", "integrate"] as const, {
         description:
-          "extend continues from the parent's Candidate; integrate starts from the destination and includes the parent's retained output.",
+          "extend starts at the parent Candidate; integrate starts at the destination and incorporates it.",
       }),
     },
-    {
-      additionalProperties: false,
-      description: "Optional parent Candidate relationship for the new Attempt.",
-    },
+    { additionalProperties: false, description: "Optional parent Candidate relationship." },
   ),
 );
 
@@ -75,7 +70,7 @@ const TaskFields = {
   id: TaskIdSchema,
   cwd: Type.Optional(
     nonBlank(
-      "Resolved starting directory for read-only roles, repository seed for Experiment, or destination identity for Implementation; defaults to session cwd and never widens role authority.",
+      "Read-only starting directory, Experiment repository seed, or Implementation destination; defaults to session cwd and grants no authority.",
     ),
   ),
 };
@@ -92,7 +87,6 @@ export interface CoordinatorOptions {
   readonly policyPath?: string;
   readonly settingsPath?: string;
   readonly herdr?: HerdrCliRuntime;
-  readonly github?: GitHubReader;
 }
 
 export default function coordinator(pi: ExtensionAPI, options: CoordinatorOptions = {}): void {
@@ -156,24 +150,16 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   };
 
   pi.on("before_agent_start", (event) => {
-    const contract = event.systemPrompt.includes(coordinatorContract)
-      ? event.systemPrompt
-      : `${event.systemPrompt}\n\n${coordinatorContract}`;
+    if (event.systemPromptOptions.forceSystemPrompt !== undefined) {
+      if (!event.systemPromptOptions.forceSystemPrompt.includes(coordinatorContract))
+        event.systemPromptOptions.forceSystemPrompt = `${event.systemPromptOptions.forceSystemPrompt}\n\n${coordinatorContract}`;
 
-    const unfinished = attached?.store
-      .listCheckouts()
-      .filter(({ disposition }) => disposition.kind !== "complete")
-      .map(({ checkoutId, disposition }) => `${checkoutId}: ${disposition.kind}`);
+      return;
+    }
 
-    return {
-      systemPrompt:
-        unfinished === undefined || unfinished.length === 0
-          ? contract
-          : `${contract}\n\nUnfinished session-owned Coordinator checkout lifecycle: ${unfinished.join(", ")}. Inspect it before deciding the next delivery action.`,
-    };
+    event.systemPromptOptions.sections[COORDINATOR_SECTION] = coordinatorContract;
   });
   pi.on("session_start", (_event, ctx) =>
-    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Session attachment and one authorized checkout reconciliation keep ordering visible.
     serialize(async () => {
       if (deliverySettingsWarning !== undefined)
         ctx.ui.notify(`Workgraph delivery tools unchanged: ${deliverySettingsWarning}`, "warning");
@@ -196,26 +182,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
         scope = nextScope;
         attached = next;
-
-        for (const checkout of store.listCheckouts()) {
-          if (
-            (checkout.disposition.kind !== "local" &&
-              checkout.disposition.kind !== "pull_request") ||
-            checkout.disposition.paused === true
-          )
-            continue;
-
-          try {
-            await deliverCheckout({
-              request: { checkoutId: checkout.checkoutId },
-              store,
-              blockCleanup: () => checkoutCleanupBlocker(store, checkout.managedPath),
-              ...(options.github === undefined ? {} : { github: options.github }),
-            });
-          } catch (cause) {
-            ctx.ui.notify(`Workgraph checkout unfinished: ${publicMessage(cause)}`, "warning");
-          }
-        }
       } catch (cause) {
         await Effect.runPromise(Scope.close(nextScope, Exit.void));
         ctx.ui.notify(`Workgraph blocked: ${publicMessage(cause)}`, "warning");
@@ -246,7 +212,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
             sessionId: ctx.sessionManager.getSessionId(),
             cwd: ctx.cwd,
             ...(params.cwd === undefined ? {} : { path: params.cwd }),
-            store: runtime().store,
           }),
         ),
       );
@@ -297,13 +262,11 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         context: Context,
         expectedEvidence: ExpectedEvidence,
         permittedEffects: Type.Array(
-          nonBlank(
-            "Authorized effect kind, scope, and lifetime independently granted to each Attempt.",
-          ),
+          nonBlank("Effect kind, scope, and lifetime authorized independently for each Attempt."),
           { minItems: 1 },
         ),
         stopCondition: nonBlank(
-          "Hard cutoff by which effects and authorized teardown must be complete; a success-dependent cutoff must include bounded exhaustion, and Workgraph does not automatically enforce it.",
+          "Hard cutoff for effects and authorized teardown; include bounded exhaustion when success-dependent. Workgraph does not enforce it.",
         ),
         selection: Selection,
       },
@@ -377,8 +340,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         }),
         useEscalationExecutor: Type.Optional(
           Type.Boolean({
-            description:
-              "Require the configured escalation executor; Task creation fails if it is unavailable.",
+            description: "Require the configured escalation executor; fail if unavailable.",
           }),
         ),
         candidateOf: CandidateOf,
@@ -421,7 +383,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       {
         ...TaskFields,
         request: nonBlank(
-          "Natural-language request for material the Review should assess; exact revisions are required only when the request depends on them.",
+          "Material to assess; require an exact revision only when the request depends on one.",
         ),
         context: Context,
         selection: Selection,
@@ -447,7 +409,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     name: "workgraph_attempt",
     label: "Workgraph Attempt",
     description:
-      "Create another execution of the same immutable Task under current model policy and a fresh applicable base. Create a new Task instead when the assignment or authority changes.",
+      "Retry the unchanged Task with current model policy and a fresh applicable base; changed assignment or authority requires a new Task.",
     parameters: Type.Object(
       {
         taskId: TaskIdSchema,
@@ -455,8 +417,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         baseRevision: Type.Optional(CommitSchema),
         useEscalationExecutor: Type.Optional(
           Type.Boolean({
-            description:
-              "Require the configured escalation executor; Attempt creation fails if it is unavailable.",
+            description: "Require the configured escalation executor; fail if unavailable.",
           }),
         ),
       },
@@ -518,17 +479,8 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       ),
       Type.Object(
         {
-          section: Type.Literal("checkout", {
-            description: "Read one exact Coordinator checkout lifecycle by ID.",
-          }),
-          id: nonBlank("Exact Coordinator checkout ID."),
-        },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        {
           section: Type.Literal("report", {
-            description: "Read a bounded slice of one Attempt's Worker report.",
+            description: "Read a complete report or an explicit bounded slice.",
           }),
           attemptId: nonBlank("Exact Attempt ID."),
           offset: Type.Optional(
@@ -538,7 +490,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
             Type.Integer({
               minimum: 1,
               maximum: 20_000,
-              description: "Maximum report characters to return.",
+              description: "Slice limit; defaults to 20,000 characters.",
             }),
           ),
         },
@@ -547,89 +499,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     ]),
     execute(_id, params) {
       return serialize(async () => result(inspect(runtime(), params)));
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_deliver",
-    label: "Workgraph Deliver",
-    description:
-      "Record or resume the accepted Coordinator checkout disposition. Local and pull-request routes verify exact bindings, reconcile the authorized destination, and complete owned cleanup; preserve pauses automated effects without discarding proof.",
-    parameters: Type.Union([
-      Type.Object(
-        {
-          checkoutId: nonBlank("Exact session-owned Coordinator checkout ID."),
-          route: Type.Literal("local"),
-          revision: CommitSchema,
-          destination: Type.Optional(
-            Type.Object(
-              {
-                cwd: nonBlank("Same-repository attached destination checkout."),
-                ref: nonBlank("Exact attached destination ref."),
-              },
-              { additionalProperties: false },
-            ),
-          ),
-        },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        {
-          checkoutId: nonBlank("Exact session-owned Coordinator checkout ID."),
-          route: Type.Literal("pull_request"),
-          revision: CommitSchema,
-          url: nonBlank("Exact GitHub pull-request HTTPS URL."),
-          remote: nonBlank("Configured publication remote name."),
-          baseRemote: Type.Optional(nonBlank("Configured remote for the PR base repository.")),
-          destination: Type.Optional(
-            Type.Object(
-              {
-                cwd: nonBlank("Same-repository attached destination checkout."),
-                ref: nonBlank("Exact attached destination ref."),
-              },
-              { additionalProperties: false },
-            ),
-          ),
-        },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        {
-          checkoutId: nonBlank("Exact session-owned Coordinator checkout ID."),
-          route: Type.Literal("preserve"),
-        },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        {
-          checkoutId: nonBlank(
-            "Reconcile an unpaused recorded disposition. A paused delivery needs explicit route selection.",
-          ),
-        },
-        { additionalProperties: false },
-      ),
-    ]),
-    execute(_id, params) {
-      return serialize(async () => {
-        const current = runtime();
-
-        const checkout = await deliverCheckout({
-          request: params,
-          store: current.store,
-          ...(options.github === undefined ? {} : { github: options.github }),
-          blockCleanup: () => {
-            const record = current.store
-              .listCheckouts()
-              .find(({ checkoutId }) => checkoutId === params.checkoutId);
-
-            return record === undefined
-              ? "checkout record disappeared"
-              : checkoutCleanupBlocker(current.store, record.managedPath);
-          },
-        });
-
-        return result(checkout);
-      });
     },
   });
 
@@ -686,11 +555,14 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           if (params.action === "steer") {
             await Effect.runPromise(current.steer(params.attemptId, params.instruction));
 
-            return result({
-              action: params.action,
-              delivery: "submitted",
-              attempt: inspectedAttempt(current, current.store.readAttempt(params.attemptId)),
-            });
+            return result(
+              controlReceipt(
+                current,
+                params.action,
+                current.store.readAttempt(params.attemptId),
+                "submitted",
+              ),
+            );
           }
 
           const operation = Match.value(params).pipe(
@@ -706,7 +578,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
           const attempt = await Effect.runPromise(operation);
 
-          return result({ action: params.action, attempt: inspectedAttempt(current, attempt) });
+          return result(controlReceipt(current, params.action, attempt));
         } catch (cause) {
           throw new Error(
             `${publicMessage(cause)} Inspect exact Attempt ${params.attemptId} persisted state before retrying.`,
@@ -900,7 +772,6 @@ type InspectInput =
       readonly offset?: number;
       readonly limit?: number;
     }
-  | { readonly section: "checkout"; readonly id: string }
   | {
       readonly section: "report";
       readonly attemptId: string;
@@ -920,7 +791,6 @@ function inspect(runtime: SessionRuntime, params: Static<TSchema>) {
         counts: runtime.store.counts(),
         blockers: status.blockers,
         activeWorkers: status.activeWorkers,
-        checkouts: runtime.store.listCheckouts(),
       };
     }
 
@@ -928,16 +798,6 @@ function inspect(runtime: SessionRuntime, params: Static<TSchema>) {
       return inspectTasks(runtime, input);
     case "attempt":
       return inspectAttempts(runtime, input);
-    case "checkout": {
-      const checkout = runtime.store
-        .listCheckouts()
-        .find(({ checkoutId }) => checkoutId === input.id);
-
-      if (checkout === undefined) throw new Error("Coordinator checkout record is absent.");
-
-      return checkout;
-    }
-
     case "report":
       return inspectReport(runtime, input);
   }
@@ -988,14 +848,24 @@ function inspectReport(
   if (attempt.outcome?.result.kind !== "reported") throw new Error("Attempt has no report.");
   const text = JSON.stringify(attempt.outcome.result.report);
   const offset = input.offset ?? 0;
-  const maxChars = input.maxChars ?? 4_000;
+  const maxChars = input.maxChars ?? 20_000;
+  const totalChars = text.length;
+
+  if (offset > totalChars)
+    throw new Error(`Report offset ${offset} exceeds totalChars ${totalChars}.`);
+
+  if (offset === 0 && totalChars <= maxChars)
+    return { attemptId: input.attemptId, totalChars, report: attempt.outcome.result.report };
+
+  const nextOffset = Math.min(offset + maxChars, totalChars);
 
   return {
     attemptId: input.attemptId,
     offset,
     maxChars,
-    totalChars: text.length,
-    text: text.slice(offset, offset + maxChars),
+    totalChars,
+    text: text.slice(offset, nextOffset),
+    nextOffset: nextOffset < totalChars ? nextOffset : null,
   };
 }
 
@@ -1041,6 +911,34 @@ function previewReport(report: object, maxChars = 2_000) {
   };
 }
 
+function controlReceipt(
+  runtime: SessionRuntime,
+  action: "cancel" | "steer" | "apply" | "discard_output",
+  attempt: AttemptRecord,
+  steering?: "submitted",
+) {
+  const result = attempt.outcome?.result;
+
+  return {
+    action,
+    taskId: attempt.taskId,
+    attemptId: attempt.id,
+    output: attempt.output ?? null,
+    outcome:
+      result === undefined
+        ? null
+        : result.kind === "reported"
+          ? {
+              kind: result.kind,
+              status: result.report.status,
+              summary: result.report.summary,
+            }
+          : { kind: result.kind, reason: result.reason },
+    blocker: runtime.blockerFor(attempt.id) ?? null,
+    ...(steering === undefined ? {} : { steering: { status: steering } }),
+  };
+}
+
 function registerTask<S extends TSchema>(
   pi: ExtensionAPI,
   name: string,
@@ -1064,17 +962,9 @@ function attemptReceipt(record: AttemptRecord) {
   return { taskId: record.taskId, attemptId: record.id, spec: record.spec };
 }
 
-function checkoutCleanupBlocker(store: RecordStore, managedPath: string): string | undefined {
-  const dependencies = store.checkoutDependencyCount(managedPath);
-
-  return dependencies === 0
-    ? undefined
-    : `${dependencies} Worker or Candidate disposition(s) still target this checkout`;
-}
-
 function result(value: object) {
   return {
-    content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
+    content: [{ type: "text" as const, text: JSON.stringify(value) }],
     details: value,
   };
 }

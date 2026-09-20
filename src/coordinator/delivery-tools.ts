@@ -68,7 +68,9 @@ export function loadDeferredDeliveryTools(path = deliverySettingsPath()): readon
 const deliveryLoaderName = "workgraph_load_delivery_tools";
 
 export function installDeliveryTools(pi: ExtensionAPI, configured: readonly string[]): void {
-  const names = [...new Set(["workgraph_deliver", ...configured])];
+  const names = [...new Set(configured)];
+
+  if (names.length === 0) return;
 
   const setActiveTools = (next: readonly string[]): void => {
     const active = pi.getActiveTools();
@@ -83,7 +85,7 @@ export function installDeliveryTools(pi: ExtensionAPI, configured: readonly stri
     const loaded = names.filter((name) => available.has(name) && !active.includes(name));
     const missing = names.filter((name) => !available.has(name));
 
-    setActiveTools([...active.filter((name) => name !== deliveryLoaderName), ...loaded]);
+    setActiveTools([...active, ...loaded]);
 
     return { loaded, missing };
   };
@@ -124,7 +126,7 @@ export function installDeliveryTools(pi: ExtensionAPI, configured: readonly stri
       const receipt = activate();
 
       return Promise.resolve({
-        content: [{ type: "text" as const, text: JSON.stringify(receipt, null, 2) }],
+        content: [{ type: "text" as const, text: JSON.stringify(receipt) }],
         details: receipt,
       });
     },

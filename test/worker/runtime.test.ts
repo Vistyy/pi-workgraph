@@ -152,6 +152,20 @@ function assistant(session: SessionManager, model = "gpt-4o") {
   });
 }
 
+void test("before_agent_start reconciles tools without forcing the system prompt", async () => {
+  const f = await fixture("research");
+
+  try {
+    const started = await f.runner.emitBeforeAgentStart("Work", undefined, { cwd: "." });
+
+    assert.equal(started.systemPromptOptions.forceSystemPrompt, undefined);
+    assert.equal(f.activeTools().includes("edit"), false);
+    assert.equal(f.activeTools().includes("workgraph_report"), true);
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("plan tool keeps one strict nonblank 1–9 item current snapshot", async () => {
   const f = await fixture();
 
