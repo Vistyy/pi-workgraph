@@ -115,15 +115,17 @@ async function smokePackage(): Promise<void> {
       const injected = await runner.emitBeforeAgentStart(
         "Coordinate the request",
         undefined,
-        "Base coordinator prompt",
-        { cwd: process.cwd() },
+        { forceSystemPrompt: "Base coordinator prompt", cwd: process.cwd() },
       );
+      const injectedPrompt = injected.systemPromptOptions.forceSystemPrompt;
       const expectedReference = "Delivery procedure at " + JSON.stringify(deliveryReferencePath);
-      if (!injected?.systemPrompt?.includes(expectedReference))
+      if (injected.messages.length !== 0)
+        throw new Error("Packaged coordinator unexpectedly injected a message.");
+      if (!injectedPrompt?.includes(expectedReference))
         throw new Error("Packaged coordinator prompt did not resolve its delivery reference.");
-      if (injected.systemPrompt.includes("](references/delivery.md)"))
+      if (injectedPrompt.includes("](references/delivery.md)"))
         throw new Error("Packaged coordinator prompt retained its source-relative delivery link.");
-      if (injected.systemPrompt.includes("# Deliver an accepted repository change"))
+      if (injectedPrompt.includes("# Deliver an accepted repository change"))
         throw new Error("Packaged coordinator prompt eagerly included the delivery procedure.");
 
       process.env.PI_WORKGRAPH_ROLE = "research";

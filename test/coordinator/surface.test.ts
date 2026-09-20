@@ -5,7 +5,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import {
+  type BuildSystemPromptOptions,
+  SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
 import { Value } from "typebox/value";
 import { RecordStore } from "../../src/coordinator/store.js";
@@ -177,21 +180,26 @@ void test("coordinator registers the exact strict tool surface", async () => {
 
     assert.equal(existsSync(deliveryReferencePath), true);
 
+    const systemPromptOptions = {
+      forceSystemPrompt: "Base coordinator prompt",
+      cwd: f.root,
+    } satisfies BuildSystemPromptOptions;
     const injected = await f.runner.emitBeforeAgentStart(
       "Coordinate the request",
       undefined,
-      "Base coordinator prompt",
-      { cwd: f.root },
+      systemPromptOptions,
     );
+    const injectedPrompt = injected.systemPromptOptions.forceSystemPrompt;
 
+    assert.deepEqual(injected.messages, []);
     assert.equal(
-      injected?.systemPrompt,
+      injectedPrompt,
       `Base coordinator prompt\n\n${guidance}`,
       "the loaded coordinator extension resolves the contract's package-local reference",
     );
-    assert.equal(injected?.systemPrompt.includes("Delivery reference path"), false);
+    assert.equal(injectedPrompt.includes("Delivery reference path"), false);
     assert.equal(
-      injected?.systemPrompt.includes("# Deliver an accepted repository change"),
+      injectedPrompt.includes("# Deliver an accepted repository change"),
       false,
       "delivery-procedure content stays out of the system prompt",
     );
@@ -264,10 +272,13 @@ void test("coordinator extension remains inactive in Worker scope", async () => 
       [],
     );
     assert.equal(f.runner.getCommand("calm"), undefined);
-    assert.equal(
-      await f.runner.emitBeforeAgentStart("Work", undefined, "Worker prompt", { cwd: f.root }),
-      undefined,
-    );
+    const systemPromptOptions = {
+      forceSystemPrompt: "Worker prompt",
+      cwd: f.root,
+    } satisfies BuildSystemPromptOptions;
+    const inactive = await f.runner.emitBeforeAgentStart("Work", undefined, systemPromptOptions);
+    assert.deepEqual(inactive.messages, []);
+    assert.equal(inactive.systemPromptOptions.forceSystemPrompt, "Worker prompt");
   } finally {
     await f.dispose();
   }
