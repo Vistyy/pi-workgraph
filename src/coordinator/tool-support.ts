@@ -1,4 +1,3 @@
-/* oxlint-disable anti-slop/require-safety-comment-for-type-assertion -- Registered TypeBox schemas validate callback values before the typed boundary. */
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
 import type { AttemptRecord } from "../domain/records.js";
@@ -68,7 +67,10 @@ export function registerTask<S extends TSchema>(
     description: `Create one immutable ${label} Task with one or more selected initial Attempts.`,
     parameters,
     execute(_id, params, _signal, _update, ctx) {
-      return serialize(() => run(params as Static<S>, ctx).then(result));
+      // SAFETY: Pi decodes params against the exact registered TypeBox schema before execution.
+      const decoded = params as Static<S>;
+
+      return serialize(() => run(decoded, ctx).then(result));
     },
   });
 }

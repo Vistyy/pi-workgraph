@@ -83,6 +83,42 @@ function worker(overrides: Partial<WorkerState> = {}): WorkerState {
   };
 }
 
+void test("checkout cleanup blocks global queued Workers and only unresolved targeted Candidates", () => {
+  const { root, cleanup } = fixture();
+
+  try {
+    const store = new RecordStore(root, "session-a");
+    store.createTaskWithAttempt("global", directoryTask, "global-attempt", directorySpec);
+    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), true);
+    store.recordOutcome("global-attempt", unreported);
+    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), false);
+
+    const targetedTask: Task = {
+      ...repositoryTask,
+      target: {
+        kind: "repository",
+        checkoutRoot: "/tmp/managed",
+        commonDir: "/tmp/repo/.git",
+      },
+    };
+
+    store.createTaskWithAttempt("targeted", targetedTask, "targeted-attempt", repositorySpec);
+    store.recordOutcome("targeted-attempt", unreported);
+    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), true);
+    store.checkpointOutput("targeted-attempt", {
+      kind: "retained",
+      tip: commit,
+      reason: "awaiting decision",
+    });
+    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), true);
+    store.checkpointOutput("targeted-attempt", { kind: "applied", revision: commit });
+    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), false);
+    store.close();
+  } finally {
+    cleanup();
+  }
+});
+
 void test("record schemas accept exact current shapes and reject undeclared fields", () => {
   assert.equal(Value.Check(CommitSchema, "a".repeat(40)), true);
   assert.equal(Value.Check(CommitSchema, "a".repeat(64)), true);

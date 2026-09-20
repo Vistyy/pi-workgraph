@@ -55,13 +55,18 @@ export async function createCheckout(input: {
     throw new Error("Persisted Coordinator checkout identity does not match this session.");
 
   if (prior?.state.kind === "complete" && observed.kind !== "absent")
+    throw new Error("Completed Coordinator checkout still has native owned resources.");
+
+  if (prior !== undefined && prior.state.kind !== "complete") {
+    if (observed.kind === "absent")
+      throw new Error("Recorded Coordinator checkout resources are unexpectedly absent.");
+
     return { ...prior, head: observed.head, created: false, reused: true };
+  }
 
   const receipt = await Effect.runPromise(
     ensureCoordinatorCheckout({ target: resolved.target, commit: resolved.commit, identity }),
   );
-
-  if (prior !== undefined && prior.state.kind !== "complete") return { ...prior, ...receipt };
 
   const attached = await Effect.runPromise(
     gitResult(resolved.target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]),

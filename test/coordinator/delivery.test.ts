@@ -4,8 +4,10 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import type { CheckoutDeliveryState } from "../../src/coordinator/delivery-state.js";
+import { RecordStore } from "../../src/coordinator/store.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../support/decoders.js";
-import { extensionFixture, git } from "../support/helpers.js";
+import { extensionFixture, fixturePolicy, git } from "../support/helpers.js";
 
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-delivery-"));
@@ -41,6 +43,39 @@ async function fixture() {
       await rm(parent, { recursive: true, force: true });
     },
   };
+}
+
+type AllocatedCheckout = {
+  checkoutId: string;
+  managedPath: string;
+  repositoryCommonDir: string;
+  ownedBranch: string;
+};
+
+async function allocateAccepted(
+  f: Awaited<ReturnType<typeof fixture>>,
+  name = "accepted.txt",
+): Promise<AllocatedCheckout & { accepted: string }> {
+  // SAFETY: Successful registered checkout results expose the asserted compact receipt.
+  const allocated = (await f.call("workgraph_checkout", {})).details as AllocatedCheckout;
+  await writeFile(join(allocated.managedPath, name), `${name}\n`);
+  await git(allocated.managedPath, "add", name);
+  await git(allocated.managedPath, "commit", "-m", `accept ${name}`);
+
+  return { ...allocated, accepted: await git(allocated.managedPath, "rev-parse", "HEAD") };
+}
+
+function checkpoint(
+  f: Awaited<ReturnType<typeof fixture>>,
+  allocated: AllocatedCheckout,
+  state: CheckoutDeliveryState,
+): void {
+  const store = new RecordStore(join(f.parent, "agent"), f.session.getSessionId());
+  const record = store.readCheckout(allocated.repositoryCommonDir);
+
+  assert.ok(record !== undefined);
+  store.checkpointCheckout({ ...record, state });
+  store.close();
 }
 
 void test("local delivery preserves disjoint destination bytes, cleans exact resources, and permits fresh allocation", async () => {
@@ -89,6 +124,22 @@ void test("local delivery preserves disjoint destination bytes, cleans exact res
     assert.equal(existsSync(allocated.managedPath), false);
     await assert.rejects(git(f.root, "rev-parse", "--verify", allocated.ownedBranch));
 
+    await git(
+      f.root,
+      "worktree",
+      "add",
+      "-b",
+      allocated.ownedBranch.slice("refs/heads/".length),
+      allocated.managedPath,
+      delivered.state.destinationRevision,
+    );
+    await assert.rejects(
+      f.call("workgraph_checkout", {}),
+      /Completed Coordinator checkout still has native owned resources/u,
+    );
+    await git(f.root, "worktree", "remove", allocated.managedPath);
+    await git(f.root, "branch", "-d", allocated.ownedBranch.slice("refs/heads/".length));
+
     // SAFETY: Successful registered checkout results expose the asserted compact receipt.
     const fresh = (await f.call("workgraph_checkout", {})).details as {
       checkoutId: string;
@@ -106,108 +157,101 @@ void test("local delivery preserves disjoint destination bytes, cleans exact res
   }
 });
 
-void test("pull-request delivery observes open then merged fork state, integrates current base, and deletes the exact published head", async () => {
-  const f = await fixture();
-  // SAFETY: This only gives a name to the optional process PATH used by the bounded CLI fixture.
-  const environment = process.env as NodeJS.ProcessEnv & { PATH: string | undefined };
-  const priorPath = environment.PATH;
+void test("pull-request delivery integrates merge, squash, and rebase results from an ordinary fork", async () => {
+  for (const method of ["merge", "squash", "rebase"] as const) {
+    const f = await fixture();
+    // SAFETY: This only gives a name to the optional process PATH used by the bounded CLI fixture.
+    const environment = process.env as NodeJS.ProcessEnv & { PATH: string | undefined };
+    const priorPath = environment.PATH;
 
-  try {
-    const baseBare = join(f.parent, "base.git");
-    const forkBare = join(f.parent, "fork.git");
-    await git(f.parent, "init", "--bare", baseBare);
-    await git(f.parent, "init", "--bare", forkBare);
-    await git(f.root, "remote", "add", "upstream", "https://github.com/base/repo.git");
-    await git(f.root, "remote", "add", "fork", "https://github.com/fork/repo.git");
-    await git(f.root, "config", `url.${baseBare}.insteadOf`, "https://github.com/base/repo.git");
-    await git(f.root, "config", `url.${forkBare}.insteadOf`, "https://github.com/fork/repo.git");
-    await git(f.root, "push", "upstream", "main");
+    try {
+      const baseBare = join(f.parent, "base.git");
+      const forkBare = join(f.parent, "fork.git");
+      await git(f.parent, "init", "--bare", baseBare);
+      await git(f.parent, "init", "--bare", forkBare);
+      await git(f.root, "remote", "add", "upstream", "https://github.com/base/repo.git");
+      await git(f.root, "remote", "add", "fork", "https://github.com/fork/repo.git");
+      await git(f.root, "config", `url.${baseBare}.insteadOf`, "https://github.com/base/repo.git");
+      await git(f.root, "config", `url.${forkBare}.insteadOf`, "https://github.com/fork/repo.git");
+      await git(f.root, "push", "upstream", "main");
+      const allocated = await allocateAccepted(f, `${method}.txt`);
+      const branch = allocated.ownedBranch.slice("refs/heads/".length);
+      await git(
+        allocated.managedPath,
+        "push",
+        "fork",
+        `${allocated.ownedBranch}:${allocated.ownedBranch}`,
+      );
 
-    // SAFETY: Successful registered checkout results expose the asserted compact receipt.
-    const allocated = (await f.call("workgraph_checkout", {})).details as {
-      checkoutId: string;
-      managedPath: string;
-      ownedBranch: string;
-    };
+      const bin = join(f.parent, "bin");
+      const response = join(f.parent, "gh-response.json");
+      await mkdir(bin);
+      await writeFile(join(bin, "gh"), `#!/bin/sh\ncat ${JSON.stringify(response)}\n`);
+      await chmod(join(bin, "gh"), 0o700);
+      environment.PATH = `${bin}:${priorPath ?? ""}`;
+      const url = "https://github.com/base/repo/pull/7";
 
-    await writeFile(join(allocated.managedPath, "pr.txt"), "pull request\n");
-    await git(allocated.managedPath, "add", "pr.txt");
-    await git(allocated.managedPath, "commit", "-m", "pull request change");
-    const accepted = await git(allocated.managedPath, "rev-parse", "HEAD");
-    const branch = allocated.ownedBranch.slice("refs/heads/".length);
-    await git(
-      allocated.managedPath,
-      "push",
-      "fork",
-      `${allocated.ownedBranch}:${allocated.ownedBranch}`,
-    );
+      const facts = (state: "OPEN" | "MERGED", merge: string | null) => ({
+        url,
+        state,
+        headRefOid: allocated.accepted,
+        headRefName: branch,
+        headRepository: { nameWithOwner: "fork/repo" },
+        baseRefName: "main",
+        baseRepository: { nameWithOwner: "base/repo" },
+        mergeCommit: merge === null ? null : { oid: merge },
+      });
 
-    const bin = join(f.parent, "bin");
-    const response = join(f.parent, "gh-response.json");
-    await mkdir(bin);
-    await writeFile(join(bin, "gh"), `#!/bin/sh\ncat ${JSON.stringify(response)}\n`);
-    await chmod(join(bin, "gh"), 0o700);
-    environment.PATH = `${bin}:${priorPath ?? ""}`;
-    const url = "https://github.com/base/repo/pull/7";
+      await writeFile(response, JSON.stringify(facts("OPEN", null)));
 
-    const facts = (state: "OPEN" | "MERGED", merge: string | null) => ({
-      url,
-      state,
-      headRefOid: accepted,
-      headRefName: branch,
-      headRepository: { nameWithOwner: "fork/repo" },
-      baseRefName: "main",
-      baseRepository: { nameWithOwner: "base/repo" },
-      mergeCommit: merge === null ? null : { oid: merge },
-    });
-
-    await writeFile(response, JSON.stringify(facts("OPEN", null)));
-
-    // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
-    const pending = (
       await f.call("workgraph_deliver", {
         checkoutId: allocated.checkoutId,
         route: "pull_request",
-        revision: accepted,
+        revision: allocated.accepted,
         url,
         remote: "fork",
-      })
-    ).details as { state: { kind: string; observation: string } };
+      });
 
-    assert.deepEqual(pending.state, {
-      kind: "pull_request",
-      acceptedRevision: accepted,
-      url,
-      remote: "fork",
-      observation: "open",
-    });
+      const mergeClone = join(f.parent, "merge-clone");
+      await git(f.parent, "clone", baseBare, mergeClone);
+      await git(mergeClone, "config", "user.name", "Maintainer");
+      await git(mergeClone, "config", "user.email", "maintainer@example.invalid");
+      await git(mergeClone, "remote", "add", "fork", forkBare);
+      await git(mergeClone, "fetch", "fork", branch);
 
-    const mergeClone = join(f.parent, "merge-clone");
-    await git(f.parent, "clone", baseBare, mergeClone);
-    await git(mergeClone, "config", "user.name", "Maintainer");
-    await git(mergeClone, "config", "user.email", "maintainer@example.invalid");
-    await git(mergeClone, "remote", "add", "fork", forkBare);
-    await git(mergeClone, "fetch", "fork", branch);
-    await git(mergeClone, "cherry-pick", accepted);
-    const merged = await git(mergeClone, "rev-parse", "HEAD");
-    await git(mergeClone, "push", "origin", "main");
-    await writeFile(response, JSON.stringify(facts("MERGED", merged)));
+      if (method === "merge")
+        await git(mergeClone, "merge", "--no-ff", "FETCH_HEAD", "-m", "merge pull request");
+      else if (method === "squash") {
+        await git(mergeClone, "merge", "--squash", "FETCH_HEAD");
+        await git(mergeClone, "commit", "-m", "squash pull request");
+      } else await git(mergeClone, "cherry-pick", allocated.accepted);
 
-    // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
-    const completed = (await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }))
-      .details as {
-      state: { kind: string; mergedRevision: string; destinationRevision: string };
-    };
+      const merged = await git(mergeClone, "rev-parse", "HEAD");
+      await writeFile(join(mergeClone, "current-base.txt"), `${method}\n`);
+      await git(mergeClone, "add", "current-base.txt");
+      await git(mergeClone, "commit", "-m", "advance current base");
+      const currentBase = await git(mergeClone, "rev-parse", "HEAD");
+      await git(mergeClone, "push", "origin", "main");
+      await writeFile(response, JSON.stringify(facts("MERGED", merged)));
 
-    assert.equal(completed.state.kind, "complete");
-    assert.equal(completed.state.mergedRevision, merged);
-    assert.equal(await git(f.root, "rev-parse", "HEAD"), completed.state.destinationRevision);
-    assert.equal(await readFile(join(f.root, "pr.txt"), "utf8"), "pull request\n");
-    await assert.rejects(git(f.root, "ls-remote", "--exit-code", "fork", allocated.ownedBranch));
-    assert.equal(existsSync(allocated.managedPath), false);
-  } finally {
-    environment.PATH = priorPath;
-    await f.dispose();
+      // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+      const completed = (await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }))
+        .details as {
+        state: { kind: string; mergedRevision: string; destinationRevision: string };
+      };
+
+      assert.equal(completed.state.kind, "complete");
+      assert.equal(completed.state.mergedRevision, merged);
+      assert.equal(completed.state.destinationRevision, currentBase);
+      assert.equal(await git(f.root, "rev-parse", "HEAD"), currentBase);
+      assert.equal(await readFile(join(f.root, `${method}.txt`), "utf8"), `${method}.txt\n`);
+      assert.equal(await readFile(join(f.root, "current-base.txt"), "utf8"), `${method}\n`);
+      await assert.rejects(git(f.root, "ls-remote", "--exit-code", "fork", allocated.ownedBranch));
+      assert.equal(existsSync(allocated.managedPath), false);
+    } finally {
+      environment.PATH = priorPath;
+      await f.dispose();
+    }
   }
 });
 
@@ -249,5 +293,284 @@ void test("local delivery refuses a destination collision without advancing or c
     assert.equal(inspected.state.kind, "local_prepared");
   } finally {
     await f.dispose();
+  }
+});
+
+void test("preserve retains an exact dirty owned checkout without changing bytes", async () => {
+  const f = await fixture();
+
+  try {
+    // SAFETY: Successful registered checkout results expose the asserted compact receipt.
+    const allocated = (await f.call("workgraph_checkout", {})).details as AllocatedCheckout;
+    await writeFile(join(allocated.managedPath, "dirty.txt"), "dirty\n");
+    const head = await git(allocated.managedPath, "rev-parse", "HEAD");
+
+    // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+    const preserved = (
+      await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId, route: "preserve" })
+    ).details as { state: { kind: string; revision: string } };
+
+    assert.deepEqual(preserved.state, { kind: "preserved", revision: head });
+    assert.equal(await readFile(join(allocated.managedPath, "dirty.txt"), "utf8"), "dirty\n");
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("local continuation recovers completed integration and interrupted cleanup from native state", async () => {
+  for (const interruption of ["integration", "cleanup"] as const) {
+    const f = await fixture();
+
+    try {
+      const allocated = await allocateAccepted(f, `${interruption}.txt`);
+      const before = await git(f.root, "rev-parse", "HEAD");
+      await git(f.root, "merge", "--ff-only", allocated.accepted);
+
+      checkpoint(
+        f,
+        allocated,
+        interruption === "integration"
+          ? {
+              kind: "local_prepared",
+              acceptedRevision: allocated.accepted,
+              destinationBefore: before,
+              destinationRevision: allocated.accepted,
+            }
+          : {
+              kind: "local_integrated",
+              acceptedRevision: allocated.accepted,
+              destinationRevision: allocated.accepted,
+            },
+      );
+
+      if (interruption === "cleanup")
+        await git(f.root, "worktree", "remove", allocated.managedPath);
+
+      // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+      const completed = (await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }))
+        .details as { state: { kind: string } };
+
+      assert.equal(completed.state.kind, "complete");
+      assert.equal(existsSync(allocated.managedPath), false);
+      await assert.rejects(git(f.root, "rev-parse", "--verify", allocated.ownedBranch));
+    } finally {
+      await f.dispose();
+    }
+  }
+});
+
+void test("cleanup waits for an unrelated current-session queued Worker then continues once settled", async () => {
+  const f = await fixture();
+
+  try {
+    const allocated = await allocateAccepted(f, "gated.txt");
+    await git(f.root, "merge", "--ff-only", allocated.accepted);
+    checkpoint(f, allocated, {
+      kind: "local_integrated",
+      acceptedRevision: allocated.accepted,
+      destinationRevision: allocated.accepted,
+    });
+
+    const store = new RecordStore(join(f.parent, "agent"), f.session.getSessionId());
+    store.createTaskWithAttempt(
+      "queued-global",
+      {
+        target: { kind: "directory", path: f.parent },
+        contract: { kind: "research", question: "hold cleanup" },
+      },
+      "queued-global-attempt",
+      {
+        selection: { kind: "target", target: fixturePolicy.roles.research[0] },
+        base: { kind: "directory" },
+      },
+    );
+
+    await assert.rejects(
+      f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }),
+      /active Worker or unresolved Candidate/u,
+    );
+    assert.equal(existsSync(allocated.managedPath), true);
+
+    store.recordOutcome("queued-global-attempt", {
+      result: { kind: "cancelled", reason: "fixture released" },
+      effectiveModels: [],
+    });
+    store.close();
+
+    // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+    const completed = (await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }))
+      .details as { state: { kind: string } };
+
+    assert.equal(completed.state.kind, "complete");
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("open and closed-unmerged pull requests continue as stable pending and retained states", async () => {
+  const f = await fixture();
+  // SAFETY: This only gives a name to the optional process PATH used by the bounded CLI fixture.
+  const environment = process.env as NodeJS.ProcessEnv & { PATH: string | undefined };
+  const priorPath = environment.PATH;
+
+  try {
+    await git(f.root, "remote", "add", "base", "https://github.com/base/repo.git");
+    await git(f.root, "remote", "add", "fork", "https://github.com/fork/repo.git");
+    const allocated = await allocateAccepted(f, "pending.txt");
+    const branch = allocated.ownedBranch.slice("refs/heads/".length);
+    const bin = join(f.parent, "bin");
+    const response = join(f.parent, "gh-response.json");
+    await mkdir(bin);
+    await writeFile(join(bin, "gh"), `#!/bin/sh\ncat ${JSON.stringify(response)}\n`);
+    await chmod(join(bin, "gh"), 0o700);
+    environment.PATH = `${bin}:${priorPath ?? ""}`;
+    const url = "https://github.com/base/repo/pull/9";
+
+    const facts = (state: "OPEN" | "CLOSED", head = allocated.accepted) => ({
+      url,
+      state,
+      headRefOid: head,
+      headRefName: branch,
+      headRepository: { nameWithOwner: "fork/repo" },
+      baseRefName: "main",
+      baseRepository: { nameWithOwner: "base/repo" },
+      mergeCommit: null,
+    });
+
+    await writeFile(response, JSON.stringify(facts("OPEN")));
+    await git(f.root, "config", "remote.fork.pushurl", "https://github.com/other/repo.git");
+    await assert.rejects(
+      f.call("workgraph_deliver", {
+        checkoutId: allocated.checkoutId,
+        route: "pull_request",
+        revision: allocated.accepted,
+        url,
+        remote: "fork",
+      }),
+      /Publication remote/u,
+    );
+    await git(f.root, "config", "--unset-all", "remote.fork.pushurl");
+
+    await f.call("workgraph_deliver", {
+      checkoutId: allocated.checkoutId,
+      route: "pull_request",
+      revision: allocated.accepted,
+      url,
+      remote: "fork",
+    });
+
+    await writeFile(join(allocated.managedPath, "replacement.txt"), "replacement\n");
+    await git(allocated.managedPath, "add", "replacement.txt");
+    await git(allocated.managedPath, "commit", "-m", "replace open authorization");
+    const replacement = await git(allocated.managedPath, "rev-parse", "HEAD");
+
+    await writeFile(response, JSON.stringify(facts("OPEN", replacement)));
+
+    // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+    const replaced = (
+      await f.call("workgraph_deliver", {
+        checkoutId: allocated.checkoutId,
+        route: "pull_request",
+        revision: replacement,
+        url,
+        remote: "fork",
+      })
+    ).details as { state: { acceptedRevision: string; observation: string } };
+
+    assert.equal(replaced.state.acceptedRevision, replacement);
+
+    // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+    const open = (await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }))
+      .details as { state: { kind: string; observation: string } };
+
+    assert.equal(open.state.observation, "open");
+
+    await writeFile(response, JSON.stringify(facts("CLOSED", replacement)));
+
+    // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+    const closed = (await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }))
+      .details as { state: { kind: string; observation: string } };
+
+    assert.equal(closed.state.observation, "closed_unmerged");
+
+    await writeFile(response, "not json");
+
+    // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+    const retained = (await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }))
+      .details as { state: { kind: string; observation: string } };
+
+    assert.deepEqual(retained.state, closed.state);
+    assert.equal(existsSync(allocated.managedPath), true);
+  } finally {
+    environment.PATH = priorPath;
+    await f.dispose();
+  }
+});
+
+void test("pull-request cleanup blocks changed tips, source drift, and changed push identity; absent tips recover", async () => {
+  for (const scenario of ["changed-tip", "source-drift", "push-identity", "absent"] as const) {
+    const f = await fixture();
+
+    try {
+      const forkBare = join(f.parent, "fork.git");
+      await git(f.parent, "init", "--bare", forkBare);
+      await git(f.root, "remote", "add", "fork", "https://github.com/fork/repo.git");
+      await git(f.root, "config", `url.${forkBare}.insteadOf`, "https://github.com/fork/repo.git");
+      const allocated = await allocateAccepted(f, `${scenario}.txt`);
+      const branch = allocated.ownedBranch.slice("refs/heads/".length);
+      await git(
+        allocated.managedPath,
+        "push",
+        "fork",
+        `${allocated.ownedBranch}:${allocated.ownedBranch}`,
+      );
+      await git(f.root, "merge", "--ff-only", allocated.accepted);
+      checkpoint(f, allocated, {
+        kind: "pull_request_integrated",
+        acceptedRevision: allocated.accepted,
+        url: "https://github.com/base/repo/pull/11",
+        remote: "fork",
+        publicationRepository: "fork/repo",
+        mergedRevision: allocated.accepted,
+        headBranch: branch,
+        destinationRevision: allocated.accepted,
+      });
+
+      if (scenario === "changed-tip") {
+        const clone = join(f.parent, "changed-clone");
+        await git(f.parent, "clone", forkBare, clone);
+        await git(clone, "config", "user.name", "Changer");
+        await git(clone, "config", "user.email", "changer@example.invalid");
+        await git(clone, "checkout", branch);
+        await writeFile(join(clone, "changed.txt"), "changed\n");
+        await git(clone, "add", "changed.txt");
+        await git(clone, "commit", "-m", "change published tip");
+        await git(clone, "push", "origin", branch);
+      } else if (scenario === "source-drift") {
+        await writeFile(join(allocated.managedPath, "dirty.txt"), "dirty\n");
+      } else if (scenario === "push-identity") {
+        await git(f.root, "config", "remote.fork.pushurl", "https://github.com/other/repo.git");
+      } else {
+        await git(f.root, "push", "fork", `:${allocated.ownedBranch}`);
+      }
+
+      if (scenario === "absent") {
+        // SAFETY: Successful registered delivery results expose the asserted compact state receipt.
+        const completed = (await f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }))
+          .details as { state: { kind: string } };
+
+        assert.equal(completed.state.kind, "complete");
+        assert.equal(existsSync(allocated.managedPath), false);
+      } else {
+        await assert.rejects(f.call("workgraph_deliver", { checkoutId: allocated.checkoutId }));
+        assert.equal(existsSync(allocated.managedPath), true);
+        assert.notEqual(
+          await git(f.root, "ls-remote", "--heads", "fork", allocated.ownedBranch),
+          "",
+        );
+      }
+    } finally {
+      await f.dispose();
+    }
   }
 });

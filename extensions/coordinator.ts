@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
+/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -233,7 +233,12 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       ),
     ]),
     execute(_id, params) {
-      return serialize(async () => result(await deliver(runtime().store, params as DeliveryInput)));
+      return serialize(async () => {
+        // SAFETY: Pi decodes params against this exact strict delivery union before execution.
+        const input = params as DeliveryInput;
+
+        return result(await Effect.runPromise(deliver(runtime().store, input)));
+      });
     },
   });
 

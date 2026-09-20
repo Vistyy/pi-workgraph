@@ -1,9 +1,8 @@
-/* oxlint-disable effecttsgo/async-function -- Registered tool execution is the Promise boundary around native Git and GitHub CLI effects. */
-
+import { Data, Effect } from "effect";
+import type { GitError } from "../repository/git.js";
+import { cleanupCoordinatorCheckout, observeAcceptedCheckout } from "./checkout-git.js";
 import {
-  acceptedCheckout,
   advanceDestination,
-  cleanupLocal,
   deletePublishedHead,
   prepareAdvancement,
   prepareMergedPullRequest,
@@ -11,17 +10,13 @@ import {
   verifyPullRequest,
 } from "./delivery-git.js";
 import type { CheckoutDeliveryRecord, CheckoutDeliveryState } from "./delivery-state.js";
-import { readPullRequest } from "./github.js";
+import { type PullRequestFacts, readPullRequest } from "./github.js";
 import type { RecordStore } from "./store.js";
 
-type Completion = {
-  kind: "complete";
-  route: "local" | "pull_request";
-  acceptedRevision: string;
-  destinationRevision: string;
-  url?: string;
-  mergedRevision?: string;
-};
+export class DeliveryError extends Data.TaggedError("DeliveryError")<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
 
 export type DeliveryInput =
   | { readonly checkoutId: string }
@@ -35,213 +30,293 @@ export type DeliveryInput =
       readonly remote: string;
     };
 
-export async function deliver(
+export function deliver(
   store: RecordStore,
   input: DeliveryInput,
-): Promise<CheckoutDeliveryRecord> {
-  const records = store.listCheckouts();
-  let record = records.find((value) => value.checkoutId === input.checkoutId);
+): Effect.Effect<CheckoutDeliveryRecord, GitError | DeliveryError> {
+  const record = store.listCheckouts().find((value) => value.checkoutId === input.checkoutId);
 
   if (record === undefined)
-    throw new Error("Coordinator checkout is not recorded for this session.");
-
-  if ("route" in input && record.destinationRef === undefined)
-    throw new Error("Detached checkout allocation has no authorized delivery destination.");
-
-  if ("route" in input && input.route === "preserve") {
-    if (record.state.kind !== "available" && record.state.kind !== "preserved")
-      throw new Error("Preserve cannot pause or erase a delivery effect already in progress.");
-    const revision = await acceptedCheckout(record, undefined);
-    record = checkpoint(store, record, { kind: "preserved", revision });
-
-    return record;
-  }
+    return deliveryFail("Coordinator checkout is not recorded for this session.");
 
   if (!("route" in input)) return continueDelivery(store, record);
 
-  if (input.route === "local") {
-    if (record.state.kind !== "available" && record.state.kind !== "preserved")
-      throw new Error("A delivery route is already recorded; continue it without route inputs.");
-    await acceptedCheckout(record, input.revision);
-    const prepared = await prepareAdvancement(record, input.revision);
-    record = checkpoint(store, record, {
-      kind: "local_prepared",
-      acceptedRevision: input.revision,
-      ...prepared,
-    });
+  if (record.destinationRef === undefined)
+    return deliveryFail("Detached checkout allocation has no authorized delivery destination.");
 
-    return continueDelivery(store, record);
-  }
+  if (input.route === "preserve") return preserveCheckout(store, record);
+
+  if (input.route === "local") return selectLocal(store, record, input.revision);
 
   return selectPullRequest(store, record, input);
 }
 
-async function selectPullRequest(
+function preserveCheckout(store: RecordStore, record: CheckoutDeliveryRecord) {
+  if (record.state.kind !== "available" && record.state.kind !== "preserved")
+    return deliveryFail("Preserve cannot pause or erase a delivery effect already in progress.");
+
+  return observeAcceptedCheckout(record, undefined, false).pipe(
+    Effect.map((revision) => checkpoint(store, record, { kind: "preserved", revision })),
+  );
+}
+
+function selectLocal(store: RecordStore, record: CheckoutDeliveryRecord, revision: string) {
+  if (record.state.kind !== "available" && record.state.kind !== "preserved")
+    return deliveryFail("A delivery route is already recorded; continue it without route inputs.");
+
+  return Effect.gen(function* () {
+    yield* observeAcceptedCheckout(record, revision);
+
+    const prepared = yield* prepareAdvancement(record, revision);
+
+    const selected = checkpoint(store, record, {
+      kind: "local_prepared",
+      acceptedRevision: revision,
+      ...prepared,
+    });
+
+    return yield* continueDelivery(store, selected);
+  });
+}
+
+function selectPullRequest(
   store: RecordStore,
   record: CheckoutDeliveryRecord,
   input: Extract<DeliveryInput, { route: "pull_request" }>,
-): Promise<CheckoutDeliveryRecord> {
-  const replaceOpen =
-    record.state.kind === "pull_request" &&
-    record.state.observation === "open" &&
-    record.state.url === input.url;
+): Effect.Effect<CheckoutDeliveryRecord, GitError | DeliveryError> {
+  return Effect.gen(function* () {
+    const replaceOpen =
+      record.state.kind === "pull_request" &&
+      record.state.observation === "open" &&
+      record.state.url === input.url;
 
-  if (!replaceOpen && record.state.kind !== "available" && record.state.kind !== "preserved")
-    throw new Error("A delivery route is already recorded; continue it without route inputs.");
-  await acceptedCheckout(record, input.revision);
-  const facts = await readPullRequest(input.url);
-  const binding = await verifyPullRequest(record, input.remote, input.revision, input.url, facts);
+    if (!replaceOpen && record.state.kind !== "available" && record.state.kind !== "preserved")
+      return yield* deliveryFail(
+        "A delivery route is already recorded; continue it without route inputs.",
+      );
 
-  if (facts.state === "OPEN")
-    return checkpoint(store, record, {
-      kind: "pull_request",
+    yield* observeAcceptedCheckout(record, input.revision);
+
+    const facts = yield* pullRequest(input.url);
+
+    const binding = yield* verifyPullRequest(
+      record,
+      input.remote,
+      input.revision,
+      input.url,
+      facts,
+    );
+
+    const authorization = {
       acceptedRevision: input.revision,
       url: input.url,
       remote: input.remote,
-      observation: "open",
+      publicationRepository: binding.publicationRepository,
+    };
+
+    if (facts.state === "OPEN")
+      return checkpoint(store, record, {
+        kind: "pull_request",
+        ...authorization,
+        observation: "open",
+      });
+
+    if (facts.state === "CLOSED")
+      return checkpoint(store, record, {
+        kind: "pull_request",
+        ...authorization,
+        observation: "closed_unmerged",
+      });
+
+    if (facts.mergeCommit === null)
+      return yield* deliveryFail("Merged pull request has no actual merge result.");
+
+    const prepared = yield* prepareMergedPullRequest(
+      record,
+      binding.baseRemote,
+      binding.baseRepository,
+      facts.baseRefName,
+      facts.mergeCommit.oid,
+    );
+
+    const next = checkpoint(store, record, {
+      kind: "pull_request_prepared",
+      ...authorization,
+      mergedRevision: facts.mergeCommit.oid,
+      headBranch: facts.headRefName,
+      baseRemote: binding.baseRemote,
+      baseRepository: binding.baseRepository,
+      baseBranch: facts.baseRefName,
+      ...prepared,
     });
 
-  if (facts.state === "CLOSED")
-    return checkpoint(store, record, {
-      kind: "pull_request",
-      acceptedRevision: input.revision,
-      url: input.url,
-      remote: input.remote,
-      observation: "closed_unmerged",
-    });
-
-  if (facts.mergeCommit === null)
-    throw new Error("Merged pull request has no actual merge result.");
-
-  const prepared = await prepareMergedPullRequest(
-    record,
-    binding.baseRemote,
-    facts.baseRefName,
-    facts.mergeCommit.oid,
-  );
-
-  const next = checkpoint(store, record, {
-    kind: "pull_request_prepared",
-    acceptedRevision: input.revision,
-    url: input.url,
-    remote: input.remote,
-    mergedRevision: facts.mergeCommit.oid,
-    headBranch: facts.headRefName,
-    baseRemote: binding.baseRemote,
-    baseBranch: facts.baseRefName,
-    ...prepared,
+    return yield* continueDelivery(store, next);
   });
-
-  return continueDelivery(store, next);
 }
 
-async function continueDelivery(
+function continueDelivery(
+  store: RecordStore,
+  initial: CheckoutDeliveryRecord,
+): Effect.Effect<CheckoutDeliveryRecord, GitError | DeliveryError> {
+  return Effect.gen(function* () {
+    let record = initial;
+
+    if (record.state.kind === "pull_request") {
+      record = yield* refreshPullRequest(store, record, record.state);
+
+      if (record.state.kind === "pull_request") return record;
+    }
+
+    record = yield* integratePrepared(store, record);
+
+    if (record.state.kind === "complete" || record.state.kind === "preserved") return record;
+
+    if (record.state.kind === "local_integrated")
+      return yield* completeLocal(store, record, record.state);
+
+    if (record.state.kind === "pull_request_integrated")
+      return yield* completePullRequest(store, record, record.state);
+
+    return yield* deliveryFail("Recorded checkout has no route to continue.");
+  });
+}
+
+function completeLocal(
   store: RecordStore,
   record: CheckoutDeliveryRecord,
-): Promise<CheckoutDeliveryRecord> {
-  if (record.state.kind === "pull_request")
-    record = await refreshPullRequest(store, record, record.state);
-  record = await integratePrepared(store, record);
+  state: Extract<CheckoutDeliveryState, { kind: "local_integrated" }>,
+) {
+  return Effect.gen(function* () {
+    yield* proveDestination(record, state.destinationRevision);
+    yield* requireCleanupAvailable(store, record);
+    yield* cleanupCoordinatorCheckout(record, state.acceptedRevision);
 
-  if (record.state.kind !== "integrated") {
-    if (record.state.kind === "complete" || record.state.kind === "preserved") return record;
-    throw new Error("Recorded checkout has no route to continue.");
-  }
-
-  await proveDestination(record, record.state.destinationRevision);
-
-  if (store.checkoutCleanupBlocked(record.managedPath))
-    throw new Error("Checkout cleanup is blocked by an active Worker or unresolved Candidate.");
-
-  if (record.state.route === "pull_request") await deletePublishedHead(record, record.state);
-  await cleanupLocal(record, record.state.acceptedRevision);
-
-  const complete: Completion = {
-    kind: "complete",
-    route: record.state.route,
-    acceptedRevision: record.state.acceptedRevision,
-    destinationRevision: record.state.destinationRevision,
-  };
-
-  if (record.state.url !== undefined) complete.url = record.state.url;
-
-  if (record.state.mergedRevision !== undefined)
-    complete.mergedRevision = record.state.mergedRevision;
-
-  return checkpoint(store, record, complete);
+    return checkpoint(store, record, {
+      kind: "complete",
+      route: "local",
+      acceptedRevision: state.acceptedRevision,
+      destinationRevision: state.destinationRevision,
+    });
+  });
 }
 
-async function refreshPullRequest(
+function completePullRequest(
+  store: RecordStore,
+  record: CheckoutDeliveryRecord,
+  state: Extract<CheckoutDeliveryState, { kind: "pull_request_integrated" }>,
+) {
+  return Effect.gen(function* () {
+    yield* proveDestination(record, state.destinationRevision);
+    yield* requireCleanupAvailable(store, record);
+    yield* deletePublishedHead(record, state);
+    yield* cleanupCoordinatorCheckout(record, state.acceptedRevision);
+
+    return checkpoint(store, record, {
+      kind: "complete",
+      route: "pull_request",
+      acceptedRevision: state.acceptedRevision,
+      destinationRevision: state.destinationRevision,
+      url: state.url,
+      mergedRevision: state.mergedRevision,
+    });
+  });
+}
+
+function requireCleanupAvailable(store: RecordStore, record: CheckoutDeliveryRecord) {
+  if (store.checkoutCleanupBlocked(record.managedPath))
+    return deliveryFail("Checkout cleanup is blocked by an active Worker or unresolved Candidate.");
+
+  return Effect.void;
+}
+
+function refreshPullRequest(
   store: RecordStore,
   record: CheckoutDeliveryRecord,
   state: Extract<CheckoutDeliveryState, { kind: "pull_request" }>,
-): Promise<CheckoutDeliveryRecord> {
-  if (state.observation === "closed_unmerged") return record;
-  const facts = await readPullRequest(state.url);
+): Effect.Effect<CheckoutDeliveryRecord, GitError | DeliveryError> {
+  return Effect.gen(function* () {
+    if (state.observation === "closed_unmerged") return record;
 
-  const binding = await verifyPullRequest(
-    record,
-    state.remote,
-    state.acceptedRevision,
-    state.url,
-    facts,
-  );
+    const facts = yield* pullRequest(state.url);
 
-  if (facts.state === "OPEN") return record;
+    const binding = yield* verifyPullRequest(
+      record,
+      state.remote,
+      state.acceptedRevision,
+      state.url,
+      facts,
+    );
 
-  if (facts.state === "CLOSED")
-    return checkpoint(store, record, { ...state, observation: "closed_unmerged" });
+    if (binding.publicationRepository !== state.publicationRepository)
+      return yield* deliveryFail("Pull request publication identity changed.");
 
-  if (facts.mergeCommit === null)
-    throw new Error("Merged pull request has no actual merge result.");
+    if (facts.state === "OPEN") return record;
 
-  const prepared = await prepareMergedPullRequest(
-    record,
-    binding.baseRemote,
-    facts.baseRefName,
-    facts.mergeCommit.oid,
-  );
+    if (facts.state === "CLOSED")
+      return checkpoint(store, record, { ...state, observation: "closed_unmerged" });
 
-  return checkpoint(store, record, {
-    kind: "pull_request_prepared",
-    acceptedRevision: state.acceptedRevision,
-    url: state.url,
-    remote: state.remote,
-    mergedRevision: facts.mergeCommit.oid,
-    headBranch: facts.headRefName,
-    baseRemote: binding.baseRemote,
-    baseBranch: facts.baseRefName,
-    ...prepared,
+    if (facts.mergeCommit === null)
+      return yield* deliveryFail("Merged pull request has no actual merge result.");
+
+    const prepared = yield* prepareMergedPullRequest(
+      record,
+      binding.baseRemote,
+      binding.baseRepository,
+      facts.baseRefName,
+      facts.mergeCommit.oid,
+    );
+
+    return checkpoint(store, record, {
+      kind: "pull_request_prepared",
+      acceptedRevision: state.acceptedRevision,
+      url: state.url,
+      remote: state.remote,
+      publicationRepository: state.publicationRepository,
+      mergedRevision: facts.mergeCommit.oid,
+      headBranch: facts.headRefName,
+      baseRemote: binding.baseRemote,
+      baseRepository: binding.baseRepository,
+      baseBranch: facts.baseRefName,
+      ...prepared,
+    });
   });
 }
 
-async function integratePrepared(
+function integratePrepared(
   store: RecordStore,
   record: CheckoutDeliveryRecord,
-): Promise<CheckoutDeliveryRecord> {
-  if (record.state.kind === "local_prepared") {
-    await advanceDestination(record, record.state);
+): Effect.Effect<CheckoutDeliveryRecord, GitError> {
+  return Effect.gen(function* () {
+    if (record.state.kind === "local_prepared") {
+      yield* advanceDestination(record, record.state);
+
+      return checkpoint(store, record, {
+        kind: "local_integrated",
+        acceptedRevision: record.state.acceptedRevision,
+        destinationRevision: record.state.destinationRevision,
+      });
+    }
+
+    if (record.state.kind !== "pull_request_prepared") return record;
+    yield* advanceDestination(record, record.state);
 
     return checkpoint(store, record, {
-      kind: "integrated",
-      route: "local",
+      kind: "pull_request_integrated",
       acceptedRevision: record.state.acceptedRevision,
       destinationRevision: record.state.destinationRevision,
+      url: record.state.url,
+      mergedRevision: record.state.mergedRevision,
+      remote: record.state.remote,
+      publicationRepository: record.state.publicationRepository,
+      headBranch: record.state.headBranch,
     });
-  }
+  });
+}
 
-  if (record.state.kind !== "pull_request_prepared") return record;
-  await advanceDestination(record, record.state);
-
-  return checkpoint(store, record, {
-    kind: "integrated",
-    route: "pull_request",
-    acceptedRevision: record.state.acceptedRevision,
-    destinationRevision: record.state.destinationRevision,
-    url: record.state.url,
-    mergedRevision: record.state.mergedRevision,
-    remote: record.state.remote,
-    headBranch: record.state.headBranch,
+function pullRequest(url: string): Effect.Effect<PullRequestFacts, DeliveryError> {
+  return Effect.tryPromise({
+    try: () => readPullRequest(url),
+    catch: (cause) => new DeliveryError({ message: "Pull request read failed.", cause }),
   });
 }
 
@@ -251,4 +326,8 @@ function checkpoint(
   state: CheckoutDeliveryState,
 ) {
   return store.checkpointCheckout({ ...record, state });
+}
+
+function deliveryFail(message: string): Effect.Effect<never, DeliveryError> {
+  return Effect.fail(new DeliveryError({ message }));
 }

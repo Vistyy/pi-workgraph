@@ -1,321 +1,382 @@
-/* oxlint-disable effecttsgo/async-function -- This module is the native Git Promise boundary for explicit delivery calls. */
-import { execFile } from "node:child_process";
-import { lstat, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
-import { promisify } from "node:util";
-import { Type } from "typebox";
-import { Value } from "typebox/value";
+import { Effect } from "effect";
+import {
+  ancestry,
+  exactCommit,
+  fail,
+  filesystem,
+  type GitError,
+  git,
+  gitDir,
+  gitDirResult,
+  gitDirWithOptions,
+  gitResult,
+} from "../repository/git.js";
+import { observeAcceptedCheckout } from "./checkout-git.js";
 import type { CheckoutDeliveryRecord, CheckoutDeliveryState } from "./delivery-state.js";
 import type { PullRequestFacts } from "./github.js";
 
-const exec = promisify(execFile);
+const NETWORK_TIMEOUT_MS = 30_000;
 
-const CommandFailureSchema = Type.Object(
-  {
-    code: Type.Integer(),
-    stdout: Type.Optional(Type.String()),
-    stderr: Type.Optional(Type.String()),
-  },
-  { additionalProperties: true },
-);
+type PullRequestIntegrated = Extract<CheckoutDeliveryState, { kind: "pull_request_integrated" }>;
 
-export async function acceptedCheckout(
-  record: CheckoutDeliveryRecord,
-  requested: string | undefined,
-): Promise<string> {
-  const common = await git(
-    record.managedPath,
-    "rev-parse",
-    "--path-format=absolute",
-    "--git-common-dir",
-  );
+function destination(record: CheckoutDeliveryRecord) {
+  return Effect.gen(function* () {
+    if (record.sourcePath === record.managedPath)
+      return yield* fail(
+        "inspect delivery destination",
+        "Managed checkout cannot be its own delivery destination.",
+      );
 
-  if ((await realpath(resolve(record.managedPath, common))) !== record.repositoryCommonDir)
-    throw new Error("Managed checkout repository identity changed.");
+    const path = yield* filesystem("inspect delivery destination", () =>
+      realpath(record.sourcePath),
+    );
 
-  if ((await git(record.managedPath, "symbolic-ref", "-q", "HEAD")) !== record.ownedBranch)
-    throw new Error("Managed checkout is not attached to its owned branch.");
-  const head = await git(record.managedPath, "rev-parse", "--verify", "HEAD^{commit}");
+    if (path !== record.sourcePath)
+      return yield* fail(
+        "inspect delivery destination",
+        "Destination checkout path identity changed.",
+      );
 
-  if (requested !== undefined && head !== requested)
-    throw new Error("Accepted revision is not the exact managed checkout HEAD.");
+    const commonText = yield* git(record.sourcePath, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ]);
 
-  if (
-    (
-      await git(
-        record.managedPath,
-        "status",
-        "--porcelain",
-        "--untracked-files=all",
-        "--ignored=matching",
-      )
-    ).length > 0
-  )
-    throw new Error("Accepted managed checkout is not clean.");
+    const common = yield* filesystem("inspect delivery destination", () =>
+      realpath(resolve(record.sourcePath, commonText)),
+    );
 
-  return head;
+    if (common !== record.repositoryCommonDir)
+      return yield* fail(
+        "inspect delivery destination",
+        "Destination repository identity changed.",
+      );
+
+    const ref = yield* git(record.sourcePath, ["symbolic-ref", "-q", "HEAD"]);
+
+    if (ref !== record.destinationRef)
+      return yield* fail("inspect delivery destination", "Destination ref changed.");
+
+    return {
+      head: yield* exactCommit(
+        record.repositoryCommonDir,
+        "HEAD",
+        "inspect delivery destination",
+        record.sourcePath,
+      ),
+    };
+  });
 }
 
-async function destination(record: CheckoutDeliveryRecord) {
-  if (record.sourcePath === record.managedPath)
-    throw new Error("Managed checkout cannot be its own delivery destination.");
+export function prepareAdvancement(record: CheckoutDeliveryRecord, source: string) {
+  return Effect.gen(function* () {
+    const current = yield* destination(record);
+    const revision = yield* advancementRevision(record, current.head, source);
 
-  if ((await realpath(record.sourcePath)) !== record.sourcePath)
-    throw new Error("Destination checkout path identity changed.");
-
-  const common = await git(
-    record.sourcePath,
-    "rev-parse",
-    "--path-format=absolute",
-    "--git-common-dir",
-  );
-
-  if ((await realpath(resolve(record.sourcePath, common))) !== record.repositoryCommonDir)
-    throw new Error("Destination repository identity changed.");
-  const ref = await git(record.sourcePath, "symbolic-ref", "-q", "HEAD");
-
-  if (ref !== record.destinationRef) throw new Error("Destination ref changed.");
-
-  return { ref, head: await git(record.sourcePath, "rev-parse", "--verify", "HEAD^{commit}") };
+    return { destinationBefore: current.head, destinationRevision: revision };
+  });
 }
 
-export async function prepareAdvancement(record: CheckoutDeliveryRecord, source: string) {
-  const current = await destination(record);
-  const revision = await advancementRevision(record, current.head, source);
-
-  return { destinationBefore: current.head, destinationRevision: revision };
-}
-
-async function advancementRevision(
+function advancementRevision(
   record: CheckoutDeliveryRecord,
   destinationHead: string,
   source: string,
-): Promise<string> {
-  if (await ancestor(record.repositoryCommonDir, destinationHead, source)) return source;
+): Effect.Effect<string, GitError> {
+  return Effect.gen(function* () {
+    if (yield* ancestry(record.repositoryCommonDir, destinationHead, source)) return source;
 
-  if (await ancestor(record.repositoryCommonDir, source, destinationHead)) return destinationHead;
-  let tree: string;
+    if (yield* ancestry(record.repositoryCommonDir, source, destinationHead))
+      return destinationHead;
 
-  try {
-    tree = await gitDir(
-      record.repositoryCommonDir,
+    const merge = yield* gitDirResult(record.repositoryCommonDir, [
       "merge-tree",
       "--write-tree",
       destinationHead,
       source,
+    ]);
+
+    if (merge.code !== 0 || merge.stdout.length === 0)
+      return yield* fail(
+        "prepare destination advancement",
+        "Accepted change conflicts with the destination; nothing was mutated.",
+      );
+
+    const timestamp = yield* gitDir(record.repositoryCommonDir, [
+      "show",
+      "-s",
+      "--format=%ct",
+      destinationHead,
+    ]);
+
+    const environment = {
+      ...globalThis.process.env,
+      GIT_AUTHOR_NAME: "Workgraph",
+      GIT_AUTHOR_EMAIL: "workgraph@example.invalid",
+      GIT_AUTHOR_DATE: `${timestamp} +0000`,
+      GIT_COMMITTER_NAME: "Workgraph",
+      GIT_COMMITTER_EMAIL: "workgraph@example.invalid",
+      GIT_COMMITTER_DATE: `${timestamp} +0000`,
+    };
+
+    return yield* gitDirWithOptions(
+      record.repositoryCommonDir,
+      [
+        "commit-tree",
+        merge.stdout,
+        "-p",
+        destinationHead,
+        "-p",
+        source,
+        "-m",
+        `Integrate Workgraph checkout ${record.checkoutId}`,
+      ],
+      { env: environment },
     );
-  } catch (cause) {
-    throw new Error("Accepted change conflicts with the destination; nothing was mutated.", {
-      cause,
-    });
-  }
-
-  const timestamp = await gitDir(
-    record.repositoryCommonDir,
-    "show",
-    "-s",
-    "--format=%ct",
-    destinationHead,
-  );
-
-  const environment = {
-    ...process.env,
-    GIT_AUTHOR_NAME: "Workgraph",
-    GIT_AUTHOR_EMAIL: "workgraph@example.invalid",
-    GIT_AUTHOR_DATE: `${timestamp} +0000`,
-    GIT_COMMITTER_NAME: "Workgraph",
-    GIT_COMMITTER_EMAIL: "workgraph@example.invalid",
-    GIT_COMMITTER_DATE: `${timestamp} +0000`,
-  };
-
-  return gitDirEnv(
-    record.repositoryCommonDir,
-    environment,
-    "commit-tree",
-    tree,
-    "-p",
-    destinationHead,
-    "-p",
-    source,
-    "-m",
-    `Integrate Workgraph checkout ${record.checkoutId}`,
-  );
+  });
 }
 
-export async function advanceDestination(
+export function advanceDestination(
   record: CheckoutDeliveryRecord,
-  state: { destinationBefore: string; destinationRevision: string },
+  state: { readonly destinationBefore: string; readonly destinationRevision: string },
 ) {
-  const current = await destination(record);
+  return Effect.gen(function* () {
+    const current = yield* destination(record);
 
-  if (current.head === state.destinationRevision) return;
+    if (current.head === state.destinationRevision) return;
 
-  if (current.head !== state.destinationBefore)
-    throw new Error("Destination changed after delivery preparation.");
-  await git(
-    record.sourcePath,
-    "merge",
-    "--ff-only",
-    "--no-overwrite-ignore",
-    state.destinationRevision,
-  );
-  await proveDestination(record, state.destinationRevision);
+    if (current.head !== state.destinationBefore)
+      return yield* fail(
+        "advance delivery destination",
+        "Destination changed after delivery preparation.",
+      );
+
+    const advancement = yield* gitResult(record.sourcePath, [
+      "merge",
+      "--ff-only",
+      "--no-overwrite-ignore",
+      state.destinationRevision,
+    ]);
+
+    if (advancement.code !== 0)
+      return yield* fail(
+        "advance delivery destination",
+        advancement.stderr || advancement.stdout || "Git refused destination advancement.",
+      );
+    yield* proveDestination(record, state.destinationRevision);
+  });
 }
 
-export async function proveDestination(record: CheckoutDeliveryRecord, revision: string) {
-  const current = await destination(record);
+export function proveDestination(record: CheckoutDeliveryRecord, revision: string) {
+  return Effect.gen(function* () {
+    const current = yield* destination(record);
 
-  if (current.head !== revision) throw new Error("Destination integration proof is absent.");
+    if (current.head !== revision)
+      return yield* fail(
+        "prove destination integration",
+        "Destination integration proof is absent.",
+      );
+  });
 }
 
-export async function verifyPullRequest(
+export function verifyPullRequest(
   record: CheckoutDeliveryRecord,
   remote: string,
   accepted: string,
   url: string,
   facts: PullRequestFacts,
 ) {
-  if (facts.url !== url || facts.headRefOid !== accepted)
-    throw new Error("Pull request URL or accepted head SHA does not match.");
-  const owned = record.ownedBranch.slice("refs/heads/".length);
+  return Effect.gen(function* () {
+    if (facts.url !== url || facts.headRefOid !== accepted)
+      return yield* fail(
+        "verify pull request",
+        "Pull request URL or accepted head SHA does not match.",
+      );
 
-  if (facts.headRefName !== owned)
-    throw new Error("Pull request head is not the owned checkout branch.");
-  const remotes = (await git(record.sourcePath, "remote")).split("\n").filter(Boolean);
+    const owned = record.ownedBranch.slice("refs/heads/".length);
 
-  if (!remotes.includes(remote)) throw new Error("Publication remote is not configured.");
+    if (facts.headRefName !== owned)
+      return yield* fail(
+        "verify pull request",
+        "Pull request head is not the owned checkout branch.",
+      );
 
-  const identities = await Promise.all(
-    remotes.map(async (name) => ({
-      name,
-      repository: githubRepository(
-        await git(record.sourcePath, "config", "--get", `remote.${name}.url`),
-      ),
-    })),
-  );
+    const publicationRepository = facts.headRepository.nameWithOwner.toLowerCase();
+    yield* verifyRemoteRepository(record, remote, publicationRepository, true);
+    const baseRepository = facts.baseRepository.nameWithOwner.toLowerCase();
+    const names = (yield* git(record.sourcePath, ["remote"], true)).split("\n").filter(Boolean);
+    const matches: string[] = [];
 
-  const publication = identities.find((value) => value.name === remote);
+    for (const name of names) {
+      const repositories = yield* remoteRepositories(record, name, false);
 
-  if (publication?.repository !== facts.headRepository.nameWithOwner.toLowerCase())
-    throw new Error("Publication remote does not identify the pull request head repository.");
+      if (repositories.length === 1 && repositories[0] === baseRepository) matches.push(name);
+    }
 
-  const baseMatches = identities.filter(
-    (value) => value.repository === facts.baseRepository.nameWithOwner.toLowerCase(),
-  );
+    if (matches.length !== 1)
+      return yield* fail(
+        "verify pull request",
+        "Exactly one configured fetch remote must identify the pull request base repository.",
+      );
 
-  if (baseMatches.length !== 1)
-    throw new Error(
-      "Exactly one configured remote must identify the pull request base repository.",
-    );
+    const baseRemote = matches[0];
 
-  const base = baseMatches[0];
+    if (baseRemote === undefined)
+      return yield* fail("verify pull request", "Pull request base remote disappeared.");
 
-  if (base === undefined) throw new Error("Pull request base remote disappeared.");
-
-  return { baseRemote: base.name };
+    return { publicationRepository, baseRepository, baseRemote };
+  });
 }
 
-export async function prepareMergedPullRequest(
+export function prepareMergedPullRequest(
   record: CheckoutDeliveryRecord,
   baseRemote: string,
+  baseRepository: string,
   baseBranch: string,
   mergedRevision: string,
 ) {
-  await git(record.sourcePath, "fetch", "--no-tags", baseRemote, `refs/heads/${baseBranch}`);
-  const currentBase = await git(record.sourcePath, "rev-parse", "--verify", "FETCH_HEAD^{commit}");
+  return Effect.gen(function* () {
+    yield* verifyRemoteRepository(record, baseRemote, baseRepository, false);
 
-  if (!(await ancestor(record.repositoryCommonDir, mergedRevision, currentBase)))
-    throw new Error(
-      "Actual merged result is not contained in the current pull request base branch.",
+    const fetched = yield* gitResult(
+      record.sourcePath,
+      ["fetch", "--no-tags", baseRemote, `refs/heads/${baseBranch}`],
+      { timeout: NETWORK_TIMEOUT_MS },
     );
 
-  return prepareAdvancement(record, currentBase);
+    if (fetched.code !== 0)
+      return yield* fail(
+        "fetch pull request base",
+        fetched.stderr || fetched.stdout || "Current pull request base could not be fetched.",
+      );
+
+    const currentBase = yield* exactCommit(
+      record.repositoryCommonDir,
+      "FETCH_HEAD",
+      "inspect fetched pull request base",
+      record.sourcePath,
+    );
+
+    if (!(yield* ancestry(record.repositoryCommonDir, mergedRevision, currentBase)))
+      return yield* fail(
+        "verify merged pull request",
+        "Actual merged result is not contained in the current pull request base branch.",
+      );
+
+    return yield* prepareAdvancement(record, currentBase);
+  });
 }
 
-export async function deletePublishedHead(
+export function deletePublishedHead(record: CheckoutDeliveryRecord, state: PullRequestIntegrated) {
+  return Effect.gen(function* () {
+    const branchRef = `refs/heads/${state.headBranch}`;
+    let tip = yield* publishedTip(record, state.remote, branchRef);
+
+    if (tip === undefined) return;
+    yield* observeAcceptedCheckout(record, state.acceptedRevision);
+    yield* verifyRemoteRepository(record, state.remote, state.publicationRepository, true);
+    tip = yield* publishedTip(record, state.remote, branchRef);
+
+    if (tip === undefined) return;
+
+    if (tip !== state.acceptedRevision)
+      return yield* fail(
+        "delete published head",
+        "Published head changed; remote branch was preserved.",
+      );
+
+    const deletion = yield* gitResult(
+      record.sourcePath,
+      [
+        "push",
+        `--force-with-lease=${branchRef}:${state.acceptedRevision}`,
+        state.remote,
+        `:${branchRef}`,
+      ],
+      { timeout: NETWORK_TIMEOUT_MS },
+    );
+
+    const remaining = yield* publishedTip(record, state.remote, branchRef);
+
+    if (remaining === undefined) return;
+
+    if (remaining !== state.acceptedRevision)
+      return yield* fail(
+        "delete published head",
+        "Published head changed during deletion; resources were preserved.",
+      );
+
+    return yield* fail(
+      "delete published head",
+      deletion.stderr || deletion.stdout || "Published head deletion was not proven.",
+    );
+  });
+}
+
+function verifyRemoteRepository(
   record: CheckoutDeliveryRecord,
-  state: Extract<CheckoutDeliveryState, { kind: "integrated" }>,
+  remote: string,
+  expected: string,
+  push: boolean,
 ) {
-  if (state.remote === undefined || state.headBranch === undefined)
-    throw new Error("Published head deletion proof is incomplete.");
+  return remoteRepositories(record, remote, push).pipe(
+    Effect.flatMap((repositories) => {
+      if (repositories.length !== 1 || repositories[0] !== expected)
+        return fail(
+          "verify Git remote identity",
+          `${push ? "Publication" : "Base fetch"} remote does not have one unambiguous GitHub repository identity.`,
+        );
 
-  const result = await gitResult(
-    record.sourcePath,
-    "ls-remote",
-    "--heads",
-    state.remote,
-    `refs/heads/${state.headBranch}`,
-  );
-
-  if (result.code !== 0) throw new Error("Published head tip could not be inspected.");
-
-  if (result.stdout.length === 0) return;
-  const fields = result.stdout.split(/\s+/u);
-
-  if (fields[0] !== state.acceptedRevision || fields[1] !== `refs/heads/${state.headBranch}`)
-    throw new Error("Published head changed; remote branch was preserved.");
-  await git(
-    record.sourcePath,
-    "push",
-    `--force-with-lease=refs/heads/${state.headBranch}:${state.acceptedRevision}`,
-    state.remote,
-    `:refs/heads/${state.headBranch}`,
+      return Effect.void;
+    }),
   );
 }
 
-export async function cleanupLocal(record: CheckoutDeliveryRecord, accepted: string) {
-  const pathEntry = await lstat(record.managedPath).catch((cause: unknown) =>
-    isMissing(cause) ? undefined : Promise.reject(cause),
+function remoteRepositories(record: CheckoutDeliveryRecord, remote: string, push: boolean) {
+  return Effect.gen(function* () {
+    let result = yield* gitResult(record.sourcePath, [
+      "config",
+      "--get-all",
+      `remote.${remote}.${push ? "pushurl" : "url"}`,
+    ]);
+
+    if (push && result.code === 1)
+      result = yield* gitResult(record.sourcePath, ["config", "--get-all", `remote.${remote}.url`]);
+
+    if (result.code !== 0)
+      return yield* fail(
+        "verify Git remote identity",
+        "Configured Git remote could not be resolved.",
+      );
+
+    return result.stdout.split("\n").filter(Boolean).map(githubRepository);
+  });
+}
+
+function publishedTip(record: CheckoutDeliveryRecord, remote: string, branchRef: string) {
+  return gitResult(record.sourcePath, ["ls-remote", "--heads", remote, branchRef], {
+    timeout: NETWORK_TIMEOUT_MS,
+  }).pipe(
+    Effect.flatMap((result) => {
+      if (result.code !== 0)
+        return fail("inspect published head", "Published head tip could not be inspected.");
+
+      // oxlint-disable-next-line effecttsgo/effect-succeed-with-void -- This branch inhabits the explicit optional-tip result.
+      if (result.stdout.length === 0) return Effect.succeed<string | undefined>(undefined);
+      const lines = result.stdout.split("\n");
+
+      if (lines.length !== 1)
+        return fail("inspect published head", "Published head identity is ambiguous.");
+      const fields = lines[0]?.split(/\s+/u);
+
+      if (fields?.length !== 2 || fields[1] !== branchRef)
+        return fail("inspect published head", "Published head response is malformed.");
+
+      return Effect.succeed<string | undefined>(fields[0]);
+    }),
   );
-
-  const registrations = await gitDir(
-    record.repositoryCommonDir,
-    "worktree",
-    "list",
-    "--porcelain",
-    "-z",
-  );
-
-  const pathRegistered = registrations.includes(`worktree ${record.managedPath}\0`);
-  const branchRegistered = registrations.includes(`branch ${record.ownedBranch}\0`);
-
-  const branch = await gitResultDir(
-    record.repositoryCommonDir,
-    "rev-parse",
-    "--verify",
-    "--quiet",
-    `${record.ownedBranch}^{commit}`,
-  );
-
-  const branchTip = branch.code === 0 ? branch.stdout : undefined;
-
-  if (pathEntry !== undefined || pathRegistered || branchRegistered) {
-    if (pathEntry === undefined || !pathRegistered || !branchRegistered)
-      throw new Error("Owned checkout cleanup resources are partial or unexpected.");
-    await acceptedCheckout(record, accepted);
-    await git(record.sourcePath, "worktree", "remove", record.managedPath);
-  }
-
-  if (branchTip !== undefined && branchTip !== accepted)
-    throw new Error("Owned checkout branch changed; it was preserved.");
-
-  if (branchTip === accepted)
-    await gitDir(record.repositoryCommonDir, "update-ref", "-d", record.ownedBranch, accepted);
-
-  const afterPath = await lstat(record.managedPath).catch((cause: unknown) =>
-    isMissing(cause) ? undefined : Promise.reject(cause),
-  );
-
-  const afterBranch = await gitResultDir(
-    record.repositoryCommonDir,
-    "rev-parse",
-    "--verify",
-    "--quiet",
-    record.ownedBranch,
-  );
-
-  if (afterPath !== undefined || afterBranch.code === 0)
-    throw new Error("Owned checkout cleanup postcondition is absent.");
 }
 
 function githubRepository(url: string): string | undefined {
@@ -324,66 +385,4 @@ function githubRepository(url: string): string | undefined {
   );
 
   return match?.[1]?.toLowerCase();
-}
-
-async function ancestor(commonDir: string, parent: string, child: string) {
-  const result = await gitResultDir(commonDir, "merge-base", "--is-ancestor", parent, child);
-
-  if (result.code === 0) return true;
-
-  if (result.code === 1) return false;
-  throw new Error("Git ancestry could not be inspected.");
-}
-
-async function git(cwd: string, ...args: string[]) {
-  return (await run(["-C", cwd, ...args])).stdout;
-}
-
-async function gitDir(commonDir: string, ...args: string[]) {
-  return (await run([`--git-dir=${commonDir}`, ...args])).stdout;
-}
-
-async function gitDirEnv(commonDir: string, env: NodeJS.ProcessEnv, ...args: string[]) {
-  return (await run([`--git-dir=${commonDir}`, ...args], env)).stdout;
-}
-
-async function gitResult(cwd: string, ...args: string[]) {
-  return runResult(["-C", cwd, ...args]);
-}
-
-async function gitResultDir(commonDir: string, ...args: string[]) {
-  return runResult([`--git-dir=${commonDir}`, ...args]);
-}
-
-async function run(args: string[], env?: NodeJS.ProcessEnv) {
-  const result = await runResult(args, env);
-
-  if (result.code !== 0)
-    throw new Error(result.stderr || result.stdout || `Git ${args.join(" ")} failed.`);
-
-  return result;
-}
-
-async function runResult(args: string[], env?: NodeJS.ProcessEnv) {
-  try {
-    const result = await exec("git", args, { env });
-
-    return { code: 0, stdout: result.stdout.trim(), stderr: result.stderr.trim() };
-  } catch (cause) {
-    if (Value.Check(CommandFailureSchema, cause)) {
-      const value = Value.Decode(CommandFailureSchema, cause);
-
-      return {
-        code: value.code,
-        stdout: value.stdout?.trim() ?? "",
-        stderr: value.stderr?.trim() ?? "",
-      };
-    }
-
-    throw cause;
-  }
-}
-
-function isMissing(cause: unknown) {
-  return cause instanceof Error && "code" in cause && cause.code === "ENOENT";
 }

@@ -27,6 +27,15 @@ const MAX_PAGE = 100;
 
 const BUSY_TIMEOUT_MS = 5_000;
 
+const CHECKOUT_SCHEMA = `
+CREATE TABLE IF NOT EXISTS checkouts (
+  session_id TEXT NOT NULL,
+  repository_common_dir TEXT NOT NULL,
+  checkout_json TEXT NOT NULL,
+  PRIMARY KEY(session_id,repository_common_dir)
+) STRICT;
+`;
+
 const SCHEMA = `
 CREATE TABLE tasks (
   session_id TEXT NOT NULL,
@@ -44,12 +53,7 @@ CREATE TABLE attempts (
   outcome_json TEXT,
   FOREIGN KEY(session_id,task_id) REFERENCES tasks(session_id,task_id)
 ) STRICT;
-CREATE TABLE checkouts (
-  session_id TEXT NOT NULL,
-  repository_common_dir TEXT NOT NULL,
-  checkout_json TEXT NOT NULL,
-  PRIMARY KEY(session_id,repository_common_dir)
-) STRICT;
+${CHECKOUT_SCHEMA}
 PRAGMA user_version=1;
 `;
 
@@ -233,7 +237,7 @@ export class RecordStore {
   readCheckout(commonDir: string): CheckoutDeliveryRecord | undefined {
     const database = this.existingOrUndefined("read Coordinator checkout");
 
-    if (database === undefined) return undefined;
+    if (database === undefined || !checkoutTableExists(database)) return undefined;
 
     const row = database
       .prepare("SELECT checkout_json FROM checkouts WHERE session_id=? AND repository_common_dir=?")
@@ -247,7 +251,7 @@ export class RecordStore {
   listCheckouts(): CheckoutDeliveryRecord[] {
     const database = this.existingOrUndefined("list Coordinator checkouts");
 
-    if (database === undefined) return [];
+    if (database === undefined || !checkoutTableExists(database)) return [];
 
     return (
       database
@@ -262,6 +266,7 @@ export class RecordStore {
     decode(CheckoutDeliveryRecordSchema, record, "Coordinator checkout");
 
     return this.transaction("checkpoint Coordinator checkout", true, (database) => {
+      ensureCheckoutTable(database);
       database
         .prepare(
           `INSERT INTO checkouts(session_id,repository_common_dir,checkout_json) VALUES(?,?,?)
@@ -282,20 +287,25 @@ export class RecordStore {
       integer(
         database
           .prepare(
-            `SELECT EXISTS(SELECT 1 FROM attempts a JOIN tasks t
-             ON t.session_id=a.session_id AND t.task_id=a.task_id
-           WHERE a.session_id=?
-             AND json_extract(t.task_json,'$.target.kind')='repository'
-             AND json_extract(t.task_json,'$.target.checkoutRoot')=?
-             AND (
-               a.outcome_json IS NULL OR
-               (a.worker_json IS NOT NULL AND json_extract(a.worker_json,'$.closed') IS NOT 1) OR
-               a.output_json IS NULL OR
-               json_extract(a.output_json,'$.kind') IN ('retained','applying','discarding') OR
-               (json_extract(a.output_json,'$.kind')='applied' AND json_extract(a.output_json,'$.cleanupTip') IS NOT NULL)
-             )) AS value`,
+            `SELECT (
+              EXISTS(SELECT 1 FROM attempts a
+                WHERE a.session_id=? AND (
+                  (a.outcome_json IS NULL AND a.worker_json IS NULL) OR
+                  (a.worker_json IS NOT NULL AND json_extract(a.worker_json,'$.closed') IS NOT 1)
+                ))
+              OR EXISTS(SELECT 1 FROM attempts a JOIN tasks t
+                ON t.session_id=a.session_id AND t.task_id=a.task_id
+                WHERE a.session_id=?
+                  AND json_extract(t.task_json,'$.target.kind')='repository'
+                  AND json_extract(t.task_json,'$.target.checkoutRoot')=?
+                  AND (
+                    a.output_json IS NULL OR
+                    json_extract(a.output_json,'$.kind') IN ('retained','applying','discarding') OR
+                    (json_extract(a.output_json,'$.kind')='applied' AND json_extract(a.output_json,'$.cleanupTip') IS NOT NULL)
+                  ))
+            ) AS value`,
           )
-          .get(this.sessionId, checkoutPath),
+          .get(this.sessionId, this.sessionId, checkoutPath),
         "value",
       ) === 1
     );
@@ -583,6 +593,23 @@ function configure(database: DatabaseSync): DatabaseSync {
   database.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
 
   return database;
+}
+
+function ensureCheckoutTable(database: DatabaseSync): void {
+  database.exec(CHECKOUT_SCHEMA);
+}
+
+function checkoutTableExists(database: DatabaseSync): boolean {
+  return (
+    integer(
+      database
+        .prepare(
+          "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='checkouts') AS value",
+        )
+        .get(),
+      "value",
+    ) === 1
+  );
 }
 
 function initializeOrValidate(database: DatabaseSync): void {

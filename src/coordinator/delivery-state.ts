@@ -5,12 +5,17 @@ const Text = Type.String({ minLength: 1, pattern: "\\S" });
 
 const Ref = Type.String({ minLength: 1, pattern: "^refs/" });
 
-const Route = Type.Union([Type.Literal("local"), Type.Literal("pull_request")]);
-
 const PullRequestFields = {
   acceptedRevision: CommitSchema,
   url: Type.String({ pattern: "^https://github\\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$" }),
   remote: Text,
+  publicationRepository: Text,
+};
+
+const AdvancementFields = {
+  acceptedRevision: CommitSchema,
+  destinationBefore: CommitSchema,
+  destinationRevision: CommitSchema,
 };
 
 const StateSchema = Type.Union([
@@ -23,12 +28,7 @@ const StateSchema = Type.Union([
     { additionalProperties: false },
   ),
   Type.Object(
-    {
-      kind: Type.Literal("local_prepared"),
-      acceptedRevision: CommitSchema,
-      destinationBefore: CommitSchema,
-      destinationRevision: CommitSchema,
-    },
+    { kind: Type.Literal("local_prepared"), ...AdvancementFields },
     { additionalProperties: false },
   ),
   Type.Object(
@@ -46,6 +46,7 @@ const StateSchema = Type.Union([
       mergedRevision: CommitSchema,
       headBranch: Text,
       baseRemote: Text,
+      baseRepository: Text,
       baseBranch: Text,
       destinationBefore: CommitSchema,
       destinationRevision: CommitSchema,
@@ -54,25 +55,39 @@ const StateSchema = Type.Union([
   ),
   Type.Object(
     {
-      kind: Type.Literal("integrated"),
-      route: Route,
+      kind: Type.Literal("local_integrated"),
       acceptedRevision: CommitSchema,
       destinationRevision: CommitSchema,
-      url: Type.Optional(Text),
-      mergedRevision: Type.Optional(CommitSchema),
-      remote: Type.Optional(Text),
-      headBranch: Type.Optional(Text),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("pull_request_integrated"),
+      ...PullRequestFields,
+      mergedRevision: CommitSchema,
+      headBranch: Text,
+      destinationRevision: CommitSchema,
     },
     { additionalProperties: false },
   ),
   Type.Object(
     {
       kind: Type.Literal("complete"),
-      route: Route,
+      route: Type.Literal("local"),
       acceptedRevision: CommitSchema,
       destinationRevision: CommitSchema,
-      url: Type.Optional(Text),
-      mergedRevision: Type.Optional(CommitSchema),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      kind: Type.Literal("complete"),
+      route: Type.Literal("pull_request"),
+      acceptedRevision: CommitSchema,
+      destinationRevision: CommitSchema,
+      url: Text,
+      mergedRevision: CommitSchema,
     },
     { additionalProperties: false },
   ),
