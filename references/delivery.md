@@ -1,5 +1,7 @@
 # Deliver an accepted repository change
 
+Delivery capabilities may have been made visible by Workgraph's Coordinator-only loader. Visibility does not grant authority. Treat a configured capability reported missing exactly as unavailable and use the fallbacks below.
+
 ## Resolve Human sign-off
 
 Human sign-off is the repository Maintainer's explicit judgment that the exact accepted change may be finally integrated. Classify its requirement as `Required` when final integration must wait for that judgment or `Optional` when the Coordinator considers its evidence sufficient without requiring it. The classification grants no repository authority, and neither a Worker Review nor completed Maintainer inspection is Human sign-off.

@@ -193,6 +193,24 @@ Calm projects the live Pi chat without changing the source transcript:
 
 Mouse interaction follows the projected layout. If Calm cannot safely use Pi's presentation seams, it restores the complete native rendering rather than applying a partial filter.
 
+## Defer delivery tools
+
+Workgraph can keep explicitly named peer delivery tools out of the Coordinator's initial active set until delivery work needs them. Configure the exact tool names at `pi-workgraph.delivery.deferredTools` in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "pi-workgraph": {
+    "delivery": {
+      "deferredTools": ["tuicr_review", "pull_request_follow"]
+    }
+  }
+}
+```
+
+Workgraph supplies no peer defaults and does not import or manage peer extensions. A nonempty deduplicated list enables `workgraph_load_delivery_tools`; an absent delivery section or empty list leaves normal tool visibility unchanged and does not activate the loader. The Coordinator calls the loader at the accepted-change delivery boundary and for explicit requests for guided review or pull-request follow or unfollow.
+
+Loading is additive and changes visibility only. Its receipt distinguishes configured tools that were loaded, already active, or missing. Missing tools retain the delivery procedure's existing fallbacks. Invalid delivery settings fail open: peer visibility remains unchanged, the loader stays inactive, and Workgraph warns without blocking coordination. Loaded visibility follows the current conversation branch, so navigating before the successful loader result restores deferral while descendants may inherit it.
+
 ## Disable Worker tools
 
 Configure tools unavailable to every Worker in `~/.pi/agent/settings.json`:

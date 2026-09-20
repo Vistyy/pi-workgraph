@@ -72,6 +72,8 @@ The user's judgment is the final product decision. Hand back only a coherent res
 
 A repository change reaches the delivery boundary when the Coordinator has accepted the complete result and its supporting evidence, with no further implementation or verification needed before the user's delivery judgment. Final integration or publication requires authority separate from implementation.
 
+When `workgraph_load_delivery_tools` is available, call it at this boundary before loading the procedure. Also call it when the user directly requests guided review or pull-request follow or unfollow. Loading changes visibility only: it grants no authority, and missing configured tools do not prevent the documented fallbacks.
+
 - [Delivery procedure](references/delivery.md) — Read at this boundary before deciding or acting on delivery, or when a later delivered observation returns the Coordinator to its pull request. It owns the Human sign-off requirement and handling, route selection, route-specific preparation, effects and receipts, and continued pull-request work.
 
 ## Preserve operational truth

@@ -1,6 +1,6 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers -- This disposable consumer owns native package commands, timing, deadline, and cleanup. */
+/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers, anti-slop/require-readable-spacing -- This disposable consumer owns native package commands, timing, deadline, cleanup, and grouped package assertions. */
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
@@ -54,13 +54,34 @@ async function smokePackage(): Promise<void> {
   const packageRoot = join(consumer, "node_modules/@syzom/pi-workgraph");
   const deliveryReferencePath = join(packageRoot, "references/delivery.md");
   const deliveryReference = await readFile(deliveryReferencePath, "utf8");
+  const packagedReadme = await readFile(join(packageRoot, "README.md"), "utf8");
+  const packagedCoordinator = await readFile(join(packageRoot, "COORDINATOR.md"), "utf8");
 
-  if (!deliveryReference.includes("# Deliver an accepted repository change"))
+  if (
+    !deliveryReference.includes("# Deliver an accepted repository change") ||
+    !deliveryReference.includes("Visibility does not grant authority")
+  )
     throw new Error("Packaged delivery reference is missing or invalid.");
+  if (
+    !packagedReadme.includes("pi-workgraph.delivery") ||
+    !packagedReadme.includes("deferredTools")
+  )
+    throw new Error("Packaged README omits delivery-tool configuration.");
+  if (
+    !packagedCoordinator.includes("workgraph_load_delivery_tools") ||
+    !packagedCoordinator.includes("guided review or pull-request follow or unfollow")
+  )
+    throw new Error("Packaged Coordinator guidance omits delivery-tool triggers.");
 
   const agentDir = join(parent, "agent");
   const sessionDir = join(parent, "sessions");
   await mkdir(agentDir);
+  await writeFile(
+    join(agentDir, "settings.json"),
+    JSON.stringify({
+      "pi-workgraph": { delivery: { deferredTools: ["package_delivery_peer"] } },
+    }),
+  );
 
   const modules = ["extensions/coordinator.ts", "extensions/worker.ts"].map((path) =>
     join(packageRoot, path),
@@ -88,6 +109,7 @@ async function smokePackage(): Promise<void> {
         if (loaded === undefined) throw new Error(label + " factory was not loaded.");
         return loaded;
       };
+      process.env.PI_CODING_AGENT_DIR = agentDir;
       delete process.env.PI_WORKGRAPH_ROLE;
       const coordinatorResult = await discoverAndLoadExtensions(
         [coordinatorPath],
@@ -95,8 +117,12 @@ async function smokePackage(): Promise<void> {
         agentDir,
       );
       const coordinator = one(coordinatorResult, "coordinator", coordinatorPath);
-      if (!coordinator.tools.has("workgraph_implement") || !coordinator.commands.has("calm"))
-        throw new Error("Packaged coordinator factory did not register its extension surface.");
+      if (
+        !coordinator.tools.has("workgraph_implement") ||
+        !coordinator.tools.has("workgraph_load_delivery_tools") ||
+        !coordinator.commands.has("calm")
+      )
+        throw new Error("Packaged coordinator factory did not register its configured extension surface.");
 
       const modelRuntime = await ModelRuntime.create({
         authPath: ${JSON.stringify(join(parent, "auth.json"))},
@@ -134,8 +160,12 @@ async function smokePackage(): Promise<void> {
         "Worker",
         workerPath,
       );
-      if (!worker.tools.has("workgraph_report") || worker.tools.has("workgraph_plan"))
-        throw new Error("Packaged Worker factory did not register its research surface.");
+      if (
+        !worker.tools.has("workgraph_report") ||
+        worker.tools.has("workgraph_plan") ||
+        worker.tools.has("workgraph_load_delivery_tools")
+      )
+        throw new Error("Packaged Worker factory did not preserve its research-only surface.");
     `,
   ]);
   process.stdout.write(

@@ -1,3 +1,4 @@
+/* oxlint-disable anti-slop/require-readable-spacing -- Fixture setup and consecutive surface observations remain grouped by behavior. */
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -5,11 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import {
-  type BuildSystemPromptOptions,
-  SessionManager,
-} from "@earendil-works/pi-coding-agent";
+import { type BuildSystemPromptOptions, SessionManager } from "@earendil-works/pi-coding-agent";
 import { Effect } from "effect";
+import { Type } from "typebox";
 import { Value } from "typebox/value";
 import { RecordStore } from "../../src/coordinator/store.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
@@ -33,6 +32,7 @@ async function fixture(
   available: boolean,
   workspaceId = available ? "workspace-exact" : null,
   role: string | null = null,
+  settings?: string,
 ) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-coordinator-"));
   const root = join(parent, "repo");
@@ -53,10 +53,43 @@ async function fixture(
     PI_WORKGRAPH_HERDR_BIN: "/bin/false",
   });
 
-  const pi = await extensionFixture("coordinator", root, parent);
+  let activeTools: string[] | undefined;
+  if (settings !== undefined) {
+    await mkdir(join(parent, "agent"), { recursive: true });
+    await writeFile(join(parent, "agent", "settings.json"), settings);
+    const hasLoader = settings !== "{" && settings.includes('"deferredTools"');
+    activeTools = ["bash", "read", ...(hasLoader ? ["workgraph_load_delivery_tools"] : [])];
+  }
+
+  const pi = await extensionFixture(
+    "coordinator",
+    root,
+    parent,
+    activeTools === undefined
+      ? {}
+      : {
+          getActiveTools: () => [...(activeTools ?? [])],
+          setActiveTools: (names) => {
+            activeTools = [...names];
+          },
+          getAllTools: () =>
+            ["bash", "read", "workgraph_load_delivery_tools"].map((name) => ({
+              name,
+              description: name,
+              parameters: Type.Object({}, { additionalProperties: false }),
+              sourceInfo: {
+                path: "fixture",
+                source: "fixture",
+                scope: "temporary" as const,
+                origin: "top-level" as const,
+              },
+            })),
+        },
+  );
 
   return {
     ...pi,
+    activeTools: () => (activeTools === undefined ? pi.runner.getActiveTools() : [...activeTools]),
     parent,
     root,
     agentDir: join(parent, "agent"),
@@ -203,6 +236,61 @@ void test("coordinator registers the exact strict tool surface", async () => {
       false,
       "delivery-procedure content stays out of the system prompt",
     );
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("configured delivery tools are deferred only in Coordinator scope", async () => {
+  const settings = JSON.stringify({
+    "pi-workgraph": { delivery: { deferredTools: ["bash", "bash", "absent_peer"] } },
+  });
+  const coordinator = await fixture(false, null, null, settings);
+
+  try {
+    const loader = coordinator.runner.getToolDefinition("workgraph_load_delivery_tools");
+    assert.ok(loader !== undefined);
+    assert.match(loader.description, /accepted change reaches the delivery boundary/);
+    assert.match(loader.description, /guided review or pull-request follow\/unfollow/);
+    assert.match(loader.description, /grants no authority/);
+    assert.equal(Value.Check(loader.parameters, {}), true);
+    assert.equal(Value.Check(loader.parameters, { unexpected: true }), false);
+
+    await coordinator.runner.emit({ type: "session_start", reason: "startup" });
+    assert.equal(coordinator.activeTools().includes("bash"), false);
+    assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
+    const receipt = await coordinator.call("workgraph_load_delivery_tools", {});
+    assert.deepEqual(receipt.details, {
+      loaded: ["bash"],
+      alreadyActive: [],
+      missing: ["absent_peer"],
+    });
+    assert.equal(coordinator.activeTools().includes("bash"), true);
+  } finally {
+    await coordinator.dispose();
+  }
+
+  const worker = await fixture(false, null, "research", settings);
+  try {
+    assert.equal(worker.runner.getToolDefinition("workgraph_load_delivery_tools"), undefined);
+  } finally {
+    await worker.dispose();
+  }
+});
+
+void test("invalid delivery settings fail open with a bounded warning", async () => {
+  const f = await fixture(false, null, null, "{");
+  try {
+    const before = f.activeTools();
+    assert.equal(f.runner.getToolDefinition("workgraph_load_delivery_tools"), undefined);
+    await f.runner.emit({ type: "session_start", reason: "startup" });
+    assert.deepEqual(f.activeTools(), before);
+    const warning = f.notifications.find(({ message }) =>
+      message.startsWith("Workgraph delivery tools unchanged:"),
+    );
+    assert.ok(warning !== undefined);
+    assert.equal(warning.type, "warning");
+    assert.ok(warning.message.length <= 550);
   } finally {
     await f.dispose();
   }

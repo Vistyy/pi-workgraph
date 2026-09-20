@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
+/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, anti-slop/require-readable-spacing -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks, and related extension setup remains grouped. */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -11,6 +11,11 @@ import { Effect, Exit, Match, Scope } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
 import { createCheckout } from "../src/coordinator/checkouts.js";
+import {
+  deliverySettingsPath,
+  installDeliveryTools,
+  loadDeferredDeliveryTools,
+} from "../src/coordinator/delivery-tools.js";
 import type { HerdrCliRuntime } from "../src/coordinator/herdr.js";
 import {
   implementationTargets,
@@ -81,6 +86,7 @@ const PageFields = {
 export interface CoordinatorOptions {
   readonly agentDir?: string;
   readonly policyPath?: string;
+  readonly settingsPath?: string;
   readonly herdr?: HerdrCliRuntime;
 }
 
@@ -99,6 +105,16 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
   const agentDir = options.agentDir ?? getAgentDir();
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
+  let deliverySettingsWarning: string | undefined;
+  let deferredDeliveryTools: readonly string[] = [];
+  try {
+    deferredDeliveryTools = loadDeferredDeliveryTools(
+      options.settingsPath ?? deliverySettingsPath(agentDir),
+    );
+  } catch (cause) {
+    deliverySettingsWarning = publicMessage(cause);
+  }
+  installDeliveryTools(pi, deferredDeliveryTools);
   const calm = installCalmMode(pi);
   let attached: SessionRuntime | undefined;
   let scope: Scope.Scope | undefined;
@@ -139,6 +155,8 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   }));
   pi.on("session_start", (_event, ctx) =>
     serialize(async () => {
+      if (deliverySettingsWarning !== undefined)
+        ctx.ui.notify(`Workgraph delivery tools unchanged: ${deliverySettingsWarning}`, "warning");
       await close();
       const nextScope = await Effect.runPromise(Scope.make());
       const store = new RecordStore(agentDir, ctx.sessionManager.getSessionId());
