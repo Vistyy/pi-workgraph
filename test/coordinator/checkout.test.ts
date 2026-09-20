@@ -5,6 +5,8 @@ import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import coordinator from "../../extensions/coordinator.js";
+import type { GitHubReader, PullRequestFacts } from "../../src/coordinator/checkouts.js";
 import { RecordStore } from "../../src/coordinator/store.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../support/decoders.js";
@@ -32,7 +34,7 @@ async function administrationDir(managedPath: string): Promise<string> {
   return match[1];
 }
 
-async function fixture() {
+async function fixture(github?: GitHubReader) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-checkout-"));
   const root = join(parent, "repo");
   await mkdir(root);
@@ -41,6 +43,7 @@ async function fixture() {
   await git(root, "config", "user.email", "workgraph@example.invalid");
   await writeFile(join(root, ".gitignore"), "ignored.txt\n");
   await writeFile(join(root, "tracked.txt"), "base\n");
+  await writeFile(join(root, "unstaged.txt"), "base unstaged\n");
   await git(root, "add", ".");
   await git(root, "commit", "-m", "base");
   const previous = configureFixtureEnvironment({
@@ -51,7 +54,13 @@ async function fixture() {
     HERDR_TAB_ID: null,
     PI_WORKGRAPH_HERDR_BIN: "/bin/false",
   });
-  const pi = await extensionFixture("coordinator", root, parent);
+  const pi = await extensionFixture(
+    "coordinator",
+    root,
+    parent,
+    {},
+    github === undefined ? [] : [(piApi) => coordinator(piApi, { github })],
+  );
 
   await pi.runner.emit({ type: "session_start", reason: "startup" });
 
@@ -71,6 +80,85 @@ async function fixture() {
       await rm(parent, { recursive: true, force: true });
     },
   };
+}
+
+async function pullRequestFixture() {
+  let current: PullRequestFacts | undefined;
+  const github: GitHubReader = {
+    readPullRequest(url) {
+      if (current === undefined) throw new Error(`No controlled PR response for ${url}`);
+
+      return Promise.resolve(current);
+    },
+  };
+  const f = await fixture(github);
+  const remote = join(f.parent, "remote.git");
+  const remoteUrl = "https://github.test/upstream/project.git";
+  await git(f.parent, "init", "--bare", remote);
+  await git(f.root, "config", `url.file://${remote}.insteadOf`, remoteUrl);
+  await git(f.root, "remote", "add", "origin", remoteUrl);
+  await git(f.root, "push", "-u", "origin", "main");
+
+  return {
+    ...f,
+    remote,
+    remoteUrl,
+    url: "https://github.test/upstream/project/pull/7",
+    setPullRequest(facts: PullRequestFacts) {
+      current = facts;
+    },
+  };
+}
+
+function pullRequestFacts(input: {
+  readonly url: string;
+  readonly accepted: string;
+  readonly branch: string;
+  readonly merged?: string;
+  readonly state?: "open" | "closed";
+}): PullRequestFacts {
+  const facts: PullRequestFacts = {
+    url: input.url,
+    number: 7,
+    state: input.state ?? (input.merged === undefined ? "open" : "closed"),
+    merged: input.merged !== undefined,
+    headSha: input.accepted,
+    headBranch: input.branch,
+    headOwner: "upstream",
+    headRepository: "project",
+    baseBranch: "main",
+    baseOwner: "upstream",
+    baseRepository: "project",
+  };
+
+  return input.merged === undefined ? facts : { ...facts, mergeCommitSha: input.merged };
+}
+
+async function mergePublishedPullRequest(
+  f: Awaited<ReturnType<typeof pullRequestFixture>>,
+  branch: string,
+  method: "merge" | "squash" | "rebase",
+): Promise<string> {
+  const integration = join(f.parent, `integration-${method}`);
+  await git(f.parent, "clone", f.remote, integration);
+  await git(integration, "config", "user.name", "Workgraph Test");
+  await git(integration, "config", "user.email", "workgraph@example.invalid");
+  await writeFile(join(integration, `base-${method}.txt`), `advanced ${method}\n`);
+  await git(integration, "add", ".");
+  await git(integration, "commit", "-m", `advance base for ${method}`);
+
+  if (method === "merge") {
+    await git(integration, "merge", "--no-ff", `origin/${branch}`, "-m", "merge PR");
+  } else if (method === "squash") {
+    await git(integration, "merge", "--squash", `origin/${branch}`);
+    await git(integration, "commit", "-m", "squash PR");
+  } else {
+    await git(integration, "cherry-pick", `origin/${branch}`);
+  }
+  const result = await git(integration, "rev-parse", "HEAD");
+  await git(integration, "push", "origin", "HEAD:main");
+
+  return result;
 }
 
 void test("checkout startup is read-only and allocation is stable across linked checkouts and reloads", async () => {
@@ -337,6 +425,8 @@ void test("registered local delivery advances the original destination, cleans o
       kind: "complete",
       route: "local",
       revision: accepted,
+      destinationRoot: f.root,
+      destinationRef: "refs/heads/main",
       destinationRevision: accepted,
     });
     assert.equal(await readFile(join(f.root, "delivered.txt"), "utf8"), "accepted\n");
@@ -394,6 +484,299 @@ void test("local delivery preserves disjoint dirty destination bytes and blocks 
     );
     assert.equal(await readFile(join(f.root, "tracked.txt"), "utf8"), "destination overlap\n");
     assert.equal(existsSync(second.managedPath), true);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("verified pull-request merge methods reconcile current remote base and clean exact ownership", async (t) => {
+  for (const method of ["merge", "squash", "rebase"] as const) {
+    await t.test(method, async () => {
+      const f = await pullRequestFixture();
+
+      try {
+        const checkout = f.facts((await f.call("workgraph_checkout", {})).details);
+        const branch = checkout.ownedBranch.slice("refs/heads/".length);
+        await writeFile(join(checkout.managedPath, "accepted-pr.txt"), `${method}\n`);
+        await git(checkout.managedPath, "add", "accepted-pr.txt");
+        await git(checkout.managedPath, "commit", "-m", `accepted ${method} PR`);
+        const accepted = await git(checkout.managedPath, "rev-parse", "HEAD");
+        await git(checkout.managedPath, "push", "origin", `${branch}:${branch}`);
+        f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch }));
+
+        const pending = await f.call("workgraph_deliver", {
+          checkoutId: checkout.checkoutId,
+          route: "pull_request",
+          revision: accepted,
+          url: f.url,
+          remote: "origin",
+        });
+        // SAFETY: Successful delivery details contain the persisted strict checkout record.
+        assert.equal(
+          (pending.details as { disposition: { kind: string } }).disposition.kind,
+          "pull_request",
+        );
+        assert.equal(existsSync(checkout.managedPath), true);
+
+        const merged = await mergePublishedPullRequest(f, branch, method);
+        f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch, merged }));
+        await writeFile(join(f.root, "local-only.txt"), `local ${method}\n`);
+        await git(f.root, "add", "local-only.txt");
+        await git(f.root, "commit", "-m", `unpublished local ${method}`);
+        const localCommit = await git(f.root, "rev-parse", "HEAD");
+        await writeFile(join(f.root, "staged-only.txt"), "staged survives\n");
+        await git(f.root, "add", "staged-only.txt");
+        await writeFile(join(f.root, "unstaged.txt"), "unstaged survives\n");
+        await writeFile(join(f.root, "untracked-pr.txt"), "untracked survives\n");
+        await writeFile(join(f.root, "ignored.txt"), "ignored survives\n");
+
+        if (method === "squash") await git(f.root, "push", "origin", `:refs/heads/${branch}`);
+        const delivered = await f.call("workgraph_deliver", {
+          checkoutId: checkout.checkoutId,
+        });
+        // SAFETY: Successful delivery details contain the persisted strict checkout record.
+        const disposition = (
+          delivered.details as {
+            disposition: {
+              kind: string;
+              route: string;
+              revision: string;
+              destinationRoot: string;
+            };
+          }
+        ).disposition;
+        assert.equal(disposition.kind, "complete");
+        assert.equal(disposition.route, "pull_request");
+        assert.equal(disposition.revision, accepted);
+        assert.equal(disposition.destinationRoot, f.root);
+        assert.equal(await readFile(join(f.root, "accepted-pr.txt"), "utf8"), `${method}\n`);
+        assert.equal(
+          await readFile(join(f.root, `base-${method}.txt`), "utf8"),
+          `advanced ${method}\n`,
+        );
+        assert.equal(await git(f.root, "show", ":staged-only.txt"), "staged survives");
+        assert.equal(await readFile(join(f.root, "unstaged.txt"), "utf8"), "unstaged survives\n");
+        assert.equal(
+          await readFile(join(f.root, "untracked-pr.txt"), "utf8"),
+          "untracked survives\n",
+        );
+        assert.equal(await readFile(join(f.root, "ignored.txt"), "utf8"), "ignored survives\n");
+        assert.equal(existsSync(checkout.managedPath), false);
+        await assert.rejects(git(f.root, "rev-parse", "--verify", checkout.ownedBranch));
+        await assert.rejects(
+          git(f.root, "ls-remote", "--exit-code", "origin", `refs/heads/${branch}`),
+        );
+        const remoteMain = await git(f.root, "ls-remote", "origin", "refs/heads/main");
+        const remoteMainRevision = remoteMain.split(/\s+/u)[0];
+        assert.ok(remoteMainRevision !== undefined);
+        await assert.rejects(
+          git(f.root, "merge-base", "--is-ancestor", localCommit, remoteMainRevision),
+        );
+        const fresh = f.facts((await f.call("workgraph_checkout", {})).details);
+        assert.equal(fresh.created, true);
+        assert.equal(fresh.head, await git(f.root, "rev-parse", "HEAD"));
+      } finally {
+        await f.dispose();
+      }
+    });
+  }
+});
+
+void test("pull-request mismatches and closed-unmerged disposition preserve owned work", async () => {
+  const f = await pullRequestFixture();
+
+  try {
+    const checkout = f.facts((await f.call("workgraph_checkout", {})).details);
+    const branch = checkout.ownedBranch.slice("refs/heads/".length);
+    await writeFile(join(checkout.managedPath, "accepted-pr.txt"), "accepted\n");
+    await git(checkout.managedPath, "add", "accepted-pr.txt");
+    await git(checkout.managedPath, "commit", "-m", "accepted PR");
+    const accepted = await git(checkout.managedPath, "rev-parse", "HEAD");
+    await git(checkout.managedPath, "push", "origin", `${branch}:${branch}`);
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted: checkout.sourceHead, branch }));
+    await assert.rejects(
+      f.call("workgraph_deliver", {
+        checkoutId: checkout.checkoutId,
+        route: "pull_request",
+        revision: accepted,
+        url: f.url,
+        remote: "origin",
+      }),
+      /head does not match/,
+    );
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch }));
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "pull_request",
+      revision: accepted,
+      url: f.url,
+      remote: "origin",
+    });
+    await writeFile(join(checkout.managedPath, "correction.txt"), "corrected\n");
+    await git(checkout.managedPath, "add", "correction.txt");
+    await git(checkout.managedPath, "commit", "-m", "non-force correction");
+    const corrected = await git(checkout.managedPath, "rev-parse", "HEAD");
+    await git(checkout.managedPath, "push", "origin", `${branch}:${branch}`);
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted: corrected, branch }));
+    const updated = await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "pull_request",
+      revision: corrected,
+      url: f.url,
+      remote: "origin",
+    });
+    // SAFETY: Successful delivery details contain the persisted strict checkout record.
+    assert.equal(
+      (updated.details as { disposition: { acceptedRevision: string } }).disposition
+        .acceptedRevision,
+      corrected,
+    );
+    f.setPullRequest(
+      pullRequestFacts({ url: f.url, accepted: corrected, branch, state: "closed" }),
+    );
+    const retained = await f.call("workgraph_deliver", { checkoutId: checkout.checkoutId });
+    // SAFETY: Successful delivery details contain the persisted strict checkout record.
+    const disposition = (
+      retained.details as {
+        disposition: { retained?: string; paused?: true };
+      }
+    ).disposition;
+    assert.equal(disposition.retained, "closed_unmerged");
+    assert.equal(disposition.paused, true);
+    assert.equal(existsSync(checkout.managedPath), true);
+    assert.equal(
+      await git(f.root, "ls-remote", "origin", `refs/heads/${branch}`).then(Boolean),
+      true,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("session restart observes an uncertain successful remote deletion without replay", async () => {
+  // SAFETY: This fixture temporarily redirects Git only for its task-owned disposable repositories.
+  const environment = process.env as NodeJS.ProcessEnv & {
+    PATH: string | undefined;
+    WORKGRAPH_TEST_REAL_GIT: string | undefined;
+  };
+  const originalPath = environment.PATH;
+  const originalRealGit = environment.WORKGRAPH_TEST_REAL_GIT;
+  const realGit = originalPath
+    ?.split(":")
+    .map((directory) => join(directory, "git"))
+    .find((candidate) => existsSync(candidate));
+  assert.ok(realGit !== undefined);
+  const f = await pullRequestFixture();
+
+  try {
+    const checkout = f.facts((await f.call("workgraph_checkout", {})).details);
+    const branch = checkout.ownedBranch.slice("refs/heads/".length);
+    await writeFile(join(checkout.managedPath, "accepted-pr.txt"), "accepted\n");
+    await git(checkout.managedPath, "add", "accepted-pr.txt");
+    await git(checkout.managedPath, "commit", "-m", "accepted PR");
+    const accepted = await git(checkout.managedPath, "rev-parse", "HEAD");
+    await git(checkout.managedPath, "push", "origin", `${branch}:${branch}`);
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch }));
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "pull_request",
+      revision: accepted,
+      url: f.url,
+      remote: "origin",
+    });
+    const merged = await mergePublishedPullRequest(f, branch, "merge");
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch, merged }));
+    const bin = join(f.parent, "uncertain-delete-bin");
+    await mkdir(bin);
+    await writeFile(
+      join(bin, "git"),
+      `#!/bin/sh\ncase " $* " in\n  *" push --force-with-lease="*" :refs/heads/"*)\n    "$WORKGRAPH_TEST_REAL_GIT" "$@"\n    status=$?\n    [ $status -eq 0 ] || exit $status\n    exit 17\n    ;;\nesac\nexec "$WORKGRAPH_TEST_REAL_GIT" "$@"\n`,
+    );
+    await chmod(join(bin, "git"), 0o700);
+    environment.WORKGRAPH_TEST_REAL_GIT = realGit;
+    environment.PATH = `${bin}:${originalPath ?? ""}`;
+
+    await f.runner.emit({ type: "session_shutdown", reason: "reload" });
+    await f.runner.emit({ type: "session_start", reason: "reload" });
+    const state = new RecordStore(f.agentDir, f.session.getSessionId());
+    const disposition = state.readCheckout(checkout.repositoryCommonDir)?.disposition;
+    state.close();
+    assert.equal(disposition?.kind, "complete");
+    assert.equal(disposition?.kind === "complete" ? disposition.route : undefined, "pull_request");
+    assert.equal(existsSync(checkout.managedPath), false);
+    await assert.rejects(git(f.root, "rev-parse", "--verify", checkout.ownedBranch));
+    await assert.rejects(git(f.root, "ls-remote", "--exit-code", "origin", `refs/heads/${branch}`));
+  } finally {
+    environment.PATH = originalPath;
+    environment.WORKGRAPH_TEST_REAL_GIT = originalRealGit;
+    await f.dispose();
+  }
+});
+
+void test("changed published tip blocks deletion after integration and preservation retains proof", async () => {
+  const f = await pullRequestFixture();
+
+  try {
+    const checkout = f.facts((await f.call("workgraph_checkout", {})).details);
+    const branch = checkout.ownedBranch.slice("refs/heads/".length);
+    await writeFile(join(checkout.managedPath, "accepted-pr.txt"), "accepted\n");
+    await git(checkout.managedPath, "add", "accepted-pr.txt");
+    await git(checkout.managedPath, "commit", "-m", "accepted PR");
+    const accepted = await git(checkout.managedPath, "rev-parse", "HEAD");
+    await git(checkout.managedPath, "push", "origin", `${branch}:${branch}`);
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch }));
+    await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "pull_request",
+      revision: accepted,
+      url: f.url,
+      remote: "origin",
+    });
+    const merged = await mergePublishedPullRequest(f, branch, "merge");
+    f.setPullRequest(pullRequestFacts({ url: f.url, accepted, branch, merged }));
+    const changed = join(f.parent, "changed-published-branch");
+    await git(f.parent, "clone", f.remote, changed);
+    await git(changed, "config", "user.name", "Workgraph Test");
+    await git(changed, "config", "user.email", "workgraph@example.invalid");
+    await git(changed, "switch", "--track", `origin/${branch}`);
+    await writeFile(join(changed, "post-acceptance.txt"), "changed\n");
+    await git(changed, "add", ".");
+    await git(changed, "commit", "-m", "post-acceptance branch change");
+    const changedTip = await git(changed, "rev-parse", "HEAD");
+    await git(changed, "push", "origin", `HEAD:${branch}`);
+
+    await assert.rejects(
+      f.call("workgraph_deliver", { checkoutId: checkout.checkoutId }),
+      /changed after acceptance and was preserved/,
+    );
+    assert.equal(await readFile(join(f.root, "accepted-pr.txt"), "utf8"), "accepted\n");
+    assert.equal(existsSync(checkout.managedPath), true);
+    assert.match(
+      await git(f.root, "ls-remote", "origin", `refs/heads/${branch}`),
+      new RegExp(`^${changedTip}`),
+    );
+    const state = new RecordStore(f.agentDir, f.session.getSessionId());
+    const integrated = state.readCheckout(checkout.repositoryCommonDir)?.disposition;
+    state.close();
+    assert.equal(integrated?.kind, "pull_request");
+    assert.equal(integrated?.kind === "pull_request" ? integrated.integrated : false, true);
+    assert.equal(
+      integrated?.kind === "pull_request" ? integrated.cleanup : undefined,
+      "remote_branch",
+    );
+    const preserved = await f.call("workgraph_deliver", {
+      checkoutId: checkout.checkoutId,
+      route: "preserve",
+    });
+    // SAFETY: Successful delivery details contain the persisted strict checkout record.
+    const paused = (
+      preserved.details as {
+        disposition: { integrated?: true; cleanup?: string; paused?: true };
+      }
+    ).disposition;
+    assert.equal(paused.integrated, true);
+    assert.equal(paused.cleanup, "remote_branch");
+    assert.equal(paused.paused, true);
   } finally {
     await f.dispose();
   }
@@ -514,10 +897,7 @@ void test("preserve observes the current owned head and self-delivery is rejecte
       route: "preserve",
     });
     // SAFETY: Successful delivery details contain the persisted strict checkout record.
-    assert.equal(
-      (preserved.details as { disposition: { revision: string } }).disposition.revision,
-      one,
-    );
+    assert.equal((preserved.details as { disposition: { head: string } }).disposition.head, one);
 
     await writeFile(join(first.managedPath, "preserved.txt"), "two\n");
     await git(first.managedPath, "commit", "-am", "preserve two");
@@ -527,10 +907,7 @@ void test("preserve observes the current owned head and self-delivery is rejecte
       route: "preserve",
     });
     // SAFETY: Successful delivery details contain the persisted strict checkout record.
-    assert.equal(
-      (repeated.details as { disposition: { revision: string } }).disposition.revision,
-      two,
-    );
+    assert.equal((repeated.details as { disposition: { head: string } }).disposition.head, two);
 
     const fresh = f.facts((await f.call("workgraph_checkout", {})).details);
     assert.equal(fresh.reused, true);
@@ -643,6 +1020,10 @@ void test("integrated destination proof and pending Candidate cleanup gate destr
       effectiveModels: [],
     });
     state.close();
+    await assert.rejects(
+      f.call("workgraph_deliver", { checkoutId: checkout.checkoutId }),
+      /Cleanup blocked: 1 Worker or Candidate disposition/,
+    );
     await f.call("workgraph_control", {
       action: "discard_output",
       attemptId: "attempt-pending-cleanup",
@@ -808,11 +1189,15 @@ void test("checkpointed branch-only creation resumes and explicit local retry re
       route: "preserve",
     });
     // SAFETY: Successful delivery details contain the persisted strict checkout record.
-    assert.deepEqual((preserved.details as { disposition: unknown }).disposition, {
-      kind: "complete",
-      route: "preserve",
-      revision: drifted,
-    });
+    const paused = (
+      preserved.details as {
+        disposition: { kind: string; acceptedRevision: string; paused?: true };
+      }
+    ).disposition;
+    assert.equal(paused.kind, "local");
+    assert.equal(paused.acceptedRevision, retainedHead);
+    assert.equal(paused.paused, true);
+    assert.equal(await git(retained.managedPath, "rev-parse", "HEAD"), drifted);
     assert.equal(existsSync(retained.managedPath), true);
   } finally {
     environment.PATH = originalPath;

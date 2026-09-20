@@ -10,7 +10,11 @@ import {
 import { Effect, Exit, Match, Scope } from "effect";
 import { type Static, type TSchema, Type } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
-import { createCheckout, deliverCheckout } from "../src/coordinator/checkouts.js";
+import {
+  createCheckout,
+  deliverCheckout,
+  type GitHubReader,
+} from "../src/coordinator/checkouts.js";
 import {
   deliverySettingsPath,
   installDeliveryTools,
@@ -88,6 +92,7 @@ export interface CoordinatorOptions {
   readonly policyPath?: string;
   readonly settingsPath?: string;
   readonly herdr?: HerdrCliRuntime;
+  readonly github?: GitHubReader;
 }
 
 export default function coordinator(pi: ExtensionAPI, options: CoordinatorOptions = {}): void {
@@ -193,13 +198,19 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         attached = next;
 
         for (const checkout of store.listCheckouts()) {
-          if (checkout.disposition.kind !== "local") continue;
+          if (
+            (checkout.disposition.kind !== "local" &&
+              checkout.disposition.kind !== "pull_request") ||
+            checkout.disposition.paused === true
+          )
+            continue;
 
           try {
             await deliverCheckout({
               request: { checkoutId: checkout.checkoutId },
               store,
               blockCleanup: () => checkoutCleanupBlocker(store, checkout.managedPath),
+              ...(options.github === undefined ? {} : { github: options.github }),
             });
           } catch (cause) {
             ctx.ui.notify(`Workgraph checkout unfinished: ${publicMessage(cause)}`, "warning");
@@ -543,13 +554,33 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     name: "workgraph_deliver",
     label: "Workgraph Deliver",
     description:
-      "Record or resume the accepted Coordinator checkout disposition. Local delivery integrates only the exact accepted committed revision into the exact authorized attached destination and then verifies owned cleanup; preserve deliberately retains resources.",
+      "Record or resume the accepted Coordinator checkout disposition. Local and pull-request routes verify exact bindings, reconcile the authorized destination, and complete owned cleanup; preserve pauses automated effects without discarding proof.",
     parameters: Type.Union([
       Type.Object(
         {
           checkoutId: nonBlank("Exact session-owned Coordinator checkout ID."),
           route: Type.Literal("local"),
           revision: CommitSchema,
+          destination: Type.Optional(
+            Type.Object(
+              {
+                cwd: nonBlank("Same-repository attached destination checkout."),
+                ref: nonBlank("Exact attached destination ref."),
+              },
+              { additionalProperties: false },
+            ),
+          ),
+        },
+        { additionalProperties: false },
+      ),
+      Type.Object(
+        {
+          checkoutId: nonBlank("Exact session-owned Coordinator checkout ID."),
+          route: Type.Literal("pull_request"),
+          revision: CommitSchema,
+          url: nonBlank("Exact GitHub pull-request HTTPS URL."),
+          remote: nonBlank("Configured publication remote name."),
+          baseRemote: Type.Optional(nonBlank("Configured remote for the PR base repository.")),
           destination: Type.Optional(
             Type.Object(
               {
@@ -581,6 +612,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         const checkout = await deliverCheckout({
           request: params,
           store: current.store,
+          ...(options.github === undefined ? {} : { github: options.github }),
           blockCleanup: () => {
             const record = current.store
               .listCheckouts()
