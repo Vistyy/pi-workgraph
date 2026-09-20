@@ -1,5 +1,7 @@
 # Deliver an accepted repository change
 
+If `workgraph_load_delivery_tools` reports a configured tool as missing, treat that tool as unavailable and use the fallback below. Loading tools does not grant delivery authority.
+
 ## Resolve Human sign-off
 
 Human sign-off is the repository Maintainer's explicit judgment that the exact accepted change may be finally integrated. Classify its requirement as `Required` when final integration must wait for that judgment or `Optional` when the Coordinator considers its evidence sufficient without requiring it. The classification grants no repository authority, and neither a Worker Review nor completed Maintainer inspection is Human sign-off.

@@ -200,6 +200,10 @@ Workgraph does not intercept file operations, redirect paths, inject checkout st
 
 Final local integration and publication use ordinary repository, forge, or session capabilities. The Coordinator contract owns the delivery-boundary trigger; the packaged delivery reference owns the Human sign-off requirement and handling, route recommendation and selection, and each selected route's procedure. A designated local session capability may support Maintainer inspection without becoming Workgraph state or authority. Neither the capability nor the procedure expands existing authority.
 
+When `pi-workgraph.delivery.deferredTools` contains tool names, Workgraph hides them until the delivery boundary. `workgraph_load_delivery_tools` activates the configured names that Pi has registered and reports the names it cannot find. Invalid settings leave all tools active and produce a warning.
+
+A successful loader result keeps those tools active on descendant conversation branches. Navigating to a point before that result hides them again. The loader is unavailable to Workers and does not change Worker tool policy or run peer extension behavior.
+
 The contract names packaged references with source-relative Markdown links. When injecting the contract, the extension renders each reference at its use site as an installed absolute path while leaving the referenced content unloaded until the contract directs the Coordinator to read it.
 
 For a pull-request route, the reference guides initial publication, exact-result verification, and establishment of continued observation when a capability is available.

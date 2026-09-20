@@ -193,6 +193,22 @@ Calm projects the live Pi chat without changing the source transcript:
 
 Mouse interaction follows the projected layout. If Calm cannot safely use Pi's presentation seams, it restores the complete native rendering rather than applying a partial filter.
 
+## Defer delivery tools
+
+List the tools to keep out of the Coordinator's initial context in `~/.pi/agent/settings.json`:
+
+```json
+{
+  "pi-workgraph": {
+    "delivery": {
+      "deferredTools": ["tuicr_review", "follow_pr", "unfollow_pr"]
+    }
+  }
+}
+```
+
+At the delivery boundary, `workgraph_load_delivery_tools` activates the configured tools that are installed and reports any that are missing. An absent or empty list changes nothing. Invalid settings leave the tools active and produce a warning.
+
 ## Disable Worker tools
 
 Configure tools unavailable to every Worker in `~/.pi/agent/settings.json`:
