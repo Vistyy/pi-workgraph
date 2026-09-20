@@ -19,6 +19,11 @@ export interface CommandResult {
   readonly stderr: string;
 }
 
+export interface GitCommandOptions {
+  readonly env?: NodeJS.ProcessEnv;
+  readonly timeout?: number;
+}
+
 export interface WorktreeRegistration {
   readonly path: string;
   readonly head?: string;
@@ -251,12 +256,28 @@ export function gitDir(
 export function gitDirResult(
   commonDir: string,
   args: string[],
+  options?: GitCommandOptions,
 ): Effect.Effect<CommandResult, GitError> {
-  return command([`--git-dir=${commonDir}`, ...args]);
+  return command([`--git-dir=${commonDir}`, ...args], options);
 }
 
-export function gitResult(cwd: string, args: string[]): Effect.Effect<CommandResult, GitError> {
-  return command(["-C", cwd, ...args]);
+export function gitResult(
+  cwd: string,
+  args: string[],
+  options?: GitCommandOptions,
+): Effect.Effect<CommandResult, GitError> {
+  return command(["-C", cwd, ...args], options);
+}
+
+export function gitDirWithOptions(
+  commonDir: string,
+  args: string[],
+  options: GitCommandOptions,
+  allowEmpty = false,
+): Effect.Effect<string, GitError> {
+  return gitDirResult(commonDir, args, options).pipe(
+    Effect.flatMap((result) => checked(args, result, allowEmpty)),
+  );
 }
 
 export function fail(operation: string, message: string): Effect.Effect<never, GitError> {
@@ -283,13 +304,17 @@ export function canonicalFuturePath(path: string): string {
   return join(realpathSync(ancestor), ...missing);
 }
 
-function command(args: string[]): Effect.Effect<CommandResult, GitError> {
+function command(
+  args: string[],
+  options: GitCommandOptions = {},
+): Effect.Effect<CommandResult, GitError> {
   const process = ChildProcess.make("git", args, {
     cwd: globalThis.process.cwd(),
     stdin: "ignore",
+    env: options.env,
   });
 
-  return Effect.scoped(
+  const execution = Effect.scoped(
     Effect.gen(function* () {
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const child = yield* spawner.spawn(process);
@@ -309,8 +334,21 @@ function command(args: string[]): Effect.Effect<CommandResult, GitError> {
         stderr: result.stderr.trim(),
       };
     }),
+  );
+
+  return (
+    options.timeout === undefined
+      ? execution
+      : execution.pipe(
+          Effect.timeoutOrElse({
+            duration: options.timeout,
+            orElse: () => fail(args.join(" "), "Git command timed out."),
+          }),
+        )
   ).pipe(
-    Effect.mapError(() => error(args.join(" "), "Git process failed.")),
+    Effect.mapError((cause) =>
+      cause instanceof GitError ? cause : error(args.join(" "), "Git process failed."),
+    ),
     Effect.provide(childProcessLayer),
   );
 }

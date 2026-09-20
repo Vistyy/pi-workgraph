@@ -4,6 +4,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { RecordStore } from "../../src/coordinator/store.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
@@ -28,7 +29,7 @@ async function administrationDir(managedPath: string): Promise<string> {
   return match[1];
 }
 
-async function fixture() {
+async function fixture(beforeLoad?: (parent: string, root: string) => Promise<void>) {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-checkout-"));
   const root = join(parent, "repo");
   await mkdir(root);
@@ -47,6 +48,7 @@ async function fixture() {
     HERDR_TAB_ID: null,
     PI_WORKGRAPH_HERDR_BIN: "/bin/false",
   });
+  await beforeLoad?.(parent, root);
   const pi = await extensionFixture("coordinator", root, parent);
 
   await pi.runner.emit({ type: "session_start", reason: "startup" });
@@ -90,6 +92,48 @@ void test("checkout startup is read-only and allocation is stable across linked 
     const afterReload = f.facts((await f.call("workgraph_checkout", {})).details);
     assert.equal(afterReload.reused, true);
     assert.equal(afterReload.checkoutId, first.checkoutId);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("explicit checkout lazily adds checkout storage to an existing version-one database", async () => {
+  const f = await fixture(async (parent) => {
+    const workgraph = join(parent, "agent", "workgraph");
+    await mkdir(workgraph, { recursive: true });
+    const database = new DatabaseSync(join(workgraph, "workgraph.sqlite"));
+    database.exec(`
+      CREATE TABLE tasks (
+        session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        task_json TEXT NOT NULL,
+        PRIMARY KEY(session_id,task_id)
+      ) STRICT;
+      CREATE TABLE attempts (
+        attempt_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        spec_json TEXT NOT NULL,
+        worker_json TEXT,
+        output_json TEXT,
+        outcome_json TEXT,
+        FOREIGN KEY(session_id,task_id) REFERENCES tasks(session_id,task_id)
+      ) STRICT;
+      PRAGMA user_version=1;
+    `);
+    database.close();
+  });
+
+  try {
+    const allocated = f.facts((await f.call("workgraph_checkout", {})).details);
+    assert.equal(existsSync(allocated.managedPath), true);
+    const database = new DatabaseSync(join(f.agentDir, "workgraph", "workgraph.sqlite"));
+    const table = database
+      .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name='checkouts'")
+      .get();
+    database.close();
+    // SAFETY: This focused native query selects one known text column from sqlite_schema.
+    assert.equal((table as { name?: unknown } | undefined)?.name, "checkouts");
   } finally {
     await f.dispose();
   }

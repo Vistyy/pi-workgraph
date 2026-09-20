@@ -3,6 +3,7 @@ import { dirname, resolve } from "node:path";
 import { Effect } from "effect";
 import {
   type CommandResult,
+  dirty,
   error,
   exactCommit,
   fail,
@@ -17,6 +18,7 @@ import {
   type WorktreeRegistration,
   worktreeRegistrations,
 } from "../repository/git.js";
+import type { CheckoutDeliveryRecord } from "./delivery-state.js";
 
 export interface CoordinatorCheckoutReceipt {
   readonly head: string;
@@ -31,7 +33,7 @@ export interface CoordinatorCheckoutIdentity {
   readonly ownedBranch: string;
 }
 
-type Classification =
+export type CoordinatorCheckoutObservation =
   | { readonly kind: "absent" }
   | { readonly kind: "exact"; readonly head: string };
 
@@ -42,7 +44,7 @@ export function ensureCoordinatorCheckout(input: {
 }): Effect.Effect<CoordinatorCheckoutReceipt, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(input.target);
-    const initial = yield* classify(input.identity);
+    const initial = yield* observeCoordinatorCheckout(input.identity);
 
     if (initial.kind === "exact") return { head: initial.head, created: false, reused: true };
 
@@ -60,13 +62,15 @@ export function ensureCoordinatorCheckout(input: {
       input.commit,
     ]);
 
-    const postcondition = yield* classify(input.identity);
+    const postcondition = yield* observeCoordinatorCheckout(input.identity);
 
     return yield* finishCreation(input.commit, placement, postcondition);
   });
 }
 
-function classify(identity: CoordinatorCheckoutIdentity): Effect.Effect<Classification, GitError> {
+export function observeCoordinatorCheckout(
+  identity: CoordinatorCheckoutIdentity,
+): Effect.Effect<CoordinatorCheckoutObservation, GitError> {
   return Effect.gen(function* () {
     const [entry, reference, registrations] = yield* Effect.all([
       optionalPathEntry(identity.managedPath),
@@ -114,7 +118,7 @@ function inspectExact(
   entry: Awaited<ReturnType<typeof lstat>>,
   reference: string,
   registration: WorktreeRegistration,
-): Effect.Effect<Classification, GitError> {
+): Effect.Effect<CoordinatorCheckoutObservation, GitError> {
   return Effect.gen(function* () {
     yield* validateManagedPath(identity.managedPath, entry);
 
@@ -234,10 +238,155 @@ function optionalPathEntry(
   });
 }
 
+export function observeAcceptedCheckout(
+  record: CheckoutDeliveryRecord,
+  requested?: string,
+  requireClean = true,
+): Effect.Effect<string, GitError> {
+  return Effect.gen(function* () {
+    const observed = yield* observeCoordinatorCheckout(record);
+
+    if (observed.kind !== "exact")
+      return yield* fail("inspect accepted checkout", "Managed checkout resources are absent.");
+
+    if (requested !== undefined && observed.head !== requested)
+      return yield* fail(
+        "inspect accepted checkout",
+        "Accepted revision is not the exact managed checkout HEAD.",
+      );
+
+    if (requireClean && (yield* dirty(record.managedPath, true)))
+      return yield* fail("inspect accepted checkout", "Accepted managed checkout is not clean.");
+
+    return observed.head;
+  });
+}
+
+export function cleanupCoordinatorCheckout(record: CheckoutDeliveryRecord, accepted: string) {
+  return Effect.gen(function* () {
+    yield* removeOwnedWorktree(record, accepted);
+    yield* deleteOwnedBranch(record, accepted);
+    const resources = yield* localResources(record);
+
+    if (
+      resources.entry !== undefined ||
+      resources.paths.length > 0 ||
+      resources.branches.length > 0
+    )
+      return yield* fail(
+        "clean up Coordinator checkout",
+        "Owned checkout cleanup postcondition is absent.",
+      );
+    const branch = yield* branchTip(record);
+
+    if (branch !== undefined)
+      return yield* fail(
+        "clean up Coordinator checkout",
+        "Owned checkout cleanup postcondition is absent.",
+      );
+  });
+}
+
+function removeOwnedWorktree(record: CheckoutDeliveryRecord, accepted: string) {
+  return Effect.gen(function* () {
+    const resources = yield* localResources(record);
+
+    if (
+      resources.entry === undefined &&
+      resources.paths.length === 0 &&
+      resources.branches.length === 0
+    )
+      return;
+
+    if (
+      resources.entry === undefined ||
+      resources.paths.length !== 1 ||
+      resources.branches.length !== 1 ||
+      resources.paths[0] !== resources.branches[0]
+    )
+      return yield* fail(
+        "clean up Coordinator checkout",
+        "Owned checkout cleanup resources are partial or unexpected.",
+      );
+
+    yield* observeAcceptedCheckout(record, accepted);
+    const removal = yield* gitResult(record.sourcePath, ["worktree", "remove", record.managedPath]);
+    const after = yield* localResources(record);
+
+    if (after.entry !== undefined || after.paths.length > 0 || after.branches.length > 0)
+      return yield* fail(
+        "clean up Coordinator checkout",
+        removal.stderr || removal.stdout || "Owned worktree removal was not proven.",
+      );
+  });
+}
+
+function deleteOwnedBranch(record: CheckoutDeliveryRecord, accepted: string) {
+  return Effect.gen(function* () {
+    const current = yield* branchTip(record);
+
+    if (current === undefined) return;
+
+    if (current !== accepted)
+      return yield* fail(
+        "clean up Coordinator checkout",
+        "Owned checkout branch changed; it was preserved.",
+      );
+
+    const deletion = yield* gitDirResult(record.repositoryCommonDir, [
+      "update-ref",
+      "-d",
+      record.ownedBranch,
+      accepted,
+    ]);
+
+    if (deletion.code !== 0)
+      return yield* fail(
+        "clean up Coordinator checkout",
+        deletion.stderr || deletion.stdout || "Owned branch deletion failed.",
+      );
+  });
+}
+
+function localResources(record: CheckoutDeliveryRecord) {
+  return Effect.gen(function* () {
+    const [entry, registrations] = yield* Effect.all([
+      optionalPathEntry(record.managedPath),
+      worktreeRegistrations(record.repositoryCommonDir),
+    ]);
+
+    return {
+      entry,
+      paths: registrations.filter(
+        (registration) => resolve(registration.path) === record.managedPath,
+      ),
+      branches: registrations.filter((registration) => registration.branch === record.ownedBranch),
+    };
+  });
+}
+
+function branchTip(record: CheckoutDeliveryRecord) {
+  return gitDirResult(record.repositoryCommonDir, [
+    "rev-parse",
+    "--verify",
+    "--quiet",
+    `${record.ownedBranch}^{commit}`,
+  ]).pipe(
+    Effect.flatMap((result) => {
+      if (result.code === 0) return Effect.succeed<string | undefined>(result.stdout);
+
+      // oxlint-disable-next-line effecttsgo/effect-succeed-with-void -- This branch inhabits the explicit optional-tip result.
+      if (result.code === 1) return Effect.succeed<string | undefined>(undefined);
+
+      return fail("clean up Coordinator checkout", "Owned branch could not be inspected.");
+    }),
+  );
+}
+
 function finishCreation(
   commit: string,
   placement: CommandResult,
-  postcondition: Classification,
+  postcondition: CoordinatorCheckoutObservation,
 ): Effect.Effect<CoordinatorCheckoutReceipt, GitError> {
   if (postcondition.kind === "exact" && postcondition.head === commit) {
     const diagnostic =

@@ -20,7 +20,7 @@ import { RecordStore } from "../../src/coordinator/store.js";
 import { herdrWorkerName, herdrWorkerTabLabel } from "../../src/coordinator/worker-naming.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
 import { runNodePlatformPromise } from "../../src/node-platform.js";
-import { detachedPlacement, ensureDetachedWorktree } from "../../src/repository.js";
+import { detachedPlacement, ensureDetachedWorktree } from "../../src/repository/candidate.js";
 import { createWorkerSessionEffect, type WorkerObjective } from "../../src/worker/session.js";
 import { git } from "../support/helpers.js";
 
