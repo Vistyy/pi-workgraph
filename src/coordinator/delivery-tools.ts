@@ -4,38 +4,35 @@ import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
-  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { type Static, Type } from "typebox";
+import { Type } from "typebox";
 import { Value } from "typebox/value";
 
-const ToolNameSchema = Type.String({ minLength: 1, pattern: "^\\S+$" });
-
-const DeliverySettingsSchema = Type.Object(
-  { deferredTools: Type.Array(ToolNameSchema) },
-  { additionalProperties: false },
-);
-
-const WorkgraphSettingsSchema = Type.Object(
-  { delivery: Type.Optional(Type.Unknown()) },
-  { additionalProperties: true },
-);
-
-const GlobalSettingsSchema = Type.Object(
-  { "pi-workgraph": Type.Optional(Type.Unknown()) },
-  { additionalProperties: true },
-);
-
-const LoaderResultSchema = Type.Object(
+const SettingsSchema = Type.Object(
   {
-    loaded: Type.Array(Type.String()),
-    alreadyActive: Type.Array(Type.String()),
-    missing: Type.Array(Type.String()),
+    "pi-workgraph": Type.Optional(
+      Type.Object(
+        {
+          delivery: Type.Optional(
+            Type.Object(
+              {
+                deferredTools: Type.Array(Type.String({ minLength: 1, pattern: "^\\S+$" })),
+              },
+              { additionalProperties: false },
+            ),
+          ),
+        },
+        { additionalProperties: true },
+      ),
+    ),
   },
-  { additionalProperties: false },
+  { additionalProperties: true },
 );
 
-type LoaderResult = Static<typeof LoaderResultSchema>;
+interface LoaderResult {
+  readonly loaded: readonly string[];
+  readonly missing: readonly string[];
+}
 
 export const deliverySettingsPath = (agentDir = getAgentDir()): string =>
   join(agentDir, "settings.json");
@@ -58,107 +55,65 @@ export function loadDeferredDeliveryTools(path = deliverySettingsPath()): readon
     throw new Error(`Invalid JSON in ${path}.`);
   }
 
-  if (!Value.Check(GlobalSettingsSchema, parsed))
-    throw new Error(`Invalid pi-workgraph settings in ${path}.`);
-
-  const workgraph = Value.Decode(GlobalSettingsSchema, parsed)["pi-workgraph"];
-
-  if (workgraph === undefined) return [];
-
-  if (!Value.Check(WorkgraphSettingsSchema, workgraph))
-    throw new Error(`Invalid pi-workgraph.delivery settings in ${path}.`);
-
-  const delivery = Value.Decode(WorkgraphSettingsSchema, workgraph).delivery;
-
-  if (delivery === undefined) return [];
-
-  if (!Value.Check(DeliverySettingsSchema, delivery))
+  if (!Value.Check(SettingsSchema, parsed))
     throw new Error(
       `Invalid pi-workgraph.delivery.deferredTools in ${path}; expected an array of non-whitespace tool names.`,
     );
 
-  return [...new Set(Value.Decode(DeliverySettingsSchema, delivery).deferredTools)];
+  const configured = Value.Decode(SettingsSchema, parsed)["pi-workgraph"]?.delivery?.deferredTools;
+
+  return configured === undefined ? [] : [...new Set(configured)];
 }
 
-class DeliveryToolVisibility {
-  readonly configured: readonly string[];
-
-  constructor(configured: readonly string[]) {
-    this.configured = [...new Set(configured)];
-  }
-
-  initial(active: readonly string[], loaderName: string): readonly string[] {
-    const deferred = new Set(this.configured);
-    const retained = active.filter((name) => !deferred.has(name) && name !== loaderName);
-
-    return [...retained, loaderName];
-  }
-
-  load(active: readonly string[], available: readonly string[]): LoaderResult {
-    const activeNames = new Set(active);
-    const availableNames = new Set(available);
-    const loaded: string[] = [];
-    const alreadyActive: string[] = [];
-    const missing: string[] = [];
-
-    for (const name of this.configured) {
-      if (activeNames.has(name)) alreadyActive.push(name);
-      else if (availableNames.has(name)) {
-        loaded.push(name);
-        activeNames.add(name);
-      } else missing.push(name);
-    }
-
-    return { loaded, alreadyActive, missing };
-  }
-
-  isLoaded(branch: readonly SessionEntry[], loaderName: string): boolean {
-    return branch.some(
-      (entry) =>
-        entry.type === "message" &&
-        entry.message.role === "toolResult" &&
-        entry.message.toolName === loaderName &&
-        !entry.message.isError &&
-        Value.Check(LoaderResultSchema, entry.message.details),
-    );
-  }
-}
-
-export const deliveryLoaderName = "workgraph_load_delivery_tools";
+const deliveryLoaderName = "workgraph_load_delivery_tools";
 
 export function installDeliveryTools(pi: ExtensionAPI, configured: readonly string[]): void {
-  if (configured.length === 0) return;
+  const names = [...new Set(configured)];
 
-  const visibility = new DeliveryToolVisibility(configured);
-  const availableNames = (): string[] => pi.getAllTools().map(({ name }) => name);
+  if (names.length === 0) return;
+
+  const setActiveTools = (next: readonly string[]): void => {
+    const active = pi.getActiveTools();
+
+    if (next.length !== active.length || next.some((name, index) => name !== active[index]))
+      pi.setActiveTools([...next]);
+  };
 
   const activate = (): LoaderResult => {
     const active = pi.getActiveTools();
-    const receipt = visibility.load(active, availableNames());
-    const next = [...active, ...receipt.loaded];
+    const available = new Set(pi.getAllTools().map(({ name }) => name));
+    const loaded = names.filter((name) => available.has(name) && !active.includes(name));
+    const missing = names.filter((name) => !available.has(name));
 
-    if (!next.includes(deliveryLoaderName)) next.push(deliveryLoaderName);
+    setActiveTools([...active.filter((name) => name !== deliveryLoaderName), ...loaded]);
 
-    if (next.length !== active.length || next.some((name, index) => name !== active[index]))
-      pi.setActiveTools(next);
-
-    return receipt;
+    return { loaded, missing };
   };
 
   const restore = (ctx: ExtensionContext): void => {
-    const branch = ctx.sessionManager.getBranch();
+    const loaded = ctx.sessionManager
+      .getBranch()
+      .some(
+        (entry) =>
+          entry.type === "message" &&
+          entry.message.role === "toolResult" &&
+          entry.message.toolName === deliveryLoaderName &&
+          !entry.message.isError,
+      );
 
-    if (visibility.isLoaded(branch, deliveryLoaderName)) {
+    if (loaded) {
       activate();
 
       return;
     }
 
-    const active = pi.getActiveTools();
-    const next = visibility.initial(active, deliveryLoaderName);
+    const deferred = new Set(names);
 
-    if (next.length !== active.length || next.some((name, index) => name !== active[index]))
-      pi.setActiveTools([...next]);
+    const active = pi
+      .getActiveTools()
+      .filter((name) => !deferred.has(name) && name !== deliveryLoaderName);
+
+    setActiveTools([...active, deliveryLoaderName]);
   };
 
   pi.registerTool({

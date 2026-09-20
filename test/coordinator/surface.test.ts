@@ -262,13 +262,41 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
     await coordinator.runner.emit({ type: "session_start", reason: "startup" });
     assert.equal(coordinator.activeTools().includes("bash"), false);
     assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
+    const beforeLoader = coordinator.session.getLeafId();
+    assert.ok(beforeLoader !== null);
+
     const receipt = await coordinator.call("workgraph_load_delivery_tools", {});
-    assert.deepEqual(receipt.details, {
-      loaded: ["bash"],
-      alreadyActive: [],
-      missing: ["absent_peer"],
+    assert.deepEqual(receipt.details, { loaded: ["bash"], missing: ["absent_peer"] });
+    assert.equal(coordinator.activeTools().includes("bash"), true);
+    assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), false);
+
+    const afterLoader = coordinator.session.appendMessage({
+      role: "toolResult",
+      toolCallId: "load-delivery",
+      toolName: "workgraph_load_delivery_tools",
+      content: receipt.content,
+      details: receipt.details,
+      isError: false,
+      timestamp: 0,
+    });
+
+    coordinator.session.branch(beforeLoader);
+    await coordinator.runner.emit({
+      type: "session_tree",
+      oldLeafId: afterLoader,
+      newLeafId: beforeLoader,
+    });
+    assert.equal(coordinator.activeTools().includes("bash"), false);
+    assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
+
+    coordinator.session.branch(afterLoader);
+    await coordinator.runner.emit({
+      type: "session_tree",
+      oldLeafId: beforeLoader,
+      newLeafId: afterLoader,
     });
     assert.equal(coordinator.activeTools().includes("bash"), true);
+    assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), false);
   } finally {
     await coordinator.dispose();
   }
