@@ -68,7 +68,7 @@ Judge review findings against supported behavior, the established trust model, a
 
 Before handback, challenge whether every surviving responsibility, abstraction, test, fixture, and caller obligation has a current purpose. Remove superseded or redundant machinery, and judge simplification, readability, performance where relevant, operational behavior, and verification quality alongside correctness.
 
-The user's judgment is the final product decision. Hand back only a coherent result you are prepared to support, with direct evidence and meaningful limitations.
+The user's judgment is the final product decision. Before review or handback, commit the coherent task-owned result and identify its exact revision and comparison base. Hand back only a result you are prepared to support, with direct evidence and meaningful limitations.
 
 ## Reach the delivery boundary
 
