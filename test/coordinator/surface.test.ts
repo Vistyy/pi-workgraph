@@ -1,4 +1,3 @@
-/* oxlint-disable anti-slop/require-readable-spacing -- Fixture setup and consecutive surface observations remain grouped by behavior. */
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -54,6 +53,7 @@ async function fixture(
   });
 
   let activeTools: string[] | undefined;
+
   if (settings !== undefined) {
     await mkdir(join(parent, "agent"), { recursive: true });
     await writeFile(join(parent, "agent", "settings.json"), settings);
@@ -217,11 +217,13 @@ void test("coordinator registers the exact strict tool surface", async () => {
       forceSystemPrompt: "Base coordinator prompt",
       cwd: f.root,
     } satisfies BuildSystemPromptOptions;
+
     const injected = await f.runner.emitBeforeAgentStart(
       "Coordinate the request",
       undefined,
       systemPromptOptions,
     );
+
     const injectedPrompt = injected.systemPromptOptions.forceSystemPrompt;
 
     assert.deepEqual(injected.messages, []);
@@ -245,14 +247,15 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
   const settings = JSON.stringify({
     "pi-workgraph": { delivery: { deferredTools: ["bash", "bash", "absent_peer"] } },
   });
+
   const coordinator = await fixture(false, null, null, settings);
 
   try {
     const loader = coordinator.runner.getToolDefinition("workgraph_load_delivery_tools");
     assert.ok(loader !== undefined);
-    assert.match(loader.description, /accepted change reaches the delivery boundary/);
-    assert.match(loader.description, /guided review or pull-request follow\/unfollow/);
-    assert.match(loader.description, /grants no authority/);
+    assert.match(loader.description, /guided review and pull-request follow or unfollow/);
+    assert.match(loader.description, /at the delivery boundary/);
+    assert.match(loader.description, /does not authorize its actions/);
     assert.equal(Value.Check(loader.parameters, {}), true);
     assert.equal(Value.Check(loader.parameters, { unexpected: true }), false);
 
@@ -271,6 +274,7 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
   }
 
   const worker = await fixture(false, null, "research", settings);
+
   try {
     assert.equal(worker.runner.getToolDefinition("workgraph_load_delivery_tools"), undefined);
   } finally {
@@ -280,14 +284,17 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
 
 void test("invalid delivery settings fail open with a bounded warning", async () => {
   const f = await fixture(false, null, null, "{");
+
   try {
     const before = f.activeTools();
     assert.equal(f.runner.getToolDefinition("workgraph_load_delivery_tools"), undefined);
     await f.runner.emit({ type: "session_start", reason: "startup" });
     assert.deepEqual(f.activeTools(), before);
+
     const warning = f.notifications.find(({ message }) =>
       message.startsWith("Workgraph delivery tools unchanged:"),
     );
+
     assert.ok(warning !== undefined);
     assert.equal(warning.type, "warning");
     assert.ok(warning.message.length <= 550);
@@ -360,10 +367,12 @@ void test("coordinator extension remains inactive in Worker scope", async () => 
       [],
     );
     assert.equal(f.runner.getCommand("calm"), undefined);
+
     const systemPromptOptions = {
       forceSystemPrompt: "Worker prompt",
       cwd: f.root,
     } satisfies BuildSystemPromptOptions;
+
     const inactive = await f.runner.emitBeforeAgentStart("Work", undefined, systemPromptOptions);
     assert.deepEqual(inactive.messages, []);
     assert.equal(inactive.systemPromptOptions.forceSystemPrompt, "Worker prompt");

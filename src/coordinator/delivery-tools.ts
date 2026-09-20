@@ -1,4 +1,3 @@
-/* oxlint-disable anti-slop/require-readable-spacing -- Closely related schema declarations and visibility transitions remain grouped. */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -11,14 +10,17 @@ import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
 const ToolNameSchema = Type.String({ minLength: 1, pattern: "^\\S+$" });
+
 const DeliverySettingsSchema = Type.Object(
   { deferredTools: Type.Array(ToolNameSchema) },
   { additionalProperties: false },
 );
+
 const WorkgraphSettingsSchema = Type.Object(
   { delivery: Type.Optional(Type.Unknown()) },
   { additionalProperties: true },
 );
+
 const GlobalSettingsSchema = Type.Object(
   { "pi-workgraph": Type.Optional(Type.Unknown()) },
   { additionalProperties: true },
@@ -40,6 +42,7 @@ export const deliverySettingsPath = (agentDir = getAgentDir()): string =>
 
 export function loadDeferredDeliveryTools(path = deliverySettingsPath()): readonly string[] {
   let source: string;
+
   try {
     source = readFileSync(path, "utf8");
   } catch (cause) {
@@ -48,6 +51,7 @@ export function loadDeferredDeliveryTools(path = deliverySettingsPath()): readon
   }
 
   let parsed: unknown;
+
   try {
     parsed = JSON.parse(source);
   } catch {
@@ -58,12 +62,16 @@ export function loadDeferredDeliveryTools(path = deliverySettingsPath()): readon
     throw new Error(`Invalid pi-workgraph settings in ${path}.`);
 
   const workgraph = Value.Decode(GlobalSettingsSchema, parsed)["pi-workgraph"];
+
   if (workgraph === undefined) return [];
+
   if (!Value.Check(WorkgraphSettingsSchema, workgraph))
     throw new Error(`Invalid pi-workgraph.delivery settings in ${path}.`);
 
   const delivery = Value.Decode(WorkgraphSettingsSchema, workgraph).delivery;
+
   if (delivery === undefined) return [];
+
   if (!Value.Check(DeliverySettingsSchema, delivery))
     throw new Error(
       `Invalid pi-workgraph.delivery.deferredTools in ${path}; expected an array of non-whitespace tool names.`,
@@ -82,6 +90,7 @@ class DeliveryToolVisibility {
   initial(active: readonly string[], loaderName: string): readonly string[] {
     const deferred = new Set(this.configured);
     const retained = active.filter((name) => !deferred.has(name) && name !== loaderName);
+
     return [...retained, loaderName];
   }
 
@@ -122,24 +131,32 @@ export function installDeliveryTools(pi: ExtensionAPI, configured: readonly stri
 
   const visibility = new DeliveryToolVisibility(configured);
   const availableNames = (): string[] => pi.getAllTools().map(({ name }) => name);
+
   const activate = (): LoaderResult => {
     const active = pi.getActiveTools();
     const receipt = visibility.load(active, availableNames());
     const next = [...active, ...receipt.loaded];
+
     if (!next.includes(deliveryLoaderName)) next.push(deliveryLoaderName);
+
     if (next.length !== active.length || next.some((name, index) => name !== active[index]))
       pi.setActiveTools(next);
+
     return receipt;
   };
+
   const restore = (ctx: ExtensionContext): void => {
     const branch = ctx.sessionManager.getBranch();
+
     if (visibility.isLoaded(branch, deliveryLoaderName)) {
       activate();
+
       return;
     }
 
     const active = pi.getActiveTools();
     const next = visibility.initial(active, deliveryLoaderName);
+
     if (next.length !== active.length || next.some((name, index) => name !== active[index]))
       pi.setActiveTools([...next]);
   };
@@ -148,10 +165,11 @@ export function installDeliveryTools(pi: ExtensionAPI, configured: readonly stri
     name: deliveryLoaderName,
     label: "Load Delivery Tools",
     description:
-      "Make explicitly configured peer delivery tools visible when an accepted change reaches the delivery boundary, or when the user directly requests guided review or pull-request follow/unfollow. Visibility grants no authority to use a tool or perform its effects.",
+      "Load configured tools for guided review and pull-request follow or unfollow. Use this at the delivery boundary or when the user asks for one of those capabilities. Loading a tool does not authorize its actions.",
     parameters: Type.Object({}, { additionalProperties: false }),
     execute() {
       const receipt = activate();
+
       return Promise.resolve({
         content: [{ type: "text" as const, text: JSON.stringify(receipt, null, 2) }],
         details: receipt,

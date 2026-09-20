@@ -1,4 +1,3 @@
-/* oxlint-disable anti-slop/require-readable-spacing -- Test setup and consecutive observations remain grouped by behavior. */
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -32,13 +31,16 @@ async function fixture(configured: readonly string[]) {
   const root = join(parent, "repo");
   await mkdir(root);
   const delivery: InlineExtension = (pi) => installDeliveryTools(pi, configured);
+
   let active = [
     "peer_review",
     "peer_follow",
     "unrelated",
     ...(configured.length > 0 ? [deliveryLoaderName] : []),
   ];
+
   const all = [...active];
+
   const f = await extensionFixture(
     "coordinator",
     root,
@@ -78,6 +80,7 @@ async function fixture(configured: readonly string[]) {
 void test("delivery settings are explicit, strict, and deduplicated", async () => {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-delivery-settings-"));
   const path = join(parent, "settings.json");
+
   try {
     assert.deepEqual(loadDeferredDeliveryTools(path), []);
     await writeFile(path, JSON.stringify({ other: true }));
@@ -111,6 +114,7 @@ void test("delivery settings are explicit, strict, and deduplicated", async () =
 
 void test("loader defers only configured tools and restores visibility from its branch result", async () => {
   const f = await fixture(["peer_review", "peer_review", "missing_peer"]);
+
   try {
     const loader = f.runner.getToolDefinition(deliveryLoaderName);
     assert.ok(loader !== undefined);
@@ -151,6 +155,7 @@ void test("loader defers only configured tools and restores visibility from its 
       isError: false,
       timestamp: 0,
     });
+
     await f.runner.emit({ type: "session_tree", oldLeafId: beforeMarker, newLeafId: marker });
     assert.equal(f.activeTools().includes("peer_review"), true);
     await f.runner.emit({ type: "session_start", reason: "reload" });
@@ -183,6 +188,7 @@ void test("loader defers only configured tools and restores visibility from its 
 
 void test("empty configuration registers no loader and changes no peer visibility", async () => {
   const f = await fixture([]);
+
   try {
     await f.runner.emit({ type: "session_start", reason: "startup" });
     assert.equal(f.runner.getToolDefinition(deliveryLoaderName), undefined);

@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread, anti-slop/require-readable-spacing -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks, and related extension setup remains grouped. */
+/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -107,6 +107,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   const policyPath = options.policyPath ?? modelPolicyPath(agentDir);
   let deliverySettingsWarning: string | undefined;
   let deferredDeliveryTools: readonly string[] = [];
+
   try {
     deferredDeliveryTools = loadDeferredDeliveryTools(
       options.settingsPath ?? deliverySettingsPath(agentDir),
@@ -114,6 +115,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   } catch (cause) {
     deliverySettingsWarning = publicMessage(cause);
   }
+
   installDeliveryTools(pi, deferredDeliveryTools);
   const calm = installCalmMode(pi);
   let attached: SessionRuntime | undefined;

@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers, anti-slop/require-readable-spacing -- This disposable consumer owns native package commands, timing, deadline, cleanup, and grouped package assertions. */
+/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers -- This disposable consumer owns native package commands, timing, deadline, and cleanup. */
 import { execFile } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -55,23 +55,18 @@ async function smokePackage(): Promise<void> {
   const deliveryReferencePath = join(packageRoot, "references/delivery.md");
   const deliveryReference = await readFile(deliveryReferencePath, "utf8");
   const packagedReadme = await readFile(join(packageRoot, "README.md"), "utf8");
-  const packagedCoordinator = await readFile(join(packageRoot, "COORDINATOR.md"), "utf8");
 
   if (
     !deliveryReference.includes("# Deliver an accepted repository change") ||
     !deliveryReference.includes("Visibility does not grant authority")
   )
     throw new Error("Packaged delivery reference is missing or invalid.");
+
   if (
     !packagedReadme.includes("pi-workgraph.delivery") ||
     !packagedReadme.includes("deferredTools")
   )
     throw new Error("Packaged README omits delivery-tool configuration.");
-  if (
-    !packagedCoordinator.includes("workgraph_load_delivery_tools") ||
-    !packagedCoordinator.includes("guided review or pull-request follow or unfollow")
-  )
-    throw new Error("Packaged Coordinator guidance omits delivery-tool triggers.");
 
   const agentDir = join(parent, "agent");
   const sessionDir = join(parent, "sessions");
@@ -117,12 +112,19 @@ async function smokePackage(): Promise<void> {
         agentDir,
       );
       const coordinator = one(coordinatorResult, "coordinator", coordinatorPath);
+      const deliveryLoader = coordinator.tools.get("workgraph_load_delivery_tools");
       if (
         !coordinator.tools.has("workgraph_implement") ||
-        !coordinator.tools.has("workgraph_load_delivery_tools") ||
+        deliveryLoader === undefined ||
         !coordinator.commands.has("calm")
       )
         throw new Error("Packaged coordinator factory did not register its configured extension surface.");
+      if (
+        !deliveryLoader.definition.description.includes("guided review and pull-request follow or unfollow") ||
+        !deliveryLoader.definition.description.includes("at the delivery boundary") ||
+        !deliveryLoader.definition.description.includes("does not authorize its actions")
+      )
+        throw new Error("Packaged delivery loader omits its trigger or authority boundary.");
 
       const modelRuntime = await ModelRuntime.create({
         authPath: ${JSON.stringify(join(parent, "auth.json"))},
