@@ -305,6 +305,88 @@ void test("partial and switched resources remain present and block", async () =>
   }
 });
 
+void test("registered local delivery advances the original destination, cleans ownership, and permits a fresh allocation", async () => {
+  const f = await fixture();
+
+  try {
+    const first = f.facts((await f.call("workgraph_checkout", {})).details);
+    await writeFile(join(first.managedPath, "delivered.txt"), "accepted\n");
+    await git(first.managedPath, "add", "delivered.txt");
+    await git(first.managedPath, "commit", "-m", "accepted local change");
+    const accepted = await git(first.managedPath, "rev-parse", "HEAD");
+
+    const delivered = await f.call("workgraph_deliver", {
+      checkoutId: first.checkoutId,
+      route: "local",
+      revision: accepted,
+    });
+
+    // SAFETY: The registered delivery tool returns the persisted checkout record as details.
+    assert.deepEqual((delivered.details as { disposition: unknown }).disposition, {
+      kind: "complete",
+      route: "local",
+      revision: accepted,
+      destinationRevision: accepted,
+    });
+    assert.equal(await readFile(join(f.root, "delivered.txt"), "utf8"), "accepted\n");
+    assert.equal(existsSync(first.managedPath), false);
+    await assert.rejects(git(f.root, "rev-parse", "--verify", first.ownedBranch));
+
+    const fresh = f.facts((await f.call("workgraph_checkout", {})).details);
+    assert.equal(fresh.checkoutId, first.checkoutId);
+    assert.equal(fresh.created, true);
+    assert.equal(fresh.head, accepted);
+    assert.equal(await readFile(join(fresh.managedPath, "delivered.txt"), "utf8"), "accepted\n");
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("local delivery preserves disjoint dirty destination bytes and blocks overlap", async () => {
+  const f = await fixture();
+
+  try {
+    const first = f.facts((await f.call("workgraph_checkout", {})).details);
+    await writeFile(join(first.managedPath, "delivered.txt"), "accepted\n");
+    await git(first.managedPath, "add", "delivered.txt");
+    await git(first.managedPath, "commit", "-m", "accepted local change");
+    const accepted = await git(first.managedPath, "rev-parse", "HEAD");
+    await writeFile(join(f.root, "tracked.txt"), "dirty but disjoint\n");
+    await writeFile(join(f.root, "untracked.txt"), "preserve\n");
+    await writeFile(join(f.root, "ignored.txt"), "preserve ignored\n");
+
+    await f.call("workgraph_deliver", {
+      checkoutId: first.checkoutId,
+      route: "local",
+      revision: accepted,
+    });
+    assert.equal(await readFile(join(f.root, "tracked.txt"), "utf8"), "dirty but disjoint\n");
+    assert.equal(await readFile(join(f.root, "untracked.txt"), "utf8"), "preserve\n");
+    assert.equal(await readFile(join(f.root, "ignored.txt"), "utf8"), "preserve ignored\n");
+
+    await git(f.root, "reset", "--hard");
+    await rm(join(f.root, "untracked.txt"));
+    const second = f.facts((await f.call("workgraph_checkout", {})).details);
+    await writeFile(join(second.managedPath, "tracked.txt"), "accepted overlap\n");
+    await git(second.managedPath, "commit", "-am", "overlapping change");
+    const overlap = await git(second.managedPath, "rev-parse", "HEAD");
+    await writeFile(join(f.root, "tracked.txt"), "destination overlap\n");
+
+    await assert.rejects(
+      f.call("workgraph_deliver", {
+        checkoutId: second.checkoutId,
+        route: "local",
+        revision: overlap,
+      }),
+      /overlaps the prepared change/,
+    );
+    assert.equal(await readFile(join(f.root, "tracked.txt"), "utf8"), "destination overlap\n");
+    assert.equal(existsSync(second.managedPath), true);
+  } finally {
+    await f.dispose();
+  }
+});
+
 void test("retained implementation Candidate applies only into the managed checkout", async () => {
   const f = await fixture();
 

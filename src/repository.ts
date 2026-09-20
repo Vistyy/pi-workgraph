@@ -1,4 +1,4 @@
-/* oxlint-disable anti-slop/require-readable-spacing -- Effect generators keep sequential custody checks grouped without incidental whitespace. */
+/* oxlint-disable anti-slop/require-readable-spacing, anti-slop/no-conditional-empty-object-spread -- Effect generators keep sequential custody checks and exact optional facts grouped. */
 import { existsSync, realpathSync } from "node:fs";
 import { chmod, lstat, mkdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -216,6 +216,30 @@ function ensureCoordinatorCheckoutParent(managedPath: string): Effect.Effect<voi
         );
       yield* filesystem("secure Coordinator checkout parent", () => chmod(path, 0o700));
     }
+  });
+}
+
+export interface CoordinatorSourceFacts {
+  readonly target: RepositoryTarget;
+  readonly head: string;
+  readonly ref?: string;
+}
+
+export function coordinatorSourceFacts(
+  cwd: string,
+  path?: string,
+): Effect.Effect<CoordinatorSourceFacts, GitError> {
+  return Effect.gen(function* () {
+    const resolved = yield* resolveCoordinatorRepository(cwd, path);
+    const symbolic = yield* gitResult(resolved.target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]);
+
+    return {
+      target: resolved.target,
+      head: resolved.commit,
+      ...(symbolic.code === 0 && symbolic.stdout.startsWith("refs/heads/")
+        ? { ref: symbolic.stdout }
+        : {}),
+    };
   });
 }
 
@@ -479,6 +503,271 @@ function boundedDiagnostic(message: string): string {
   return message.replace(/\s+/g, " ").slice(0, 500);
 }
 
+export interface CoordinatorAdvancement {
+  readonly destinationRoot: string;
+  readonly destinationRef: string;
+  readonly destinationHead: string;
+  readonly preparedRevision: string;
+}
+
+export function prepareCoordinatorAdvancement(input: {
+  readonly identity: CoordinatorCheckoutIdentity;
+  readonly acceptedRevision: string;
+  readonly destinationRoot: string;
+  readonly destinationRef: string;
+}): Effect.Effect<CoordinatorAdvancement, GitError> {
+  return Effect.gen(function* () {
+    const source = yield* classifyCoordinatorCheckout(input.identity);
+
+    if (source.kind !== "exact" || source.head !== input.acceptedRevision)
+      return yield* fail(
+        "prepare local delivery",
+        "Accepted revision is not the owned branch HEAD.",
+      );
+    if (yield* dirty(input.identity.managedPath, false))
+      return yield* fail(
+        "prepare local delivery",
+        "Coordinator checkout has tracked or untracked changes.",
+      );
+    const destination = yield* resolveCoordinatorRepository(input.destinationRoot);
+
+    if (destination.target.commonDir !== input.identity.repositoryCommonDir)
+      return yield* fail("prepare local delivery", "Destination belongs to another repository.");
+    const ref = yield* gitResult(destination.target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]);
+
+    if (ref.code !== 0 || ref.stdout !== input.destinationRef)
+      return yield* fail(
+        "prepare local delivery",
+        "Destination is not attached to the authorized ref.",
+      );
+    if (yield* operationInProgress(destination.target.checkoutRoot))
+      return yield* fail(
+        "prepare local delivery",
+        "Destination has a merge or rebase operation in progress.",
+      );
+    const destinationHead = destination.commit;
+    const preparedRevision = yield* plannedRevision(
+      input.identity.repositoryCommonDir,
+      destinationHead,
+      input.acceptedRevision,
+      "Integrate accepted Workgraph checkout",
+    );
+
+    yield* requireDisjointDestinationChanges(
+      destination.target.checkoutRoot,
+      destinationHead,
+      preparedRevision,
+    );
+
+    return {
+      destinationRoot: destination.target.checkoutRoot,
+      destinationRef: input.destinationRef,
+      destinationHead,
+      preparedRevision,
+    };
+  });
+}
+
+export function applyCoordinatorAdvancement(input: {
+  readonly commonDir: string;
+  readonly acceptedRevision: string;
+  readonly advancement: CoordinatorAdvancement;
+}): Effect.Effect<string, GitError> {
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Exact advancement observation and postconditions form one custody boundary.
+  return Effect.gen(function* () {
+    const resolved = yield* resolveCoordinatorRepository(input.advancement.destinationRoot);
+
+    if (resolved.target.commonDir !== input.commonDir)
+      return yield* fail("apply local delivery", "Destination repository identity changed.");
+    const ref = yield* gitResult(resolved.target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]);
+
+    if (ref.code !== 0 || ref.stdout !== input.advancement.destinationRef)
+      return yield* fail("apply local delivery", "Destination ref changed.");
+    if (resolved.commit === input.advancement.preparedRevision) return resolved.commit;
+    if (resolved.commit !== input.advancement.destinationHead)
+      return yield* fail("apply local delivery", "Destination HEAD changed after preparation.");
+    yield* requireDisjointDestinationChanges(
+      resolved.target.checkoutRoot,
+      input.advancement.destinationHead,
+      input.advancement.preparedRevision,
+    );
+    const merge = yield* gitResult(resolved.target.checkoutRoot, [
+      "merge",
+      "--ff-only",
+      "--no-overwrite-ignore",
+      input.advancement.preparedRevision,
+    ]);
+    const observed = yield* resolveCoordinatorRepository(resolved.target.checkoutRoot);
+
+    if (observed.commit !== input.advancement.preparedRevision) {
+      if (merge.code !== 0)
+        return yield* fail(
+          "apply local delivery",
+          `Git refused the prepared advancement: ${boundedDiagnostic(merge.stderr || merge.stdout)}`,
+        );
+
+      return yield* fail(
+        "apply local delivery",
+        "Prepared advancement failed exact post-validation.",
+      );
+    }
+    if (!(yield* ancestry(input.commonDir, input.acceptedRevision, observed.commit)))
+      return yield* fail(
+        "apply local delivery",
+        "Destination does not contain the accepted revision.",
+      );
+
+    return observed.commit;
+  });
+}
+
+export function removeCoordinatorWorktree(input: {
+  readonly target: RepositoryTarget;
+  readonly identity: CoordinatorCheckoutIdentity;
+  readonly expectedTip: string;
+}): Effect.Effect<void, GitError> {
+  return Effect.gen(function* () {
+    yield* revalidate(input.target);
+    const [exists, registration] = yield* Effect.all([
+      pathExists(input.identity.managedPath),
+      registeredWorktree(input.target.commonDir, input.identity.managedPath),
+    ]);
+
+    if (!exists && registration === undefined) {
+      yield* requireExactRef(input.target.commonDir, input.identity.ownedBranch, input.expectedTip);
+
+      return;
+    }
+    if (!exists || registration === undefined)
+      return yield* fail("cleanup Coordinator checkout", "Owned worktree resources are partial.");
+    const classification = yield* classifyCoordinatorCheckout(input.identity);
+
+    if (classification.kind !== "exact" || classification.head !== input.expectedTip)
+      return yield* fail(
+        "cleanup Coordinator checkout",
+        "Owned branch no longer has the accepted tip.",
+      );
+    if (yield* dirty(input.identity.managedPath, false))
+      return yield* fail(
+        "cleanup Coordinator checkout",
+        "Coordinator checkout has new tracked or untracked changes.",
+      );
+    yield* git(
+      input.target.checkoutRoot,
+      ["worktree", "remove", "--force", input.identity.managedPath],
+      true,
+    );
+
+    if (
+      (yield* pathExists(input.identity.managedPath)) ||
+      (yield* registeredWorktree(input.target.commonDir, input.identity.managedPath)) !== undefined
+    )
+      return yield* fail(
+        "cleanup Coordinator checkout",
+        "Owned worktree removal was not established.",
+      );
+  });
+}
+
+export function deleteCoordinatorBranch(input: {
+  readonly commonDir: string;
+  readonly branch: string;
+  readonly expectedTip: string;
+}): Effect.Effect<void, GitError> {
+  return deleteExactRef(input.commonDir, input.branch, input.expectedTip);
+}
+
+function plannedRevision(
+  commonDir: string,
+  destination: string,
+  source: string,
+  message: string,
+): Effect.Effect<string, GitError> {
+  return Effect.gen(function* () {
+    if (yield* ancestry(commonDir, destination, source)) return source;
+    if (yield* ancestry(commonDir, source, destination)) return destination;
+    const tree = yield* proveMergeable(commonDir, destination, source);
+
+    return yield* gitDir(commonDir, [
+      "commit-tree",
+      tree,
+      "-p",
+      destination,
+      "-p",
+      source,
+      "-m",
+      message,
+    ]);
+  });
+}
+
+function requireDisjointDestinationChanges(
+  cwd: string,
+  from: string,
+  to: string,
+): Effect.Effect<void, GitError> {
+  return Effect.gen(function* () {
+    if (yield* operationInProgress(cwd))
+      return yield* fail(
+        "prepare local delivery",
+        "Destination has a merge or rebase operation in progress.",
+      );
+    const planned = new Set(
+      (yield* git(cwd, ["diff", "--name-only", "-z", from, to], true)).split("\0").filter(Boolean),
+    );
+    const status = yield* git(
+      cwd,
+      ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"],
+      true,
+    );
+
+    for (const path of statusPaths(status)) {
+      if (planned.has(path))
+        return yield* fail(
+          "prepare local delivery",
+          `Destination path ${path} overlaps the prepared change.`,
+        );
+    }
+  });
+}
+
+function statusPaths(status: string): string[] {
+  const fields = status.split("\0").filter(Boolean);
+  const paths: string[] = [];
+
+  for (let index = 0; index < fields.length; index += 1) {
+    const field = fields[index];
+
+    if (field === undefined || field.length < 3) continue;
+    const pathStart = field[1] === " " && field[2] !== " " ? 2 : 3;
+    paths.push(field.slice(pathStart));
+
+    if (field[0] === "R" || field[0] === "C" || field[1] === "R" || field[1] === "C") index += 1;
+  }
+
+  return paths;
+}
+
+function operationInProgress(cwd: string): Effect.Effect<boolean, GitError> {
+  return git(cwd, ["rev-parse", "--git-path", "MERGE_HEAD"]).pipe(
+    Effect.flatMap((mergePath) =>
+      git(cwd, ["rev-parse", "--git-path", "rebase-merge"]).pipe(
+        Effect.flatMap((rebaseMerge) =>
+          git(cwd, ["rev-parse", "--git-path", "rebase-apply"]).pipe(
+            Effect.flatMap((rebaseApply) =>
+              Effect.all([
+                pathExists(resolve(cwd, mergePath)),
+                pathExists(resolve(cwd, rebaseMerge)),
+                pathExists(resolve(cwd, rebaseApply)),
+              ]).pipe(Effect.map((entries) => entries.some(Boolean))),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 export function resolveRevision(
   target: RepositoryTarget,
   revision: string,
@@ -659,13 +948,14 @@ function classifyAbsentOutput(
 /** Validate application facts and, at most once, checkpoint a clean same-ref advancement. */
 export function prepareApplication(
   operation: RepositoryOperation,
+  allowReplan = false,
 ): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(operation.target);
     const output = operation.output;
 
     return yield* output?.kind === "applying"
-      ? prepareApplicationRetry(operation, output)
+      ? prepareApplicationRetry(operation, output, allowReplan)
       : prepareRetainedApplication(operation);
   });
 }
@@ -673,6 +963,7 @@ export function prepareApplication(
 function prepareApplicationRetry(
   operation: RepositoryOperation,
   output: Extract<AttemptOutput, { kind: "applying" }>,
+  allowReplan: boolean,
 ): Effect.Effect<AttemptOutput, GitError> {
   return Effect.gen(function* () {
     const destination = yield* destinationState(operation.target);
@@ -692,13 +983,13 @@ function prepareApplicationRetry(
       return yield* fail("apply output", "Destination advanced beyond the exact candidate result.");
 
     if (
-      output.replanned === true ||
+      !allowReplan ||
       !(yield* ancestry(operation.target.commonDir, output.destinationHead, destination.head))
     )
       return yield* fail("apply output", "Destination changed after application preparation.");
     yield* proveMergeable(operation.target.commonDir, destination.head, output.sourceTip);
 
-    return { ...output, destinationHead: destination.head, replanned: true as const };
+    return { ...output, destinationHead: destination.head };
   });
 }
 
@@ -726,10 +1017,8 @@ function prepareRetainedApplication(
 
     if (destination.dirty) return yield* fail("apply output", "Destination checkout is dirty.");
 
-    if (
-      !(yield* ancestry(operation.target.commonDir, baseCommit(operation.spec), destination.head))
-    )
-      return yield* fail("apply output", "Destination no longer descends from the Attempt base.");
+    if (!(yield* ancestry(operation.target.commonDir, root, destination.head)))
+      return yield* fail("apply output", "Destination no longer descends from the Candidate root.");
     yield* proveMergeable(operation.target.commonDir, destination.head, source);
 
     return {

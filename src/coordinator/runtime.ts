@@ -329,14 +329,10 @@ export class SessionRuntime {
         if (attempt.output?.kind !== "retained" && attempt.output?.kind !== "applying")
           return yield* fail("apply output", "Attempt has no retained or applying output.");
 
-        let prepared = yield* prepareApplication(self.repositoryOperation(attempt)).pipe(
+        const prepared = yield* prepareApplication(self.repositoryOperation(attempt), true).pipe(
           Effect.mapError((cause) => runtimeError("apply output", cause)),
         );
 
-        attempt = self.store.checkpointOutput(attemptId, prepared);
-        prepared = yield* prepareApplication(self.repositoryOperation(attempt)).pipe(
-          Effect.mapError((cause) => runtimeError("apply output", cause)),
-        );
         attempt = self.store.checkpointOutput(attemptId, prepared);
 
         const applied = yield* applyOutput(self.repositoryOperation(attempt)).pipe(

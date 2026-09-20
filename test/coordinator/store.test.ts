@@ -171,6 +171,47 @@ void test("RecordStore creates one exact database lazily", () => {
   }
 });
 
+void test("checkout records are additive, strictly decoded, and exact-session partitioned", () => {
+  const { root, cleanup } = fixture();
+
+  try {
+    const first = new RecordStore(root, "session-a");
+    const second = new RecordStore(root, "session-b");
+    first.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec);
+
+    const record = {
+      checkoutId: "checkout-a",
+      managedPath: "/tmp/managed",
+      repositoryCommonDir: "/tmp/repo/.git",
+      ownedBranch: "refs/heads/pi-workgraph/coordinators/checkout-a",
+      sourceCheckoutRoot: "/tmp/repo",
+      sourceHead: commit,
+      sourceRef: "refs/heads/main",
+      disposition: { kind: "creating" as const },
+    };
+
+    assert.deepEqual(first.listCheckouts(), []);
+    assert.deepEqual(second.listCheckouts(), []);
+    first.checkpointCheckout(record);
+    assert.deepEqual(first.readCheckout(record.repositoryCommonDir), record);
+    assert.deepEqual(second.listCheckouts(), []);
+    assert.deepEqual(first.readTask("task"), { id: "task", task: directoryTask });
+    first.close();
+    second.close();
+
+    const database = new DatabaseSync(join(root, "workgraph", "workgraph.sqlite"));
+    database
+      .prepare("UPDATE coordinator_checkouts SET record_json=? WHERE session_id=?")
+      .run(JSON.stringify({ ...record, unexpected: true }), "session-a");
+    database.close();
+    const restored = new RecordStore(root, "session-a");
+    assert.throws(() => restored.listCheckouts(), StoreError);
+    restored.close();
+  } finally {
+    cleanup();
+  }
+});
+
 void test("session partitions share one file without sharing records or relations", () => {
   const { root, cleanup } = fixture();
 

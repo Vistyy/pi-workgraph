@@ -24,6 +24,8 @@ const accepted = [
   "workgraph_attempt",
   "workgraph_inspect",
   "workgraph_control",
+  "workgraph_deliver",
+  "workgraph_load_delivery_tools",
   "workgraph_notepad",
 ] as const;
 
@@ -73,7 +75,7 @@ async function fixture(
             activeTools = [...names];
           },
           getAllTools: () =>
-            ["bash", "read", "workgraph_load_delivery_tools"].map((name) => ({
+            ["bash", "read", "workgraph_deliver", "workgraph_load_delivery_tools"].map((name) => ({
               name,
               description: name,
               parameters: Type.Object({}, { additionalProperties: false }),
@@ -203,7 +205,10 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
     assert.ok(beforeLoader !== null);
 
     const receipt = await coordinator.call("workgraph_load_delivery_tools", {});
-    assert.deepEqual(receipt.details, { loaded: ["bash"], missing: ["absent_peer"] });
+    assert.deepEqual(receipt.details, {
+      loaded: ["workgraph_deliver", "bash"],
+      missing: ["absent_peer"],
+    });
     assert.equal(coordinator.activeTools().includes("bash"), true);
     assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), false);
 
@@ -256,9 +261,10 @@ void test("invalid delivery settings fail open with a bounded warning", async ()
 
   try {
     const before = f.activeTools();
-    assert.equal(f.runner.getToolDefinition("workgraph_load_delivery_tools"), undefined);
+    assert.ok(f.runner.getToolDefinition("workgraph_load_delivery_tools") !== undefined);
+    assert.ok(f.runner.getToolDefinition("workgraph_deliver") !== undefined);
     await f.runner.emit({ type: "session_start", reason: "startup" });
-    assert.deepEqual(f.activeTools(), before);
+    assert.deepEqual(f.activeTools(), [...before, "workgraph_load_delivery_tools"]);
 
     const warning = f.notifications.find(({ message }) =>
       message.startsWith("Workgraph delivery tools unchanged:"),

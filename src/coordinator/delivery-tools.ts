@@ -68,9 +68,7 @@ export function loadDeferredDeliveryTools(path = deliverySettingsPath()): readon
 const deliveryLoaderName = "workgraph_load_delivery_tools";
 
 export function installDeliveryTools(pi: ExtensionAPI, configured: readonly string[]): void {
-  const names = [...new Set(configured)];
-
-  if (names.length === 0) return;
+  const names = [...new Set(["workgraph_deliver", ...configured])];
 
   const setActiveTools = (next: readonly string[]): void => {
     const active = pi.getActiveTools();
@@ -132,6 +130,15 @@ export function installDeliveryTools(pi: ExtensionAPI, configured: readonly stri
     },
   });
 
-  pi.on("session_start", (_event, ctx) => restore(ctx));
-  pi.on("session_tree", (_event, ctx) => restore(ctx));
+  const restoreIfAvailable = (ctx: ExtensionContext): void => {
+    try {
+      restore(ctx);
+    } catch (cause) {
+      if (!(cause instanceof Error && cause.message.includes("runtime not initialized")))
+        throw cause;
+    }
+  };
+
+  pi.on("session_start", (_event, ctx) => restoreIfAvailable(ctx));
+  pi.on("session_tree", (_event, ctx) => restoreIfAvailable(ctx));
 }
