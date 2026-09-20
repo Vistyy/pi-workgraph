@@ -129,7 +129,7 @@ void test("RecordStore creates one exact database lazily", () => {
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
         .all()
         .map((row) => (row as { name: string }).name),
-      ["attempts", "tasks"],
+      ["attempts", "checkouts", "tasks"],
     );
     assert.deepEqual(
       database

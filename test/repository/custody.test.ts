@@ -12,12 +12,11 @@ import {
   detachedPlacement,
   discardOutput,
   ensureDetachedWorktree,
-  GitError,
   prepareApplication,
   prepareDiscard,
   type RepositoryOperation,
-  resolveTaskTarget,
-} from "../../src/repository.js";
+} from "../../src/repository/candidate.js";
+import { GitError, resolveTaskTarget } from "../../src/repository/git.js";
 import { git } from "../support/helpers.js";
 
 const selection = {

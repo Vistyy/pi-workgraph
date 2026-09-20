@@ -31,7 +31,7 @@ export interface CoordinatorCheckoutIdentity {
   readonly ownedBranch: string;
 }
 
-type Classification =
+export type CoordinatorCheckoutObservation =
   | { readonly kind: "absent" }
   | { readonly kind: "exact"; readonly head: string };
 
@@ -42,7 +42,7 @@ export function ensureCoordinatorCheckout(input: {
 }): Effect.Effect<CoordinatorCheckoutReceipt, GitError> {
   return Effect.gen(function* () {
     yield* revalidate(input.target);
-    const initial = yield* classify(input.identity);
+    const initial = yield* observeCoordinatorCheckout(input.identity);
 
     if (initial.kind === "exact") return { head: initial.head, created: false, reused: true };
 
@@ -60,13 +60,15 @@ export function ensureCoordinatorCheckout(input: {
       input.commit,
     ]);
 
-    const postcondition = yield* classify(input.identity);
+    const postcondition = yield* observeCoordinatorCheckout(input.identity);
 
     return yield* finishCreation(input.commit, placement, postcondition);
   });
 }
 
-function classify(identity: CoordinatorCheckoutIdentity): Effect.Effect<Classification, GitError> {
+export function observeCoordinatorCheckout(
+  identity: CoordinatorCheckoutIdentity,
+): Effect.Effect<CoordinatorCheckoutObservation, GitError> {
   return Effect.gen(function* () {
     const [entry, reference, registrations] = yield* Effect.all([
       optionalPathEntry(identity.managedPath),
@@ -114,7 +116,7 @@ function inspectExact(
   entry: Awaited<ReturnType<typeof lstat>>,
   reference: string,
   registration: WorktreeRegistration,
-): Effect.Effect<Classification, GitError> {
+): Effect.Effect<CoordinatorCheckoutObservation, GitError> {
   return Effect.gen(function* () {
     yield* validateManagedPath(identity.managedPath, entry);
 
@@ -237,7 +239,7 @@ function optionalPathEntry(
 function finishCreation(
   commit: string,
   placement: CommandResult,
-  postcondition: Classification,
+  postcondition: CoordinatorCheckoutObservation,
 ): Effect.Effect<CoordinatorCheckoutReceipt, GitError> {
   if (postcondition.kind === "exact" && postcondition.head === commit) {
     const diagnostic =

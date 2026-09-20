@@ -25,13 +25,13 @@ import {
   detachedPlacement,
   discardOutput,
   ensureDetachedWorktree,
-  GitError,
   isAncestor,
   prepareApplication,
   prepareDiscard,
   type RepositoryOperation,
   validateRetainedCandidate,
-} from "../repository.js";
+} from "../repository/candidate.js";
+import { GitError } from "../repository/git.js";
 import {
   createWorkerSessionEffect,
   readWorkerSession,

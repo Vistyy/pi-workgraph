@@ -3,27 +3,30 @@ import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect } from "effect";
-import { canonicalFuturePath, fail, resolveTaskTarget } from "../repository/git.js";
-import { ensureCoordinatorCheckout } from "./checkout-git.js";
+import { canonicalFuturePath, fail, gitResult, resolveTaskTarget } from "../repository/git.js";
+import {
+  type CoordinatorCheckoutIdentity,
+  ensureCoordinatorCheckout,
+  observeCoordinatorCheckout,
+} from "./checkout-git.js";
+import type { CheckoutDeliveryRecord } from "./delivery-state.js";
+import type { RecordStore } from "./store.js";
 
-export interface CheckoutFacts {
-  readonly checkoutId: string;
-  readonly managedPath: string;
-  readonly repositoryCommonDir: string;
-  readonly ownedBranch: string;
+export interface CheckoutFacts extends CheckoutDeliveryRecord {
   readonly head: string;
   readonly created: boolean;
   readonly reused: boolean;
   readonly diagnostic?: string;
 }
 
-type Identity = Omit<CheckoutFacts, "head" | "created" | "reused" | "diagnostic">;
+type Identity = CoordinatorCheckoutIdentity & { readonly checkoutId: string };
 
-/** Keep Pi's async callback as the boundary around repository-owned Effects. */
+/** Explicitly allocate, adopt, or reuse this session's one exact repository checkout. */
 export async function createCheckout(input: {
   readonly agentDir: string;
   readonly sessionId: string;
   readonly cwd: string;
+  readonly store: RecordStore;
   readonly path?: string;
 }): Promise<CheckoutFacts> {
   const resolved = await Effect.runPromise(
@@ -45,11 +48,38 @@ export async function createCheckout(input: {
     resolved.target.commonDir,
   );
 
+  const prior = input.store.readCheckout(resolved.target.commonDir);
+  const observed = await Effect.runPromise(observeCoordinatorCheckout(identity));
+
+  if (prior !== undefined && prior.checkoutId !== identity.checkoutId)
+    throw new Error("Persisted Coordinator checkout identity does not match this session.");
+
+  if (prior?.state.kind === "complete" && observed.kind !== "absent")
+    return { ...prior, head: observed.head, created: false, reused: true };
+
   const receipt = await Effect.runPromise(
     ensureCoordinatorCheckout({ target: resolved.target, commit: resolved.commit, identity }),
   );
 
-  return { ...identity, ...receipt };
+  if (prior !== undefined && prior.state.kind !== "complete") return { ...prior, ...receipt };
+
+  const attached = await Effect.runPromise(
+    gitResult(resolved.target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]),
+  );
+
+  const destinationRef =
+    attached.code === 0 && attached.stdout.startsWith("refs/heads/") ? attached.stdout : undefined;
+
+  const record: CheckoutDeliveryRecord = {
+    ...identity,
+    sourcePath: resolved.target.checkoutRoot,
+    state: { kind: "available", allocatedRevision: receipt.head },
+  };
+
+  if (destinationRef !== undefined) record.destinationRef = destinationRef;
+  input.store.checkpointCheckout(record);
+
+  return { ...record, ...receipt };
 }
 
 async function checkoutIdentity(

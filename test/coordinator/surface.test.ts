@@ -23,7 +23,9 @@ const accepted = [
   "workgraph_review",
   "workgraph_attempt",
   "workgraph_inspect",
+  "workgraph_load_delivery_tools",
   "workgraph_control",
+  "workgraph_deliver",
   "workgraph_notepad",
 ] as const;
 
@@ -73,7 +75,7 @@ async function fixture(
             activeTools = [...names];
           },
           getAllTools: () =>
-            ["bash", "read", "workgraph_load_delivery_tools"].map((name) => ({
+            ["bash", "read", "workgraph_deliver", "workgraph_load_delivery_tools"].map((name) => ({
               name,
               description: name,
               parameters: Type.Object({}, { additionalProperties: false }),
@@ -217,13 +219,18 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
 
     await coordinator.runner.emit({ type: "session_start", reason: "startup" });
     assert.equal(coordinator.activeTools().includes("bash"), false);
+    assert.equal(coordinator.activeTools().includes("workgraph_deliver"), false);
     assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
     const beforeLoader = coordinator.session.getLeafId();
     assert.ok(beforeLoader !== null);
 
     const receipt = await coordinator.call("workgraph_load_delivery_tools", {});
-    assert.deepEqual(receipt.details, { loaded: ["bash"], missing: ["absent_peer"] });
+    assert.deepEqual(receipt.details, {
+      loaded: ["bash", "workgraph_deliver"],
+      missing: ["absent_peer"],
+    });
     assert.equal(coordinator.activeTools().includes("bash"), true);
+    assert.equal(coordinator.activeTools().includes("workgraph_deliver"), true);
     assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
     assert.equal(receipt.content[0]?.type, "text");
     assert.equal(
