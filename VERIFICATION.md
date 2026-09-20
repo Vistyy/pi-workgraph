@@ -10,7 +10,7 @@ Use the smallest real boundary that distinguishes the supported promise from con
 | --- | --- |
 | Persisted records and Outcomes | Native SQLite store through separate exact-session instances |
 | Worker lifecycle, reports, and observed models | Real Worker Pi session with deterministic Herdr transport |
-| Repository output, Candidates, and Coordinator checkouts | Disposable real Git repositories through registered tools |
+| Repository output, Candidates, Coordinator checkouts, and delivery | Disposable real Git repositories, bare remotes, and native SQLite through registered tools |
 | Coordinator surface | Pi extension registration and returned persisted facts |
 | Implementation trajectory | Real Pi Worker session with controlled providers |
 | Calm | Installed Pi using the running CLI's component constructors |
@@ -61,15 +61,17 @@ Discard evidence must show the reason and exact retained tip checkpointed before
 
 ### Coordinator checkouts
 
-Drive `workgraph_checkout` through the registered tool. For [Coordinator checkout lifecycle](DESIGN.md#coordinator-checkout-lifecycle), observe the filesystem path, direct branch ref, exhaustive worktree registrations, attached `HEAD`, Git common directory, and both backlinks.
+Drive `workgraph_checkout` through the registered tool. For [Coordinator checkout lifecycle](DESIGN.md#coordinator-checkout-lifecycle), observe the canonical filesystem path, direct branch ref, exhaustive worktree registrations, attached `HEAD`, and Git common directory.
 
-Establish that identity is deterministic for one session and repository, isolated across sessions, and based on committed source `HEAD` without copying or changing source checkout bytes. Exact owned state may be reused even when managed content changed; partial, duplicate, locked, symlinked, foreign, moved, or unreadable state must remain blocked rather than repaired.
+Establish that identity is deterministic for one session and repository, isolated across sessions, and based on committed source `HEAD` without copying or changing source checkout bytes. Exact owned state may be adopted or reused even when managed content changed; partial, duplicate, locked, symlinked, foreign, moved, or unreadable state must remain blocked rather than repaired.
 
-A failed native creation response counts as recovered success only when immediate observation proves the complete requested identity at the exact commit. Wrong-commit or partial state must remain visible and blocked.
+A failed native creation response counts as recovered success only when immediate observation proves the complete requested identity at the exact commit. Wrong-commit or partial state must remain visible and blocked. An existing version-one SQLite store must support explicit allocation without a separate migration step.
 
 The supported end-to-end flow is: create the managed checkout, make a direct committed change there, target an Implementation Task there, and apply its Candidate back into that managed destination. This distinguishes Coordinator checkout custody from ordinary Worker output and from the original source checkout.
 
-Delivery and cleanup use native repository, forge, and session capabilities. Inspection of the packaged Coordinator contract and delivery reference establishes their authority boundary; it does not establish live forge publication or continued observation.
+Drive `workgraph_deliver` through the registered deferred tool. With real disposable repositories and bare remotes, establish local integration with disjoint staged, unstaged, untracked, and ignored bytes preserved; collision refusal without mutation; dependency gating; interrupted integration and cleanup continuation; exact cleanup; and fresh explicit allocation.
+
+For pull-request delivery, control only the bounded GitHub read while keeping every Git effect real. Cover open and closed-unmerged retention, same-repository or ordinary-fork remote binding, merge/squash/rebase results contained in the current fetched base, changed and already-absent publication tips, fetch/push identity drift, source drift, exact-tip deletion, and post-integration destination descendants. These checks do not establish live GitHub authentication, publication, merge, or continued observation.
 
 ## Installed Pi surfaces
 
@@ -101,7 +103,7 @@ Projection fixtures establish classification and caching, not compatibility with
 
 Load Coordinator and Worker extensions from the exact checkout through Pi's extension runtime to establish registration, role gating, structured Coordinator guidance injection with resolved package-local reference links, forced-prompt fallback, Worker tool reconciliation without prompt forcing, and clean release of session-owned resources.
 
-Pack the exact revision, install it in a disposable consumer, load both supported extension entry points, emit the installed Coordinator's guidance injection, and read the installed delivery reference. Assert that the injected link resolves inside the installed package while the reference body stays unloaded. Archive inspection, source-tree import, or build success does not establish installed package loading. The package check does not establish real Worker lifecycle, native integration, or forge publication.
+Pack the exact revision, install it in a disposable consumer, load both supported extension entry points, emit the installed Coordinator's guidance injection, and read the installed delivery reference. Assert that the injected link resolves inside the installed package while the reference body stays unloaded, and that `workgraph_deliver` remains deferred until the loader is invoked. Archive inspection, source-tree import, or build success does not establish installed package loading. The package check does not establish real Worker lifecycle, native integration, or forge publication.
 
 ## Suite and resource policy
 

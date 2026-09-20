@@ -30,9 +30,9 @@ Each route permits only its stated effects under the existing task authority. A 
 
 | Selected route | Authorizes | Does not authorize |
 | --- | --- | --- |
-| Pull request | Commit accepted content or same-scope corrections, non-force push the accepted branch, create or update the exact pull request, and establish continued observation. | Merge or finally integrate, force-push, add unrelated work, or expand scope. |
-| Local integration | Integrate the exact accepted change into the exact authorized local destination with ordinary non-force Git operations. | Publish remotely, force, add unrelated work, or change the destination or scope. |
-| Preserve checkout | Retain the exact Coordinator checkout and report its identity and state. | Integrate, publish, or clean up merely to make the handback neater. |
+| Pull request | Commit accepted content or same-scope corrections, non-force push the accepted branch, create or update the exact pull request, record it with `workgraph_deliver`, establish continued observation, and after verified merge continue recorded integration and exact owned cleanup. | Merge the PR, force-push, add unrelated work, or expand scope. |
+| Local integration | Record and perform exact accepted integration into the checkout's original attached destination plus exact owned cleanup through `workgraph_deliver`. | Publish remotely, force, add unrelated work, or change the destination or scope. |
+| Preserve checkout | Record preservation through `workgraph_deliver`, retain the exact Coordinator checkout, and report its state. | Integrate, publish, or clean up merely to make the handback neater. |
 
 A pull request requests repository maintainer consideration. It does not satisfy `Required` Human sign-off for final integration.
 
@@ -96,14 +96,15 @@ Do not:
 - expose local paths, credentials, private logs, or unpublished local artifacts; or
 - link screenshots or other media without a deliberate destination accessible to the repository maintainer.
 
-### Publish and verify
+### Publish, record, and verify
 
 1. Push the accepted branch with ordinary Git and forge tooling.
 2. Create or update the exact pull request with the prepared title and body.
 3. Verify its intended base and exact accepted head.
-4. Establish continued observation through an available session capability that confirms the exact pull-request identity.
+4. Invoke `workgraph_deliver` with the selected pull-request route, accepted revision, exact URL, and already-configured publication remote. An open PR records pending state without integration or cleanup.
+5. Establish continued observation through an available session capability that confirms the exact pull-request identity.
 
-If no observation capability is available or confirmation fails, preserve the published pull request and report the limitation.
+The publication remote must identify the PR head repository. Exactly one configured fetch remote must identify the base repository; this also supports an ordinary fork. If route recording or observation fails, preserve the published pull request and report the limitation.
 
 Once observation is established, its availability may be reported directly to the user without starting an agent turn.
 
@@ -125,8 +126,9 @@ A later delivered observation returns the Coordinator to the same pull-request w
 
 1. Read current remote state once.
 2. Reconcile the observation with the accepted change and current evidence.
-3. When a same-scope correction is needed, commit only that correction and non-force push the same branch.
-4. Report a delivered merged or closed state, which ends the Coordinator's responsibility.
+3. When a same-scope correction is needed before merge, commit only that correction, non-force push the same branch, and replace the still-open recorded authorization with the newly accepted revision.
+4. Invoke `workgraph_deliver` with only the checkout ID to continue the recorded route. It performs its own fresh GitHub read. Open remains pending; closed-unmerged remains retained; merged integrates the current verified base and conditionally cleans exact owned resources.
+5. Report the persisted result and any preserved blocker.
 
 Do not independently poll or keep observation available. The observation capability may report its own later availability failure directly to the user without starting an agent turn.
 
@@ -134,13 +136,13 @@ If the needed response would merge, force-push, add unrelated work, or expand sc
 
 ## Local integration
 
-1. Verify the exact accepted source revision, destination repository and ref, current destination head, and authority to integrate them.
-2. Commit only accepted source content that must be committed for integration.
-3. Use ordinary non-force Git operations. If Git refuses, conflicts, or leaves the result uncertain, stop and preserve both source and destination state.
-4. Verify that the destination contains the exact accepted change and that no unrelated state changed.
+1. Verify the exact accepted clean checkout revision and authority to integrate it into the original attached source destination.
+2. Invoke `workgraph_deliver` with the selected local route and accepted revision.
+3. If it refuses, conflicts, or returns an uncertain result, inspect the exact checkout record and native state before explicitly continuing with only the checkout ID.
+4. Report the accepted and resulting destination revisions, cleanup result, preserved blockers, verification evidence, and material limitations.
 
-Report the source and resulting destination revisions, the observed integration result, verification evidence, and material limitations. Do not publish or clean up unless separately authorized.
+The selected route already includes exact owned worktree and branch cleanup after delivery and dependency proof. It does not authorize publication.
 
 ## Preserve the ready checkout
 
-Leave the accepted change and Coordinator checkout unchanged. Report the exact checkout path, current revision and status, verification evidence, material limitations, and anything still depending on the checkout.
+Invoke `workgraph_deliver` with the preservation route before any delivery effect. It records the exact owned checkout revision without requiring the checkout to be clean and changes no repository bytes. Report the checkout identity, revision and status, verification evidence, material limitations, and anything still depending on it.

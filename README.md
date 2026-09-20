@@ -6,7 +6,7 @@ Repository changes return to a session-owned Coordinator checkout for evaluation
 
 ## Install
 
-Requirements: Node.js 24+, Git, Pi, and a Herdr-managed Pi pane with Herdr's Pi state integration.
+Requirements: Node.js 24+, Git, Pi, and a Herdr-managed Pi pane with Herdr's Pi state integration. Pull-request delivery additionally requires authenticated GitHub CLI access and configured Git remotes for the PR head and base repositories.
 
 Install the published npm release:
 
@@ -87,13 +87,16 @@ user request
   → Coordinator evaluation
   → applicable Maintainer inspection and Human sign-off
   → explicit delivery route
+      ├── local → integrate original destination → clean owned checkout
+      ├── pull request → publish/observe → integrate merged base → clean owned branches
+      └── preserve → retain checkout unchanged
 ```
 
 Before repository mutation, the Coordinator calls `workgraph_checkout`. The returned branch-backed checkout starts from committed `HEAD` without changing the source checkout or copying its uncommitted files.
 
 Implementation Workers use detached worktrees. Their committed results can become retained Candidates, which the Coordinator may apply into its managed checkout with `workgraph_control`.
 
-Workgraph does not perform final integration or publication. When an accepted change reaches the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to classify the [Human sign-off requirement](references/delivery.md#resolve-human-sign-off), use a designated local Maintainer-inspection capability when applicable, recommend a route, and carry out only the selected route's authorized effects. Without an explicit route, it waits for the user's choice.
+Workgraph never publishes or merges a pull request. When an accepted change reaches the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to classify the [Human sign-off requirement](references/delivery.md#resolve-human-sign-off), use a designated Maintainer-inspection capability when applicable, and obtain one explicit route choice. `workgraph_deliver` then records that choice, performs verified local integration and exact owned cleanup, and can continue the same route after interruption without another housekeeping decision. Opening or resuming a session performs no delivery effect.
 
 ## Task types
 
@@ -153,7 +156,8 @@ A Worker may modify only its assigned worktree and the Git state needed to commi
 
 | Tool | Purpose |
 | --- | --- |
-| `workgraph_checkout` | Create or exactly reuse this session's deterministic Coordinator checkout. |
+| `workgraph_checkout` | Create, adopt, or exactly reuse this session's deterministic Coordinator checkout. |
+| `workgraph_deliver` | Record or continue an accepted checkout's local, pull-request, or preservation route. |
 | `workgraph_research` | Create a read-only Research Task. |
 | `workgraph_experiment` | Create an Experiment with explicit effects and a hard cutoff. |
 | `workgraph_consult` | Ask the configured advisor a question. |
@@ -168,12 +172,14 @@ A Worker may modify only its assigned worktree and the Git state needed to commi
 
 Each Coordinator session owns its records. Sessions share one private SQLite database under the Pi agent directory, partitioned by exact session identity; one session cannot enumerate another's records.
 
-Stopping or reloading the Coordinator stops only its coordination activity. It preserves:
+Stopping or reloading the Coordinator stops only its coordination activity. It performs no delivery effects and preserves:
 
-- Coordinator checkouts;
+- Coordinator checkouts and their current delivery checkpoints;
 - independent Worker sessions and Herdr tabs;
 - retained repository output; and
 - uncertain resources.
+
+Explicit `workgraph_inspect` calls expose the current checkout record. Explicit `workgraph_deliver` calls continue a selected route from persisted and native proof.
 
 The notepad stores at most 4,000 characters on the current Pi branch and restores a nonempty memo after genuine context compaction. It is pending memory only: it grants no authority and establishes neither acceptance nor correctness.
 
@@ -207,7 +213,7 @@ List the tools to keep out of the Coordinator's initial context in `~/.pi/agent/
 }
 ```
 
-At the delivery boundary, `workgraph_load_delivery_tools` activates the configured tools that are installed, remains available for repeat calls, and reports any that are missing. An absent or empty list changes nothing. Invalid settings leave the tools active and produce a warning.
+`workgraph_deliver` is always deferred until the delivery boundary. There, `workgraph_load_delivery_tools` activates it together with configured tools that are installed, remains available for repeat calls, and reports any that are missing. An absent or empty configured list defers only `workgraph_deliver`. Invalid settings leave tools active and produce a warning.
 
 ## Disable Worker tools
 
