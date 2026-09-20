@@ -156,10 +156,9 @@ void test("before_agent_start reconciles tools without forcing the system prompt
   const f = await fixture("research");
 
   try {
-    const options = { forceSystemPrompt: "Earlier forced prompt", cwd: "." };
-    const started = await f.runner.emitBeforeAgentStart("Work", undefined, options);
+    const started = await f.runner.emitBeforeAgentStart("Work", undefined, { cwd: "." });
 
-    assert.equal(started.systemPromptOptions.forceSystemPrompt, "Earlier forced prompt");
+    assert.equal(started.systemPromptOptions.forceSystemPrompt, undefined);
     assert.equal(f.activeTools().includes("edit"), false);
     assert.equal(f.activeTools().includes("workgraph_report"), true);
   } finally {
