@@ -57,7 +57,7 @@ async function fixture(
   if (settings !== undefined) {
     await mkdir(join(parent, "agent"), { recursive: true });
     await writeFile(join(parent, "agent", "settings.json"), settings);
-    const hasLoader = settings !== "{" && settings.includes('"deferredTools"');
+    const hasLoader = settings.includes('"deferredTools":[');
     activeTools = ["bash", "read", ...(hasLoader ? ["workgraph_load_delivery_tools"] : [])];
   }
 
@@ -311,7 +311,11 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
 });
 
 void test("invalid delivery settings fail open with a bounded warning", async () => {
-  const f = await fixture(false, null, null, "{");
+  const settings = JSON.stringify({
+    "pi-workgraph": { delivery: { deferredTools: "bash" } },
+  });
+
+  const f = await fixture(false, null, null, settings);
 
   try {
     const before = f.activeTools();
