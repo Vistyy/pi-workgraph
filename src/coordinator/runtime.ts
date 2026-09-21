@@ -1099,7 +1099,7 @@ export class SessionRuntime {
     const tick = Effect.gen(
       function* (this: SessionRuntime) {
         const at = yield* Clock.currentTimeMillis;
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         const read = yield* Effect.result(
           this.serializedEffect(
             "read unsettled",

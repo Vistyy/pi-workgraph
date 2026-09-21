@@ -80,19 +80,19 @@ function hasCheckoutDependencies(
 ): boolean {
   return snapshots.some(({ task, attempt }) => {
     const target = task.task.target;
-    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
     const targetsCheckout =
       target.kind === "repository"
         ? target.checkoutRoot === checkoutPath
         : target.path === checkoutPath || target.path.startsWith(`${checkoutPath}/`);
-    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
     const workerBlocks =
       targetsCheckout &&
       ((attempt.worker === undefined && attempt.outcome === undefined) ||
         (attempt.worker !== undefined && attempt.worker.closed !== true));
-    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
     const output = attempt.output;
-    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
     const candidateBlocks =
       target.kind === "repository" &&
       target.checkoutRoot === checkoutPath &&

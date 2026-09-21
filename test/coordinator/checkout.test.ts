@@ -22,14 +22,14 @@ type Facts = {
 };
 
 const execFilePromise = promisify(execFile);
-// oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
 const model = { model: "fixture/model", thinking: "high" } as const;
-// oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
 const directorySpec: AttemptSpec = {
   selection: { kind: "target", target: model },
   base: { kind: "directory" },
 };
-// oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
 const repositorySpec = (head: string): AttemptSpec => ({
   selection: { kind: "implementation", guide: model, executor: model },
   base: { kind: "repository", baseCommit: head },
@@ -98,7 +98,7 @@ async function fixture() {
   await writeFile(join(root, "tracked.txt"), "base\n");
   await git(root, "add", ".");
   await git(root, "commit", "-m", "base");
-  // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
   const previous = configureFixtureEnvironment({
     PI_CODING_AGENT_DIR: join(parent, "agent"),
     PI_WORKGRAPH_ROLE: null,
@@ -107,7 +107,7 @@ async function fixture() {
     HERDR_TAB_ID: null,
     PI_WORKGRAPH_HERDR_BIN: "/bin/false",
   });
-  // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
   const pi = await extensionFixture("coordinator", root, parent);
   await pi.runner.emit({ type: "session_start", reason: "startup" });
 
@@ -268,7 +268,7 @@ for (const [name, dirty] of [
 ] as const) {
   void test(`finish preserves ${name} state`, async () => {
     const f = await fixture();
-    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
     try {
       const facts = f.facts((await f.call("workgraph_checkout", {})).details);
       await dirty(facts.managedPath);
@@ -283,7 +283,7 @@ for (const [name, dirty] of [
 void test("finish refuses changed leases, switched, locked, moved, symlinked, and foreign identities", async (t) => {
   await t.test("changed branch tip", async () => {
     const f = await fixture();
-    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
     try {
       const facts = f.facts((await f.call("workgraph_checkout", {})).details);
       await writeFile(join(facts.managedPath, "next.txt"), "next\n");
@@ -303,29 +303,29 @@ void test("finish refuses changed leases, switched, locked, moved, symlinked, an
     // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: One table-driven test keeps all identity mutations under the same refusal assertions.
     await t.test(mode, async () => {
       const f = await fixture();
-      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
       try {
         const facts = f.facts((await f.call("workgraph_checkout", {})).details);
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (mode === "switched") await git(facts.managedPath, "switch", "-c", "foreign");
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (mode === "locked") await git(f.root, "worktree", "lock", facts.managedPath);
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (mode === "moved") await rename(facts.managedPath, `${facts.managedPath}-moved`);
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (mode === "symlinked") {
           await git(f.root, "worktree", "remove", facts.managedPath);
           await symlink(f.root, facts.managedPath);
         }
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (mode === "foreign") {
           await git(f.root, "worktree", "remove", facts.managedPath);
           await mkdir(facts.managedPath);
         }
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         await assert.rejects(f.finish(facts));
         assert.equal(await git(f.root, "rev-parse", facts.ownedBranch), facts.head);
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (mode === "moved") {
           assert.equal(existsSync(`${facts.managedPath}-moved`), true);
           assert.match(
@@ -406,15 +406,15 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
 
   for (const scenario of cases) {
     const f = await fixture();
-    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
     try {
       const facts = f.facts((await f.call("workgraph_checkout", {})).details);
-      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
       const sessionId =
         scenario.name === "unrelated session" ? "another-session" : f.session.getSessionId();
-      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
       const store = new RecordStore(f.agentDir, sessionId);
-      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
       const repositoryTarget = {
         kind: "repository" as const,
         checkoutRoot:
@@ -423,7 +423,7 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
             : facts.managedPath,
         commonDir: facts.repositoryCommonDir,
       };
-      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
       const directoryPath =
         // oxlint-disable-next-line anti-slop-effect/prefer-effect-match -- This test-only state matrix is clearer as a compact literal branch.
         scenario.name === "similarly prefixed directory"
@@ -431,9 +431,9 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
           : scenario.name === "differently cased directory"
             ? `${facts.managedPath.toUpperCase()}/inside`
             : join(facts.managedPath, "inside");
-      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
       const candidate = scenario.name.includes("Candidate");
-      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
       const task: Task = {
         target:
           candidate ||
@@ -445,7 +445,7 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
           ? { kind: "implementation", objective: "Candidate", acceptance: ["Classified"] }
           : { kind: "research", question: "Does this block cleanup?" },
       };
-      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
       const attemptId = "dependency-attempt";
       store.createTaskWithAttempt(
         "dependency",
@@ -474,14 +474,14 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
           result: { kind: "unreported", reason: "ended" },
           effectiveModels: [],
         });
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (scenario.name === "retained Candidate")
           store.checkpointOutput(attemptId, {
             kind: "retained",
             tip: facts.head,
             reason: "custody",
           });
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (scenario.name === "applying Candidate")
           store.checkpointOutput(attemptId, {
             kind: "applying",
@@ -490,14 +490,14 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
             destinationRef: facts.ownedBranch,
             destinationHead: facts.head,
           });
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (scenario.name === "discarding Candidate")
           store.checkpointOutput(attemptId, {
             kind: "discarding",
             tip: facts.head,
             reason: "cleanup",
           });
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (scenario.name === "applied Candidate awaiting cleanup")
           store.checkpointOutput(attemptId, {
             kind: "applied",
@@ -505,17 +505,17 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
             cleanupTip: facts.head,
             cleanupReason: "cleanup",
           });
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (scenario.name === "no-output terminal Candidate")
           store.checkpointOutput(attemptId, { kind: "no_output" });
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (scenario.name === "discarded terminal Candidate")
           store.checkpointOutput(attemptId, { kind: "discarded", reason: "done" });
-        // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
         if (scenario.name === "applied clean terminal Candidate")
           store.checkpointOutput(attemptId, { kind: "applied", revision: facts.head });
       }
-      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
       store.close();
 
       if (scenario.blocked) {
@@ -534,7 +534,7 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
 
 void test("finish recomputes identity and rejects another repository or checkout ID", async () => {
   const f = await fixture();
-  // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+
   try {
     const facts = f.facts((await f.call("workgraph_checkout", {})).details);
     await assert.rejects(
