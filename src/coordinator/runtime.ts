@@ -1,5 +1,3 @@
-/* oxlint-disable typescript/no-this-alias -- Effect generators retain the runtime owner while yielding serialized lifecycle operations. */
-/* biome-ignore-all lint/complexity/noExcessiveCognitiveComplexity: lifecycle ordering is intentionally visible in cohesive flow owners. */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -25,13 +23,13 @@ import {
   detachedPlacement,
   discardOutput,
   ensureDetachedWorktree,
-  GitError,
   isAncestor,
   prepareApplication,
   prepareDiscard,
   type RepositoryOperation,
   validateRetainedCandidate,
-} from "../repository.js";
+} from "../repository/candidate.js";
+import { GitError } from "../repository/git.js";
 import {
   createWorkerSessionEffect,
   readWorkerSession,
@@ -153,6 +151,7 @@ export class SessionRuntime {
     readonly candidateOf?: CandidateRequest;
     readonly baseCommit?: string;
   }): Effect.Effect<AttemptRecord, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
 
     return this.serializedEffect(
@@ -183,6 +182,7 @@ export class SessionRuntime {
     readonly candidateOf?: CandidateRequest;
     readonly baseCommit?: string;
   }): Effect.Effect<AttemptRecord, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
 
     return this.serializedEffect(
@@ -207,6 +207,7 @@ export class SessionRuntime {
   }
 
   steer(attemptId: string, instruction: string): Effect.Effect<void, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
 
     return this.serializedEffect(
@@ -233,6 +234,7 @@ export class SessionRuntime {
   }
 
   cancel(attemptId: string, reason: string): Effect.Effect<AttemptRecord, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
 
     return this.serializedEffect(
@@ -315,6 +317,7 @@ export class SessionRuntime {
   }
 
   apply(attemptId: string): Effect.Effect<AttemptRecord, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
 
     return this.serializedEffect(
@@ -364,6 +367,7 @@ export class SessionRuntime {
   }
 
   discard(attemptId: string, reason: string): Effect.Effect<AttemptRecord, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
 
     return this.serializedEffect(
@@ -527,8 +531,10 @@ export class SessionRuntime {
   }
 
   private reconcileExecution(initial: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
 
+    // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: One lifecycle owner keeps checkpoint ordering and recovery branches visible together.
     return Effect.gen(function* () {
       let attempt = initial;
       const context = self.context(attempt);
@@ -704,6 +710,7 @@ export class SessionRuntime {
     attempt: AttemptRecord,
     outcome: Outcome,
   ): Effect.Effect<void, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
 
     return Effect.gen(function* () {
@@ -754,6 +761,7 @@ export class SessionRuntime {
     attempt: AttemptRecord,
     worker: WorkerState,
   ): Effect.Effect<void, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
 
     return Effect.gen(function* () {
@@ -773,6 +781,7 @@ export class SessionRuntime {
   }
 
   private reconcileCancellation(attempt: AttemptRecord): Effect.Effect<void, RuntimeError> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
     const self = this;
     const worker = attempt.worker;
 
@@ -864,6 +873,7 @@ export class SessionRuntime {
     return { task, attempt, cwd, target, objective: this.objective(task, attempt) };
   }
 
+  // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: One contract projection keeps each role's exact assignment wording co-located.
   private objective(task: TaskRecord, attempt: AttemptRecord): WorkerObjective {
     const contract = task.task.contract;
 
@@ -1051,6 +1061,40 @@ export class SessionRuntime {
     });
   }
 
+  private recordBlocker(key: string, detail: string, at: number, prior?: Blocker): void {
+    const failures = (prior?.failures ?? 0) + 1;
+    this.blockers.set(key, {
+      detail,
+      failures,
+      retryAt: at + Math.min(30_000, 250 * 2 ** Math.min(failures, 7)),
+    });
+  }
+
+  private reconcileUnsettled(records: readonly AttemptRecord[], at: number): Effect.Effect<void> {
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner across yielded operations.
+    const self = this;
+
+    return Effect.gen(function* () {
+      for (const record of records) {
+        const prior = self.blockers.get(record.id);
+
+        if (prior !== undefined && prior.retryAt > at) continue;
+
+        const result = yield* Effect.result(
+          self.serializedEffect("reconcile Attempt", self.reconcileAttempt(record.id)),
+        );
+
+        if (result._tag === "Success") self.blockers.delete(record.id);
+        else {
+          self.recordBlocker(record.id, result.failure.message, at, prior);
+
+          if (self.blockers.size > 128)
+            self.blockers.delete(self.blockers.keys().next().value ?? "");
+        }
+      }
+    });
+  }
+
   private reconciliation(): Effect.Effect<never, never> {
     const tick = Effect.gen(
       function* (this: SessionRuntime) {
@@ -1064,43 +1108,13 @@ export class SessionRuntime {
         );
 
         if (read._tag === "Failure") {
-          const prior = this.blockers.get("runtime");
-          const failures = (prior?.failures ?? 0) + 1;
-          this.blockers.set("runtime", {
-            detail: read.failure.message,
-            failures,
-            retryAt: at + Math.min(30_000, 250 * 2 ** Math.min(failures, 7)),
-          });
+          this.recordBlocker("runtime", read.failure.message, at, this.blockers.get("runtime"));
 
           return yield* Effect.sleep(1000);
         }
 
         this.blockers.delete("runtime");
-        const records = read.success;
-
-        for (const record of records) {
-          const prior = this.blockers.get(record.id);
-
-          if (prior !== undefined && prior.retryAt > at) continue;
-
-          const result = yield* Effect.result(
-            this.serializedEffect("reconcile Attempt", this.reconcileAttempt(record.id)),
-          );
-
-          if (result._tag === "Success") this.blockers.delete(record.id);
-          else {
-            const failures = (prior?.failures ?? 0) + 1;
-            this.blockers.set(record.id, {
-              detail: result.failure.message,
-              failures,
-              retryAt: at + Math.min(30_000, 250 * 2 ** Math.min(failures, 7)),
-            });
-
-            if (this.blockers.size > 128)
-              this.blockers.delete(this.blockers.keys().next().value ?? "");
-          }
-        }
-
+        yield* this.reconcileUnsettled(read.success, at);
         this.publishActiveWorkers();
         yield* Queue.take(this.wakeSignal).pipe(
           Effect.timeoutOrElse({ duration: "1 second", orElse: () => Effect.void }),

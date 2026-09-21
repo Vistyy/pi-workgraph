@@ -38,9 +38,11 @@ Before the first repository edit or implementation delegation:
 
 Read and research in the user's checkout without creating resources. Applying a Worker Candidate with `workgraph_control` changes the Coordinator checkout; it is not final integration.
 
-Preserve the checkout while any Worker, Candidate decision, or delivery choice depends on it.
+Preserve the checkout while any Worker, Candidate decision, or delivery choice depends on it. Delivery remains ordinary Git, forge, and session work.
 
-Cleanup uses ordinary non-force Git operations, one step at a time. If a step refuses or its result is uncertain, stop and report what completed and what remains.
+Treat checkout finish as local cleanup, never as delivery evidence. Finish only after independently proving that the accepted change reached its selected destination and that no retained work still needs the managed checkout. It may remove only that exact clean owned worktree and branch.
+
+If finish refuses or its result is uncertain, inspect the reported native state before retrying with ordinary capabilities. Preserve resources whose identity, current head, cleanliness, dependency state, or removal postcondition is not proven.
 
 ## Delegate when useful
 
@@ -68,13 +70,13 @@ Judge review findings against supported behavior, the established trust model, a
 
 Before handback, challenge whether every surviving responsibility, abstraction, test, fixture, and caller obligation has a current purpose. Remove superseded or redundant machinery, and judge simplification, readability, performance where relevant, operational behavior, and verification quality alongside correctness.
 
-The user's judgment is the final product decision. Hand back only a coherent result you are prepared to support, with direct evidence and meaningful limitations.
+The user's judgment is the final product decision. Before review or handback, commit the coherent task-owned result and identify its exact revision and comparison base. Hand back only a result you are prepared to support, with direct evidence and meaningful limitations.
 
 ## Reach the delivery boundary
 
 A repository change reaches the delivery boundary when the Coordinator has accepted the complete result and its supporting evidence, with no further implementation or verification needed before the user's delivery judgment. Final integration or publication requires authority separate from implementation.
 
-- [Delivery procedure](references/delivery.md) — Read at this boundary before deciding or acting on delivery, or when a later delivered observation returns the Coordinator to its pull request. It owns the Human sign-off requirement and handling, route selection, route-specific preparation, effects and receipts, and continued pull-request work.
+- [Delivery procedure](references/delivery.md) — Read at this boundary before deciding or acting on delivery, or when a later delivered observation returns the Coordinator to its pull request. It owns Human sign-off handling, route selection, route-specific effects and receipts, continued pull-request work, and the point at which exact local checkout finish is safe.
 
 ## Preserve operational truth
 

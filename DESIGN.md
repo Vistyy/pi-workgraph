@@ -20,11 +20,11 @@ This document owns Workgraph's integrated architecture and durable constraints.
 ```text
 extensions/                 # thin Pi host entry points
 src/
-├── coordinator/            # records, models, checkouts, orchestration, Worker placement
+├── coordinator/            # records, models, checkout custody, orchestration
+├── repository/             # shared Git primitives and Candidate custody
 ├── worker/                 # policy, execution trajectory, TODO state, Pi session behavior
 ├── calm/                   # presentation feature and guarded Pi compatibility seam
 ├── domain/                 # shared structural vocabulary
-├── repository.ts           # Git custody
 └── node-platform.ts        # shared Effect/Node bridge
 references/
 └── delivery.md             # delivery classification, route choice, and procedures
@@ -112,7 +112,7 @@ The store guarantees:
 - every JSON field is decoded with its strict TypeBox schema when a supported read uses it; and
 - SQL row shape and scalar types are checked at that boundary.
 
-The store has no aggregate mirror, global revision, cached frontier, cross-session lease, or process-coordination state. Coordinator checkouts have no database record.
+The store has no aggregate mirror, global revision, cached frontier, cross-session lease, process-coordination state, or Coordinator checkout record.
 
 Schema version 1 fails closed on an unknown version. Workgraph does not migrate another format. Operational updates replace only their owned field, so unrelated records require no reconstruction.
 
@@ -182,23 +182,20 @@ A collision-resistant identity derived from exact Pi session and canonical Git c
 
 Exact reuse proves:
 
-- real path and Git common directory;
-- one direct owned branch;
-- one matching unlocked worktree registration;
-- attached `HEAD`; and
-- both worktree backlinks.
+- canonical path and Git common directory;
+- one direct owned branch at the registered tip;
+- one matching unlocked worktree registration; and
+- attached `HEAD`.
 
-A failed native creation response counts as success only when immediate observation proves the complete requested identity at the exact commit. An interrupted initialization remains locked and blocked.
+A failed native creation response counts as success only when immediate observation proves the complete requested identity at the exact commit.
 
-Complete later absence permits deterministic creation at the same path. Routine shutdown preserves the checkout.
+An explicit finish request supplies the deterministic checkout ID and expected current head. Complete native absence is idempotent success. Exact branch-only state continues interrupted cleanup. An exact clean attached checkout, or a clean detached checkout at the same head while its owned branch remains unchanged, permits worktree removal followed by compare-and-delete of that branch. Actual targeted Workers or unresolved Candidate custody block deletion. Dirty, changed, locked, partial, moved, foreign, or ambiguous state remains untouched.
 
-The managed checkout is the Coordinator's mutable integration destination.
-
-Workgraph does not intercept file operations, redirect paths, inject checkout state into prompts, persist checkout records, or reconcile checkouts in a background loop.
+After finish proves exact absence, a later allocation may create the same deterministic resources from the source checkout's then-current committed `HEAD`. Workgraph stores no checkout record, does not establish that delivery occurred, and performs no checkout effect on startup.
 
 ### Delivery boundary
 
-Final local integration and publication use ordinary repository, forge, or session capabilities. The Coordinator contract owns the delivery-boundary trigger; the packaged delivery reference owns the Human sign-off requirement and handling, route recommendation and selection, and each selected route's procedure. A designated local session capability may support Maintainer inspection without becoming Workgraph state or authority. Neither the capability nor the procedure expands existing authority.
+Final integration, publication, pull-request interaction, and remote branch cleanup remain ordinary Git, forge, and session operations owned by the Coordinator and Maintainer. The packaged delivery reference owns Human sign-off handling, route selection, route-specific effects, receipts, and the proof that the managed checkout is no longer needed. Neither the procedure nor checkout finish expands existing authority.
 
 When `pi-workgraph.delivery.deferredTools` contains tool names, Workgraph hides them until the delivery boundary. `workgraph_load_delivery_tools` additively activates the configured names that Pi has registered, remains active, and reports the names it cannot find. Repeated activation is idempotent. Invalid settings leave all tools active and produce a warning.
 
@@ -206,13 +203,9 @@ A successful loader result keeps the loader and loaded tools active on descendan
 
 The contract names packaged references with source-relative Markdown links. When injecting the contract, the extension renders each reference at its use site as an installed absolute path while leaving the referenced content unloaded until the contract directs the Coordinator to read it.
 
-For a pull-request route, the reference guides initial publication, exact-result verification, and establishment of continued observation when a capability is available.
+For a pull-request route, publication, observation, merge proof, local synchronization, and remote cleanup use whatever ordinary capabilities are available. Workgraph has no PR state or peer-extension lifecycle.
 
-Delivered observations return the Coordinator to the same work under its existing authority.
-
-Workgraph owns no publication or observation state, merge authority, independent state checking, or observation-availability reporting.
-
-Cleanup waits until no Worker, Candidate decision, or delivery choice depends on the checkout. It uses ordinary non-force Git operations and preserves resources after refusal or uncertainty.
+After delivery is independently proven, `workgraph_checkout` finish removes only its deterministic local resources. It blocks queued or active Attempts whose exact target is the managed checkout or a directory inside it, plus unresolved Candidate custody targeting it. It revalidates native identity, cleanliness, expected head, compare-and-delete, and final absence; refusal or uncertainty preserves remaining resources.
 
 ## Implementation trajectory
 
@@ -317,9 +310,9 @@ Repository implementation Tasks target the Coordinator checkout passed as `cwd`.
 
 ## Repository custody
 
-`src/repository.ts` owns shared Git custody for Worker output and Coordinator checkout allocation. `src/coordinator/checkouts.ts` owns deterministic checkout identity and the thin Pi Promise boundary.
+`src/repository/git.ts` owns scoped Git execution and shared target, ancestry, ref, and worktree-registration facts. `src/repository/candidate.ts` owns Candidate custody. `src/coordinator/checkouts.ts` and `checkout-git.ts` own deterministic Coordinator identity and checkout custody.
 
-The two paths share target revalidation, Git process ownership, and worktree-registration parsing while keeping each resource's identity checks separate.
+Candidate and Coordinator policies share native primitives but keep their resource identities and lifecycle decisions separate. There is no compatibility barrel or generic checkout lifecycle owner.
 
 ### Classifying output
 
@@ -354,7 +347,7 @@ Discard is explicit and requires a reason. Workgraph checkpoints the exact retai
 
 An unplaced extension child or unclassified integration child pins its source. Recovery accepts only proven postconditions and never removes foreign or uncertain resources. Outcomes and shutdown cannot discard output.
 
-Applying a Candidate changes only its recorded local destination. Workgraph never publishes or finally integrates a Coordinator checkout.
+Applying a Candidate changes only its recorded local destination. Workgraph never finally integrates or publishes an accepted Coordinator checkout. Explicit finish releases exact local checkout resources only after the Coordinator has established delivery through ordinary capabilities.
 
 Mutation tools return persisted Attempt facts, not a generic success flag. Exact Attempt inspection combines semantic and repository state with any runtime blocker.
 

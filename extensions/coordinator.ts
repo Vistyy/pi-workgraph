@@ -1,86 +1,61 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-object-parameters, anti-slop/require-safety-comment-for-type-assertion, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { StringEnum } from "@earendil-works/pi-ai";
 import {
   type ExtensionAPI,
   type ExtensionContext,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
 import { Effect, Exit, Match, Scope } from "effect";
-import { type Static, type TSchema, Type } from "typebox";
+import { Type } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
-import { createCheckout } from "../src/coordinator/checkouts.js";
+import { createCheckout, finishCheckout } from "../src/coordinator/checkouts.js";
 import {
   deliverySettingsPath,
   installDeliveryTools,
   loadDeferredDeliveryTools,
 } from "../src/coordinator/delivery-tools.js";
 import type { HerdrCliRuntime } from "../src/coordinator/herdr.js";
+import { inspect } from "../src/coordinator/inspection.js";
 import {
   implementationTargets,
   loadModelPolicy,
   type ModelPolicy,
   modelPolicyPath,
   resolveSelection,
-  SelectionRequestSchema,
 } from "../src/coordinator/model-policy.js";
 import { installNotepad } from "../src/coordinator/notepad.js";
-import { type CandidateRequest, RuntimeError, SessionRuntime } from "../src/coordinator/runtime.js";
+import { type CandidateRequest, SessionRuntime } from "../src/coordinator/runtime.js";
 import { RecordStore } from "../src/coordinator/store.js";
 import {
-  AssignmentContextSchema,
+  CandidateOf,
+  Context,
+  ExpectedEvidence,
+  nonBlank,
+  PageFields,
+  Selection,
+  TaskFields,
+  Text,
+} from "../src/coordinator/tool-schema.js";
+import {
+  attemptReceipt,
+  controlReceipt,
+  publicMessage,
+  registerTask,
+  result,
+  retainedTip,
+} from "../src/coordinator/tool-support.js";
+import {
   type AttemptRecord,
   type AttemptSelection,
   CommitSchema,
-  ExpectedEvidenceSchema,
   type Task,
   type TaskContract,
   TaskIdSchema,
 } from "../src/domain/records.js";
-import { resolveRevision, resolveTaskTarget } from "../src/repository.js";
-
-const Text = Type.String({ minLength: 1, pattern: "\\S" });
+import { resolveRevision } from "../src/repository/candidate.js";
+import { resolveTaskTarget } from "../src/repository/git.js";
 
 const COORDINATOR_SECTION = "workgraph_coordinator_contract";
-
-const nonBlank = (description: string) =>
-  Type.String({ minLength: 1, pattern: "\\S", description });
-
-const CandidateOf = Type.Optional(
-  Type.Object(
-    {
-      attemptId: nonBlank("Parent Candidate Attempt ID."),
-      mode: StringEnum(["extend", "integrate"] as const, {
-        description:
-          "extend starts at the parent Candidate; integrate starts at the destination and incorporates it.",
-      }),
-    },
-    { additionalProperties: false, description: "Optional parent Candidate relationship." },
-  ),
-);
-
-const Selection = Type.Optional(SelectionRequestSchema);
-
-const Context = Type.Optional(AssignmentContextSchema);
-
-const ExpectedEvidence = Type.Optional(ExpectedEvidenceSchema);
-
-const TaskFields = {
-  id: TaskIdSchema,
-  cwd: Type.Optional(
-    nonBlank(
-      "Read-only starting directory, Experiment repository seed, or Implementation destination; defaults to session cwd and grants no authority.",
-    ),
-  ),
-};
-
-const PageFields = {
-  offset: Type.Optional(Type.Integer({ minimum: 0, description: "Zero-based result offset." })),
-  limit: Type.Optional(
-    Type.Integer({ minimum: 1, maximum: 100, description: "Maximum records to return." }),
-  ),
-};
 
 export interface CoordinatorOptions {
   readonly agentDir?: string;
@@ -137,6 +112,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     return attached;
   };
 
+  // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
   const close = async (): Promise<void> => {
     attached = undefined;
 
@@ -160,6 +136,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     event.systemPromptOptions.sections[COORDINATOR_SECTION] = coordinatorContract;
   });
   pi.on("session_start", (_event, ctx) =>
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     serialize(async () => {
       if (deliverySettingsWarning !== undefined)
         ctx.ui.notify(`Workgraph delivery tools unchanged: ${deliverySettingsWarning}`, "warning");
@@ -173,8 +150,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
             store,
             agentDir,
             // biome-ignore lint/complexity/useLiteralKeys: ProcessEnv keys require indexed access under noPropertyAccessFromIndexSignature.
-            workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "",
+            workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "", // oxlint-disable-line effecttsgo/process-env -- This owned host boundary reads Coordinator workspace identity.
             pi,
+            // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
             ...(options.herdr === undefined ? {} : { herdr: options.herdr }),
             setActiveWorkers: (count) => calm.setActiveWorkers(count),
           }).pipe(Scope.provide(nextScope)),
@@ -195,26 +173,59 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   pi.registerTool({
     name: "workgraph_checkout",
     label: "Workgraph Checkout",
-    description: "Create or exactly reuse this session's deterministic branch-backed checkout.",
+    description:
+      "Allocate/reuse this session's deterministic checkout, or finish only its owned local worktree and branch. Omit finish to allocate/reuse; finish never delivers or changes remotes.",
     parameters: Type.Object(
       {
         cwd: Type.Optional(
-          nonBlank("Repository checkout to allocate from; defaults to the session cwd."),
+          nonBlank(
+            "Repository worktree whose repository identifies the allocation or finish target; defaults to session cwd.",
+          ),
+        ),
+        finish: Type.Optional(
+          Type.Object(
+            {
+              checkoutId: nonBlank(
+                "Exact checkout ID returned by allocation for this session and repository.",
+              ),
+              expectedHead: Type.String({
+                pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+                description:
+                  "Exact accepted checkout HEAD used as the cleanup lease; a changed head is refused.",
+              }),
+            },
+            {
+              additionalProperties: false,
+              description:
+                "Exact local cleanup request. If both owned resources are already absent, finish succeeds; otherwise the checkout must be exact, clean, and free of retained dependencies.",
+            },
+          ),
         ),
       },
       { additionalProperties: false },
     ),
     execute(_id, params, _signal, _update, ctx) {
-      return serialize(async () =>
-        result(
-          await createCheckout({
-            agentDir: runtime().agentDir,
-            sessionId: ctx.sessionManager.getSessionId(),
-            cwd: ctx.cwd,
-            ...(params.cwd === undefined ? {} : { path: params.cwd }),
-          }),
-        ),
-      );
+      // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
+      return serialize(async () => {
+        const common = {
+          agentDir: runtime().agentDir,
+          sessionId: ctx.sessionManager.getSessionId(),
+          cwd: ctx.cwd,
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
+          ...(params.cwd === undefined ? {} : { path: params.cwd }),
+        };
+
+        return result(
+          params.finish === undefined
+            ? await createCheckout(common)
+            : await finishCheckout({
+                ...common,
+                checkoutId: params.finish.checkoutId,
+                expectedHead: params.finish.expectedHead,
+                store: runtime().store,
+              }),
+        );
+      });
     },
   });
 
@@ -232,19 +243,24 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) => {
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "directory",
         contract: {
           kind: "research",
           question: params.question,
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.context === undefined ? {} : { context: params.context }),
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.expectedEvidence === undefined
             ? {}
             : { expectedEvidence: params.expectedEvidence }),
         },
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.selection === undefined ? {} : { selection: params.selection }),
       });
     },
@@ -272,21 +288,26 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) =>
       createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "repository",
         contract: {
           kind: "experiment",
           question: params.question,
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.context === undefined ? {} : { context: params.context }),
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.expectedEvidence === undefined
             ? {}
             : { expectedEvidence: params.expectedEvidence }),
           permittedEffects: params.permittedEffects,
           stopCondition: params.stopCondition,
         },
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.selection === undefined ? {} : { selection: params.selection }),
       }),
     serialize,
@@ -304,6 +325,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) => {
       const policy = await loadModelPolicy(policyPath);
 
@@ -314,6 +336,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "directory",
         contract,
@@ -348,6 +371,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) => {
       if (params.candidateOf?.mode === "extend" && params.baseRevision !== undefined)
         throw new Error("Candidate extension forbids baseRevision.");
@@ -356,6 +380,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "repository",
         contract: {
@@ -368,7 +393,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           guide: selected.guide,
           executor: selected.executor,
         },
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.candidateOf === undefined ? {} : { candidateOf: params.candidateOf }),
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.baseRevision === undefined ? {} : { baseRevision: params.baseRevision }),
       });
     },
@@ -390,16 +417,20 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) =>
       createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "directory",
         contract: {
           kind: "review",
           request: params.request,
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.context === undefined ? {} : { context: params.context }),
         },
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.selection === undefined ? {} : { selection: params.selection }),
       }),
     serialize,
@@ -424,6 +455,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     execute(_id, params) {
+      // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
       return serialize(async () => {
         const current = runtime();
         const attempt = await createAttempt(current, policyPath, params);
@@ -498,6 +530,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       ),
     ]),
     execute(_id, params) {
+      // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
       return serialize(async () => result(inspect(runtime(), params)));
     },
   });
@@ -548,6 +581,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       ),
     ]),
     execute(_id, params) {
+      // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
       return serialize(async () => {
         const current = runtime();
 
@@ -601,6 +635,7 @@ type CreateTaskInput = {
   readonly baseRevision?: string;
 };
 
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 async function createTask(
   runtime: SessionRuntime,
   ctx: ExtensionContext,
@@ -615,8 +650,10 @@ async function createTask(
   const resolved = await Effect.runPromise(
     resolveTaskTarget({
       cwd: ctx.cwd,
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(input.cwd === undefined ? {} : { path: input.cwd }),
       kind: input.targetKind,
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(input.targetKind === "repository" && revision !== undefined ? { revision } : {}),
     }),
   );
@@ -632,7 +669,9 @@ async function createTask(
       target: resolved.target,
       contract: input.contract,
       selection: first,
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(input.candidateOf === undefined ? {} : { candidateOf: input.candidateOf }),
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...("commit" in resolved && input.candidateOf?.mode !== "extend"
         ? { baseCommit: resolved.commit }
         : {}),
@@ -648,6 +687,7 @@ async function createTask(
           runtime.createAttempt({
             taskId: input.id,
             selection,
+            // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
             ...("commit" in resolved ? { baseCommit: resolved.commit } : {}),
           }),
         ),
@@ -666,6 +706,7 @@ async function createTask(
   };
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 async function selectionsFor(
   input: CreateTaskInput,
   policyPath: string,
@@ -680,6 +721,7 @@ async function selectionsFor(
   }));
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 async function createAttempt(
   runtime: SessionRuntime,
   policyPath: string,
@@ -710,7 +752,9 @@ async function createAttempt(
     runtime.createAttempt({
       taskId: params.taskId,
       selection,
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(params.candidateOf === undefined ? {} : { candidateOf: params.candidateOf }),
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(baseCommit === undefined ? {} : { baseCommit }),
     }),
   );
@@ -738,6 +782,7 @@ function selectionForAttempt(
   return { kind: "target", target: { ...policy.roles[role][0] } };
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 async function baseForAttempt(
   task: Task,
   candidateOf?: CandidateRequest,
@@ -746,237 +791,4 @@ async function baseForAttempt(
   if (task.target.kind !== "repository" || candidateOf?.mode === "extend") return undefined;
 
   return Effect.runPromise(resolveRevision(task.target, baseRevision ?? "HEAD"));
-}
-
-function retainedTip(runtime: SessionRuntime, attemptId: string): string {
-  const attempt = runtime.store.readAttempt(attemptId);
-
-  if (attempt.output?.kind !== "retained")
-    throw new Error("Candidate parent has no retained output.");
-
-  return attempt.output.tip;
-}
-
-type InspectInput =
-  | { readonly section: "overview" }
-  | {
-      readonly section: "task";
-      readonly id?: string;
-      readonly offset?: number;
-      readonly limit?: number;
-    }
-  | {
-      readonly section: "attempt";
-      readonly id?: string;
-      readonly taskId?: string;
-      readonly offset?: number;
-      readonly limit?: number;
-    }
-  | {
-      readonly section: "report";
-      readonly attemptId: string;
-      readonly offset?: number;
-      readonly maxChars?: number;
-    };
-
-function inspect(runtime: SessionRuntime, params: Static<TSchema>) {
-  // SAFETY: This helper receives only values decoded by the registered inspection union.
-  const input = params as InspectInput;
-
-  switch (input.section) {
-    case "overview": {
-      const status = runtime.inspectionStatus();
-
-      return {
-        counts: runtime.store.counts(),
-        blockers: status.blockers,
-        activeWorkers: status.activeWorkers,
-      };
-    }
-
-    case "task":
-      return inspectTasks(runtime, input);
-    case "attempt":
-      return inspectAttempts(runtime, input);
-    case "report":
-      return inspectReport(runtime, input);
-  }
-}
-
-function inspectTasks(runtime: SessionRuntime, input: Extract<InspectInput, { section: "task" }>) {
-  if (input.id !== undefined) return runtime.store.readTask(input.id);
-  const offset = input.offset ?? 0;
-  const limit = input.limit ?? 20;
-
-  return {
-    offset,
-    limit,
-    tasks: runtime.store.listTasks(offset, limit).map((record) => ({
-      id: record.id,
-      targetKind: record.task.target.kind,
-      taskKind: record.task.contract.kind,
-    })),
-  };
-}
-
-function inspectAttempts(
-  runtime: SessionRuntime,
-  input: Extract<InspectInput, { section: "attempt" }>,
-) {
-  if (input.id !== undefined) return inspectedAttempt(runtime, runtime.store.readAttempt(input.id));
-  const offset = input.offset ?? 0;
-  const limit = input.limit ?? 20;
-
-  return {
-    offset,
-    limit,
-    attempts: runtime.store.listAttempts(offset, limit, input.taskId).map((attempt) => ({
-      taskId: attempt.taskId,
-      attemptId: attempt.id,
-      outcome: attempt.outcome?.result.kind ?? null,
-      output: attempt.output?.kind ?? null,
-    })),
-  };
-}
-
-function inspectReport(
-  runtime: SessionRuntime,
-  input: Extract<InspectInput, { section: "report" }>,
-) {
-  const attempt = runtime.store.readAttempt(input.attemptId);
-
-  if (attempt.outcome?.result.kind !== "reported") throw new Error("Attempt has no report.");
-  const text = JSON.stringify(attempt.outcome.result.report);
-  const offset = input.offset ?? 0;
-  const maxChars = input.maxChars ?? 20_000;
-  const totalChars = text.length;
-
-  if (offset > totalChars)
-    throw new Error(`Report offset ${offset} exceeds totalChars ${totalChars}.`);
-
-  if (offset === 0 && totalChars <= maxChars)
-    return { attemptId: input.attemptId, totalChars, report: attempt.outcome.result.report };
-
-  const nextOffset = Math.min(offset + maxChars, totalChars);
-
-  return {
-    attemptId: input.attemptId,
-    offset,
-    maxChars,
-    totalChars,
-    text: text.slice(offset, nextOffset),
-    nextOffset: nextOffset < totalChars ? nextOffset : null,
-  };
-}
-
-function inspectedAttempt(runtime: SessionRuntime, attempt: AttemptRecord) {
-  const outcome = attempt.outcome;
-  const task = runtime.store.readTask(attempt.taskId).task;
-
-  return {
-    attemptId: attempt.id,
-    taskId: attempt.taskId,
-    task: { target: task.target, contract: task.contract },
-    spec: attempt.spec,
-    worker: attempt.worker ?? null,
-    output: attempt.output ?? null,
-    blocker: runtime.blockerFor(attempt.id) ?? null,
-    effectiveModels: outcome?.effectiveModels ?? [],
-    outcome:
-      outcome === undefined
-        ? null
-        : outcome.result.kind === "reported"
-          ? {
-              kind: outcome.result.kind,
-              reportStatus: outcome.result.report.status,
-              ...(outcome.result.report.role === "implementation" &&
-              "outcome" in outcome.result.report
-                ? { reportOutcome: outcome.result.report.outcome }
-                : {}),
-              summary: outcome.result.report.summary,
-            }
-          : { kind: outcome.result.kind, summary: outcome.result.reason },
-    reportPreview:
-      outcome?.result.kind === "reported" ? previewReport(outcome.result.report) : null,
-  };
-}
-
-function previewReport(report: object, maxChars = 2_000) {
-  const text = JSON.stringify(report);
-
-  return {
-    text: text.slice(0, maxChars),
-    totalChars: text.length,
-    truncated: text.length > maxChars,
-  };
-}
-
-function controlReceipt(
-  runtime: SessionRuntime,
-  action: "cancel" | "steer" | "apply" | "discard_output",
-  attempt: AttemptRecord,
-  steering?: "submitted",
-) {
-  const result = attempt.outcome?.result;
-
-  return {
-    action,
-    taskId: attempt.taskId,
-    attemptId: attempt.id,
-    output: attempt.output ?? null,
-    outcome:
-      result === undefined
-        ? null
-        : result.kind === "reported"
-          ? {
-              kind: result.kind,
-              status: result.report.status,
-              summary: result.report.summary,
-            }
-          : { kind: result.kind, reason: result.reason },
-    blocker: runtime.blockerFor(attempt.id) ?? null,
-    ...(steering === undefined ? {} : { steering: { status: steering } }),
-  };
-}
-
-function registerTask<S extends TSchema>(
-  pi: ExtensionAPI,
-  name: string,
-  label: string,
-  parameters: S,
-  run: (params: Static<S>, ctx: ExtensionContext) => Promise<object>,
-  serialize: <A>(run: () => Promise<A>) => Promise<A>,
-): void {
-  pi.registerTool({
-    name,
-    label: `Workgraph ${label}`,
-    description: `Create one immutable ${label} Task with one or more selected initial Attempts.`,
-    parameters,
-    execute(_id, params, _signal, _update, ctx) {
-      return serialize(() => run(params as Static<S>, ctx).then(result));
-    },
-  });
-}
-
-function attemptReceipt(record: AttemptRecord) {
-  return { taskId: record.taskId, attemptId: record.id, spec: record.spec };
-}
-
-function result(value: object) {
-  return {
-    content: [{ type: "text" as const, text: JSON.stringify(value) }],
-    details: value,
-  };
-}
-
-function publicMessage(cause: unknown): string {
-  return (
-    cause instanceof RuntimeError
-      ? `${cause.operation}: ${cause.message}`
-      : cause instanceof Error
-        ? cause.message
-        : "operation failed"
-  )
-    .replace(/\s+/g, " ")
-    .slice(0, 500);
 }

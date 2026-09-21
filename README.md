@@ -86,14 +86,18 @@ user request
                                  → retained Candidate
   → Coordinator evaluation
   → applicable Maintainer inspection and Human sign-off
-  → explicit delivery route
+  → explicit delivery route through ordinary capabilities
+      ├── local integration
+      ├── pull request
+      └── preserve
+  → when delivery is proven complete → finish exact owned checkout
 ```
 
 Before repository mutation, the Coordinator calls `workgraph_checkout`. The returned branch-backed checkout starts from committed `HEAD` without changing the source checkout or copying its uncommitted files.
 
 Implementation Workers use detached worktrees. Their committed results can become retained Candidates, which the Coordinator may apply into its managed checkout with `workgraph_control`.
 
-Workgraph does not perform final integration or publication. When an accepted change reaches the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to classify the [Human sign-off requirement](references/delivery.md#resolve-human-sign-off), use a designated local Maintainer-inspection capability when applicable, recommend a route, and carry out only the selected route's authorized effects. Without an explicit route, it waits for the user's choice.
+Workgraph never integrates or publishes an accepted Coordinator checkout. At the delivery boundary, the Coordinator follows the packaged [delivery procedure](references/delivery.md) to classify the [Human sign-off requirement](references/delivery.md#resolve-human-sign-off), use available Maintainer-inspection capabilities when applicable, and obtain one explicit route choice. Delivery uses ordinary Git, forge, and session capabilities. After separately proving delivery complete, the Coordinator may call `workgraph_checkout` with the exact checkout ID and expected head to finish only Workgraph's clean local worktree and branch.
 
 ## Task types
 
@@ -153,7 +157,7 @@ A Worker may modify only its assigned worktree and the Git state needed to commi
 
 | Tool | Purpose |
 | --- | --- |
-| `workgraph_checkout` | Create or exactly reuse this session's deterministic Coordinator checkout. |
+| `workgraph_checkout` | Create or exactly reuse this session's deterministic Coordinator checkout, or finish its exact clean local resources. |
 | `workgraph_research` | Create a read-only Research Task. |
 | `workgraph_experiment` | Create an Experiment with explicit effects and a hard cutoff. |
 | `workgraph_consult` | Ask the configured advisor a question. |
@@ -168,12 +172,13 @@ A Worker may modify only its assigned worktree and the Git state needed to commi
 
 Each Coordinator session owns its records. Sessions share one private SQLite database under the Pi agent directory, partitioned by exact session identity; one session cannot enumerate another's records.
 
-Stopping or reloading the Coordinator stops only its coordination activity. It preserves:
+Stopping or reloading the Coordinator stops only its coordination activity. It does not remove Coordinator checkouts and preserves:
 
-- Coordinator checkouts;
 - independent Worker sessions and Herdr tabs;
 - retained repository output; and
 - uncertain resources.
+
+Coordinator checkout identity and finish recovery come from exact native Git state, not persisted Workgraph records.
 
 The notepad stores at most 4,000 characters on the current Pi branch and restores a nonempty memo after genuine context compaction. It is pending memory only: it grants no authority and establishes neither acceptance nor correctness.
 
@@ -201,13 +206,13 @@ List the tools to keep out of the Coordinator's initial context in `~/.pi/agent/
 {
   "pi-workgraph": {
     "delivery": {
-      "deferredTools": ["tuicr_review", "follow_pr", "unfollow_pr"]
+      "deferredTools": ["example_review_tool", "example_observation_tool"]
     }
   }
 }
 ```
 
-At the delivery boundary, `workgraph_load_delivery_tools` activates the configured tools that are installed, remains available for repeat calls, and reports any that are missing. An absent or empty list changes nothing. Invalid settings leave the tools active and produce a warning.
+At the delivery boundary, `workgraph_load_delivery_tools` additively activates configured tools that are installed, remains available for repeat calls, and reports missing names. An absent or empty configured list adds nothing. Invalid settings leave tools active and produce a warning. Workgraph does not name, configure, or coordinate the loaded tools.
 
 ## Disable Worker tools
 

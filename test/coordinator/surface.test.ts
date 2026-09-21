@@ -73,7 +73,7 @@ async function fixture(
             activeTools = [...names];
           },
           getAllTools: () =>
-            ["bash", "read", "workgraph_load_delivery_tools"].map((name) => ({
+            ["bash", "read", "workgraph_deliver", "workgraph_load_delivery_tools"].map((name) => ({
               name,
               description: name,
               parameters: Type.Object({}, { additionalProperties: false }),
@@ -112,6 +112,29 @@ void test("coordinator registers the exact strict tool surface", async () => {
       .sort();
 
     assert.deepEqual(registered, [...accepted].sort());
+    const checkout = f.runner.getToolDefinition("workgraph_checkout");
+    assert.ok(checkout !== undefined);
+    assert.equal(Value.Check(checkout.parameters, {}), true);
+    assert.equal(Value.Check(checkout.parameters, { cwd: "." }), true);
+    assert.equal(
+      Value.Check(checkout.parameters, {
+        finish: { checkoutId: "a".repeat(64), expectedHead: "b".repeat(40) },
+      }),
+      true,
+    );
+    assert.equal(
+      Value.Check(checkout.parameters, { finish: { checkoutId: "a".repeat(64) } }),
+      false,
+    );
+    assert.equal(Value.Check(checkout.parameters, { checkoutId: "a".repeat(64) }), false);
+    assert.equal(
+      Value.Check(checkout.parameters, {
+        finish: { checkoutId: "a".repeat(64), expectedHead: "b".repeat(40), extra: true },
+      }),
+      false,
+    );
+    assert.equal(f.runner.getToolDefinition("workgraph_deliver"), undefined);
+
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(
@@ -217,13 +240,18 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
 
     await coordinator.runner.emit({ type: "session_start", reason: "startup" });
     assert.equal(coordinator.activeTools().includes("bash"), false);
+    assert.equal(coordinator.activeTools().includes("workgraph_deliver"), false);
     assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
     const beforeLoader = coordinator.session.getLeafId();
     assert.ok(beforeLoader !== null);
 
     const receipt = await coordinator.call("workgraph_load_delivery_tools", {});
-    assert.deepEqual(receipt.details, { loaded: ["bash"], missing: ["absent_peer"] });
+    assert.deepEqual(receipt.details, {
+      loaded: ["bash"],
+      missing: ["absent_peer"],
+    });
     assert.equal(coordinator.activeTools().includes("bash"), true);
+    assert.equal(coordinator.activeTools().includes("workgraph_deliver"), false);
     assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
     assert.equal(receipt.content[0]?.type, "text");
     assert.equal(

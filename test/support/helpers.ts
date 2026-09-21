@@ -119,6 +119,24 @@ export async function extensionFixture(
 
   const registry = new ModelRegistry(models);
   const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, root, session, registry);
+
+  const fixtureToolNames = [
+    "workgraph_attempt",
+    "workgraph_checkout",
+    "workgraph_consult",
+    "workgraph_control",
+    "workgraph_experiment",
+    "workgraph_implement",
+    "workgraph_inspect",
+    "workgraph_load_delivery_tools",
+    "workgraph_notepad",
+    "workgraph_research",
+    "workgraph_review",
+    "workgraph_report",
+    "workgraph_plan",
+  ];
+
+  let activeToolNames = [...fixtureToolNames];
   const messages: Parameters<ExtensionActions["sendMessage"]>[0][] = [];
   const selected: string[] = [];
   let level: ReturnType<ExtensionActions["getThinkingLevel"]> = "high";
@@ -150,6 +168,30 @@ export async function extensionFixture(
         messages.push(message);
       },
       getThinkingLevel: () => level,
+      getActiveTools: () => [...activeToolNames],
+      setActiveTools: (names) => {
+        activeToolNames = [...names];
+      },
+      getAllTools: () =>
+        fixtureToolNames.flatMap((name) => {
+          const tool = runner.getToolDefinition(name);
+
+          return tool === undefined
+            ? []
+            : [
+                {
+                  name: tool.name,
+                  description: tool.description,
+                  parameters: tool.parameters,
+                  sourceInfo: {
+                    path: "fixture",
+                    source: "fixture",
+                    scope: "temporary" as const,
+                    origin: "top-level" as const,
+                  },
+                },
+              ];
+        }),
       setThinkingLevel: (next) => {
         level = next;
       },

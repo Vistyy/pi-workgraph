@@ -1,5 +1,3 @@
-/* oxlint-disable anti-slop/no-known-value-widening, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion, typescript/no-unsafe-return -- node:sqlite rows and TypeBox outputs are decoded at this private host boundary. */
-/* biome-ignore-all lint/complexity/useLiteralKeys: SQLite rows require indexed access under noPropertyAccessFromIndexSignature. */
 import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, realpathSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DatabaseSync, type SQLOutputValue } from "node:sqlite";
@@ -52,6 +50,11 @@ export interface RecordCounts {
   readonly tasks: number;
   readonly attempts: number;
   readonly activeWorkers: number;
+}
+
+export interface SessionAttemptSnapshot {
+  readonly task: TaskRecord;
+  readonly attempt: AttemptRecord;
 }
 
 export class StoreError extends Data.TaggedError("StoreError")<{
@@ -223,6 +226,27 @@ export class RecordStore {
     });
   }
 
+  currentSessionAttempts(): SessionAttemptSnapshot[] {
+    const database = this.existingOrUndefined("read current session Attempts");
+
+    if (database === undefined) return [];
+
+    // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
+    const rows = database
+      .prepare(
+        `SELECT a.*,t.task_json
+         FROM attempts a JOIN tasks t
+           ON t.session_id=a.session_id AND t.task_id=a.task_id
+         WHERE a.session_id=? ORDER BY a.rowid`,
+      )
+      .all(this.sessionId) as Row[];
+
+    return rows.map((row) => ({
+      task: taskRecord(row),
+      attempt: this.attemptRecord(database, row),
+    }));
+  }
+
   hasPendingOutcomes(): boolean {
     const database = this.existingOrUndefined("read pending Outcomes");
 
@@ -245,6 +269,7 @@ export class RecordStore {
 
     if (database === undefined) return [];
 
+    // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
     const rows = database
       .prepare(
         `SELECT * FROM attempts
@@ -322,6 +347,7 @@ export class RecordStore {
 
     if (database === undefined) return [];
 
+    // SAFETY: node:sqlite returns open rows; taskRecord strictly decodes every consumed field.
     return (
       database
         .prepare("SELECT * FROM tasks WHERE session_id=? ORDER BY rowid LIMIT ? OFFSET ?")
@@ -337,6 +363,7 @@ export class RecordStore {
 
     if (database === undefined) return [];
 
+    // SAFETY: node:sqlite returns open rows; attemptRecord strictly decodes every consumed field.
     const rows =
       taskId === undefined
         ? (database
@@ -620,16 +647,21 @@ function validatePage(offset: number, limit: number): void {
 
 function nullableParse<S extends TSchema>(
   schema: S,
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This private I/O boundary validates the untyped host value before use.
   value: unknown,
   name: string,
 ): Static<S> | undefined {
+  // oxlint-disable-next-line typescript/no-unsafe-return -- The strict TypeBox check immediately establishes the returned decoded type.
   return value === null ? undefined : parse(schema, value, name);
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This private I/O boundary validates the untyped host value before use.
 function parse<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This private I/O boundary validates the host scalar representation.
   if (typeof value !== "string") throw failure(`decode ${name}`, `${name} JSON is not text.`);
 
   try {
+    // oxlint-disable-next-line typescript/no-unsafe-return -- The strict TypeBox check immediately establishes the returned decoded type.
     return decode(schema, JSON.parse(value), name);
   } catch (cause) {
     if (cause instanceof StoreError) throw cause;
@@ -637,20 +669,24 @@ function parse<S extends TSchema>(schema: S, value: unknown, name: string): Stat
   }
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This private I/O boundary validates the untyped host value before use.
 function decode<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
   if (!Value.Check(schema, value)) throw failure(`decode ${name}`, `${name} is malformed.`);
 
+  // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion, typescript/no-unsafe-return -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type. The strict TypeBox check immediately establishes the returned decoded type.
   return Value.Decode(schema, value) as Static<S>;
 }
 
 // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Name and Value preserve the computed key-to-value relation in the mapped return type.
 function optional<const Name extends string, Value>(name: Name, value: Value | undefined) {
+  // oxlint-disable-next-line anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion -- The explicit boundary type intentionally hides fixture or SQLite implementation details. The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
   return value === undefined ? {} : ({ [name]: value } as { [Key in Name]: Value });
 }
 
 function text(row: Row, field: string): string {
   const value = row[field];
 
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This private I/O boundary validates the host scalar representation.
   if (typeof value !== "string") throw failure("decode row", `${field} is malformed.`);
 
   return value;
@@ -659,12 +695,14 @@ function text(row: Row, field: string): string {
 function integer(row: Row | undefined, field: string): number {
   const value = row?.[field];
 
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- This private I/O boundary validates the host scalar representation.
   if (typeof value !== "number" || !Number.isSafeInteger(value))
     throw failure("decode row", `${field} is malformed.`);
 
   return value;
 }
 
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- This private I/O boundary validates the untyped host value before use.
 function json(value: unknown): string {
   return JSON.stringify(value);
 }
