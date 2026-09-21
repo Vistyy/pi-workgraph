@@ -173,19 +173,32 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   pi.registerTool({
     name: "workgraph_checkout",
     label: "Workgraph Checkout",
-    description: "Allocate/reuse or finish this session's deterministic branch-backed checkout.",
+    description:
+      "Allocate/reuse this session's deterministic checkout, or finish only its owned local worktree and branch. Omit finish to allocate/reuse; finish never delivers or changes remotes.",
     parameters: Type.Object(
       {
         cwd: Type.Optional(
-          nonBlank("Repository checkout to allocate from or identify; defaults to session cwd."),
+          nonBlank(
+            "Repository worktree whose repository identifies the allocation or finish target; defaults to session cwd.",
+          ),
         ),
         finish: Type.Optional(
           Type.Object(
             {
-              checkoutId: nonBlank("Exact deterministic Coordinator checkout ID."),
-              expectedHead: CommitSchema,
+              checkoutId: nonBlank(
+                "Exact checkout ID returned by allocation for this session and repository.",
+              ),
+              expectedHead: Type.String({
+                pattern: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+                description:
+                  "Exact accepted checkout HEAD used as the cleanup lease; a changed head is refused.",
+              }),
             },
-            { additionalProperties: false },
+            {
+              additionalProperties: false,
+              description:
+                "Exact local cleanup request. If both owned resources are already absent, finish succeeds; otherwise the checkout must be exact, clean, and free of retained dependencies.",
+            },
           ),
         ),
       },
