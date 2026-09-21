@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { finishCheckout } from "../../src/coordinator/checkouts.js";
 import { RecordStore } from "../../src/coordinator/store.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../support/decoders.js";
@@ -409,11 +410,13 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
 
     try {
       const facts = f.facts((await f.call("workgraph_checkout", {})).details);
+      const currentSessionId = f.session.getSessionId();
+      await f.runner.emit({ type: "session_shutdown", reason: "quit" });
 
-      const sessionId =
-        scenario.name === "unrelated session" ? "another-session" : f.session.getSessionId();
+      const dependencySessionId =
+        scenario.name === "unrelated session" ? "another-session" : currentSessionId;
 
-      const store = new RecordStore(f.agentDir, sessionId);
+      const store = new RecordStore(f.agentDir, dependencySessionId);
 
       const repositoryTarget = {
         kind: "repository" as const,
@@ -516,16 +519,33 @@ void test("finish dependency rules preserve exact Worker and Candidate boundarie
           store.checkpointOutput(attemptId, { kind: "applied", revision: facts.head });
       }
 
-      store.close();
+      const finishStore =
+        dependencySessionId === currentSessionId
+          ? store
+          : new RecordStore(f.agentDir, currentSessionId);
+
+      const finish = () =>
+        finishCheckout({
+          agentDir: f.agentDir,
+          sessionId: currentSessionId,
+          cwd: f.root,
+          checkoutId: facts.checkoutId,
+          expectedHead: facts.head,
+          store: finishStore,
+        });
 
       if (scenario.blocked) {
-        await assert.rejects(f.finish(facts), /dependencies/, scenario.name);
+        await assert.rejects(finish(), /dependencies/, scenario.name);
         assert.equal(await git(f.root, "rev-parse", facts.ownedBranch), facts.head);
         assert.equal(existsSync(facts.managedPath), true);
       } else {
-        await f.finish(facts);
+        await finish();
         assert.equal(existsSync(facts.managedPath), false, scenario.name);
       }
+
+      store.close();
+
+      if (finishStore !== store) finishStore.close();
     } finally {
       await f.dispose();
     }
