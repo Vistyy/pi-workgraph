@@ -103,7 +103,7 @@ Projection fixtures establish classification and caching, not compatibility with
 
 Load Coordinator and Worker extensions from the exact checkout through Pi's extension runtime to establish registration, role gating, structured Coordinator guidance injection with resolved package-local reference links, forced-prompt fallback, Worker tool reconciliation without prompt forcing, and clean release of session-owned resources.
 
-Pack the exact revision, install it in a disposable consumer, load both supported extension entry points, emit the installed Coordinator's guidance injection, and read the installed delivery reference. Assert that the injected link resolves inside the installed package while the reference body stays unloaded, and that configured generic delivery tools remain deferred until the loader is invoked. Archive inspection, source-tree import, or build success does not establish installed package loading. The package check does not establish real Worker lifecycle, native integration, checkout finish, or forge publication.
+Pack the exact revision, install it in a disposable consumer, load both supported extension entry points, verify the packaged delivery reference, and inspect the installed `workgraph_checkout` schema. Assert compact allocation and complete nested finish forms while rejecting partial or undeclared finish fields. Archive inspection, source-tree import, or build success does not establish installed package loading. The package check does not establish real Worker lifecycle, native integration, checkout finish, deferred-tool activation, or forge publication.
 
 ## Suite and resource policy
 

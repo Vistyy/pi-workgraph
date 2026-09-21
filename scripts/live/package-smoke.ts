@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -30,6 +30,7 @@ try {
   command(consumer, "npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund", tarball]);
 
   const packageRoot = join(consumer, "node_modules/@syzom/pi-workgraph");
+  statSync(join(packageRoot, "references/delivery.md"));
 
   const modules = ["extensions/coordinator.ts", "extensions/worker.ts"].map((path) =>
     join(packageRoot, path),
