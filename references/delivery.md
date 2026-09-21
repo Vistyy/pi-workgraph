@@ -9,7 +9,7 @@ Human sign-off is the repository Maintainer's explicit judgment that the exact a
 After accepting a repository change:
 
 1. Classify the Human sign-off requirement as `Required` or `Optional`, and give the reason.
-2. When it is `Required` and `tuicr_review` is available, use it as the designated local Maintainer-inspection capability before recommending a delivery route unless the user directs otherwise. Another available capability is designated only by the user.
+2. When it is `Required` and a local Maintainer-inspection capability has been designated, use it before recommending a delivery route unless the user directs otherwise. A capability is designated only by the user or installed Coordinator contract.
 3. Treat delivered inspection comments as feedback, not authority. Resolve them, reaccept the complete result, and repeat inspection when material changes warrant it.
 4. Obtain explicit Human sign-off for the exact accepted change before final integration.
 
@@ -30,9 +30,9 @@ Each route permits only its stated effects under the existing task authority. A 
 
 | Selected route | Authorizes | Does not authorize |
 | --- | --- | --- |
-| Pull request | Commit accepted content or same-scope corrections, non-force push the accepted branch, create or update the exact pull request, record it with `workgraph_deliver`, establish continued observation, and after verified merge continue recorded integration and exact owned cleanup. | Merge the PR, force-push, add unrelated work, or expand scope. |
-| Local integration | Record and perform exact accepted integration into the checkout's original attached destination plus exact owned cleanup through `workgraph_deliver`. | Publish remotely, force, add unrelated work, or change the destination or scope. |
-| Preserve checkout | Record preservation through `workgraph_deliver`, retain the exact Coordinator checkout, and report its state. | Integrate, publish, or clean up merely to make the handback neater. |
+| Pull request | Commit accepted content or same-scope corrections, non-force push the accepted branch, create or update the exact pull request, and establish continued observation. After verified merge, finish exact local Workgraph resources when nothing depends on them. | Merge the PR, force-push, add unrelated work, or expand scope. |
+| Local integration | Integrate the exact accepted change into the exact authorized local destination with ordinary non-force Git operations, then finish exact local Workgraph resources. | Publish remotely, force, add unrelated work, or change the destination or scope. |
+| Preserve checkout | Retain the exact Coordinator checkout and report its identity and state. | Integrate, publish, or clean up merely to make the handback neater. |
 
 A pull request requests repository maintainer consideration. It does not satisfy `Required` Human sign-off for final integration.
 
@@ -96,15 +96,14 @@ Do not:
 - expose local paths, credentials, private logs, or unpublished local artifacts; or
 - link screenshots or other media without a deliberate destination accessible to the repository maintainer.
 
-### Publish, record, and verify
+### Publish and verify
 
 1. Push the accepted branch with ordinary Git and forge tooling.
 2. Create or update the exact pull request with the prepared title and body.
 3. Verify its intended base and exact accepted head.
-4. Invoke `workgraph_deliver` with the selected pull-request route, accepted revision, exact URL, and already-configured publication remote. An open PR records pending state without integration or cleanup.
-5. Establish continued observation through an available session capability that confirms the exact pull-request identity.
+4. Establish continued observation through an available session capability that confirms the exact pull-request identity.
 
-The publication remote must identify the PR head repository. Exactly one configured fetch remote must identify the base repository; this also supports an ordinary fork. If route recording or observation fails, preserve the published pull request and report the limitation.
+If observation is unavailable or confirmation fails, preserve the published pull request and report the limitation. Workgraph records no pull-request state.
 
 Once observation is established, its availability may be reported directly to the user without starting an agent turn.
 
@@ -126,23 +125,36 @@ A later delivered observation returns the Coordinator to the same pull-request w
 
 1. Read current remote state once.
 2. Reconcile the observation with the accepted change and current evidence.
-3. When a same-scope correction is needed before merge, commit only that correction, non-force push the same branch, and replace the still-open recorded authorization with the newly accepted revision.
-4. Invoke `workgraph_deliver` with only the checkout ID to continue the recorded route. It performs its own fresh GitHub read. Open remains pending; closed-unmerged remains retained; merged integrates the current verified base and conditionally cleans exact owned resources.
-5. Report the persisted result and any preserved blocker.
+3. When a same-scope correction is needed before merge, commit only that correction and non-force push the same branch.
+4. When merged, prove the accepted result and any desired local synchronization through ordinary capabilities, then finish the exact local Workgraph checkout as described below.
+5. When closed without merge, preserve the checkout unless the user authorizes another disposition.
+6. Report the observed result and any preserved blocker.
 
-Do not independently poll or keep observation available. The observation capability may report its own later availability failure directly to the user without starting an agent turn.
+Do not independently poll or keep observation available. An observation capability may report its own later availability failure directly to the user without starting an agent turn. Remote branch deletion uses repository configuration or ordinary forge/Git tooling; checkout finish never touches a remote.
 
 If the needed response would merge, force-push, add unrelated work, or expand scope or authority, stop and return the decision to the user.
 
 ## Local integration
 
-1. Verify the exact accepted clean checkout revision and authority to integrate it into the original attached source destination.
-2. Invoke `workgraph_deliver` with the selected local route and accepted revision.
-3. If it refuses, conflicts, or returns an uncertain result, inspect the exact checkout record and native state before explicitly continuing with only the checkout ID.
-4. Report the accepted and resulting destination revisions, cleanup result, preserved blockers, verification evidence, and material limitations.
+1. Verify the exact accepted source revision, authorized destination, current destination head, and authority to integrate them.
+2. Use ordinary non-force Git operations. If Git refuses, conflicts, or leaves the result uncertain, stop and preserve both source and destination state.
+3. Verify that the destination contains the accepted result and no unrelated state changed.
+4. Finish the exact local Workgraph checkout as described below.
+5. Report the accepted and resulting destination revisions, cleanup result, preserved blockers, verification evidence, and material limitations.
 
-The selected route already includes exact owned worktree and branch cleanup after delivery and dependency proof. It does not authorize publication.
+Local integration does not authorize publication.
+
+## Finish the owned local checkout
+
+Finish is housekeeping after delivery proof, not delivery evidence or authority.
+
+1. Verify the deterministic checkout ID, its clean exact current `HEAD`, and that no retained work still needs it.
+2. Call `workgraph_checkout` with a repository `cwd` when needed and `finish: { checkoutId, expectedHead }`.
+3. Treat exact absence as completion. If finish reports dirty, changed, dependent, partial, moved, foreign, or ambiguous state, preserve it and inspect before retrying. Change `expectedHead` only after independently accepting that exact observed head, never merely to overcome a lease refusal.
+4. Report whether local Workgraph resources were removed or preserved.
+
+Finish removes no destination or remote resource. A selected local or merged pull-request route permits it only after that route's result has been independently proven.
 
 ## Preserve the ready checkout
 
-Invoke `workgraph_deliver` with the preservation route before any delivery effect. It records the exact owned checkout revision without requiring the checkout to be clean and changes no repository bytes. Report the checkout identity, revision and status, verification evidence, material limitations, and anything still depending on it.
+Leave the accepted change and Coordinator checkout unchanged. Report the exact checkout path, current revision and status, verification evidence, material limitations, and anything still depending on the checkout.

@@ -10,7 +10,7 @@ Use the smallest real boundary that distinguishes the supported promise from con
 | --- | --- |
 | Persisted records and Outcomes | Native SQLite store through separate exact-session instances |
 | Worker lifecycle, reports, and observed models | Real Worker Pi session with deterministic Herdr transport |
-| Repository output, Candidates, Coordinator checkouts, and delivery | Disposable real Git repositories, bare remotes, and native SQLite through registered tools |
+| Repository output, Candidates, and Coordinator checkouts | Disposable real Git repositories and native SQLite through registered tools |
 | Coordinator surface | Pi extension registration and returned persisted facts |
 | Implementation trajectory | Real Pi Worker session with controlled providers |
 | Calm | Installed Pi using the running CLI's component constructors |
@@ -65,13 +65,13 @@ Drive `workgraph_checkout` through the registered tool. For [Coordinator checkou
 
 Establish that identity is deterministic for one session and repository, isolated across sessions, and based on committed source `HEAD` without copying or changing source checkout bytes. Exact owned state may be adopted or reused even when managed content changed; partial, duplicate, locked, symlinked, foreign, moved, or unreadable state must remain blocked rather than repaired.
 
-A failed native creation response counts as recovered success only when immediate observation proves the complete requested identity at the exact commit. Wrong-commit or partial state must remain visible and blocked. An existing version-one SQLite store must support explicit allocation without a separate migration step.
+A failed native creation response counts as recovered success only when immediate observation proves the complete requested identity at the exact commit. Wrong-commit or partial state must remain visible and blocked.
 
-The supported end-to-end flow is: create the managed checkout, make a direct committed change there, target an Implementation Task there, and apply its Candidate back into that managed destination. This distinguishes Coordinator checkout custody from ordinary Worker output and from the original source checkout.
+The supported end-to-end flow is: create the managed checkout, make a direct committed change there, target an Implementation Task there, apply its Candidate back into that managed destination, and explicitly finish exact local resources only after delivery has been proven separately. This distinguishes Coordinator checkout custody from ordinary Worker output and from delivery.
 
-Drive `workgraph_deliver` through the registered deferred tool. With real disposable repositories and bare remotes, establish local integration with disjoint staged, unstaged, untracked, and ignored bytes preserved; collision refusal without mutation; dependency gating; interrupted integration and cleanup continuation; exact cleanup; and fresh explicit allocation.
+Drive finish through the registered `workgraph_checkout` tool with its exact checkout ID and expected head. Establish normal attached and clean equivalent detached removal, branch-only interrupted continuation, complete-absence idempotence, compare-and-delete race recovery, targeted dependency gating, and fresh allocation. Dirty tracked, staged, untracked, ignored, or merge state and changed, switched, locked, moved, symlinked, foreign, or ambiguous identities must preserve resources. Include literal path-boundary cases so similarly named or differently cased targets do not become false dependencies.
 
-For pull-request delivery, control only the bounded GitHub read while keeping every Git effect real. Cover open and closed-unmerged retention, same-repository or ordinary-fork remote binding, merge/squash/rebase results contained in the current fetched base, changed and already-absent publication tips, fetch/push identity drift, source drift, exact-tip deletion, and post-integration destination descendants. These checks do not establish live GitHub authentication, publication, merge, or continued observation.
+These checks establish only local Workgraph resource custody. They do not establish final integration, publication, GitHub state, remote branch deletion, or another extension's observation.
 
 ## Installed Pi surfaces
 
@@ -103,7 +103,7 @@ Projection fixtures establish classification and caching, not compatibility with
 
 Load Coordinator and Worker extensions from the exact checkout through Pi's extension runtime to establish registration, role gating, structured Coordinator guidance injection with resolved package-local reference links, forced-prompt fallback, Worker tool reconciliation without prompt forcing, and clean release of session-owned resources.
 
-Pack the exact revision, install it in a disposable consumer, load both supported extension entry points, emit the installed Coordinator's guidance injection, and read the installed delivery reference. Assert that the injected link resolves inside the installed package while the reference body stays unloaded, and that `workgraph_deliver` remains deferred until the loader is invoked. Archive inspection, source-tree import, or build success does not establish installed package loading. The package check does not establish real Worker lifecycle, native integration, or forge publication.
+Pack the exact revision, install it in a disposable consumer, load both supported extension entry points, emit the installed Coordinator's guidance injection, and read the installed delivery reference. Assert that the injected link resolves inside the installed package while the reference body stays unloaded, and that configured generic delivery tools remain deferred until the loader is invoked. Archive inspection, source-tree import, or build success does not establish installed package loading. The package check does not establish real Worker lifecycle, native integration, checkout finish, or forge publication.
 
 ## Suite and resource policy
 

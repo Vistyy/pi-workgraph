@@ -38,9 +38,9 @@ Before the first repository edit or implementation delegation:
 
 Read and research in the user's checkout without creating resources. Applying a Worker Candidate with `workgraph_control` changes the Coordinator checkout; it is not final integration.
 
-Preserve the checkout while any Worker, Candidate decision, or delivery choice depends on it. After the Maintainer selects a route, use the deferred `workgraph_deliver` capability for recorded integration and owned cleanup rather than reconstructing those effects manually. Repeating it continues only the selected route; session startup never does so automatically.
+Preserve the checkout while any Worker, Candidate decision, or delivery choice depends on it. Delivery remains ordinary Git, forge, and session work. After proving the accepted change reached its selected destination and no retained work still needs the managed checkout, call `workgraph_checkout` with `finish: { checkoutId, expectedHead }` to remove only that exact clean owned worktree and branch.
 
-If delivery refuses or its result is uncertain, inspect the exact checkout record and native state before explicitly continuing. Preserve resources whose ownership or postcondition is not proven.
+Finish does not establish delivery. If it refuses or its result is uncertain, inspect the reported native state before retrying with ordinary capabilities. Preserve resources whose identity, current head, cleanliness, dependency state, or removal postcondition is not proven.
 
 ## Delegate when useful
 
@@ -74,7 +74,7 @@ The user's judgment is the final product decision. Before review or handback, co
 
 A repository change reaches the delivery boundary when the Coordinator has accepted the complete result and its supporting evidence, with no further implementation or verification needed before the user's delivery judgment. Final integration or publication requires authority separate from implementation.
 
-- [Delivery procedure](references/delivery.md) — Read at this boundary before deciding or acting on delivery, or when a later delivered observation returns the Coordinator to its pull request. It owns Human sign-off handling, route selection, publication, invocation of the recorded delivery capability, receipts, and continued pull-request work.
+- [Delivery procedure](references/delivery.md) — Read at this boundary before deciding or acting on delivery, or when a later delivered observation returns the Coordinator to its pull request. It owns Human sign-off handling, route selection, route-specific effects and receipts, continued pull-request work, and the point at which exact local checkout finish is safe.
 
 ## Preserve operational truth
 

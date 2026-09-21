@@ -8,7 +8,7 @@ Canonical language for delegated Workgraph coordination and repository output.
 The Pi session responsible for understanding the user's goal, making consequential decisions, delegating where useful, and accepting the final result. It owns its Tasks, Attempts, and Coordinator checkouts.
 
 **Coordinator checkout**:
-A deterministically named branch-backed Git worktree created or exactly reused on a Coordinator's explicit request as that session's mutable integration destination for one repository. Direct Coordinator changes and Worker Candidates converge there before delivery. Workgraph persists its current allocation, selected delivery route, and recovery proof for that exact session and repository.
+A deterministically named branch-backed Git worktree created or exactly reused on a Coordinator's explicit request as that session's mutable integration destination for one repository. Direct Coordinator changes and Worker Candidates converge there before delivery. After delivery is proven elsewhere, Workgraph can finish its exact clean local worktree and branch from native state.
 
 _Avoid_: Workspace
 
@@ -38,7 +38,7 @@ A Maintainer's explicit judgment that the exact accepted change may be finally i
 _Avoid_: Human review
 
 **Delivery route**:
-The Maintainer-authorized disposition of an accepted Coordinator checkout: local delivery, pull-request delivery, or preservation. Workgraph records one selected route and continues only its authorized integration and owned cleanup effects.
+The Maintainer-authorized disposition of an accepted Coordinator checkout: local delivery, pull-request delivery, or preservation. The Coordinator performs it through ordinary capabilities; it is not persisted Workgraph state.
 
 **Maintainer**:
 The human who performs Maintainer inspection and gives or withholds Human sign-off. It is distinct from a Worker performing a Review.
