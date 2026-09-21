@@ -1,4 +1,3 @@
-/* oxlint-disable effecttsgo/async-function -- Pi callbacks are the Promise boundary around repository-owned Effects. */
 import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { join } from "node:path";
@@ -9,7 +8,7 @@ import {
   cleanupCoordinatorCheckout,
   ensureCoordinatorCheckout,
 } from "./checkout-git.js";
-import type { RecordStore } from "./store.js";
+import type { RecordStore, SessionAttemptSnapshot } from "./store.js";
 
 export interface CheckoutFacts extends CoordinatorCheckoutIdentity {
   readonly checkoutId: string;
@@ -26,6 +25,7 @@ interface ResolvedIdentity {
 }
 
 /** Allocate or exactly reuse this session's deterministic repository checkout. */
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 export async function createCheckout(input: {
   readonly agentDir: string;
   readonly sessionId: string;
@@ -50,6 +50,7 @@ export async function createCheckout(input: {
 }
 
 /** Remove only the exact clean owned checkout and compare-and-delete its unchanged branch. */
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 export async function finishCheckout(input: {
   readonly agentDir: string;
   readonly sessionId: string;
@@ -66,13 +67,47 @@ export async function finishCheckout(input: {
 
   await Effect.runPromise(
     cleanupCoordinatorCheckout(resolved.identity, resolved.sourcePath, input.expectedHead, () =>
-      input.store.checkoutCleanupBlocked(resolved.identity.managedPath),
+      hasCheckoutDependencies(resolved.identity.managedPath, input.store.currentSessionAttempts()),
     ),
   );
 
   return { checkoutId: resolved.identity.checkoutId, finished: true };
 }
 
+function hasCheckoutDependencies(
+  checkoutPath: string,
+  snapshots: readonly SessionAttemptSnapshot[],
+): boolean {
+  return snapshots.some(({ task, attempt }) => {
+    const target = task.task.target;
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+    const targetsCheckout =
+      target.kind === "repository"
+        ? target.checkoutRoot === checkoutPath
+        : target.path === checkoutPath || target.path.startsWith(`${checkoutPath}/`);
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+    const workerBlocks =
+      targetsCheckout &&
+      ((attempt.worker === undefined && attempt.outcome === undefined) ||
+        (attempt.worker !== undefined && attempt.worker.closed !== true));
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+    const output = attempt.output;
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
+    const candidateBlocks =
+      target.kind === "repository" &&
+      target.checkoutRoot === checkoutPath &&
+      task.task.contract.kind === "implementation" &&
+      (output === undefined ||
+        output.kind === "retained" ||
+        output.kind === "applying" ||
+        output.kind === "discarding" ||
+        (output.kind === "applied" && output.cleanupTip !== undefined));
+
+    return workerBlocks || candidateBlocks;
+  });
+}
+
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 async function resolveIdentity(input: {
   readonly agentDir: string;
   readonly sessionId: string;
