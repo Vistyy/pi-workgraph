@@ -21,20 +21,10 @@ import {
   type WorkerState,
   WorkerStateSchema,
 } from "../domain/records.js";
-import { type CheckoutDeliveryRecord, CheckoutDeliveryRecordSchema } from "./delivery-state.js";
 
 const MAX_PAGE = 100;
 
 const BUSY_TIMEOUT_MS = 5_000;
-
-const CHECKOUT_SCHEMA = `
-CREATE TABLE IF NOT EXISTS checkouts (
-  session_id TEXT NOT NULL,
-  repository_common_dir TEXT NOT NULL,
-  checkout_json TEXT NOT NULL,
-  PRIMARY KEY(session_id,repository_common_dir)
-) STRICT;
-`;
 
 const SCHEMA = `
 CREATE TABLE tasks (
@@ -53,7 +43,6 @@ CREATE TABLE attempts (
   outcome_json TEXT,
   FOREIGN KEY(session_id,task_id) REFERENCES tasks(session_id,task_id)
 ) STRICT;
-${CHECKOUT_SCHEMA}
 PRAGMA user_version=1;
 `;
 
@@ -234,62 +223,27 @@ export class RecordStore {
     });
   }
 
-  readCheckout(commonDir: string): CheckoutDeliveryRecord | undefined {
-    const database = this.existingOrUndefined("read Coordinator checkout");
-
-    if (database === undefined || !checkoutTableExists(database)) return undefined;
-
-    const row = database
-      .prepare("SELECT checkout_json FROM checkouts WHERE session_id=? AND repository_common_dir=?")
-      .get(this.sessionId, commonDir);
-
-    if (row === undefined) return undefined;
-
-    return parse(CheckoutDeliveryRecordSchema, row["checkout_json"], "Coordinator checkout");
-  }
-
-  listCheckouts(): CheckoutDeliveryRecord[] {
-    const database = this.existingOrUndefined("list Coordinator checkouts");
-
-    if (database === undefined || !checkoutTableExists(database)) return [];
-
-    return (
-      database
-        .prepare("SELECT checkout_json FROM checkouts WHERE session_id=? ORDER BY rowid")
-        .all(this.sessionId) as Row[]
-    ).map((row) =>
-      parse(CheckoutDeliveryRecordSchema, row["checkout_json"], "Coordinator checkout"),
-    );
-  }
-
-  checkpointCheckout(record: CheckoutDeliveryRecord): CheckoutDeliveryRecord {
-    decode(CheckoutDeliveryRecordSchema, record, "Coordinator checkout");
-
-    return this.transaction("checkpoint Coordinator checkout", true, (database) => {
-      ensureCheckoutTable(database);
-      database
-        .prepare(
-          `INSERT INTO checkouts(session_id,repository_common_dir,checkout_json) VALUES(?,?,?)
-           ON CONFLICT(session_id,repository_common_dir) DO UPDATE SET checkout_json=excluded.checkout_json`,
-        )
-        .run(this.sessionId, record.repositoryCommonDir, json(record));
-
-      return record;
-    });
-  }
-
   checkoutCleanupBlocked(checkoutPath: string): boolean {
     const database = this.existingOrUndefined("inspect checkout dependencies");
 
     if (database === undefined) return false;
+
+    const targetMatches = `(
+      (json_extract(t.task_json,'$.target.kind')='repository'
+        AND json_extract(t.task_json,'$.target.checkoutRoot')=?)
+      OR (json_extract(t.task_json,'$.target.kind')='directory'
+        AND (json_extract(t.task_json,'$.target.path')=?
+          OR json_extract(t.task_json,'$.target.path') LIKE ?))
+    )`;
 
     return (
       integer(
         database
           .prepare(
             `SELECT (
-              EXISTS(SELECT 1 FROM attempts a
-                WHERE a.session_id=? AND (
+              EXISTS(SELECT 1 FROM attempts a JOIN tasks t
+                ON t.session_id=a.session_id AND t.task_id=a.task_id
+                WHERE a.session_id=? AND ${targetMatches} AND (
                   (a.outcome_json IS NULL AND a.worker_json IS NULL) OR
                   (a.worker_json IS NOT NULL AND json_extract(a.worker_json,'$.closed') IS NOT 1)
                 ))
@@ -298,14 +252,24 @@ export class RecordStore {
                 WHERE a.session_id=?
                   AND json_extract(t.task_json,'$.target.kind')='repository'
                   AND json_extract(t.task_json,'$.target.checkoutRoot')=?
+                  AND json_extract(t.task_json,'$.contract.kind')='implementation'
                   AND (
                     a.output_json IS NULL OR
                     json_extract(a.output_json,'$.kind') IN ('retained','applying','discarding') OR
-                    (json_extract(a.output_json,'$.kind')='applied' AND json_extract(a.output_json,'$.cleanupTip') IS NOT NULL)
-                  ))
+                    (json_extract(a.output_json,'$.kind')='applied'
+                      AND json_extract(a.output_json,'$.cleanupTip') IS NOT NULL)
+                  )
+              )
             ) AS value`,
           )
-          .get(this.sessionId, this.sessionId, checkoutPath),
+          .get(
+            this.sessionId,
+            checkoutPath,
+            checkoutPath,
+            `${checkoutPath}/%`,
+            this.sessionId,
+            checkoutPath,
+          ),
         "value",
       ) === 1
     );
@@ -593,23 +557,6 @@ function configure(database: DatabaseSync): DatabaseSync {
   database.exec(`PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
 
   return database;
-}
-
-function ensureCheckoutTable(database: DatabaseSync): void {
-  database.exec(CHECKOUT_SCHEMA);
-}
-
-function checkoutTableExists(database: DatabaseSync): boolean {
-  return (
-    integer(
-      database
-        .prepare(
-          "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='checkouts') AS value",
-        )
-        .get(),
-      "value",
-    ) === 1
-  );
 }
 
 function initializeOrValidate(database: DatabaseSync): void {

@@ -125,7 +125,6 @@ export async function extensionFixture(
     "workgraph_checkout",
     "workgraph_consult",
     "workgraph_control",
-    "workgraph_deliver",
     "workgraph_experiment",
     "workgraph_implement",
     "workgraph_inspect",

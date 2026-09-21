@@ -23,9 +23,7 @@ const accepted = [
   "workgraph_review",
   "workgraph_attempt",
   "workgraph_inspect",
-  "workgraph_load_delivery_tools",
   "workgraph_control",
-  "workgraph_deliver",
   "workgraph_notepad",
 ] as const;
 
@@ -114,6 +112,20 @@ void test("coordinator registers the exact strict tool surface", async () => {
       .sort();
 
     assert.deepEqual(registered, [...accepted].sort());
+    const checkout = f.runner.getToolDefinition("workgraph_checkout");
+    assert.ok(checkout !== undefined);
+    assert.equal(Value.Check(checkout.parameters, {}), true);
+    assert.equal(Value.Check(checkout.parameters, { cwd: "." }), true);
+    assert.equal(
+      Value.Check(checkout.parameters, {
+        checkoutId: "a".repeat(64),
+        expectedHead: "b".repeat(40),
+      }),
+      true,
+    );
+    assert.equal(Value.Check(checkout.parameters, { checkoutId: "a".repeat(64) }), false);
+    assert.equal(f.runner.getToolDefinition("workgraph_deliver"), undefined);
+
     const implement = f.runner.getToolDefinition("workgraph_implement");
     assert.ok(implement !== undefined);
     assert.equal(
@@ -226,11 +238,11 @@ void test("configured delivery tools are deferred only in Coordinator scope", as
 
     const receipt = await coordinator.call("workgraph_load_delivery_tools", {});
     assert.deepEqual(receipt.details, {
-      loaded: ["bash", "workgraph_deliver"],
+      loaded: ["bash"],
       missing: ["absent_peer"],
     });
     assert.equal(coordinator.activeTools().includes("bash"), true);
-    assert.equal(coordinator.activeTools().includes("workgraph_deliver"), true);
+    assert.equal(coordinator.activeTools().includes("workgraph_deliver"), false);
     assert.equal(coordinator.activeTools().includes("workgraph_load_delivery_tools"), true);
     assert.equal(receipt.content[0]?.type, "text");
     assert.equal(

@@ -83,15 +83,22 @@ function worker(overrides: Partial<WorkerState> = {}): WorkerState {
   };
 }
 
-void test("checkout cleanup blocks global queued Workers and only unresolved targeted Candidates", () => {
+void test("checkout cleanup blocks only targeted activity and unresolved Candidate custody", () => {
   const { root, cleanup } = fixture();
 
   try {
     const store = new RecordStore(root, "session-a");
     store.createTaskWithAttempt("global", directoryTask, "global-attempt", directorySpec);
-    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), true);
-    store.recordOutcome("global-attempt", unreported);
     assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), false);
+
+    const insideTask: Task = {
+      ...directoryTask,
+      target: { kind: "directory", path: "/tmp/managed/inside" },
+    };
+
+    store.createTaskWithAttempt("inside", insideTask, "inside-attempt", directorySpec);
+    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), true);
+    store.recordOutcome("inside-attempt", unreported);
 
     const targetedTask: Task = {
       ...repositoryTask,
@@ -105,15 +112,28 @@ void test("checkout cleanup blocks global queued Workers and only unresolved tar
     store.createTaskWithAttempt("targeted", targetedTask, "targeted-attempt", repositorySpec);
     store.recordOutcome("targeted-attempt", unreported);
     assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), true);
-    store.checkpointOutput("targeted-attempt", {
-      kind: "retained",
-      tip: commit,
-      reason: "awaiting decision",
-    });
-    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), true);
     store.checkpointOutput("targeted-attempt", { kind: "applied", revision: commit });
     assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), false);
     store.close();
+  } finally {
+    cleanup();
+  }
+});
+
+void test("version-one databases remain usable with an unused checkout table", () => {
+  const { root, cleanup } = fixture();
+
+  try {
+    const first = new RecordStore(root, "session-a");
+    first.createTaskWithAttempt("task", directoryTask, "attempt", directorySpec);
+    first.close();
+    const database = new DatabaseSync(join(root, "workgraph", "workgraph.sqlite"));
+    database.exec("CREATE TABLE checkouts (legacy TEXT) STRICT;");
+    database.close();
+
+    const reopened = new RecordStore(root, "session-a");
+    assert.equal(reopened.readTask("task").id, "task");
+    reopened.close();
   } finally {
     cleanup();
   }
@@ -165,7 +185,7 @@ void test("RecordStore creates one exact database lazily", () => {
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
         .all()
         .map((row) => (row as { name: string }).name),
-      ["attempts", "checkouts", "tasks"],
+      ["attempts", "tasks"],
     );
     assert.deepEqual(
       database

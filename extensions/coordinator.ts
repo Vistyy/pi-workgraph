@@ -9,8 +9,7 @@ import {
 import { Effect, Exit, Match, Scope } from "effect";
 import { Type } from "typebox";
 import { installCalmMode, isCoordinatorScope } from "../src/calm/index.js";
-import { createCheckout } from "../src/coordinator/checkouts.js";
-import { type DeliveryInput, deliver } from "../src/coordinator/delivery.js";
+import { createCheckout, finishCheckout } from "../src/coordinator/checkouts.js";
 import {
   deliverySettingsPath,
   installDeliveryTools,
@@ -85,12 +84,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   let deferredDeliveryTools: readonly string[] = [];
 
   try {
-    deferredDeliveryTools = [
-      ...new Set([
-        ...loadDeferredDeliveryTools(options.settingsPath ?? deliverySettingsPath(agentDir)),
-        "workgraph_deliver",
-      ]),
-    ];
+    deferredDeliveryTools = loadDeferredDeliveryTools(
+      options.settingsPath ?? deliverySettingsPath(agentDir),
+    );
   } catch (cause) {
     deliverySettingsWarning = publicMessage(cause);
   }
@@ -175,69 +171,48 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
   pi.registerTool({
     name: "workgraph_checkout",
     label: "Workgraph Checkout",
-    description: "Create or exactly reuse this session's deterministic branch-backed checkout.",
-    parameters: Type.Object(
-      {
-        cwd: Type.Optional(
-          nonBlank("Repository checkout to allocate from; defaults to the session cwd."),
-        ),
-      },
-      { additionalProperties: false },
-    ),
-    execute(_id, params, _signal, _update, ctx) {
-      return serialize(async () =>
-        result(
-          await createCheckout({
-            agentDir: runtime().agentDir,
-            sessionId: ctx.sessionManager.getSessionId(),
-            cwd: ctx.cwd,
-            store: runtime().store,
-            ...(params.cwd === undefined ? {} : { path: params.cwd }),
-          }),
-        ),
-      );
-    },
-  });
-
-  pi.registerTool({
-    name: "workgraph_deliver",
-    label: "Workgraph Deliver",
-    description:
-      "Continue one explicitly selected local, pull-request, or preservation route for an owned Coordinator checkout.",
+    description: "Allocate/reuse or finish this session's deterministic branch-backed checkout.",
     parameters: Type.Union([
       Type.Object(
-        { checkoutId: nonBlank("Exact Coordinator checkout ID.") },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        { checkoutId: nonBlank("Exact Coordinator checkout ID."), route: Type.Literal("preserve") },
-        { additionalProperties: false },
-      ),
-      Type.Object(
         {
-          checkoutId: nonBlank("Exact Coordinator checkout ID."),
-          route: Type.Literal("local"),
-          revision: CommitSchema,
+          cwd: Type.Optional(
+            nonBlank("Repository checkout to allocate from; defaults to the session cwd."),
+          ),
         },
         { additionalProperties: false },
       ),
       Type.Object(
         {
-          checkoutId: nonBlank("Exact Coordinator checkout ID."),
-          route: Type.Literal("pull_request"),
-          revision: CommitSchema,
-          url: Type.String({ pattern: "^https://github\\.com/[^/]+/[^/]+/pull/[1-9][0-9]*$" }),
-          remote: nonBlank("Already-configured publication remote."),
+          cwd: Type.Optional(
+            nonBlank(
+              "Repository checkout that identifies the owned checkout; defaults to session cwd.",
+            ),
+          ),
+          checkoutId: nonBlank("Exact deterministic Coordinator checkout ID."),
+          expectedHead: CommitSchema,
         },
         { additionalProperties: false },
       ),
     ]),
-    execute(_id, params) {
+    execute(_id, params, _signal, _update, ctx) {
       return serialize(async () => {
-        // SAFETY: Pi decodes params against this exact strict delivery union before execution.
-        const input = params as DeliveryInput;
+        const common = {
+          agentDir: runtime().agentDir,
+          sessionId: ctx.sessionManager.getSessionId(),
+          cwd: ctx.cwd,
+          ...(params.cwd === undefined ? {} : { path: params.cwd }),
+        };
 
-        return result(await Effect.runPromise(deliver(runtime().store, input)));
+        return result(
+          "checkoutId" in params
+            ? await finishCheckout({
+                ...common,
+                checkoutId: params.checkoutId,
+                expectedHead: params.expectedHead,
+                store: runtime().store,
+              })
+            : await createCheckout(common),
+        );
       });
     },
   });
@@ -498,15 +473,6 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           }),
           taskId: Type.Optional(TaskIdSchema),
           ...PageFields,
-        },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        {
-          section: Type.Literal("checkout", {
-            description: "Inspect recorded Coordinator checkouts.",
-          }),
-          checkoutId: Type.Optional(nonBlank("Exact Coordinator checkout ID.")),
         },
         { additionalProperties: false },
       ),

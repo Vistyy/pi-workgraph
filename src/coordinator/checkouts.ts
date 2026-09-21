@@ -3,37 +3,93 @@ import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { Effect } from "effect";
-import { canonicalFuturePath, fail, gitResult, resolveTaskTarget } from "../repository/git.js";
+import { canonicalFuturePath, fail, resolveTaskTarget } from "../repository/git.js";
 import {
   type CoordinatorCheckoutIdentity,
+  cleanupCoordinatorCheckout,
   ensureCoordinatorCheckout,
-  observeCoordinatorCheckout,
 } from "./checkout-git.js";
-import type { CheckoutDeliveryRecord } from "./delivery-state.js";
 import type { RecordStore } from "./store.js";
 
-export interface CheckoutFacts extends CheckoutDeliveryRecord {
+export interface CheckoutFacts extends CoordinatorCheckoutIdentity {
+  readonly checkoutId: string;
   readonly head: string;
   readonly created: boolean;
   readonly reused: boolean;
   readonly diagnostic?: string;
 }
 
-type Identity = CoordinatorCheckoutIdentity & { readonly checkoutId: string };
+interface ResolvedIdentity {
+  readonly identity: CoordinatorCheckoutIdentity & { readonly checkoutId: string };
+  readonly sourcePath: string;
+  readonly sourceHead: string;
+}
 
-/** Explicitly allocate, adopt, or reuse this session's one exact repository checkout. */
+/** Allocate or exactly reuse this session's deterministic repository checkout. */
 export async function createCheckout(input: {
   readonly agentDir: string;
   readonly sessionId: string;
   readonly cwd: string;
-  readonly store: RecordStore;
   readonly path?: string;
 }): Promise<CheckoutFacts> {
+  const resolved = await resolveIdentity(input);
+
+  const receipt = await Effect.runPromise(
+    ensureCoordinatorCheckout({
+      target: {
+        kind: "repository",
+        checkoutRoot: resolved.sourcePath,
+        commonDir: resolved.identity.repositoryCommonDir,
+      },
+      commit: resolved.sourceHead,
+      identity: resolved.identity,
+    }),
+  );
+
+  return { ...resolved.identity, ...receipt };
+}
+
+/** Remove only the exact clean owned checkout and compare-and-delete its unchanged branch. */
+export async function finishCheckout(input: {
+  readonly agentDir: string;
+  readonly sessionId: string;
+  readonly cwd: string;
+  readonly path?: string;
+  readonly checkoutId: string;
+  readonly expectedHead: string;
+  readonly store: RecordStore;
+}): Promise<{ readonly checkoutId: string; readonly finished: true }> {
+  const resolved = await resolveIdentity(input);
+
+  if (input.checkoutId !== resolved.identity.checkoutId)
+    throw new Error("Coordinator checkout ID does not match this session and repository.");
+
+  if (input.store.checkoutCleanupBlocked(resolved.identity.managedPath))
+    throw new Error(
+      "Coordinator checkout has queued, active, or unresolved Candidate custody dependencies.",
+    );
+
+  await Effect.runPromise(
+    cleanupCoordinatorCheckout(resolved.identity, resolved.sourcePath, input.expectedHead),
+  );
+
+  return { checkoutId: resolved.identity.checkoutId, finished: true };
+}
+
+async function resolveIdentity(input: {
+  readonly agentDir: string;
+  readonly sessionId: string;
+  readonly cwd: string;
+  readonly path?: string;
+}): Promise<ResolvedIdentity> {
   const resolved = await Effect.runPromise(
     Effect.gen(function* () {
-      const target = yield* input.path === undefined
-        ? resolveTaskTarget({ cwd: input.cwd, kind: "repository" })
-        : resolveTaskTarget({ cwd: input.cwd, path: input.path, kind: "repository" });
+      const request =
+        input.path === undefined
+          ? { cwd: input.cwd, kind: "repository" as const }
+          : { cwd: input.cwd, path: input.path, kind: "repository" as const };
+
+      const target = yield* resolveTaskTarget(request);
 
       if (target.target.kind !== "repository" || !("commit" in target))
         return yield* fail("resolve Coordinator checkout", "Repository target resolution failed.");
@@ -42,68 +98,22 @@ export async function createCheckout(input: {
     }),
   );
 
-  const identity = await checkoutIdentity(
-    input.agentDir,
-    input.sessionId,
-    resolved.target.commonDir,
-  );
-
-  const prior = input.store.readCheckout(resolved.target.commonDir);
-  const observed = await Effect.runPromise(observeCoordinatorCheckout(identity));
-
-  if (prior !== undefined && prior.checkoutId !== identity.checkoutId)
-    throw new Error("Persisted Coordinator checkout identity does not match this session.");
-
-  if (prior?.state.kind === "complete" && observed.kind !== "absent")
-    throw new Error("Completed Coordinator checkout still has native owned resources.");
-
-  if (prior !== undefined && prior.state.kind !== "complete") {
-    if (observed.kind === "absent")
-      throw new Error("Recorded Coordinator checkout resources are unexpectedly absent.");
-
-    return { ...prior, head: observed.head, created: false, reused: true };
-  }
-
-  const receipt = await Effect.runPromise(
-    ensureCoordinatorCheckout({ target: resolved.target, commit: resolved.commit, identity }),
-  );
-
-  const attached = await Effect.runPromise(
-    gitResult(resolved.target.checkoutRoot, ["symbolic-ref", "-q", "HEAD"]),
-  );
-
-  const destinationRef =
-    attached.code === 0 && attached.stdout.startsWith("refs/heads/") ? attached.stdout : undefined;
-
-  const record: CheckoutDeliveryRecord = {
-    ...identity,
-    sourcePath: resolved.target.checkoutRoot,
-    state: { kind: "available", allocatedRevision: receipt.head },
-  };
-
-  if (destinationRef !== undefined) record.destinationRef = destinationRef;
-  input.store.checkpointCheckout(record);
-
-  return { ...record, ...receipt };
-}
-
-async function checkoutIdentity(
-  agentDir: string,
-  sessionId: string,
-  commonDir: string,
-): Promise<Identity> {
-  const canonicalAgentDir = await realpath(agentDir);
+  const canonicalAgentDir = await realpath(input.agentDir);
 
   const checkoutId = createHash("sha256")
-    .update(JSON.stringify([sessionId, commonDir]))
+    .update(JSON.stringify([input.sessionId, resolved.target.commonDir]))
     .digest("hex");
 
   return {
-    checkoutId,
-    managedPath: canonicalFuturePath(
-      join(canonicalAgentDir, "workgraph", "coordinator-checkouts", checkoutId),
-    ),
-    repositoryCommonDir: commonDir,
-    ownedBranch: `refs/heads/pi-workgraph/coordinators/${checkoutId}`,
+    identity: {
+      checkoutId,
+      managedPath: canonicalFuturePath(
+        join(canonicalAgentDir, "workgraph", "coordinator-checkouts", checkoutId),
+      ),
+      repositoryCommonDir: resolved.target.commonDir,
+      ownedBranch: `refs/heads/pi-workgraph/coordinators/${checkoutId}`,
+    },
+    sourcePath: resolved.target.checkoutRoot,
+    sourceHead: resolved.commit,
   };
 }

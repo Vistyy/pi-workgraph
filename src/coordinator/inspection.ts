@@ -18,7 +18,6 @@ type InspectInput =
       readonly offset?: number;
       readonly limit?: number;
     }
-  | { readonly section: "checkout"; readonly checkoutId?: string }
   | {
       readonly section: "report";
       readonly attemptId: string;
@@ -45,17 +44,6 @@ export function inspect(runtime: SessionRuntime, params: Static<TSchema>) {
       return inspectTasks(runtime, input);
     case "attempt":
       return inspectAttempts(runtime, input);
-    case "checkout": {
-      const checkouts = runtime.store.listCheckouts();
-
-      if (input.checkoutId === undefined) return { checkouts };
-      const checkout = checkouts.find((value) => value.checkoutId === input.checkoutId);
-
-      if (checkout === undefined) throw new Error("Coordinator checkout is not recorded.");
-
-      return checkout;
-    }
-
     case "report":
       return inspectReport(runtime, input);
   }
