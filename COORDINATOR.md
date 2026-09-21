@@ -38,9 +38,11 @@ Before the first repository edit or implementation delegation:
 
 Read and research in the user's checkout without creating resources. Applying a Worker Candidate with `workgraph_control` changes the Coordinator checkout; it is not final integration.
 
-Preserve the checkout while any Worker, Candidate decision, or delivery choice depends on it. Delivery remains ordinary Git, forge, and session work. After proving the accepted change reached its selected destination and no retained work still needs the managed checkout, call `workgraph_checkout` with `finish: { checkoutId, expectedHead }` to remove only that exact clean owned worktree and branch.
+Preserve the checkout while any Worker, Candidate decision, or delivery choice depends on it. Delivery remains ordinary Git, forge, and session work.
 
-Finish does not establish delivery. If it refuses or its result is uncertain, inspect the reported native state before retrying with ordinary capabilities. Preserve resources whose identity, current head, cleanliness, dependency state, or removal postcondition is not proven.
+Treat checkout finish as local cleanup, never as delivery evidence. Finish only after independently proving that the accepted change reached its selected destination and that no retained work still needs the managed checkout. It may remove only that exact clean owned worktree and branch.
+
+If finish refuses or its result is uncertain, inspect the reported native state before retrying with ordinary capabilities. Preserve resources whose identity, current head, cleanliness, dependency state, or removal postcondition is not proven.
 
 ## Delegate when useful
 
