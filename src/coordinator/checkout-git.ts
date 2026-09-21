@@ -72,14 +72,29 @@ export function ensureCoordinatorCheckout(input: {
       input.identity.managedPath,
       input.commit,
     ]);
-    const postcondition = yield* observe(input.identity);
+    const postcondition = yield* observe(input.identity).pipe(
+      Effect.catch((observationError) => {
+        const diagnostic = commandDiagnostic(placement);
+
+        return diagnostic === undefined
+          ? Effect.fail(observationError)
+          : fail(
+              "create Coordinator checkout",
+              `Created checkout failed exact post-validation: ${diagnostic}`,
+            );
+      }),
+    );
 
     if (postcondition.kind === "worktree" && postcondition.attached)
       return yield* finishCreation(input.commit, placement, postcondition.head);
 
+    const diagnostic = commandDiagnostic(placement);
+
     return yield* fail(
       "create Coordinator checkout",
-      "Created checkout failed exact post-validation.",
+      diagnostic === undefined
+        ? "Created checkout failed exact post-validation."
+        : `Created checkout failed exact post-validation: ${diagnostic}`,
     );
   });
 }
@@ -88,12 +103,19 @@ export function cleanupCoordinatorCheckout(
   identity: CoordinatorCheckoutIdentity,
   sourcePath: string,
   expectedHead: string,
+  cleanupBlocked: () => boolean,
 ): Effect.Effect<void, GitError> {
   // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Destructive validation and cleanup ordering stays visible as one safety boundary.
   return Effect.gen(function* () {
     const initial = yield* observe(identity);
 
     if (initial.kind === "absent") return;
+
+    if (yield* Effect.sync(cleanupBlocked))
+      return yield* fail(
+        "finish Coordinator checkout",
+        "Coordinator checkout has queued, active, or unresolved Candidate custody dependencies.",
+      );
 
     if (initial.head !== expectedHead)
       return yield* fail(
@@ -111,10 +133,11 @@ export function cleanupCoordinatorCheckout(
       const removal = yield* gitResult(sourcePath, ["worktree", "remove", identity.managedPath]);
       const afterRemoval = yield* observe(identity);
 
+      if (afterRemoval.kind === "absent") return;
       if (afterRemoval.kind !== "branch" || afterRemoval.head !== expectedHead)
         return yield* fail(
           "finish Coordinator checkout",
-          removal.stderr || removal.stdout || "Exact worktree removal was not proven.",
+          commandDiagnostic(removal) ?? "Exact worktree removal was not proven.",
         );
     }
 
@@ -124,18 +147,16 @@ export function cleanupCoordinatorCheckout(
       identity.ownedBranch,
       expectedHead,
     ]);
+    const afterDeletion = yield* observe(identity);
 
-    if (deletion.code !== 0)
-      return yield* fail(
-        "finish Coordinator checkout",
-        deletion.stderr || deletion.stdout || "Owned branch compare-and-delete failed.",
-      );
+    if (afterDeletion.kind === "absent") return;
 
-    if ((yield* observe(identity)).kind !== "absent")
-      return yield* fail(
-        "finish Coordinator checkout",
-        "Owned checkout cleanup postcondition is not absent.",
-      );
+    return yield* fail(
+      "finish Coordinator checkout",
+      afterDeletion.head !== expectedHead
+        ? "Owned checkout branch changed during compare-and-delete; resources were preserved."
+        : (commandDiagnostic(deletion) ?? "Owned branch compare-and-delete was not proven."),
+    );
   });
 }
 
@@ -294,13 +315,16 @@ function finishCreation(
       "create Coordinator checkout",
       "Created checkout HEAD does not match the exact requested commit.",
     );
-  const diagnostic =
-    placement.code === 0
-      ? undefined
-      : (placement.stderr || placement.stdout || "Git returned a failure.")
-          .replace(/\s+/g, " ")
-          .slice(0, 500);
+  const diagnostic = commandDiagnostic(placement);
   const receipt = { head, created: true, reused: false } as const;
 
   return Effect.succeed(diagnostic === undefined ? receipt : { ...receipt, diagnostic });
+}
+
+function commandDiagnostic(result: CommandResult): string | undefined {
+  if (result.code === 0) return undefined;
+
+  return (result.stderr || result.stdout || "Git returned a failure.")
+    .replace(/\s+/g, " ")
+    .slice(0, 500);
 }

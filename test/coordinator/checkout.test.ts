@@ -1,10 +1,13 @@
-/* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/require-readable-spacing, anti-slop/require-safety-comment-for-type-assertion -- Registered TypeBox validation guards tool details before this test projection. */
+/* oxlint-disable anti-slop/no-unknown-parameters, anti-slop/require-readable-spacing, anti-slop/require-safety-comment-for-type-assertion, effecttsgo/process-env -- Registered TypeBox validation guards tool details before this test projection; the native Git shim is scoped and restored by each test. */
+/* biome-ignore-all lint/complexity/useLiteralKeys: ProcessEnv keys require indexed access under noPropertyAccessFromIndexSignature. */
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 import { RecordStore } from "../../src/coordinator/store.js";
 import type { AttemptSpec, Task } from "../../src/domain/records.js";
 import { configureFixtureEnvironment, restoreFixtureEnvironment } from "../support/decoders.js";
@@ -20,6 +23,7 @@ type Facts = {
   readonly reused: boolean;
 };
 
+const execFilePromise = promisify(execFile);
 const model = { model: "fixture/model", thinking: "high" } as const;
 const directorySpec: AttemptSpec = {
   selection: { kind: "target", target: model },
@@ -29,6 +33,52 @@ const repositorySpec = (head: string): AttemptSpec => ({
   selection: { kind: "implementation", guide: model, executor: model },
   base: { kind: "repository", baseCommit: head },
 });
+
+async function installGitShim(parent: string): Promise<() => void> {
+  const originalPath = process.env["PATH"];
+  const realGit = (await execFilePromise("sh", ["-c", "command -v git"])).stdout.trim();
+  const bin = join(parent, "bin");
+  const shim = join(bin, "git");
+  await mkdir(bin);
+  await writeFile(
+    shim,
+    `#!/bin/sh
+mode="$WORKGRAPH_GIT_SHIM_MODE"
+case "$mode:$*" in
+  create-fail:*" worktree add "*)
+    echo "simulated bounded creation failure detail" >&2
+    exit 23
+    ;;
+  remove-all-fail:*" worktree remove "*)
+    ${realGit} "$@"
+    ${realGit} -C "$2" update-ref -d "$WORKGRAPH_GIT_SHIM_BRANCH"
+    echo "simulated remove response loss after complete cleanup" >&2
+    exit 23
+    ;;
+  remove-fail:*" worktree remove "*)
+    ${realGit} "$@"
+    echo "simulated remove response loss" >&2
+    exit 23
+    ;;
+  delete-fail:*" update-ref -d "*)
+    ${realGit} "$@"
+    echo "simulated delete response loss" >&2
+    exit 23
+    ;;
+esac
+exec ${realGit} "$@"
+`,
+  );
+  await chmod(shim, 0o755);
+  process.env["PATH"] = `${bin}:${originalPath ?? ""}`;
+
+  return () => {
+    if (originalPath === undefined) delete process.env["PATH"];
+    else process.env["PATH"] = originalPath;
+    delete process.env["WORKGRAPH_GIT_SHIM_MODE"];
+    delete process.env["WORKGRAPH_GIT_SHIM_BRANCH"];
+  };
+}
 
 async function fixture() {
   const parent = await mkdtemp(join(tmpdir(), "workgraph-checkout-"));
@@ -61,8 +111,7 @@ async function fixture() {
     finish: (facts: Facts, cwd = root) =>
       pi.call("workgraph_checkout", {
         cwd,
-        checkoutId: facts.checkoutId,
-        expectedHead: facts.head,
+        finish: { checkoutId: facts.checkoutId, expectedHead: facts.head },
       }),
     async dispose() {
       await pi.close();
@@ -116,6 +165,52 @@ void test("normal, interrupted, and complete finish are exact and permit fresh a
     await f.finish(fresh);
     await assert.rejects(git(f.root, "rev-parse", "--verify", fresh.ownedBranch));
   } finally {
+    await f.dispose();
+  }
+});
+
+void test("finish treats destructive command responses by exact observed postconditions", async () => {
+  const f = await fixture();
+  const restoreGit = await installGitShim(f.parent);
+
+  try {
+    const absentAfterRemoval = f.facts((await f.call("workgraph_checkout", {})).details);
+    process.env["WORKGRAPH_GIT_SHIM_MODE"] = "remove-all-fail";
+    process.env["WORKGRAPH_GIT_SHIM_BRANCH"] = absentAfterRemoval.ownedBranch;
+    await f.finish(absentAfterRemoval);
+    assert.equal(existsSync(absentAfterRemoval.managedPath), false);
+    await assert.rejects(git(f.root, "rev-parse", "--verify", absentAfterRemoval.ownedBranch));
+
+    delete process.env["WORKGRAPH_GIT_SHIM_BRANCH"];
+    process.env["WORKGRAPH_GIT_SHIM_MODE"] = "remove-fail";
+    const branchAfterRemoval = f.facts((await f.call("workgraph_checkout", {})).details);
+    await f.finish(branchAfterRemoval);
+    await assert.rejects(git(f.root, "rev-parse", "--verify", branchAfterRemoval.ownedBranch));
+
+    delete process.env["WORKGRAPH_GIT_SHIM_MODE"];
+    const branchOnly = f.facts((await f.call("workgraph_checkout", {})).details);
+    await git(f.root, "worktree", "remove", branchOnly.managedPath);
+    process.env["WORKGRAPH_GIT_SHIM_MODE"] = "delete-fail";
+    await f.finish(branchOnly);
+    await assert.rejects(git(f.root, "rev-parse", "--verify", branchOnly.ownedBranch));
+  } finally {
+    restoreGit();
+    await f.dispose();
+  }
+});
+
+void test("failed native creation reports bounded Git diagnostics", async () => {
+  const f = await fixture();
+  const restoreGit = await installGitShim(f.parent);
+
+  try {
+    process.env["WORKGRAPH_GIT_SHIM_MODE"] = "create-fail";
+    await assert.rejects(
+      f.call("workgraph_checkout", {}),
+      /failed exact post-validation: simulated bounded creation failure detail/,
+    );
+  } finally {
+    restoreGit();
     await f.dispose();
   }
 });
@@ -204,10 +299,61 @@ void test("finish refuses changed leases, switched, locked, moved, symlinked, an
         }
         await assert.rejects(f.finish(facts));
         assert.equal(await git(f.root, "rev-parse", facts.ownedBranch), facts.head);
+        if (mode === "moved") {
+          assert.equal(existsSync(`${facts.managedPath}-moved`), true);
+          assert.match(
+            await git(f.root, "worktree", "list", "--porcelain"),
+            new RegExp(facts.managedPath),
+          );
+        }
       } finally {
         await f.dispose();
       }
     });
+  }
+});
+
+void test("complete absence is idempotent even when a targeted dependency exists", async () => {
+  const f = await fixture();
+
+  try {
+    const facts = f.facts((await f.call("workgraph_checkout", {})).details);
+    await git(f.root, "worktree", "remove", facts.managedPath);
+    await git(f.root, "update-ref", "-d", facts.ownedBranch, facts.head);
+    const store = new RecordStore(f.agentDir, f.session.getSessionId());
+    store.createTaskWithAttempt(
+      "targeted-absent",
+      {
+        target: { kind: "directory", path: join(facts.managedPath, "inside") },
+        contract: { kind: "research", question: "Targeted after cleanup?" },
+      },
+      "attempt-targeted-absent",
+      directorySpec,
+    );
+    store.close();
+
+    await f.finish(facts);
+  } finally {
+    await f.dispose();
+  }
+});
+
+void test("branch-only advanced tips fail CAS and remain preserved", async () => {
+  const f = await fixture();
+
+  try {
+    const facts = f.facts((await f.call("workgraph_checkout", {})).details);
+    await git(f.root, "worktree", "remove", facts.managedPath);
+    await writeFile(join(f.root, "advanced.txt"), "advanced\n");
+    await git(f.root, "add", "advanced.txt");
+    await git(f.root, "commit", "-m", "advanced branch source");
+    const advanced = await git(f.root, "rev-parse", "HEAD");
+    await git(f.root, "update-ref", facts.ownedBranch, advanced, facts.head);
+
+    await assert.rejects(f.finish(facts), /branch or HEAD changed/);
+    assert.equal(await git(f.root, "rev-parse", facts.ownedBranch), advanced);
+  } finally {
+    await f.dispose();
   }
 });
 
@@ -264,8 +410,10 @@ void test("finish dependency blocking is targeted and preserves Candidate custod
         });
       }
       store.close();
+      if (kind === "active") await git(f.root, "worktree", "remove", facts.managedPath);
       await assert.rejects(f.finish(facts), /dependencies/);
-      assert.equal(existsSync(facts.managedPath), true);
+      assert.equal(await git(f.root, "rev-parse", facts.ownedBranch), facts.head);
+      if (kind === "candidate") assert.equal(existsSync(facts.managedPath), true);
     } finally {
       await f.dispose();
     }
@@ -277,7 +425,9 @@ void test("finish recomputes identity and rejects another repository or checkout
   try {
     const facts = f.facts((await f.call("workgraph_checkout", {})).details);
     await assert.rejects(
-      f.call("workgraph_checkout", { checkoutId: "0".repeat(64), expectedHead: facts.head }),
+      f.call("workgraph_checkout", {
+        finish: { checkoutId: "0".repeat(64), expectedHead: facts.head },
+      }),
       /does not match/,
     );
     assert.equal(await readFile(join(facts.managedPath, "tracked.txt"), "utf8"), "base\n");

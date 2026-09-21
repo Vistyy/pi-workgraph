@@ -230,10 +230,11 @@ export class RecordStore {
 
     const targetMatches = `(
       (json_extract(t.task_json,'$.target.kind')='repository'
-        AND json_extract(t.task_json,'$.target.checkoutRoot')=?)
+        AND json_extract(t.task_json,'$.target.checkoutRoot')=? COLLATE BINARY)
       OR (json_extract(t.task_json,'$.target.kind')='directory'
-        AND (json_extract(t.task_json,'$.target.path')=?
-          OR json_extract(t.task_json,'$.target.path') LIKE ?))
+        AND (json_extract(t.task_json,'$.target.path')=? COLLATE BINARY
+          OR substr(json_extract(t.task_json,'$.target.path'),1,length(?) + 1)
+            = (? || '/') COLLATE BINARY))
     )`;
 
     return (
@@ -266,7 +267,8 @@ export class RecordStore {
             this.sessionId,
             checkoutPath,
             checkoutPath,
-            `${checkoutPath}/%`,
+            checkoutPath,
+            checkoutPath,
             this.sessionId,
             checkoutPath,
           ),

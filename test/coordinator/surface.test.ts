@@ -118,12 +118,21 @@ void test("coordinator registers the exact strict tool surface", async () => {
     assert.equal(Value.Check(checkout.parameters, { cwd: "." }), true);
     assert.equal(
       Value.Check(checkout.parameters, {
-        checkoutId: "a".repeat(64),
-        expectedHead: "b".repeat(40),
+        finish: { checkoutId: "a".repeat(64), expectedHead: "b".repeat(40) },
       }),
       true,
     );
+    assert.equal(
+      Value.Check(checkout.parameters, { finish: { checkoutId: "a".repeat(64) } }),
+      false,
+    );
     assert.equal(Value.Check(checkout.parameters, { checkoutId: "a".repeat(64) }), false);
+    assert.equal(
+      Value.Check(checkout.parameters, {
+        finish: { checkoutId: "a".repeat(64), expectedHead: "b".repeat(40), extra: true },
+      }),
+      false,
+    );
     assert.equal(f.runner.getToolDefinition("workgraph_deliver"), undefined);
 
     const implement = f.runner.getToolDefinition("workgraph_implement");

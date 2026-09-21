@@ -39,7 +39,15 @@ try {
     "--input-type=module",
     "--eval",
     `
-      import { discoverAndLoadExtensions } from "@earendil-works/pi-coding-agent";
+      import {
+        DefaultResourceLoader,
+        ExtensionRunner,
+        ModelRegistry,
+        ModelRuntime,
+        SessionManager,
+        discoverAndLoadExtensions,
+      } from "@earendil-works/pi-coding-agent";
+      import { Value } from "typebox/value";
       const [coordinator, worker] = ${JSON.stringify(modules)};
       const agentDir = ${JSON.stringify(join(parent, "agent"))};
       process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -54,6 +62,49 @@ try {
       };
       await load(coordinator, null);
       await load(worker, "research");
+
+      delete process.env.PI_WORKGRAPH_ROLE;
+      const resources = new DefaultResourceLoader({
+        cwd: process.cwd(),
+        agentDir,
+        additionalExtensionPaths: [coordinator],
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+      });
+      await resources.reload();
+      const loaded = resources.getExtensions();
+      if (loaded.errors.length > 0)
+        throw new Error("coordinator registration failed: " + JSON.stringify(loaded.errors));
+      const models = await ModelRuntime.create({
+        authPath: ${JSON.stringify(join(parent, "auth.json"))},
+        modelsPath: null,
+        modelsStorePath: ${JSON.stringify(join(parent, "catalog.json"))},
+        refreshOnCreate: false,
+        allowModelNetwork: false,
+      });
+      const session = SessionManager.create(process.cwd(), ${JSON.stringify(join(parent, "sessions"))});
+      const runner = new ExtensionRunner(
+        loaded.extensions,
+        loaded.runtime,
+        process.cwd(),
+        session,
+        new ModelRegistry(models),
+      );
+      const schema = runner.getToolDefinition("workgraph_checkout")?.parameters;
+      if (schema === undefined) throw new Error("workgraph_checkout was not registered.");
+      const id = "a".repeat(64);
+      const head = "b".repeat(40);
+      if (!Value.Check(schema, {}) || !Value.Check(schema, { cwd: "." }))
+        throw new Error("checkout allocation schema rejected a compact allocation.");
+      if (!Value.Check(schema, { finish: { checkoutId: id, expectedHead: head } }))
+        throw new Error("checkout finish schema rejected a complete nested finish.");
+      if (
+        Value.Check(schema, { checkoutId: id, expectedHead: head }) ||
+        Value.Check(schema, { finish: { checkoutId: id } }) ||
+        Value.Check(schema, { finish: { checkoutId: id, expectedHead: head, extra: true } })
+      ) throw new Error("checkout schema accepted a partial or undeclared finish form.");
     `,
   ]);
 

@@ -64,13 +64,10 @@ export async function finishCheckout(input: {
   if (input.checkoutId !== resolved.identity.checkoutId)
     throw new Error("Coordinator checkout ID does not match this session and repository.");
 
-  if (input.store.checkoutCleanupBlocked(resolved.identity.managedPath))
-    throw new Error(
-      "Coordinator checkout has queued, active, or unresolved Candidate custody dependencies.",
-    );
-
   await Effect.runPromise(
-    cleanupCoordinatorCheckout(resolved.identity, resolved.sourcePath, input.expectedHead),
+    cleanupCoordinatorCheckout(resolved.identity, resolved.sourcePath, input.expectedHead, () =>
+      input.store.checkoutCleanupBlocked(resolved.identity.managedPath),
+    ),
   );
 
   return { checkoutId: resolved.identity.checkoutId, finished: true };

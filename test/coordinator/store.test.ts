@@ -120,6 +120,34 @@ void test("checkout cleanup blocks only targeted activity and unresolved Candida
   }
 });
 
+void test("checkout directory containment is literal, case-sensitive, and path-bounded", () => {
+  const cases = [
+    ["/tmp/managed", "/tmp/managed/inside", true],
+    ["/tmp/manage_", "/tmp/managed/inside", false],
+    ["/tmp/manage%", "/tmp/managed/inside", false],
+    ["/tmp/Managed", "/tmp/managed/inside", false],
+    ["/tmp/managed", "/tmp/managed-other/inside", false],
+  ] as const;
+
+  for (const [checkoutPath, targetPath, expected] of cases) {
+    const { root, cleanup } = fixture();
+
+    try {
+      const store = new RecordStore(root, "session-a");
+      store.createTaskWithAttempt(
+        "targeted",
+        { ...directoryTask, target: { kind: "directory", path: targetPath } },
+        "targeted-attempt",
+        directorySpec,
+      );
+      assert.equal(store.checkoutCleanupBlocked(checkoutPath), expected);
+      store.close();
+    } finally {
+      cleanup();
+    }
+  }
+});
+
 void test("version-one databases remain usable with an unused checkout table", () => {
   const { root, cleanup } = fixture();
 

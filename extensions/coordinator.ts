@@ -172,28 +172,23 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     name: "workgraph_checkout",
     label: "Workgraph Checkout",
     description: "Allocate/reuse or finish this session's deterministic branch-backed checkout.",
-    parameters: Type.Union([
-      Type.Object(
-        {
-          cwd: Type.Optional(
-            nonBlank("Repository checkout to allocate from; defaults to the session cwd."),
+    parameters: Type.Object(
+      {
+        cwd: Type.Optional(
+          nonBlank("Repository checkout to allocate from or identify; defaults to session cwd."),
+        ),
+        finish: Type.Optional(
+          Type.Object(
+            {
+              checkoutId: nonBlank("Exact deterministic Coordinator checkout ID."),
+              expectedHead: CommitSchema,
+            },
+            { additionalProperties: false },
           ),
-        },
-        { additionalProperties: false },
-      ),
-      Type.Object(
-        {
-          cwd: Type.Optional(
-            nonBlank(
-              "Repository checkout that identifies the owned checkout; defaults to session cwd.",
-            ),
-          ),
-          checkoutId: nonBlank("Exact deterministic Coordinator checkout ID."),
-          expectedHead: CommitSchema,
-        },
-        { additionalProperties: false },
-      ),
-    ]),
+        ),
+      },
+      { additionalProperties: false },
+    ),
     execute(_id, params, _signal, _update, ctx) {
       return serialize(async () => {
         const common = {
@@ -204,14 +199,14 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
         };
 
         return result(
-          "checkoutId" in params
-            ? await finishCheckout({
+          params.finish === undefined
+            ? await createCheckout(common)
+            : await finishCheckout({
                 ...common,
-                checkoutId: params.checkoutId,
-                expectedHead: params.expectedHead,
+                checkoutId: params.finish.checkoutId,
+                expectedHead: params.finish.expectedHead,
                 store: runtime().store,
-              })
-            : await createCheckout(common),
+              }),
         );
       });
     },
