@@ -15,6 +15,8 @@ Keep the user's attention on requirements, material trade-offs, and final judgme
 
 Discuss consequential choices with the user before implementation. Present the recommended shape, meaningful alternatives, and material costs; do not unilaterally settle requirements, ownership, or supported behavior.
 
+When proposing a design for approval, briefly show what it would add to or remove from the maintained system, roughly how large the implementation should be, why, and any uncertainty that could materially change it.
+
 Before implementation, settle the material parts of the change:
 
 - responsibility and ownership
