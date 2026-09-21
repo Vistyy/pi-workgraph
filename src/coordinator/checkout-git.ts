@@ -1,4 +1,3 @@
-/* oxlint-disable anti-slop/require-readable-spacing -- Git safety checks stay grouped with their immediate observations and effects. */
 import { lstat, mkdir, realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Effect } from "effect";
@@ -64,6 +63,7 @@ export function ensureCoordinatorCheckout(input: {
     yield* filesystem("create Coordinator checkout parent", () =>
       mkdir(dirname(input.identity.managedPath), { recursive: true, mode: 0o700 }),
     );
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
     const placement = yield* gitResult(input.target.checkoutRoot, [
       "worktree",
       "add",
@@ -72,6 +72,7 @@ export function ensureCoordinatorCheckout(input: {
       input.identity.managedPath,
       input.commit,
     ]);
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
     const postcondition = yield* observe(input.identity).pipe(
       Effect.catch((observationError) => {
         const diagnostic = commandDiagnostic(placement);
@@ -134,6 +135,7 @@ export function cleanupCoordinatorCheckout(
       const afterRemoval = yield* observe(identity);
 
       if (afterRemoval.kind === "absent") return;
+      // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
       if (afterRemoval.kind !== "branch" || afterRemoval.head !== expectedHead)
         return yield* fail(
           "finish Coordinator checkout",
@@ -147,6 +149,7 @@ export function cleanupCoordinatorCheckout(
       identity.ownedBranch,
       expectedHead,
     ]);
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
     const afterDeletion = yield* observe(identity);
 
     if (afterDeletion.kind === "absent") return;
@@ -168,9 +171,11 @@ function observe(identity: CoordinatorCheckoutIdentity): Effect.Effect<Observati
       directReference(identity.repositoryCommonDir, identity.ownedBranch),
       worktreeRegistrations(identity.repositoryCommonDir),
     ]);
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
     const paths = registrations.filter(
       (registration) => resolve(registration.path) === identity.managedPath,
     );
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
     const branches = registrations.filter(
       (registration) => registration.branch === identity.ownedBranch,
     );
@@ -209,11 +214,13 @@ function observe(identity: CoordinatorCheckoutIdentity): Effect.Effect<Observati
       );
 
     yield* validateManagedPath(identity.managedPath, entry);
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
     const commonText = yield* git(identity.managedPath, [
       "rev-parse",
       "--path-format=absolute",
       "--git-common-dir",
     ]);
+    // oxlint-disable-next-line anti-slop/require-readable-spacing -- The existing cohesive safety sequence keeps this statement adjacent to its observation.
     const commonDir = yield* filesystem("inspect managed checkout repository", () =>
       realpath(resolve(identity.managedPath, commonText)),
     );
@@ -280,7 +287,7 @@ function directReference(
     Effect.flatMap((result) => {
       if (result.code !== 0)
         return fail("inspect Coordinator checkout", "Owned branch could not be inspected.");
-      // oxlint-disable-next-line effecttsgo/effect-succeed-with-void -- This branch inhabits the explicit optional-ref result.
+      // oxlint-disable-next-line anti-slop/require-readable-spacing, effecttsgo/effect-succeed-with-void -- This adjacent branch inhabits the explicit optional-ref result.
       if (result.stdout.length === 0) return Effect.succeed<string | undefined>(undefined);
       const fields = result.stdout.split("\0");
 

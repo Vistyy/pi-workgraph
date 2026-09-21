@@ -52,60 +52,70 @@ try {
       const [coordinator, worker] = ${JSON.stringify(modules)};
       const agentDir = ${JSON.stringify(join(parent, "agent"))};
       process.env.PI_CODING_AGENT_DIR = agentDir;
-      const load = async (path, role) => {
-        if (role === null) delete process.env.PI_WORKGRAPH_ROLE;
-        else process.env.PI_WORKGRAPH_ROLE = role;
+      const withRole = async (role, run) => {
+        const previous = process.env.PI_WORKGRAPH_ROLE;
+        try {
+          if (role === null) delete process.env.PI_WORKGRAPH_ROLE;
+          else process.env.PI_WORKGRAPH_ROLE = role;
+          return await run();
+        } finally {
+          if (previous === undefined) delete process.env.PI_WORKGRAPH_ROLE;
+          else process.env.PI_WORKGRAPH_ROLE = previous;
+        }
+      };
+      const load = (path, role) => withRole(role, async () => {
         const result = await discoverAndLoadExtensions([path], process.cwd(), agentDir);
         if (result.errors.length > 0)
           throw new Error(path + " failed to load: " + JSON.stringify(result.errors));
         if (!result.extensions.some((extension) => extension.resolvedPath === path))
           throw new Error(path + " factory was not loaded.");
-      };
+      });
       await load(coordinator, null);
       await load(worker, "research");
 
-      delete process.env.PI_WORKGRAPH_ROLE;
-      const resources = new DefaultResourceLoader({
-        cwd: process.cwd(),
-        agentDir,
-        additionalExtensionPaths: [coordinator],
-        noSkills: true,
-        noPromptTemplates: true,
-        noThemes: true,
-        noContextFiles: true,
+      await withRole(null, async () => {
+        const resources = new DefaultResourceLoader({
+          cwd: process.cwd(),
+          agentDir,
+          additionalExtensionPaths: [coordinator],
+          noSkills: true,
+          noPromptTemplates: true,
+          noThemes: true,
+          noContextFiles: true,
+        });
+        await resources.reload();
+        const loaded = resources.getExtensions();
+        if (loaded.errors.length > 0)
+          throw new Error("coordinator registration failed: " + JSON.stringify(loaded.errors));
+        const models = await ModelRuntime.create({
+          authPath: ${JSON.stringify(join(parent, "auth.json"))},
+          modelsPath: null,
+          modelsStorePath: ${JSON.stringify(join(parent, "catalog.json"))},
+          refreshOnCreate: false,
+          allowModelNetwork: false,
+        });
+        const session = SessionManager.create(process.cwd(), ${JSON.stringify(join(parent, "sessions"))});
+        const runner = new ExtensionRunner(
+          loaded.extensions,
+          loaded.runtime,
+          process.cwd(),
+          session,
+          new ModelRegistry(models),
+        );
+        const schema = runner.getToolDefinition("workgraph_checkout")?.parameters;
+        if (schema === undefined) throw new Error("workgraph_checkout was not registered.");
+        const id = "a".repeat(64);
+        const head = "b".repeat(40);
+        if (!Value.Check(schema, {}) || !Value.Check(schema, { cwd: "." }))
+          throw new Error("checkout allocation schema rejected a compact allocation.");
+        if (!Value.Check(schema, { finish: { checkoutId: id, expectedHead: head } }))
+          throw new Error("checkout finish schema rejected a complete nested finish.");
+        if (
+          Value.Check(schema, { checkoutId: id, expectedHead: head }) ||
+          Value.Check(schema, { finish: { checkoutId: id } }) ||
+          Value.Check(schema, { finish: { checkoutId: id, expectedHead: head, extra: true } })
+        ) throw new Error("checkout schema accepted a partial or undeclared finish form.");
       });
-      await resources.reload();
-      const loaded = resources.getExtensions();
-      if (loaded.errors.length > 0)
-        throw new Error("coordinator registration failed: " + JSON.stringify(loaded.errors));
-      const models = await ModelRuntime.create({
-        authPath: ${JSON.stringify(join(parent, "auth.json"))},
-        modelsPath: null,
-        modelsStorePath: ${JSON.stringify(join(parent, "catalog.json"))},
-        refreshOnCreate: false,
-        allowModelNetwork: false,
-      });
-      const session = SessionManager.create(process.cwd(), ${JSON.stringify(join(parent, "sessions"))});
-      const runner = new ExtensionRunner(
-        loaded.extensions,
-        loaded.runtime,
-        process.cwd(),
-        session,
-        new ModelRegistry(models),
-      );
-      const schema = runner.getToolDefinition("workgraph_checkout")?.parameters;
-      if (schema === undefined) throw new Error("workgraph_checkout was not registered.");
-      const id = "a".repeat(64);
-      const head = "b".repeat(40);
-      if (!Value.Check(schema, {}) || !Value.Check(schema, { cwd: "." }))
-        throw new Error("checkout allocation schema rejected a compact allocation.");
-      if (!Value.Check(schema, { finish: { checkoutId: id, expectedHead: head } }))
-        throw new Error("checkout finish schema rejected a complete nested finish.");
-      if (
-        Value.Check(schema, { checkoutId: id, expectedHead: head }) ||
-        Value.Check(schema, { finish: { checkoutId: id } }) ||
-        Value.Check(schema, { finish: { checkoutId: id, expectedHead: head, extra: true } })
-      ) throw new Error("checkout schema accepted a partial or undeclared finish form.");
     `,
   ]);
 

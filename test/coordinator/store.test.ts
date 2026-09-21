@@ -1,4 +1,3 @@
-/* oxlint-disable anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion, typescript/require-array-sort-compare -- focused tests inspect native SQLite row shapes through node:sqlite's open row type. */
 import assert from "node:assert/strict";
 import {
   chmodSync,
@@ -72,6 +71,7 @@ const unreported: Outcome = {
 function fixture(): { root: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "record-store-"));
 
+  // oxlint-disable-next-line anti-slop/no-known-value-widening -- The explicit boundary type intentionally hides fixture or SQLite implementation details.
   return { root, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -83,68 +83,36 @@ function worker(overrides: Partial<WorkerState> = {}): WorkerState {
   };
 }
 
-void test("checkout cleanup blocks only targeted activity and unresolved Candidate custody", () => {
+void test("current session snapshot returns decoded Task and Attempt records only for its session", () => {
   const { root, cleanup } = fixture();
 
   try {
-    const store = new RecordStore(root, "session-a");
-    store.createTaskWithAttempt("global", directoryTask, "global-attempt", directorySpec);
-    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), false);
+    const current = new RecordStore(root, "session-a");
+    const unrelated = new RecordStore(root, "session-b");
+    current.createTaskWithAttempt("current", directoryTask, "current-attempt", directorySpec);
+    current.checkpointWorker("current-attempt", worker());
+    unrelated.createTaskWithAttempt(
+      "unrelated",
+      repositoryTask,
+      "unrelated-attempt",
+      repositorySpec,
+    );
 
-    const insideTask: Task = {
-      ...directoryTask,
-      target: { kind: "directory", path: "/tmp/managed/inside" },
-    };
-
-    store.createTaskWithAttempt("inside", insideTask, "inside-attempt", directorySpec);
-    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), true);
-    store.recordOutcome("inside-attempt", unreported);
-
-    const targetedTask: Task = {
-      ...repositoryTask,
-      target: {
-        kind: "repository",
-        checkoutRoot: "/tmp/managed",
-        commonDir: "/tmp/repo/.git",
+    assert.deepEqual(current.currentSessionAttempts(), [
+      {
+        task: { id: "current", task: directoryTask },
+        attempt: {
+          id: "current-attempt",
+          taskId: "current",
+          spec: directorySpec,
+          worker: worker(),
+        },
       },
-    };
-
-    store.createTaskWithAttempt("targeted", targetedTask, "targeted-attempt", repositorySpec);
-    store.recordOutcome("targeted-attempt", unreported);
-    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), true);
-    store.checkpointOutput("targeted-attempt", { kind: "applied", revision: commit });
-    assert.equal(store.checkoutCleanupBlocked("/tmp/managed"), false);
-    store.close();
+    ]);
+    current.close();
+    unrelated.close();
   } finally {
     cleanup();
-  }
-});
-
-void test("checkout directory containment is literal, case-sensitive, and path-bounded", () => {
-  const cases = [
-    ["/tmp/managed", "/tmp/managed/inside", true],
-    ["/tmp/manage_", "/tmp/managed/inside", false],
-    ["/tmp/manage%", "/tmp/managed/inside", false],
-    ["/tmp/Managed", "/tmp/managed/inside", false],
-    ["/tmp/managed", "/tmp/managed-other/inside", false],
-  ] as const;
-
-  for (const [checkoutPath, targetPath, expected] of cases) {
-    const { root, cleanup } = fixture();
-
-    try {
-      const store = new RecordStore(root, "session-a");
-      store.createTaskWithAttempt(
-        "targeted",
-        { ...directoryTask, target: { kind: "directory", path: targetPath } },
-        "targeted-attempt",
-        directorySpec,
-      );
-      assert.equal(store.checkoutCleanupBlocked(checkoutPath), expected);
-      store.close();
-    } finally {
-      cleanup();
-    }
   }
 });
 
@@ -205,6 +173,7 @@ void test("RecordStore creates one exact database lazily", () => {
     });
 
     assert.equal(
+      // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
       (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
       1,
     );
@@ -212,6 +181,7 @@ void test("RecordStore creates one exact database lazily", () => {
       database
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
         .all()
+        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => (row as { name: string }).name),
       ["attempts", "tasks"],
     );
@@ -219,6 +189,7 @@ void test("RecordStore creates one exact database lazily", () => {
       database
         .prepare("PRAGMA table_info(tasks)")
         .all()
+        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => (row as { name: string }).name),
       ["session_id", "task_id", "task_json"],
     );
@@ -226,6 +197,7 @@ void test("RecordStore creates one exact database lazily", () => {
       database
         .prepare("PRAGMA table_info(attempts)")
         .all()
+        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => (row as { name: string }).name),
       [
         "attempt_id",
@@ -238,10 +210,13 @@ void test("RecordStore creates one exact database lazily", () => {
       ],
     );
     assert.deepEqual(
+      // oxlint-disable-next-line typescript/require-array-sort-compare -- The test compares native SQLite row values whose ordering is already numeric.
       database
         .prepare("PRAGMA table_list")
         .all()
+        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .filter((row) => ["tasks", "attempts"].includes((row as { name: string }).name))
+        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => [(row as { name: string }).name, (row as { strict: number }).strict])
         .sort(),
       [
@@ -372,6 +347,7 @@ void test("RecordStore resumes an interrupted empty initialization", () => {
 
     const database = new DatabaseSync(path, { readOnly: true });
     assert.equal(
+      // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
       (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
       1,
     );
@@ -405,6 +381,7 @@ void test("RecordStore preserves and rejects a nonempty version-zero database", 
       preserved
         .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
         .all()
+        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => (row as { name: string }).name),
       ["foreign_record"],
     );

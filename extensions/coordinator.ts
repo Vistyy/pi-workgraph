@@ -1,4 +1,3 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/process-env, anti-slop/no-conditional-empty-object-spread -- Pi callbacks are Promise boundaries; registered TypeBox schemas validate values before these typed callbacks. */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
@@ -113,6 +112,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     return attached;
   };
 
+  // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
   const close = async (): Promise<void> => {
     attached = undefined;
 
@@ -136,6 +136,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     event.systemPromptOptions.sections[COORDINATOR_SECTION] = coordinatorContract;
   });
   pi.on("session_start", (_event, ctx) =>
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     serialize(async () => {
       if (deliverySettingsWarning !== undefined)
         ctx.ui.notify(`Workgraph delivery tools unchanged: ${deliverySettingsWarning}`, "warning");
@@ -149,8 +150,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
             store,
             agentDir,
             // biome-ignore lint/complexity/useLiteralKeys: ProcessEnv keys require indexed access under noPropertyAccessFromIndexSignature.
-            workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "",
+            workspaceId: process.env["HERDR_WORKSPACE_ID"] ?? "", // oxlint-disable-line effecttsgo/process-env -- This owned host boundary reads Coordinator workspace identity.
             pi,
+            // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
             ...(options.herdr === undefined ? {} : { herdr: options.herdr }),
             setActiveWorkers: (count) => calm.setActiveWorkers(count),
           }).pipe(Scope.provide(nextScope)),
@@ -190,11 +192,13 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     execute(_id, params, _signal, _update, ctx) {
+      // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
       return serialize(async () => {
         const common = {
           agentDir: runtime().agentDir,
           sessionId: ctx.sessionManager.getSessionId(),
           cwd: ctx.cwd,
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.cwd === undefined ? {} : { path: params.cwd }),
         };
 
@@ -226,19 +230,24 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) => {
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "directory",
         contract: {
           kind: "research",
           question: params.question,
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.context === undefined ? {} : { context: params.context }),
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.expectedEvidence === undefined
             ? {}
             : { expectedEvidence: params.expectedEvidence }),
         },
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.selection === undefined ? {} : { selection: params.selection }),
       });
     },
@@ -266,21 +275,26 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) =>
       createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "repository",
         contract: {
           kind: "experiment",
           question: params.question,
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.context === undefined ? {} : { context: params.context }),
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.expectedEvidence === undefined
             ? {}
             : { expectedEvidence: params.expectedEvidence }),
           permittedEffects: params.permittedEffects,
           stopCondition: params.stopCondition,
         },
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.selection === undefined ? {} : { selection: params.selection }),
       }),
     serialize,
@@ -298,6 +312,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) => {
       const policy = await loadModelPolicy(policyPath);
 
@@ -308,6 +323,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "directory",
         contract,
@@ -342,6 +358,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) => {
       if (params.candidateOf?.mode === "extend" && params.baseRevision !== undefined)
         throw new Error("Candidate extension forbids baseRevision.");
@@ -350,6 +367,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
 
       return createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "repository",
         contract: {
@@ -362,7 +380,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
           guide: selected.guide,
           executor: selected.executor,
         },
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.candidateOf === undefined ? {} : { candidateOf: params.candidateOf }),
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.baseRevision === undefined ? {} : { baseRevision: params.baseRevision }),
       });
     },
@@ -384,16 +404,20 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       },
       { additionalProperties: false },
     ),
+    // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
     async (params, ctx) =>
       createTask(runtime(), ctx, policyPath, {
         id: params.id,
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.cwd === undefined ? {} : { cwd: params.cwd }),
         targetKind: "directory",
         contract: {
           kind: "review",
           request: params.request,
+          // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
           ...(params.context === undefined ? {} : { context: params.context }),
         },
+        // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
         ...(params.selection === undefined ? {} : { selection: params.selection }),
       }),
     serialize,
@@ -418,6 +442,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       { additionalProperties: false },
     ),
     execute(_id, params) {
+      // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
       return serialize(async () => {
         const current = runtime();
         const attempt = await createAttempt(current, policyPath, params);
@@ -492,6 +517,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       ),
     ]),
     execute(_id, params) {
+      // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
       return serialize(async () => result(inspect(runtime(), params)));
     },
   });
@@ -542,6 +568,7 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
       ),
     ]),
     execute(_id, params) {
+      // oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
       return serialize(async () => {
         const current = runtime();
 
@@ -595,6 +622,7 @@ type CreateTaskInput = {
   readonly baseRevision?: string;
 };
 
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 async function createTask(
   runtime: SessionRuntime,
   ctx: ExtensionContext,
@@ -609,8 +637,10 @@ async function createTask(
   const resolved = await Effect.runPromise(
     resolveTaskTarget({
       cwd: ctx.cwd,
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(input.cwd === undefined ? {} : { path: input.cwd }),
       kind: input.targetKind,
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(input.targetKind === "repository" && revision !== undefined ? { revision } : {}),
     }),
   );
@@ -626,7 +656,9 @@ async function createTask(
       target: resolved.target,
       contract: input.contract,
       selection: first,
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(input.candidateOf === undefined ? {} : { candidateOf: input.candidateOf }),
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...("commit" in resolved && input.candidateOf?.mode !== "extend"
         ? { baseCommit: resolved.commit }
         : {}),
@@ -642,6 +674,7 @@ async function createTask(
           runtime.createAttempt({
             taskId: input.id,
             selection,
+            // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
             ...("commit" in resolved ? { baseCommit: resolved.commit } : {}),
           }),
         ),
@@ -660,6 +693,7 @@ async function createTask(
   };
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 async function selectionsFor(
   input: CreateTaskInput,
   policyPath: string,
@@ -674,6 +708,7 @@ async function selectionsFor(
   }));
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 async function createAttempt(
   runtime: SessionRuntime,
   policyPath: string,
@@ -704,7 +739,9 @@ async function createAttempt(
     runtime.createAttempt({
       taskId: params.taskId,
       selection,
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(params.candidateOf === undefined ? {} : { candidateOf: params.candidateOf }),
+      // oxlint-disable-next-line anti-slop/no-conditional-empty-object-spread -- The public input shape must omit this optional property when absent.
       ...(baseCommit === undefined ? {} : { baseCommit }),
     }),
   );
@@ -732,6 +769,7 @@ function selectionForAttempt(
   return { kind: "target", target: { ...policy.roles[role][0] } };
 }
 
+// oxlint-disable-next-line effecttsgo/async-function -- Pi host callbacks and existing native Promise seams require this async boundary.
 async function baseForAttempt(
   task: Task,
   candidateOf?: CandidateRequest,

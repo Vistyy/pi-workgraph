@@ -1,4 +1,3 @@
-/* oxlint-disable effecttsgo/global-date, anti-slop/no-object-parameters, typescript/no-unsafe-member-access -- Flow tests inspect deterministic native transport logs and real Pi session files. */
 import assert from "node:assert/strict";
 import {
   chmodSync,
@@ -63,6 +62,7 @@ function temporary(): string {
   return mkdtempSync(join(tmpdir(), "session-runtime-"));
 }
 
+// oxlint-disable-next-line anti-slop/no-object-parameters -- The test helper deliberately accepts arbitrary serializable event detail.
 function fixture(root: string, initial: object = {}) {
   const executable = join(root, "herdr.mjs");
   const statePath = join(root, "native.json");
@@ -165,6 +165,7 @@ function appendSettledReport(
       },
     },
     isError: false,
+    // oxlint-disable-next-line effecttsgo/global-date -- This deterministic flow test observes native wall-clock progress.
     timestamp: Date.now(),
   });
   manager.appendCustomEntry("pi-workgraph-agent-settled", {});
@@ -214,6 +215,7 @@ void test("staged launch persists original workspace and shutdown never closes t
       commands(native.log).filter((entry) => entry[0] === "tab" && entry[1] === "close").length,
       0,
     );
+    // oxlint-disable-next-line typescript/no-unsafe-member-access -- This flow test inspects a schema-controlled native fixture record.
     assert.equal(JSON.parse(readFileSync(native.statePath, "utf8")).present, true);
   } finally {
     rmSync(root, { recursive: true, force: true });
