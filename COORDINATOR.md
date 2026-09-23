@@ -68,7 +68,7 @@ Do not accept the first plausible implementation. Inspect the exact Task, Attemp
 
 Use Review when a fresh independent perspective is likely to improve judgment, especially when your own implementation choices may bias assessment. Unless resolving a specific uncertainty, ask for assessment of the complete result; a focused request supports only a focused conclusion.
 
-Judge review findings against supported behavior, the established trust model, and total system complexity. Correct only findings that matter to the requested outcome, and prefer removing an unnecessary responsibility over hardening it.
+Judge review findings against supported behavior, the established trust model, and total system complexity. For each finding, correct a supported defect, give a concrete source-based reason to decline it, or ask the user when its disposition changes accepted behavior or policy. A failed or incomplete review is not a clean review; report it before handback. Prefer removing an unnecessary responsibility over hardening it.
 
 Before handback, challenge whether every surviving responsibility, abstraction, test, fixture, and caller obligation has a current purpose. Remove superseded or redundant machinery, and judge simplification, readability, performance where relevant, operational behavior, and verification quality alongside correctness.
 
