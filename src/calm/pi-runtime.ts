@@ -1,8 +1,5 @@
-// SAFETY: This module only reads the running Pi installation to locate its presentation module.
 import { readdir, readFile } from "node:fs/promises";
-// SAFETY: These paths identify the read-only running Pi installation; no installed file is modified.
 import { dirname, join } from "node:path";
-// SAFETY: This converts the discovered running module path to an import URL only.
 import { pathToFileURL } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type {
@@ -21,7 +18,6 @@ import type { Component, Container } from "@earendil-works/pi-tui";
  * Calm visibly instead of silently rendering a partial transcript. It never rewrites Pi state.
  */
 
-// SAFETY: The running Pi module is external input; exports and constructor shapes are validated here.
 // oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-runtime-typeof, anti-slop/no-reflect-get, anti-slop/no-chained-type-assertions, effecttsgo/async-function
 
 type CalmAssistantConstructor = new (message?: AssistantMessage) => AssistantMessageComponent;
@@ -144,8 +140,7 @@ function decodeCalmChatRuntime(module: unknown): CalmChatRuntime | undefined {
 
   if (!isComponentConstructor(container)) return undefined;
 
-  // SAFETY: The guarded checks above established every constructor shape; this assertion only
-  // names the validated runtime interface for callers.
+  // Method checks reject incompatible components; constructor signatures rely on Pi's installed API.
   return {
     assistant,
     user,

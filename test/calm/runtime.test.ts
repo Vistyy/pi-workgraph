@@ -179,7 +179,6 @@ const installedRuntimeTest = (name: string, body: () => Promise<void>): void =>
     body,
   );
 
-// SAFETY: Pi stores this presentation state as a live instance field; this probe only reads it.
 const streamingOf = (component: AssistantMessageComponent): boolean =>
   Object.getOwnPropertyDescriptor(component, "isStreaming")?.value === true;
 
@@ -192,10 +191,8 @@ installedRuntimeTest(
     assert.notEqual(runtime.assistant, publicPi.AssistantMessageComponent);
 
     const stubUi = { requestRender: () => {} };
-    // SAFETY: The runtime decoder validated these exact live constructors.
     // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- Runtime classes need constructor signatures for this flow.
     const ToolExecution = runtime.toolExecution as unknown as ToolExecutionCtor;
-    // SAFETY: The runtime decoder validated these exact live constructors.
     // oxlint-disable-next-line anti-slop/no-chained-type-assertions -- Runtime classes need constructor signatures for this flow.
     const CustomMessage = runtime.customMessage as unknown as CustomMessageCtor;
     const chat = new runtime.container();
@@ -277,7 +274,6 @@ installedRuntimeTest(
     if (entrypoint === undefined) return;
     const runtime = await loadCalmChatRuntime(entrypoint);
 
-    // SAFETY: This is the bundle module already validated by the runtime loader.
     const bundle = (await import(pathToFileURL(join(dirname(entrypoint), "index.js")).href)) as {
       readonly BashExecutionComponent: BashExecutionCtor;
     };

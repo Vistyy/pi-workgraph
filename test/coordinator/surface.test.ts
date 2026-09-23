@@ -428,7 +428,6 @@ void test("Review accepts a live dirty directory without Attempt provenance or r
       context: "Prioritize actionable correctness findings.",
     });
 
-    // SAFETY: The registered Review tool returns the bounded creation receipt.
     const receipt = created.details as { attempts: { attemptId: string }[] };
     const attemptId = receipt.attempts[0]?.attemptId;
     assert.ok(attemptId !== undefined);
@@ -437,7 +436,6 @@ void test("Review accepts a live dirty directory without Attempt provenance or r
 
     for (let index = 0; index < 100 && sessionFile === undefined; index += 1) {
       const inspected = await f.call("workgraph_inspect", { section: "attempt", id: attemptId });
-      // SAFETY: Exact Attempt inspection exposes its nullable decoded Worker state.
       sessionFile = (inspected.details as { worker: null | { sessionFile: string } }).worker
         ?.sessionFile;
 
@@ -454,7 +452,6 @@ void test("Review accepts a live dirty directory without Attempt provenance or r
 
     assert.ok(objective?.type === "custom_message");
     assert.equal(Array.isArray(objective.content), false);
-    // SAFETY: The objective's non-array custom-message content is text under Pi's content union.
     const content = objective.content as string;
 
     assert.match(content, /resolved starting context/);
@@ -561,7 +558,6 @@ void test("registered extension starts candidate extension from the exact retain
       /Private output ref is absent or was repointed/,
     );
     const afterRejection = await f.call("workgraph_inspect", { section: "overview" });
-    // SAFETY: The registered inspect tool owns this successful overview detail shape.
     assert.deepEqual(
       (afterRejection.details as { counts: { tasks: number; attempts: number } }).counts,
       { tasks: 1, attempts: 1, activeWorkers: 0 },
@@ -576,7 +572,6 @@ void test("registered extension starts candidate extension from the exact retain
       candidateOf: { attemptId: sourceAttemptId, mode: "extend" },
     });
 
-    // SAFETY: The registered implementation tool returns this bounded creation receipt.
     const receipt = created.details as {
       attempts: { attemptId: string }[];
     };
@@ -589,7 +584,6 @@ void test("registered extension starts candidate extension from the exact retain
       id: successorId,
     });
 
-    // SAFETY: Exact Attempt inspection returns the strictly decoded persisted specification.
     const successor = (inspected.details as { spec: AttemptSpec }).spec;
     assert.deepEqual(successor.base, { kind: "repository", baseCommit: sourceTip });
     assert.deepEqual(successor.lineage, {
@@ -681,7 +675,6 @@ void test("registered task adapters persist their requested contracts", async ()
     for (const entry of cases) {
       const created = await f.call(entry.tool, entry.params);
 
-      // SAFETY: Task creation receipts expose each exact immutable Attempt specification.
       const selections = (created.details as { attempts: { spec: AttemptSpec }[] }).attempts.map(
         ({ spec }) => spec.selection,
       );
@@ -689,7 +682,6 @@ void test("registered task adapters persist their requested contracts", async ()
       assert.deepEqual(selections, entry.selections);
 
       const inspected = await f.call("workgraph_inspect", { section: "task", id: entry.id });
-      // SAFETY: Exact Task inspection returns the strictly decoded persisted Task record.
       assert.deepEqual((inspected.details as { task: Task }).task.contract, entry.contract);
     }
 
@@ -701,7 +693,6 @@ void test("registered task adapters persist their requested contracts", async ()
       acceptance: ["The change is committed"],
     });
 
-    // SAFETY: Implementation creation returns its persisted target and Attempt identifiers.
     const implementationReceipt = implementation.details as {
       task: { target: { checkoutRoot: string } };
       attempts: { attemptId: string }[];
@@ -716,7 +707,6 @@ void test("registered task adapters persist their requested contracts", async ()
       id: implementationAttemptId,
     });
 
-    // SAFETY: Exact Attempt inspection returns the strictly decoded frozen base.
     assert.deepEqual((implementationAttempt.details as { spec: AttemptSpec }).spec.base, {
       kind: "repository",
       baseCommit: base,
@@ -732,7 +722,6 @@ void test("registered task adapters persist their requested contracts", async ()
     );
 
     const repeated = await f.call("workgraph_attempt", { taskId: "advice" });
-    // SAFETY: Another-Attempt receipts identify the immutable source Task and selection.
     const repeatedReceipt = repeated.details as { taskId: string; spec: AttemptSpec };
     assert.equal(repeatedReceipt.taskId, "advice");
     assert.deepEqual(repeatedReceipt.spec.selection, cases[1].selections[0]);
@@ -751,7 +740,6 @@ void test("without exact Herdr launch identity inspection remains usable and cre
     try {
       await f.runner.emit({ type: "session_start", reason: "startup" });
       const overview = await f.call("workgraph_inspect", { section: "overview" });
-      // SAFETY: Overview inspection returns the RecordStore count projection.
       assert.deepEqual((overview.details as { counts: object }).counts, {
         tasks: 0,
         attempts: 0,

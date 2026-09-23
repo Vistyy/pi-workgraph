@@ -199,7 +199,7 @@ export function installCalmMode(
     }
 
     if (timer !== undefined) return;
-    // SAFETY: This timer only advances the rail pulse and is cleared by stopTimer and shutdown.
+    // stopTimer also clears this pulse on shutdown.
     // oxlint-disable-next-line effecttsgo/global-timers
     timer = setInterval(() => {
       frame += 1;

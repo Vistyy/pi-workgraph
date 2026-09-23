@@ -1,8 +1,7 @@
 import type { ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 
-// SAFETY: Pi exposes tool arguments as an untyped runtime value. This module deliberately accepts
-// unknown and applies a fail-closed structural guard before reading the one allowlisted property.
+// Pi exposes tool arguments as untyped values; this module guards the only field it reads.
 // oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-runtime-typeof
 
 type CalmActivityPhase = "thinking" | "responding";
@@ -187,8 +186,7 @@ export function createCalmActivityTracker(onChange: () => void = () => {}): Calm
 }
 
 function validatedPathBasename(args: unknown): string | undefined {
-  // SAFETY: Pi tool arguments are untrusted. Accept only an own data property so malformed
-  // getters and proxies fail closed without exposing arbitrary fields.
+  // Read an own data property only; malformed getters and proxies fail closed.
   if (args === null || typeof args !== "object" || Array.isArray(args)) return undefined;
 
   try {

@@ -40,7 +40,6 @@ export default function workgraphWorker(pi: ExtensionAPI): void {
       return (await pi.setModel(model)) ? "selected" : "no_credentials";
     },
     setThinking(level) {
-      // SAFETY: The objective's thinking value passed TypeBox ModelTarget decoding.
       pi.setThinkingLevel(level as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
     },
   });

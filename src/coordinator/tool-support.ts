@@ -67,7 +67,7 @@ export function registerTask<S extends TSchema>(
     description: `Create one immutable ${label} Task with one or more selected initial Attempts.`,
     parameters,
     execute(_id, params, _signal, _update, ctx) {
-      // SAFETY: Pi decodes params against the exact registered TypeBox schema before execution.
+      // Pi decodes params against the registered TypeBox schema before execution.
       const decoded = params as Static<S>;
 
       return serialize(() => run(decoded, ctx).then(result));

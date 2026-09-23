@@ -142,13 +142,11 @@ export function fakePi() {
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This test adapter owns the deliberately partial host fixture boundary.
 function extensionApiFixture(value: unknown): ExtensionAPI {
-  // SAFETY: The fixture implements only the ExtensionAPI members Calm consumes at its guarded host boundary.
   return value as ExtensionAPI;
 }
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This test adapter owns the deliberately partial host fixture boundary.
 function extensionContextFixture(value: unknown): ExtensionContext {
-  // SAFETY: The fixture implements only the ExtensionContext members Calm consumes at its guarded host boundary.
   return value as ExtensionContext;
 }
 

@@ -204,7 +204,6 @@ void test("plan tool keeps one strict nonblank 1–9 item current snapshot", asy
       patch: { status: "done", note: "verified" },
     });
 
-    // SAFETY: The registered plan tool returned schema-validated snapshot details.
     assert.equal((update.details as { todos: typeof todo }).todos[0]?.status, "done");
     await assert.rejects(f.call("workgraph_plan", { action: "set", todos: setTodo }));
   } finally {
@@ -659,7 +658,6 @@ void test("actual models are recorded only at agent_start with actual thinking",
     assert.equal(markers.length, 1);
 
     if (markers[0]?.type === "custom") {
-      // SAFETY: The marker is emitted only from the typed agent_start observation.
       assert.equal((markers[0].data as { thinking: string }).thinking, "high");
     }
   } finally {

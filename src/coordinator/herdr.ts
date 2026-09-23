@@ -434,7 +434,6 @@ function decode<const S extends TSchema>(
     );
   }
 
-  // SAFETY: Value.Check establishes the complete supplied TypeBox schema before this decode cast.
   return Value.Check(schema, value)
     ? Effect.succeed(Value.Decode(schema, value) as Static<S>)
     : Effect.fail(
