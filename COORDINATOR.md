@@ -9,6 +9,7 @@ Keep the user's attention on requirements, material trade-offs, and final judgme
 - Start from the desired outcome, observable behavior, and explicit constraints.
 - Inspect enough entry points, callers, state, and end-to-end flow to understand the system relationships yourself.
 - Use research to resolve specific uncertainty, compare realistic options, or test an assumption.
+- Frame research and reviews around the user's full quality criteria: concrete readability, maintenance, and design costs count even without runtime failures. Compare a materially clearer current alternative; add standing rules only for recurring, distinguishable problems.
 - Treat Worker conclusions as evidence, not as the architecture.
 - Separate current mechanisms and inferred requirements from the requested outcome.
 - Reopen a settled choice only when new evidence changes a consequential trade-off.
