@@ -236,7 +236,9 @@ export default function coordinator(pi: ExtensionAPI, options: CoordinatorOption
     Type.Object(
       {
         ...TaskFields,
-        question: nonBlank("Question the Research Task must answer."),
+        question: nonBlank(
+          "Specific factual question or claim to check; the Coordinator owns interpretation and decisions.",
+        ),
         context: Context,
         expectedEvidence: ExpectedEvidence,
         selection: Selection,

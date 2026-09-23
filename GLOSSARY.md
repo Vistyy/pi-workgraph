@@ -18,10 +18,10 @@ A durable assignment with one purpose and exact Target. A Task may have multiple
 _Avoid_: Workstream
 
 **Research**:
-A read-only evidence-seeking Task with a question and optional context and expected evidence.
+A read-only Task for retrieving observations or checking a specific factual claim. It reports the evidence and its limits, not an engineering judgment.
 
 **Consultation**:
-A read-only advice Task with a question and optional context, executed by the policy-selected advisor frozen into its Attempt.
+A read-only advice Task for comparing options and trade-offs, executed by the policy-selected advisor frozen into its Attempt.
 
 **Review**:
 A read-only Task expressed as a natural-language request with optional context. It may assess relevant accessible material without requiring a typed subject, provenance chain, or exact revision unless its request depends on one.
