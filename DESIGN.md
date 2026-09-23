@@ -77,8 +77,8 @@ Effective models may be absent when execution never established one. They may di
 
 | Role | Authority and result |
 | --- | --- |
-| Research | Read-only evidence gathering. |
-| Consultation | Read-only advice from the policy-selected advisor. |
+| Research | Read-only retrieval or bounded factual checks, with sources and limits rather than engineering judgment. |
+| Consultation | Read-only option comparison and advice from the policy-selected advisor. |
 | Review | Read-only assessment of relevant accessible material; exact revision only when the request requires it. |
 | Experiment | Explicit effect kind, scope, lifetime, and hard cutoff in a detached repository worktree. Output is inspectable but never an applicable Candidate. |
 | Implementation | Repository change that may produce a Candidate. |

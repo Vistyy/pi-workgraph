@@ -103,14 +103,15 @@ Workgraph never integrates or publishes an accepted Coordinator checkout. At the
 
 | Task | Purpose | Effects and repository result |
 | --- | --- | --- |
-| Research | Answer an evidence-seeking question. | Read-only; no repository output. |
-| Consultation | Obtain decision-oriented advice from the configured advisor. | Read-only; no repository output. |
+| Research | Retrieve observations or check a specific factual claim, with sources and limits. | Read-only; no repository output. |
+| Consultation | Compare options and obtain decision-oriented advice from the configured advisor. | Read-only; no repository output. |
 | Review | Assess a natural-language request against relevant accessible material. | Read-only; no repository output. |
 | Experiment | Gather evidence through explicitly permitted effects before a hard cutoff. | Uses a detached worktree; commits may be retained for inspection but never become applicable Candidates. |
 | Implementation | Propose a repository change for Coordinator evaluation. | Uses a detached worktree; committed changes may become a Candidate. |
 
 For read-only Tasks:
 
+- Research reports factual findings rather than recommending a design; the Coordinator judges whether the evidence supports its hypothesis or decision;
 - `cwd` is placement and starting context—not evidence scope, provenance, subject, or authority;
 - Review may assess uncommitted, mutable, partial, conceptual, report, comparative, Attempt-related, or committed material; and
 - an exact revision is required only when the request depends on one.
