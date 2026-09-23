@@ -62,9 +62,9 @@ export const SelectionRequestSchema = Type.Object(
 
 export type SelectionRequest = Static<typeof SelectionRequestSchema>;
 
-export type ModelPolicyOperation = "read" | "parse" | "decode";
+type ModelPolicyOperation = "read" | "parse" | "decode";
 
-export class ModelPolicyError extends Data.TaggedError("ModelPolicyError")<{
+class ModelPolicyError extends Data.TaggedError("ModelPolicyError")<{
   readonly operation: ModelPolicyOperation;
   readonly path: string;
   readonly message: string;
@@ -77,7 +77,7 @@ export function modelPolicyPath(agentDir = getAgentDir()): string {
   return join(agentDir, "workgraph", "models.json");
 }
 
-export function loadModelPolicyEffect(
+function loadModelPolicyEffect(
   path = modelPolicyPath(),
 ): Effect.Effect<ModelPolicy, ModelPolicyError | PlatformError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
@@ -142,7 +142,6 @@ function decodeModelPolicy(value: unknown): ModelPolicy {
     throw new Error(`Invalid Workgraph model policy at ${location}: ${issue.message}.`);
   }
 
-  // SAFETY: strict schema validation establishes the complete shape; tuple casts are checked below as nonempty lists.
   const policy = Value.Decode(ModelPolicySchema, value) as ModelPolicy;
 
   for (const role of MODEL_LIST_ROLES) rejectDuplicateModels(role, policy.roles[role]);

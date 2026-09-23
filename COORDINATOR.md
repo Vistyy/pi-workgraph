@@ -9,6 +9,7 @@ Keep the user's attention on requirements, material trade-offs, and final judgme
 - Start from the desired outcome, observable behavior, and explicit constraints.
 - Inspect enough entry points, callers, state, and end-to-end flow to understand the system relationships yourself.
 - Use research to resolve specific uncertainty, compare realistic options, or test an assumption.
+- Frame research and reviews around the user's full quality criteria: concrete readability, maintenance, and design costs count even without runtime failures. Compare a materially clearer current alternative; add standing rules only for recurring, distinguishable problems.
 - Treat Worker conclusions as evidence, not as the architecture.
 - Separate current mechanisms and inferred requirements from the requested outcome.
 - Reopen a settled choice only when new evidence changes a consequential trade-off.
@@ -68,7 +69,7 @@ Do not accept the first plausible implementation. Inspect the exact Task, Attemp
 
 Use Review when a fresh independent perspective is likely to improve judgment, especially when your own implementation choices may bias assessment. Unless resolving a specific uncertainty, ask for assessment of the complete result; a focused request supports only a focused conclusion.
 
-Judge review findings against supported behavior, the established trust model, and total system complexity. Correct only findings that matter to the requested outcome, and prefer removing an unnecessary responsibility over hardening it.
+Judge review findings against supported behavior, the established trust model, and total system complexity. For each finding, correct a supported defect, give a concrete source-based reason to decline it, or ask the user when its disposition changes accepted behavior or policy. A failed or incomplete review is not a clean review; report it before handback. Prefer removing an unnecessary responsibility over hardening it.
 
 Before handback, challenge whether every surviving responsibility, abstraction, test, fixture, and caller obligation has a current purpose. Remove superseded or redundant machinery, and judge simplification, readability, performance where relevant, operational behavior, and verification quality alongside correctness.
 

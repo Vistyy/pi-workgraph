@@ -1,8 +1,5 @@
-// SAFETY: This module only reads the running Pi installation to locate its presentation module.
 import { readdir, readFile } from "node:fs/promises";
-// SAFETY: These paths identify the read-only running Pi installation; no installed file is modified.
 import { dirname, join } from "node:path";
-// SAFETY: This converts the discovered running module path to an import URL only.
 import { pathToFileURL } from "node:url";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type {
@@ -21,7 +18,6 @@ import type { Component, Container } from "@earendil-works/pi-tui";
  * Calm visibly instead of silently rendering a partial transcript. It never rewrites Pi state.
  */
 
-// SAFETY: The running Pi module is external input; exports and constructor shapes are validated here.
 // oxlint-disable anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns, anti-slop/no-runtime-typeof, anti-slop/no-reflect-get, anti-slop/no-chained-type-assertions, effecttsgo/async-function
 
 type CalmAssistantConstructor = new (message?: AssistantMessage) => AssistantMessageComponent;
@@ -102,7 +98,7 @@ async function chunkModuleUrls(directory: string): Promise<readonly string[]> {
       if (MESSAGE_EXPORTS.every((exportName) => source.includes(exportName)))
         urls.push(pathToFileURL(path).href);
     } catch {
-      // An unreadable chunk is not a usable runtime module.
+      continue;
     }
   }
 
@@ -137,15 +133,11 @@ function decodeCalmChatRuntime(module: unknown): CalmChatRuntime | undefined {
     !isComponentConstructor(customMessage)
   )
     return undefined;
-  // Pi's assistant component extends the same private Container the live chat uses; deriving the
-  // container from that prototype parent keeps discovery and the projection aligned with Pi.
   const parent: unknown = Object.getPrototypeOf(assistant.prototype);
   const container: unknown = readProperty(parent, "constructor");
 
   if (!isComponentConstructor(container)) return undefined;
 
-  // SAFETY: The guarded checks above established every constructor shape; this assertion only
-  // names the validated runtime interface for callers.
   return {
     assistant,
     user,

@@ -137,6 +137,8 @@ place clean workspace
   → submit kickoff
 ```
 
+Pi defers writing a new session file until provider activity. Worker session creation therefore appends the objective and a zero-usage synthetic assistant entry, materializing the exact session file before tab creation.
+
 Before agent start becomes uncertain, placement must remain at the exact clean Attempt base. After that checkpoint, execution dirtiness no longer blocks reconciliation.
 
 Recovery observes persisted and native identity. It does not replay a possibly completed effect or guess ownership.

@@ -197,7 +197,6 @@ void test("real Pi runs the minimal guide-to-executor trajectory and semantic re
     );
 
     assert.ok(report?.type === "message" && report.message.role === "toolResult");
-    // SAFETY: The preceding role assertion narrows this to the tool-result details boundary.
     assert.deepEqual(Object.keys(report.message.details as object), ["report"]);
   } finally {
     await session?.abort();

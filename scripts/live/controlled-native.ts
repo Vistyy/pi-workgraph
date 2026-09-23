@@ -1,4 +1,4 @@
-/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers, effecttsgo/new-promise, effecttsgo/process-env, anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, anti-slop/require-safety-comment-for-type-assertion, typescript/strict-boolean-expressions, typescript/no-unsafe-return -- This operator-controlled native boundary owns host resources, chronology, untyped Herdr envelopes, and bounded cleanup. */
+/* oxlint-disable effecttsgo/async-function, effecttsgo/global-date, effecttsgo/global-timers, effecttsgo/new-promise, effecttsgo/process-env, anti-slop/no-runtime-typeof, anti-slop/no-unsafe-dictionary-type, typescript/strict-boolean-expressions, typescript/no-unsafe-return -- This operator-controlled native boundary owns host resources, chronology, untyped Herdr envelopes, and bounded cleanup. */
 /* biome-ignore-all lint/complexity/useLiteralKeys: decoded JSON records require indexed access under noPropertyAccessFromIndexSignature. */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -286,7 +286,6 @@ function createResearchGate(signal: AbortSignal): ResearchGate {
     else signal.addEventListener("abort", abort, { once: true });
   });
 
-  // The provider may not reach this promise before cleanup rejects it.
   void promise.catch(() => undefined);
 
   return {

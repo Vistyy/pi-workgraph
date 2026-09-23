@@ -3,18 +3,14 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { Effect } from "effect";
 import { Value } from "typebox/value";
 import {
   implementationTargets,
   loadModelPolicy,
-  loadModelPolicyEffect,
   type ModelPolicy,
-  ModelPolicyError,
   resolveSelection,
   SelectionRequestSchema,
 } from "../../src/coordinator/model-policy.js";
-import { liveLayer } from "../../src/node-platform.js";
 
 const valid: ModelPolicy = {
   roles: {
@@ -62,7 +58,11 @@ await test("loads only the complete strict user policy shape", async () => {
     ]) {
       if (invalid === undefined) {
         await rm(path);
-        await assert.rejects(loadModelPolicy(path), /required/);
+        await assert.rejects(loadModelPolicy(path), {
+          _tag: "ModelPolicyError",
+          operation: "read",
+          message: /required/,
+        });
         await writeFile(path, JSON.stringify(valid));
       } else {
         await writeFile(path, JSON.stringify(invalid));
@@ -75,21 +75,6 @@ await test("loads only the complete strict user policy shape", async () => {
     await assert.rejects(loadModelPolicy(path), /Invalid Workgraph model policy/);
     await writeFile(path, "{broken");
     await assert.rejects(loadModelPolicy(path), /Invalid JSON/);
-  } finally {
-    await rm(parent, { recursive: true, force: true });
-  }
-});
-
-await test("policy Effect classifies missing and malformed files", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "workgraph-policy-errors-"));
-
-  try {
-    const missing = await Effect.runPromise(
-      Effect.flip(Effect.provide(loadModelPolicyEffect(join(parent, "missing.json")), liveLayer)),
-    );
-
-    assert.ok(missing instanceof ModelPolicyError);
-    assert.equal(missing.operation, "read");
   } finally {
     await rm(parent, { recursive: true, force: true });
   }
@@ -115,7 +100,6 @@ await test("selection repeats independently or takes distinct policy-order targe
     () => resolveSelection("review", { count: 2, distinctModels: true }, policy),
     /only 1/,
   );
-  // Callers cannot supply arbitrary targets or thinking levels.
   assert.equal(Value.Check(SelectionRequestSchema, { model: "fixture/research-first" }), false);
 });
 

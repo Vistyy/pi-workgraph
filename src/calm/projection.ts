@@ -12,8 +12,6 @@ import type { CalmChatRuntime, CalmComponentConstructor } from "./pi-runtime.js"
  * the adapter owns only the exact chat instance's render, invalidate, and mouse-dispatch seams.
  */
 
-// SAFETY: This module is the guarded Pi chat compatibility boundary; live component instances are
-// inspected structurally and every owned seam is validated before use.
 // oxlint-disable anti-slop/no-object-parameters, anti-slop/no-runtime-typeof, anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns
 
 const DOCUMENT_INDEX = 0;
@@ -28,8 +26,6 @@ const EXCLUDED_CUSTOM_TYPE = "pi-workgraph-outcome";
 
 const ATTACHED_CHATS = new WeakSet<Container>();
 
-// Pi keeps these render inputs in private instance fields. Copies must follow them to preserve the
-// running Pi's markdown transformers, theme, and padding.
 const ASSISTANT_PRESENTATION_FIELDS = [
   "markdownTheme",
   "outputPad",

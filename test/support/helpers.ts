@@ -232,7 +232,6 @@ export async function extensionFixture(
     const tool = runner.getToolDefinition(toolName);
     assert.ok(tool !== undefined, `Missing registered tool ${toolName}`);
     assert.ok(Value.Check(tool.parameters, params), `Invalid fixture input to ${toolName}`);
-    // SAFETY: Pi's registered definition erases its concrete schema generic, but Value.Check above validates this value against the exact runtime schema.
     const decoded = Value.Decode(tool.parameters, params);
 
     return tool.execute(toolCallId, decoded, signal, undefined, runner.createContext());

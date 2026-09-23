@@ -115,7 +115,6 @@ export function installCalmMode(
   let statusPublished = false;
   let workingHidden = false;
   let requestWidgetRender: (() => void) | undefined;
-  // Report each real incompatibility once per session.
   const diagnosed = new Set<string>();
   let activityTracker: ReturnType<typeof createCalmActivityTracker>;
 
@@ -199,8 +198,7 @@ export function installCalmMode(
     }
 
     if (timer !== undefined) return;
-    // SAFETY: This timer only advances the rail pulse and is cleared by stopTimer and shutdown.
-    // oxlint-disable-next-line effecttsgo/global-timers
+    // oxlint-disable-next-line effecttsgo/global-timers -- stopTimer clears the pulse on shutdown.
     timer = setInterval(() => {
       frame += 1;
       syncWidget();
@@ -218,7 +216,6 @@ export function installCalmMode(
 
     if (state.on) {
       if (!workingHidden) {
-        // Calm owns the single activity surface; Pi keeps its working indicator hidden.
         ui.setWorkingVisible(false);
         workingHidden = true;
       }
@@ -237,13 +234,11 @@ export function installCalmMode(
     syncTimer();
   };
 
-  // Calm becomes unavailable only for a real incompatibility that disables the projection.
   const diagnose: Diagnostic = (message) => {
     if (diagnosed.has(message)) return;
     diagnosed.add(message);
     const diagnosedGeneration = generation;
     queueMicrotask(() => {
-      // A stale failure must not disable a newer attachment or rewrite current chrome.
       if (diagnosedGeneration !== generation) return;
 
       if (state.on) state.on = false;
@@ -307,8 +302,7 @@ export function installCalmMode(
     });
   };
 
-  // Loading the running Pi module is a native dynamic import that must settle before attachment.
-  // oxlint-disable-next-line effecttsgo/async-function
+  // oxlint-disable-next-line effecttsgo/async-function -- Pi's dynamic import settles before projection attachment.
   const startSession = async (
     currentGeneration: number,
     on: boolean,
@@ -325,7 +319,6 @@ export function installCalmMode(
       attachProjection(chatRuntime);
       adapterReady = true;
     } catch (error) {
-      // A superseded session's rejection must not mutate or report through the current one.
       if (currentGeneration !== generation) return;
       adapterReady = false;
       state.on = false;
@@ -371,7 +364,6 @@ export function installCalmMode(
       activityTracker.messageUpdate(event.assistantMessageEvent.type);
   });
   pi.on("tool_execution_start", (event) => {
-    // Pi exposes tool args without a runtime-safe static shape; the activity tracker guards them.
     activityTracker.toolStart(event.toolCallId, event.toolName, event.args);
   });
   pi.on("tool_execution_end", (event) => {

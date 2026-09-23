@@ -26,7 +26,6 @@ type InspectInput =
     };
 
 export function inspect(runtime: SessionRuntime, params: Static<TSchema>) {
-  // SAFETY: This helper receives only values decoded by the registered inspection union.
   const input = params as InspectInput;
 
   switch (input.section) {

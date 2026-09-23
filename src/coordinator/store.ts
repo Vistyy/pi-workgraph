@@ -231,7 +231,6 @@ export class RecordStore {
 
     if (database === undefined) return [];
 
-    // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
     const rows = database
       .prepare(
         `SELECT a.*,t.task_json
@@ -269,7 +268,6 @@ export class RecordStore {
 
     if (database === undefined) return [];
 
-    // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
     const rows = database
       .prepare(
         `SELECT * FROM attempts
@@ -347,7 +345,6 @@ export class RecordStore {
 
     if (database === undefined) return [];
 
-    // SAFETY: node:sqlite returns open rows; taskRecord strictly decodes every consumed field.
     return (
       database
         .prepare("SELECT * FROM tasks WHERE session_id=? ORDER BY rowid LIMIT ? OFFSET ?")
@@ -363,7 +360,6 @@ export class RecordStore {
 
     if (database === undefined) return [];
 
-    // SAFETY: node:sqlite returns open rows; attemptRecord strictly decodes every consumed field.
     const rows =
       taskId === undefined
         ? (database
@@ -673,13 +669,13 @@ function parse<S extends TSchema>(schema: S, value: unknown, name: string): Stat
 function decode<S extends TSchema>(schema: S, value: unknown, name: string): Static<S> {
   if (!Value.Check(schema, value)) throw failure(`decode ${name}`, `${name} is malformed.`);
 
-  // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion, typescript/no-unsafe-return -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type. The strict TypeBox check immediately establishes the returned decoded type.
+  // oxlint-disable-next-line typescript/no-unsafe-return -- The strict TypeBox check immediately establishes the returned decoded type.
   return Value.Decode(schema, value) as Static<S>;
 }
 
 // oxlint-disable-next-line typescript/no-unnecessary-type-parameters -- Name and Value preserve the computed key-to-value relation in the mapped return type.
 function optional<const Name extends string, Value>(name: Name, value: Value | undefined) {
-  // oxlint-disable-next-line anti-slop/no-known-value-widening, anti-slop/require-safety-comment-for-type-assertion -- The explicit boundary type intentionally hides fixture or SQLite implementation details. The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
+  // oxlint-disable-next-line anti-slop/no-known-value-widening -- The explicit boundary type intentionally hides fixture or SQLite implementation details.
   return value === undefined ? {} : ({ [name]: value } as { [Key in Name]: Value });
 }
 

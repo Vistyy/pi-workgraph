@@ -460,7 +460,6 @@ void test("completed repository reports settle through mutable scratch and retai
 
     assert.ok(assignment?.type === "custom_message");
     assert.equal(Array.isArray(assignment.content), false);
-    // SAFETY: The objective's non-array custom-message content is text under Pi's content union.
     const content = assignment.content as string;
 
     assert.match(content, /repository seed identity/);

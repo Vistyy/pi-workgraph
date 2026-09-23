@@ -115,7 +115,6 @@ export function createWorkerSessionEffect(request: {
         request.objective.details,
       ),
     );
-    // Pi otherwise defers the new file until provider activity.
     yield* native("persist", () =>
       session.appendMessage({
         role: "assistant",
@@ -132,8 +131,7 @@ export function createWorkerSessionEffect(request: {
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
         },
         stopReason: "stop",
-        // Pi requires an epoch timestamp for the synthetic persistence marker.
-        // oxlint-disable-next-line effecttsgo/global-date
+        // oxlint-disable-next-line effecttsgo/global-date -- Pi's synthetic persistence marker needs an epoch timestamp.
         timestamp: Date.now(),
       }),
     );

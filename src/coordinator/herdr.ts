@@ -109,7 +109,6 @@ export class HerdrError extends Data.TaggedError("HerdrError")<{
 export class HerdrCliRuntime {
   readonly available: boolean;
   constructor(
-    // Herdr launch configuration belongs to this exact host adapter.
     // oxlint-disable-next-line effecttsgo/process-env
     private readonly executable = process.env["PI_WORKGRAPH_HERDR_BIN"] ?? "herdr",
     environment: NodeJS.ProcessEnv = process.env,
@@ -434,7 +433,6 @@ function decode<const S extends TSchema>(
     );
   }
 
-  // SAFETY: Value.Check establishes the complete supplied TypeBox schema before this decode cast.
   return Value.Check(schema, value)
     ? Effect.succeed(Value.Decode(schema, value) as Static<S>)
     : Effect.fail(

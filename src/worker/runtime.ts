@@ -186,8 +186,7 @@ export class WorkerRuntime {
   }
 
   recoverModel(branch: readonly WorkerEntry[], host: WorkerModelHost) {
-    // Effect generators retain the runtime owner while yielding host failures.
-    // oxlint-disable-next-line typescript/no-this-alias
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner while yielding host failures.
     const self = this;
 
     return Effect.gen(function* () {
@@ -219,8 +218,7 @@ export class WorkerRuntime {
   }
 
   private liveCutover(host: WorkerModelHost) {
-    // Effect generators retain the runtime owner while yielding host failures.
-    // oxlint-disable-next-line typescript/no-this-alias
+    // oxlint-disable-next-line typescript/no-this-alias -- Effect generators retain the runtime owner while yielding host failures.
     const self = this;
 
     return Effect.gen(function* () {
