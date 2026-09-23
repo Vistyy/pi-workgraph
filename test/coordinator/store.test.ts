@@ -173,7 +173,6 @@ void test("RecordStore creates one exact database lazily", () => {
     });
 
     assert.equal(
-      // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
       (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
       1,
     );
@@ -181,7 +180,6 @@ void test("RecordStore creates one exact database lazily", () => {
       database
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
         .all()
-        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => (row as { name: string }).name),
       ["attempts", "tasks"],
     );
@@ -189,7 +187,6 @@ void test("RecordStore creates one exact database lazily", () => {
       database
         .prepare("PRAGMA table_info(tasks)")
         .all()
-        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => (row as { name: string }).name),
       ["session_id", "task_id", "task_json"],
     );
@@ -197,7 +194,6 @@ void test("RecordStore creates one exact database lazily", () => {
       database
         .prepare("PRAGMA table_info(attempts)")
         .all()
-        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => (row as { name: string }).name),
       [
         "attempt_id",
@@ -214,9 +210,7 @@ void test("RecordStore creates one exact database lazily", () => {
       database
         .prepare("PRAGMA table_list")
         .all()
-        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .filter((row) => ["tasks", "attempts"].includes((row as { name: string }).name))
-        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => [(row as { name: string }).name, (row as { strict: number }).strict])
         .sort(),
       [
@@ -347,7 +341,6 @@ void test("RecordStore resumes an interrupted empty initialization", () => {
 
     const database = new DatabaseSync(path, { readOnly: true });
     assert.equal(
-      // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
       (database.prepare("PRAGMA user_version").get() as { user_version: number }).user_version,
       1,
     );
@@ -381,7 +374,6 @@ void test("RecordStore preserves and rejects a nonempty version-zero database", 
       preserved
         .prepare("SELECT name FROM sqlite_schema WHERE type='table'")
         .all()
-        // oxlint-disable-next-line anti-slop/require-safety-comment-for-type-assertion -- The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
         .map((row) => (row as { name: string }).name),
       ["foreign_record"],
     );

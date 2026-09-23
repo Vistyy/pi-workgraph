@@ -117,7 +117,7 @@ async function fixture() {
     parent,
     root,
     agentDir: join(parent, "agent"),
-    // oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/require-safety-comment-for-type-assertion -- This private I/O boundary validates the untyped host value before use. The assertion projects a schema-checked or native SQLite value into its owned test or boundary type.
+    // oxlint-disable-next-line anti-slop/no-unknown-parameters -- This private I/O boundary validates the untyped host value before use.
     facts: (details: unknown) => details as Facts,
     finish: (facts: Facts, cwd = root) =>
       pi.call("workgraph_checkout", {

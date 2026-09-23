@@ -62,9 +62,9 @@ export const SelectionRequestSchema = Type.Object(
 
 export type SelectionRequest = Static<typeof SelectionRequestSchema>;
 
-export type ModelPolicyOperation = "read" | "parse" | "decode";
+type ModelPolicyOperation = "read" | "parse" | "decode";
 
-export class ModelPolicyError extends Data.TaggedError("ModelPolicyError")<{
+class ModelPolicyError extends Data.TaggedError("ModelPolicyError")<{
   readonly operation: ModelPolicyOperation;
   readonly path: string;
   readonly message: string;
@@ -77,7 +77,7 @@ export function modelPolicyPath(agentDir = getAgentDir()): string {
   return join(agentDir, "workgraph", "models.json");
 }
 
-export function loadModelPolicyEffect(
+function loadModelPolicyEffect(
   path = modelPolicyPath(),
 ): Effect.Effect<ModelPolicy, ModelPolicyError | PlatformError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
