@@ -69,7 +69,6 @@ export class FixtureAssistant extends FixtureContainer {
     if (message !== undefined) this.updateContent(message);
   }
 
-  // Mirrors Pi's native default: an omitted streaming argument keeps the component's current state.
   updateContent(message: AssistantMessage, isStreaming: boolean = this.isStreaming): void {
     this.updates += 1;
     this.lastMessage = message;

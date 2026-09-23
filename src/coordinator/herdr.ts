@@ -109,7 +109,6 @@ export class HerdrError extends Data.TaggedError("HerdrError")<{
 export class HerdrCliRuntime {
   readonly available: boolean;
   constructor(
-    // Herdr launch configuration belongs to this exact host adapter.
     // oxlint-disable-next-line effecttsgo/process-env
     private readonly executable = process.env["PI_WORKGRAPH_HERDR_BIN"] ?? "herdr",
     environment: NodeJS.ProcessEnv = process.env,

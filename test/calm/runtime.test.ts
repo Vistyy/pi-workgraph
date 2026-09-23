@@ -166,7 +166,6 @@ function locateInstalledPiEntrypoint(): string | undefined {
 
   const checkoutModules = join(import.meta.dirname, "..", "..", "node_modules");
 
-  // Maintained checks use the lockfile's Pi; the explicit override remains available for native runs.
   return candidates.find((candidate) => candidate.startsWith(checkoutModules)) ?? candidates[0];
 }
 

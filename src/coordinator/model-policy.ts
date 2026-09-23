@@ -142,7 +142,6 @@ function decodeModelPolicy(value: unknown): ModelPolicy {
     throw new Error(`Invalid Workgraph model policy at ${location}: ${issue.message}.`);
   }
 
-  // The schema establishes the shape and nonempty target lists before this cast.
   const policy = Value.Decode(ModelPolicySchema, value) as ModelPolicy;
 
   for (const role of MODEL_LIST_ROLES) rejectDuplicateModels(role, policy.roles[role]);

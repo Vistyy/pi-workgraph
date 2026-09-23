@@ -345,7 +345,6 @@ export class RecordStore {
 
     if (database === undefined) return [];
 
-    // node:sqlite returns open rows; taskRecord decodes every consumed field.
     return (
       database
         .prepare("SELECT * FROM tasks WHERE session_id=? ORDER BY rowid LIMIT ? OFFSET ?")
@@ -361,7 +360,6 @@ export class RecordStore {
 
     if (database === undefined) return [];
 
-    // node:sqlite returns open rows; attemptRecord decodes every consumed field.
     const rows =
       taskId === undefined
         ? (database

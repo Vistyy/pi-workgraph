@@ -12,4 +12,4 @@ Keep guidance with its owning document instead of duplicating it.
 
 Package only what installed operation needs: runtime entry points and source, injected Coordinator guidance and its references, and the human-facing guide. Keep contributor instructions, design rationale, verification policy, domain language, and decision records in the repository rather than the npm package.
 
-Production names and comments describe durable responsibilities, contracts, invariants, or safety facts, never delivery phases or change history.
+Production names and owning documentation describe durable responsibilities, contracts, invariants, or safety facts, never delivery phases or change history. TypeScript source, tests, and scripts use no free-form `//` comments; only applicable rule-suppression directives are allowed. Do not turn prose into block comments to evade this boundary.

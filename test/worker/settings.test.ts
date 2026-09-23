@@ -23,7 +23,6 @@ void test("global Pi settings validate worker tool settings and ignore Calm sect
     );
     assert.deepEqual(await loadWorkerDisabledTools(path), ["rename_resource", "custom_lookup"]);
 
-    // Retired Calm presentation settings must not invalidate the retained worker settings.
     await writeFile(
       path,
       JSON.stringify({

@@ -11,7 +11,6 @@ import {
 import { loadWorkerDisabledTools } from "../src/worker/settings.js";
 
 export default function workgraphWorker(pi: ExtensionAPI): void {
-  // The dedicated Worker process receives its role through the launch environment.
   // biome-ignore lint/complexity/useLiteralKeys: ProcessEnv keys require indexed access under noPropertyAccessFromIndexSignature.
   const configuredRole = configuredWorkerRole(process.env["PI_WORKGRAPH_ROLE"]); // oxlint-disable-line effecttsgo/process-env
 

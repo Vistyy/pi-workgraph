@@ -26,8 +26,6 @@ const EXCLUDED_CUSTOM_TYPE = "pi-workgraph-outcome";
 
 const ATTACHED_CHATS = new WeakSet<Container>();
 
-// Pi keeps these render inputs in private instance fields. Copies must follow them to preserve the
-// running Pi's markdown transformers, theme, and padding.
 const ASSISTANT_PRESENTATION_FIELDS = [
   "markdownTheme",
   "outputPad",

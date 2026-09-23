@@ -100,7 +100,6 @@ await test("selection repeats independently or takes distinct policy-order targe
     () => resolveSelection("review", { count: 2, distinctModels: true }, policy),
     /only 1/,
   );
-  // Callers cannot supply arbitrary targets or thinking levels.
   assert.equal(Value.Check(SelectionRequestSchema, { model: "fixture/research-first" }), false);
 });
 

@@ -98,7 +98,7 @@ async function chunkModuleUrls(directory: string): Promise<readonly string[]> {
       if (MESSAGE_EXPORTS.every((exportName) => source.includes(exportName)))
         urls.push(pathToFileURL(path).href);
     } catch {
-      // An unreadable chunk is not a usable runtime module.
+      continue;
     }
   }
 
@@ -133,14 +133,11 @@ function decodeCalmChatRuntime(module: unknown): CalmChatRuntime | undefined {
     !isComponentConstructor(customMessage)
   )
     return undefined;
-  // Pi's assistant component extends the same private Container the live chat uses; deriving the
-  // container from that prototype parent keeps discovery and the projection aligned with Pi.
   const parent: unknown = Object.getPrototypeOf(assistant.prototype);
   const container: unknown = readProperty(parent, "constructor");
 
   if (!isComponentConstructor(container)) return undefined;
 
-  // Method checks reject incompatible components; constructor signatures rely on Pi's installed API.
   return {
     assistant,
     user,

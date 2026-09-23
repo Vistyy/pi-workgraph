@@ -286,7 +286,6 @@ function createResearchGate(signal: AbortSignal): ResearchGate {
     else signal.addEventListener("abort", abort, { once: true });
   });
 
-  // The provider may not reach this promise before cleanup rejects it.
   void promise.catch(() => undefined);
 
   return {
