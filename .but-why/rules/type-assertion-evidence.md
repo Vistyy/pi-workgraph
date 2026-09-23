@@ -1,7 +1,9 @@
-# Type assertion evidence
+# Unsupported type assertions
 
-Review TypeScript type assertions added or changed in the requested code scope, and existing assertions whose supporting validation changes. Ignore `as const` and quoted examples or deliberately failing test fixtures.
+Inspect non-`const` TypeScript assertions (`value as T` or `<T>value`) when a change adds or modifies the assertion, changes validation it relies on, or adds a use of its asserted shape. Ignore quoted code and deliberately failing fixtures unless they execute as part of the changed program.
 
-For each possible issue, trace the value from its source through the checks or contracts relied on at the point of use. Report an assertion when it claims a type or property the code has not established. If straightforward narrowing or decoding would establish the missing invariant, explain that concrete alternative. A `SAFETY:` comment or lint suppression is not evidence that the assertion is sound. Do not flag an assertion merely because it exists or demand runtime validation when a concrete static or host contract already establishes the needed invariant.
+Report a violation only when code uses a type, field, or variant claimed by the assertion before the source value has been checked for that claim or an identifiable static or host contract establishes it. Trace the source to the first use. A `SAFETY:` comment or lint suppression is not evidence; a later check does not justify an earlier unchecked use. Do not report a cast solely because a different implementation could avoid it.
 
-For each finding, cite the file and location, the missing evidence, the resulting risk, and the smallest sound alternative. If no such issue is substantiated, say so; disclose any relevant scope you could not inspect. Do not repeat a deterministic lint diagnostic without identifying the underlying risk.
+For example, if `parsed` is `unknown`, `const roles = (parsed as ModelPolicy).roles.research` uses `roles` without establishing that `parsed` is a model policy: report that missing validation and its consequence. By contrast, `Value.Check(ModelPolicySchema, parsed)` followed by `Value.Decode(ModelPolicySchema, parsed) as ModelPolicy` establishes the consumed shape; the remaining cast alone is not a finding. If a deterministic lint rule already catches an expression, report it only when you can identify a distinct underlying risk.
+
+For each violation, name the unsupported claim, the first unsafe use, the missing check or contract, and a sound correction grounded in the surrounding code.
